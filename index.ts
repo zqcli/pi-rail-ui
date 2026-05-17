@@ -179,4 +179,6 @@ export default function piRailUi(pi: ExtensionAPI) {
 	process.on("exit", () => {
 		if (altScreenEnabled) exitAlternateScreen();
 	});
+
+	if (CONVERSATION_SCROLL_LAYOUT.enabled) enableAltScreen();
 }

@@ -329,7 +329,7 @@ Rail Overlay 是 Rail Section 在弹出菜单方向的对应抽象。slash autoc
 
 这些旧区块仍然控制其它 UI surface 的专用细节。对于弹出菜单，`slashCommand` 继续提供 selected text、列表列宽、最大行数、底部间距等菜单行为配置；`selectorOutput` 提供共享 rail/background surface 样式。
 
-`footer.bottomGapRows` 会在 app-level conversation viewport 模式下为 footer 后方预留终端空白行。当前配置为 `1`，因此 footer 会位于终端底部上方一行；设为 `0` 可恢复之前贴底的布局。
+`footer.bottomGapRows` 会在 app-level conversation viewport 模式下为 footer 后方预留终端空白行。默认配置为 `0`，保持之前贴底的布局；如果希望 footer 位于终端底部上方，可设为 `1` 或更大。
 
 ## 项目结构
 

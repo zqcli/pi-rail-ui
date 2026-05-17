@@ -329,7 +329,7 @@ Rail Overlay is the popup-menu counterpart to Rail Section. It reuses the same r
 
 These legacy sections still control specialized details of the other major UI surfaces. For popup menus, `slashCommand` continues to provide menu-specific behavior such as selected text color, list column widths, max rows, and bottom spacing; `selectorOutput` provides the shared rail/background surface style.
 
-`footer.bottomGapRows` reserves blank terminal rows after the footer in app-level conversation viewport mode. The current config sets it to `1` so the footer sits one row above the terminal bottom; set it to `0` to restore the previous flush-bottom layout.
+`footer.bottomGapRows` reserves blank terminal rows after the footer in app-level conversation viewport mode. The default config sets it to `0` for the previous flush-bottom layout; set it to `1` or higher if you want the footer to sit above the terminal bottom.
 
 ## Project Structure
 

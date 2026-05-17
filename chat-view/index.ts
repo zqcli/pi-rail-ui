@@ -1,1 +1,1 @@
-export { installConversationScroll, uninstallConversationScroll } from "./viewport";
+export { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, uninstallConversationScroll } from "./viewport";

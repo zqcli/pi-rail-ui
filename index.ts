@@ -4,11 +4,11 @@ import {
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
-import { TallGrayInputEditor, disableMouseTracking, enableMouseTracking, enterAlternateScreen, exitAlternateScreen, hideAllEditorOverlays } from "./components/editor";
+import { TallGrayInputEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays } from "./components/editor";
 import { createTallGrayFooter } from "./components/footer";
 import { installCommandOutputGap, uninstallCommandOutputGap } from "./patches/command-output";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
-import { installConversationScroll, uninstallConversationScroll } from "./chat-view";
+import { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, uninstallConversationScroll } from "./chat-view";
 import {
 	installThinkingSurface,
 	uninstallThinkingSurface,
@@ -40,10 +40,12 @@ export * from "./ui/rail-surface";
 export * from "./patches/execution-surfaces";
 export * from "./utils";
 
-export default function piRailUi(pi: ExtensionAPI) {
+export default async function piRailUi(pi: ExtensionAPI) {
 	let enabled = true;
 	let mouseEnabled = false;
-	let altScreenEnabled = false;
+
+	await installConversationScroll();
+	if (!CONVERSATION_SCROLL_LAYOUT.enabled || !CONVERSATION_SCROLL_LAYOUT.alternateScreen) releaseConversationAlternateScreen();
 
 	function enableMouse() {
 		if (mouseEnabled) return;
@@ -57,31 +59,17 @@ export default function piRailUi(pi: ExtensionAPI) {
 		mouseEnabled = false;
 	}
 
-	function enableAltScreen() {
-		if (altScreenEnabled) return;
-		if (!CONVERSATION_SCROLL_LAYOUT.alternateScreen) return;
-		enterAlternateScreen();
-		altScreenEnabled = true;
-	}
-
-	function disableAltScreen() {
-		if (!altScreenEnabled) return;
-		exitAlternateScreen();
-		altScreenEnabled = false;
-	}
-
 	function installEditor(ctx: ExtensionContext) {
-		ctx.ui.setEditorComponent((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) =>
-			new TallGrayInputEditor(tui, theme, keybindings, ctx.ui.theme),
-		);
+		ctx.ui.setEditorComponent((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => {
+			ensureConversationAlternateScreen(tui);
+			return new TallGrayInputEditor(tui, theme, keybindings, ctx.ui.theme);
+		});
 
 		if (EDITOR_MOUSE_TRACKING_ENABLED || CONVERSATION_SCROLL_LAYOUT.enabled) enableMouse();
 		else {
 			disableMouseTracking();
 			mouseEnabled = false;
 		}
-
-		if (CONVERSATION_SCROLL_LAYOUT.enabled) enableAltScreen();
 	}
 
 	function installFooter(ctx: ExtensionContext) {
@@ -107,7 +95,7 @@ export default function piRailUi(pi: ExtensionAPI) {
 		ctx.ui.setFooter(undefined);
 		hideAllEditorOverlays();
 		disableMouse();
-		disableAltScreen();
+		releaseConversationAlternateScreen();
 		uninstallThinkingSurface();
 		uninstallUserMessageSurface();
 		uninstallSettingsMenuSurface();
@@ -162,23 +150,30 @@ export default function piRailUi(pi: ExtensionAPI) {
 		if (ctx.hasUI && enabled) installFooter(ctx);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
+		// Keep alternate screen across /reload. Exiting and immediately re-entering
+		// clears the terminal while pi-tui still has differential-render state,
+		// which can make the editor/footer repaint at stale rows.
+		const keepAlternateScreen = event.reason === "reload";
 		hideAllEditorOverlays();
 		disableMouse();
-		disableAltScreen();
+		if (!keepAlternateScreen) releaseConversationAlternateScreen();
 		uninstallThinkingSurface();
 		uninstallUserMessageSurface();
 		uninstallSettingsMenuSurface();
 		uninstallToolExecutionGap();
 		uninstallResourceStatusGap();
 		uninstallCommandOutputGap();
-		uninstallConversationScroll();
+		uninstallConversationScroll({ releaseAlternateScreen: !keepAlternateScreen });
 		enabled = true;
 	});
 
 	process.on("exit", () => {
-		if (altScreenEnabled) exitAlternateScreen();
+		releaseConversationAlternateScreen();
 	});
 
-	if (CONVERSATION_SCROLL_LAYOUT.enabled) enableAltScreen();
+	// Conversation scroll is patched during extension load so startup's first TUI
+	// render uses the fixed app viewport. The patched TUI.start() enters the
+	// alternate screen after Pi startup logs and before that first render, which
+	// prevents native terminal scrollback/scrollbar growth on process startup.
 }

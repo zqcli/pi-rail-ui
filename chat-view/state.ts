@@ -80,12 +80,14 @@ export type ConversationScrollStore = {
 	targets: PrototypePatchTarget[];
 	states: WeakMap<object, ScrollState>;
 	animationTimers: Set<ReturnType<typeof setTimeout>>;
+	alternateScreenActive: boolean;
 };
 
 export const getConversationScrollStore = createStore<ConversationScrollStore>("conversation-scroll-patch", () => ({
 	targets: [],
 	states: new WeakMap<object, ScrollState>(),
 	animationTimers: new Set<ReturnType<typeof setTimeout>>(),
+	alternateScreenActive: false,
 }));
 
 export function stateFor(tui: object, store: ConversationScrollStore): ScrollState {

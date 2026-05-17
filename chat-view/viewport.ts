@@ -12,6 +12,33 @@ import {
 	type TuiCtor,
 } from "./state";
 
+const ENTER_ALT_SCREEN = "\x1b[?1049h\x1b[H\x1b[2J\x1b[3J";
+const EXIT_ALT_SCREEN = "\x1b[?1049l";
+
+function writeTerminalControl(sequence: string): void {
+	if (process.stdout.isTTY) process.stdout.write(sequence);
+}
+
+function requestFullRenderAfterScreenClear(tui: any | undefined): void {
+	if (typeof tui?.requestRender === "function") tui.requestRender(true);
+}
+
+export function ensureConversationAlternateScreen(tui?: any): void {
+	if (!CONVERSATION_SCROLL_LAYOUT.enabled || !CONVERSATION_SCROLL_LAYOUT.alternateScreen) return;
+	const store = getConversationScrollStore();
+	if (store.alternateScreenActive) return;
+	writeTerminalControl(ENTER_ALT_SCREEN);
+	store.alternateScreenActive = true;
+	requestFullRenderAfterScreenClear(tui);
+}
+
+export function releaseConversationAlternateScreen(): void {
+	const store = getConversationScrollStore();
+	if (!store.alternateScreenActive) return;
+	writeTerminalControl(EXIT_ALT_SCREEN);
+	store.alternateScreenActive = false;
+}
+
 async function resolveNativeTuiExport<T>(exportName: string): Promise<T | undefined> {
 	try {
 		const packageUrl = import.meta.resolve("@earendil-works/pi-tui");
@@ -106,6 +133,28 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 function patchTui(ctor: TuiCtor | undefined, store: ConversationScrollStore): void {
 	if (!ctor?.prototype) return;
 
+	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "start")) {
+		const originalStart = ctor.prototype.start;
+		ctor.prototype.start = function patchedConversationScrollStart(this: any, ...args: any[]) {
+			const result = originalStart.apply(this, args);
+			ensureConversationAlternateScreen(this);
+			return result;
+		};
+		store.targets.push({ ctor, methodName: "start", original: originalStart });
+	}
+
+	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "stop")) {
+		const originalStop = ctor.prototype.stop;
+		ctor.prototype.stop = function patchedConversationScrollStop(this: any, ...args: any[]) {
+			try {
+				return originalStop.apply(this, args);
+			} finally {
+				releaseConversationAlternateScreen();
+			}
+		};
+		store.targets.push({ ctor, methodName: "stop", original: originalStop });
+	}
+
 	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "render")) {
 		const originalRender = ctor.prototype.render;
 		ctor.prototype.render = function patchedConversationScrollRender(width: number): string[] {
@@ -130,8 +179,9 @@ export async function installConversationScroll(): Promise<void> {
 	patchTui(await resolveNativeTuiExport<TuiCtor>("TUI"), store);
 }
 
-export function uninstallConversationScroll(): void {
+export function uninstallConversationScroll(options: { releaseAlternateScreen?: boolean } = {}): void {
 	const store = getConversationScrollStore();
+	if (options.releaseAlternateScreen !== false) releaseConversationAlternateScreen();
 	restorePrototypePatches(store.targets);
 	for (const timer of store.animationTimers) clearTimeout(timer);
 	store.animationTimers.clear();

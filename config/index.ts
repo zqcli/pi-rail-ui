@@ -41,7 +41,8 @@ function readStyleFile(): StyleFile {
 const style = readStyleFile();
 const editorBackground = bg(style.editor.background, "editor.background");
 const editorRail = fg(style.editor.rail, "editor.rail");
-const selection = `${bg(style.editor.selection.background, "editor.selection.background")}${fg(
+const selectionBackground = bg(style.editor.selection.background, "editor.selection.background");
+const selection = `${selectionBackground}${fg(
 	style.editor.selection.foreground,
 	"editor.selection.foreground",
 )}`;
@@ -165,6 +166,8 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailS
 		selection: resolvedSelection,
 	};
 }
+
+export const CONVERSATION_SELECTION_STYLE = selectionBackground;
 
 export const TALL_GRAY_EDITOR_SURFACE_STYLE: RailSurfaceStyle = {
 	...style.surfaceLayout,

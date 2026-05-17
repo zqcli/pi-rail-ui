@@ -101,6 +101,82 @@ export function indexForVisualCol(text: string, targetCol: number): number {
 	return text.length;
 }
 
+type SgrState = {
+	bold: boolean;
+	dim: boolean;
+	italic: boolean;
+	underline: boolean;
+	inverse: boolean;
+	strikethrough: boolean;
+	foreground: string;
+	background: string;
+};
+
+const SGR_RE = /^\x1b\[([0-9;:]*)m$/;
+
+function emptySgrState(): SgrState {
+	return { bold: false, dim: false, italic: false, underline: false, inverse: false, strikethrough: false, foreground: "", background: "" };
+}
+
+function sgrParams(raw: string): number[] {
+	if (!raw) return [0];
+	const params = raw.split(/[;:]/u).map((part) => part === "" ? 0 : Number(part));
+	return params.every(Number.isFinite) ? params : [];
+}
+
+function updateSgrState(state: SgrState, ansi: string): void {
+	const match = SGR_RE.exec(ansi);
+	if (!match) return;
+
+	const params = sgrParams(match[1] ?? "");
+	for (let index = 0; index < params.length; index++) {
+		const code = params[index] ?? 0;
+		if (code === 0) {
+			Object.assign(state, emptySgrState());
+		} else if (code === 1) state.bold = true;
+		else if (code === 2) state.dim = true;
+		else if (code === 3) state.italic = true;
+		else if (code === 4) state.underline = true;
+		else if (code === 7) state.inverse = true;
+		else if (code === 9) state.strikethrough = true;
+		else if (code === 22) {
+			state.bold = false;
+			state.dim = false;
+		} else if (code === 23) state.italic = false;
+		else if (code === 24) state.underline = false;
+		else if (code === 27) state.inverse = false;
+		else if (code === 29) state.strikethrough = false;
+		else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) state.foreground = `\x1b[${code}m`;
+		else if (code === 39) state.foreground = "";
+		else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) state.background = `\x1b[${code}m`;
+		else if (code === 49) state.background = "";
+		else if ((code === 38 || code === 48) && params[index + 1] === 2 && params.length >= index + 5) {
+			const sequence = `\x1b[${code};2;${params[index + 2]};${params[index + 3]};${params[index + 4]}m`;
+			if (code === 38) state.foreground = sequence;
+			else state.background = sequence;
+			index += 4;
+		} else if ((code === 38 || code === 48) && params[index + 1] === 5 && params.length >= index + 3) {
+			const sequence = `\x1b[${code};5;${params[index + 2]}m`;
+			if (code === 38) state.foreground = sequence;
+			else state.background = sequence;
+			index += 2;
+		}
+	}
+}
+
+function activeSgrAnsi(state: SgrState): string {
+	return [
+		state.bold ? "\x1b[1m" : "",
+		state.dim ? "\x1b[2m" : "",
+		state.italic ? "\x1b[3m" : "",
+		state.underline ? "\x1b[4m" : "",
+		state.inverse ? "\x1b[7m" : "",
+		state.strikethrough ? "\x1b[9m" : "",
+		state.foreground,
+		state.background,
+	].join("");
+}
+
 export function applyColumnHighlight(
 	line: string,
 	startCol: number,
@@ -114,9 +190,10 @@ export function applyColumnHighlight(
 	let col = 0;
 	let i = 0;
 	let highlighted = false;
+	const sgrState = emptySgrState();
 	const setHighlighted = (next: boolean): void => {
 		if (highlighted === next) return;
-		out += next ? highlightAnsi : resetAnsi;
+		out += next ? highlightAnsi : resetAnsi + activeSgrAnsi(sgrState);
 		highlighted = next;
 	};
 
@@ -124,6 +201,7 @@ export function applyColumnHighlight(
 		const ansi = line.slice(i).match(ANSI_AT_RE)?.[0];
 		if (ansi) {
 			out += ansi;
+			updateSgrState(sgrState, ansi);
 			if (highlighted) out += highlightAnsi;
 			i += ansi.length;
 			continue;

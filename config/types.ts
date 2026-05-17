@@ -136,6 +136,7 @@ export type StyleFile = {
 		cwdMaxWidth: number;
 		modelMaxWidth: number;
 		branchMaxWidth: number;
+		bottomGapRows?: number;
 		colors: Record<"sky" | "mint" | "amber" | "lilac" | "text" | "muted", ColorSpec>;
 	};
 };
@@ -259,6 +260,7 @@ export type FooterLayout = {
 	cwdMaxWidth: number;
 	modelMaxWidth: number;
 	branchMaxWidth: number;
+	bottomGapRows: number;
 };
 
 export type ThemeLike = {

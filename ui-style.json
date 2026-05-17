@@ -145,6 +145,7 @@
     "cwdMaxWidth": 20,
     "modelMaxWidth": 24,
     "branchMaxWidth": 16,
+    "bottomGapRows": 1,
     "colors": {
       "sky": { "rgb": [125, 211, 252] },
       "mint": { "rgb": [134, 239, 172] },

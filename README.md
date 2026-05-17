@@ -82,6 +82,7 @@ The footer is customized to be visually lightweight:
 - No rail.
 - Compact session/context/model information.
 - Context percentage shown with two decimals.
+- Configurable blank rows below the footer via `footer.bottomGapRows`.
 
 ### 3. Scrollable Conversation History
 
@@ -327,6 +328,8 @@ Rail Overlay is the popup-menu counterpart to Rail Section. It reuses the same r
 ### `thinking`, `userMessage`, `slashCommand`, `footer`
 
 These legacy sections still control specialized details of the other major UI surfaces. For popup menus, `slashCommand` continues to provide menu-specific behavior such as selected text color, list column widths, max rows, and bottom spacing; `selectorOutput` provides the shared rail/background surface style.
+
+`footer.bottomGapRows` reserves blank terminal rows after the footer in app-level conversation viewport mode. The current config sets it to `1` so the footer sits one row above the terminal bottom; set it to `0` to restore the previous flush-bottom layout.
 
 ## Project Structure
 

@@ -338,4 +338,5 @@ export const FOOTER_LAYOUT: FooterLayout = {
 	cwdMaxWidth: style.footer.cwdMaxWidth,
 	modelMaxWidth: style.footer.modelMaxWidth,
 	branchMaxWidth: style.footer.branchMaxWidth,
+	bottomGapRows: Math.max(0, Math.round(style.footer.bottomGapRows ?? 0)),
 };

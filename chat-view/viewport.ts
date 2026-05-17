@@ -1,5 +1,5 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, TALL_GRAY_EDITOR_STYLE } from "../config";
+import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, FOOTER_LAYOUT, TALL_GRAY_EDITOR_STYLE } from "../config";
 import { restorePrototypePatches } from "../patching";
 import { applyColumnHighlight, clamp, padToWidth } from "../utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
@@ -108,7 +108,8 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 		const state = stateFor(tui, store);
 		const sections = getRenderedSections(children, width, state);
 		const { historyLines, pendingLines, statusLines, aboveLines, editorLines, belowLines, footerLines } = sections;
-		const fixedLines = [...pendingLines, ...statusLines, ...aboveLines, ...editorLines, ...belowLines, ...footerLines];
+		const footerBottomGapLines = Array.from({ length: FOOTER_LAYOUT.bottomGapRows }, () => "");
+		const fixedLines = [...pendingLines, ...statusLines, ...aboveLines, ...editorLines, ...belowLines, ...footerLines, ...footerBottomGapLines];
 		const terminalRows = Math.max(1, tui.terminal?.rows ?? 24);
 		const historyRows = Math.max(1, terminalRows - fixedLines.length);
 		const editorTopRow = historyRows + pendingLines.length + statusLines.length + aboveLines.length;

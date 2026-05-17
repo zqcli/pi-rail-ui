@@ -82,6 +82,7 @@ Footer 被设计为轻量样式：
 - 无 rail。
 - 紧凑显示 session/context/model 等信息。
 - Context 百分比保留两位小数。
+- 可通过 `footer.bottomGapRows` 配置 footer 下方的空白行数。
 
 ### 3. 可滚动聊天历史
 
@@ -327,6 +328,8 @@ Rail Overlay 是 Rail Section 在弹出菜单方向的对应抽象。slash autoc
 ### `thinking`、`userMessage`、`slashCommand`、`footer`
 
 这些旧区块仍然控制其它 UI surface 的专用细节。对于弹出菜单，`slashCommand` 继续提供 selected text、列表列宽、最大行数、底部间距等菜单行为配置；`selectorOutput` 提供共享 rail/background surface 样式。
+
+`footer.bottomGapRows` 会在 app-level conversation viewport 模式下为 footer 后方预留终端空白行。当前配置为 `1`，因此 footer 会位于终端底部上方一行；设为 `0` 可恢复之前贴底的布局。
 
 ## 项目结构
 

@@ -105,6 +105,8 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 		const historyRows = Math.max(1, terminalRows - fixedLines.length);
 		const editorTopRow = historyRows + pendingLines.length + statusLines.length + aboveLines.length;
 		const editorBottomRow = editorTopRow + editorLines.length;
+		const footerTopRow = editorBottomRow + belowLines.length;
+		const footerBottomRow = footerTopRow + footerLines.length;
 		const maxStart = Math.max(0, historyLines.length - historyRows);
 		let start: number;
 		if (state.lockedStart !== undefined) {
@@ -116,7 +118,7 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 		}
 
 		const scrollbar = getScrollbarMetrics(historyRows, historyLines.length, start, width);
-		state.view = { start, rows: historyRows, lineCount: historyLines.length, width, editorTopRow, editorBottomRow, scrollbar };
+		state.view = { start, rows: historyRows, lineCount: historyLines.length, width, editorTopRow, editorBottomRow, footerTopRow, footerBottomRow, scrollbar };
 		const selection = selectionRange(state.selection);
 		const historyWithScrollbar: string[] = [];
 		for (let index = 0; index < historyRows; index++) {

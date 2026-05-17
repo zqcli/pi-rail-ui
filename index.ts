@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { TallGrayInputEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays } from "./components/editor";
-import { createTallGrayFooter } from "./components/footer";
+import { createTallGrayFooter, setFooterExpanded } from "./components/footer";
 import { installCommandOutputGap, uninstallCommandOutputGap } from "./patches/command-output";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
 import { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, uninstallConversationScroll } from "./chat-view";
@@ -119,7 +119,8 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		if (event.reason === "reload") setFooterExpanded(false);
 		await install(ctx);
 	});
 

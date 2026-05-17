@@ -11,6 +11,8 @@ export type ScrollView = {
 	width: number;
 	editorTopRow: number;
 	editorBottomRow: number;
+	footerTopRow: number;
+	footerBottomRow: number;
 	scrollbar?: ScrollbarMetrics;
 };
 
@@ -32,6 +34,7 @@ export type ActiveInteraction =
 	| { type: "idle" }
 	| { type: "selecting" }
 	| { type: "scrollbarDrag"; pointerOffsetRows: number }
+	| { type: "footerClick"; x: number; y: number; moved: boolean }
 	| { type: "railSectionClick"; section: RailSectionDefinition; x: number; y: number; moved: boolean };
 
 export type ScrollAnimation = {

@@ -1,5 +1,6 @@
 import { TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { copyToClipboard } from "../clipboard";
+import { toggleFooterExpanded } from "../components/footer";
 import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE } from "../config";
 import {
 	canToggleRailSection,
@@ -411,6 +412,56 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 	return false;
 }
 
+function isOnFooter(view: ScrollView, mouse: ConversationMouse): boolean {
+	const row = mouse.y - 1;
+	return row >= view.footerTopRow && row < view.footerBottomRow;
+}
+
+function pointerMoved(click: { x: number; y: number }, x: number, y: number): boolean {
+	return click.x !== x || click.y !== y;
+}
+
+function handleFooterMouse(tui: any, data: string, store: ConversationScrollStore): boolean {
+	const mouse = parseConversationMouse(data);
+	if (!mouse || mouse.action === "copy") return false;
+
+	const state = stateFor(tui, store);
+	const view = state.view;
+	if (!view) {
+		if (mouse.action === "release" && state.interaction.type === "footerClick") state.interaction = { type: "idle" };
+		return false;
+	}
+
+	if (mouse.action === "press") {
+		if (!isOnFooter(view, mouse)) return false;
+		clearSelectionCopyTimer(state);
+		clearScrollAnimation(state, store);
+		state.selection = undefined;
+		state.interaction = { type: "footerClick", x: mouse.x, y: mouse.y, moved: false };
+		return true;
+	}
+
+	if (state.interaction.type !== "footerClick") return false;
+	const pending = state.interaction;
+
+	if (mouse.action === "drag") {
+		if (pointerMoved(pending, mouse.x, mouse.y)) pending.moved = true;
+		return true;
+	}
+
+	if (mouse.action === "release") {
+		state.interaction = { type: "idle" };
+		if (!pending.moved && !pointerMoved(pending, mouse.x, mouse.y) && isOnFooter(view, mouse)) {
+			toggleFooterExpanded();
+			state.preferCachedRender = true;
+			tui.requestRender?.();
+		}
+		return true;
+	}
+
+	return false;
+}
+
 function handleConversationScrollbarDrag(tui: any, data: string, store: ConversationScrollStore): boolean {
 	if (!CONVERSATION_SCROLLBAR_STYLE.dragEnabled) return false;
 	const mouse = parseConversationMouse(data);
@@ -532,6 +583,7 @@ export function handleConversationInput(tui: any, data: string, originalHandleIn
 	}
 
 	if (handleConversationScrollbarDrag(tui, data, store)) return;
+	if (handleFooterMouse(tui, data, store)) return;
 	if (handleRailSectionMouse(tui, data, store)) return;
 	if (handleConversationSelection(tui, data, store)) return;
 	const state = stateFor(tui, store);

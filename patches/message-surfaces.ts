@@ -51,6 +51,7 @@ type ThinkingSurfacePatchStore = {
 
 const ASSISTANT_THINKING_EXPANDED_KEY = Symbol.for("pi-rail-ui.assistant-thinking-expanded");
 const ASSISTANT_THINKING_MANUAL_KEY = Symbol.for("pi-rail-ui.assistant-thinking-manual");
+const ASSISTANT_THINKING_BLOCKS_KEY = Symbol.for("pi-rail-ui.assistant-thinking-blocks");
 const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
 const USER_MESSAGE_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.user-message-render-cache");
 
@@ -96,26 +97,42 @@ class AssistantThinkingRailBlock implements Component {
 	private autoSetting = false;
 	private fullCache?: { width: number; rows: string[] };
 	private collapsedCache?: { width: number; limit: number; rows: string[] };
-	private readonly rawText: string;
-	private readonly rawLines: string[];
-	private readonly hidden: boolean;
-	private readonly markdownTheme: ConstructorParameters<typeof Markdown>[3];
-	private readonly hiddenLabel: string;
+	private inner: Component;
+	private surface: EditorSurfaceRenderer;
+	private appTheme: Theme;
+	private rawText = "";
+	private rawLines: string[] = [];
+	private hidden = false;
+	private markdownTheme: ConstructorParameters<typeof Markdown>[3];
+	private hiddenLabel = "";
 
 	constructor(
-		private readonly inner: Component,
-		private readonly surface: EditorSurfaceRenderer,
+		inner: Component,
+		surface: EditorSurfaceRenderer,
 		private readonly owner: any,
-		private readonly appTheme: Theme,
+		appTheme: Theme,
 		options: AssistantThinkingRailOptions,
 	) {
+		this.inner = inner;
+		this.surface = surface;
+		this.appTheme = appTheme;
+		this.markdownTheme = options.markdownTheme;
+		this.update(inner, surface, appTheme, options);
+		defineRailSection(this, "assistantThinking");
+		if (owner?.[ASSISTANT_THINKING_MANUAL_KEY] === true) this.expanded = owner[ASSISTANT_THINKING_EXPANDED_KEY] !== false;
+	}
+
+	update(inner: Component, surface: EditorSurfaceRenderer, appTheme: Theme, options: AssistantThinkingRailOptions): void {
+		this.inner = inner;
+		this.surface = surface;
+		this.appTheme = appTheme;
 		this.rawText = options.rawText.trim();
 		this.rawLines = this.rawText ? this.rawText.split(/\r?\n/u) : [];
 		this.hidden = options.hidden;
 		this.markdownTheme = options.markdownTheme;
 		this.hiddenLabel = options.hiddenLabel;
-		defineRailSection(this, "assistantThinking");
-		if (owner?.[ASSISTANT_THINKING_MANUAL_KEY] === true) this.expanded = owner[ASSISTANT_THINKING_EXPANDED_KEY] !== false;
+		if (this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] === true) this.expanded = this.owner[ASSISTANT_THINKING_EXPANDED_KEY] !== false;
+		this.invalidate();
 	}
 
 	setExpanded(expanded: boolean): void {
@@ -177,6 +194,30 @@ class AssistantThinkingRailBlock implements Component {
 	}
 }
 
+function assistantThinkingBlocks(component: AssistantMessageWithInternals): AssistantThinkingRailBlock[] {
+	return ((component as any)[ASSISTANT_THINKING_BLOCKS_KEY] ??= []) as AssistantThinkingRailBlock[];
+}
+
+function assistantThinkingBlockFor(
+	component: AssistantMessageWithInternals,
+	index: number,
+	inner: Component,
+	surface: EditorSurfaceRenderer,
+	appTheme: Theme,
+	options: AssistantThinkingRailOptions,
+): AssistantThinkingRailBlock {
+	const blocks = assistantThinkingBlocks(component);
+	let block = blocks[index];
+	if (block) block.update(inner, surface, appTheme, options);
+	else block = blocks[index] = new AssistantThinkingRailBlock(inner, surface, component, appTheme, options);
+	return block;
+}
+
+function trimAssistantThinkingBlocks(component: AssistantMessageWithInternals, count: number): void {
+	const blocks = (component as any)[ASSISTANT_THINKING_BLOCKS_KEY] as AssistantThinkingRailBlock[] | undefined;
+	if (blocks) blocks.length = count;
+}
+
 function updateAssistantMessageWithThinkingSurface(
 	component: AssistantMessageWithInternals,
 	message: any,
@@ -190,6 +231,7 @@ function updateAssistantMessageWithThinkingSurface(
 	const hasVisibleAfter = visibleAssistantSuffixMap(content);
 	if (hasVisibleAfter[0]) component.contentContainer.addChild(new Spacer(1));
 
+	let thinkingIndex = 0;
 	for (let i = 0; i < content.length; i++) {
 		const part = content[i];
 		if (part?.type === "text" && part.text?.trim()) {
@@ -202,7 +244,7 @@ function updateAssistantMessageWithThinkingSurface(
 			const inner = hidden
 				? makeHiddenThinkingLabel(component.hiddenThinkingLabel, appTheme)
 				: makeThinkingMarkdown(part.thinking, component.markdownTheme, appTheme);
-			component.contentContainer.addChild(new AssistantThinkingRailBlock(inner, surface, component, appTheme, {
+			component.contentContainer.addChild(assistantThinkingBlockFor(component, thinkingIndex++, inner, surface, appTheme, {
 				rawText: part.thinking,
 				markdownTheme: component.markdownTheme,
 				hidden,
@@ -211,6 +253,7 @@ function updateAssistantMessageWithThinkingSurface(
 			if (hasVisibleContentAfter) component.contentContainer.addChild(new Spacer(1));
 		}
 	}
+	trimAssistantThinkingBlocks(component, thinkingIndex);
 
 	const hasToolCalls = content.some((part) => part?.type === "toolCall");
 	component.hasToolCalls = hasToolCalls;

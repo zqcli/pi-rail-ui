@@ -1,0 +1,156 @@
+{
+  "surfaceLayout": {
+    "leftWindowGapWidth": 2,
+    "leftBorder": "▎",
+    "leftBorderWidth": 1,
+    "borderContentGapWidth": 0,
+    "reset": "\u001b[0m"
+  },
+  "editor": {
+    "height": {
+      "min": 4,
+      "max": 12,
+      "maxRatio": 0.32
+    },
+    "background": { "rgb": [48, 50, 56] },
+    "rail": { "rgb": [147, 197, 253] },
+    "selection": {
+      "background": { "rgb": [76, 91, 112] },
+      "foreground": { "rgb": [248, 250, 252] }
+    },
+    "pasteMarker": {
+      "background": { "rgb": [64, 70, 84] },
+      "foreground": "editor.rail",
+      "bold": true
+    },
+    "mouseTracking": {
+      "enabled": false
+    }
+  },
+  "conversationScroll": {
+    "mode": "app",
+    "enabled": true,
+    "wheelStepRows": 3,
+    "performance": {
+      "historyTailRenderWindow": 4
+    },
+    "scrollbar": {
+      "visible": true,
+      "dragEnabled": true,
+      "trackBackground": "editor.background",
+      "thumbBackground": { "rgb": [96, 165, 250] },
+      "widthMultiplier": 1,
+      "dragAnimationMs": 90
+    }
+  },
+  "thinking": {
+    "background": "transparent",
+    "rail": "theme:thinkingText"
+  },
+  "assistantReply": {
+    "alignSurface": "thinking"
+  },
+  "userMessage": {
+    "background": "editor.background",
+    "rail": "editor.rail",
+    "textGapWidth": 1,
+    "verticalPaddingRows": 1,
+    "timestampColor": "theme:thinkingText"
+  },
+  "slashCommand": {
+    "background": "editor.background",
+    "rail": "theme:thinkingText",
+    "selectedText": "editor.rail",
+    "textGapWidth": 1,
+    "bottomReservedRows": 1,
+    "firstLevelHeightMultiplier": 2,
+    "nestedMaxOverlayRows": 6,
+    "minPrimaryColumnWidth": 12,
+    "maxPrimaryColumnWidth": 32
+  },
+  "bashExecution": {
+    "background": { "rgb": [38, 43, 52] },
+    "rail": "theme:bashMode",
+    "leftBorder": "▎",
+    "borderContentGapWidth": 0,
+    "verticalSpacingRows": 1
+  },
+  "railSections": {
+    "defaults": {
+      "selectable": true,
+      "collapsible": false,
+      "clickToToggle": false,
+      "preserveScrollOnToggle": true,
+      "preserveScrollOnUpdate": true,
+      "autoCollapseAfterRows": false,
+      "layout": {
+        "leftWindowGapWidth": 2,
+        "leftBorder": "▎",
+        "leftBorderWidth": 1,
+        "borderContentGapWidth": 0,
+        "verticalSpacingRows": 0,
+        "spacing": {
+          "beforeRows": 0,
+          "afterRows": 0,
+          "collapseAdjacent": true,
+          "scope": "section"
+        }
+      },
+      "style": {
+        "background": "transparent",
+        "rail": "transparent"
+      },
+      "selection": {
+        "mode": "contentOnly",
+        "stripAnsi": true,
+        "trimRight": true,
+        "includeRail": false,
+        "includeGap": false,
+        "includeLeadingBlankRows": false,
+        "includeTrailingBlankRows": false
+      }
+    },
+    "sections": {
+      "assistantMessage": { "layout": { "alignWith": "assistantThinking" } },
+      "assistantThinking": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "style": { "background": "transparent", "rail": "theme:thinkingText" } },
+      "assistantReply": { "layout": { "alignWith": "assistantThinking" }, "style": { "background": "transparent", "rail": false } },
+      "userMessage": { "style": { "background": "editor.background", "rail": "editor.rail" }, "selection": { "includeTimestamp": true } },
+      "toolExecution": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "style": { "background": "transparent", "rail": false } },
+      "bashExecution": {
+        "collapsible": true,
+        "clickToToggle": true,
+        "autoCollapseAfterRows": 20,
+        "style": { "background": { "rgb": [38, 43, 52] }, "rail": "theme:bashMode" },
+        "layout": {
+          "leftBorder": "▎",
+          "borderContentGapWidth": 0,
+          "verticalSpacingRows": 1,
+          "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "section" }
+        }
+      },
+      "commandOutput": {
+        "style": { "background": "transparent", "rail": false },
+        "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
+      },
+      "resourceStatus": {
+        "style": { "background": "transparent", "rail": false },
+        "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
+      },
+      "selectorOutput": { "selectable": false, "style": { "background": "editor.background", "rail": "theme:thinkingText" } },
+      "custom": { "style": { "background": "transparent", "rail": false } }
+    }
+  },
+  "footer": {
+    "cwdMaxWidth": 20,
+    "modelMaxWidth": 24,
+    "branchMaxWidth": 16,
+    "colors": {
+      "sky": { "rgb": [125, 211, 252] },
+      "mint": { "rgb": [134, 239, 172] },
+      "amber": { "rgb": [251, 191, 36] },
+      "lilac": { "rgb": [196, 181, 253] },
+      "text": { "rgb": [238, 242, 255] },
+      "muted": { "rgb": [148, 163, 184] }
+    }
+  }
+}

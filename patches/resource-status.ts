@@ -1,0 +1,160 @@
+import { InteractiveMode } from "@earendil-works/pi-coding-agent";
+import { isGapBlock, isLeftGapBlock, LeftGapBlock, unwrapGapBlock } from "../ui/gap";
+import { restorePrototypePatches, resolveNativePiExport, type PrototypePatchTarget } from "../patching";
+import { RailSectionBlock } from "../ui/rail-section";
+
+type InteractiveModeCtor = { prototype: any };
+
+type ResourceStatusGapPatchStore = {
+	active: boolean;
+	targets: PrototypePatchTarget[];
+};
+
+const RESOURCE_STATUS_GAP_PATCH_KEY = Symbol.for("pi-rail-ui.resource-status-gap-patch");
+const STATUS_ORIGINAL_PADDING_X_KEY = Symbol.for("pi-rail-ui.status-original-padding-x");
+
+function getResourceStatusGapPatchStore(): ResourceStatusGapPatchStore {
+	const globalStore = globalThis as typeof globalThis & { [RESOURCE_STATUS_GAP_PATCH_KEY]?: Partial<ResourceStatusGapPatchStore> };
+	const store = globalStore[RESOURCE_STATUS_GAP_PATCH_KEY] ?? {};
+	store.active ??= false;
+	store.targets ??= [];
+	globalStore[RESOURCE_STATUS_GAP_PATCH_KEY] = store;
+	return store as ResourceStatusGapPatchStore;
+}
+
+function shouldGapResourceChild(child: any): boolean {
+	return Boolean(child && typeof child.render === "function" && child.constructor?.name !== "Spacer" && !isGapBlock(child));
+}
+
+function leftGapBlock(child: any): LeftGapBlock {
+	return new RailSectionBlock(child, "resourceStatus");
+}
+
+function withGappedResourceChildren<T>(mode: any, renderResources: () => T): T {
+	const chatContainer = mode?.chatContainer;
+	const originalAddChild = chatContainer?.addChild;
+	if (typeof originalAddChild !== "function") return renderResources();
+
+	chatContainer.addChild = function patchedResourceAddChild(this: any, child: any) {
+		return originalAddChild.call(this, shouldGapResourceChild(child) ? leftGapBlock(child) : child);
+	};
+	try {
+		return renderResources();
+	} finally {
+		chatContainer.addChild = originalAddChild;
+	}
+}
+
+function normalizeStatusPaddingForGap(statusText: any): void {
+	if (typeof statusText?.paddingX !== "number") return;
+	if (statusText[STATUS_ORIGINAL_PADDING_X_KEY] === undefined) {
+		statusText[STATUS_ORIGINAL_PADDING_X_KEY] = statusText.paddingX;
+	}
+	if (statusText.paddingX !== 0) {
+		statusText.paddingX = 0;
+		statusText.invalidate?.();
+	}
+}
+
+function wrapLastStatusLine(mode: any): void {
+	const children = mode?.chatContainer?.children;
+	if (!Array.isArray(children) || children.length === 0) return;
+
+	const lastIndex = children.length - 1;
+	const last = children[lastIndex];
+	if (isGapBlock(last)) {
+		const inner = unwrapGapBlock(last);
+		normalizeStatusPaddingForGap(inner);
+		if (isLeftGapBlock(last)) {
+			mode.lastStatusText = last;
+			return;
+		}
+		const wrapped = leftGapBlock(inner);
+		children[lastIndex] = wrapped;
+		mode.lastStatusText = wrapped;
+		return;
+	}
+	if (!shouldGapResourceChild(last)) return;
+
+	normalizeStatusPaddingForGap(last);
+	const wrapped = leftGapBlock(last);
+	children[lastIndex] = wrapped;
+	if (mode.lastStatusText === last) mode.lastStatusText = wrapped;
+}
+
+function wrapLastCommandOutputChild(mode: any): void {
+	const children = mode?.chatContainer?.children;
+	if (!Array.isArray(children) || children.length === 0) return;
+
+	const lastIndex = children.length - 1;
+	const last = children[lastIndex];
+	if (isGapBlock(last)) {
+		const inner = unwrapGapBlock(last);
+		normalizeStatusPaddingForGap(inner);
+		if (!isLeftGapBlock(last)) children[lastIndex] = leftGapBlock(inner);
+		return;
+	}
+	if (!shouldGapResourceChild(last)) return;
+	normalizeStatusPaddingForGap(last);
+	children[lastIndex] = leftGapBlock(last);
+}
+
+async function getInteractiveModeConstructors(): Promise<InteractiveModeCtor[]> {
+	const ctors: InteractiveModeCtor[] = [InteractiveMode as unknown as InteractiveModeCtor];
+	const nativeCtor = await resolveNativePiExport<InteractiveModeCtor>("./modes/interactive/interactive-mode.js", "InteractiveMode");
+	if (nativeCtor && !ctors.includes(nativeCtor)) ctors.push(nativeCtor);
+	return ctors;
+}
+
+function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusGapPatchStore): void {
+	if (!ctor?.prototype) return;
+
+	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showLoadedResources")) {
+		const original = ctor.prototype.showLoadedResources;
+		ctor.prototype.showLoadedResources = function patchedShowLoadedResources(this: any, options: any) {
+			const currentStore = getResourceStatusGapPatchStore();
+			if (!currentStore.active || typeof original !== "function") return original?.call(this, options);
+			return withGappedResourceChildren(this, () => original.call(this, options));
+		};
+		store.targets.push({ ctor, methodName: "showLoadedResources", original });
+	}
+
+	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showStatus")) {
+		const original = ctor.prototype.showStatus;
+		ctor.prototype.showStatus = function patchedShowStatus(this: any, message: string) {
+			const currentStore = getResourceStatusGapPatchStore();
+			if (!currentStore.active || typeof original !== "function") return original?.call(this, message);
+
+			const result = original.call(this, message);
+			wrapLastStatusLine(this);
+			return result;
+		};
+		store.targets.push({ ctor, methodName: "showStatus", original });
+	}
+
+	for (const methodName of ["showError", "showWarning"] as const) {
+		if (store.targets.some((target) => target.ctor === ctor && target.methodName === methodName)) continue;
+		const original = ctor.prototype[methodName];
+		ctor.prototype[methodName] = function patchedCommandStatusOutput(this: any, message: string) {
+			const currentStore = getResourceStatusGapPatchStore();
+			if (!currentStore.active || typeof original !== "function") return original?.call(this, message);
+
+			const result = original.call(this, message);
+			wrapLastCommandOutputChild(this);
+			return result;
+		};
+		store.targets.push({ ctor, methodName, original });
+	}
+}
+
+export async function installResourceStatusGap(): Promise<void> {
+	const store = getResourceStatusGapPatchStore();
+	store.active = true;
+	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor, store);
+}
+
+export function uninstallResourceStatusGap(): void {
+	const store = getResourceStatusGapPatchStore();
+	store.active = false;
+	restorePrototypePatches(store.targets);
+}

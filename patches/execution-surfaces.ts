@@ -1,8 +1,8 @@
-import { BashExecutionComponent, ToolExecutionComponent, keyHint, truncateToVisualLines } from "@earendil-works/pi-coding-agent";
+import { BashExecutionComponent, ToolExecutionComponent, truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import { railSectionConfig, type ThemeLike } from "../config";
 import { renderLinesWithGap } from "../ui/gap";
-import { restorePrototypePatches, resolveNativePiExport, type PrototypePatchTarget } from "../patching";
-import { markRailSectionManuallyToggled, wasRailSectionManuallyToggled } from "../ui/rail-section";
+import { createStore, restorePrototypePatches, resolveNativePiExport, type PrototypePatchTarget } from "../patching";
+import { collapseHint, markRailSectionManuallyToggled, wasRailSectionManuallyToggled } from "../ui/rail-section";
 import { bashExecutionSurfaceForTheme } from "../ui/rail-surface";
 import { padToWidth, stripAnsi } from "../utils";
 
@@ -14,22 +14,16 @@ type ToolExecutionGapPatchStore = {
 	theme?: ThemeLike;
 };
 
-const TOOL_EXECUTION_GAP_PATCH_KEY = Symbol.for("pi-rail-ui.tool-execution-gap-patch");
+const getToolExecutionGapPatchStore = createStore<ToolExecutionGapPatchStore>("tool-execution-gap-patch", () => ({
+	active: false,
+	targets: [],
+}));
 const BASH_PREVIEW_LINES = 20;
 const AUTO_COLLAPSE_RENDERING_KEY = Symbol.for("pi-rail-ui.execution-auto-collapse-rendering");
 const EXECUTION_RENDERED_KEY = Symbol.for("pi-rail-ui.execution-rendered");
 const BASH_SURFACE_CACHE_KEY = Symbol.for("pi-rail-ui.bash-surface-cache");
 const TOOL_GAP_CACHE_KEY = Symbol.for("pi-rail-ui.tool-gap-cache");
 const AUTO_COLLAPSE_SIGNATURE_KEY = Symbol.for("pi-rail-ui.execution-auto-collapse-signature");
-
-function getToolExecutionGapPatchStore(): ToolExecutionGapPatchStore {
-	const globalStore = globalThis as typeof globalThis & { [TOOL_EXECUTION_GAP_PATCH_KEY]?: Partial<ToolExecutionGapPatchStore> };
-	const store = globalStore[TOOL_EXECUTION_GAP_PATCH_KEY] ?? {};
-	store.active ??= false;
-	store.targets ??= [];
-	globalStore[TOOL_EXECUTION_GAP_PATCH_KEY] = store;
-	return store as ToolExecutionGapPatchStore;
-}
 
 function isBashExecution(component: any): boolean {
 	return component?.constructor?.name === "BashExecutionComponent" || typeof component?.getCommand === "function";
@@ -110,15 +104,6 @@ function fg(theme: ThemeLike | undefined, color: string, value: string): string 
 	}
 }
 
-function collapseHint(theme: ThemeLike | undefined, hiddenLineCount: number): string {
-	const prefix = fg(theme, "muted", `... (${Math.max(0, hiddenLineCount)} earlier lines,`);
-	try {
-		return `${prefix} ${keyHint("app.tools.expand", "to expand")})`;
-	} catch {
-		return `${prefix} ctrl+o to expand)`;
-	}
-}
-
 function applyToolHintBackground(component: any, hint: string, width: number): string {
 	const bg = component?.contentText?.customBgFn;
 	return typeof bg === "function" ? bg(padToWidth(hint, width)) : hint;
@@ -144,6 +129,8 @@ function estimatedExpandedRows(component: any, kind: "bashExecution" | "toolExec
 		const statusRows = component.status === "running" ? 1 : 1;
 		return Math.max(1, commandRows) + bashOutputLines(component).length + statusRows;
 	}
+
+	if (component?.hasRendererDefinition?.() === true) return undefined;
 
 	try {
 		const argsRows = component.args === undefined ? 0 : lineCount(JSON.stringify(component.args, null, 2));
@@ -181,6 +168,13 @@ function withTemporaryExpanded<T>(component: any, expanded: boolean, render: () 
 	}
 }
 
+function shouldCollapseByDefault(component: any, kind: "bashExecution" | "toolExecution"): boolean {
+	const names = railSectionConfig(kind).collapseByDefault;
+	if (!names?.length) return false;
+	const name = typeof component?.toolName === "string" ? component.toolName : undefined;
+	return name !== undefined && names.includes(name);
+}
+
 function applyDefaultAutoCollapse(
 	component: any,
 	kind: "bashExecution" | "toolExecution",
@@ -189,9 +183,11 @@ function applyDefaultAutoCollapse(
 	if (component?.[AUTO_COLLAPSE_RENDERING_KEY] || wasRailSectionManuallyToggled(component)) return;
 	const config = railSectionConfig(kind);
 	const limit = config.collapsible ? config.autoCollapseAfterRows : undefined;
-	if (!limit || typeof component?.setExpanded !== "function") return;
+	const forceCollapse = shouldCollapseByDefault(component, kind);
+	if (!limit && !forceCollapse) return;
+	if (typeof component?.setExpanded !== "function") return;
 
-	const signature = autoCollapseSignature(component, kind, limit);
+	const signature = autoCollapseSignature(component, kind, limit ?? 0);
 	const previousAuto = component[AUTO_COLLAPSE_SIGNATURE_KEY] as { signature?: string; result?: any; args?: any } | undefined;
 	if (signature && previousAuto?.signature === signature && previousAuto.result === component.result && previousAuto.args === component.args) return;
 
@@ -199,7 +195,7 @@ function applyDefaultAutoCollapse(
 	if (estimatedRows !== undefined) {
 		component[AUTO_COLLAPSE_RENDERING_KEY] = true;
 		try {
-			const shouldExpand = estimatedRows <= limit;
+			const shouldExpand = !forceCollapse && limit !== undefined && estimatedRows <= limit;
 			if (Boolean(component.expanded) !== shouldExpand) component.setExpanded(shouldExpand);
 			if (signature) component[AUTO_COLLAPSE_SIGNATURE_KEY] = { signature, result: component.result, args: component.args };
 		} finally {
@@ -211,7 +207,7 @@ function applyDefaultAutoCollapse(
 	component[AUTO_COLLAPSE_RENDERING_KEY] = true;
 	try {
 		const expandedRows = withTemporaryExpanded(component, true, renderExpandedRows);
-		const shouldExpand = expandedRows.length <= limit;
+		const shouldExpand = !forceCollapse && limit !== undefined && expandedRows.length <= limit;
 		if (Boolean(component.expanded) !== shouldExpand) component.setExpanded(shouldExpand);
 		if (signature) component[AUTO_COLLAPSE_SIGNATURE_KEY] = { signature, result: component.result, args: component.args };
 	} finally {

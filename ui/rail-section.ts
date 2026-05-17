@@ -1,9 +1,11 @@
 import type { Component } from "@earendil-works/pi-tui";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import {
 	railSectionConfig,
 	TALL_GRAY_EDITOR_STYLE,
 	type RailSectionKind,
 	type RailSectionResolvedConfig,
+	type ThemeLike,
 } from "../config";
 import { LeftGapBlock, isGapBlock, unwrapGapBlock } from "./gap";
 import { padToWidth, stripAnsi, type Position } from "../utils";
@@ -195,6 +197,16 @@ export function setCollapsibleRailSectionsExpanded(root: any, expanded: boolean,
 	if (isGapBlock(root)) count += setCollapsibleRailSectionsExpanded(unwrapGapBlock(root as Component), expanded, seen);
 	for (const child of railSectionChildren(root)) count += setCollapsibleRailSectionsExpanded(child, expanded, seen);
 	return count;
+}
+
+export function collapseHint(theme: ThemeLike | undefined, hiddenLineCount: number): string {
+	const prefix = theme ? theme.fg("muted", `... (${Math.max(0, hiddenLineCount)} earlier lines,`) : `... (${Math.max(0, hiddenLineCount)} earlier lines,`;
+	try {
+		return `${prefix} ${keyHint("app.tools.expand", "to expand")})`;
+	} catch {
+		const fallback = theme ? `${theme.fg("dim", "ctrl+o")}${theme.fg("muted", " to expand")}` : "ctrl+o to expand";
+		return `${prefix} ${fallback})`;
+	}
 }
 
 export class RailSectionBlock extends LeftGapBlock {

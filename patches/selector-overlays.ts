@@ -6,7 +6,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
 import { SLASH_COMMAND_LAYOUT, TALL_GRAY_EDITOR_HEIGHT, applyTextColor, type ThemeLike } from "../config";
-import { resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../patching";
+import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../patching";
 import { RailOverlayPanel, renderRailOverlayRows, type RailOverlayBodyRenderer } from "../ui/rail-overlay";
 import { selectorOutputSurfaceForTheme, tallGraySelectorOutputSurface, type EditorSurfaceRenderer } from "../ui/rail-surface";
 
@@ -20,18 +20,13 @@ type SettingsMenuPatchStore = {
 	surface: EditorSurfaceRenderer;
 };
 
-const SETTINGS_MENU_PATCH_KEY = Symbol.for("pi-rail-ui.settings-menu-patch");
 const SELECTOR_SURFACE_CACHE_KEY = Symbol.for("pi-rail-ui.selector-surface-cache");
 
-function getSettingsMenuPatchStore(): SettingsMenuPatchStore {
-	const globalStore = globalThis as typeof globalThis & { [SETTINGS_MENU_PATCH_KEY]?: Partial<SettingsMenuPatchStore> };
-	const store = globalStore[SETTINGS_MENU_PATCH_KEY] ?? {};
-	store.targets ??= [];
-	store.handles ??= new Set<OverlayHandle>();
-	store.surface ??= tallGraySelectorOutputSurface;
-	globalStore[SETTINGS_MENU_PATCH_KEY] = store;
-	return store as SettingsMenuPatchStore;
-}
+const getSettingsMenuPatchStore = createStore<SettingsMenuPatchStore>("settings-menu-patch", () => ({
+	targets: [],
+	handles: new Set<OverlayHandle>(),
+	surface: tallGraySelectorOutputSurface,
+}));
 
 function themeFg(theme: ThemeLike | undefined, name: string, text: string): string {
 	return theme ? theme.fg(name, text) : text;

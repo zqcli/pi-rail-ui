@@ -1,7 +1,7 @@
 import { TUI } from "@earendil-works/pi-tui";
 import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, TALL_GRAY_EDITOR_STYLE } from "../config";
 import { restorePrototypePatches } from "../patching";
-import { applyColumnHighlight, padToWidth } from "../utils";
+import { applyColumnHighlight, clamp, padToWidth } from "../utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
 import { handleConversationInput, selectionRange } from "./interactions";
 import {
@@ -20,10 +20,6 @@ async function resolveNativeTuiExport<T>(exportName: string): Promise<T | undefi
 	} catch {
 		return undefined;
 	}
-}
-
-function clamp(value: number, min: number, max: number): number {
-	return Math.max(min, Math.min(max, value));
 }
 
 function getScrollbarMetrics(visibleRows: number, totalRows: number, start: number, width: number): ScrollbarMetrics | undefined {

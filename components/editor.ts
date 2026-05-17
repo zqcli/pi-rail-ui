@@ -6,11 +6,13 @@ import { selectorOutputSurfaceForTheme, tallGrayEditorSurface, type EditorSurfac
 import {
 	CURSOR_POSITION_RE,
 	SGR_MOUSE_RE,
+	segmenter,
 	wrapLine,
 	clampPosition,
 	comparePosition,
 	indexForVisualCol,
 	padToWidth,
+	parseWheel,
 	samePosition,
 	visibleColForIndex,
 	type ColumnRange,
@@ -22,24 +24,9 @@ import {
 
 const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1002l\x1b[?1006l";
+const ENTER_ALT_SCREEN = "\x1b[?1049h";
+const EXIT_ALT_SCREEN = "\x1b[?1049l";
 const PASTE_MARKER_RE = /\[paste #\d+(?: (?:\+\d+ lines|\d+ chars))?\]/g;
-const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-
-type ParsedWheel = { direction: 1 | -1 };
-
-function parseWheel(data: string): ParsedWheel | undefined {
-	const match = SGR_MOUSE_RE.exec(data);
-	if (!match) return undefined;
-
-	const code = Number(match[1]);
-	const final = match[4];
-	if (!Number.isFinite(code) || final !== "M" || (code & 64) === 0) return undefined;
-
-	const wheelButton = code & 3;
-	if (wheelButton === 0) return { direction: 1 };
-	if (wheelButton === 1) return { direction: -1 };
-	return undefined;
-}
 
 function parseMouse(data: string): ParsedMouse | undefined {
 	const match = SGR_MOUSE_RE.exec(data);
@@ -76,6 +63,14 @@ export function enableMouseTracking(): void {
 
 export function disableMouseTracking(): void {
 	if (process.stdout.isTTY) process.stdout.write(DISABLE_MOUSE);
+}
+
+export function enterAlternateScreen(): void {
+	if (process.stdout.isTTY) process.stdout.write(ENTER_ALT_SCREEN);
+}
+
+export function exitAlternateScreen(): void {
+	if (process.stdout.isTTY) process.stdout.write(EXIT_ALT_SCREEN);
 }
 
 export class MouseSelectableCustomEditor extends CustomEditor {

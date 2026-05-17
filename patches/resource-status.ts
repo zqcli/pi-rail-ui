@@ -1,6 +1,5 @@
-import { InteractiveMode } from "@earendil-works/pi-coding-agent";
 import { isGapBlock, isLeftGapBlock, LeftGapBlock, unwrapGapBlock } from "../ui/gap";
-import { restorePrototypePatches, resolveNativePiExport, type PrototypePatchTarget } from "../patching";
+import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../patching";
 import { RailSectionBlock } from "../ui/rail-section";
 
 type InteractiveModeCtor = { prototype: any };
@@ -10,17 +9,12 @@ type ResourceStatusGapPatchStore = {
 	targets: PrototypePatchTarget[];
 };
 
-const RESOURCE_STATUS_GAP_PATCH_KEY = Symbol.for("pi-rail-ui.resource-status-gap-patch");
-const STATUS_ORIGINAL_PADDING_X_KEY = Symbol.for("pi-rail-ui.status-original-padding-x");
+const getResourceStatusGapPatchStore = createStore<ResourceStatusGapPatchStore>("resource-status-gap-patch", () => ({
+	active: false,
+	targets: [],
+}));
 
-function getResourceStatusGapPatchStore(): ResourceStatusGapPatchStore {
-	const globalStore = globalThis as typeof globalThis & { [RESOURCE_STATUS_GAP_PATCH_KEY]?: Partial<ResourceStatusGapPatchStore> };
-	const store = globalStore[RESOURCE_STATUS_GAP_PATCH_KEY] ?? {};
-	store.active ??= false;
-	store.targets ??= [];
-	globalStore[RESOURCE_STATUS_GAP_PATCH_KEY] = store;
-	return store as ResourceStatusGapPatchStore;
-}
+const STATUS_ORIGINAL_PADDING_X_KEY = Symbol.for("pi-rail-ui.status-original-padding-x");
 
 function shouldGapResourceChild(child: any): boolean {
 	return Boolean(child && typeof child.render === "function" && child.constructor?.name !== "Spacer" && !isGapBlock(child));
@@ -97,13 +91,6 @@ function wrapLastCommandOutputChild(mode: any): void {
 	if (!shouldGapResourceChild(last)) return;
 	normalizeStatusPaddingForGap(last);
 	children[lastIndex] = leftGapBlock(last);
-}
-
-async function getInteractiveModeConstructors(): Promise<InteractiveModeCtor[]> {
-	const ctors: InteractiveModeCtor[] = [InteractiveMode as unknown as InteractiveModeCtor];
-	const nativeCtor = await resolveNativePiExport<InteractiveModeCtor>("./modes/interactive/interactive-mode.js", "InteractiveMode");
-	if (nativeCtor && !ctors.includes(nativeCtor)) ctors.push(nativeCtor);
-	return ctors;
 }
 
 function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusGapPatchStore): void {

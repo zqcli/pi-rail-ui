@@ -30,6 +30,7 @@
   "conversationScroll": {
     "mode": "app",
     "enabled": true,
+    "alternateScreen": true,
     "wheelStepRows": 3,
     "performance": {
       "historyTailRenderWindow": 4
@@ -115,7 +116,7 @@
       "assistantThinking": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "style": { "background": "transparent", "rail": "theme:thinkingText" } },
       "assistantReply": { "layout": { "alignWith": "assistantThinking" }, "style": { "background": "transparent", "rail": false } },
       "userMessage": { "style": { "background": "editor.background", "rail": "editor.rail" }, "selection": { "includeTimestamp": true } },
-      "toolExecution": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "style": { "background": "transparent", "rail": false } },
+      "toolExecution": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "collapseByDefault": ["write"], "style": { "background": "transparent", "rail": false } },
       "bashExecution": {
         "collapsible": true,
         "clickToToggle": true,

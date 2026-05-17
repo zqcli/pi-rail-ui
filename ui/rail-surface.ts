@@ -39,7 +39,9 @@ export class EditorSurfaceRenderer {
 	private readonly leftMargin: string;
 	private readonly transparentGap: string;
 	private readonly completionPrefix: string;
-	private readonly rowCache = new Map<string, string>();
+	private readonly _rowPrefix: string;
+	private readonly _rowSuffix: string;
+	private rowCache = new Map<string, string>();
 
 	constructor(
 		style: RailSurfaceStyle = TALL_GRAY_EDITOR_STYLE,
@@ -50,6 +52,8 @@ export class EditorSurfaceRenderer {
 		this.leftMargin = " ".repeat(style.leftWindowGapWidth);
 		this.transparentGap = " ".repeat(style.borderContentGapWidth);
 		this.completionPrefix = " ".repeat(this.contentStart);
+		this._rowPrefix = `${this.leftMargin}${style.rail}${style.leftBorder}${style.reset}${this.transparentGap}${style.background}`;
+		this._rowSuffix = style.reset;
 	}
 
 	minRenderableWidth(): number {
@@ -79,8 +83,11 @@ export class EditorSurfaceRenderer {
 		const contentWidth = visibleWidth(content);
 		const rawFitted = contentWidth <= targetWidth ? content + " ".repeat(targetWidth - contentWidth) : padToWidth(content, targetWidth);
 		const fitted = this.restoreSurfaceAfterResets(rawFitted);
-		const row = `${this.leftMargin}${this.style.rail}${this.style.leftBorder}${this.style.reset}${this.transparentGap}${this.style.background}${fitted}${this.style.reset}`;
-		if (this.rowCache.size > 2048) this.rowCache.clear();
+		const row = `${this._rowPrefix}${fitted}${this._rowSuffix}`;
+		if (this.rowCache.size > 2048) {
+			const entries = [...this.rowCache.entries()];
+			this.rowCache = new Map(entries.slice(entries.length >> 1));
+		}
 		this.rowCache.set(key, row);
 		return row;
 	}
@@ -145,17 +152,22 @@ export function slashCommandSurfaceForTheme(theme: ThemeLike): EditorSurfaceRend
 	});
 }
 
+let _bashSurfaceCache: { theme: ThemeLike | undefined; surface: EditorSurfaceRenderer } | undefined;
+
 export function bashExecutionSurfaceForTheme(theme: ThemeLike | undefined): EditorSurfaceRenderer {
+	if (_bashSurfaceCache?.theme === theme) return _bashSurfaceCache.surface;
 	let rail = TALL_GRAY_BASH_EXECUTION_STYLE.rail;
 	try {
 		if (theme) rail = railAnsiForTheme(theme, BASH_EXECUTION_RAIL_COLOR) ?? rail;
 	} catch {
 		// Theme may not be initialized in isolated tests; keep the static fallback.
 	}
-	return new EditorSurfaceRenderer({
+	const surface = new EditorSurfaceRenderer({
 		...TALL_GRAY_BASH_EXECUTION_STYLE,
 		rail,
 	});
+	_bashSurfaceCache = { theme, surface };
+	return surface;
 }
 
 export class SurfaceRailBlock implements Component {

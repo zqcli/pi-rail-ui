@@ -4,19 +4,21 @@ import {
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
-import { TallGrayInputEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays } from "./components/editor";
+import { TallGrayInputEditor, disableMouseTracking, enableMouseTracking, enterAlternateScreen, exitAlternateScreen, hideAllEditorOverlays } from "./components/editor";
 import { createTallGrayFooter } from "./components/footer";
 import { installCommandOutputGap, uninstallCommandOutputGap } from "./patches/command-output";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
 import { installConversationScroll, uninstallConversationScroll } from "./chat-view";
 import {
 	installThinkingSurface,
+	uninstallThinkingSurface,
+} from "./patches/message-surfaces";
+import {
 	installUserMessageSurface,
 	refreshUserMessageTimestamps,
 	rememberUserMessageTimestamp,
-	uninstallThinkingSurface,
 	uninstallUserMessageSurface,
-} from "./patches/message-surfaces";
+} from "./patches/user-message-surface";
 import { installResourceStatusGap, uninstallResourceStatusGap } from "./patches/resource-status";
 import { installSettingsMenuSurface, uninstallSettingsMenuSurface } from "./patches/selector-overlays";
 import { installToolExecutionGap, uninstallToolExecutionGap } from "./patches/execution-surfaces";
@@ -30,6 +32,7 @@ export * from "./components/footer";
 export * from "./ui/gap";
 export * from "./ui/rail-overlay";
 export * from "./patches/message-surfaces";
+export * from "./patches/user-message-surface";
 export * from "./ui/rail-section";
 export * from "./patches/resource-status";
 export * from "./patches/selector-overlays";
@@ -40,6 +43,7 @@ export * from "./utils";
 export default function piRailUi(pi: ExtensionAPI) {
 	let enabled = true;
 	let mouseEnabled = false;
+	let altScreenEnabled = false;
 
 	function enableMouse() {
 		if (mouseEnabled) return;
@@ -53,6 +57,19 @@ export default function piRailUi(pi: ExtensionAPI) {
 		mouseEnabled = false;
 	}
 
+	function enableAltScreen() {
+		if (altScreenEnabled) return;
+		if (!CONVERSATION_SCROLL_LAYOUT.alternateScreen) return;
+		enterAlternateScreen();
+		altScreenEnabled = true;
+	}
+
+	function disableAltScreen() {
+		if (!altScreenEnabled) return;
+		exitAlternateScreen();
+		altScreenEnabled = false;
+	}
+
 	function installEditor(ctx: ExtensionContext) {
 		ctx.ui.setEditorComponent((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) =>
 			new TallGrayInputEditor(tui, theme, keybindings, ctx.ui.theme),
@@ -63,6 +80,8 @@ export default function piRailUi(pi: ExtensionAPI) {
 			disableMouseTracking();
 			mouseEnabled = false;
 		}
+
+		if (CONVERSATION_SCROLL_LAYOUT.enabled) enableAltScreen();
 	}
 
 	function installFooter(ctx: ExtensionContext) {
@@ -88,6 +107,7 @@ export default function piRailUi(pi: ExtensionAPI) {
 		ctx.ui.setFooter(undefined);
 		hideAllEditorOverlays();
 		disableMouse();
+		disableAltScreen();
 		uninstallThinkingSurface();
 		uninstallUserMessageSurface();
 		uninstallSettingsMenuSurface();
@@ -145,6 +165,7 @@ export default function piRailUi(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		hideAllEditorOverlays();
 		disableMouse();
+		disableAltScreen();
 		uninstallThinkingSurface();
 		uninstallUserMessageSurface();
 		uninstallSettingsMenuSurface();
@@ -153,5 +174,9 @@ export default function piRailUi(pi: ExtensionAPI) {
 		uninstallCommandOutputGap();
 		uninstallConversationScroll();
 		enabled = true;
+	});
+
+	process.on("exit", () => {
+		if (altScreenEnabled) exitAlternateScreen();
 	});
 }

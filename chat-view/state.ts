@@ -1,5 +1,5 @@
-import type { PrototypePatchTarget } from "../patching";
-import type { RailSectionClickState, RailSectionRange } from "../ui/rail-section";
+import { createStore, type PrototypePatchTarget } from "../patching";
+import type { RailSectionDefinition, RailSectionRange } from "../ui/rail-section";
 import type { Position } from "../utils";
 
 export type TuiCtor = { prototype: any };
@@ -27,7 +27,12 @@ export type ScrollbarMetrics = {
 };
 
 export type ScrollSelection = { anchor: Position; active: Position };
-export type ScrollbarDragState = { pointerOffsetRows: number };
+
+export type ActiveInteraction =
+	| { type: "idle" }
+	| { type: "selecting" }
+	| { type: "scrollbarDrag"; pointerOffsetRows: number }
+	| { type: "railSectionClick"; section: RailSectionDefinition; x: number; y: number; moved: boolean };
 
 export type ScrollAnimation = {
 	startOffsetFromBottom: number;
@@ -60,11 +65,9 @@ export type RenderCache = HistoryRenderResult & {
 
 export type ScrollState = {
 	offsetFromBottom: number;
+	interaction: ActiveInteraction;
 	view?: ScrollView;
 	selection?: ScrollSelection;
-	selecting?: boolean;
-	scrollbarDrag?: ScrollbarDragState;
-	railSectionClick?: RailSectionClickState;
 	scrollAnimation?: ScrollAnimation;
 	lockedStart?: number;
 	preferCachedRender?: boolean;
@@ -79,22 +82,16 @@ export type ConversationScrollStore = {
 	animationTimers: Set<ReturnType<typeof setTimeout>>;
 };
 
-const CONVERSATION_SCROLL_KEY = Symbol.for("pi-rail-ui.conversation-scroll-patch");
-
-export function getConversationScrollStore(): ConversationScrollStore {
-	const globalStore = globalThis as typeof globalThis & { [CONVERSATION_SCROLL_KEY]?: Partial<ConversationScrollStore> };
-	const store = globalStore[CONVERSATION_SCROLL_KEY] ?? {};
-	store.targets ??= [];
-	store.states ??= new WeakMap<object, ScrollState>();
-	store.animationTimers ??= new Set<ReturnType<typeof setTimeout>>();
-	globalStore[CONVERSATION_SCROLL_KEY] = store;
-	return store as ConversationScrollStore;
-}
+export const getConversationScrollStore = createStore<ConversationScrollStore>("conversation-scroll-patch", () => ({
+	targets: [],
+	states: new WeakMap<object, ScrollState>(),
+	animationTimers: new Set<ReturnType<typeof setTimeout>>(),
+}));
 
 export function stateFor(tui: object, store: ConversationScrollStore): ScrollState {
 	let state = store.states.get(tui);
 	if (!state) {
-		state = { offsetFromBottom: 0 };
+		state = { offsetFromBottom: 0, interaction: { type: "idle" } };
 		store.states.set(tui, state);
 	}
 	return state;

@@ -8,15 +8,13 @@ import {
 	railSectionSelectionStartCol,
 	sameRailSection,
 	toggleRailSection,
-	type RailSectionClickState,
 	type RailSectionRange,
 } from "../ui/rail-section";
-import { SGR_MOUSE_RE, comparePosition, samePosition, stripAnsi, type Position } from "../utils";
+import { SGR_MOUSE_RE, clamp, comparePosition, parseWheel, samePosition, segmenter, stripAnsi, type Position } from "../utils";
 import { isInteractiveRoot } from "./history-renderer";
-import { stateFor, type ConversationScrollStore, type ScrollAnimation, type ScrollState, type ScrollView } from "./state";
+import { stateFor, type ActiveInteraction, type ConversationScrollStore, type ScrollAnimation, type ScrollState, type ScrollView } from "./state";
 
 const HISTORY_MUTATING_KEYS = new Set(["\x0f"]); // Ctrl+O: Pi global expand/collapse may mutate older history blocks.
-const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 type ConversationMouse = { x: number; y: number; action: "press" | "drag" | "release" | "copy" };
 
@@ -123,28 +121,8 @@ function shouldPreferHistoryCacheForInput(data: string): boolean {
 	return true;
 }
 
-function isSgrMouseData(data: string): boolean {
-	return data.startsWith("\x1b[<");
-}
-
-function parseWheel(data: string): { direction: 1 | -1; y: number } | undefined {
-	if (!isSgrMouseData(data)) return undefined;
-	const match = SGR_MOUSE_RE.exec(data);
-	if (!match) return undefined;
-
-	const code = Number(match[1]);
-	const y = Number(match[3]);
-	const final = match[4];
-	if (!Number.isFinite(code) || !Number.isFinite(y) || final !== "M" || (code & 64) === 0) return undefined;
-
-	const wheelButton = code & 3;
-	if (wheelButton === 0) return { direction: 1, y }; // Wheel up: older conversation history.
-	if (wheelButton === 1) return { direction: -1, y }; // Wheel down: newer conversation history.
-	return undefined;
-}
-
 function parseConversationMouse(data: string): ConversationMouse | undefined {
-	if (!isSgrMouseData(data)) return undefined;
+	if (!data.startsWith("\x1b[<")) return undefined;
 	const match = SGR_MOUSE_RE.exec(data);
 	if (!match) return undefined;
 
@@ -177,10 +155,6 @@ function pointForMouse(state: ScrollState, mouse: ConversationMouse): Position |
 	const line = Math.max(0, Math.min(view.lineCount - 1, view.start + row));
 	const col = Math.max(0, Math.min(view.width, mouse.x - 1));
 	return normalizePointForSelection(state, { line, col });
-}
-
-function clamp(value: number, min: number, max: number): number {
-	return Math.max(min, Math.min(max, value));
 }
 
 function isOnScrollbar(view: ScrollView, mouse: ConversationMouse): boolean {
@@ -244,6 +218,7 @@ function advanceScrollAnimation(tui: any, state: ScrollState, store: Conversatio
 	const target = clamp(animation.targetOffsetFromBottom, 0, maxOffset);
 	const elapsed = Date.now() - animation.startedAt;
 	const progress = animation.durationMs <= 0 ? 1 : clamp(elapsed / animation.durationMs, 0, 1);
+	const timedOut = elapsed > 2000;
 	const nextOffset = progress >= 1
 		? target
 		: Math.round(animation.startOffsetFromBottom + (target - animation.startOffsetFromBottom) * easeOutCubic(progress));
@@ -254,7 +229,7 @@ function advanceScrollAnimation(tui: any, state: ScrollState, store: Conversatio
 		tui.requestRender?.();
 	}
 
-	if (progress >= 1 || state.offsetFromBottom === target) {
+	if (progress >= 1 || timedOut || state.offsetFromBottom === target) {
 		state.offsetFromBottom = target;
 		if (animation.lockAtEnd) {
 			const maxStart = Math.max(0, view.lineCount - view.rows);
@@ -346,7 +321,7 @@ function scrollStartForThumbRow(row: number, metrics: NonNullable<ScrollView["sc
 function applyScrollbarMouseRow(tui: any, state: ScrollState, store: ConversationScrollStore, row: number): boolean {
 	const view = state.view;
 	const metrics = view?.scrollbar;
-	const drag = state.scrollbarDrag;
+	const drag = state.interaction.type === "scrollbarDrag" ? state.interaction : undefined;
 	if (!view || !metrics || !drag) return false;
 
 	const clampedRow = clamp(row, 0, Math.max(0, view.rows - 1));
@@ -366,7 +341,7 @@ function railSectionRangeAtMouse(state: ScrollState, mouse: ConversationMouse): 
 function setRailSectionSelectionFromMouse(
 	tui: any,
 	state: ScrollState,
-	pending: RailSectionClickState,
+	pending: ActiveInteraction & { type: "railSectionClick" },
 	mouse: ConversationMouse,
 	selecting: boolean,
 ): boolean {
@@ -374,8 +349,7 @@ function setRailSectionSelectionFromMouse(
 	const active = pointForMouse(state, mouse);
 	if (!anchor || !active) return false;
 
-	state.railSectionClick = undefined;
-	state.selecting = selecting;
+	state.interaction = selecting ? { type: "selecting" } : { type: "idle" };
 	state.selection = { anchor, active };
 	const range = selectionRange(state.selection);
 	if (range && selecting) scheduleSelectedHistoryCopy(state);
@@ -402,13 +376,12 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 		clearScrollAnimation(state, store);
 		if (state.view) lockScrollStart(state, state.view.start);
 		state.selection = undefined;
-		state.selecting = false;
-		state.railSectionClick = { section: range.section, x: mouse.x, y: mouse.y, moved: false };
+		state.interaction = { type: "railSectionClick", section: range.section, x: mouse.x, y: mouse.y, moved: false };
 		return true;
 	}
 
-	const pending = state.railSectionClick;
-	if (!pending) return false;
+	if (state.interaction.type !== "railSectionClick") return false;
+	const pending = state.interaction;
 
 	if (mouse.action === "drag") {
 		if (railSectionMoved(pending, mouse.x, mouse.y)) {
@@ -419,7 +392,7 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 	}
 
 	if (mouse.action === "release") {
-		state.railSectionClick = undefined;
+		state.interaction = { type: "idle" };
 		if (pending.moved || railSectionMoved(pending, mouse.x, mouse.y)) {
 			setRailSectionSelectionFromMouse(tui, state, pending, mouse, false);
 			return true;
@@ -447,7 +420,7 @@ function handleConversationScrollbarDrag(tui: any, data: string, store: Conversa
 	const view = state.view;
 	const metrics = view?.scrollbar;
 	if (!view || !metrics) {
-		if (mouse.action === "release") state.scrollbarDrag = undefined;
+		if (mouse.action === "release" && state.interaction.type === "scrollbarDrag") state.interaction = { type: "idle" };
 		return false;
 	}
 
@@ -459,17 +432,16 @@ function handleConversationScrollbarDrag(tui: any, data: string, store: Conversa
 		if (!onScrollbar) return false;
 
 		clearSelectionCopyTimer(state);
-		const hadSelection = Boolean(state.selection || state.selecting);
+		const hadSelection = Boolean(state.selection || state.interaction.type === "selecting");
 		state.selection = undefined;
-		state.selecting = false;
 		const insideThumb = row >= metrics.thumbStart && row < metrics.thumbStart + metrics.thumbSize;
 		const pointerOffsetRows = insideThumb ? row - metrics.thumbStart : Math.floor(metrics.thumbSize / 2);
-		state.scrollbarDrag = { pointerOffsetRows: clamp(pointerOffsetRows, 0, Math.max(0, metrics.thumbSize - 1)) };
+		state.interaction = { type: "scrollbarDrag", pointerOffsetRows: clamp(pointerOffsetRows, 0, Math.max(0, metrics.thumbSize - 1)) };
 		if (applyScrollbarMouseRow(tui, state, store, row) || hadSelection) tui.requestRender?.();
 		return true;
 	}
 
-	if (!state.scrollbarDrag) return false;
+	if (state.interaction.type !== "scrollbarDrag") return false;
 
 	if (mouse.action === "drag") {
 		if (applyScrollbarMouseRow(tui, state, store, row)) tui.requestRender?.();
@@ -478,7 +450,7 @@ function handleConversationScrollbarDrag(tui: any, data: string, store: Conversa
 
 	if (mouse.action === "release") {
 		const changed = applyScrollbarMouseRow(tui, state, store, row);
-		state.scrollbarDrag = undefined;
+		state.interaction = { type: "idle" };
 		if (changed) tui.requestRender?.();
 		return true;
 	}
@@ -504,12 +476,12 @@ function handleConversationSelection(tui: any, data: string, store: Conversation
 		if (state.selection) {
 			clearSelectionCopyTimer(state);
 			state.selection = undefined;
-			state.selecting = false;
+			state.interaction = { type: "idle" };
 			tui.requestRender?.();
 		}
 		return false;
 	}
-	if (mouse.action !== "press" && !state.selecting) return false;
+	if (mouse.action !== "press" && state.interaction.type !== "selecting") return false;
 
 	const pos = pointForMouse(state, mouse);
 	if (!pos) return false;
@@ -518,15 +490,15 @@ function handleConversationSelection(tui: any, data: string, store: Conversation
 		clearSelectionCopyTimer(state);
 		clearScrollAnimation(state, store);
 		lockScrollStart(state, view.start);
-		state.selecting = true;
+		state.interaction = { type: "selecting" };
 		state.selection = { anchor: pos, active: pos };
 	} else if (mouse.action === "drag") {
-		state.selecting = true;
+		state.interaction = { type: "selecting" };
 		state.selection = state.selection ? { ...state.selection, active: pos } : { anchor: pos, active: pos };
 		if (selectionRange(state.selection)) scheduleSelectedHistoryCopy(state);
 	} else {
 		if (state.selection) state.selection.active = pos;
-		state.selecting = false;
+		state.interaction = { type: "idle" };
 		clearSelectionCopyTimer(state);
 		if (!selectionRange(state.selection)) state.selection = undefined;
 		else copySelectedHistoryText(state);

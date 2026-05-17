@@ -13,7 +13,7 @@ export const SGR_RESET_RE = /\x1b\[0m/g;
 export const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
 export const CURSOR_POSITION_RE = /^\x1b\[(\d+);(\d+)R$/;
 
-const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+export const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 export type Position = {
 	line: number;
@@ -248,4 +248,26 @@ export function buildVisualMap(lines: string[], layoutWidth: number): VisualRow[
 export function ansiPrefixForStyledSentinel(styled: string, sentinel = "\u0000"): string {
 	const index = styled.indexOf(sentinel);
 	return index >= 0 ? styled.slice(0, index) : "";
+}
+
+export function clamp(value: number, min: number, max: number): number {
+	return Math.max(min, Math.min(max, value));
+}
+
+export type ParsedWheel = { direction: 1 | -1; x: number; y: number };
+
+export function parseWheel(data: string): ParsedWheel | undefined {
+	const match = SGR_MOUSE_RE.exec(data);
+	if (!match) return undefined;
+
+	const code = Number(match[1]);
+	const x = Number(match[2]);
+	const y = Number(match[3]);
+	const final = match[4];
+	if (!Number.isFinite(code) || final !== "M" || (code & 64) === 0) return undefined;
+
+	const wheelButton = code & 3;
+	if (wheelButton === 0) return { direction: 1, x, y };
+	if (wheelButton === 1) return { direction: -1, x, y };
+	return undefined;
 }

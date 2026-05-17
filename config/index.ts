@@ -1,330 +1,41 @@
 import * as fs from "node:fs";
+import { bg, fg, resolveBackground, resolveTextColor } from "./colors";
+import type {
+	BashExecutionLayout,
+	ConversationScrollLayout,
+	ConversationScrollMode,
+	ConversationScrollbarStyle,
+	EditorPasteMarkerStyle,
+	EditorSurfaceStyle,
+	FooterLayout,
+	FooterStyle,
+	RailSectionKind,
+	RailSectionLayoutConfig,
+	RailSectionRawConfig,
+	RailSectionRawLayout,
+	RailSectionRawSelection,
+	RailSectionRawStyle,
+	RailSectionResolvedConfig,
+	RailSectionSelectionConfig,
+	RailSectionSpacingConfig,
+	RailSurfaceStyle,
+	SlashCommandLayout,
+	StyleFile,
+	UserMessageLayout,
+} from "./types";
 
-/**
- * Visual configuration lives in ui-style.json so colors and layout knobs can be
- * changed without touching renderer/editor logic. This module only validates the
- * JSON shape and resolves RGB/theme references into ANSI fragments consumed by
- * the TUI components.
- */
-
-type RgbTuple = [number, number, number];
-type ColorSpec = { rgb: RgbTuple };
-type ColorReference = ColorSpec | "transparent" | "editor.background" | "editor.rail" | `theme:${string}`;
-export type RailSectionKind =
-	| "assistantMessage"
-	| "assistantThinking"
-	| "assistantReply"
-	| "userMessage"
-	| "toolExecution"
-	| "bashExecution"
-	| "commandOutput"
-	| "resourceStatus"
-	| "selectorOutput"
-	| "custom";
-export type RailSectionSelectionMode = "fullRow" | "contentOnly" | "visible";
-
-type RailSectionRawStyle = {
-	background?: ColorReference;
-	rail?: ColorReference | false;
-};
-
-type RailSectionSpacingScope = "section" | "group";
-
-type RailSectionRawSpacing = {
-	beforeRows?: number;
-	afterRows?: number;
-	collapseAdjacent?: boolean;
-	scope?: RailSectionSpacingScope;
-};
-
-type RailSectionRawLayout = {
-	leftWindowGapWidth?: number;
-	leftBorder?: string;
-	leftBorderWidth?: number;
-	borderContentGapWidth?: number;
-	verticalSpacingRows?: number;
-	spacing?: RailSectionRawSpacing;
-	contentStartCol?: number;
-	alignWith?: RailSectionKind | string;
-};
-
-type RailSectionRawSelection = {
-	mode?: RailSectionSelectionMode;
-	stripAnsi?: boolean;
-	trimRight?: boolean;
-	includeRail?: boolean;
-	includeGap?: boolean;
-	includeLeadingBlankRows?: boolean;
-	includeTrailingBlankRows?: boolean;
-	includeTimestamp?: boolean;
-};
-
-type RailSectionRawConfig = {
-	selectable?: boolean;
-	collapsible?: boolean;
-	clickToToggle?: boolean;
-	autoCollapseAfterRows?: number | false;
-	preserveScrollOnToggle?: boolean;
-	preserveScrollOnUpdate?: boolean;
-	layout?: RailSectionRawLayout;
-	style?: RailSectionRawStyle;
-	selection?: RailSectionRawSelection;
-};
-
-type StyleFile = {
-	surfaceLayout: {
-		leftWindowGapWidth: number;
-		leftBorder: string;
-		leftBorderWidth: number;
-		borderContentGapWidth: number;
-		reset: string;
-	};
-	editor: {
-		height: { min: number; max: number; maxRatio: number };
-		background: ColorSpec;
-		rail: ColorSpec;
-		selection: { background: ColorSpec; foreground: ColorSpec };
-		pasteMarker?: { background?: ColorReference; foreground?: ColorReference; bold?: boolean };
-		mouseTracking?: { enabled?: boolean };
-	};
-	conversationScroll?: {
-		mode?: "app" | "native";
-		enabled?: boolean;
-		wheelStepRows?: number;
-		performance?: {
-			historyTailRenderWindow?: number;
-		};
-		scrollbar?: {
-			visible?: boolean;
-			dragEnabled?: boolean;
-			trackBackground?: ColorReference;
-			thumbBackground?: ColorReference;
-			widthMultiplier?: number;
-			dragAnimationMs?: number;
-		};
-	};
-	thinking: {
-		background: ColorReference;
-		rail: ColorReference;
-	};
-	assistantReply: {
-		alignSurface: "thinking" | "editor" | "userMessage";
-	};
-	userMessage: {
-		background: ColorReference;
-		rail: ColorReference;
-		textGapWidth: number;
-		verticalPaddingRows: number;
-		timestampColor: ColorReference;
-	};
-	slashCommand: {
-		background: ColorReference;
-		rail: ColorReference;
-		selectedText: ColorReference;
-		textGapWidth: number;
-		bottomReservedRows: number;
-		firstLevelHeightMultiplier: number;
-		nestedMaxOverlayRows: number;
-		minPrimaryColumnWidth: number;
-		maxPrimaryColumnWidth: number;
-	};
-	bashExecution?: {
-		background?: ColorReference;
-		rail?: ColorReference;
-		leftBorder?: string;
-		borderContentGapWidth?: number;
-		verticalSpacingRows?: number;
-	};
-	railSections?: {
-		defaults?: RailSectionRawConfig;
-		sections?: Partial<Record<RailSectionKind, RailSectionRawConfig>>;
-	};
-	footer: {
-		cwdMaxWidth: number;
-		modelMaxWidth: number;
-		branchMaxWidth: number;
-		colors: Record<"sky" | "mint" | "amber" | "lilac" | "text" | "muted", ColorSpec>;
-	};
-};
-
-export type RailSurfaceStyle = {
-	leftWindowGapWidth: number;
-	leftBorder: string;
-	leftBorderWidth: number;
-	borderContentGapWidth: number;
-	background: string;
-	rail: string;
-	selection: string;
-	reset: string;
-};
-
-export type EditorHeightPolicy = {
-	minHeight: number;
-	maxHeight: number;
-	maxHeightRatio: number;
-};
-
-export type EditorSurfaceStyle = RailSurfaceStyle & EditorHeightPolicy;
-
-export type TextColorTarget = {
-	themeKey?: string;
-	ansi?: string;
-};
-
-export type UserMessageLayout = {
-	textGapWidth: number;
-	verticalPaddingRows: number;
-	timestampColor: TextColorTarget;
-};
-
-export type SlashCommandLayout = {
-	textGapWidth: number;
-	bottomReservedRows: number;
-	firstLevelMaxRows: number;
-	nestedMaxRows: number;
-	minPrimaryColumnWidth: number;
-	maxPrimaryColumnWidth: number;
-	selectedText: TextColorTarget;
-};
-
-export type FooterStyle = Record<"sky" | "mint" | "amber" | "lilac" | "text" | "muted", string>;
-
-export type BashExecutionLayout = {
-	verticalSpacingRows: number;
-};
-
-export type RailSectionSelectionConfig = Required<Omit<RailSectionRawSelection, "includeTimestamp">> & {
-	includeTimestamp: boolean;
-};
-
-export type RailSectionStyleConfig = {
-	background: string;
-	rail: TextColorTarget;
-	railEnabled: boolean;
-};
-
-export type RailSectionSpacingConfig = {
-	beforeRows: number;
-	afterRows: number;
-	collapseAdjacent: boolean;
-	scope: RailSectionSpacingScope;
-};
-
-export type RailSectionLayoutConfig = {
-	leftWindowGapWidth: number;
-	leftBorder: string;
-	leftBorderWidth: number;
-	borderContentGapWidth: number;
-	verticalSpacingRows: number;
-	spacing: RailSectionSpacingConfig;
-	contentStartCol: number;
-	alignWith?: string;
-};
-
-export type RailSectionResolvedConfig = {
-	kind: RailSectionKind;
-	selectable: boolean;
-	collapsible: boolean;
-	clickToToggle: boolean;
-	autoCollapseAfterRows?: number;
-	preserveScrollOnToggle: boolean;
-	preserveScrollOnUpdate: boolean;
-	layout: RailSectionLayoutConfig;
-	style: RailSectionStyleConfig;
-	selection: RailSectionSelectionConfig;
-};
-
-export type EditorPasteMarkerStyle = {
-	background: string;
-	foreground: TextColorTarget;
-	bold: string;
-	reset: string;
-};
-
-export type ConversationScrollMode = "app" | "native";
-
-export type ConversationScrollLayout = {
-	mode: ConversationScrollMode;
-	enabled: boolean;
-	wheelStepRows: number;
-	historyTailRenderWindow: number;
-};
-
-export type ConversationScrollbarStyle = {
-	visible: boolean;
-	dragEnabled: boolean;
-	trackBackground: string;
-	thumbBackground: string;
-	width: number;
-	dragAnimationMs: number;
-	reset: string;
-};
-
-export type FooterLayout = {
-	cwdMaxWidth: number;
-	modelMaxWidth: number;
-	branchMaxWidth: number;
-};
-
-export type ThemeLike = {
-	fg(name: string, value: string): string;
-};
+export type { EditorHeightPolicy, EditorSurfaceStyle, RailSurfaceStyle } from "./types";
+export type { TextColorTarget, ThemeLike, RailSectionKind, RailSectionSelectionMode } from "./types";
+export type { UserMessageLayout, SlashCommandLayout, FooterStyle, BashExecutionLayout } from "./types";
+export type { RailSectionSelectionConfig, RailSectionStyleConfig, RailSectionSpacingConfig } from "./types";
+export type { RailSectionLayoutConfig, RailSectionResolvedConfig, EditorPasteMarkerStyle } from "./types";
+export type { ConversationScrollMode, ConversationScrollLayout, ConversationScrollbarStyle } from "./types";
+export type { FooterLayout } from "./types";
+export { applyTextColor, railAnsiForTheme } from "./colors";
 
 function readStyleFile(): StyleFile {
-	const url = new URL("./ui-style.json", import.meta.url);
+	const url = new URL("../ui-style.json", import.meta.url);
 	return JSON.parse(fs.readFileSync(url, "utf8")) as StyleFile;
-}
-
-function rgbTuple(spec: ColorSpec, label: string): RgbTuple {
-	const rgb = spec?.rgb;
-	if (!Array.isArray(rgb) || rgb.length !== 3 || rgb.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) {
-		throw new Error(`Invalid RGB color for ${label} in pi-rail-ui/ui-style.json`);
-	}
-	return rgb as RgbTuple;
-}
-
-function rgbAnsi(kind: 38 | 48, spec: ColorSpec, label: string): string {
-	const [r, g, b] = rgbTuple(spec, label);
-	return `\x1b[${kind};2;${r};${g};${b}m`;
-}
-
-function fg(spec: ColorSpec, label: string): string {
-	return rgbAnsi(38, spec, label);
-}
-
-function bg(spec: ColorSpec, label: string): string {
-	return rgbAnsi(48, spec, label);
-}
-
-function isThemeReference(spec: unknown): spec is `theme:${string}` {
-	return typeof spec === "string" && spec.startsWith("theme:");
-}
-
-function resolveBackground(spec: ColorReference, editorBackground: string): string {
-	if (spec === "transparent") return "";
-	if (spec === "editor.background") return editorBackground;
-	if (spec === "editor.rail" || isThemeReference(spec)) return "";
-	return bg(spec, "background");
-}
-
-function resolveTextColor(spec: ColorReference, refs: { editorRail: string }): TextColorTarget {
-	if (spec === "editor.rail") return { ansi: refs.editorRail };
-	if (isThemeReference(spec)) return { themeKey: spec.slice("theme:".length) };
-	if (spec === "transparent" || spec === "editor.background") return {};
-	return { ansi: fg(spec, "text color") };
-}
-
-export function applyTextColor(theme: ThemeLike | undefined, color: TextColorTarget, value: string): string {
-	if (color.themeKey && theme) return theme.fg(color.themeKey, value);
-	if (color.ansi) return `${color.ansi}${value}`;
-	return value;
-}
-
-export function railAnsiForTheme(theme: ThemeLike, color: TextColorTarget, sentinel = "\u0000"): string | undefined {
-	if (!color.themeKey) return color.ansi;
-	const styled = theme.fg(color.themeKey, sentinel);
-	const index = styled.indexOf(sentinel);
-	return index >= 0 ? styled.slice(0, index) : undefined;
 }
 
 const style = readStyleFile();
@@ -444,6 +155,7 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailS
 		autoCollapseAfterRows,
 		preserveScrollOnToggle: raw.preserveScrollOnToggle ?? defaults.preserveScrollOnToggle ?? fallback.preserveScrollOnToggle ?? true,
 		preserveScrollOnUpdate: raw.preserveScrollOnUpdate ?? defaults.preserveScrollOnUpdate ?? fallback.preserveScrollOnUpdate ?? true,
+		collapseByDefault: raw.collapseByDefault ?? defaults.collapseByDefault ?? fallback.collapseByDefault,
 		layout: resolvedLayout,
 		style: {
 			background: resolveBackground(sectionStyle.background ?? "transparent", editorBackground) || fallbackStyle?.background || "",
@@ -461,11 +173,11 @@ export const TALL_GRAY_EDITOR_SURFACE_STYLE: RailSurfaceStyle = {
 	selection,
 };
 
-export const TALL_GRAY_EDITOR_HEIGHT: EditorHeightPolicy = {
+export const TALL_GRAY_EDITOR_HEIGHT = {
 	minHeight: style.editor.height.min,
 	maxHeight: style.editor.height.max,
 	maxHeightRatio: style.editor.height.maxRatio,
-};
+} as const;
 
 export const EDITOR_MOUSE_TRACKING_ENABLED = style.editor.mouseTracking?.enabled === true;
 
@@ -485,6 +197,7 @@ const conversationScrollEnabled = style.conversationScroll?.mode === "app"
 export const CONVERSATION_SCROLL_LAYOUT: ConversationScrollLayout = {
 	mode: conversationScrollMode,
 	enabled: conversationScrollMode === "app" && conversationScrollEnabled,
+	alternateScreen: style.conversationScroll?.alternateScreen !== false,
 	wheelStepRows: Math.max(1, Math.round(style.conversationScroll?.wheelStepRows ?? 3)),
 	historyTailRenderWindow: Math.max(1, Math.round(style.conversationScroll?.performance?.historyTailRenderWindow ?? 8)),
 };
@@ -501,7 +214,6 @@ export const CONVERSATION_SCROLLBAR_STYLE: ConversationScrollbarStyle = {
 	reset: style.surfaceLayout.reset,
 };
 
-// Backwards-compatible aggregate style for callers/tests that expect one object.
 export const TALL_GRAY_EDITOR_STYLE: EditorSurfaceStyle = {
 	...TALL_GRAY_EDITOR_SURFACE_STYLE,
 	...TALL_GRAY_EDITOR_HEIGHT,

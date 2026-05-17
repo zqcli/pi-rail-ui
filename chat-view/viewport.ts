@@ -14,6 +14,7 @@ import {
 
 const ENTER_ALT_SCREEN = "\x1b[?1049h\x1b[H\x1b[2J\x1b[3J";
 const EXIT_ALT_SCREEN = "\x1b[?1049l";
+const MAX_SCROLLBAR_THUMB_RATIO = 0.65;
 
 function writeTerminalControl(sequence: string): void {
 	if (process.stdout.isTTY) process.stdout.write(sequence);
@@ -54,7 +55,14 @@ function getScrollbarMetrics(visibleRows: number, totalRows: number, start: numb
 	const barWidth = CONVERSATION_SCROLLBAR_STYLE.width;
 	if (width <= barWidth || totalRows <= visibleRows || visibleRows <= 0) return undefined;
 
-	const thumbSize = Math.max(1, Math.floor((visibleRows * visibleRows) / totalRows));
+	const rawThumbSize = Math.max(1, Math.floor((visibleRows * visibleRows) / totalRows));
+	const maxVisibleThumbSize = Math.max(1, Math.floor(visibleRows * MAX_SCROLLBAR_THUMB_RATIO));
+	// When startup resources overflow by only a few rows, a proportional thumb
+	// covers most of the viewport and looks like a thick native scrollbar.
+	// Hide it until there is enough history for a useful scroll affordance.
+	if (rawThumbSize > maxVisibleThumbSize) return undefined;
+
+	const thumbSize = rawThumbSize;
 	const maxThumbStart = Math.max(0, visibleRows - thumbSize);
 	const maxScrollStart = Math.max(1, totalRows - visibleRows);
 	const thumbStart = Math.round((start / maxScrollStart) * maxThumbStart);

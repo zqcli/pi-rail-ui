@@ -50,11 +50,20 @@ function normalizeStatusPaddingForGap(statusText: any): void {
 	}
 }
 
+function lastRenderableResourceChildIndex(children: any[]): number {
+	for (let index = children.length - 1; index >= 0; index--) {
+		const child = children[index];
+		if (isGapBlock(child) || shouldGapResourceChild(child)) return index;
+	}
+	return -1;
+}
+
 function wrapLastStatusLine(mode: any): void {
 	const children = mode?.chatContainer?.children;
 	if (!Array.isArray(children) || children.length === 0) return;
 
-	const lastIndex = children.length - 1;
+	const lastIndex = lastRenderableResourceChildIndex(children);
+	if (lastIndex < 0) return;
 	const last = children[lastIndex];
 	if (isGapBlock(last)) {
 		const inner = unwrapGapBlock(last);
@@ -80,7 +89,8 @@ function wrapLastCommandOutputChild(mode: any): void {
 	const children = mode?.chatContainer?.children;
 	if (!Array.isArray(children) || children.length === 0) return;
 
-	const lastIndex = children.length - 1;
+	const lastIndex = lastRenderableResourceChildIndex(children);
+	if (lastIndex < 0) return;
 	const last = children[lastIndex];
 	if (isGapBlock(last)) {
 		const inner = unwrapGapBlock(last);

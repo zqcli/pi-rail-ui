@@ -94,15 +94,13 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		ctx.ui.setEditorComponent(undefined);
 		ctx.ui.setFooter(undefined);
 		hideAllEditorOverlays();
-		disableMouse();
-		releaseConversationAlternateScreen();
+		if (!CONVERSATION_SCROLL_LAYOUT.enabled) disableMouse();
 		uninstallThinkingSurface();
 		uninstallUserMessageSurface();
 		uninstallSettingsMenuSurface();
 		uninstallToolExecutionGap();
 		uninstallResourceStatusGap();
 		uninstallCommandOutputGap();
-		uninstallConversationScroll();
 	}
 
 	pi.registerCommand("rail-ui", {
@@ -170,6 +168,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	});
 
 	process.on("exit", () => {
+		disableMouseTracking();
 		releaseConversationAlternateScreen();
 	});
 

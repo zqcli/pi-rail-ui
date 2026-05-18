@@ -1,6 +1,7 @@
 import { BashExecutionComponent, ToolExecutionComponent, truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import { railSectionConfig, type ThemeLike } from "../config";
 import { renderLinesWithGap } from "../ui/gap";
+import { cachedRender } from "../ui/render-cache";
 import { createStore, restorePrototypePatches, resolveNativePiExport, type PrototypePatchTarget } from "../patching";
 import { collapseHint, markRailSectionManuallyToggled, wasRailSectionManuallyToggled } from "../ui/rail-section";
 import { bashExecutionSurfaceForTheme } from "../ui/rail-surface";
@@ -66,9 +67,15 @@ function renderToolWithLeftGap(
 	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, innerWidth));
 
 	const cacheable = Boolean(component.result && component.isPartial === false && (!Array.isArray(component.imageComponents) || component.imageComponents.length === 0));
-	const cache = component[TOOL_GAP_CACHE_KEY] as { width: number; innerWidth: number; expanded: boolean; result: any; args: any; rows: string[] } | undefined;
-	if (cacheable && cache?.width === width && cache.innerWidth === innerWidth && cache.expanded === Boolean(component.expanded) && cache.result === component.result && cache.args === component.args) {
-		return cache.rows;
+	if (cacheable) {
+		const signature = [width, innerWidth, component.expanded ? 1 : 0].join("\u001f");
+		return cachedRender(component, TOOL_GAP_CACHE_KEY, signature, () => {
+			const renderedRows = originalRender.call(component, innerWidth);
+			const innerRows = shouldApplyGenericToolCollapse(component)
+				? collapsedExecutionRows(component, kind, renderedRows, innerWidth, store.theme)
+				: renderedRows;
+			return renderLinesWithGap(width, gap, () => innerRows);
+		}, { result: component.result, args: component.args });
 	}
 
 	const renderedRows = originalRender.call(component, innerWidth);
@@ -76,7 +83,6 @@ function renderToolWithLeftGap(
 		? collapsedExecutionRows(component, kind, renderedRows, innerWidth, store.theme)
 		: renderedRows;
 	const rows = renderLinesWithGap(width, gap, () => innerRows);
-	if (cacheable) component[TOOL_GAP_CACHE_KEY] = { width, innerWidth, expanded: Boolean(component.expanded), result: component.result, args: component.args, rows };
 	return rows;
 }
 
@@ -282,17 +288,14 @@ function renderBashWithRailSurface(
 	applyDefaultAutoCollapse(component, "bashExecution", () => renderedChildLines(component.contentContainer, contentWidth));
 
 	const signature = bashRenderSignature(component, width, contentWidth);
-	const cache = component[BASH_SURFACE_CACHE_KEY] as { signature: string; rows: string[] } | undefined;
-	if (cache?.signature === signature) return cache.rows;
-
-	const directPreview = collapsedBashPreviewRows(component, contentWidth, store.theme);
-	const lines = directPreview ?? (() => {
-		const content = component.contentContainer?.render?.(contentWidth);
-		return normalizeCollapsedBashPreview(component, Array.isArray(content) ? content : originalRender.call(component, contentWidth), contentWidth, store.theme);
-	})();
-	const rows = lines.map((line) => surface.renderSurfaceRow(width, line));
-	component[BASH_SURFACE_CACHE_KEY] = { signature, rows };
-	return rows;
+	return cachedRender(component, BASH_SURFACE_CACHE_KEY, signature, () => {
+		const directPreview = collapsedBashPreviewRows(component, contentWidth, store.theme);
+		const lines = directPreview ?? (() => {
+			const content = component.contentContainer?.render?.(contentWidth);
+			return normalizeCollapsedBashPreview(component, Array.isArray(content) ? content : originalRender.call(component, contentWidth), contentWidth, store.theme);
+		})();
+		return lines.map((line) => surface.renderSurfaceRow(width, line));
+	});
 }
 
 async function resolveTheme(): Promise<ThemeLike | undefined> {

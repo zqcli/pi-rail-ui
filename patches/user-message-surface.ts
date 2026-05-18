@@ -2,6 +2,7 @@ import { UserMessageComponent, type ExtensionContext, type Theme } from "@earend
 import type { Component } from "@earendil-works/pi-tui";
 import { USER_MESSAGE_LAYOUT, applyTextColor } from "../config";
 import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../patching";
+import { cachedRender } from "../ui/render-cache";
 import { EditorSurfaceRenderer, tallGrayUserMessageSurface } from "../ui/rail-surface";
 import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, padToWidth } from "../utils";
 
@@ -163,25 +164,23 @@ function renderUserMessageWithSurface(
 	const sourceText = getMarkdownSourceText(markdown);
 	const timestamp = timestampForUserMessage(component, sourceText);
 	const signature = [width, contentWidth, markdownWidth, textGapWidth, timestamp, sourceText ?? ""].join("\u001f");
-	const cache = (component as any)[USER_MESSAGE_RENDER_CACHE_KEY] as { signature: string; markdown: Component; rows: string[] } | undefined;
-	if (cache?.signature === signature && cache.markdown === markdown) return cache.rows;
+	return cachedRender(component, USER_MESSAGE_RENDER_CACHE_KEY, signature, () => {
+		const timeText = formatUserMessageTimestamp(timestamp);
+		const timeLine = applyTextColor(theme, USER_MESSAGE_LAYOUT.timestampColor, timeText);
 
-	const timeText = formatUserMessageTimestamp(timestamp);
-	const timeLine = applyTextColor(theme, USER_MESSAGE_LAYOUT.timestampColor, timeText);
+		const rows: string[] = [];
+		for (let i = 0; i < USER_MESSAGE_LAYOUT.verticalPaddingRows; i++) rows.push(surface.renderSurfaceRow(width));
+		for (const line of markdown.render(markdownWidth)) {
+			rows.push(surface.renderSurfaceRow(width, textGap + padToWidth(line, markdownWidth)));
+		}
+		rows.push(surface.renderSurfaceRow(width, textGap + padToWidth(timeLine, markdownWidth)));
+		for (let i = 0; i < USER_MESSAGE_LAYOUT.verticalPaddingRows; i++) rows.push(surface.renderSurfaceRow(width));
 
-	const rows: string[] = [];
-	for (let i = 0; i < USER_MESSAGE_LAYOUT.verticalPaddingRows; i++) rows.push(surface.renderSurfaceRow(width));
-	for (const line of markdown.render(markdownWidth)) {
-		rows.push(surface.renderSurfaceRow(width, textGap + padToWidth(line, markdownWidth)));
-	}
-	rows.push(surface.renderSurfaceRow(width, textGap + padToWidth(timeLine, markdownWidth)));
-	for (let i = 0; i < USER_MESSAGE_LAYOUT.verticalPaddingRows; i++) rows.push(surface.renderSurfaceRow(width));
-
-	if (rows.length === 0) return rows;
-	rows[0] = OSC133_ZONE_START + rows[0];
-	rows[rows.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + rows[rows.length - 1];
-	(component as any)[USER_MESSAGE_RENDER_CACHE_KEY] = { signature, markdown, rows };
-	return rows;
+		if (rows.length === 0) return rows;
+		rows[0] = OSC133_ZONE_START + rows[0];
+		rows[rows.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + rows[rows.length - 1];
+		return rows;
+	}, { markdown });
 }
 
 export async function installUserMessageSurface(ctx: ExtensionContext): Promise<void> {

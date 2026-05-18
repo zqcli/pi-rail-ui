@@ -8,6 +8,7 @@ import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
 import { SLASH_COMMAND_LAYOUT, TALL_GRAY_EDITOR_HEIGHT, applyTextColor, type ThemeLike } from "../config";
 import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../patching";
 import { RailOverlayPanel, renderRailOverlayRows, type RailOverlayBodyRenderer } from "../ui/rail-overlay";
+import { cachedRender } from "../ui/render-cache";
 import { selectorOutputSurfaceForTheme, tallGraySelectorOutputSurface, type EditorSurfaceRenderer } from "../ui/rail-surface";
 
 type SelectorCtor = { prototype: any };
@@ -144,11 +145,7 @@ function renderModelSelectorBody(instance: any, contentWidth: number, store: Set
 }
 
 function cachedSelectorRows(instance: any, signature: string, renderRows: () => string[]): string[] {
-	const cache = instance[SELECTOR_SURFACE_CACHE_KEY] as { signature: string; rows: string[] } | undefined;
-	if (cache?.signature === signature) return cache.rows;
-	const rows = renderRows();
-	instance[SELECTOR_SURFACE_CACHE_KEY] = { signature, rows };
-	return rows;
+	return cachedRender(instance, SELECTOR_SURFACE_CACHE_KEY, signature, renderRows);
 }
 
 function renderModelSelectorSurface(

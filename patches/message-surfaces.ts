@@ -5,6 +5,7 @@ import {
 import { Markdown, Spacer, Text, type Component } from "@earendil-works/pi-tui";
 import { railSectionConfig } from "../config";
 import { PrototypePatchTarget, resolveNativePiExport, restorePrototypePatches, getInteractiveModeConstructors, createStore } from "../patching";
+import { cachedRender } from "../ui/render-cache";
 import {
 	EditorSurfaceRenderer,
 	SurfaceContentInsetBlock,
@@ -288,12 +289,8 @@ function patchAssistantRenderCache(ctor: AssistantMessageConstructor, store: Thi
 		const currentStore = getThinkingSurfacePatchStore();
 		if (!currentStore.active) return original.call(this, width);
 		const signature = [width, this.lastMessage ? 1 : 0, this.hasToolCalls ? 1 : 0, this.hideThinkingBlock ? 1 : 0, this.hiddenThinkingLabel ?? ""].join("\u001f");
-		const cache = (this as any)[ASSISTANT_RENDER_CACHE_KEY] as { signature: string; message: any; children: any[]; rows: string[] } | undefined;
 		const children = Array.isArray(this.contentContainer?.children) ? this.contentContainer.children : [];
-		if (cache?.signature === signature && cache.message === this.lastMessage && cache.children === children) return cache.rows;
-		const rows = original.call(this, width);
-		(this as any)[ASSISTANT_RENDER_CACHE_KEY] = { signature, message: this.lastMessage, children, rows };
-		return rows;
+		return cachedRender(this, ASSISTANT_RENDER_CACHE_KEY, signature, () => original.call(this, width), { message: this.lastMessage, children });
 	};
 	store.targets.push({ ctor, methodName: "render", original });
 }

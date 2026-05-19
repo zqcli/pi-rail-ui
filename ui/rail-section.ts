@@ -45,6 +45,15 @@ export type RailSectionClickState = {
 
 const RAIL_SECTION_METADATA_KEY = Symbol.for("pi-rail-ui.rail-section-metadata");
 const RAIL_SECTION_MANUAL_TOGGLE_KEY = Symbol.for("pi-rail-ui.rail-section-manual-toggle");
+const RAIL_UI_ACTIVE_KEY = Symbol.for("pi-rail-ui.active");
+
+export function setRailUiActive(active: boolean): void {
+	(globalThis as any)[RAIL_UI_ACTIVE_KEY] = active;
+}
+
+export function isRailUiActive(): boolean {
+	return (globalThis as any)[RAIL_UI_ACTIVE_KEY] !== false;
+}
 
 function mergeSectionConfig(kind: RailSectionKind, overrides?: RailSectionOverrides): RailSectionResolvedConfig {
 	const base = railSectionConfig(kind);
@@ -228,6 +237,7 @@ export class RailSectionBlock extends LeftGapBlock {
 	}
 
 	render(width: number): string[] {
+		if (!isRailUiActive()) return this.inner.render(width);
 		const layout = this.config.layout;
 		const railAnsi = this.config.style.rail.ansi ?? "";
 		const hasRail = this.config.style.railEnabled && railAnsi.length > 0 && layout.leftBorderWidth > 0;

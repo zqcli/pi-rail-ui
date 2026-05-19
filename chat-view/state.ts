@@ -84,6 +84,7 @@ export type ConversationScrollStore = {
 	states: WeakMap<object, ScrollState>;
 	animationTimers: Set<ReturnType<typeof setTimeout>>;
 	alternateScreenActive: boolean;
+	clearOnNextOverflowRender: boolean;
 };
 
 export const getConversationScrollStore = createStore<ConversationScrollStore>("conversation-scroll-patch", () => ({
@@ -91,6 +92,7 @@ export const getConversationScrollStore = createStore<ConversationScrollStore>("
 	states: new WeakMap<object, ScrollState>(),
 	animationTimers: new Set<ReturnType<typeof setTimeout>>(),
 	alternateScreenActive: false,
+	clearOnNextOverflowRender: false,
 }));
 
 export function stateFor(tui: object, store: ConversationScrollStore): ScrollState {

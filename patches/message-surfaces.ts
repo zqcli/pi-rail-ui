@@ -16,6 +16,7 @@ import {
 import {
 	collapseHint,
 	defineRailSection,
+	isRailUiActive,
 	markRailSectionManuallyToggled,
 	setCollapsibleRailSectionsExpanded,
 	wasRailSectionManuallyToggled,
@@ -183,6 +184,7 @@ class AssistantThinkingRailBlock implements Component {
 	}
 
 	render(width: number): string[] {
+		if (!isRailUiActive()) return this.inner.render(width);
 		const config = railSectionConfig("assistantThinking");
 		const limit = config.collapsible ? config.autoCollapseAfterRows : undefined;
 		if (!limit || this.hidden || this.rawLines.length <= limit) {

@@ -18,6 +18,7 @@ import {
 	type RailSurfaceStyle,
 	type ThemeLike,
 } from "../config";
+import { isRailUiActive } from "./rail-section";
 import {
 	SGR_RESET,
 	SGR_RESET_RE,
@@ -184,7 +185,7 @@ export class SurfaceRailBlock implements Component {
 	}
 
 	render(width: number): string[] {
-		if (width < this.surface.minRenderableWidth()) return this.inner.render(width);
+		if (!isRailUiActive() || width < this.surface.minRenderableWidth()) return this.inner.render(width);
 		const innerLines = this.inner.render(this.surface.contentWidth(width));
 		if (this.cached?.width === width && this.cached.innerLines === innerLines) return this.cached.rows;
 		const rows = innerLines.map((line) => this.surface.renderSurfaceRow(width, line));
@@ -210,6 +211,7 @@ export class SurfaceContentInsetBlock implements Component {
 	}
 
 	render(width: number): string[] {
+		if (!isRailUiActive()) return this.inner.render(width);
 		const inset = this.surface.contentStartCol();
 		if (inset <= 0 || width <= inset + 1) return this.inner.render(width);
 

@@ -1,6 +1,6 @@
 import { TUI } from "@earendil-works/pi-tui";
 import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, CONVERSATION_SELECTION_STYLE, FOOTER_LAYOUT, TALL_GRAY_EDITOR_STYLE } from "../config";
-import { restorePrototypePatches } from "../patching";
+import { getInteractiveModeConstructors, restorePrototypePatches } from "../patching";
 import { applyColumnHighlight, clamp, padToWidth } from "../utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
 import { handleConversationInput, selectionRange } from "./interactions";
@@ -12,7 +12,10 @@ import {
 	type TuiCtor,
 } from "./state";
 
-const ENTER_ALT_SCREEN = "\x1b[?1049h\x1b[H\x1b[2J\x1b[3J";
+type InteractiveModeCtor = { prototype: any };
+
+const CLEAR_SCREEN_AND_SCROLLBACK = "\x1b[H\x1b[2J\x1b[3J";
+const ENTER_ALT_SCREEN = `\x1b[?1049h${CLEAR_SCREEN_AND_SCROLLBACK}`;
 const EXIT_ALT_SCREEN = "\x1b[?1049l";
 const MAX_SCROLLBAR_THUMB_RATIO = 0.65;
 
@@ -22,6 +25,25 @@ function writeTerminalControl(sequence: string): void {
 
 function requestFullRenderAfterScreenClear(tui: any | undefined): void {
 	if (typeof tui?.requestRender === "function") tui.requestRender(true);
+}
+
+function resetTuiRenderMemory(tui: any): void {
+	if (!tui || typeof tui !== "object") return;
+	tui.previousLines = [];
+	tui.previousWidth = 0;
+	tui.previousHeight = 0;
+	tui.cursorRow = 0;
+	tui.hardwareCursorRow = 0;
+	tui.maxLinesRendered = 0;
+	tui.previousViewportTop = 0;
+	if (tui.previousKittyImageIds instanceof Set) tui.previousKittyImageIds.clear();
+}
+
+function clearBeforeOverflowRender(tui: any, store: ConversationScrollStore, hasOverflow: boolean): void {
+	if (!hasOverflow || !store.clearOnNextOverflowRender) return;
+	store.clearOnNextOverflowRender = false;
+	writeTerminalControl(CLEAR_SCREEN_AND_SCROLLBACK);
+	resetTuiRenderMemory(tui);
 }
 
 export function ensureConversationAlternateScreen(tui?: any): void {
@@ -126,6 +148,7 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 			start = maxStart - state.offsetFromBottom;
 		}
 
+		clearBeforeOverflowRender(tui, store, historyLines.length > historyRows);
 		const scrollbar = getScrollbarMetrics(historyRows, historyLines.length, start, width);
 		state.view = { start, rows: historyRows, lineCount: historyLines.length, width, editorTopRow, editorBottomRow, footerTopRow, footerBottomRow, scrollbar };
 		const selection = selectionRange(state.selection);
@@ -139,6 +162,23 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 	} catch {
 		return originalRender.call(tui, width);
 	}
+}
+
+function patchInteractiveMode(ctor: InteractiveModeCtor | undefined, store: ConversationScrollStore): void {
+	if (!ctor?.prototype || typeof ctor.prototype.renderInitialMessages !== "function") return;
+	if (store.targets.some((target) => target.ctor === ctor && target.methodName === "renderInitialMessages")) return;
+
+	const originalRenderInitialMessages = ctor.prototype.renderInitialMessages;
+	ctor.prototype.renderInitialMessages = function patchedConversationInitialMessages(this: any, ...args: any[]) {
+		const result = originalRenderInitialMessages.apply(this, args);
+		const tui = this.ui;
+		if (CONVERSATION_SCROLL_LAYOUT.enabled && isInteractiveRoot(tui)) {
+			clearConversationScrollState(store, { clearOnNextOverflowRender: true });
+			tui.requestRender?.(true);
+		}
+		return result;
+	};
+	store.targets.push({ ctor, methodName: "renderInitialMessages", original: originalRenderInitialMessages });
 }
 
 function patchTui(ctor: TuiCtor | undefined, store: ConversationScrollStore): void {
@@ -188,13 +228,23 @@ export async function installConversationScroll(): Promise<void> {
 	const store = getConversationScrollStore();
 	patchTui(TUI as unknown as TuiCtor, store);
 	patchTui(await resolveNativeTuiExport<TuiCtor>("TUI"), store);
+	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor, store);
+}
+
+function clearConversationScrollState(store: ConversationScrollStore, options: { clearOnNextOverflowRender?: boolean } = {}): void {
+	for (const timer of store.animationTimers) clearTimeout(timer);
+	store.animationTimers.clear();
+	store.states = new WeakMap<object, any>();
+	store.clearOnNextOverflowRender = options.clearOnNextOverflowRender === true;
+}
+
+export function resetConversationScrollState(): void {
+	clearConversationScrollState(getConversationScrollStore(), { clearOnNextOverflowRender: true });
 }
 
 export function uninstallConversationScroll(options: { releaseAlternateScreen?: boolean } = {}): void {
 	const store = getConversationScrollStore();
 	if (options.releaseAlternateScreen !== false) releaseConversationAlternateScreen();
 	restorePrototypePatches(store.targets);
-	for (const timer of store.animationTimers) clearTimeout(timer);
-	store.animationTimers.clear();
-	store.states = new WeakMap<object, any>();
+	clearConversationScrollState(store);
 }

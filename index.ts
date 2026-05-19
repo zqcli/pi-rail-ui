@@ -8,7 +8,7 @@ import { TallGrayInputEditor, disableMouseTracking, enableMouseTracking, hideAll
 import { createTallGrayFooter, setFooterExpanded } from "./components/footer";
 import { installCommandOutputGap, uninstallCommandOutputGap } from "./patches/command-output";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
-import { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, uninstallConversationScroll } from "./chat-view";
+import { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll } from "./chat-view";
 import {
 	installThinkingSurface,
 	uninstallThinkingSurface,
@@ -22,6 +22,7 @@ import {
 import { installResourceStatusGap, uninstallResourceStatusGap } from "./patches/resource-status";
 import { installSettingsMenuSurface, uninstallSettingsMenuSurface } from "./patches/selector-overlays";
 import { installToolExecutionGap, uninstallToolExecutionGap } from "./patches/execution-surfaces";
+import { setRailUiActive } from "./ui/rail-section";
 
 export * from "./ui/slash-autocomplete-overlay";
 export * from "./patches/command-output";
@@ -78,6 +79,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 
 	async function install(ctx: ExtensionContext) {
 		if (!ctx.hasUI || !enabled) return;
+		setRailUiActive(true);
 		await installConversationScroll();
 		installEditor(ctx);
 		installFooter(ctx);
@@ -91,16 +93,19 @@ export default async function piRailUi(pi: ExtensionAPI) {
 
 	function uninstall(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
+		setRailUiActive(false);
 		ctx.ui.setEditorComponent(undefined);
 		ctx.ui.setFooter(undefined);
 		hideAllEditorOverlays();
-		if (!CONVERSATION_SCROLL_LAYOUT.enabled) disableMouse();
+		disableMouse();
+		releaseConversationAlternateScreen();
 		uninstallThinkingSurface();
 		uninstallUserMessageSurface();
 		uninstallSettingsMenuSurface();
 		uninstallToolExecutionGap();
 		uninstallResourceStatusGap();
 		uninstallCommandOutputGap();
+		uninstallConversationScroll();
 	}
 
 	pi.registerCommand("rail-ui", {
@@ -150,10 +155,12 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
-		// Keep alternate screen across /reload. Exiting and immediately re-entering
-		// clears the terminal while pi-tui still has differential-render state,
-		// which can make the editor/footer repaint at stale rows.
-		const keepAlternateScreen = event.reason === "reload";
+		setRailUiActive(false);
+		// Keep the app viewport alive across in-process session switches. Pi resets
+		// extension UI between shutdown/start; if the TUI render patch is removed in
+		// that gap, long resumed histories briefly paint with terminal-native scroll.
+		const keepAlternateScreen = event.reason !== "quit";
+		const keepConversationScroll = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
 		hideAllEditorOverlays();
 		disableMouse();
 		if (!keepAlternateScreen) releaseConversationAlternateScreen();
@@ -163,7 +170,8 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		uninstallToolExecutionGap();
 		uninstallResourceStatusGap();
 		uninstallCommandOutputGap();
-		uninstallConversationScroll({ releaseAlternateScreen: !keepAlternateScreen });
+		if (keepConversationScroll) resetConversationScrollState();
+		else uninstallConversationScroll({ releaseAlternateScreen: !keepAlternateScreen });
 		enabled = true;
 	});
 

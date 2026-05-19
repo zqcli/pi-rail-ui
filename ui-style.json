@@ -38,7 +38,7 @@
     "scrollbar": {
       "visible": true,
       "dragEnabled": true,
-      "trackBackground": "editor.background",
+      "trackBackground": "transparent",
       "thumbBackground": { "rgb": [96, 165, 250] },
       "widthMultiplier": 1,
       "dragAnimationMs": 90

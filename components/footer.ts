@@ -17,11 +17,9 @@ export type FooterStats = {
 	usingSubscription?: boolean;
 };
 
-type FooterStore = {
-	expanded: boolean;
-};
+type FooterStore = { expanded: boolean };
 
-type FooterRenderState = {
+type FooterSnapshot = {
 	cwd: string;
 	cwdShort: string;
 	branch?: string | null;
@@ -45,10 +43,11 @@ const SIMPLE_MODEL_MAX_WIDTH = Math.max(12, FOOTER_LAYOUT.modelMaxWidth);
 const EXPANDED_MODEL_MAX_WIDTH = Math.max(28, FOOTER_LAYOUT.modelMaxWidth + 12);
 const SESSION_MAX_WIDTH = 28;
 const STATUS_MAX_WIDTH = 32;
+const SIGNATURE_SEP = "\u001f";
+const LIST_SEP = "\u001e";
 
 function footerStore(): FooterStore {
-	const g = globalThis as any;
-	return g[FOOTER_STORE_KEY] ??= { expanded: false } satisfies FooterStore;
+	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { expanded: false } satisfies FooterStore);
 }
 
 export function isFooterExpanded(): boolean {
@@ -79,51 +78,24 @@ function formatCost(value: number): string {
 	return `$${value.toFixed(2)}`;
 }
 
-function formatContextPercent(value: number | null | undefined): string {
-	return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "?";
-}
-
-function sanitizeStatusText(text: string): string {
-	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
-}
-
-function compactPath(cwd: string): string {
-	const home = process.env.HOME || process.env.USERPROFILE;
-	return home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
-}
-
-function shortModelName(model?: string, maxWidth = SIMPLE_MODEL_MAX_WIDTH): string {
-	if (!model) return "no model";
-	const simplified = model
-		.replace(/^claude-/, "claude ")
-		.replace(/^gemini-/, "gemini ")
-		.replace(/^gpt-/, "gpt ")
-		.replace(/-20\d{6}$/u, "")
-		.replace(/-latest$/u, "")
-		.replace(/-preview$/u, "")
-		.replace(/-/gu, " ")
-		.replace(/\s+/gu, " ")
-		.trim();
-	return fitToWidth(simplified, maxWidth);
-}
-
 function footerLine(content: string, width: number): string {
 	return truncateToWidth(content, Math.max(0, width), "…", true);
 }
 
-function footerContentWidth(width: number): number {
-	return Math.max(0, width - Math.min(FOOTER_LEFT_GAP, Math.max(0, width)));
-}
-
-function addFooterLeftGap(rows: string[], width: number): string[] {
-	if (FOOTER_LEFT_GAP <= 0) return rows.map((row) => footerLine(row, width));
-	const prefix = " ".repeat(Math.min(FOOTER_LEFT_GAP, Math.max(0, width)));
-	const contentWidth = footerContentWidth(width);
+function withFooterGap(rows: string[], width: number): string[] {
+	const prefixWidth = Math.min(FOOTER_LEFT_GAP, Math.max(0, width));
+	const contentWidth = Math.max(0, width - prefixWidth);
+	const prefix = prefixWidth > 0 ? " ".repeat(prefixWidth) : "";
 	return rows.map((row) => `${prefix}${footerLine(row, contentWidth)}`);
 }
 
 function visibleJoin(parts: Array<string | undefined>, separator: string): string {
-	return parts.filter((part): part is string => Boolean(part && visibleWidth(part) > 0)).join(separator);
+	let out = "";
+	for (const part of parts) {
+		if (!part || visibleWidth(part) <= 0) continue;
+		out += out ? `${separator}${part}` : part;
+	}
+	return out;
 }
 
 function fitAligned(left: string, right: string, width: number): string {
@@ -135,18 +107,39 @@ function fitAligned(left: string, right: string, width: number): string {
 	return footerLine(`${fittedLeft}${gap}${right}`, width);
 }
 
-function usageFromEntry(entry: any): FooterStats | undefined {
-	if (entry?.type !== "message") return undefined;
-	const usage = entry.message?.usage;
-	if (!usage) return undefined;
-	return {
-		inputTokens: usage.input ?? 0,
-		outputTokens: usage.output ?? 0,
-		cacheReadTokens: usage.cacheRead ?? 0,
-		cacheWriteTokens: usage.cacheWrite ?? 0,
-		totalTokens: 0,
-		cost: usage.cost?.total ?? 0,
-	};
+function stateText(state: FooterSnapshot, style: FooterStyle): string {
+	return state.idle ? `${style.mint}● ready` : `${style.amber}● working`;
+}
+
+function contextText(stats: FooterStats, style: FooterStyle, expanded = false): string {
+	const hasPercent = typeof stats.contextPercent === "number" && Number.isFinite(stats.contextPercent);
+	const percent = hasPercent ? `${stats.contextPercent!.toFixed(2)}%` : "?";
+	const color = hasPercent && stats.contextPercent! >= 70 ? style.amber : style.lilac;
+	const windowText = expanded && stats.contextWindow ? `/${formatNum(stats.contextWindow)}` : "";
+	return `${color}ctx ${percent}${windowText}`;
+}
+
+function costText(stats: FooterStats, style: FooterStyle): string {
+	return `${style.mint}${formatCost(stats.cost)}${stats.usingSubscription ? " (sub)" : ""}`;
+}
+
+function usageText(stats: FooterStats, style: FooterStyle, expanded = false): string {
+	return expanded
+		? visibleJoin([
+			`${style.sky}↑ input ${formatNum(stats.inputTokens)}`,
+			`${style.sky}↓ output ${formatNum(stats.outputTokens)}`,
+			`${style.lilac}R cache ${formatNum(stats.cacheReadTokens)}`,
+			`${style.lilac}W cache ${formatNum(stats.cacheWriteTokens)}`,
+			`${style.text}total ${formatNum(stats.inputTokens + stats.outputTokens)}`,
+			costText(stats, style),
+			contextText(stats, style, true),
+		], `${style.muted} · `)
+		: visibleJoin([
+			`${style.sky}↑${formatNum(stats.inputTokens)}`,
+			`${style.sky}↓${formatNum(stats.outputTokens)}`,
+			`${style.lilac}R${formatNum(stats.cacheReadTokens)}`,
+			`${style.lilac}W${formatNum(stats.cacheWriteTokens)}`,
+		], " ");
 }
 
 export function collectFooterStats(ctx: ExtensionContext): FooterStats {
@@ -158,19 +151,18 @@ export function collectFooterStats(ctx: ExtensionContext): FooterStats {
 
 	const entries = ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch();
 	for (const entry of entries) {
-		const usage = usageFromEntry(entry);
+		if (entry?.type !== "message") continue;
+		const usage = entry.message?.usage;
 		if (!usage) continue;
-		inputTokens += usage.inputTokens;
-		outputTokens += usage.outputTokens;
-		cacheReadTokens += usage.cacheReadTokens;
-		cacheWriteTokens += usage.cacheWriteTokens;
-		cost += usage.cost;
+		inputTokens += usage.input ?? 0;
+		outputTokens += usage.output ?? 0;
+		cacheReadTokens += usage.cacheRead ?? 0;
+		cacheWriteTokens += usage.cacheWrite ?? 0;
+		cost += usage.cost?.total ?? 0;
 	}
 
 	const contextUsage = ctx.getContextUsage();
 	const contextTokens = contextUsage?.tokens;
-	const usageTotal = inputTokens + outputTokens;
-	const totalTokens = typeof contextTokens === "number" ? contextTokens : usageTotal;
 	let usingSubscription = false;
 	try {
 		usingSubscription = Boolean(ctx.model && ctx.modelRegistry?.isUsingOAuth?.(ctx.model));
@@ -183,7 +175,7 @@ export function collectFooterStats(ctx: ExtensionContext): FooterStats {
 		outputTokens,
 		cacheReadTokens,
 		cacheWriteTokens,
-		totalTokens,
+		totalTokens: typeof contextTokens === "number" ? contextTokens : inputTokens + outputTokens,
 		cost,
 		contextTokens,
 		contextWindow: contextUsage?.contextWindow,
@@ -192,96 +184,66 @@ export function collectFooterStats(ctx: ExtensionContext): FooterStats {
 	};
 }
 
-function footerStatuses(footerData: any): string[] {
+function collectFooterSnapshot(ctx: ExtensionContext, pi: ExtensionAPI, footerData: any): FooterSnapshot {
+	const rawCwd = ctx.sessionManager.getCwd?.() ?? ctx.cwd;
+	const home = process.env.HOME || process.env.USERPROFILE;
 	const statuses = footerData.getExtensionStatuses?.();
-	if (!statuses || typeof statuses.entries !== "function") return [];
-	return Array.from(statuses.entries())
-		.sort(([a], [b]) => String(a).localeCompare(String(b)))
-		.map(([, text]) => sanitizeStatusText(String(text)))
-		.filter(Boolean);
-}
-
-function safeTools(pi: ExtensionAPI): { activeTools: string[]; allToolCount: number } {
-	try {
-		const activeTools = pi.getActiveTools?.() ?? [];
-		const allTools = pi.getAllTools?.() ?? [];
-		return { activeTools: [...activeTools], allToolCount: allTools.length };
-	} catch {
-		return { activeTools: [], allToolCount: 0 };
-	}
-}
-
-function renderState(ctx: ExtensionContext, pi: ExtensionAPI, footerData: any): FooterRenderState {
-	const cwd = compactPath(ctx.sessionManager.getCwd?.() ?? ctx.cwd);
-	const cwdShort = path.basename(ctx.cwd) || ctx.cwd;
-	const branch = footerData.getGitBranch?.();
-	const { activeTools, allToolCount } = safeTools(pi);
-	const provider = (ctx.model as any)?.provider;
-	const modelId = ctx.model?.id;
+	let activeTools: string[] = [];
+	let allToolCount = 0;
 	let providerCount = 0;
+
+	try {
+		activeTools = [...(pi.getActiveTools?.() ?? [])];
+		allToolCount = pi.getAllTools?.()?.length ?? 0;
+	} catch {
+		activeTools = [];
+		allToolCount = 0;
+	}
 	try {
 		providerCount = footerData.getAvailableProviderCount?.() ?? 0;
 	} catch {
 		providerCount = 0;
 	}
+
+	const modelId = ctx.model?.id;
+	const modelShort = modelId
+		? fitToWidth(modelId
+			.replace(/^claude-/, "claude ")
+			.replace(/^gemini-/, "gemini ")
+			.replace(/^gpt-/, "gpt ")
+			.replace(/-20\d{6}$/u, "")
+			.replace(/-latest$/u, "")
+			.replace(/-preview$/u, "")
+			.replace(/-/gu, " ")
+			.replace(/\s+/gu, " ")
+			.trim(), SIMPLE_MODEL_MAX_WIDTH)
+		: "no model";
+
 	return {
-		cwd,
-		cwdShort,
-		branch,
+		cwd: home && rawCwd.startsWith(home) ? `~${rawCwd.slice(home.length)}` : rawCwd,
+		cwdShort: path.basename(ctx.cwd) || ctx.cwd,
+		branch: footerData.getGitBranch?.(),
 		sessionName: ctx.sessionManager.getSessionName?.(),
 		idle: ctx.isIdle(),
 		pending: ctx.hasPendingMessages?.() === true,
 		modelId,
-		modelShort: shortModelName(modelId),
-		provider,
+		modelShort,
+		provider: (ctx.model as any)?.provider,
 		providerCount,
 		thinking: pi.getThinkingLevel?.() ?? "off",
 		activeTools,
 		allToolCount,
-		extensionStatuses: footerStatuses(footerData),
+		extensionStatuses: statuses && typeof statuses.entries === "function"
+			? Array.from(statuses.entries())
+				.sort(([a], [b]) => String(a).localeCompare(String(b)))
+				.map(([, text]) => String(text).replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+				.filter(Boolean)
+			: [],
 		expanded: isFooterExpanded(),
 	};
 }
 
-function stateText(state: FooterRenderState, style: FooterStyle): string {
-	return state.idle ? `${style.mint}● ready` : `${style.amber}● working`;
-}
-
-function contextText(stats: FooterStats, style: FooterStyle, expanded = false): string {
-	const hasPercent = typeof stats.contextPercent === "number" && Number.isFinite(stats.contextPercent);
-	const percent = hasPercent ? `${formatContextPercent(stats.contextPercent)}%` : "?";
-	const color = hasPercent && stats.contextPercent! >= 70 ? style.amber : style.lilac;
-	const windowText = expanded && stats.contextWindow ? `/${formatNum(stats.contextWindow)}` : "";
-	return `${color}ctx ${percent}${windowText}`;
-}
-
-function costText(stats: FooterStats, style: FooterStyle): string {
-	const suffix = stats.usingSubscription ? " (sub)" : "";
-	return `${style.mint}${formatCost(stats.cost)}${suffix}`;
-}
-
-function usageCompact(stats: FooterStats, style: FooterStyle): string {
-	return visibleJoin([
-		`${style.sky}↑${formatNum(stats.inputTokens)}`,
-		`${style.sky}↓${formatNum(stats.outputTokens)}`,
-		`${style.lilac}R${formatNum(stats.cacheReadTokens)}`,
-		`${style.lilac}W${formatNum(stats.cacheWriteTokens)}`,
-	], " ");
-}
-
-function usageExpanded(stats: FooterStats, style: FooterStyle): string {
-	return visibleJoin([
-		`${style.sky}↑ input ${formatNum(stats.inputTokens)}`,
-		`${style.sky}↓ output ${formatNum(stats.outputTokens)}`,
-		`${style.lilac}R cache ${formatNum(stats.cacheReadTokens)}`,
-		`${style.lilac}W cache ${formatNum(stats.cacheWriteTokens)}`,
-		`${style.text}total ${formatNum(stats.inputTokens + stats.outputTokens)}`,
-		costText(stats, style),
-		contextText(stats, style, true),
-	], `${style.muted} · `);
-}
-
-function renderSimpleFooter(width: number, state: FooterRenderState, stats: FooterStats, style: FooterStyle): string[] {
+function renderSimpleFooter(width: number, state: FooterSnapshot, stats: FooterStats, style: FooterStyle): string[] {
 	const identity = `${style.text}▸ ${fitToWidth(state.cwdShort, FOOTER_LAYOUT.cwdMaxWidth)}${state.branch ? `${style.mint}@${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : ""}`;
 	const left = visibleJoin([
 		identity,
@@ -291,35 +253,14 @@ function renderSimpleFooter(width: number, state: FooterRenderState, stats: Foot
 		state.pending ? `${style.amber}queued` : undefined,
 	], `${style.muted} · `);
 	const right = visibleJoin([
-		usageCompact(stats, style),
+		usageText(stats, style),
 		contextText(stats, style),
 		stats.cost > 0 || stats.usingSubscription ? costText(stats, style) : undefined,
 	], `${style.muted} · `);
 	return [fitAligned(left, right, width)];
 }
 
-function providerModelText(state: FooterRenderState, style: FooterStyle): string {
-	const providerPrefix = state.provider && (state.providerCount > 1 || state.provider)
-		? `${state.provider}/`
-		: "";
-	return `${style.sky}model ${fitToWidth(`${providerPrefix}${state.modelId ?? "no model"}`, EXPANDED_MODEL_MAX_WIDTH)}`;
-}
-
-function toolsText(state: FooterRenderState, style: FooterStyle): string | undefined {
-	if (state.activeTools.length === 0 && state.allToolCount === 0) return undefined;
-	if (state.activeTools.length > 0 && state.activeTools.length <= 6) {
-		return `${style.text}tools ${state.activeTools.join(",")}`;
-	}
-	return `${style.text}tools ${state.activeTools.length}/${state.allToolCount || state.activeTools.length}`;
-}
-
-function statusesText(state: FooterRenderState, style: FooterStyle): string | undefined {
-	if (state.extensionStatuses.length === 0) return undefined;
-	if (state.extensionStatuses.length === 1) return `${style.muted}status ${fitToWidth(state.extensionStatuses[0]!, STATUS_MAX_WIDTH)}`;
-	return `${style.muted}status ${state.extensionStatuses.length}`;
-}
-
-function renderExpandedFooter(width: number, state: FooterRenderState, stats: FooterStats, style: FooterStyle): string[] {
+function renderExpandedFooter(width: number, state: FooterSnapshot, stats: FooterStats, style: FooterStyle): string[] {
 	const row1Left = visibleJoin([
 		`${style.text}▾ pi`,
 		`${style.muted}cwd ${style.text}${fitToWidth(state.cwd, Math.max(FOOTER_LAYOUT.cwdMaxWidth, 36))}`,
@@ -328,20 +269,36 @@ function renderExpandedFooter(width: number, state: FooterRenderState, stats: Fo
 		stateText(state, style),
 		state.pending ? `${style.amber}queued` : undefined,
 	], `${style.muted} · `);
-	const row1Right = contextText(stats, style, true);
-
+	const toolText = state.activeTools.length === 0 && state.allToolCount === 0
+		? undefined
+		: state.activeTools.length > 0 && state.activeTools.length <= 6
+			? `${style.text}tools ${state.activeTools.join(",")}`
+			: `${style.text}tools ${state.activeTools.length}/${state.allToolCount || state.activeTools.length}`;
+	const statusText = state.extensionStatuses.length === 0
+		? ""
+		: state.extensionStatuses.length === 1
+			? `${style.muted}status ${fitToWidth(state.extensionStatuses[0]!, STATUS_MAX_WIDTH)}`
+			: `${style.muted}status ${state.extensionStatuses.length}`;
 	const row2Left = visibleJoin([
-		providerModelText(state, style),
+		`${style.sky}model ${fitToWidth(`${state.provider ? `${state.provider}/` : ""}${state.modelId ?? "no model"}`, EXPANDED_MODEL_MAX_WIDTH)}`,
 		`${style.amber}thinking ${state.thinking}`,
-		toolsText(state, style),
+		toolText,
 	], `${style.muted} · `);
-	const row2Right = statusesText(state, style) ?? "";
 
 	return [
-		fitAligned(row1Left, row1Right, width),
-		fitAligned(`  ${row2Left}`, row2Right, width),
-		footerLine(`  ${style.muted}usage ${usageExpanded(stats, style)}`, width),
+		fitAligned(row1Left, contextText(stats, style, true), width),
+		fitAligned(`  ${row2Left}`, statusText, width),
+		footerLine(`  ${style.muted}usage ${usageText(stats, style, true)}`, width),
 	];
+}
+
+function renderFooterRows(width: number, state: FooterSnapshot, stats: FooterStats, style: FooterStyle): string[] {
+	const prefixWidth = Math.min(FOOTER_LEFT_GAP, Math.max(0, width));
+	const contentWidth = Math.max(0, width - prefixWidth);
+	const rows = state.expanded
+		? renderExpandedFooter(contentWidth, state, stats, style)
+		: renderSimpleFooter(contentWidth, state, stats, style);
+	return withFooterGap(rows, width);
 }
 
 export function renderFooter(
@@ -352,21 +309,38 @@ export function renderFooter(
 	stats: FooterStats = collectFooterStats(ctx),
 	style: FooterStyle = TALL_GRAY_FOOTER_STYLE,
 ): string[] {
-	const state = renderState(ctx, pi, footerData);
-	const contentWidth = footerContentWidth(width);
-	const rows = state.expanded
-		? renderExpandedFooter(contentWidth, state, stats, style)
-		: renderSimpleFooter(contentWidth, state, stats, style);
-	return addFooterLeftGap(rows, width);
+	return renderFooterRows(width, collectFooterSnapshot(ctx, pi, footerData), stats, style);
 }
 
-function renderSignature(width: number, ctx: ExtensionContext, pi: ExtensionAPI, footerData: any, stats: FooterStats): string {
-	const state = renderState(ctx, pi, footerData);
-	return JSON.stringify({
+function footerSignature(width: number, state: FooterSnapshot, stats: FooterStats): string {
+	return [
 		width,
-		state,
-		stats,
-	});
+		state.expanded ? 1 : 0,
+		state.cwd,
+		state.cwdShort,
+		state.branch ?? "",
+		state.sessionName ?? "",
+		state.idle ? 1 : 0,
+		state.pending ? 1 : 0,
+		state.modelId ?? "",
+		state.modelShort,
+		state.provider ?? "",
+		state.providerCount,
+		state.thinking,
+		state.allToolCount,
+		state.activeTools.join(LIST_SEP),
+		state.extensionStatuses.join(LIST_SEP),
+		stats.inputTokens,
+		stats.outputTokens,
+		stats.cacheReadTokens,
+		stats.cacheWriteTokens,
+		stats.totalTokens,
+		stats.cost,
+		stats.contextTokens ?? "",
+		stats.contextWindow ?? "",
+		stats.contextPercent ?? "",
+		stats.usingSubscription ? 1 : 0,
+	].join(SIGNATURE_SEP);
 }
 
 export function createTallGrayFooter(ctx: ExtensionContext, pi: ExtensionAPI) {
@@ -381,7 +355,7 @@ export function createTallGrayFooter(ctx: ExtensionContext, pi: ExtensionAPI) {
 			renderCache = undefined;
 		};
 		const unsubscribe = footerData.onBranchChange?.(() => {
-			invalidateStats();
+			invalidateRender();
 			tui.requestRender();
 		});
 		return {
@@ -393,9 +367,10 @@ export function createTallGrayFooter(ctx: ExtensionContext, pi: ExtensionAPI) {
 			},
 			render(width: number): string[] {
 				statsCache ??= collectFooterStats(ctx);
-				const signature = renderSignature(width, ctx, pi, footerData, statsCache);
+				const state = collectFooterSnapshot(ctx, pi, footerData);
+				const signature = footerSignature(width, state, statsCache);
 				if (renderCache?.signature === signature) return renderCache.rows;
-				const rows = renderFooter(width, ctx, pi, footerData, statsCache);
+				const rows = renderFooterRows(width, state, statsCache, TALL_GRAY_FOOTER_STYLE);
 				renderCache = { signature, rows };
 				return rows;
 			},

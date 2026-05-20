@@ -1,12 +1,12 @@
 import { CURSOR_MARKER, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import {
-	TALL_GRAY_EDITOR_HEIGHT,
-	TALL_GRAY_EDITOR_SURFACE_STYLE,
-	TALL_GRAY_EDITOR_STYLE,
-	TALL_GRAY_THINKING_STYLE,
-	TALL_GRAY_USER_MESSAGE_STYLE,
-	TALL_GRAY_SLASH_COMMAND_STYLE,
-	TALL_GRAY_BASH_EXECUTION_STYLE,
+	RAIL_EDITOR_HEIGHT,
+	RAIL_EDITOR_SURFACE_STYLE,
+	RAIL_EDITOR_STYLE,
+	RAIL_THINKING_STYLE,
+	RAIL_USER_MESSAGE_STYLE,
+	RAIL_SLASH_COMMAND_STYLE,
+	RAIL_BASH_EXECUTION_STYLE,
 	BASH_EXECUTION_RAIL_COLOR,
 	THINKING_RAIL_COLOR,
 	SLASH_COMMAND_RAIL_COLOR,
@@ -30,7 +30,7 @@ import {
 	type ColumnRange,
 	type MouseLayout,
 	type VisualRow,
-} from "../utils";
+} from "../core/utils";
 
 export type { EditorHeightPolicy, EditorSurfaceStyle, RailSurfaceStyle } from "../config";
 
@@ -45,7 +45,7 @@ export class EditorSurfaceRenderer {
 	private rowCache = new Map<string, string>();
 
 	constructor(
-		style: RailSurfaceStyle = TALL_GRAY_EDITOR_STYLE,
+		style: RailSurfaceStyle = RAIL_EDITOR_STYLE,
 		private readonly heightPolicy?: EditorHeightPolicy,
 	) {
 		this.style = style;
@@ -107,11 +107,11 @@ export class EditorSurfaceRenderer {
 	}
 }
 
-export const tallGrayEditorSurface = new EditorSurfaceRenderer(TALL_GRAY_EDITOR_STYLE, TALL_GRAY_EDITOR_HEIGHT);
-export const tallGrayThinkingSurface = new EditorSurfaceRenderer(TALL_GRAY_THINKING_STYLE);
-export const tallGrayUserMessageSurface = new EditorSurfaceRenderer(TALL_GRAY_USER_MESSAGE_STYLE);
-export const tallGraySlashCommandSurface = new EditorSurfaceRenderer(TALL_GRAY_SLASH_COMMAND_STYLE);
-export const tallGrayBashExecutionSurface = new EditorSurfaceRenderer(TALL_GRAY_BASH_EXECUTION_STYLE);
+export const railEditorSurface = new EditorSurfaceRenderer(RAIL_EDITOR_STYLE, RAIL_EDITOR_HEIGHT);
+export const railThinkingSurface = new EditorSurfaceRenderer(RAIL_THINKING_STYLE);
+export const railUserMessageSurface = new EditorSurfaceRenderer(RAIL_USER_MESSAGE_STYLE);
+export const railSlashCommandSurface = new EditorSurfaceRenderer(RAIL_SLASH_COMMAND_STYLE);
+export const railBashExecutionSurface = new EditorSurfaceRenderer(RAIL_BASH_EXECUTION_STYLE);
 
 export function railSectionSurfaceStyle(kind: RailSectionKind, theme?: ThemeLike): RailSurfaceStyle {
 	const config = railSectionConfig(kind);
@@ -119,7 +119,7 @@ export function railSectionSurfaceStyle(kind: RailSectionKind, theme?: ThemeLike
 		? (theme ? railAnsiForTheme(theme, config.style.rail) : undefined) ?? config.style.rail.ansi ?? ""
 		: "";
 	return {
-		...TALL_GRAY_EDITOR_SURFACE_STYLE,
+		...RAIL_EDITOR_SURFACE_STYLE,
 		leftWindowGapWidth: config.layout.leftWindowGapWidth,
 		leftBorder: config.style.railEnabled ? config.layout.leftBorder : "",
 		leftBorderWidth: config.style.railEnabled ? config.layout.leftBorderWidth : 0,
@@ -133,7 +133,7 @@ export function railSectionSurfaceForTheme(kind: RailSectionKind, theme?: ThemeL
 	return new EditorSurfaceRenderer(railSectionSurfaceStyle(kind, theme));
 }
 
-export const tallGraySelectorOutputSurface = railSectionSurfaceForTheme("selectorOutput");
+export const railSelectorOutputSurface = railSectionSurfaceForTheme("selectorOutput");
 
 export function selectorOutputSurfaceForTheme(theme: ThemeLike | undefined): EditorSurfaceRenderer {
 	return railSectionSurfaceForTheme("selectorOutput", theme);
@@ -141,15 +141,15 @@ export function selectorOutputSurfaceForTheme(theme: ThemeLike | undefined): Edi
 
 export function thinkingSurfaceForTheme(theme: ThemeLike): EditorSurfaceRenderer {
 	return new EditorSurfaceRenderer({
-		...TALL_GRAY_THINKING_STYLE,
-		rail: railAnsiForTheme(theme, THINKING_RAIL_COLOR) ?? TALL_GRAY_THINKING_STYLE.rail,
+		...RAIL_THINKING_STYLE,
+		rail: railAnsiForTheme(theme, THINKING_RAIL_COLOR) ?? RAIL_THINKING_STYLE.rail,
 	});
 }
 
 export function slashCommandSurfaceForTheme(theme: ThemeLike): EditorSurfaceRenderer {
 	return new EditorSurfaceRenderer({
-		...TALL_GRAY_SLASH_COMMAND_STYLE,
-		rail: railAnsiForTheme(theme, SLASH_COMMAND_RAIL_COLOR) ?? TALL_GRAY_SLASH_COMMAND_STYLE.rail,
+		...RAIL_SLASH_COMMAND_STYLE,
+		rail: railAnsiForTheme(theme, SLASH_COMMAND_RAIL_COLOR) ?? RAIL_SLASH_COMMAND_STYLE.rail,
 	});
 }
 
@@ -157,14 +157,14 @@ let _bashSurfaceCache: { theme: ThemeLike | undefined; surface: EditorSurfaceRen
 
 export function bashExecutionSurfaceForTheme(theme: ThemeLike | undefined): EditorSurfaceRenderer {
 	if (_bashSurfaceCache?.theme === theme) return _bashSurfaceCache.surface;
-	let rail = TALL_GRAY_BASH_EXECUTION_STYLE.rail;
+	let rail = RAIL_BASH_EXECUTION_STYLE.rail;
 	try {
 		if (theme) rail = railAnsiForTheme(theme, BASH_EXECUTION_RAIL_COLOR) ?? rail;
 	} catch {
 		// Theme may not be initialized in isolated tests; keep the static fallback.
 	}
 	const surface = new EditorSurfaceRenderer({
-		...TALL_GRAY_BASH_EXECUTION_STYLE,
+		...RAIL_BASH_EXECUTION_STYLE,
 		rail,
 	});
 	_bashSurfaceCache = { theme, surface };
@@ -176,7 +176,7 @@ export class SurfaceRailBlock implements Component {
 
 	constructor(
 		private readonly inner: Component,
-		private readonly surface: EditorSurfaceRenderer = tallGrayThinkingSurface,
+		private readonly surface: EditorSurfaceRenderer = railThinkingSurface,
 	) {}
 
 	invalidate(): void {
@@ -194,15 +194,14 @@ export class SurfaceRailBlock implements Component {
 	}
 }
 
-// Compatibility name used by older iterations of this extension.
-export class ThinkingSurfaceBlock extends SurfaceRailBlock {}
+export class ThinkingRailBlock extends SurfaceRailBlock {}
 
 export class SurfaceContentInsetBlock implements Component {
 	private cached?: { width: number; innerLines: string[]; rows: string[] };
 
 	constructor(
 		private readonly inner: Component,
-		private readonly surface: EditorSurfaceRenderer = tallGrayThinkingSurface,
+		private readonly surface: EditorSurfaceRenderer = railThinkingSurface,
 	) {}
 
 	invalidate(): void {
@@ -244,7 +243,7 @@ export type EditorSurfaceRenderResult = {
 export function renderEditorSurface(
 	width: number,
 	options: EditorSurfaceRenderOptions,
-	surface: EditorSurfaceRenderer = tallGrayEditorSurface,
+	surface: EditorSurfaceRenderer = railEditorSurface,
 ): EditorSurfaceRenderResult {
 	const contentWidth = surface.contentWidth(width);
 	const split = splitDefaultEditor(options.defaultEditorRows);

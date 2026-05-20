@@ -1,15 +1,15 @@
-import { isGapBlock, isLeftGapBlock, LeftGapBlock, unwrapGapBlock } from "../ui/gap";
-import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../patching";
-import { RailSectionBlock } from "../ui/rail-section";
+import { isGapBlock, isLeftGapBlock, LeftGapBlock, unwrapGapBlock } from "../../rail/rail-gap";
+import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../../core/patching";
+import { RailSectionBlock } from "../../rail/rail-section";
 
 type InteractiveModeCtor = { prototype: any };
 
-type ResourceStatusGapPatchStore = {
+type ResourceStatusRailPatchStore = {
 	active: boolean;
 	targets: PrototypePatchTarget[];
 };
 
-const getResourceStatusGapPatchStore = createStore<ResourceStatusGapPatchStore>("resource-status-gap-patch", () => ({
+const getResourceStatusRailPatchStore = createStore<ResourceStatusRailPatchStore>("resource-status-rail-patch", () => ({
 	active: false,
 	targets: [],
 }));
@@ -103,13 +103,13 @@ function wrapLastCommandOutputChild(mode: any): void {
 	children[lastIndex] = leftGapBlock(last);
 }
 
-function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusGapPatchStore): void {
+function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRailPatchStore): void {
 	if (!ctor?.prototype) return;
 
 	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showLoadedResources")) {
 		const original = ctor.prototype.showLoadedResources;
 		ctor.prototype.showLoadedResources = function patchedShowLoadedResources(this: any, options: any) {
-			const currentStore = getResourceStatusGapPatchStore();
+			const currentStore = getResourceStatusRailPatchStore();
 			if (!currentStore.active || typeof original !== "function") return original?.call(this, options);
 			return withGappedResourceChildren(this, () => original.call(this, options));
 		};
@@ -119,7 +119,7 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusGa
 	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showStatus")) {
 		const original = ctor.prototype.showStatus;
 		ctor.prototype.showStatus = function patchedShowStatus(this: any, message: string) {
-			const currentStore = getResourceStatusGapPatchStore();
+			const currentStore = getResourceStatusRailPatchStore();
 			if (!currentStore.active || typeof original !== "function") return original?.call(this, message);
 
 			const result = original.call(this, message);
@@ -133,7 +133,7 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusGa
 		if (store.targets.some((target) => target.ctor === ctor && target.methodName === methodName)) continue;
 		const original = ctor.prototype[methodName];
 		ctor.prototype[methodName] = function patchedCommandStatusOutput(this: any, message: string) {
-			const currentStore = getResourceStatusGapPatchStore();
+			const currentStore = getResourceStatusRailPatchStore();
 			if (!currentStore.active || typeof original !== "function") return original?.call(this, message);
 
 			const result = original.call(this, message);
@@ -144,14 +144,14 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusGa
 	}
 }
 
-export async function installResourceStatusGap(): Promise<void> {
-	const store = getResourceStatusGapPatchStore();
+export async function installResourceStatusRail(): Promise<void> {
+	const store = getResourceStatusRailPatchStore();
 	store.active = true;
 	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor, store);
 }
 
-export function uninstallResourceStatusGap(): void {
-	const store = getResourceStatusGapPatchStore();
+export function uninstallResourceStatusRail(): void {
+	const store = getResourceStatusRailPatchStore();
 	store.active = false;
 	restorePrototypePatches(store.targets);
 }

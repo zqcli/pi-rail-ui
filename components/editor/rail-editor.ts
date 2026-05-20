@@ -1,8 +1,8 @@
 import { CustomEditor, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, SelectList, matchesKey, visibleWidth, type Component, type EditorTheme, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
-import { SlashCommandOverlay } from "../ui/slash-autocomplete-overlay";
-import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED, EDITOR_PASTE_MARKER_STYLE, SLASH_COMMAND_LAYOUT, TALL_GRAY_EDITOR_STYLE, applyTextColor } from "../config";
-import { selectorOutputSurfaceForTheme, tallGrayEditorSurface, type EditorSurfaceRenderer } from "../ui/rail-surface";
+import { SlashCommandOverlay } from "./slash-autocomplete";
+import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED, EDITOR_PASTE_MARKER_STYLE, SLASH_COMMAND_LAYOUT, RAIL_EDITOR_STYLE, applyTextColor } from "../../config";
+import { selectorOutputSurfaceForTheme, railEditorSurface, type EditorSurfaceRenderer } from "../../rail/rail-surface";
 import {
 	CURSOR_POSITION_RE,
 	SGR_MOUSE_RE,
@@ -20,7 +20,7 @@ import {
 	type ParsedMouse,
 	type Position,
 	type VisualRow,
-} from "../utils";
+} from "../../core/utils";
 
 const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1002l\x1b[?1006l";
@@ -73,7 +73,7 @@ export function exitAlternateScreen(): void {
 	if (process.stdout.isTTY) process.stdout.write(EXIT_ALT_SCREEN);
 }
 
-export class MouseSelectableCustomEditor extends CustomEditor {
+export class MouseSelectableRailEditor extends CustomEditor {
 	protected selection?: { anchor: Position; active: Position };
 	private pendingMouse?: ParsedMouse;
 	private mouseLayout?: MouseLayout;
@@ -294,9 +294,9 @@ export class MouseSelectableCustomEditor extends CustomEditor {
 	}
 }
 
-const activeTallGrayEditors = new Set<TallGrayInputEditor>();
+const activeRailEditors = new Set<RailEditor>();
 
-function selectListThemeForTallGraySlashMenu(theme: EditorTheme, appTheme: Theme): EditorTheme {
+function selectListThemeForRailSlashMenu(theme: EditorTheme, appTheme: Theme): EditorTheme {
 	return {
 		...theme,
 		selectList: {
@@ -307,13 +307,13 @@ function selectListThemeForTallGraySlashMenu(theme: EditorTheme, appTheme: Theme
 }
 
 export function hideAllEditorOverlays(): void {
-	for (const editor of activeTallGrayEditors) editor.hideSlashOverlay();
-	activeTallGrayEditors.clear();
+	for (const editor of activeRailEditors) editor.hideSlashOverlay();
+	activeRailEditors.clear();
 }
 
 type SlashAutocompleteLevel = "top" | "nested";
 
-export class TallGrayInputEditor extends MouseSelectableCustomEditor {
+export class RailEditor extends MouseSelectableRailEditor {
 	private slashOverlay?: OverlayHandle;
 	private slashOverlaySignature?: string;
 	private readonly slashOverlaySurface: EditorSurfaceRenderer;
@@ -330,14 +330,14 @@ export class TallGrayInputEditor extends MouseSelectableCustomEditor {
 		theme: EditorTheme,
 		keybindings: KeybindingsManager,
 		private readonly appTheme: Theme,
-		private readonly surface: EditorSurfaceRenderer = tallGrayEditorSurface,
+		private readonly surface: EditorSurfaceRenderer = railEditorSurface,
 	) {
-		const themedEditorTheme = selectListThemeForTallGraySlashMenu(theme, appTheme);
+		const themedEditorTheme = selectListThemeForRailSlashMenu(theme, appTheme);
 		super(tui, themedEditorTheme, keybindings);
 		this.selectListTheme = themedEditorTheme.selectList;
 		this.slashOverlaySurface = selectorOutputSurfaceForTheme(appTheme);
 		this.setAutocompleteMaxVisible(Math.max(SLASH_COMMAND_LAYOUT.firstLevelMaxRows, SLASH_COMMAND_LAYOUT.nestedMaxRows));
-		activeTallGrayEditors.add(this);
+		activeRailEditors.add(this);
 	}
 
 	hideSlashOverlay(): void {
@@ -439,7 +439,7 @@ export class TallGrayInputEditor extends MouseSelectableCustomEditor {
 		const maxScrollStart = Math.max(1, totalRows - visibleRows);
 		const thumbStart = Math.round((start / maxScrollStart) * maxThumbStart);
 		const isThumb = rowIndex >= thumbStart && rowIndex < thumbStart + thumbSize;
-		const bar = isThumb ? `${TALL_GRAY_EDITOR_STYLE.rail}┃${TALL_GRAY_EDITOR_STYLE.reset}` : "│";
+		const bar = isThumb ? `${RAIL_EDITOR_STYLE.rail}┃${RAIL_EDITOR_STYLE.reset}` : "│";
 		return `${padToWidth(line, contentWidth - 1)}${bar}`;
 	}
 

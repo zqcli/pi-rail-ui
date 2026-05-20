@@ -1,8 +1,8 @@
 import * as path from "node:path";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { FOOTER_LAYOUT, TALL_GRAY_EDITOR_SURFACE_STYLE, TALL_GRAY_FOOTER_STYLE, type FooterStyle } from "../config";
-import { fitToWidth } from "../utils";
+import { FOOTER_LAYOUT, RAIL_EDITOR_SURFACE_STYLE, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
+import { fitToWidth } from "../../core/utils";
 
 export type FooterStats = {
 	inputTokens: number;
@@ -38,7 +38,7 @@ type FooterSnapshot = {
 };
 
 const FOOTER_STORE_KEY = Symbol.for("pi-rail-ui.footer-state");
-const FOOTER_LEFT_GAP = Math.max(0, TALL_GRAY_EDITOR_SURFACE_STYLE.leftWindowGapWidth);
+const FOOTER_LEFT_GAP = Math.max(0, RAIL_EDITOR_SURFACE_STYLE.leftWindowGapWidth);
 const SIMPLE_MODEL_MAX_WIDTH = Math.max(12, FOOTER_LAYOUT.modelMaxWidth);
 const EXPANDED_MODEL_MAX_WIDTH = Math.max(28, FOOTER_LAYOUT.modelMaxWidth + 12);
 const SESSION_MAX_WIDTH = 28;
@@ -307,7 +307,7 @@ export function renderFooter(
 	pi: ExtensionAPI,
 	footerData: any,
 	stats: FooterStats = collectFooterStats(ctx),
-	style: FooterStyle = TALL_GRAY_FOOTER_STYLE,
+	style: FooterStyle = RAIL_FOOTER_STYLE,
 ): string[] {
 	return renderFooterRows(width, collectFooterSnapshot(ctx, pi, footerData), stats, style);
 }
@@ -343,7 +343,7 @@ function footerSignature(width: number, state: FooterSnapshot, stats: FooterStat
 	].join(SIGNATURE_SEP);
 }
 
-export function createTallGrayFooter(ctx: ExtensionContext, pi: ExtensionAPI) {
+export function createRailFooter(ctx: ExtensionContext, pi: ExtensionAPI) {
 	return (tui: any, _theme: any, footerData: any) => {
 		let statsCache: FooterStats | undefined;
 		let renderCache: { signature: string; rows: string[] } | undefined;
@@ -370,7 +370,7 @@ export function createTallGrayFooter(ctx: ExtensionContext, pi: ExtensionAPI) {
 				const state = collectFooterSnapshot(ctx, pi, footerData);
 				const signature = footerSignature(width, state, statsCache);
 				if (renderCache?.signature === signature) return renderCache.rows;
-				const rows = renderFooterRows(width, state, statsCache, TALL_GRAY_FOOTER_STYLE);
+				const rows = renderFooterRows(width, state, statsCache, RAIL_FOOTER_STYLE);
 				renderCache = { signature, rows };
 				return rows;
 			},

@@ -1,6 +1,6 @@
-import { CONVERSATION_SCROLL_LAYOUT } from "../config";
-import { renderedRailSectionRange, resolveRailSection, type RailSectionRange } from "../ui/rail-section";
-import { stripAnsi } from "../utils";
+import { CONVERSATION_SCROLL_LAYOUT } from "../../config";
+import { renderedRailSectionRange, resolveRailSection, type RailSectionRange } from "../../rail/rail-section";
+import { stripAnsi } from "../../core/utils";
 import type { HistoryRenderResult, RenderCache, ScrollState } from "./state";
 
 function renderChild(child: any, width: number): string[] {

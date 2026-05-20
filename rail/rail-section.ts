@@ -2,13 +2,13 @@ import type { Component } from "@earendil-works/pi-tui";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import {
 	railSectionConfig,
-	TALL_GRAY_EDITOR_STYLE,
+	RAIL_EDITOR_STYLE,
 	type RailSectionKind,
 	type RailSectionResolvedConfig,
 	type ThemeLike,
 } from "../config";
-import { LeftGapBlock, isGapBlock, unwrapGapBlock } from "./gap";
-import { padToWidth, stripAnsi, type Position } from "../utils";
+import { LeftGapBlock, isGapBlock, unwrapGapBlock } from "./rail-gap";
+import { padToWidth, stripAnsi, type Position } from "../core/utils";
 
 export type { RailSectionKind, RailSectionResolvedConfig } from "../config";
 
@@ -110,8 +110,6 @@ export function resolveRailSection(component: any): RailSectionDefinition | unde
 	return { kind, component: target, config: railSectionConfig(kind) };
 }
 
-// Compatibility name used by the first tool/bash-only iteration.
-export const resolveCollapsibleRailSection = resolveRailSection;
 
 export function isBlankRailSectionLine(line: string): boolean {
 	return stripAnsi(line).trim().length === 0;
@@ -252,10 +250,10 @@ export class RailSectionBlock extends LeftGapBlock {
 		if (this.cached?.width === width && this.cached.innerLines === innerLines) return this.cached.rows;
 
 		const leftGap = " ".repeat(layout.leftWindowGapWidth);
-		const border = hasRail ? `${railAnsi}${layout.leftBorder}${TALL_GRAY_EDITOR_STYLE.reset}` : "";
+		const border = hasRail ? `${railAnsi}${layout.leftBorder}${RAIL_EDITOR_STYLE.reset}` : "";
 		const borderGap = hasRail ? " ".repeat(layout.borderContentGapWidth) : "";
 		const rows = innerLines.map((line) => {
-			const content = `${this.config.style.background}${padToWidth(line, innerWidth)}${TALL_GRAY_EDITOR_STYLE.reset}`;
+			const content = `${this.config.style.background}${padToWidth(line, innerWidth)}${RAIL_EDITOR_STYLE.reset}`;
 			return `${leftGap}${border}${borderGap}${content}`;
 		});
 		this.cached = { width, innerLines, rows };

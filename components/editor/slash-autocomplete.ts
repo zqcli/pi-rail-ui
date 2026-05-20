@@ -1,7 +1,7 @@
 import { type Component } from "@earendil-works/pi-tui";
-import { SLASH_COMMAND_LAYOUT } from "../config";
-import { RailOverlayPanel } from "./rail-overlay";
-import { EditorSurfaceRenderer, tallGraySelectorOutputSurface } from "./rail-surface";
+import { SLASH_COMMAND_LAYOUT } from "../../config";
+import { RailOverlayPanel } from "../../rail/rail-overlay";
+import { EditorSurfaceRenderer, railSelectorOutputSurface } from "../../rail/rail-surface";
 
 /**
  * Non-capturing overlay body for slash-command autocomplete. It intentionally
@@ -12,7 +12,7 @@ export class SlashCommandOverlay extends RailOverlayPanel {
 	constructor(
 		getList: () => Component | undefined,
 		getMaxRows: () => number,
-		surface: EditorSurfaceRenderer = tallGraySelectorOutputSurface,
+		surface: EditorSurfaceRenderer = railSelectorOutputSurface,
 	) {
 		super({
 			surface,

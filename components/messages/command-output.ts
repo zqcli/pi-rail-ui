@@ -1,14 +1,14 @@
-import { isGapBlock } from "../ui/gap";
-import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../patching";
-import { RailSectionBlock } from "../ui/rail-section";
+import { isGapBlock } from "../../rail/rail-gap";
+import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../../core/patching";
+import { RailSectionBlock } from "../../rail/rail-section";
 
 type InteractiveModeCtor = { prototype: any };
-type CommandOutputGapPatchStore = {
+type CommandOutputRailPatchStore = {
 	active: boolean;
 	targets: PrototypePatchTarget[];
 };
 
-const getCommandOutputGapPatchStore = createStore<CommandOutputGapPatchStore>("command-output-gap-patch", () => ({
+const getCommandOutputRailPatchStore = createStore<CommandOutputRailPatchStore>("command-output-rail-patch", () => ({
 	active: false,
 	targets: [],
 }));
@@ -58,7 +58,7 @@ function withLeftGappedChatChildren<T>(mode: any, renderOutput: () => T): T {
 	return result;
 }
 
-function patchInteractiveMode(ctor: InteractiveModeCtor, store: CommandOutputGapPatchStore): void {
+function patchInteractiveMode(ctor: InteractiveModeCtor, store: CommandOutputRailPatchStore): void {
 	if (!ctor?.prototype) return;
 
 	for (const methodName of COMMAND_OUTPUT_METHODS) {
@@ -67,7 +67,7 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: CommandOutputGap
 		if (typeof original !== "function") continue;
 
 		ctor.prototype[methodName] = function patchedCommandOutputMethod(this: any, ...args: any[]) {
-			const currentStore = getCommandOutputGapPatchStore();
+			const currentStore = getCommandOutputRailPatchStore();
 			if (!currentStore.active) return original.apply(this, args);
 			return withLeftGappedChatChildren(this, () => original.apply(this, args));
 		};
@@ -75,14 +75,14 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: CommandOutputGap
 	}
 }
 
-export async function installCommandOutputGap(): Promise<void> {
-	const store = getCommandOutputGapPatchStore();
+export async function installCommandOutputRail(): Promise<void> {
+	const store = getCommandOutputRailPatchStore();
 	store.active = true;
 	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor, store);
 }
 
-export function uninstallCommandOutputGap(): void {
-	const store = getCommandOutputGapPatchStore();
+export function uninstallCommandOutputRail(): void {
+	const store = getCommandOutputRailPatchStore();
 	store.active = false;
 	restorePrototypePatches(store.targets);
 }

@@ -1,10 +1,10 @@
 import { UserMessageComponent, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
-import { USER_MESSAGE_LAYOUT, applyTextColor } from "../config";
-import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../patching";
-import { cachedRender } from "../ui/render-cache";
-import { EditorSurfaceRenderer, tallGrayUserMessageSurface } from "../ui/rail-surface";
-import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, padToWidth } from "../utils";
+import { USER_MESSAGE_LAYOUT, applyTextColor } from "../../config";
+import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../../core/patching";
+import { cachedRender } from "../../rail/render-cache";
+import { EditorSurfaceRenderer, railUserMessageSurface } from "../../rail/rail-surface";
+import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, padToWidth } from "../../core/utils";
 
 type UserMessageWithInternals = UserMessageComponent & {
 	contentBox?: { children?: Component[] };
@@ -14,7 +14,7 @@ type UserMessageConstructor = {
 	prototype: UserMessageWithInternals & { render(width: number): string[] };
 };
 
-type UserMessageSurfacePatchStore = {
+type UserMessageRailPatchStore = {
 	active: boolean;
 	installed: boolean;
 	targets: PrototypePatchTarget[];
@@ -28,11 +28,11 @@ type UserMessageSurfacePatchStore = {
 
 const USER_MESSAGE_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.user-message-render-cache");
 
-const getUserMessageSurfacePatchStore = createStore<UserMessageSurfacePatchStore>("user-message-surface-patch", () => ({
+const getUserMessageRailPatchStore = createStore<UserMessageRailPatchStore>("user-message-rail-patch", () => ({
 	active: false,
 	installed: false,
 	targets: [],
-	surface: tallGrayUserMessageSurface,
+	surface: railUserMessageSurface,
 	timestampsByText: new Map<string, number[]>(),
 	timestampCursorByText: new Map<string, number>(),
 	assignedTimestamps: new WeakMap<object, number>(),
@@ -64,7 +64,7 @@ function timestampFromMessageOrEntry(message: any, entry?: any): number | undefi
 }
 
 function rememberTimestamp(text: string, timestamp: number): void {
-	const store = getUserMessageSurfacePatchStore();
+	const store = getUserMessageRailPatchStore();
 	const timestamps = store.timestampsByText.get(text) ?? [];
 	if (timestamps[timestamps.length - 1] !== timestamp) timestamps.push(timestamp);
 	store.timestampsByText.set(text, timestamps);
@@ -78,7 +78,7 @@ export function rememberUserMessageTimestamp(message: any, entry?: any): void {
 }
 
 export function refreshUserMessageTimestamps(ctx: ExtensionContext): void {
-	const store = getUserMessageSurfacePatchStore();
+	const store = getUserMessageRailPatchStore();
 	store.timestampsByText.clear();
 	store.timestampCursorByText.clear();
 	store.assignedTimestamps = new WeakMap<object, number>();
@@ -114,7 +114,7 @@ function formatUserMessageTimestamp(timestamp: number): string {
 }
 
 function timestampForUserMessage(component: object, sourceText: string | undefined): number {
-	const store = getUserMessageSurfacePatchStore();
+	const store = getUserMessageRailPatchStore();
 	const assigned = store.assignedTimestamps.get(component);
 	if (assigned !== undefined) return assigned;
 
@@ -183,9 +183,9 @@ function renderUserMessageWithSurface(
 	}, { markdown });
 }
 
-export async function installUserMessageSurface(ctx: ExtensionContext): Promise<void> {
-	const store = getUserMessageSurfacePatchStore();
-	store.surface = tallGrayUserMessageSurface;
+export async function installUserMessageRail(ctx: ExtensionContext): Promise<void> {
+	const store = getUserMessageRailPatchStore();
+	store.surface = railUserMessageSurface;
 	store.theme = ctx.ui.theme;
 	refreshUserMessageTimestamps(ctx);
 	store.active = true;
@@ -195,7 +195,7 @@ export async function installUserMessageSurface(ctx: ExtensionContext): Promise<
 
 		const original = ctor.prototype.render;
 		ctor.prototype.render = function patchedUserMessageRender(this: UserMessageWithInternals, width: number) {
-			const currentStore = getUserMessageSurfacePatchStore();
+			const currentStore = getUserMessageRailPatchStore();
 			if (!currentStore.active) return original.call(this, width);
 			try {
 				return renderUserMessageWithSurface(this, width, currentStore.surface, currentStore.theme, original);
@@ -209,8 +209,8 @@ export async function installUserMessageSurface(ctx: ExtensionContext): Promise<
 	store.installed = store.targets.length > 0;
 }
 
-export function uninstallUserMessageSurface(): void {
-	const store = getUserMessageSurfacePatchStore();
+export function uninstallUserMessageRail(): void {
+	const store = getUserMessageRailPatchStore();
 	store.active = false;
 	store.theme = undefined;
 	store.timestampsByText.clear();

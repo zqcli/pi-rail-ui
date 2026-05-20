@@ -1,7 +1,7 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { SLASH_COMMAND_LAYOUT } from "../config";
-import { padToWidth } from "../utils";
-import { EditorSurfaceRenderer, tallGraySelectorOutputSurface } from "./rail-surface";
+import { padToWidth } from "../core/utils";
+import { EditorSurfaceRenderer, railSelectorOutputSurface } from "./rail-surface";
 
 export type RailOverlayBodyRenderer = (contentWidth: number) => string[];
 
@@ -27,7 +27,7 @@ export function renderRailOverlayRows(
 	renderBody: RailOverlayBodyRenderer,
 	options: RailOverlayRenderOptions = {},
 ): string[] {
-	const surface = options.surface ?? tallGraySelectorOutputSurface;
+	const surface = options.surface ?? railSelectorOutputSurface;
 	if (width < surface.minRenderableWidth()) return [];
 
 	const contentWidth = surface.contentWidth(width);
@@ -52,7 +52,7 @@ export class RailOverlayPanel implements Component {
 	private readonly textGapWidth: number;
 
 	constructor(private readonly options: RailOverlayPanelOptions) {
-		this.surface = options.surface ?? tallGraySelectorOutputSurface;
+		this.surface = options.surface ?? railSelectorOutputSurface;
 		this.textGapWidth = Math.max(0, Math.round(options.textGapWidth ?? SLASH_COMMAND_LAYOUT.textGapWidth));
 	}
 

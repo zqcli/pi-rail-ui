@@ -1,6 +1,6 @@
-import { createStore, type PrototypePatchTarget } from "../patching";
-import type { RailSectionDefinition, RailSectionRange } from "../ui/rail-section";
-import type { Position } from "../utils";
+import { createStore, type PrototypePatchTarget } from "../../core/patching";
+import type { RailSectionDefinition, RailSectionRange } from "../../rail/rail-section";
+import type { Position } from "../../core/utils";
 
 export type TuiCtor = { prototype: any };
 

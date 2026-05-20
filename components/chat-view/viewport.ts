@@ -1,7 +1,7 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, CONVERSATION_SELECTION_STYLE, FOOTER_LAYOUT, TALL_GRAY_EDITOR_STYLE } from "../config";
-import { getInteractiveModeConstructors, restorePrototypePatches } from "../patching";
-import { applyColumnHighlight, clamp, padToWidth } from "../utils";
+import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, CONVERSATION_SELECTION_STYLE, FOOTER_LAYOUT, RAIL_EDITOR_STYLE } from "../../config";
+import { getInteractiveModeConstructors, restorePrototypePatches } from "../../core/patching";
+import { applyColumnHighlight, clamp, padToWidth } from "../../core/utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
 import { handleConversationInput, selectionRange } from "./interactions";
 import {
@@ -119,7 +119,7 @@ function highlightHistoryLine(
 
 	const startCol = lineIndex === range.start.line ? range.start.col : 0;
 	const endCol = lineIndex === range.end.line ? range.end.col : width;
-	return applyColumnHighlight(line, startCol, endCol, CONVERSATION_SELECTION_STYLE, TALL_GRAY_EDITOR_STYLE.reset);
+	return applyColumnHighlight(line, startCol, endCol, CONVERSATION_SELECTION_STYLE, RAIL_EDITOR_STYLE.reset);
 }
 
 function renderStickyConversation(tui: any, width: number, originalRender: (width: number) => string[], store: ConversationScrollStore): string[] {

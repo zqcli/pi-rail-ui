@@ -4,42 +4,24 @@ import {
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
-import { TallGrayInputEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays } from "./components/editor";
-import { createTallGrayFooter, setFooterExpanded } from "./components/footer";
-import { installCommandOutputGap, uninstallCommandOutputGap } from "./patches/command-output";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
-import { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll } from "./chat-view";
-import {
-	installThinkingSurface,
-	uninstallThinkingSurface,
-} from "./patches/message-surfaces";
-import {
-	installUserMessageSurface,
-	refreshUserMessageTimestamps,
-	rememberUserMessageTimestamp,
-	uninstallUserMessageSurface,
-} from "./patches/user-message-surface";
-import { installResourceStatusGap, uninstallResourceStatusGap } from "./patches/resource-status";
-import { installSettingsMenuSurface, uninstallSettingsMenuSurface } from "./patches/selector-overlays";
-import { installToolExecutionGap, uninstallToolExecutionGap } from "./patches/execution-surfaces";
-import { setRailUiActive } from "./ui/rail-section";
+import { RailEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays, installSelectorOverlay, uninstallSelectorOverlay } from "./components/editor";
+import { createRailFooter, setFooterExpanded } from "./components/footer";
+import { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll } from "./components/chat-view";
+import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
+import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
+import { setRailUiActive } from "./rail";
 
-export * from "./ui/slash-autocomplete-overlay";
-export * from "./patches/command-output";
 export * from "./config";
-export * from "./chat-view";
+export * from "./core/clipboard";
+export * from "./core/patching";
+export * from "./core/utils";
+export * from "./rail";
 export * from "./components/editor";
 export * from "./components/footer";
-export * from "./ui/gap";
-export * from "./ui/rail-overlay";
-export * from "./patches/message-surfaces";
-export * from "./patches/user-message-surface";
-export * from "./ui/rail-section";
-export * from "./patches/resource-status";
-export * from "./patches/selector-overlays";
-export * from "./ui/rail-surface";
-export * from "./patches/execution-surfaces";
-export * from "./utils";
+export * from "./components/messages";
+export * from "./components/executions";
+export * from "./components/chat-view";
 
 export default async function piRailUi(pi: ExtensionAPI) {
 	let enabled = true;
@@ -63,7 +45,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	function installEditor(ctx: ExtensionContext) {
 		ctx.ui.setEditorComponent((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => {
 			ensureConversationAlternateScreen(tui);
-			return new TallGrayInputEditor(tui, theme, keybindings, ctx.ui.theme);
+			return new RailEditor(tui, theme, keybindings, ctx.ui.theme);
 		});
 
 		if (EDITOR_MOUSE_TRACKING_ENABLED || CONVERSATION_SCROLL_LAYOUT.enabled) enableMouse();
@@ -74,7 +56,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	}
 
 	function installFooter(ctx: ExtensionContext) {
-		ctx.ui.setFooter(createTallGrayFooter(ctx, pi));
+		ctx.ui.setFooter(createRailFooter(ctx, pi));
 	}
 
 	async function install(ctx: ExtensionContext) {
@@ -83,12 +65,12 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		await installConversationScroll();
 		installEditor(ctx);
 		installFooter(ctx);
-		await installThinkingSurface(ctx.ui.theme);
-		await installUserMessageSurface(ctx);
-		await installSettingsMenuSurface(ctx.ui.theme);
-		await installToolExecutionGap();
-		await installResourceStatusGap();
-		await installCommandOutputGap();
+		await installAssistantMessageRail(ctx.ui.theme);
+		await installUserMessageRail(ctx);
+		await installSelectorOverlay(ctx.ui.theme);
+		await installExecutionRails();
+		await installResourceStatusRail();
+		await installCommandOutputRail();
 	}
 
 	function uninstall(ctx: ExtensionContext) {
@@ -99,12 +81,12 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		hideAllEditorOverlays();
 		disableMouse();
 		releaseConversationAlternateScreen();
-		uninstallThinkingSurface();
-		uninstallUserMessageSurface();
-		uninstallSettingsMenuSurface();
-		uninstallToolExecutionGap();
-		uninstallResourceStatusGap();
-		uninstallCommandOutputGap();
+		uninstallAssistantMessageRail();
+		uninstallUserMessageRail();
+		uninstallSelectorOverlay();
+		uninstallExecutionRails();
+		uninstallResourceStatusRail();
+		uninstallCommandOutputRail();
 		uninstallConversationScroll();
 	}
 
@@ -164,12 +146,12 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		hideAllEditorOverlays();
 		disableMouse();
 		if (!keepAlternateScreen) releaseConversationAlternateScreen();
-		uninstallThinkingSurface();
-		uninstallUserMessageSurface();
-		uninstallSettingsMenuSurface();
-		uninstallToolExecutionGap();
-		uninstallResourceStatusGap();
-		uninstallCommandOutputGap();
+		uninstallAssistantMessageRail();
+		uninstallUserMessageRail();
+		uninstallSelectorOverlay();
+		uninstallExecutionRails();
+		uninstallResourceStatusRail();
+		uninstallCommandOutputRail();
 		if (keepConversationScroll) resetConversationScrollState();
 		else uninstallConversationScroll({ releaseAlternateScreen: !keepAlternateScreen });
 		enabled = true;

@@ -101,8 +101,8 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailS
 
 	const fallbackSpacing = fallbackLayout.spacing;
 	const rawSpacing = layout.spacing;
-	const legacyBeforeRows = layout.verticalSpacingRows ?? fallbackLayout.verticalSpacingRows;
-	const beforeRows = rawSpacing?.beforeRows ?? fallbackSpacing?.beforeRows ?? legacyBeforeRows ?? 0;
+	const fallbackBeforeRows = layout.verticalSpacingRows ?? fallbackLayout.verticalSpacingRows;
+	const beforeRows = rawSpacing?.beforeRows ?? fallbackSpacing?.beforeRows ?? fallbackBeforeRows ?? 0;
 	const resolvedSpacing: RailSectionSpacingConfig = {
 		beforeRows: Math.max(0, Math.round(beforeRows)),
 		afterRows: Math.max(0, Math.round(rawSpacing?.afterRows ?? fallbackSpacing?.afterRows ?? 0)),
@@ -169,14 +169,14 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailS
 
 export const CONVERSATION_SELECTION_STYLE = selectionBackground;
 
-export const TALL_GRAY_EDITOR_SURFACE_STYLE: RailSurfaceStyle = {
+export const RAIL_EDITOR_SURFACE_STYLE: RailSurfaceStyle = {
 	...style.surfaceLayout,
 	background: editorBackground,
 	rail: editorRail,
 	selection,
 };
 
-export const TALL_GRAY_EDITOR_HEIGHT = {
+export const RAIL_EDITOR_HEIGHT = {
 	minHeight: style.editor.height.min,
 	maxHeight: style.editor.height.max,
 	maxHeightRatio: style.editor.height.maxRatio,
@@ -217,9 +217,9 @@ export const CONVERSATION_SCROLLBAR_STYLE: ConversationScrollbarStyle = {
 	reset: style.surfaceLayout.reset,
 };
 
-export const TALL_GRAY_EDITOR_STYLE: EditorSurfaceStyle = {
-	...TALL_GRAY_EDITOR_SURFACE_STYLE,
-	...TALL_GRAY_EDITOR_HEIGHT,
+export const RAIL_EDITOR_STYLE: EditorSurfaceStyle = {
+	...RAIL_EDITOR_SURFACE_STYLE,
+	...RAIL_EDITOR_HEIGHT,
 };
 
 const thinkingSectionStyle = rawSectionStyle("assistantThinking");
@@ -227,8 +227,8 @@ export const THINKING_RAIL_COLOR = resolveTextColor(
 	thinkingSectionStyle?.rail && thinkingSectionStyle.rail !== false ? thinkingSectionStyle.rail : style.thinking.rail,
 	{ editorRail },
 );
-export const TALL_GRAY_THINKING_STYLE: RailSurfaceStyle = {
-	...TALL_GRAY_EDITOR_SURFACE_STYLE,
+export const RAIL_THINKING_STYLE: RailSurfaceStyle = {
+	...RAIL_EDITOR_SURFACE_STYLE,
 	background: resolveBackground(thinkingSectionStyle?.background ?? style.thinking.background, editorBackground),
 	rail: THINKING_RAIL_COLOR.ansi ?? editorRail,
 };
@@ -244,8 +244,8 @@ const userRailColor = resolveTextColor(
 	userMessageSectionStyle?.rail && userMessageSectionStyle.rail !== false ? userMessageSectionStyle.rail : style.userMessage.rail,
 	{ editorRail },
 );
-export const TALL_GRAY_USER_MESSAGE_STYLE: RailSurfaceStyle = {
-	...TALL_GRAY_EDITOR_SURFACE_STYLE,
+export const RAIL_USER_MESSAGE_STYLE: RailSurfaceStyle = {
+	...RAIL_EDITOR_SURFACE_STYLE,
 	background: resolveBackground(userMessageSectionStyle?.background ?? style.userMessage.background, editorBackground),
 	rail: userRailColor.ansi ?? editorRail,
 };
@@ -254,15 +254,15 @@ export const SLASH_COMMAND_RAIL_COLOR = resolveTextColor(style.slashCommand.rail
 export const SLASH_COMMAND_LAYOUT: SlashCommandLayout = {
 	textGapWidth: Math.max(0, style.slashCommand.textGapWidth),
 	bottomReservedRows: Math.max(0, style.slashCommand.bottomReservedRows),
-	firstLevelMaxRows: Math.max(1, Math.round(TALL_GRAY_EDITOR_HEIGHT.minHeight * style.slashCommand.firstLevelHeightMultiplier)),
+	firstLevelMaxRows: Math.max(1, Math.round(RAIL_EDITOR_HEIGHT.minHeight * style.slashCommand.firstLevelHeightMultiplier)),
 	nestedMaxRows: Math.max(1, style.slashCommand.nestedMaxOverlayRows),
 	minPrimaryColumnWidth: Math.max(1, style.slashCommand.minPrimaryColumnWidth),
 	maxPrimaryColumnWidth: Math.max(1, style.slashCommand.maxPrimaryColumnWidth),
 	selectedText: resolveTextColor(style.slashCommand.selectedText, { editorRail }),
 };
 
-export const TALL_GRAY_SLASH_COMMAND_STYLE: RailSurfaceStyle = {
-	...TALL_GRAY_EDITOR_SURFACE_STYLE,
+export const RAIL_SLASH_COMMAND_STYLE: RailSurfaceStyle = {
+	...RAIL_EDITOR_SURFACE_STYLE,
 	background: resolveBackground(style.slashCommand.background, editorBackground),
 	rail: SLASH_COMMAND_RAIL_COLOR.ansi ?? editorRail,
 };
@@ -282,8 +282,8 @@ export const BASH_EXECUTION_RAIL_COLOR = resolveTextColor(
 	bashExecutionSectionStyle?.rail && bashExecutionSectionStyle.rail !== false ? bashExecutionSectionStyle.rail : style.bashExecution?.rail ?? "theme:bashMode",
 	{ editorRail },
 );
-export const TALL_GRAY_BASH_EXECUTION_STYLE: RailSurfaceStyle = {
-	...TALL_GRAY_EDITOR_SURFACE_STYLE,
+export const RAIL_BASH_EXECUTION_STYLE: RailSurfaceStyle = {
+	...RAIL_EDITOR_SURFACE_STYLE,
 	leftBorder: bashExecutionSectionLayout?.leftBorder ?? style.bashExecution?.leftBorder ?? style.surfaceLayout.leftBorder,
 	borderContentGapWidth: Math.max(0, Math.round(bashExecutionSectionLayout?.borderContentGapWidth ?? style.bashExecution?.borderContentGapWidth ?? style.surfaceLayout.borderContentGapWidth)),
 	background: resolveBackground(bashExecutionSectionStyle?.background ?? style.bashExecution?.background ?? "editor.background", editorBackground),
@@ -328,7 +328,7 @@ export function railSectionConfig(kind: RailSectionKind): RailSectionResolvedCon
 	return RAIL_SECTION_CONFIGS[kind] ?? RAIL_SECTION_CONFIGS.custom;
 }
 
-export const TALL_GRAY_FOOTER_STYLE: FooterStyle = {
+export const RAIL_FOOTER_STYLE: FooterStyle = {
 	sky: fg(style.footer.colors.sky, "footer.colors.sky"),
 	mint: fg(style.footer.colors.mint, "footer.colors.mint"),
 	amber: fg(style.footer.colors.amber, "footer.colors.amber"),

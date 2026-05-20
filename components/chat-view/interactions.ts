@@ -1,7 +1,7 @@
 import { TUI, visibleWidth } from "@earendil-works/pi-tui";
-import { copyToClipboard } from "../clipboard";
-import { toggleFooterExpanded } from "../components/footer";
-import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE } from "../config";
+import { copyToClipboard } from "../../core/clipboard";
+import { toggleFooterExpanded } from "../footer";
+import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE } from "../../config";
 import {
 	canToggleRailSection,
 	normalizeRailSectionPosition,
@@ -10,8 +10,8 @@ import {
 	sameRailSection,
 	toggleRailSection,
 	type RailSectionRange,
-} from "../ui/rail-section";
-import { SGR_MOUSE_RE, clamp, comparePosition, parseWheel, samePosition, segmenter, stripAnsi, type Position } from "../utils";
+} from "../../rail/rail-section";
+import { SGR_MOUSE_RE, clamp, comparePosition, parseWheel, samePosition, segmenter, stripAnsi, type Position } from "../../core/utils";
 import { isInteractiveRoot } from "./history-renderer";
 import { stateFor, type ActiveInteraction, type ConversationScrollStore, type ScrollAnimation, type ScrollState, type ScrollView } from "./state";
 

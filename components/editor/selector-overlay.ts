@@ -5,16 +5,16 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
-import { SLASH_COMMAND_LAYOUT, TALL_GRAY_EDITOR_HEIGHT, applyTextColor, type ThemeLike } from "../config";
-import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../patching";
-import { RailOverlayPanel, renderRailOverlayRows, type RailOverlayBodyRenderer } from "../ui/rail-overlay";
-import { cachedRender } from "../ui/render-cache";
-import { selectorOutputSurfaceForTheme, tallGraySelectorOutputSurface, type EditorSurfaceRenderer } from "../ui/rail-surface";
+import { SLASH_COMMAND_LAYOUT, RAIL_EDITOR_HEIGHT, applyTextColor, type ThemeLike } from "../../config";
+import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../../core/patching";
+import { RailOverlayPanel, renderRailOverlayRows, type RailOverlayBodyRenderer } from "../../rail/rail-overlay";
+import { cachedRender } from "../../rail/render-cache";
+import { selectorOutputSurfaceForTheme, railSelectorOutputSurface, type EditorSurfaceRenderer } from "../../rail/rail-surface";
 
 type SelectorCtor = { prototype: any };
 type InteractiveModeCtor = { prototype: any };
 type SelectorFactory = (done: () => void) => { component: Component; focus: any };
-type SettingsMenuPatchStore = {
+type SelectorOverlayPatchStore = {
 	targets: PrototypePatchTarget[];
 	handles: Set<OverlayHandle>;
 	theme?: ThemeLike;
@@ -23,10 +23,10 @@ type SettingsMenuPatchStore = {
 
 const SELECTOR_SURFACE_CACHE_KEY = Symbol.for("pi-rail-ui.selector-surface-cache");
 
-const getSettingsMenuPatchStore = createStore<SettingsMenuPatchStore>("settings-menu-patch", () => ({
+const getSelectorOverlayPatchStore = createStore<SelectorOverlayPatchStore>("selector-overlay-patch", () => ({
 	targets: [],
 	handles: new Set<OverlayHandle>(),
-	surface: tallGraySelectorOutputSurface,
+	surface: railSelectorOutputSurface,
 }));
 
 function themeFg(theme: ThemeLike | undefined, name: string, text: string): string {
@@ -128,7 +128,7 @@ function visibleModelRows(instance: any, theme: ThemeLike | undefined): string[]
 	return rows;
 }
 
-function renderModelSelectorBody(instance: any, contentWidth: number, store: SettingsMenuPatchStore): string[] {
+function renderModelSelectorBody(instance: any, contentWidth: number, store: SelectorOverlayPatchStore): string[] {
 	const hasScopedModels = (instance.scopedModels?.length ?? 0) > 0 || (instance.scopedModelItems?.length ?? 0) > 0;
 	const rows: string[] = [];
 	if (hasScopedModels) {
@@ -152,7 +152,7 @@ function renderModelSelectorSurface(
 	instance: any,
 	width: number,
 	originalRender: (width: number) => string[],
-	store: SettingsMenuPatchStore,
+	store: SelectorOverlayPatchStore,
 ): string[] {
 	try {
 		if (width < store.surface.minRenderableWidth()) return originalRender.call(instance, width);
@@ -199,7 +199,7 @@ function visibleScopedModelRows(instance: any, theme: ThemeLike | undefined): st
 	return rows;
 }
 
-function renderScopedModelsSelectorBody(instance: any, contentWidth: number, store: SettingsMenuPatchStore): string[] {
+function renderScopedModelsSelectorBody(instance: any, contentWidth: number, store: SelectorOverlayPatchStore): string[] {
 	const footerText = instance.getFooterText?.() ?? "";
 	return [
 		selectedText(store.theme, themeBold(store.theme, "Model Configuration")),
@@ -217,7 +217,7 @@ function renderScopedModelsSelectorSurface(
 	instance: any,
 	width: number,
 	originalRender: (width: number) => string[],
-	store: SettingsMenuPatchStore,
+	store: SelectorOverlayPatchStore,
 ): string[] {
 	try {
 		if (width < store.surface.minRenderableWidth()) return originalRender.call(instance, width);
@@ -235,14 +235,14 @@ function settingsListFor(instance: any): any {
 	return instance.getSettingsList?.() ?? instance.settingsList;
 }
 
-function renderSettingsMenuBody(instance: any, _contentWidth: number, store: SettingsMenuPatchStore): string[] {
+function renderSettingsMenuBody(instance: any, _contentWidth: number, store: SelectorOverlayPatchStore): string[] {
 	const settingsList = settingsListFor(instance);
 	if (!settingsList) return [];
 	restyleSettingsList(settingsList, store.theme);
 	return settingsList.render(_contentWidth);
 }
 
-function renderSettingsMenuSurface(instance: any, width: number, originalRender: (width: number) => string[], store: SettingsMenuPatchStore): string[] {
+function renderSettingsSelectorOverlay(instance: any, width: number, originalRender: (width: number) => string[], store: SelectorOverlayPatchStore): string[] {
 	try {
 		const settingsList = settingsListFor(instance);
 		if (!settingsList || width < store.surface.minRenderableWidth()) return originalRender.call(instance, width);
@@ -276,7 +276,7 @@ function isScopedModelsSelectorComponent(component: any): boolean {
 	return Boolean(component?.searchInput && Array.isArray(component?.filteredItems) && component?.modelsById instanceof Map);
 }
 
-function selectorBodyRenderer(component: any, store: SettingsMenuPatchStore): RailOverlayBodyRenderer | undefined {
+function selectorBodyRenderer(component: any, store: SelectorOverlayPatchStore): RailOverlayBodyRenderer | undefined {
 	if (isSettingsSelectorComponent(component)) return (contentWidth) => renderSettingsMenuBody(component, contentWidth, store);
 	if (isModelSelectorComponent(component)) return (contentWidth) => renderModelSelectorBody(component, contentWidth, store);
 	if (isScopedModelsSelectorComponent(component)) return (contentWidth) => renderScopedModelsSelectorBody(component, contentWidth, store);
@@ -290,7 +290,7 @@ function renderedEditorRows(instance: any, width: number): number {
 	} catch {
 		// Fall back to the configured default height when the editor cannot be rendered here.
 	}
-	return TALL_GRAY_EDITOR_HEIGHT.minHeight;
+	return RAIL_EDITOR_HEIGHT.minHeight;
 }
 
 function ensureEditorInContainer(instance: any): void {
@@ -301,7 +301,7 @@ function ensureEditorInContainer(instance: any): void {
 	container.addChild?.(instance.editor);
 }
 
-function showSettingsOverlay(instance: any, create: SelectorFactory, store: SettingsMenuPatchStore): void {
+function showSettingsOverlay(instance: any, create: SelectorFactory, store: SelectorOverlayPatchStore): void {
 	let handle: OverlayHandle | undefined;
 	const done = () => {
 		handle?.hide();
@@ -345,8 +345,8 @@ function showSettingsOverlay(instance: any, create: SelectorFactory, store: Sett
 
 function patchRender(
 	ctor: SelectorCtor | undefined,
-	store: SettingsMenuPatchStore,
-	render: (instance: any, width: number, originalRender: (width: number) => string[], store: SettingsMenuPatchStore) => string[],
+	store: SelectorOverlayPatchStore,
+	render: (instance: any, width: number, originalRender: (width: number) => string[], store: SelectorOverlayPatchStore) => string[],
 ): void {
 	if (!ctor?.prototype || store.targets.some((target) => target.ctor === ctor && target.methodName === "render")) return;
 
@@ -357,7 +357,7 @@ function patchRender(
 	store.targets.push({ ctor, methodName: "render", original });
 }
 
-function patchInteractiveMode(ctor: InteractiveModeCtor | undefined, store: SettingsMenuPatchStore): void {
+function patchInteractiveMode(ctor: InteractiveModeCtor | undefined, store: SelectorOverlayPatchStore): void {
 	if (!ctor?.prototype || store.targets.some((target) => target.ctor === ctor && target.methodName === "showSelector")) return;
 
 	const original = ctor.prototype.showSelector;
@@ -371,17 +371,17 @@ function patchInteractiveMode(ctor: InteractiveModeCtor | undefined, store: Sett
 	store.targets.push({ ctor, methodName: "showSelector", original });
 }
 
-export async function installSettingsMenuSurface(theme: Theme): Promise<void> {
-	const store = getSettingsMenuPatchStore();
+export async function installSelectorOverlay(theme: Theme): Promise<void> {
+	const store = getSelectorOverlayPatchStore();
 	store.theme = theme;
 	store.surface = selectorOutputSurfaceForTheme(theme);
 
-	patchRender(SettingsSelectorComponent as unknown as SelectorCtor, store, renderSettingsMenuSurface);
+	patchRender(SettingsSelectorComponent as unknown as SelectorCtor, store, renderSettingsSelectorOverlay);
 	const nativeSettingsSelector = await resolveNativePiExport<SelectorCtor>(
 		"./modes/interactive/components/settings-selector.js",
 		"SettingsSelectorComponent",
 	);
-	patchRender(nativeSettingsSelector, store, renderSettingsMenuSurface);
+	patchRender(nativeSettingsSelector, store, renderSettingsSelectorOverlay);
 
 	patchRender(ModelSelectorComponent as unknown as SelectorCtor, store, renderModelSelectorSurface);
 	const nativeModelSelector = await resolveNativePiExport<SelectorCtor>("./modes/interactive/components/model-selector.js", "ModelSelectorComponent");
@@ -401,11 +401,11 @@ export async function installSettingsMenuSurface(theme: Theme): Promise<void> {
 	patchInteractiveMode(nativeInteractiveMode, store);
 }
 
-export function uninstallSettingsMenuSurface(): void {
-	const store = getSettingsMenuPatchStore();
+export function uninstallSelectorOverlay(): void {
+	const store = getSelectorOverlayPatchStore();
 	for (const handle of store.handles) handle.hide();
 	store.handles.clear();
 	restorePrototypePatches(store.targets);
 	store.theme = undefined;
-	store.surface = tallGraySelectorOutputSurface;
+	store.surface = railSelectorOutputSurface;
 }

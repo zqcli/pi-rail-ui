@@ -2,7 +2,7 @@
 
 Pi Rail UI 是一个用于 Pi coding agent 的本地 TUI 界面扩展。它把默认交互式终端界面改造成基于左侧 rail 的底部固定布局，适合长时间编码会话：沉稳的 slate 灰色输入框、统一对齐的消息块、固定 footer、可滚动聊天历史、鼠标选择、工具块单独展开，以及一致的命令/工具输出间距。
 
-这个项目最初只是一个 “tall gray input” 输入框扩展，但现在已经扩展为覆盖 Pi 交互式 TUI 多个界面的完整 UI 层。
+它覆盖 Pi 交互式 TUI 的主要界面，同时保留 Pi 原有编辑器行为和快捷键。
 
 ## 功能概览
 
@@ -100,7 +100,7 @@ Pi Rail UI 实现了应用层聊天历史滚动，从而让输入框和 footer �
 
 滚动条样式可配置。当前默认：
 
-- 轨道背景使用 editor 背景色。
+- 轨道背景透明。
 - 滑块使用协调的蓝色。
 - 宽度为一个 rail 宽度单位。
 
@@ -251,7 +251,7 @@ ui-style.json
 
 ### `bashExecution`
 
-控制专用于 `!bash` 系统命令结果的 surface。这个旧配置仍然兼容，同时会被 `railSections.sections.bashExecution` 对应配置接管：
+控制专用于 `!bash` 系统命令结果的 surface，并和 `railSections.sections.bashExecution` 配合使用：
 
 ```json
 {
@@ -327,7 +327,7 @@ Rail Overlay 是 Rail Section 在弹出菜单方向的对应抽象。slash autoc
 
 ### `thinking`、`userMessage`、`slashCommand`、`footer`
 
-这些旧区块仍然控制其它 UI surface 的专用细节。对于弹出菜单，`slashCommand` 继续提供 selected text、列表列宽、最大行数、底部间距等菜单行为配置；`selectorOutput` 提供共享 rail/background surface 样式。
+这些区块控制其它 UI surface 的专用细节。对于弹出菜单，`slashCommand` 提供 selected text、列表列宽、最大行数、底部间距等菜单行为配置；`selectorOutput` 提供共享 rail/background surface 样式。
 
 `footer.bottomGapRows` 会在 app-level conversation viewport 模式下为 footer 后方预留终端空白行。默认配置为 `0`，保持之前贴底的布局；如果希望 footer 位于终端底部上方，可设为 `1` 或更大。
 
@@ -335,50 +335,66 @@ Rail Overlay 是 Rail Section 在弹出菜单方向的对应抽象。slash autoc
 
 ```text
 pi-rail-ui/
-├── index.ts                    # 扩展入口、命令和 feature install/uninstall 逻辑
-├── ui-style.json               # 集中视觉配置
-├── config.ts                   # 配置解析、颜色解析、已解析 style/layout 导出
-├── patching.ts                 # 原型 patch 工具和 Pi 原生导出解析
-├── clipboard.ts                # 剪贴板工具
-├── utils.ts                    # ANSI、鼠标、换行、宽度、选择等工具函数
-├── ui/
-│   ├── gap.ts                       # 左侧 gap 包装和旧 gap marker 兼容
-│   ├── rail-surface.ts              # 共享 rail/surface 渲染器和 section 派生 surface style
-│   ├── rail-section.ts              # History block metadata、范围、选择 offset、切换和包装
-│   ├── rail-overlay.ts              # 复用 rail layout/style、但不继承 history 行为的弹出菜单 shell
-│   └── slash-autocomplete-overlay.ts # Slash autocomplete overlay 包装
-├── chat-view/
-│   ├── index.ts                     # Chat-view feature 导出
-│   ├── state.ts                     # viewport/cache/interaction 共享状态和 store
-│   ├── history-renderer.ts          # chat history flatten、spacing、range、prefix/tail cache
-│   ├── viewport.ts                  # 固定 chat viewport、滚动条绘制、TUI patch 安装
-│   └── interactions.ts              # 滚轮/鼠标路由、滚动条拖动、聊天选择/复制、section 点击
-├── components/
-│   ├── editor.ts                    # 自定义输入框、内部滚动、鼠标选择、paste marker 渲染
-│   └── footer.ts                    # 自定义 footer 和 footer stats 渲染
-└── patches/
-    ├── message-surfaces.ts          # Assistant thinking/reply 和用户消息 surface patch
-    ├── selector-overlays.ts         # Settings/model selector surface 和 Rail Overlay 定位
-    ├── execution-surfaces.ts        # Tool/bash 执行渲染 patch
-    ├── command-output.ts            # Slash command 输出 Rail Section 包装
-    └── resource-status.ts           # /reload 资源和 status/message Rail Section 包装
+├── index.ts                         # 扩展入口、命令、功能 install/uninstall 编排
+├── ui-style.json                    # 集中的视觉配置
+├── config/
+│   ├── index.ts                     # 配置解析和解析后的样式/布局导出
+│   ├── colors.ts                    # 主题/颜色解析辅助
+│   └── types.ts                     # 配置和布局类型
+├── core/
+│   ├── clipboard.ts                 # 剪贴板辅助
+│   ├── patching.ts                  # 原型 patch 和原生 Pi 导出解析
+│   └── utils.ts                     # ANSI、鼠标、换行、宽度、选择工具
+├── rail/
+│   ├── index.ts                     # Rail 基础能力导出
+│   ├── rail-gap.ts                  # 左侧 gap 包装
+│   ├── rail-surface.ts              # 共享 rail/surface 渲染器
+│   ├── rail-section.ts              # 历史区 metadata、ranges、选择、折叠和包装
+│   ├── rail-overlay.ts              # 弹出层 shell，复用 rail 布局但不混入历史行为
+│   └── render-cache.ts              # 基于宽度/signature 的渲染缓存
+└── components/
+    ├── editor/
+    │   ├── index.ts                 # Editor 功能导出
+    │   ├── rail-editor.ts           # Rail editor、内部滚动、鼠标选择、paste marker
+    │   ├── slash-autocomplete.ts    # Slash autocomplete overlay body
+    │   └── selector-overlay.ts      # Settings/model selector overlay patch
+    ├── footer/
+    │   ├── index.ts                 # Footer 功能导出
+    │   └── footer.ts                # Footer 统计、布局、缓存和渲染
+    ├── messages/
+    │   ├── index.ts                 # Message 功能导出
+    │   ├── assistant-message.ts     # Assistant thinking/reply rail patch
+    │   ├── user-message.ts          # User message rail card patch
+    │   ├── command-output.ts        # Slash command output rail 包装
+    │   └── resource-status.ts       # /reload resources 和 status/message rail 包装
+    ├── executions/
+    │   ├── index.ts                 # Execution 功能导出
+    │   ├── bash-execution.ts        # Bash execution rail surface 和 preview 规范化
+    │   ├── tool-execution.ts        # Tool execution rail install/uninstall patch
+    │   └── execution-collapse.ts    # 共享 execution auto-collapse 辅助
+    └── chat-view/
+        ├── index.ts                 # Chat-view 功能导出
+        ├── state.ts                 # 共享 viewport/cache/interaction state 和 store
+        ├── history-renderer.ts      # 历史扁平化、spacing、ranges、prefix/tail cache
+        ├── viewport.ts              # 固定 chat viewport、scrollbar 绘制、TUI patch install
+        └── interactions.ts          # wheel/mouse 路由、scrollbar drag、选择/copy、section clicks
 ```
 
 ## 设计原则
 
-1. **保留 Pi 原生行为**  
+1. **保留 Pi 原生行为**
    输入框仍然基于 Pi 的 `CustomEditor`，标准快捷键和输入行为保持不变。
 
-2. **视觉配置集中化**  
+2. **视觉配置集中化**
    颜色和布局参数尽量放在 `ui-style.json`，避免散落在 TypeScript 代码中。
 
-3. **复用同一套 Rail layout/style 系统**  
+3. **复用同一套 Rail layout/style 系统**
    输入框、thinking、用户消息、slash 菜单、settings/model overlay、命令输出都复用同一个 rail 几何模型。History block 使用 Rail Section 行为；弹出菜单使用 Rail Overlay，因此能复用 gap/rail/background，但不会继承 history selection/copy/collapse 语义。
 
-4. **在没有公开 API 的地方谨慎 patch**  
+4. **在没有公开 API 的地方谨慎 patch**
    Pi 当前没有为所有 TUI surface 提供公开扩展 API，因此本项目使用可控的 prototype patch，并保留 fallback 行为。
 
-5. **优化热路径性能**  
+5. **优化热路径性能**
    聊天滚动、滚动条拖动、输入框渲染、鼠标选择等路径使用缓存，避免大历史或大 prompt 下无谓重渲染。
 
 ## 性能说明

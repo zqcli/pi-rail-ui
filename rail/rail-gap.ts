@@ -1,17 +1,13 @@
 import type { Component } from "@earendil-works/pi-tui";
-import { TALL_GRAY_EDITOR_STYLE } from "../config";
+import { RAIL_EDITOR_STYLE } from "../config";
 
 const LEFT_GAP_BLOCK_MARKER = Symbol.for("pi-rail-ui.left-gap-block");
-const LEGACY_LEFT_GAP_BLOCK_MARKER = Symbol.for("pi-rail-ui.legacy.tall-gray-input.left-gap-block");
-// Keep recognizing the old marker so existing chat rows created before /reload
-// are not wrapped again by newer patches.
 const RIGHT_GAP_BLOCK_MARKER = Symbol.for("pi-rail-ui.right-gap-block");
-const LEGACY_RIGHT_GAP_BLOCK_MARKER = Symbol.for("pi-rail-ui.legacy.tall-gray-input.right-gap-block");
 
 type GapBlockLike = Component & { unwrap(): Component };
 
 export function leftGapWidth(): number {
-	return Math.max(0, Math.round(TALL_GRAY_EDITOR_STYLE.leftWindowGapWidth));
+	return Math.max(0, Math.round(RAIL_EDITOR_STYLE.leftWindowGapWidth));
 }
 
 export function renderLinesWithGap(width: number, gap: number, renderInner: (innerWidth: number) => string[]): string[] {
@@ -49,19 +45,11 @@ export class LeftGapBlock implements Component {
 }
 
 export function isLeftGapBlock(value: unknown): value is LeftGapBlock {
-	return Boolean(
-		value &&
-			typeof value === "object" &&
-			((value as any)[LEFT_GAP_BLOCK_MARKER] === true || (value as any)[LEGACY_LEFT_GAP_BLOCK_MARKER] === true),
-	);
+	return Boolean(value && typeof value === "object" && (value as any)[LEFT_GAP_BLOCK_MARKER] === true);
 }
 
 function isRightGapBlockMarker(value: unknown): value is GapBlockLike {
-	return Boolean(
-		value &&
-			typeof value === "object" &&
-			((value as any)[RIGHT_GAP_BLOCK_MARKER] === true || (value as any)[LEGACY_RIGHT_GAP_BLOCK_MARKER] === true),
-	);
+	return Boolean(value && typeof value === "object" && (value as any)[RIGHT_GAP_BLOCK_MARKER] === true);
 }
 
 export function isGapBlock(value: unknown): value is GapBlockLike {

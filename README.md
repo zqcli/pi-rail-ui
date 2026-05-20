@@ -2,7 +2,7 @@
 
 Pi Rail UI is a local UI extension for the Pi coding agent. It replaces the default interactive terminal experience with a rail-based, bottom-docked layout designed for long coding sessions: a calm slate editor, aligned message surfaces, fixed footer, scrollable conversation history, mouse-aware selection, and consistent command/tool output spacing.
 
-The project started as a taller gray input editor, but it now customizes most of the interactive TUI surface while preserving Pi's normal editor behavior and keybindings.
+It customizes most of the interactive TUI surface while preserving Pi's normal editor behavior and keybindings.
 
 ## Highlights
 
@@ -100,7 +100,7 @@ Supported interactions:
 
 Scrollbar styling is configurable. The current default uses:
 
-- Track background: editor background.
+- Track background: transparent.
 - Thumb background: coordinated blue.
 - Width: one rail-width unit.
 
@@ -251,7 +251,7 @@ Controls app-level conversation scrolling:
 
 ### `bashExecution`
 
-Controls the dedicated `!bash` system-command surface. This legacy section remains supported and is also mirrored by `railSections.sections.bashExecution`:
+Controls the dedicated `!bash` system-command surface and complements `railSections.sections.bashExecution`:
 
 ```json
 {
@@ -327,7 +327,7 @@ Rail Overlay is the popup-menu counterpart to Rail Section. It reuses the same r
 
 ### `thinking`, `userMessage`, `slashCommand`, `footer`
 
-These legacy sections still control specialized details of the other major UI surfaces. For popup menus, `slashCommand` continues to provide menu-specific behavior such as selected text color, list column widths, max rows, and bottom spacing; `selectorOutput` provides the shared rail/background surface style.
+These sections control specialized details of the other major UI surfaces. For popup menus, `slashCommand` provides menu-specific behavior such as selected text color, list column widths, max rows, and bottom spacing; `selectorOutput` provides the shared rail/background surface style.
 
 `footer.bottomGapRows` reserves blank terminal rows after the footer in app-level conversation viewport mode. The default config sets it to `0` for the previous flush-bottom layout; set it to `1` or higher if you want the footer to sit above the terminal bottom.
 
@@ -335,50 +335,66 @@ These legacy sections still control specialized details of the other major UI su
 
 ```text
 pi-rail-ui/
-├── index.ts                    # Extension entry point, command, and feature install/uninstall glue
-├── ui-style.json               # Centralized visual configuration
-├── config.ts                   # Config parsing, color resolution, and resolved style/layout exports
-├── patching.ts                 # Prototype patch helpers and native Pi export resolution
-├── clipboard.ts                # Clipboard helpers
-├── utils.ts                    # ANSI, mouse, wrapping, width, and selection utilities
-├── ui/
-│   ├── gap.ts                       # Left-gap wrappers and legacy gap compatibility
+├── index.ts                         # Extension entry point, command, and feature install/uninstall glue
+├── ui-style.json                    # Centralized visual configuration
+├── config/
+│   ├── index.ts                     # Config parsing and resolved style/layout exports
+│   ├── colors.ts                    # Theme/color resolution helpers
+│   └── types.ts                     # Config and layout types
+├── core/
+│   ├── clipboard.ts                 # Clipboard helpers
+│   ├── patching.ts                  # Prototype patch helpers and native Pi export resolution
+│   └── utils.ts                     # ANSI, mouse, wrapping, width, and selection utilities
+├── rail/
+│   ├── index.ts                     # Rail primitive exports
+│   ├── rail-gap.ts                  # Left-gap wrappers
 │   ├── rail-surface.ts              # Shared rail/surface renderers and section-derived surface styles
-│   ├── rail-section.ts              # History block metadata, ranges, selection offsets, toggles, and wrapper
-│   ├── rail-overlay.ts              # Popup menu shell reusing rail layout/style without history behavior
-│   └── slash-autocomplete-overlay.ts # Slash autocomplete overlay wrapper
-├── chat-view/
-│   ├── index.ts                     # Chat-view feature exports
-│   ├── state.ts                     # Shared viewport/cache/interaction state and store
-│   ├── history-renderer.ts          # Chat history flattening, spacing, ranges, and prefix/tail cache
-│   ├── viewport.ts                  # Sticky chat viewport, scrollbar drawing, and TUI patch install
-│   └── interactions.ts              # Wheel/mouse routing, scrollbar drag, chat selection/copy, section clicks
-├── components/
-│   ├── editor.ts                    # Custom editor, internal scrolling, mouse selection, paste marker rendering
-│   └── footer.ts                    # Custom footer and footer stats rendering
-└── patches/
-    ├── message-surfaces.ts          # Assistant thinking/reply and user message surface patches
-    ├── selector-overlays.ts         # Settings/model selector surfaces and Rail Overlay placement
-    ├── execution-surfaces.ts        # Tool/bash execution rendering patches
-    ├── command-output.ts            # Slash command output Rail Section wrapping
-    └── resource-status.ts           # /reload resources and status/message Rail Section wrapping
+│   ├── rail-section.ts              # History metadata, ranges, selection offsets, toggles, and wrapper
+│   ├── rail-overlay.ts              # Popup shell reusing rail layout/style without history behavior
+│   └── render-cache.ts              # Width/signature render cache helper
+└── components/
+    ├── editor/
+    │   ├── index.ts                 # Editor feature exports
+    │   ├── rail-editor.ts           # Rail editor, internal scrolling, mouse selection, paste marker rendering
+    │   ├── slash-autocomplete.ts    # Slash autocomplete overlay body
+    │   └── selector-overlay.ts      # Settings/model selector overlay patches
+    ├── footer/
+    │   ├── index.ts                 # Footer feature exports
+    │   └── footer.ts                # Footer stats, layout, cache, and render logic
+    ├── messages/
+    │   ├── index.ts                 # Message feature exports
+    │   ├── assistant-message.ts     # Assistant thinking/reply rail patches
+    │   ├── user-message.ts          # User message rail card patches
+    │   ├── command-output.ts        # Slash command output rail wrapping
+    │   └── resource-status.ts       # /reload resources and status/message rail wrapping
+    ├── executions/
+    │   ├── index.ts                 # Execution feature exports
+    │   ├── bash-execution.ts        # Bash execution rail surface and preview normalization
+    │   ├── tool-execution.ts        # Tool execution rail install/uninstall patches
+    │   └── execution-collapse.ts    # Shared execution auto-collapse helpers
+    └── chat-view/
+        ├── index.ts                 # Chat-view feature exports
+        ├── state.ts                 # Shared viewport/cache/interaction state and store
+        ├── history-renderer.ts      # Chat history flattening, spacing, ranges, and prefix/tail cache
+        ├── viewport.ts              # Sticky chat viewport, scrollbar drawing, and TUI patch install
+        └── interactions.ts          # Wheel/mouse routing, scrollbar drag, chat selection/copy, section clicks
 ```
 
 ## Design Principles
 
-1. **Keep Pi behavior intact**  
+1. **Keep Pi behavior intact**
    The editor remains based on Pi's `CustomEditor`; standard keybindings and input behavior are preserved.
 
-2. **Centralize visual tuning**  
+2. **Centralize visual tuning**
    Colors and layout constants should live in `ui-style.json`, not scattered through TypeScript.
 
-3. **Reuse one rail layout/style system**  
+3. **Reuse one rail layout/style system**
    Editor, thinking, user messages, slash menus, settings/model overlays, and command output share the same rail geometry. History blocks use Rail Section behavior; popup menus use Rail Overlay so they can reuse gap/rail/background without inheriting history selection/copy/collapse semantics.
 
-4. **Patch carefully where no public API exists**  
+4. **Patch carefully where no public API exists**
    Pi currently does not expose public hooks for every surface customized here, so this extension uses controlled prototype patches with fallback behavior.
 
-5. **Optimize hot paths**  
+5. **Optimize hot paths**
    Conversation scrolling, scrollbar dragging, editor rendering, and mouse selection use caches to avoid re-rendering large histories or large prompts unnecessarily.
 
 ## Performance Notes

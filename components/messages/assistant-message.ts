@@ -3,16 +3,16 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Markdown, Spacer, Text, type Component } from "@earendil-works/pi-tui";
-import { railSectionConfig } from "../config";
-import { PrototypePatchTarget, resolveNativePiExport, restorePrototypePatches, getInteractiveModeConstructors, createStore } from "../patching";
-import { cachedRender } from "../ui/render-cache";
+import { railSectionConfig } from "../../config";
+import { PrototypePatchTarget, resolveNativePiExport, restorePrototypePatches, getInteractiveModeConstructors, createStore } from "../../core/patching";
+import { cachedRender } from "../../rail/render-cache";
 import {
 	EditorSurfaceRenderer,
 	SurfaceContentInsetBlock,
-	ThinkingSurfaceBlock,
+	ThinkingRailBlock,
 	thinkingSurfaceForTheme,
-	tallGrayThinkingSurface,
-} from "../ui/rail-surface";
+	railThinkingSurface,
+} from "../../rail/rail-surface";
 import {
 	collapseHint,
 	defineRailSection,
@@ -20,7 +20,7 @@ import {
 	markRailSectionManuallyToggled,
 	setCollapsibleRailSectionsExpanded,
 	wasRailSectionManuallyToggled,
-} from "../ui/rail-section";
+} from "../../rail/rail-section";
 
 // -----------------------------------------------------------------------------
 // Assistant thinking/reply surface patch
@@ -43,7 +43,7 @@ type InteractiveModeConstructor = {
 	prototype: { setToolsExpanded(expanded: boolean): void };
 };
 
-type ThinkingSurfacePatchStore = {
+type AssistantMessageRailPatchStore = {
 	active: boolean;
 	installed: boolean;
 	targets: PrototypePatchTarget[];
@@ -57,11 +57,11 @@ const ASSISTANT_THINKING_BLOCKS_KEY = Symbol.for("pi-rail-ui.assistant-thinking-
 const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
 const USER_MESSAGE_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.user-message-render-cache");
 
-const getThinkingSurfacePatchStore = createStore<ThinkingSurfacePatchStore>("thinking-surface-patch", () => ({
+const getAssistantMessageRailPatchStore = createStore<AssistantMessageRailPatchStore>("assistant-message-rail-patch", () => ({
 	active: false,
 	installed: false,
 	targets: [],
-	surface: tallGrayThinkingSurface,
+	surface: railThinkingSurface,
 }));
 
 function isAssistantVisiblePart(part: any): boolean {
@@ -156,7 +156,7 @@ class AssistantThinkingRailBlock implements Component {
 
 	private fullRows(width: number): string[] {
 		if (this.fullCache?.width === width) return this.fullCache.rows;
-		const rows = new ThinkingSurfaceBlock(this.inner, this.surface).render(width);
+		const rows = new ThinkingRailBlock(this.inner, this.surface).render(width);
 		this.fullCache = { width, rows };
 		return rows;
 	}
@@ -167,7 +167,7 @@ class AssistantThinkingRailBlock implements Component {
 
 		const previewText = this.rawLines.slice(0, limit).join("\n");
 		const previewInner = makeThinkingMarkdown(previewText, this.markdownTheme, this.appTheme);
-		const previewRows = new ThinkingSurfaceBlock(previewInner, this.surface).render(width);
+		const previewRows = new ThinkingRailBlock(previewInner, this.surface).render(width);
 		const hidden = Math.max(0, this.rawLines.length - limit);
 		const rows = [...previewRows, this.surface.renderSurfaceRow(width, collapseHint(this.appTheme, hidden))];
 		this.collapsedCache = { width, limit, rows };
@@ -221,7 +221,7 @@ function trimAssistantThinkingBlocks(component: AssistantMessageWithInternals, c
 	if (blocks) blocks.length = count;
 }
 
-function updateAssistantMessageWithThinkingSurface(
+function updateAssistantMessageWithRail(
 	component: AssistantMessageWithInternals,
 	message: any,
 	appTheme: Theme,
@@ -284,11 +284,11 @@ async function getAssistantMessageConstructors(): Promise<AssistantMessageConstr
 	return ctors;
 }
 
-function patchAssistantRenderCache(ctor: AssistantMessageConstructor, store: ThinkingSurfacePatchStore): void {
+function patchAssistantRenderCache(ctor: AssistantMessageConstructor, store: AssistantMessageRailPatchStore): void {
 	if (!ctor?.prototype || store.targets.some((target) => target.ctor === ctor && target.methodName === "render")) return;
 	const original = ctor.prototype.render;
 	ctor.prototype.render = function patchedAssistantRender(this: AssistantMessageWithInternals, width: number): string[] {
-		const currentStore = getThinkingSurfacePatchStore();
+		const currentStore = getAssistantMessageRailPatchStore();
 		if (!currentStore.active) return original.call(this, width);
 		const signature = [width, this.lastMessage ? 1 : 0, this.hasToolCalls ? 1 : 0, this.hideThinkingBlock ? 1 : 0, this.hiddenThinkingLabel ?? ""].join("\u001f");
 		const children = Array.isArray(this.contentContainer?.children) ? this.contentContainer.children : [];
@@ -297,7 +297,7 @@ function patchAssistantRenderCache(ctor: AssistantMessageConstructor, store: Thi
 	store.targets.push({ ctor, methodName: "render", original });
 }
 
-function patchGlobalRailSectionExpansion(ctor: InteractiveModeConstructor, store: ThinkingSurfacePatchStore): void {
+function patchGlobalRailSectionExpansion(ctor: InteractiveModeConstructor, store: AssistantMessageRailPatchStore): void {
 	if (!ctor?.prototype || store.targets.some((target) => target.ctor === ctor && target.methodName === "setToolsExpanded")) return;
 	const original = ctor.prototype.setToolsExpanded;
 	if (typeof original !== "function") return;
@@ -316,8 +316,8 @@ function patchGlobalRailSectionExpansion(ctor: InteractiveModeConstructor, store
 	store.targets.push({ ctor, methodName: "setToolsExpanded", original });
 }
 
-export async function installThinkingSurface(theme: Theme): Promise<void> {
-	const store = getThinkingSurfacePatchStore();
+export async function installAssistantMessageRail(theme: Theme): Promise<void> {
+	const store = getAssistantMessageRailPatchStore();
 	store.theme = theme;
 	store.surface = thinkingSurfaceForTheme(theme);
 	store.active = true;
@@ -327,10 +327,10 @@ export async function installThinkingSurface(theme: Theme): Promise<void> {
 			const original = ctor.prototype.updateContent;
 			ctor.prototype.updateContent = function patchedUpdateContent(this: AssistantMessageWithInternals, message: any) {
 				delete (this as any)[ASSISTANT_RENDER_CACHE_KEY];
-				const currentStore = getThinkingSurfacePatchStore();
+				const currentStore = getAssistantMessageRailPatchStore();
 				if (!currentStore.active || !currentStore.theme) return original.call(this, message);
 				try {
-					return updateAssistantMessageWithThinkingSurface(this, message, currentStore.theme, currentStore.surface);
+					return updateAssistantMessageWithRail(this, message, currentStore.theme, currentStore.surface);
 				} catch {
 					return original.call(this, message);
 				}
@@ -345,8 +345,8 @@ export async function installThinkingSurface(theme: Theme): Promise<void> {
 	store.installed = store.targets.length > 0;
 }
 
-export function uninstallThinkingSurface(): void {
-	const store = getThinkingSurfacePatchStore();
+export function uninstallAssistantMessageRail(): void {
+	const store = getAssistantMessageRailPatchStore();
 	store.active = false;
 	store.theme = undefined;
 	restorePrototypePatches(store.targets);

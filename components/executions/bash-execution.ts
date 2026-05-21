@@ -9,6 +9,8 @@ import {
 	applyDefaultAutoCollapse,
 	bashOutputLines,
 	collapsedPreviewLimit,
+	collapsedTitleRows,
+	executionHiddenLineCount,
 	fg,
 	renderedChildLines,
 	type ExecutionRailPatchStore,
@@ -65,6 +67,16 @@ function normalizeCollapsedBashPreview(
 	return collapsedBashPreviewRows(component, contentWidth, theme) ?? lines;
 }
 
+function collapsedBashTitleRows(component: any, theme: ThemeLike | undefined): string[] {
+	const command = String(component.command ?? component.getCommand?.() ?? "...");
+	return collapsedTitleRows(
+		fg(theme, "bashMode", "bash"),
+		fg(theme, "bashMode", `$ ${command}`),
+		executionHiddenLineCount(component, "bashExecution"),
+		theme,
+	);
+}
+
 function bashRenderSignature(component: any, width: number, contentWidth: number): string {
 	const outputLines = bashOutputLines(component);
 	return [
@@ -92,7 +104,12 @@ export function renderBashExecutionRail(
 	const surface = bashExecutionSurfaceForTheme(store.theme);
 	if (width < surface.minRenderableWidth()) return renderBashWithLeftGap(component, width, originalRender);
 	const contentWidth = surface.contentWidth(width);
-	applyDefaultAutoCollapse(component, "bashExecution", () => renderedChildLines(component.contentContainer, contentWidth));
+	const titleMode = railSectionConfig("bashExecution").collapsedRenderMode === "title";
+	applyDefaultAutoCollapse(component, "bashExecution", () => renderedChildLines(component.contentContainer, contentWidth), { avoidExpandedRender: titleMode });
+
+	if (titleMode && !component.expanded) {
+		return collapsedBashTitleRows(component, store.theme).map((line) => line ? surface.renderSurfaceRow(width, line) : line);
+	}
 
 	const signature = bashRenderSignature(component, width, contentWidth);
 	return cachedRender(component, BASH_SURFACE_CACHE_KEY, signature, () => {

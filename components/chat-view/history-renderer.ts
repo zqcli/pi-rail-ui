@@ -47,6 +47,18 @@ function shouldInsertBeforeSpacing(
 	return !isBlankHistoryLine(historyLines[historyLines.length - 1]) && !isBlankHistoryLine(childLines[0]);
 }
 
+function shouldCollapseLeadingBlankRow(
+	historyLines: string[],
+	childLines: string[],
+	section: ReturnType<typeof resolveRailSection>,
+): boolean {
+	return Boolean(
+		section?.config.layout.spacing.collapseAdjacent
+		&& isBlankHistoryLine(historyLines[historyLines.length - 1])
+		&& isBlankHistoryLine(childLines[0]),
+	);
+}
+
 type MutableHistoryRender = HistoryRenderResult & { previousSectionKind?: string };
 
 function emptyHistoryRender(historyChildren: any[]): MutableHistoryRender {
@@ -92,7 +104,7 @@ function recordHistoryChild(render: MutableHistoryRender, childIndex: number): v
 	render.historyChildPreviousSectionKinds[childIndex] = render.previousSectionKind;
 }
 
-function nestedRailSectionRanges(component: any, width: number, start: number): RailSectionRange[] {
+function nestedRailSectionRanges(component: any, width: number, start: number, trimmedLeadingRows = 0): RailSectionRange[] {
 	const children = component?.contentContainer?.children;
 	if (!Array.isArray(children) || children.length === 0) return [];
 
@@ -101,8 +113,8 @@ function nestedRailSectionRanges(component: any, width: number, start: number): 
 	for (const child of children) {
 		const childLines = renderChild(child, width);
 		const section = resolveRailSection(child);
-		const range = section ? renderedRailSectionRange(start + offset, childLines, section) : undefined;
-		if (range) ranges.push(range);
+		const range = section ? renderedRailSectionRange(start + offset - trimmedLeadingRows, childLines, section) : undefined;
+		if (range && range.end > start) ranges.push({ ...range, start: Math.max(start, range.start) });
 		offset += childLines.length;
 	}
 	return ranges;
@@ -124,13 +136,15 @@ function appendRenderedHistoryChild(render: MutableHistoryRender, component: any
 	if (shouldInsertBeforeSpacing(render.historyLines, childLines, section, render.previousSectionKind)) {
 		appendUnsectionedBlankRows(render.historyLines, section!.config.layout.spacing.beforeRows);
 	}
+	const trimmedLeadingRows = shouldCollapseLeadingBlankRow(render.historyLines, childLines, section) ? 1 : 0;
+	const visibleChildLines = trimmedLeadingRows > 0 ? childLines.slice(trimmedLeadingRows) : childLines;
 	const start = render.historyLines.length;
-	render.historyLines.push(...childLines);
-	const nestedRanges = nestedRailSectionRanges(component, width, start);
+	render.historyLines.push(...visibleChildLines);
+	const nestedRanges = nestedRailSectionRanges(component, width, start, trimmedLeadingRows);
 	if (nestedRanges.length > 0) {
 		render.historyRailSectionRanges.push(...nestedRanges);
 	} else {
-		const range = section ? renderedRailSectionRange(start, childLines, section) : undefined;
+		const range = section ? renderedRailSectionRange(start, visibleChildLines, section) : undefined;
 		if (range) render.historyRailSectionRanges.push(range);
 	}
 	if (section) {

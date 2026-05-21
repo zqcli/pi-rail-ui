@@ -1,3 +1,4 @@
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { railSectionConfig, type ThemeLike } from "../../config";
 import { collapseHint, markRailSectionManuallyToggled, wasRailSectionManuallyToggled } from "../../rail/rail-section";
 import { padToWidth } from "../../core/utils";
@@ -30,9 +31,17 @@ export function fg(theme: ThemeLike | undefined, color: string, value: string): 
 	}
 }
 
-export function applyToolHintBackground(component: any, hint: string, width: number): string {
-	const bg = component?.contentText?.customBgFn;
-	return typeof bg === "function" ? bg(padToWidth(hint, width)) : hint;
+function toolStatusBackgroundName(component: any): "toolPendingBg" | "toolSuccessBg" | "toolErrorBg" {
+	if (component?.isPartial !== false) return "toolPendingBg";
+	return component?.result?.isError ? "toolErrorBg" : "toolSuccessBg";
+}
+
+export function applyToolHintBackground(component: any, hint: string, width: number, theme?: ThemeLike): string {
+	const padded = padToWidth(hint, width);
+	const themeBg = (theme as any)?.bg;
+	if (typeof themeBg === "function") return themeBg.call(theme, toolStatusBackgroundName(component), padded);
+	const bg = component?.contentBox?.bgFn ?? component?.contentText?.customBgFn;
+	return typeof bg === "function" ? bg(padded) : hint;
 }
 
 export function renderedChildLines(child: any, width: number): string[] {
@@ -46,7 +55,56 @@ export function collapsedPreviewLimit(kind: ExecutionKind): number {
 
 function lineCount(text: string | undefined): number {
 	if (!text) return 0;
-	return text.split("\n").length;
+	let count = 1;
+	for (let index = 0; index < text.length; index++) {
+		if (text.charCodeAt(index) === 10) count++;
+	}
+	return count;
+}
+
+function stringArgLineCount(value: unknown): number {
+	return typeof value === "string" && value.length > 0 ? lineCount(value) : 0;
+}
+
+export function executionHiddenLineCount(component: any, kind: ExecutionKind): number {
+	if (kind === "bashExecution") return Math.max(0, bashOutputLines(component).length);
+	const args = component?.args;
+	const textOutputRows = lineCount(component?.getTextOutput?.());
+	const contentRows = Math.max(
+		stringArgLineCount(args?.content),
+		stringArgLineCount(args?.oldText) + stringArgLineCount(args?.newText),
+	);
+	if (contentRows > 0) return contentRows + textOutputRows;
+	const argsRows = args === undefined ? 0 : lineCount(JSON.stringify(args, null, 2));
+	return Math.max(0, argsRows + textOutputRows);
+}
+
+export function titleCollapseHint(theme: ThemeLike | undefined, hiddenLineCount: number): string {
+	const prefix = theme ? theme.fg("muted", `... (${Math.max(0, hiddenLineCount)} more lines,`) : `... (${Math.max(0, hiddenLineCount)} more lines,`;
+	try {
+		return `${prefix} ${keyHint("app.tools.expand", "to expand")})`;
+	} catch {
+		const fallback = theme ? `${theme.fg("dim", "ctrl+o")}${theme.fg("muted", " to expand")}` : "ctrl+o to expand";
+		return `${prefix} ${fallback})`;
+	}
+}
+
+export function collapsedTitleContentRows(
+	title: string,
+	detail: string,
+	hiddenLineCount: number,
+	theme: ThemeLike | undefined,
+): string[] {
+	return [title, detail, titleCollapseHint(theme, hiddenLineCount)];
+}
+
+export function collapsedTitleRows(
+	title: string,
+	detail: string,
+	hiddenLineCount: number,
+	theme: ThemeLike | undefined,
+): string[] {
+	return ["", ...collapsedTitleContentRows(title, detail, hiddenLineCount, theme), ""];
 }
 
 function estimatedExpandedRows(component: any, kind: ExecutionKind): number | undefined {
@@ -105,6 +163,7 @@ export function applyDefaultAutoCollapse(
 	component: any,
 	kind: ExecutionKind,
 	renderExpandedRows: () => string[],
+	options: { avoidExpandedRender?: boolean } = {},
 ): void {
 	if (component?.[AUTO_COLLAPSE_RENDERING_KEY] || wasRailSectionManuallyToggled(component)) return;
 	const config = railSectionConfig(kind);
@@ -123,6 +182,17 @@ export function applyDefaultAutoCollapse(
 		try {
 			const shouldExpand = !forceCollapse && limit !== undefined && estimatedRows <= limit;
 			if (Boolean(component.expanded) !== shouldExpand) component.setExpanded(shouldExpand);
+			if (signature) component[AUTO_COLLAPSE_SIGNATURE_KEY] = { signature, result: component.result, args: component.args };
+		} finally {
+			component[AUTO_COLLAPSE_RENDERING_KEY] = false;
+		}
+		return;
+	}
+
+	if (options.avoidExpandedRender) {
+		component[AUTO_COLLAPSE_RENDERING_KEY] = true;
+		try {
+			if (component.expanded) component.setExpanded(false);
 			if (signature) component[AUTO_COLLAPSE_SIGNATURE_KEY] = { signature, result: component.result, args: component.args };
 		} finally {
 			component[AUTO_COLLAPSE_RENDERING_KEY] = false;
@@ -153,7 +223,7 @@ export function collapsedExecutionRows(
 	if (!limit || component.expanded || rows.length <= limit) return rows;
 	const hidden = Math.max(0, rows.length - limit);
 	const hint = collapseHint(theme, hidden);
-	const renderedHint = kind === "toolExecution" ? applyToolHintBackground(component, hint, width) : hint;
+	const renderedHint = kind === "toolExecution" ? applyToolHintBackground(component, hint, width, theme) : hint;
 	return [...rows.slice(0, limit), renderedHint];
 }
 

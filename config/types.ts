@@ -13,6 +13,7 @@ export type RailSectionKind =
 	| "selectorOutput"
 	| "custom";
 export type RailSectionSelectionMode = "fullRow" | "contentOnly" | "visible";
+export type RailSectionCollapsedRenderMode = "review" | "title";
 
 export type RailSectionRawStyle = {
 	background?: ColorReference;
@@ -58,6 +59,7 @@ export type RailSectionRawConfig = {
 	preserveScrollOnToggle?: boolean;
 	preserveScrollOnUpdate?: boolean;
 	collapseByDefault?: string[];
+	collapsedRenderMode?: RailSectionCollapsedRenderMode;
 	layout?: RailSectionRawLayout;
 	style?: RailSectionRawStyle;
 	selection?: RailSectionRawSelection;
@@ -224,6 +226,7 @@ export type RailSectionResolvedConfig = {
 	preserveScrollOnToggle: boolean;
 	preserveScrollOnUpdate: boolean;
 	collapseByDefault?: string[];
+	collapsedRenderMode: RailSectionCollapsedRenderMode;
 	layout: RailSectionLayoutConfig;
 	style: RailSectionStyleConfig;
 	selection: RailSectionSelectionConfig;

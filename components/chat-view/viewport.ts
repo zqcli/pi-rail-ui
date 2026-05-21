@@ -18,6 +18,8 @@ const CLEAR_SCREEN_AND_SCROLLBACK = "\x1b[H\x1b[2J\x1b[3J";
 const ENTER_ALT_SCREEN = `\x1b[?1049h${CLEAR_SCREEN_AND_SCROLLBACK}`;
 const EXIT_ALT_SCREEN = "\x1b[?1049l";
 const MAX_SCROLLBAR_THUMB_RATIO = 0.65;
+const MIN_SCROLLBAR_HITBOX_WIDTH = 2;
+const SCROLLBAR_THUMB_GLYPH = "█";
 
 function writeTerminalControl(sequence: string): void {
 	if (process.stdout.isTTY) process.stdout.write(sequence);
@@ -72,6 +74,10 @@ async function resolveNativeTuiExport<T>(exportName: string): Promise<T | undefi
 	}
 }
 
+function foregroundFromBackgroundAnsi(ansi: string): string {
+	return ansi.replace(/\x1b\[48([;:])/g, "\x1b[38$1");
+}
+
 function getScrollbarMetrics(visibleRows: number, totalRows: number, start: number, width: number): ScrollbarMetrics | undefined {
 	if (!CONVERSATION_SCROLLBAR_STYLE.visible) return undefined;
 	const barWidth = CONVERSATION_SCROLLBAR_STYLE.width;
@@ -80,24 +86,25 @@ function getScrollbarMetrics(visibleRows: number, totalRows: number, start: numb
 	const rawThumbSize = Math.max(1, Math.floor((visibleRows * visibleRows) / totalRows));
 	const maxVisibleThumbSize = Math.max(1, Math.floor(visibleRows * MAX_SCROLLBAR_THUMB_RATIO));
 	// When startup resources overflow by only a few rows, a proportional thumb
-	// covers most of the viewport and looks like a thick native scrollbar.
-	// Hide it until there is enough history for a useful scroll affordance.
-	if (rawThumbSize > maxVisibleThumbSize) return undefined;
-
-	const thumbSize = rawThumbSize;
+	// covers most of the viewport. Clamp the thumb instead of hiding it so the
+	// scrollbar remains visible and draggable during resume/startup frames.
+	const thumbSize = Math.min(rawThumbSize, maxVisibleThumbSize);
 	const maxThumbStart = Math.max(0, visibleRows - thumbSize);
 	const maxScrollStart = Math.max(1, totalRows - visibleRows);
 	const thumbStart = Math.round((start / maxScrollStart) * maxThumbStart);
+	const hitboxWidth = Math.max(barWidth, MIN_SCROLLBAR_HITBOX_WIDTH);
 	const fill = " ".repeat(barWidth);
+	const thumb = SCROLLBAR_THUMB_GLYPH.repeat(barWidth);
+	const thumbColor = foregroundFromBackgroundAnsi(CONVERSATION_SCROLLBAR_STYLE.thumbBackground) || RAIL_EDITOR_STYLE.rail;
 	return {
 		width: barWidth,
 		thumbSize,
 		thumbStart,
 		maxThumbStart,
 		maxScrollStart,
-		xStart: width - barWidth + 1,
+		xStart: Math.max(1, width - hitboxWidth + 1),
 		xEnd: width,
-		thumbBar: `${CONVERSATION_SCROLLBAR_STYLE.thumbBackground}${fill}${CONVERSATION_SCROLLBAR_STYLE.reset}`,
+		thumbBar: `${thumbColor}${thumb}${CONVERSATION_SCROLLBAR_STYLE.reset}`,
 		trackBar: `${CONVERSATION_SCROLLBAR_STYLE.trackBackground}${fill}${CONVERSATION_SCROLLBAR_STYLE.reset}`,
 	};
 }
@@ -106,7 +113,8 @@ function renderScrollbar(line: string, rowIndex: number, metrics: ScrollbarMetri
 	if (!metrics) return line;
 
 	const isThumb = rowIndex >= metrics.thumbStart && rowIndex < metrics.thumbStart + metrics.thumbSize;
-	return `${padToWidth(line, width - metrics.width)}${isThumb ? metrics.thumbBar : metrics.trackBar}`;
+	const content = padToWidth(`${line}${RAIL_EDITOR_STYLE.reset}`, width - metrics.width);
+	return `${content}${isThumb ? metrics.thumbBar : metrics.trackBar}`;
 }
 
 function highlightHistoryLine(

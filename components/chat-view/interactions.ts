@@ -23,6 +23,7 @@ type SelectionCopyThrottle = { lastAttemptAt: number; pending: boolean };
 
 const selectionCopyThrottles = new WeakMap<ScrollState, SelectionCopyThrottle>();
 const coalescedInteractionRenderTimers = new WeakMap<ScrollState, ReturnType<typeof setTimeout>>();
+const coalescedInteractionRenderForces = new WeakMap<ScrollState, boolean>();
 
 export function selectionRange(selection?: { anchor: Position; active: Position }): { start: Position; end: Position } | undefined {
 	if (!selection || samePosition(selection.anchor, selection.active)) return undefined;
@@ -202,13 +203,16 @@ function animationFrameMs(): number {
 	return Math.max(8, Math.round((TUI as any).MIN_RENDER_INTERVAL_MS ?? 16));
 }
 
-function requestCoalescedInteractionRender(tui: any, state: ScrollState, store: ConversationScrollStore): void {
+function requestCoalescedInteractionRender(tui: any, state: ScrollState, store: ConversationScrollStore, force = false): void {
+	if (force) coalescedInteractionRenderForces.set(state, true);
 	if (coalescedInteractionRenderTimers.has(state)) return;
 	const timer = setTimeout(() => {
 		store.animationTimers.delete(timer);
 		if (coalescedInteractionRenderTimers.get(state) !== timer) return;
 		coalescedInteractionRenderTimers.delete(state);
-		tui.requestRender?.();
+		const shouldForce = coalescedInteractionRenderForces.get(state) === true;
+		coalescedInteractionRenderForces.delete(state);
+		tui.requestRender?.(shouldForce);
 	}, animationFrameMs());
 	coalescedInteractionRenderTimers.set(state, timer);
 	store.animationTimers.add(timer);
@@ -268,7 +272,7 @@ function advanceScrollAnimation(tui: any, state: ScrollState, store: Conversatio
 	if (state.offsetFromBottom !== nextOffset) {
 		state.offsetFromBottom = nextOffset;
 		state.preferCachedRender = true;
-		tui.requestRender?.();
+		tui.requestRender?.(true);
 	}
 
 	if (progress >= 1 || timedOut || state.offsetFromBottom === target) {
@@ -531,21 +535,21 @@ function handleConversationScrollbarDrag(tui: any, data: string, store: Conversa
 		const insideThumb = row >= metrics.thumbStart && row < metrics.thumbStart + metrics.thumbSize;
 		const pointerOffsetRows = insideThumb ? row - metrics.thumbStart : Math.floor(metrics.thumbSize / 2);
 		state.interaction = { type: "scrollbarDrag", pointerOffsetRows: clamp(pointerOffsetRows, 0, Math.max(0, metrics.thumbSize - 1)) };
-		if (applyScrollbarMouseRow(tui, state, store, row) || hadSelection) tui.requestRender?.();
+		if (applyScrollbarMouseRow(tui, state, store, row) || hadSelection) tui.requestRender?.(true);
 		return true;
 	}
 
 	if (state.interaction.type !== "scrollbarDrag") return false;
 
 	if (mouse.action === "drag") {
-		if (applyScrollbarMouseRow(tui, state, store, row)) requestCoalescedInteractionRender(tui, state, store);
+		if (applyScrollbarMouseRow(tui, state, store, row)) requestCoalescedInteractionRender(tui, state, store, true);
 		return true;
 	}
 
 	if (mouse.action === "release") {
 		const changed = applyScrollbarMouseRow(tui, state, store, row);
 		state.interaction = { type: "idle" };
-		if (changed) tui.requestRender?.();
+		if (changed) tui.requestRender?.(true);
 		return true;
 	}
 
@@ -621,7 +625,7 @@ export function handleConversationInput(tui: any, data: string, originalHandleIn
 			return originalHandleInput.call(tui, data);
 		}
 		if (setOffsetFromBottomImmediate(state, store, state.offsetFromBottom + wheel.direction * CONVERSATION_SCROLL_LAYOUT.wheelStepRows, true)) {
-			requestCoalescedInteractionRender(tui, state, store);
+			requestCoalescedInteractionRender(tui, state, store, true);
 		}
 		return;
 	}

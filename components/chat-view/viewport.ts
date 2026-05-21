@@ -15,8 +15,12 @@ import {
 type InteractiveModeCtor = { prototype: any };
 
 const CLEAR_SCREEN_AND_SCROLLBACK = "\x1b[H\x1b[2J\x1b[3J";
-const ENTER_ALT_SCREEN = `\x1b[?1049h${CLEAR_SCREEN_AND_SCROLLBACK}`;
-const EXIT_ALT_SCREEN = "\x1b[?1049l";
+// Keep wheel input in the alternate screen instead of letting the terminal
+// scroll its native viewport, which would move the fixed editor/footer away.
+const ENABLE_ALT_SCROLL_MODE = "\x1b[?1007h";
+const DISABLE_ALT_SCROLL_MODE = "\x1b[?1007l";
+const ENTER_ALT_SCREEN = `\x1b[?1049h${ENABLE_ALT_SCROLL_MODE}${CLEAR_SCREEN_AND_SCROLLBACK}`;
+const EXIT_ALT_SCREEN = `${DISABLE_ALT_SCROLL_MODE}\x1b[?1049l`;
 const MAX_SCROLLBAR_THUMB_RATIO = 0.65;
 const MIN_SCROLLBAR_HITBOX_WIDTH = 2;
 const SCROLLBAR_THUMB_GLYPH = "█";
@@ -130,6 +134,10 @@ function highlightHistoryLine(
 	return applyColumnHighlight(line, startCol, endCol, CONVERSATION_SELECTION_STYLE, RAIL_EDITOR_STYLE.reset);
 }
 
+function fitToTerminalRows(lines: string[], terminalRows: number): string[] {
+	return lines.length > terminalRows ? lines.slice(lines.length - terminalRows) : lines;
+}
+
 function renderStickyConversation(tui: any, width: number, originalRender: (width: number) => string[], store: ConversationScrollStore): string[] {
 	if (!CONVERSATION_SCROLL_LAYOUT.enabled || !isInteractiveRoot(tui)) return originalRender.call(tui, width);
 
@@ -166,9 +174,10 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 			const line = historyLines[lineIndex] ?? "";
 			historyWithScrollbar.push(renderScrollbar(highlightHistoryLine(line, lineIndex, selection, width), index, scrollbar, width));
 		}
-		return [...historyWithScrollbar, ...fixedLines];
+		return fitToTerminalRows([...historyWithScrollbar, ...fixedLines], terminalRows);
 	} catch {
-		return originalRender.call(tui, width);
+		const terminalRows = Math.max(1, tui.terminal?.rows ?? 24);
+		return fitToTerminalRows(originalRender.call(tui, width), terminalRows);
 	}
 }
 

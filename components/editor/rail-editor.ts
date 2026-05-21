@@ -22,8 +22,10 @@ import {
 	type VisualRow,
 } from "../../core/utils";
 
-const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1002l\x1b[?1006l";
+// 1007 keeps wheel events from falling through to the terminal's native
+// scrollback while the app-level chat viewport is active.
+const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1007h";
+const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l";
 const ENTER_ALT_SCREEN = "\x1b[?1049h";
 const EXIT_ALT_SCREEN = "\x1b[?1049l";
 const PASTE_MARKER_RE = /\[paste #\d+(?: (?:\+\d+ lines|\d+ chars))?\]/g;

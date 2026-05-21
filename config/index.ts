@@ -157,7 +157,7 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailS
 		preserveScrollOnToggle: raw.preserveScrollOnToggle ?? defaults.preserveScrollOnToggle ?? fallback.preserveScrollOnToggle ?? true,
 		preserveScrollOnUpdate: raw.preserveScrollOnUpdate ?? defaults.preserveScrollOnUpdate ?? fallback.preserveScrollOnUpdate ?? true,
 		collapseByDefault: raw.collapseByDefault ?? defaults.collapseByDefault ?? fallback.collapseByDefault,
-		collapsedRenderMode: (raw.collapsedRenderMode ?? defaults.collapsedRenderMode ?? fallback.collapsedRenderMode) === "title" ? "title" : "review",
+		collapsedRenderMode: (raw.collapsedRenderMode ?? defaults.collapsedRenderMode ?? fallback.collapsedRenderMode) === "simple" ? "simple" : "review",
 		layout: resolvedLayout,
 		style: {
 			background: resolveBackground(sectionStyle.background ?? "transparent", editorBackground) || fallbackStyle?.background || "",

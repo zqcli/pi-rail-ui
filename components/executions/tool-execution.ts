@@ -8,7 +8,7 @@ import {
 	applyDefaultAutoCollapse,
 	applyToolHintBackground,
 	collapsedExecutionRows,
-	collapsedTitleRows,
+	collapsedSimpleRows,
 	executionHiddenLineCount,
 	EXECUTION_RENDERED_KEY,
 	fg,
@@ -69,8 +69,8 @@ function toolDetail(component: any, theme: ThemeLike | undefined): string {
 	return fg(theme, "toolOutput", compactArgs(args));
 }
 
-function collapsedToolTitleRows(component: any, contentWidth: number, theme: ThemeLike | undefined): string[] {
-	const rows = collapsedTitleRows(toolTitle(component, theme), toolDetail(component, theme), executionHiddenLineCount(component, "toolExecution"), theme);
+function collapsedToolSimpleRows(component: any, contentWidth: number, theme: ThemeLike | undefined): string[] {
+	const rows = collapsedSimpleRows(toolTitle(component, theme), toolDetail(component, theme), executionHiddenLineCount(component, "toolExecution"), theme);
 	return rows.map((line) => line ? applyToolHintBackground(component, line, contentWidth, theme) : line);
 }
 
@@ -85,11 +85,11 @@ function renderToolExecutionRail(
 	const gap = config.layout.leftWindowGapWidth;
 	const normalizedGap = Math.max(0, Math.round(gap));
 	const innerWidth = normalizedGap <= 0 || width <= normalizedGap + 1 ? width : Math.max(1, width - normalizedGap);
-	const titleMode = config.collapsedRenderMode === "title";
-	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, innerWidth), { avoidExpandedRender: titleMode });
+	const simpleMode = config.collapsedRenderMode === "simple";
+	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, innerWidth), { avoidExpandedRender: simpleMode });
 
-	if (titleMode && !component.expanded) {
-		return renderLinesWithGap(width, gap, () => collapsedToolTitleRows(component, innerWidth, store.theme));
+	if (simpleMode && !component.expanded) {
+		return renderLinesWithGap(width, gap, () => collapsedToolSimpleRows(component, innerWidth, store.theme));
 	}
 
 	const cacheable = Boolean(component.result && component.isPartial === false && (!Array.isArray(component.imageComponents) || component.imageComponents.length === 0));

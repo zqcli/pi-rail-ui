@@ -79,7 +79,7 @@ export function executionHiddenLineCount(component: any, kind: ExecutionKind): n
 	return Math.max(0, argsRows + textOutputRows);
 }
 
-export function titleCollapseHint(theme: ThemeLike | undefined, hiddenLineCount: number): string {
+export function simpleCollapseHint(theme: ThemeLike | undefined, hiddenLineCount: number): string {
 	const prefix = theme ? theme.fg("muted", `... (${Math.max(0, hiddenLineCount)} more lines,`) : `... (${Math.max(0, hiddenLineCount)} more lines,`;
 	try {
 		return `${prefix} ${keyHint("app.tools.expand", "to expand")})`;
@@ -89,22 +89,22 @@ export function titleCollapseHint(theme: ThemeLike | undefined, hiddenLineCount:
 	}
 }
 
-export function collapsedTitleContentRows(
+export function collapsedSimpleContentRows(
 	title: string,
 	detail: string,
 	hiddenLineCount: number,
 	theme: ThemeLike | undefined,
 ): string[] {
-	return [title, detail, titleCollapseHint(theme, hiddenLineCount)];
+	return [title, detail, simpleCollapseHint(theme, hiddenLineCount)];
 }
 
-export function collapsedTitleRows(
+export function collapsedSimpleRows(
 	title: string,
 	detail: string,
 	hiddenLineCount: number,
 	theme: ThemeLike | undefined,
 ): string[] {
-	return ["", ...collapsedTitleContentRows(title, detail, hiddenLineCount, theme), ""];
+	return ["", ...collapsedSimpleContentRows(title, detail, hiddenLineCount, theme), ""];
 }
 
 function estimatedExpandedRows(component: any, kind: ExecutionKind): number | undefined {
@@ -176,6 +176,17 @@ export function applyDefaultAutoCollapse(
 	const previousAuto = component[AUTO_COLLAPSE_SIGNATURE_KEY] as { signature?: string; result?: any; args?: any } | undefined;
 	if (signature && previousAuto?.signature === signature && previousAuto.result === component.result && previousAuto.args === component.args) return;
 
+	if (options.avoidExpandedRender && component.expanded) {
+		component[AUTO_COLLAPSE_RENDERING_KEY] = true;
+		try {
+			// Preserve user/global expansion in simple mode during streaming updates.
+			if (signature) component[AUTO_COLLAPSE_SIGNATURE_KEY] = { signature, result: component.result, args: component.args };
+		} finally {
+			component[AUTO_COLLAPSE_RENDERING_KEY] = false;
+		}
+		return;
+	}
+
 	const estimatedRows = estimatedExpandedRows(component, kind);
 	if (estimatedRows !== undefined) {
 		component[AUTO_COLLAPSE_RENDERING_KEY] = true;
@@ -192,7 +203,9 @@ export function applyDefaultAutoCollapse(
 	if (options.avoidExpandedRender) {
 		component[AUTO_COLLAPSE_RENDERING_KEY] = true;
 		try {
-			if (component.expanded) component.setExpanded(false);
+			// Simple mode should avoid rendering expanded content just to decide
+			// collapse state. Keep the current expanded state so a user click during
+			// streaming is not immediately folded again by the next partial update.
 			if (signature) component[AUTO_COLLAPSE_SIGNATURE_KEY] = { signature, result: component.result, args: component.args };
 		} finally {
 			component[AUTO_COLLAPSE_RENDERING_KEY] = false;

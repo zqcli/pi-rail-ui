@@ -13,7 +13,7 @@ export type RailSectionKind =
 	| "selectorOutput"
 	| "custom";
 export type RailSectionSelectionMode = "fullRow" | "contentOnly" | "visible";
-export type RailSectionCollapsedRenderMode = "review" | "title";
+export type RailSectionCollapsedRenderMode = "review" | "simple";
 
 export type RailSectionRawStyle = {
 	background?: ColorReference;

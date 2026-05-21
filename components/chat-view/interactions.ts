@@ -16,8 +16,13 @@ import { isInteractiveRoot } from "./history-renderer";
 import { stateFor, type ActiveInteraction, type ConversationScrollStore, type ScrollAnimation, type ScrollState, type ScrollView } from "./state";
 
 const HISTORY_MUTATING_KEYS = new Set(["\x0f"]); // Ctrl+O: Pi global expand/collapse may mutate older history blocks.
+const SELECTION_COPY_THROTTLE_MS = 300;
 
 type ConversationMouse = { x: number; y: number; action: "press" | "drag" | "release" | "copy" };
+type SelectionCopyThrottle = { lastAttemptAt: number; pending: boolean };
+
+const selectionCopyThrottles = new WeakMap<ScrollState, SelectionCopyThrottle>();
+const coalescedInteractionRenderTimers = new WeakMap<ScrollState, ReturnType<typeof setTimeout>>();
 
 export function selectionRange(selection?: { anchor: Position; active: Position }): { start: Position; end: Position } | undefined {
 	if (!selection || samePosition(selection.anchor, selection.active)) return undefined;
@@ -98,18 +103,42 @@ function copySelectedHistoryText(state: ScrollState): boolean {
 	return Boolean(text && copyToClipboard(text));
 }
 
+function selectionCopyThrottleFor(state: ScrollState): SelectionCopyThrottle {
+	let throttle = selectionCopyThrottles.get(state);
+	if (!throttle) {
+		throttle = { lastAttemptAt: 0, pending: false };
+		selectionCopyThrottles.set(state, throttle);
+	}
+	return throttle;
+}
+
+function copySelectedHistoryTextNow(state: ScrollState): boolean {
+	const throttle = selectionCopyThrottleFor(state);
+	throttle.lastAttemptAt = Date.now();
+	throttle.pending = false;
+	return copySelectedHistoryText(state);
+}
+
 function clearSelectionCopyTimer(state: ScrollState): void {
-	if (!state.copyTimer) return;
-	clearTimeout(state.copyTimer);
-	state.copyTimer = undefined;
+	if (state.copyTimer) {
+		clearTimeout(state.copyTimer);
+		state.copyTimer = undefined;
+	}
+	const throttle = selectionCopyThrottles.get(state);
+	if (throttle) throttle.pending = false;
 }
 
 function scheduleSelectedHistoryCopy(state: ScrollState): void {
-	clearSelectionCopyTimer(state);
+	const throttle = selectionCopyThrottleFor(state);
+	throttle.pending = true;
+	if (state.copyTimer) return;
+
+	const delay = Math.max(0, SELECTION_COPY_THROTTLE_MS - (Date.now() - throttle.lastAttemptAt));
 	state.copyTimer = setTimeout(() => {
 		state.copyTimer = undefined;
-		copySelectedHistoryText(state);
-	}, 120);
+		if (!throttle.pending) return;
+		copySelectedHistoryTextNow(state);
+	}, delay);
 }
 
 function shouldPreferHistoryCacheForInput(data: string): boolean {
@@ -171,6 +200,18 @@ function easeOutCubic(value: number): number {
 
 function animationFrameMs(): number {
 	return Math.max(8, Math.round((TUI as any).MIN_RENDER_INTERVAL_MS ?? 16));
+}
+
+function requestCoalescedInteractionRender(tui: any, state: ScrollState, store: ConversationScrollStore): void {
+	if (coalescedInteractionRenderTimers.has(state)) return;
+	const timer = setTimeout(() => {
+		store.animationTimers.delete(timer);
+		if (coalescedInteractionRenderTimers.get(state) !== timer) return;
+		coalescedInteractionRenderTimers.delete(state);
+		tui.requestRender?.();
+	}, animationFrameMs());
+	coalescedInteractionRenderTimers.set(state, timer);
+	store.animationTimers.add(timer);
 }
 
 function clearScrollAnimation(state: ScrollState, store: ConversationScrollStore): void {
@@ -342,6 +383,7 @@ function railSectionRangeAtMouse(state: ScrollState, mouse: ConversationMouse): 
 function setRailSectionSelectionFromMouse(
 	tui: any,
 	state: ScrollState,
+	store: ConversationScrollStore,
 	pending: ActiveInteraction & { type: "railSectionClick" },
 	mouse: ConversationMouse,
 	selecting: boolean,
@@ -356,9 +398,10 @@ function setRailSectionSelectionFromMouse(
 	if (range && selecting) scheduleSelectedHistoryCopy(state);
 	else clearSelectionCopyTimer(state);
 	if (!range && !selecting) state.selection = undefined;
-	else if (range && !selecting) copySelectedHistoryText(state);
+	else if (range && !selecting) copySelectedHistoryTextNow(state);
 	state.preferCachedRender = true;
-	tui.requestRender?.();
+	if (selecting) requestCoalescedInteractionRender(tui, state, store);
+	else tui.requestRender?.();
 	return true;
 }
 
@@ -387,7 +430,7 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 	if (mouse.action === "drag") {
 		if (railSectionMoved(pending, mouse.x, mouse.y)) {
 			pending.moved = true;
-			setRailSectionSelectionFromMouse(tui, state, pending, mouse, true);
+			setRailSectionSelectionFromMouse(tui, state, store, pending, mouse, true);
 		}
 		return true;
 	}
@@ -395,7 +438,7 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 	if (mouse.action === "release") {
 		state.interaction = { type: "idle" };
 		if (pending.moved || railSectionMoved(pending, mouse.x, mouse.y)) {
-			setRailSectionSelectionFromMouse(tui, state, pending, mouse, false);
+			setRailSectionSelectionFromMouse(tui, state, store, pending, mouse, false);
 			return true;
 		}
 
@@ -495,7 +538,7 @@ function handleConversationScrollbarDrag(tui: any, data: string, store: Conversa
 	if (state.interaction.type !== "scrollbarDrag") return false;
 
 	if (mouse.action === "drag") {
-		if (applyScrollbarMouseRow(tui, state, store, row)) tui.requestRender?.();
+		if (applyScrollbarMouseRow(tui, state, store, row)) requestCoalescedInteractionRender(tui, state, store);
 		return true;
 	}
 
@@ -521,7 +564,7 @@ function handleConversationSelection(tui: any, data: string, store: Conversation
 	const startsInHistory = row >= 0 && row < view.rows;
 	if (mouse.action === "copy") {
 		clearSelectionCopyTimer(state);
-		return startsInHistory && copySelectedHistoryText(state);
+		return startsInHistory && copySelectedHistoryTextNow(state);
 	}
 	if (mouse.action === "press" && !startsInHistory) {
 		if (state.selection) {
@@ -552,11 +595,12 @@ function handleConversationSelection(tui: any, data: string, store: Conversation
 		state.interaction = { type: "idle" };
 		clearSelectionCopyTimer(state);
 		if (!selectionRange(state.selection)) state.selection = undefined;
-		else copySelectedHistoryText(state);
+		else copySelectedHistoryTextNow(state);
 	}
 
 	state.preferCachedRender = true;
-	tui.requestRender?.();
+	if (mouse.action === "drag") requestCoalescedInteractionRender(tui, state, store);
+	else tui.requestRender?.();
 	return true;
 }
 
@@ -577,7 +621,7 @@ export function handleConversationInput(tui: any, data: string, originalHandleIn
 			return originalHandleInput.call(tui, data);
 		}
 		if (setOffsetFromBottomImmediate(state, store, state.offsetFromBottom + wheel.direction * CONVERSATION_SCROLL_LAYOUT.wheelStepRows, true)) {
-			tui.requestRender?.();
+			requestCoalescedInteractionRender(tui, state, store);
 		}
 		return;
 	}

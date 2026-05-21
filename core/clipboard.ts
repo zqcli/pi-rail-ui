@@ -1,5 +1,10 @@
 import { spawnSync } from "node:child_process";
 
+const DUPLICATE_COPY_SKIP_MS = 1000;
+
+let lastCopiedText = "";
+let lastCopyAt = 0;
+
 function writeClipboardProcess(command: string, args: string[], text: string): boolean {
 	try {
 		const result = spawnSync(command, args, {
@@ -36,6 +41,14 @@ function copyViaOsc52(text: string): boolean {
 
 export function copyToClipboard(text: string): boolean {
 	if (!text) return false;
-	const copied = copyViaPlatformClipboard(text);
-	return copyViaOsc52(text) || copied;
+
+	const now = Date.now();
+	if (text === lastCopiedText && now - lastCopyAt < DUPLICATE_COPY_SKIP_MS) return true;
+
+	const copied = copyViaOsc52(text) || copyViaPlatformClipboard(text);
+	if (copied) {
+		lastCopiedText = text;
+		lastCopyAt = now;
+	}
+	return copied;
 }

@@ -89,13 +89,17 @@ export function simpleCollapseHint(theme: ThemeLike | undefined, hiddenLineCount
 	}
 }
 
+export function collapsedSimpleLine(text: string): string {
+	return text.replace(/[\r\n\t\v\f\u2028\u2029]+/gu, " ").replace(/ {2,}/g, " ");
+}
+
 export function collapsedSimpleContentRows(
 	title: string,
 	detail: string,
 	hiddenLineCount: number,
 	theme: ThemeLike | undefined,
 ): string[] {
-	return [title, detail, simpleCollapseHint(theme, hiddenLineCount)];
+	return [collapsedSimpleLine(title), collapsedSimpleLine(detail), collapsedSimpleLine(simpleCollapseHint(theme, hiddenLineCount))];
 }
 
 export function collapsedSimpleRows(

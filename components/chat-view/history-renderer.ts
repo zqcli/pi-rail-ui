@@ -29,6 +29,13 @@ function isBlankHistoryLine(line: string | undefined): boolean {
 	return stripAnsi(line ?? "").trim().length === 0;
 }
 
+function isPlainBlankHistoryLine(line: string | undefined): boolean {
+	const value = line ?? "";
+	// Background-colored padding rows are visually part of the previous block;
+	// only unstyled blank rows should satisfy/collapse inter-section spacing.
+	return value.trim().length === 0 && stripAnsi(value) === value;
+}
+
 function appendUnsectionedBlankRows(lines: string[], count: number): void {
 	for (let index = 0; index < count; index++) lines.push("");
 }
@@ -44,7 +51,7 @@ function shouldInsertBeforeSpacing(
 	if (spacing.beforeRows <= 0) return false;
 	if (spacing.scope === "group" && previousSectionKind === section.kind) return false;
 	if (!spacing.collapseAdjacent) return true;
-	return !isBlankHistoryLine(historyLines[historyLines.length - 1]) && !isBlankHistoryLine(childLines[0]);
+	return !isPlainBlankHistoryLine(historyLines[historyLines.length - 1]) && !isPlainBlankHistoryLine(childLines[0]);
 }
 
 function shouldCollapseLeadingBlankRow(
@@ -54,8 +61,8 @@ function shouldCollapseLeadingBlankRow(
 ): boolean {
 	return Boolean(
 		section?.config.layout.spacing.collapseAdjacent
-		&& isBlankHistoryLine(historyLines[historyLines.length - 1])
-		&& isBlankHistoryLine(childLines[0]),
+		&& isPlainBlankHistoryLine(historyLines[historyLines.length - 1])
+		&& isPlainBlankHistoryLine(childLines[0]),
 	);
 }
 

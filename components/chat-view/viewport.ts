@@ -248,10 +248,25 @@ export async function installConversationScroll(): Promise<void> {
 	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor, store);
 }
 
-function clearConversationScrollState(store: ConversationScrollStore, options: { clearOnNextOverflowRender?: boolean } = {}): void {
+function clearConversationScrollState(store: ConversationScrollStore, options: { clearOnNextOverflowRender?: boolean; keepEditorCache?: boolean } = {}): void {
 	for (const timer of store.animationTimers) clearTimeout(timer);
 	store.animationTimers.clear();
-	store.states = new WeakMap<object, any>();
+	if (options.keepEditorCache) {
+		// Preserve editorCache so IME stability survives wheel/scroll events
+		// during a streaming turn.
+		const oldStates = store.states;
+		store.states = new WeakMap<object, any>();
+		for (const [key, state] of oldStates as Map<object, ScrollState>) {
+			const ec = state.editorCache;
+			if (ec) {
+				const newState: ScrollState = { offsetFromBottom: 0, interaction: { type: "idle" } };
+				newState.editorCache = ec;
+				store.states.set(key, newState);
+			}
+		}
+	} else {
+		store.states = new WeakMap<object, any>();
+	}
 	store.clearOnNextOverflowRender = options.clearOnNextOverflowRender === true;
 }
 

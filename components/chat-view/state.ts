@@ -77,6 +77,11 @@ export type ScrollState = {
 	historyDirty?: boolean;
 	renderCache?: RenderCache;
 	copyTimer?: ReturnType<typeof setTimeout>;
+	/** Cached editor output from last frame. Used to skip re-rendering the
+	 * editor during streaming when only history content changes. Avoids
+	 * moving the CURSOR_MARKER on every token, which causes IME candidate-window
+	 * flickering on Windows when typing while the assistant streams. */
+	editorCache?: { width: number; editorRef: any; editorRenderId: string; lines: string[]; belowLines: string[]; footerLines: string[] };
 };
 
 export type ConversationScrollStore = {

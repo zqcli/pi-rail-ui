@@ -316,6 +316,11 @@ export function hideAllEditorOverlays(): void {
 type SlashAutocompleteLevel = "top" | "nested";
 
 export class RailEditor extends MouseSelectableRailEditor {
+	/** Stable identifier that changes only when the editor's visual output
+	 * must be regenerated (content, cursor, focus, or size). Used by
+	 * the chat-viewport to skip re-rendering the editor during streaming
+	 * when the editor hasn't changed, avoiding IME candidate-window flicker. */
+	renderId!: string;
 	private slashOverlay?: OverlayHandle;
 	private slashOverlaySignature?: string;
 	private readonly slashOverlaySurface: EditorSurfaceRenderer;
@@ -677,6 +682,7 @@ export class RailEditor extends MouseSelectableRailEditor {
 		const slashAutocompleteLevel = this.getSlashAutocompleteLevel();
 		const lines = this.editorLinesRef();
 		const signature = this.renderSignature(width, lines, slashAutocompleteLevel);
+		this.renderId = signature;
 		if (this.renderCache?.linesRef === lines && this.renderCache.signature === signature) return this.renderCache.rows;
 
 		const body = this.editorBodyRows(width, lines);

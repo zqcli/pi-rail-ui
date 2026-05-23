@@ -48,6 +48,18 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 						"Proxy URL. Supports socks5:// socks5h:// http:// https://. e.g. socks5://127.0.0.1:1080",
 				}),
 			),
+			followRedirects: Type.Optional(
+				Type.Boolean({
+					description: "Whether to follow HTTP redirects. Default: true.",
+					default: true,
+				}),
+			),
+			maxRedirects: Type.Optional(
+				Type.Number({
+					description: "Maximum number of redirects to follow. Default: 10.",
+					default: 10,
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
@@ -57,6 +69,8 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 			const body = params.body as string | undefined;
 			const timeout = (params.timeout as number | undefined) ?? 30;
 			const proxy = params.proxy as string | undefined;
+		const followRedirects = (params.followRedirects as boolean | undefined) ?? true;
+		const maxRedirects = (params.maxRedirects as number | undefined) ?? 10;
 
 			// Merge: user headers override defaults
 			const mergedHeaders: Record<string, string> = {};
@@ -79,6 +93,10 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 				args.push("-H", `${k}: ${v}`);
 			}
 
+			if (followRedirects && maxRedirects > 0) {
+				args.push("-L", "--max-redirs", String(maxRedirects));
+			}
+
 			args.push(url);
 
 			if (body && method !== "GET") {
@@ -91,7 +109,8 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 				throw new Error(`curl error: ${stderr}`);
 			}
 
-			const { statusCode, responseHeaders, responseBody } = parseCurlOutput(stdout);
+			const { statusCode, responseHeaders, responseBody, redirectUrls } =
+				parseCurlOutput(stdout);
 
 			const truncation = truncateHead(responseBody, { maxBytes: DEFAULT_MAX_BYTES });
 			let displayBody = truncation.content;
@@ -108,6 +127,9 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 					headers: Object.fromEntries(responseHeaders.slice(0, 20)),
 					body: displayBody,
 					truncated: truncation.truncated,
+					...(redirectUrls.length > 0
+					? { redirectCount: redirectUrls.length, redirectUrls }
+					: {}),
 				},
 				null,
 				2,
@@ -120,6 +142,7 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 					headerCount: responseHeaders.length,
 					bodySize: truncation.totalBytes,
 					truncated: truncation.truncated,
+					redirectCount: redirectUrls.length,
 				},
 			};
 		},
@@ -145,42 +168,75 @@ function runCurl(
 	});
 }
 
+interface HttpResponseBlock {
+	statusCode: number;
+	responseHeaders: [string, string][];
+	responseBody: string;
+	redirectUrl?: string;
+}
+
 function parseCurlOutput(raw: string): {
 	statusCode: number;
 	responseHeaders: [string, string][];
 	responseBody: string;
+	redirectUrls: string[];
 } {
 	const lines = raw.split(/\r?\n/);
-	let statusCode = 0;
+	const blocks: HttpResponseBlock[] = [];
+	const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 
-	// Find the real HTTP status line. Skip proxy CONNECT tunnel lines
-	// like "HTTP/1.1 200 Connection established" that precede the actual response.
-	let start = 0;
-	for (let i = 0; i < lines.length; i++) {
+	let i = 0;
+	while (i < lines.length) {
 		const m = lines[i]?.match(/^HTTP\/(?:\d\.\d|2)\s+(\d+)/);
-		if (m) {
-			statusCode = +m[1];
-			start = i;
-			// If this is a proxy CONNECT response, look for the next status line
-			if (lines[i]?.includes("Connection established")) {
-				continue;
+		if (m && !lines[i]?.includes("Connection established")) {
+			const sc = +m[1];
+			let hi = i + 1;
+			const hdrs: [string, string][] = [];
+			let location: string | undefined;
+			for (; hi < lines.length; hi++) {
+				if (lines[hi] === "" || lines[hi] === "\r") {
+					hi++;
+					break;
+				}
+				const ci = lines[hi].indexOf(":");
+				if (ci > 0) {
+					const key = lines[hi].slice(0, ci).trim();
+					const val = lines[hi].slice(ci + 1).trim();
+					hdrs.push([key, val]);
+					if (key.toLowerCase() === "location") location = val;
+				}
 			}
-			break;
-		}
-	}
-
-	const responseHeaders: [string, string][] = [];
-	let i = start + 1;
-	for (; i < lines.length; i++) {
-		if (lines[i] === "" || lines[i] === "\r") {
+			// Scan body until next HTTP status line or EOF
+			let bi = hi;
+			while (bi < lines.length && !/^HTTP\/(?:\d\.\d|2)\s+\d+/.test(lines[bi] ?? "")) {
+				bi++;
+			}
+			const body = lines.slice(hi, bi).join("\n").trim();
+			blocks.push({
+				statusCode: sc,
+				responseHeaders: hdrs,
+				responseBody: body,
+				redirectUrl: REDIRECT_CODES.has(sc) ? location : undefined,
+			});
+			i = bi;
+		} else {
 			i++;
-			break;
-		}
-		const ci = lines[i].indexOf(":");
-		if (ci > 0) {
-			responseHeaders.push([lines[i].slice(0, ci).trim(), lines[i].slice(ci + 1).trim()]);
 		}
 	}
 
-	return { statusCode, responseHeaders, responseBody: lines.slice(i).join("\n").trim() };
+	if (blocks.length === 0) {
+		return { statusCode: 0, responseHeaders: [], responseBody: raw, redirectUrls: [] };
+	}
+
+	const last = blocks[blocks.length - 1];
+	const redirectUrls = blocks
+		.filter((b) => b.redirectUrl)
+		.map((b) => b.redirectUrl!);
+
+	return {
+		statusCode: last.statusCode,
+		responseHeaders: last.responseHeaders,
+		responseBody: last.responseBody,
+		redirectUrls,
+	};
 }

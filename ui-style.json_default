@@ -12,14 +12,14 @@
       "max": 12,
       "maxRatio": 0.32
     },
-    "background": { "rgb": [49, 50, 68] },
-    "rail": { "rgb": [137, 180, 250] },
+    "background": { "rgb": [48, 50, 56] },
+    "rail": { "rgb": [147, 197, 253] },
     "selection": {
-      "background": { "rgb": [69, 71, 90] },
-      "foreground": { "rgb": [245, 245, 250] }
+      "background": { "rgb": [76, 91, 112] },
+      "foreground": { "rgb": [248, 250, 252] }
     },
     "pasteMarker": {
-      "background": { "rgb": [69, 71, 90] },
+      "background": { "rgb": [64, 70, 84] },
       "foreground": "editor.rail",
       "bold": true
     },
@@ -39,29 +39,29 @@
       "visible": true,
       "dragEnabled": true,
       "trackBackground": "transparent",
-      "thumbBackground": { "rgb": [137, 180, 250] },
+      "thumbBackground": { "rgb": [96, 165, 250] },
       "widthMultiplier": 1,
       "dragAnimationMs": 90
     }
   },
   "thinking": {
     "background": "transparent",
-    "rail": { "rgb": [203, 166, 247] }
+    "rail": "theme:thinkingText"
   },
   "assistantReply": {
     "alignSurface": "thinking"
   },
   "userMessage": {
-    "background": { "rgb": [49, 50, 68] },
-    "rail": { "rgb": [137, 180, 250] },
+    "background": "editor.background",
+    "rail": "editor.rail",
     "textGapWidth": 1,
     "verticalPaddingRows": 1,
-    "timestampColor": { "rgb": [127, 132, 156] }
+    "timestampColor": "theme:thinkingText"
   },
   "slashCommand": {
-    "background": { "rgb": [49, 50, 68] },
-    "rail": { "rgb": [148, 226, 213] },
-    "selectedText": { "rgb": [137, 180, 250] },
+    "background": "editor.background",
+    "rail": "theme:thinkingText",
+    "selectedText": "editor.rail",
     "textGapWidth": 1,
     "bottomReservedRows": 1,
     "firstLevelHeightMultiplier": 2,
@@ -70,8 +70,8 @@
     "maxPrimaryColumnWidth": 32
   },
   "bashExecution": {
-    "background": { "rgb": [24, 24, 37] },
-    "rail": { "rgb": [249, 226, 175] },
+    "background": { "rgb": [38, 43, 52] },
+    "rail": "theme:bashMode",
     "leftBorder": "▎",
     "borderContentGapWidth": 0,
     "verticalSpacingRows": 1
@@ -114,16 +114,16 @@
     },
     "sections": {
       "assistantMessage": { "layout": { "alignWith": "assistantThinking" } },
-      "assistantThinking": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "style": { "background": "transparent", "rail": { "rgb": [203, 166, 247] } } },
+      "assistantThinking": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "style": { "background": "transparent", "rail": "theme:thinkingText" } },
       "assistantReply": { "layout": { "alignWith": "assistantThinking" }, "style": { "background": "transparent", "rail": false } },
-      "userMessage": { "style": { "background": { "rgb": [49, 50, 68] }, "rail": { "rgb": [137, 180, 250] } }, "selection": { "includeTimestamp": true } },
-      "toolExecution": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "collapseByDefault": ["write"], "collapsedRenderMode": "simple", "style": { "background": "transparent", "rail": { "rgb": [166, 227, 161] } } },
+      "userMessage": { "style": { "background": "editor.background", "rail": "editor.rail" }, "selection": { "includeTimestamp": true } },
+      "toolExecution": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "collapseByDefault": ["write"], "collapsedRenderMode": "simple", "style": { "background": "transparent", "rail": false } },
       "bashExecution": {
         "collapsible": true,
         "clickToToggle": true,
         "autoCollapseAfterRows": 20,
         "collapsedRenderMode": "simple",
-        "style": { "background": { "rgb": [24, 24, 37] }, "rail": { "rgb": [249, 226, 175] } },
+        "style": { "background": { "rgb": [38, 43, 52] }, "rail": "theme:bashMode" },
         "layout": {
           "leftBorder": "▎",
           "borderContentGapWidth": 0,
@@ -132,14 +132,14 @@
         }
       },
       "commandOutput": {
-        "style": { "background": "transparent", "rail": { "rgb": [148, 226, 213] } },
+        "style": { "background": "transparent", "rail": false },
         "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
       },
       "resourceStatus": {
-        "style": { "background": "transparent", "rail": { "rgb": [250, 179, 135] } },
+        "style": { "background": "transparent", "rail": false },
         "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
       },
-      "selectorOutput": { "selectable": false, "style": { "background": { "rgb": [49, 50, 68] }, "rail": { "rgb": [148, 226, 213] } } },
+      "selectorOutput": { "selectable": false, "style": { "background": "editor.background", "rail": "theme:thinkingText" } },
       "custom": { "style": { "background": "transparent", "rail": false } }
     }
   },
@@ -149,12 +149,12 @@
     "branchMaxWidth": 16,
     "bottomGapRows": 0,
     "colors": {
-      "sky": { "rgb": [137, 180, 250] },
-      "mint": { "rgb": [166, 227, 161] },
-      "amber": { "rgb": [249, 226, 175] },
-      "lilac": { "rgb": [203, 166, 247] },
-      "text": { "rgb": [205, 214, 244] },
-      "muted": { "rgb": [127, 132, 156] }
+      "sky": { "rgb": [125, 211, 252] },
+      "mint": { "rgb": [134, 239, 172] },
+      "amber": { "rgb": [251, 191, 36] },
+      "lilac": { "rgb": [196, 181, 253] },
+      "text": { "rgb": [238, 242, 255] },
+      "muted": { "rgb": [148, 163, 184] }
     }
   }
 }

@@ -7,7 +7,7 @@ import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
 import { RailEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays, installSelectorOverlay, uninstallSelectorOverlay } from "./components/editor";
 import { createRailFooter, setFooterExpanded } from "./components/footer";
-import { ensureConversationAlternateScreen, installConversationScroll, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll } from "./components/chat-view";
+import { ensureConversationAlternateScreen, installConversationScroll, installTerminalOutputCoalescing, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll, uninstallTerminalOutputCoalescing } from "./components/chat-view";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
@@ -30,6 +30,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	let enabled = true;
 	let mouseEnabled = false;
 
+	await installTerminalOutputCoalescing();
 	await installConversationScroll();
 	if (!CONVERSATION_SCROLL_LAYOUT.enabled || !CONVERSATION_SCROLL_LAYOUT.alternateScreen) releaseConversationAlternateScreen();
 
@@ -65,6 +66,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	async function install(ctx: ExtensionContext) {
 		if (!ctx.hasUI || !enabled) return;
 		setRailUiActive(true);
+		await installTerminalOutputCoalescing();
 		await installConversationScroll();
 		installEditor(ctx);
 		installFooter(ctx);
@@ -91,6 +93,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		uninstallResourceStatusRail();
 		uninstallCommandOutputRail();
 		uninstallConversationScroll();
+		uninstallTerminalOutputCoalescing();
 	}
 
 	pi.registerCommand("rail-ui", {
@@ -156,7 +159,10 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		uninstallResourceStatusRail();
 		uninstallCommandOutputRail();
 		if (keepConversationScroll) resetConversationScrollState();
-		else uninstallConversationScroll({ releaseAlternateScreen: !keepAlternateScreen });
+		else {
+			uninstallConversationScroll({ releaseAlternateScreen: !keepAlternateScreen });
+			uninstallTerminalOutputCoalescing();
+		}
 		enabled = true;
 	});
 

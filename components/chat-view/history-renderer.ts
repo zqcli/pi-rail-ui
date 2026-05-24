@@ -237,30 +237,6 @@ export function getRenderedSections(children: any[], width: number, state: Scrol
 			state.renderCache,
 			reusablePrefixChildCount(state.renderCache, historyChildren, width, state),
 		);
-
-	// Reuse editor/footer lines when the editor component didn't change between
-	// frames. During streaming the assistant appends new content to the history
-	// while the editor stays identical; re-rendering it moves the CURSOR_MARKER
-	// and causes IME candidate-window flicker on Windows.
-	const editorRef = children[5];
-	let editorLines: string[];
-	let belowLines: string[];
-	let footerLines: string[];
-	const editorCache = state.editorCache;
-	const editorRenderId = editorRef?.renderId as string | undefined;
-	if (editorCache && editorCache.width === width && editorCache.editorRef === editorRef && editorCache.editorRenderId === editorRenderId) {
-		editorLines = editorCache.lines;
-		belowLines = editorCache.belowLines;
-		footerLines = editorCache.footerLines;
-	} else {
-		editorLines = renderChild(editorRef, width);
-		belowLines = renderChild(children[6], width);
-		footerLines = renderChild(children[7], width);
-		// Re-read renderId after render() since the editor sets it during rendering.
-		const postRenderId = (editorRef?.renderId as string | undefined) ?? "";
-		state.editorCache = { width, editorRef, editorRenderId: postRenderId, lines: editorLines, belowLines, footerLines };
-	}
-
 	const cache: RenderCache = {
 		width,
 		children: [...children],
@@ -268,9 +244,9 @@ export function getRenderedSections(children: any[], width: number, state: Scrol
 		pendingLines: renderChild(children[2], width),
 		statusLines: renderChild(children[3], width),
 		aboveLines: renderChild(children[4], width),
-		editorLines,
-		belowLines,
-		footerLines,
+		editorLines: renderChild(children[5], width),
+		belowLines: renderChild(children[6], width),
+		footerLines: renderChild(children[7], width),
 	};
 	state.renderCache = cache;
 	state.preferCachedRender = false;

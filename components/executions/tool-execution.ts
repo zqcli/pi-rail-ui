@@ -69,9 +69,12 @@ function toolDetail(component: any, theme: ThemeLike | undefined): string {
 	return fg(theme, "toolOutput", compactArgs(args));
 }
 
+const TOOL_COLLAPSED_CONTENT_PADDING = 1;
+
 function collapsedToolSimpleRows(component: any, contentWidth: number, theme: ThemeLike | undefined): string[] {
 	const rows = collapsedSimpleRows(toolTitle(component, theme), toolDetail(component, theme), executionHiddenLineCount(component, "toolExecution"), theme);
-	return rows.map((line) => line ? applyToolHintBackground(component, line, contentWidth, theme) : line);
+	const contentPadding = " ".repeat(TOOL_COLLAPSED_CONTENT_PADDING);
+	return rows.map((line) => line ? applyToolHintBackground(component, `${contentPadding}${line}`, contentWidth, theme) : line);
 }
 
 function renderToolExecutionRail(

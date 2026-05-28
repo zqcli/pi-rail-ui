@@ -77,6 +77,7 @@ export type ScrollState = {
 	preferCachedRender?: boolean;
 	historyDirty?: boolean;
 	renderCache?: RenderCache;
+	viewportLayoutSignature?: string;
 	copyTimer?: ReturnType<typeof setTimeout>;
 };
 

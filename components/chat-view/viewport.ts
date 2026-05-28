@@ -1,7 +1,7 @@
 import { TUI } from "@earendil-works/pi-tui";
 import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, CONVERSATION_SELECTION_STYLE, FOOTER_LAYOUT, RAIL_EDITOR_STYLE } from "../../config";
 import { getInteractiveModeConstructors, restorePrototypePatches } from "../../core/patching";
-import { applyColumnHighlight, clamp, padToWidth } from "../../core/utils";
+import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, applyColumnHighlight, clamp, padToWidth } from "../../core/utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
 import { handleConversationInput, selectionRange } from "./interactions";
 import {
@@ -62,6 +62,35 @@ function clearBeforeOverflowRender(tui: any, store: ConversationScrollStore, has
 	store.clearOnNextOverflowRender = false;
 	writeTerminalControl(CLEAR_SCREEN_AND_SCROLLBACK);
 	resetTuiRenderMemory(tui);
+}
+
+function clearViewportRenderMemory(tui: any): void {
+	writeTerminalControl(CLEAR_SCREEN_AND_SCROLLBACK);
+	resetTuiRenderMemory(tui);
+}
+
+function fixedViewportLayoutSignature(parts: {
+	leftGutterWidth: number;
+	historyRows: number;
+	pendingRows: number;
+	statusRows: number;
+	aboveRows: number;
+	editorRows: number;
+	belowRows: number;
+	footerRows: number;
+	footerBottomGapRows: number;
+}): string {
+	return [
+		parts.leftGutterWidth,
+		parts.historyRows,
+		parts.pendingRows,
+		parts.statusRows,
+		parts.aboveRows,
+		parts.editorRows,
+		parts.belowRows,
+		parts.footerRows,
+		parts.footerBottomGapRows,
+	].join("\u001f");
 }
 
 export function ensureConversationAlternateScreen(tui?: any): void {
@@ -133,10 +162,30 @@ function renderScrollbar(line: string, rowIndex: number, metrics: ScrollbarMetri
 	return `${content}${isThumb ? metrics.thumbBar : metrics.trackBar}`;
 }
 
+const LEADING_ZERO_WIDTH_ROW_MARKERS = [OSC133_ZONE_START, OSC133_ZONE_END, OSC133_ZONE_FINAL] as const;
+
+function splitLeadingZeroWidthRowMarkers(line: string): { markers: string; body: string } {
+	let markers = "";
+	let body = line;
+	let matched = true;
+	while (matched) {
+		matched = false;
+		for (const marker of LEADING_ZERO_WIDTH_ROW_MARKERS) {
+			if (!body.startsWith(marker)) continue;
+			markers += marker;
+			body = body.slice(marker.length);
+			matched = true;
+			break;
+		}
+	}
+	return { markers, body };
+}
+
 function addGlobalLeftGutter(line: string, width: number, gutter: number): string {
 	const prefixWidth = Math.min(gutter, Math.max(0, width - 1));
 	const contentWidth = Math.max(0, width - prefixWidth);
-	return `${" ".repeat(prefixWidth)}${padToWidth(line, contentWidth)}`;
+	const { markers, body } = splitLeadingZeroWidthRowMarkers(line);
+	return `${markers}${" ".repeat(prefixWidth)}${padToWidth(body, contentWidth)}`;
 }
 
 function addGlobalLeftGutterToRows(lines: string[], width: number, gutter: number): string[] {
@@ -186,6 +235,21 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 		const editorBottomRow = editorTopRow + editorLines.length;
 		const footerTopRow = editorBottomRow + belowLines.length;
 		const footerBottomRow = footerTopRow + footerLines.length;
+		const layoutSignature = fixedViewportLayoutSignature({
+			leftGutterWidth,
+			historyRows,
+			pendingRows: pendingLines.length,
+			statusRows: statusLines.length,
+			aboveRows: aboveLines.length,
+			editorRows: editorLines.length,
+			belowRows: belowLines.length,
+			footerRows: footerLines.length,
+			footerBottomGapRows: FOOTER_LAYOUT.bottomGapRows,
+		});
+		const fixedLayoutChanged = state.viewportLayoutSignature !== undefined && state.viewportLayoutSignature !== layoutSignature;
+		state.viewportLayoutSignature = layoutSignature;
+		if (fixedLayoutChanged && historyLines.length > historyRows) clearViewportRenderMemory(tui);
+
 		const maxStart = Math.max(0, historyLines.length - historyRows);
 		let start: number;
 		if (state.lockedStart !== undefined) {

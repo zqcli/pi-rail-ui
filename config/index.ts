@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import { bg, fg, resolveBackground, resolveTextColor } from "./colors";
 import type {
+	AppLayout,
 	BashExecutionLayout,
 	ConversationScrollLayout,
 	ConversationScrollMode,
@@ -26,7 +27,7 @@ import type {
 
 export type { EditorHeightPolicy, EditorSurfaceStyle, RailSurfaceStyle } from "./types";
 export type { TextColorTarget, ThemeLike, RailSectionKind, RailSectionSelectionMode } from "./types";
-export type { UserMessageLayout, SlashCommandLayout, FooterStyle, BashExecutionLayout } from "./types";
+export type { AppLayout, UserMessageLayout, SlashCommandLayout, FooterStyle, BashExecutionLayout } from "./types";
 export type { RailSectionSelectionConfig, RailSectionStyleConfig, RailSectionSpacingConfig } from "./types";
 export type { RailSectionLayoutConfig, RailSectionResolvedConfig, EditorPasteMarkerStyle } from "./types";
 export type { ConversationScrollMode, ConversationScrollLayout, ConversationScrollbarStyle } from "./types";
@@ -83,11 +84,10 @@ function mergeRaw<T extends object>(defaults: T | undefined, value: T | undefine
 function sectionContentStart(layout: RailSectionRawLayout, fallback: Partial<RailSectionLayoutConfig>, railEnabled: boolean): number {
 	if (typeof layout.contentStartCol === "number") return Math.max(0, Math.round(layout.contentStartCol));
 	if (typeof fallback.contentStartCol === "number") return Math.max(0, Math.round(fallback.contentStartCol));
-	const gap = Math.max(0, Math.round(layout.leftWindowGapWidth ?? fallback.leftWindowGapWidth ?? style.surfaceLayout.leftWindowGapWidth));
-	if (!railEnabled) return gap;
+	if (!railEnabled) return 0;
 	const borderWidth = Math.max(0, Math.round(layout.leftBorderWidth ?? fallback.leftBorderWidth ?? style.surfaceLayout.leftBorderWidth));
 	const borderGap = Math.max(0, Math.round(layout.borderContentGapWidth ?? fallback.borderContentGapWidth ?? style.surfaceLayout.borderContentGapWidth));
-	return gap + borderWidth + borderGap;
+	return borderWidth + borderGap;
 }
 
 function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailSectionResolvedConfig> = {}): RailSectionResolvedConfig {
@@ -110,7 +110,6 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailS
 		scope: rawSpacing?.scope ?? fallbackSpacing?.scope ?? "section",
 	};
 	const resolvedLayout: RailSectionLayoutConfig = {
-		leftWindowGapWidth: Math.max(0, Math.round(layout.leftWindowGapWidth ?? fallbackLayout.leftWindowGapWidth ?? style.surfaceLayout.leftWindowGapWidth)),
 		leftBorder: layout.leftBorder ?? fallbackLayout.leftBorder ?? style.surfaceLayout.leftBorder,
 		leftBorderWidth: Math.max(0, Math.round(layout.leftBorderWidth ?? fallbackLayout.leftBorderWidth ?? style.surfaceLayout.leftBorderWidth)),
 		borderContentGapWidth: Math.max(0, Math.round(layout.borderContentGapWidth ?? fallbackLayout.borderContentGapWidth ?? style.surfaceLayout.borderContentGapWidth)),
@@ -166,6 +165,15 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailS
 		},
 		selection: resolvedSelection,
 	};
+}
+
+export const APP_LAYOUT: AppLayout = {
+	leftGutterWidth: Math.max(0, Math.round(style.appLayout?.leftGutterWidth ?? 0)),
+};
+
+export function appLeftGutterWidth(width?: number): number {
+	const gutter = APP_LAYOUT.leftGutterWidth;
+	return width === undefined ? gutter : Math.min(gutter, Math.max(0, Math.round(width) - 1));
 }
 
 export const CONVERSATION_SELECTION_STYLE = selectionBackground;
@@ -291,10 +299,9 @@ export const RAIL_BASH_EXECUTION_STYLE: RailSurfaceStyle = {
 	rail: BASH_EXECUTION_RAIL_COLOR.ansi ?? editorRail,
 };
 
-const surfaceContentStart = style.surfaceLayout.leftWindowGapWidth + style.surfaceLayout.leftBorderWidth + style.surfaceLayout.borderContentGapWidth;
-const leftGapContentStart = style.surfaceLayout.leftWindowGapWidth;
-const bashContentStart = style.surfaceLayout.leftWindowGapWidth
-	+ style.surfaceLayout.leftBorderWidth
+const surfaceContentStart = style.surfaceLayout.leftBorderWidth + style.surfaceLayout.borderContentGapWidth;
+const outerContentStart = 0;
+const bashContentStart = style.surfaceLayout.leftBorderWidth
 	+ Math.max(0, Math.round(bashExecutionSectionLayout?.borderContentGapWidth ?? style.bashExecution?.borderContentGapWidth ?? style.surfaceLayout.borderContentGapWidth));
 const contentOnlySelection: RailSectionSelectionConfig = {
 	mode: "contentOnly",
@@ -314,12 +321,12 @@ export const RAIL_SECTION_CONFIGS: Record<RailSectionKind, RailSectionResolvedCo
 			assistantThinking: { selectable: true, layout: { contentStartCol: surfaceContentStart }, selection: contentOnlySelection },
 			assistantReply: { selectable: true, layout: { contentStartCol: surfaceContentStart, alignWith: "assistantThinking" }, selection: contentOnlySelection },
 			userMessage: { selectable: true, layout: { contentStartCol: surfaceContentStart + Math.max(0, style.userMessage.textGapWidth), spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: contentOnlySelection },
-			toolExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: leftGapContentStart, spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: contentOnlySelection },
+			toolExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: contentOnlySelection },
 			bashExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: bashContentStart, spacing: { beforeRows: BASH_EXECUTION_LAYOUT.verticalSpacingRows, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: contentOnlySelection },
-			commandOutput: { selectable: true, layout: { contentStartCol: leftGapContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: contentOnlySelection },
-			resourceStatus: { selectable: true, layout: { contentStartCol: leftGapContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: contentOnlySelection },
+			commandOutput: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: contentOnlySelection },
+			resourceStatus: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: contentOnlySelection },
 			selectorOutput: { selectable: false, layout: { contentStartCol: surfaceContentStart }, selection: contentOnlySelection },
-			custom: { selectable: true, layout: { contentStartCol: leftGapContentStart }, selection: contentOnlySelection },
+			custom: { selectable: true, layout: { contentStartCol: outerContentStart }, selection: contentOnlySelection },
 		};
 		return [kind, resolveRailSectionConfig(kind, fallbackByKind[kind])];
 	}),

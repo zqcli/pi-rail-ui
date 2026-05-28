@@ -5,7 +5,7 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
-import { SLASH_COMMAND_LAYOUT, RAIL_EDITOR_HEIGHT, applyTextColor, type ThemeLike } from "../../config";
+import { appLeftGutterWidth, SLASH_COMMAND_LAYOUT, RAIL_EDITOR_HEIGHT, applyTextColor, type ThemeLike } from "../../config";
 import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../../core/patching";
 import { RailOverlayPanel, renderRailOverlayRows, type RailOverlayBodyRenderer } from "../../rail/rail-overlay";
 import { cachedRender } from "../../rail/render-cache";
@@ -326,7 +326,9 @@ function showSettingsOverlay(instance: any, create: SelectorFactory, store: Sele
 	instance.editor?.hideSlashOverlay?.();
 	const terminal = instance.ui?.terminal;
 	const width = Math.max(1, terminal?.columns ?? 80);
-	const bottomMargin = renderedEditorRows(instance, width) + SLASH_COMMAND_LAYOUT.bottomReservedRows;
+	const leftGutterWidth = appLeftGutterWidth(width);
+	const contentWidth = Math.max(1, width - leftGutterWidth);
+	const bottomMargin = renderedEditorRows(instance, contentWidth) + SLASH_COMMAND_LAYOUT.bottomReservedRows;
 	const panel = new RailOverlayPanel({
 		renderBody,
 		focusTarget: focus,

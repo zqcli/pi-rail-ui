@@ -9,6 +9,7 @@ export type ScrollView = {
 	rows: number;
 	lineCount: number;
 	width: number;
+	leftGutterWidth: number;
 	editorTopRow: number;
 	editorBottomRow: number;
 	footerTopRow: number;

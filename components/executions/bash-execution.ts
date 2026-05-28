@@ -1,7 +1,6 @@
 import { truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import { railSectionConfig, type ThemeLike } from "../../config";
 import { padToWidth, stripAnsi } from "../../core/utils";
-import { renderLinesWithGap } from "../../rail/rail-gap";
 import { collapseHint } from "../../rail/rail-section";
 import { bashExecutionSurfaceForTheme } from "../../rail/rail-surface";
 import { cachedRender } from "../../rail/render-cache";
@@ -22,12 +21,9 @@ export function isBashExecution(component: any): boolean {
 	return component?.constructor?.name === "BashExecutionComponent" || typeof component?.getCommand === "function";
 }
 
-function renderBashWithLeftGap(component: any, width: number, originalRender: (width: number) => string[]): string[] {
-	const gap = railSectionConfig("bashExecution").layout.leftWindowGapWidth;
-	return renderLinesWithGap(width, gap, (innerWidth) => {
-		applyDefaultAutoCollapse(component, "bashExecution", () => originalRender.call(component, innerWidth));
-		return originalRender.call(component, innerWidth);
-	});
+function renderBashWithoutSurface(component: any, width: number, originalRender: (width: number) => string[]): string[] {
+	applyDefaultAutoCollapse(component, "bashExecution", () => originalRender.call(component, width));
+	return originalRender.call(component, width);
 }
 
 function collapsedBashPreviewRows(component: any, contentWidth: number, theme: ThemeLike | undefined): string[] | undefined {
@@ -102,7 +98,7 @@ export function renderBashExecutionRail(
 	store: ExecutionRailPatchStore,
 ): string[] {
 	const surface = bashExecutionSurfaceForTheme(store.theme);
-	if (width < surface.minRenderableWidth()) return renderBashWithLeftGap(component, width, originalRender);
+	if (width < surface.minRenderableWidth()) return renderBashWithoutSurface(component, width, originalRender);
 	const contentWidth = surface.contentWidth(width);
 	const simpleMode = railSectionConfig("bashExecution").collapsedRenderMode === "simple";
 	applyDefaultAutoCollapse(component, "bashExecution", () => renderedChildLines(component.contentContainer, contentWidth), { avoidExpandedRender: simpleMode });

@@ -1,5 +1,5 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, CONVERSATION_SELECTION_STYLE, FOOTER_LAYOUT, RAIL_EDITOR_STYLE } from "../../config";
+import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, CONVERSATION_SELECTION_STYLE, FOOTER_LAYOUT, RAIL_EDITOR_STYLE } from "../../config";
 import { getInteractiveModeConstructors, restorePrototypePatches } from "../../core/patching";
 import { applyColumnHighlight, clamp, padToWidth } from "../../core/utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
@@ -31,6 +31,18 @@ function writeTerminalControl(sequence: string): void {
 
 function requestFullRenderAfterScreenClear(tui: any | undefined): void {
 	if (typeof tui?.requestRender === "function") tui.requestRender(true);
+}
+
+function withGlobalLeftGutterOverlayOptions(options: any, width: number): any {
+	const gutter = appLeftGutterWidth(width);
+	if (gutter <= 0) return options;
+
+	const rawMargin = options?.margin;
+	const margin = typeof rawMargin === "number"
+		? { top: rawMargin, right: rawMargin, bottom: rawMargin, left: rawMargin }
+		: { ...(rawMargin ?? {}) };
+	margin.left = Math.max(0, Math.round(margin.left ?? 0)) + gutter;
+	return { ...(options ?? {}), margin };
 }
 
 function resetTuiRenderMemory(tui: any): void {
@@ -114,11 +126,21 @@ function getScrollbarMetrics(visibleRows: number, totalRows: number, start: numb
 }
 
 function renderScrollbar(line: string, rowIndex: number, metrics: ScrollbarMetrics | undefined, width: number): string {
-	if (!metrics) return line;
+	if (!metrics) return padToWidth(line, width);
 
 	const isThumb = rowIndex >= metrics.thumbStart && rowIndex < metrics.thumbStart + metrics.thumbSize;
 	const content = padToWidth(`${line}${RAIL_EDITOR_STYLE.reset}`, width - metrics.width);
 	return `${content}${isThumb ? metrics.thumbBar : metrics.trackBar}`;
+}
+
+function addGlobalLeftGutter(line: string, width: number, gutter: number): string {
+	const prefixWidth = Math.min(gutter, Math.max(0, width - 1));
+	const contentWidth = Math.max(0, width - prefixWidth);
+	return `${" ".repeat(prefixWidth)}${padToWidth(line, contentWidth)}`;
+}
+
+function addGlobalLeftGutterToRows(lines: string[], width: number, gutter: number): string[] {
+	return lines.map((line) => addGlobalLeftGutter(line, width, gutter));
 }
 
 function highlightHistoryLine(
@@ -144,10 +166,20 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 	try {
 		const children = tui.children as any[];
 		const state = stateFor(tui, store);
-		const sections = getRenderedSections(children, width, state);
+		const leftGutterWidth = appLeftGutterWidth(width);
+		const contentWidth = Math.max(1, width - leftGutterWidth);
+		const sections = getRenderedSections(children, contentWidth, state);
 		const { historyLines, pendingLines, statusLines, aboveLines, editorLines, belowLines, footerLines } = sections;
 		const footerBottomGapLines = Array.from({ length: FOOTER_LAYOUT.bottomGapRows }, () => "");
-		const fixedLines = [...pendingLines, ...statusLines, ...aboveLines, ...editorLines, ...belowLines, ...footerLines, ...footerBottomGapLines];
+		const fixedLines = addGlobalLeftGutterToRows([
+			...pendingLines,
+			...statusLines,
+			...aboveLines,
+			...editorLines,
+			...belowLines,
+			...footerLines,
+			...footerBottomGapLines,
+		], width, leftGutterWidth);
 		const terminalRows = Math.max(1, tui.terminal?.rows ?? 24);
 		const historyRows = Math.max(1, terminalRows - fixedLines.length);
 		const editorTopRow = historyRows + pendingLines.length + statusLines.length + aboveLines.length;
@@ -166,13 +198,14 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 
 		clearBeforeOverflowRender(tui, store, historyLines.length > historyRows);
 		const scrollbar = getScrollbarMetrics(historyRows, historyLines.length, start, width);
-		state.view = { start, rows: historyRows, lineCount: historyLines.length, width, editorTopRow, editorBottomRow, footerTopRow, footerBottomRow, scrollbar };
+		state.view = { start, rows: historyRows, lineCount: historyLines.length, width: contentWidth, leftGutterWidth, editorTopRow, editorBottomRow, footerTopRow, footerBottomRow, scrollbar };
 		const selection = selectionRange(state.selection);
 		const historyWithScrollbar: string[] = [];
 		for (let index = 0; index < historyRows; index++) {
 			const lineIndex = start + index;
 			const line = historyLines[lineIndex] ?? "";
-			historyWithScrollbar.push(renderScrollbar(highlightHistoryLine(line, lineIndex, selection, width), index, scrollbar, width));
+			const highlighted = highlightHistoryLine(line, lineIndex, selection, contentWidth);
+			historyWithScrollbar.push(renderScrollbar(addGlobalLeftGutter(highlighted, width, leftGutterWidth), index, scrollbar, width));
 		}
 		return fitToTerminalRows([...historyWithScrollbar, ...fixedLines], terminalRows);
 	} catch {
@@ -229,6 +262,15 @@ function patchTui(ctor: TuiCtor | undefined, store: ConversationScrollStore): vo
 			return renderStickyConversation(this, width, originalRender, store);
 		};
 		store.targets.push({ ctor, methodName: "render", original: originalRender });
+	}
+
+	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showOverlay")) {
+		const originalShowOverlay = ctor.prototype.showOverlay;
+		ctor.prototype.showOverlay = function patchedGlobalGutterOverlay(this: any, component: any, options?: any) {
+			if (!CONVERSATION_SCROLL_LAYOUT.enabled || !isInteractiveRoot(this)) return originalShowOverlay.call(this, component, options);
+			return originalShowOverlay.call(this, component, withGlobalLeftGutterOverlayOptions(options, this.terminal?.columns ?? 80));
+		};
+		store.targets.push({ ctor, methodName: "showOverlay", original: originalShowOverlay });
 	}
 
 	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "handleInput")) {

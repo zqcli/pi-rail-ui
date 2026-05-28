@@ -207,13 +207,22 @@ ui-style.json
 
 重要配置区块如下。
 
-### `surfaceLayout`
+### `appLayout`
 
-控制共享 rail 几何结构：
+控制主 viewport 每一行最外层的统一左侧 gutter：
 
 ```json
 {
-  "leftWindowGapWidth": 2,
+  "leftGutterWidth": 2
+}
+```
+
+### `surfaceLayout`
+
+控制 app gutter 内部的共享 rail 几何结构：
+
+```json
+{
   "leftBorder": "▎",
   "leftBorderWidth": 1,
   "borderContentGapWidth": 0
@@ -291,7 +300,6 @@ ui-style.json
   "clickToToggle": false,
   "autoCollapseAfterRows": false,
   "layout": {
-    "leftWindowGapWidth": 2,
     "leftBorder": "▎",
     "leftBorderWidth": 1,
     "borderContentGapWidth": 0,
@@ -347,7 +355,6 @@ pi-rail-ui/
 │   └── utils.ts                     # ANSI、鼠标、换行、宽度、选择工具
 ├── rail/
 │   ├── index.ts                     # Rail 基础能力导出
-│   ├── rail-gap.ts                  # 左侧 gap 包装
 │   ├── rail-surface.ts              # 共享 rail/surface 渲染器
 │   ├── rail-section.ts              # 历史区 metadata、ranges、选择、折叠和包装
 │   ├── rail-overlay.ts              # 弹出层 shell，复用 rail 布局但不混入历史行为

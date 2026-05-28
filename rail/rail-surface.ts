@@ -37,7 +37,6 @@ export type { EditorHeightPolicy, EditorSurfaceStyle, RailSurfaceStyle } from ".
 export class EditorSurfaceRenderer {
 	readonly style: RailSurfaceStyle;
 	private readonly contentStart: number;
-	private readonly leftMargin: string;
 	private readonly transparentGap: string;
 	private readonly completionPrefix: string;
 	private readonly _rowPrefix: string;
@@ -49,11 +48,10 @@ export class EditorSurfaceRenderer {
 		private readonly heightPolicy?: EditorHeightPolicy,
 	) {
 		this.style = style;
-		this.contentStart = style.leftWindowGapWidth + style.leftBorderWidth + style.borderContentGapWidth;
-		this.leftMargin = " ".repeat(style.leftWindowGapWidth);
+		this.contentStart = style.leftBorderWidth + style.borderContentGapWidth;
 		this.transparentGap = " ".repeat(style.borderContentGapWidth);
 		this.completionPrefix = " ".repeat(this.contentStart);
-		this._rowPrefix = `${this.leftMargin}${style.rail}${style.leftBorder}${style.reset}${this.transparentGap}${style.background}`;
+		this._rowPrefix = `${style.rail}${style.leftBorder}${style.reset}${this.transparentGap}${style.background}`;
 		this._rowSuffix = style.reset;
 	}
 
@@ -120,7 +118,6 @@ export function railSectionSurfaceStyle(kind: RailSectionKind, theme?: ThemeLike
 		: "";
 	return {
 		...RAIL_EDITOR_SURFACE_STYLE,
-		leftWindowGapWidth: config.layout.leftWindowGapWidth,
 		leftBorder: config.style.railEnabled ? config.layout.leftBorder : "",
 		leftBorderWidth: config.style.railEnabled ? config.layout.leftBorderWidth : 0,
 		borderContentGapWidth: config.style.railEnabled ? config.layout.borderContentGapWidth : 0,

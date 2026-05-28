@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { FOOTER_LAYOUT, RAIL_EDITOR_SURFACE_STYLE, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
+import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
 
 export type FooterStats = {
@@ -38,7 +38,6 @@ type FooterSnapshot = {
 };
 
 const FOOTER_STORE_KEY = Symbol.for("pi-rail-ui.footer-state");
-const FOOTER_LEFT_GAP = Math.max(0, RAIL_EDITOR_SURFACE_STYLE.leftWindowGapWidth);
 const SIMPLE_MODEL_MAX_WIDTH = Math.max(12, FOOTER_LAYOUT.modelMaxWidth);
 const EXPANDED_MODEL_MAX_WIDTH = Math.max(28, FOOTER_LAYOUT.modelMaxWidth + 12);
 const SESSION_MAX_WIDTH = 28;
@@ -80,13 +79,6 @@ function formatCost(value: number): string {
 
 function footerLine(content: string, width: number): string {
 	return truncateToWidth(content, Math.max(0, width), "…", true);
-}
-
-function withFooterGap(rows: string[], width: number): string[] {
-	const prefixWidth = Math.min(FOOTER_LEFT_GAP, Math.max(0, width));
-	const contentWidth = Math.max(0, width - prefixWidth);
-	const prefix = prefixWidth > 0 ? " ".repeat(prefixWidth) : "";
-	return rows.map((row) => `${prefix}${footerLine(row, contentWidth)}`);
 }
 
 function visibleJoin(parts: Array<string | undefined>, separator: string): string {
@@ -293,12 +285,9 @@ function renderExpandedFooter(width: number, state: FooterSnapshot, stats: Foote
 }
 
 function renderFooterRows(width: number, state: FooterSnapshot, stats: FooterStats, style: FooterStyle): string[] {
-	const prefixWidth = Math.min(FOOTER_LEFT_GAP, Math.max(0, width));
-	const contentWidth = Math.max(0, width - prefixWidth);
-	const rows = state.expanded
-		? renderExpandedFooter(contentWidth, state, stats, style)
-		: renderSimpleFooter(contentWidth, state, stats, style);
-	return withFooterGap(rows, width);
+	return state.expanded
+		? renderExpandedFooter(width, state, stats, style)
+		: renderSimpleFooter(width, state, stats, style);
 }
 
 export function renderFooter(

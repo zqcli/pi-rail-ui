@@ -1,7 +1,6 @@
 import { BashExecutionComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import { railSectionConfig, type ThemeLike } from "../../config";
 import { createStore, resolveNativePiExport, restorePrototypePatches } from "../../core/patching";
-import { renderLinesWithGap } from "../../rail/rail-gap";
 import { cachedRender } from "../../rail/render-cache";
 import { isBashExecution, renderBashExecutionRail } from "./bash-execution";
 import {
@@ -85,33 +84,28 @@ function renderToolExecutionRail(
 ): string[] {
 	const kind = "toolExecution";
 	const config = railSectionConfig(kind);
-	const gap = config.layout.leftWindowGapWidth;
-	const normalizedGap = Math.max(0, Math.round(gap));
-	const innerWidth = normalizedGap <= 0 || width <= normalizedGap + 1 ? width : Math.max(1, width - normalizedGap);
 	const simpleMode = config.collapsedRenderMode === "simple";
-	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, innerWidth), { avoidExpandedRender: simpleMode });
+	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, width), { avoidExpandedRender: simpleMode });
 
 	if (simpleMode && !component.expanded) {
-		return renderLinesWithGap(width, gap, () => collapsedToolSimpleRows(component, innerWidth, store.theme));
+		return collapsedToolSimpleRows(component, width, store.theme);
 	}
 
 	const cacheable = Boolean(component.result && component.isPartial === false && (!Array.isArray(component.imageComponents) || component.imageComponents.length === 0));
 	if (cacheable) {
-		const signature = [width, innerWidth, component.expanded ? 1 : 0].join("\u001f");
+		const signature = [width, component.expanded ? 1 : 0].join("\u001f");
 		return cachedRender(component, TOOL_RAIL_CACHE_KEY, signature, () => {
-			const renderedRows = originalRender.call(component, innerWidth);
-			const innerRows = shouldApplyGenericToolCollapse(component)
-				? collapsedExecutionRows(component, kind, renderedRows, innerWidth, store.theme)
+			const renderedRows = originalRender.call(component, width);
+			return shouldApplyGenericToolCollapse(component)
+				? collapsedExecutionRows(component, kind, renderedRows, width, store.theme)
 				: renderedRows;
-			return renderLinesWithGap(width, gap, () => innerRows);
 		}, { result: component.result, args: component.args });
 	}
 
-	const renderedRows = originalRender.call(component, innerWidth);
-	const innerRows = shouldApplyGenericToolCollapse(component)
-		? collapsedExecutionRows(component, kind, renderedRows, innerWidth, store.theme)
+	const renderedRows = originalRender.call(component, width);
+	return shouldApplyGenericToolCollapse(component)
+		? collapsedExecutionRows(component, kind, renderedRows, width, store.theme)
 		: renderedRows;
-	return renderLinesWithGap(width, gap, () => innerRows);
 }
 
 async function resolveTheme(): Promise<ThemeLike | undefined> {

@@ -1,6 +1,5 @@
-import { isGapBlock, isLeftGapBlock, LeftGapBlock, unwrapGapBlock } from "../../rail/rail-gap";
 import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../../core/patching";
-import { RailSectionBlock } from "../../rail/rail-section";
+import { RailSectionBlock, resolveRailSection } from "../../rail/rail-section";
 
 type InteractiveModeCtor = { prototype: any };
 
@@ -16,11 +15,11 @@ const getResourceStatusRailPatchStore = createStore<ResourceStatusRailPatchStore
 
 const STATUS_ORIGINAL_PADDING_X_KEY = Symbol.for("pi-rail-ui.status-original-padding-x");
 
-function shouldGapResourceChild(child: any): boolean {
-	return Boolean(child && typeof child.render === "function" && child.constructor?.name !== "Spacer" && !isGapBlock(child));
+function shouldWrapResourceChild(child: any): boolean {
+	return Boolean(child && typeof child.render === "function" && child.constructor?.name !== "Spacer" && !resolveRailSection(child));
 }
 
-function leftGapBlock(child: any): LeftGapBlock {
+function resourceRailBlock(child: any): RailSectionBlock {
 	return new RailSectionBlock(child, "resourceStatus");
 }
 
@@ -30,7 +29,7 @@ function withGappedResourceChildren<T>(mode: any, renderResources: () => T): T {
 	if (typeof originalAddChild !== "function") return renderResources();
 
 	chatContainer.addChild = function patchedResourceAddChild(this: any, child: any) {
-		return originalAddChild.call(this, shouldGapResourceChild(child) ? leftGapBlock(child) : child);
+		return originalAddChild.call(this, shouldWrapResourceChild(child) ? resourceRailBlock(child) : child);
 	};
 	try {
 		return renderResources();
@@ -53,7 +52,7 @@ function normalizeStatusPaddingForGap(statusText: any): void {
 function lastRenderableResourceChildIndex(children: any[]): number {
 	for (let index = children.length - 1; index >= 0; index--) {
 		const child = children[index];
-		if (isGapBlock(child) || shouldGapResourceChild(child)) return index;
+		if (resolveRailSection(child) || shouldWrapResourceChild(child)) return index;
 	}
 	return -1;
 }
@@ -65,22 +64,16 @@ function wrapLastStatusLine(mode: any): void {
 	const lastIndex = lastRenderableResourceChildIndex(children);
 	if (lastIndex < 0) return;
 	const last = children[lastIndex];
-	if (isGapBlock(last)) {
-		const inner = unwrapGapBlock(last);
-		normalizeStatusPaddingForGap(inner);
-		if (isLeftGapBlock(last)) {
-			mode.lastStatusText = last;
-			return;
-		}
-		const wrapped = leftGapBlock(inner);
-		children[lastIndex] = wrapped;
-		mode.lastStatusText = wrapped;
+	const existingSection = resolveRailSection(last);
+	if (existingSection) {
+		normalizeStatusPaddingForGap(existingSection.component);
+		mode.lastStatusText = last;
 		return;
 	}
-	if (!shouldGapResourceChild(last)) return;
+	if (!shouldWrapResourceChild(last)) return;
 
 	normalizeStatusPaddingForGap(last);
-	const wrapped = leftGapBlock(last);
+	const wrapped = resourceRailBlock(last);
 	children[lastIndex] = wrapped;
 	if (mode.lastStatusText === last) mode.lastStatusText = wrapped;
 }
@@ -92,15 +85,14 @@ function wrapLastCommandOutputChild(mode: any): void {
 	const lastIndex = lastRenderableResourceChildIndex(children);
 	if (lastIndex < 0) return;
 	const last = children[lastIndex];
-	if (isGapBlock(last)) {
-		const inner = unwrapGapBlock(last);
-		normalizeStatusPaddingForGap(inner);
-		if (!isLeftGapBlock(last)) children[lastIndex] = leftGapBlock(inner);
+	const existingSection = resolveRailSection(last);
+	if (existingSection) {
+		normalizeStatusPaddingForGap(existingSection.component);
 		return;
 	}
-	if (!shouldGapResourceChild(last)) return;
+	if (!shouldWrapResourceChild(last)) return;
 	normalizeStatusPaddingForGap(last);
-	children[lastIndex] = leftGapBlock(last);
+	children[lastIndex] = resourceRailBlock(last);
 }
 
 function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRailPatchStore): void {

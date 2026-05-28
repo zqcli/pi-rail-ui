@@ -1,6 +1,5 @@
-import { isGapBlock } from "../../rail/rail-gap";
 import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../../core/patching";
-import { RailSectionBlock } from "../../rail/rail-section";
+import { RailSectionBlock, resolveRailSection } from "../../rail/rail-section";
 
 type InteractiveModeCtor = { prototype: any };
 type CommandOutputRailPatchStore = {
@@ -27,8 +26,8 @@ const COMMAND_OUTPUT_METHODS = [
 	"showPackageUpdateNotification",
 ] as const;
 
-function shouldGapCommandChild(child: any): boolean {
-	return Boolean(child && typeof child.render === "function" && child.constructor?.name !== "Spacer" && !isGapBlock(child));
+function shouldWrapCommandChild(child: any): boolean {
+	return Boolean(child && typeof child.render === "function" && child.constructor?.name !== "Spacer" && !resolveRailSection(child));
 }
 
 function withLeftGappedChatChildren<T>(mode: any, renderOutput: () => T): T {
@@ -37,7 +36,7 @@ function withLeftGappedChatChildren<T>(mode: any, renderOutput: () => T): T {
 	if (typeof originalAddChild !== "function") return renderOutput();
 
 	chatContainer.addChild = function patchedCommandOutputAddChild(this: any, child: any) {
-		return originalAddChild.call(this, shouldGapCommandChild(child) ? new RailSectionBlock(child, "commandOutput") : child);
+		return originalAddChild.call(this, shouldWrapCommandChild(child) ? new RailSectionBlock(child, "commandOutput") : child);
 	};
 
 	let result: T;

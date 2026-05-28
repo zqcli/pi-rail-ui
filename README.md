@@ -164,7 +164,7 @@ They render as bottom overlays above the editor instead of replacing the editor.
 
 ### 9. Tool Execution Layout
 
-Tool execution blocks receive the same left window gap as thinking/editor surfaces. `!bash` execution results use a dedicated system-command surface: the same outer left gap, a thin thinking-like left rail, no top/bottom divider lines, a darker slate background, and a blank separator row before each bash block. The bash rail color is resolved from the active theme's `bashMode` token, so it follows theme changes while remaining visually distinct from normal tool output. Collapsed bash previews keep the first echoed rows under the command line instead of jumping straight to the tail preview.
+Tool execution blocks are rendered inside the app-level left gutter. `!bash` execution results use a dedicated system-command surface: the shared app gutter, a thin thinking-like left rail, no top/bottom divider lines, a darker slate background, and a blank separator row before each bash block. The bash rail color is resolved from the active theme's `bashMode` token, so it follows theme changes while remaining visually distinct from normal tool output. Collapsed bash previews keep the first echoed rows under the command line instead of jumping straight to the tail preview.
 
 Collapsed tool/bash/thinking sections use a shared hint shape such as `... (3 earlier lines, ctrl+o to expand)`. Long tool or bash results may still show Pi's built-in hint text inside the section, but Pi Rail UI suppresses extra section-outside duplicate hints and adds precise mouse interaction and selection behavior:
 
@@ -195,7 +195,7 @@ Covered output includes:
 - `showWarning(...)`
 - `showError(...)`
 
-Status-like messages have their internal padding normalized so the final visual left gap is exactly the configured rail gap.
+Status-like messages have their internal padding normalized so the final visual left edge aligns with the shared app gutter and rail geometry.
 
 ## Configuration
 
@@ -207,13 +207,22 @@ ui-style.json
 
 Important sections:
 
-### `surfaceLayout`
+### `appLayout`
 
-Controls the shared rail geometry:
+Controls the outer app-level gutter applied before every main viewport row:
 
 ```json
 {
-  "leftWindowGapWidth": 2,
+  "leftGutterWidth": 2
+}
+```
+
+### `surfaceLayout`
+
+Controls the shared rail geometry inside the app gutter:
+
+```json
+{
   "leftBorder": "▎",
   "leftBorderWidth": 1,
   "borderContentGapWidth": 0
@@ -291,7 +300,6 @@ Each section can use the same shape:
   "clickToToggle": false,
   "autoCollapseAfterRows": false,
   "layout": {
-    "leftWindowGapWidth": 2,
     "leftBorder": "▎",
     "leftBorderWidth": 1,
     "borderContentGapWidth": 0,
@@ -347,7 +355,6 @@ pi-rail-ui/
 │   └── utils.ts                     # ANSI, mouse, wrapping, width, and selection utilities
 ├── rail/
 │   ├── index.ts                     # Rail primitive exports
-│   ├── rail-gap.ts                  # Left-gap wrappers
 │   ├── rail-surface.ts              # Shared rail/surface renderers and section-derived surface styles
 │   ├── rail-section.ts              # History metadata, ranges, selection offsets, toggles, and wrapper
 │   ├── rail-overlay.ts              # Popup shell reusing rail layout/style without history behavior

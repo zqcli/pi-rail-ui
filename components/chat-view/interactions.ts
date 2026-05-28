@@ -184,7 +184,8 @@ function pointForMouse(state: ScrollState, mouse: ConversationMouse): Position |
 
 	const row = Math.max(0, Math.min(view.rows - 1, mouse.y - 1));
 	const line = Math.max(0, Math.min(view.lineCount - 1, view.start + row));
-	const col = Math.max(0, Math.min(view.width, mouse.x - 1));
+	const localX = mouse.x - 1 - view.leftGutterWidth;
+	const col = Math.max(0, Math.min(view.width, localX));
 	return normalizePointForSelection(state, { line, col });
 }
 

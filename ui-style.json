@@ -1,6 +1,8 @@
 {
+  "appLayout": {
+    "leftGutterWidth": 2
+  },
   "surfaceLayout": {
-    "leftWindowGapWidth": 2,
     "leftBorder": "▎",
     "leftBorderWidth": 1,
     "borderContentGapWidth": 0,
@@ -86,7 +88,6 @@
       "autoCollapseAfterRows": false,
       "collapsedRenderMode": "review",
       "layout": {
-        "leftWindowGapWidth": 2,
         "leftBorder": "▎",
         "leftBorderWidth": 1,
         "borderContentGapWidth": 0,

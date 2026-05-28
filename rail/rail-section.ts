@@ -7,7 +7,6 @@ import {
 	type RailSectionResolvedConfig,
 	type ThemeLike,
 } from "../config";
-import { LeftGapBlock, isGapBlock, unwrapGapBlock } from "./rail-gap";
 import { padToWidth, stripAnsi, type Position } from "../core/utils";
 
 export type { RailSectionKind, RailSectionResolvedConfig } from "../config";
@@ -89,27 +88,19 @@ function builtInKindForComponent(component: any): RailSectionKind | undefined {
 export function resolveRailSection(component: any): RailSectionDefinition | undefined {
 	if (!component || typeof component !== "object") return undefined;
 
-	let current = component;
-	while (current && typeof current === "object") {
-		const metadata = metadataFor(current);
-		if (metadata) {
-			const resolvedComponent = metadata.component ?? (isGapBlock(current) ? unwrapGapBlock(current) : current);
-			return {
-				kind: metadata.kind,
-				component: resolvedComponent,
-				config: mergeSectionConfig(metadata.kind, metadata.overrides),
-			};
-		}
-		if (!isGapBlock(current)) break;
-		current = unwrapGapBlock(current);
+	const metadata = metadataFor(component);
+	if (metadata) {
+		return {
+			kind: metadata.kind,
+			component: metadata.component ?? component,
+			config: mergeSectionConfig(metadata.kind, metadata.overrides),
+		};
 	}
 
-	const target = isGapBlock(component) ? unwrapGapBlock(component) : component;
-	const kind = builtInKindForComponent(target);
+	const kind = builtInKindForComponent(component);
 	if (!kind) return undefined;
-	return { kind, component: target, config: railSectionConfig(kind) };
+	return { kind, component, config: railSectionConfig(kind) };
 }
-
 
 export function isBlankRailSectionLine(line: string): boolean {
 	return stripAnsi(line).trim().length === 0;
@@ -143,9 +134,7 @@ export function railSectionSelectionStartCol(section: RailSectionDefinition): nu
 	const selection = section.config.selection;
 	const layout = section.config.layout;
 	if (selection.mode !== "contentOnly") return 0;
-	if (selection.includeGap && selection.includeRail) return 0;
-	if (selection.includeGap) return 0;
-	if (selection.includeRail) return layout.leftWindowGapWidth;
+	if (selection.includeGap || selection.includeRail) return 0;
 	return layout.contentStartCol;
 }
 
@@ -181,13 +170,15 @@ export function toggleRailSection(section: RailSectionDefinition): void {
 }
 
 function railSectionChildren(component: any): any[] {
+	const unwrapped = typeof component?.unwrap === "function" ? component.unwrap() : undefined;
 	const groups = [
 		component?.children,
 		component?.contentContainer?.children,
 		component?.contentBox?.children,
 		component?.selfRenderContainer?.children,
 	];
-	return groups.flatMap((group) => (Array.isArray(group) ? group : []));
+	const children = groups.flatMap((group) => (Array.isArray(group) ? group : []));
+	return unwrapped && unwrapped !== component ? [unwrapped, ...children] : children;
 }
 
 export function setCollapsibleRailSectionsExpanded(root: any, expanded: boolean, seen = new Set<any>()): number {
@@ -201,7 +192,6 @@ export function setCollapsibleRailSectionsExpanded(root: any, expanded: boolean,
 		count++;
 	}
 
-	if (isGapBlock(root)) count += setCollapsibleRailSectionsExpanded(unwrapGapBlock(root as Component), expanded, seen);
 	for (const child of railSectionChildren(root)) count += setCollapsibleRailSectionsExpanded(child, expanded, seen);
 	return count;
 }
@@ -216,17 +206,22 @@ export function collapseHint(theme: ThemeLike | undefined, hiddenLineCount: numb
 	}
 }
 
-export class RailSectionBlock extends LeftGapBlock {
+export class RailSectionBlock implements Component {
 	private readonly config: RailSectionResolvedConfig;
-	private readonly inner: Component;
 	private cached?: { width: number; innerLines: string[]; rows: string[] };
 
-	constructor(inner: Component, kind: RailSectionKind, overrides?: RailSectionOverrides) {
-		const config = mergeSectionConfig(kind, overrides);
-		super(inner, config.layout.leftWindowGapWidth);
-		this.config = config;
-		this.inner = inner;
+	constructor(private readonly inner: Component, kind: RailSectionKind, overrides?: RailSectionOverrides) {
+		this.config = mergeSectionConfig(kind, overrides);
 		defineRailSection(this, kind, overrides, inner);
+	}
+
+	setText(text: string): void {
+		(this.inner as any).setText?.(text);
+		this.cached = undefined;
+	}
+
+	unwrap(): Component {
+		return this.inner;
 	}
 
 	invalidate(): void {
@@ -240,21 +235,20 @@ export class RailSectionBlock extends LeftGapBlock {
 		const railAnsi = this.config.style.rail.ansi ?? "";
 		const hasRail = this.config.style.railEnabled && railAnsi.length > 0 && layout.leftBorderWidth > 0;
 		const hasBackground = this.config.style.background.length > 0;
-		if (!hasRail && !hasBackground) return super.render(width);
+		if (!hasRail && !hasBackground) return this.inner.render(width);
 
-		const contentStart = layout.leftWindowGapWidth + (hasRail ? layout.leftBorderWidth + layout.borderContentGapWidth : 0);
-		if (width <= contentStart + 1) return super.render(width);
+		const contentStart = hasRail ? layout.leftBorderWidth + layout.borderContentGapWidth : 0;
+		if (width <= contentStart + 1) return this.inner.render(width);
 
 		const innerWidth = Math.max(1, width - contentStart);
 		const innerLines = this.inner.render(innerWidth);
 		if (this.cached?.width === width && this.cached.innerLines === innerLines) return this.cached.rows;
 
-		const leftGap = " ".repeat(layout.leftWindowGapWidth);
 		const border = hasRail ? `${railAnsi}${layout.leftBorder}${RAIL_EDITOR_STYLE.reset}` : "";
 		const borderGap = hasRail ? " ".repeat(layout.borderContentGapWidth) : "";
 		const rows = innerLines.map((line) => {
 			const content = `${this.config.style.background}${padToWidth(line, innerWidth)}${RAIL_EDITOR_STYLE.reset}`;
-			return `${leftGap}${border}${borderGap}${content}`;
+			return `${border}${borderGap}${content}`;
 		});
 		this.cached = { width, innerLines, rows };
 		return rows;

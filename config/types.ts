@@ -30,7 +30,6 @@ export type RailSectionRawSpacing = {
 };
 
 export type RailSectionRawLayout = {
-	leftWindowGapWidth?: number;
 	leftBorder?: string;
 	leftBorderWidth?: number;
 	borderContentGapWidth?: number;
@@ -66,8 +65,10 @@ export type RailSectionRawConfig = {
 };
 
 export type StyleFile = {
+	appLayout?: {
+		leftGutterWidth?: number;
+	};
 	surfaceLayout: {
-		leftWindowGapWidth: number;
 		leftBorder: string;
 		leftBorderWidth: number;
 		borderContentGapWidth: number;
@@ -143,8 +144,11 @@ export type StyleFile = {
 	};
 };
 
+export type AppLayout = {
+	leftGutterWidth: number;
+};
+
 export type RailSurfaceStyle = {
-	leftWindowGapWidth: number;
 	leftBorder: string;
 	leftBorderWidth: number;
 	borderContentGapWidth: number;
@@ -207,7 +211,6 @@ export type RailSectionSpacingConfig = {
 };
 
 export type RailSectionLayoutConfig = {
-	leftWindowGapWidth: number;
 	leftBorder: string;
 	leftBorderWidth: number;
 	borderContentGapWidth: number;

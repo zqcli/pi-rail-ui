@@ -163,6 +163,13 @@ function renderScrollbar(line: string, rowIndex: number, metrics: ScrollbarMetri
 }
 
 const LEADING_ZERO_WIDTH_ROW_MARKERS = [OSC133_ZONE_START, OSC133_ZONE_END, OSC133_ZONE_FINAL] as const;
+const GLOBAL_LEFT_GUTTER_ROW_CACHE_LIMIT = 8192;
+const GLOBAL_LEFT_GUTTER_ROW_CACHE_MAX_LINE_LENGTH = 16384;
+const globalLeftGutterRowCache = {
+	width: -1,
+	gutter: -1,
+	rows: new Map<string, string>(),
+};
 
 function splitLeadingZeroWidthRowMarkers(line: string): { markers: string; body: string } {
 	let markers = "";
@@ -182,10 +189,32 @@ function splitLeadingZeroWidthRowMarkers(line: string): { markers: string; body:
 }
 
 function addGlobalLeftGutter(line: string, width: number, gutter: number): string {
+	if (globalLeftGutterRowCache.width !== width || globalLeftGutterRowCache.gutter !== gutter) {
+		globalLeftGutterRowCache.width = width;
+		globalLeftGutterRowCache.gutter = gutter;
+		globalLeftGutterRowCache.rows.clear();
+	}
+
+	const cached = globalLeftGutterRowCache.rows.get(line);
+	if (cached !== undefined) {
+		globalLeftGutterRowCache.rows.delete(line);
+		globalLeftGutterRowCache.rows.set(line, cached);
+		return cached;
+	}
+
 	const prefixWidth = Math.min(gutter, Math.max(0, width - 1));
 	const contentWidth = Math.max(0, width - prefixWidth);
 	const { markers, body } = splitLeadingZeroWidthRowMarkers(line);
-	return `${markers}${" ".repeat(prefixWidth)}${padToWidth(body, contentWidth)}`;
+	const rendered = `${markers}${" ".repeat(prefixWidth)}${padToWidth(body, contentWidth)}`;
+	if (line.length <= GLOBAL_LEFT_GUTTER_ROW_CACHE_MAX_LINE_LENGTH) {
+		globalLeftGutterRowCache.rows.set(line, rendered);
+		while (globalLeftGutterRowCache.rows.size > GLOBAL_LEFT_GUTTER_ROW_CACHE_LIMIT) {
+			const oldestKey = globalLeftGutterRowCache.rows.keys().next().value;
+			if (oldestKey === undefined) break;
+			globalLeftGutterRowCache.rows.delete(oldestKey);
+		}
+	}
+	return rendered;
 }
 
 function addGlobalLeftGutterToRows(lines: string[], width: number, gutter: number): string[] {

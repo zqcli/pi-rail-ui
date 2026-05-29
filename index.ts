@@ -126,8 +126,11 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		rememberUserMessageTimestamp(event.message);
 	});
 
-	pi.on("message_end", async (event, _ctx) => {
+	pi.on("message_end", async (event, ctx) => {
 		rememberUserMessageTimestamp(event.message);
+		if (event.message.role === "assistant" && ctx.hasUI && enabled) {
+			installFooter(ctx);
+		}
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {

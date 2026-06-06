@@ -34,7 +34,7 @@ export type FooterLiveState = {
 	usingSubscription?: boolean;
 };
 
-type FooterStore = { expanded: boolean };
+type FooterStore = { expanded: boolean; selectionNoticeUntil: number; selectionNoticeTimer?: ReturnType<typeof setTimeout> };
 
 const FOOTER_STORE_KEY = Symbol.for("pi-rail-ui.footer-state");
 const SIMPLE_MODEL_MAX_WIDTH = Math.max(12, FOOTER_LAYOUT.modelMaxWidth);
@@ -43,7 +43,7 @@ const SESSION_MAX_WIDTH = 28;
 const STATUS_MAX_WIDTH = 32;
 
 function footerStore(): FooterStore {
-	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { expanded: false } satisfies FooterStore);
+	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { expanded: false, selectionNoticeUntil: 0 } satisfies FooterStore);
 }
 
 export function isFooterExpanded(): boolean {
@@ -58,6 +58,22 @@ export function toggleFooterExpanded(): boolean {
 	const store = footerStore();
 	store.expanded = !store.expanded;
 	return store.expanded;
+}
+
+export function showFooterSelectionNotice(tui?: any, durationMs = 1800): void {
+	const store = footerStore();
+	store.selectionNoticeUntil = Date.now() + durationMs;
+	if (store.selectionNoticeTimer) clearTimeout(store.selectionNoticeTimer);
+	store.selectionNoticeTimer = setTimeout(() => {
+		store.selectionNoticeTimer = undefined;
+		store.selectionNoticeUntil = 0;
+		tui?.requestRender?.();
+	}, durationMs);
+	tui?.requestRender?.();
+}
+
+function selectionNoticeText(style: FooterStyle): string | undefined {
+	return footerStore().selectionNoticeUntil > Date.now() ? `${style.mint}selection copied` : undefined;
 }
 
 function formatNum(value: number): string {
@@ -230,6 +246,7 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 		`${style.sky}${state.modelShort}`,
 		`${style.amber}${state.thinking}`,
 		stateText(state, style),
+		selectionNoticeText(style),
 		state.pending ? `${style.amber}queued` : undefined,
 	], `${style.muted} · `);
 	const right = visibleJoin([
@@ -247,6 +264,7 @@ function renderExpandedFooter(width: number, state: FooterLiveState, stats: Foot
 		state.branch ? `${style.mint}branch ${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : undefined,
 		state.sessionName ? `${style.muted}session ${style.text}${fitToWidth(state.sessionName, SESSION_MAX_WIDTH)}` : undefined,
 		stateText(state, style),
+		selectionNoticeText(style),
 		state.pending ? `${style.amber}queued` : undefined,
 	], `${style.muted} · `);
 	const toolText = state.activeTools.length === 0 && state.allToolCount === 0

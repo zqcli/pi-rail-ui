@@ -1,11 +1,10 @@
 import { TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { copyToClipboard } from "../../core/clipboard";
-import { toggleFooterExpanded } from "../footer";
+import { showFooterSelectionNotice, toggleFooterExpanded } from "../footer";
 import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE } from "../../config";
 import {
 	canToggleRailSection,
 	normalizeRailSectionPosition,
-	railSectionMoved,
 	railSectionSelectionStartCol,
 	sameRailSection,
 	toggleRailSection,
@@ -16,12 +15,15 @@ import { isInteractiveRoot } from "./history-renderer";
 import { stateFor, type ActiveInteraction, type ConversationScrollStore, type ScrollAnimation, type ScrollState, type ScrollView } from "./state";
 
 const HISTORY_MUTATING_KEYS = new Set(["\x0f"]); // Ctrl+O: Pi global expand/collapse may mutate older history blocks.
-const SELECTION_COPY_THROTTLE_MS = 300;
+const DOUBLE_CLICK_MS = 500;
+const DOUBLE_CLICK_MAX_DISTANCE = 1;
+const SELECTION_AUTO_SCROLL_MS = 80;
+const SELECTION_INCLUSIVE_COLUMN_BIAS = 2;
 
-type ConversationMouse = { x: number; y: number; action: "press" | "drag" | "release" | "copy" };
-type SelectionCopyThrottle = { lastAttemptAt: number; pending: boolean };
+type ConversationMouse = { x: number; y: number; action: "press" | "drag" | "release" | "copy"; clickCount?: number };
+type ClickMemory = { x: number; y: number; at: number; count: number };
 
-const selectionCopyThrottles = new WeakMap<ScrollState, SelectionCopyThrottle>();
+const clickMemory = new WeakMap<ScrollState, ClickMemory>();
 const coalescedInteractionRenderTimers = new WeakMap<ScrollState, ReturnType<typeof setTimeout>>();
 const coalescedInteractionRenderForces = new WeakMap<ScrollState, boolean>();
 
@@ -99,47 +101,11 @@ function selectedHistoryText(state: ScrollState): string | undefined {
 	return selected.join("\n");
 }
 
-function copySelectedHistoryText(state: ScrollState): boolean {
+function copySelectedHistoryText(state: ScrollState, tui?: any): boolean {
 	const text = selectedHistoryText(state);
-	return Boolean(text && copyToClipboard(text));
-}
-
-function selectionCopyThrottleFor(state: ScrollState): SelectionCopyThrottle {
-	let throttle = selectionCopyThrottles.get(state);
-	if (!throttle) {
-		throttle = { lastAttemptAt: 0, pending: false };
-		selectionCopyThrottles.set(state, throttle);
-	}
-	return throttle;
-}
-
-function copySelectedHistoryTextNow(state: ScrollState): boolean {
-	const throttle = selectionCopyThrottleFor(state);
-	throttle.lastAttemptAt = Date.now();
-	throttle.pending = false;
-	return copySelectedHistoryText(state);
-}
-
-function clearSelectionCopyTimer(state: ScrollState): void {
-	if (state.copyTimer) {
-		clearTimeout(state.copyTimer);
-		state.copyTimer = undefined;
-	}
-	const throttle = selectionCopyThrottles.get(state);
-	if (throttle) throttle.pending = false;
-}
-
-function scheduleSelectedHistoryCopy(state: ScrollState): void {
-	const throttle = selectionCopyThrottleFor(state);
-	throttle.pending = true;
-	if (state.copyTimer) return;
-
-	const delay = Math.max(0, SELECTION_COPY_THROTTLE_MS - (Date.now() - throttle.lastAttemptAt));
-	state.copyTimer = setTimeout(() => {
-		state.copyTimer = undefined;
-		if (!throttle.pending) return;
-		copySelectedHistoryTextNow(state);
-	}, delay);
+	const copied = Boolean(text && copyToClipboard(text));
+	if (copied) showFooterSelectionNotice(tui);
+	return copied;
 }
 
 function shouldPreferHistoryCacheForInput(data: string): boolean {
@@ -174,6 +140,24 @@ function parseConversationMouse(data: string): ConversationMouse | undefined {
 	return { x, y, action: release ? "release" : drag ? "drag" : "press" };
 }
 
+function mouseRow(mouse: Pick<ConversationMouse, "y">): number {
+	return mouse.y - 1;
+}
+
+function mouseHistoryLine(view: ScrollView, mouse: ConversationMouse): number | undefined {
+	const row = mouseRow(mouse);
+	if (row < 0 || row >= view.rows) return undefined;
+	return view.start + row;
+}
+
+function mouseLocalX(view: ScrollView, mouse: Pick<ConversationMouse, "x">): number {
+	return mouse.x - 1 - view.leftGutterWidth;
+}
+
+function mouseMovedFrom(start: { x: number; y: number }, mouse: ConversationMouse, tolerance = 0): boolean {
+	return Math.abs(start.x - mouse.x) > tolerance || Math.abs(start.y - mouse.y) > tolerance;
+}
+
 function normalizePointForSelection(state: ScrollState, pos: Position): Position {
 	return normalizeRailSectionPosition(pos, railSectionRangeAtLine(state, pos.line));
 }
@@ -182,16 +166,94 @@ function pointForMouse(state: ScrollState, mouse: ConversationMouse): Position |
 	const view = state.view;
 	if (!view || view.rows <= 0 || view.lineCount <= 0) return undefined;
 
-	const row = Math.max(0, Math.min(view.rows - 1, mouse.y - 1));
+	const row = clamp(mouseRow(mouse), 0, view.rows - 1);
 	const line = Math.max(0, Math.min(view.lineCount - 1, view.start + row));
-	const localX = mouse.x - 1 - view.leftGutterWidth;
-	const col = Math.max(0, Math.min(view.width, localX));
+	const col = Math.max(0, Math.min(view.width, mouseLocalX(view, mouse)));
 	return normalizePointForSelection(state, { line, col });
+}
+
+function inclusiveSelectionForMouse(
+	state: ScrollState,
+	anchor: Position,
+	mouse: ConversationMouse,
+): { anchor: Position; active: Position } | undefined {
+	const active = pointForMouse(state, mouse);
+	const view = state.view;
+	if (!active || !view) return undefined;
+	if (comparePosition(active, anchor) >= 0) {
+		return { anchor, active: normalizePointForSelection(state, { line: active.line, col: Math.min(view.width, active.col + SELECTION_INCLUSIVE_COLUMN_BIAS) }) };
+	}
+	return {
+		anchor: normalizePointForSelection(state, { line: anchor.line, col: Math.min(view.width, anchor.col + SELECTION_INCLUSIVE_COLUMN_BIAS) }),
+		active,
+	};
+}
+
+function clickCountForMouse(state: ScrollState, mouse: ConversationMouse): number {
+	const now = Date.now();
+	const previous = clickMemory.get(state);
+	const sameClickTarget = previous
+		&& Math.abs(previous.x - mouse.x) <= DOUBLE_CLICK_MAX_DISTANCE
+		&& previous.y === mouse.y
+		&& now - previous.at <= DOUBLE_CLICK_MS;
+	const count = sameClickTarget ? Math.min(3, previous.count + 1) : 1;
+	clickMemory.set(state, { x: mouse.x, y: mouse.y, at: now, count });
+	return count;
+}
+
+function lineVisibleWidth(state: ScrollState, line: number): number {
+	return Math.min(state.view?.width ?? 0, visibleWidth(stripAnsi(state.renderCache?.historyLines[line] ?? "")));
+}
+
+function wordSelectionAt(state: ScrollState, pos: Position): { anchor: Position; active: Position } | undefined {
+	const text = stripAnsi(state.renderCache?.historyLines[pos.line] ?? "");
+	if (!text) return undefined;
+
+	const chars = [...segmenter.segment(text)].map((segment) => ({ text: segment.segment, width: visibleWidth(segment.segment) }));
+	let col = 0;
+	let index = 0;
+	for (; index < chars.length; index++) {
+		const width = chars[index]!.width;
+		if (width > 0 && pos.col < col + width) break;
+		col += width;
+	}
+	if (index >= chars.length || /\s/u.test(chars[index]!.text)) return undefined;
+
+	let startIndex = index;
+	let endIndex = index + 1;
+	while (startIndex > 0 && !/\s/u.test(chars[startIndex - 1]!.text)) startIndex--;
+	while (endIndex < chars.length && !/\s/u.test(chars[endIndex]!.text)) endIndex++;
+
+	const startCol = chars.slice(0, startIndex).reduce((sum, item) => sum + item.width, 0);
+	const endCol = chars.slice(0, endIndex).reduce((sum, item) => sum + item.width, 0);
+	return {
+		anchor: normalizePointForSelection(state, { line: pos.line, col: startCol }),
+		active: normalizePointForSelection(state, { line: pos.line, col: endCol }),
+	};
+}
+
+function lineSelectionAt(state: ScrollState, pos: Position): { anchor: Position; active: Position } {
+	return {
+		anchor: normalizePointForSelection(state, { line: pos.line, col: 0 }),
+		active: normalizePointForSelection(state, { line: pos.line, col: lineVisibleWidth(state, pos.line) }),
+	};
+}
+
+function applyClickSelection(tui: any, state: ScrollState, pos: Position, clickCount: number): boolean {
+	if (clickCount < 2) return false;
+	const selection = clickCount >= 3 ? lineSelectionAt(state, pos) : wordSelectionAt(state, pos);
+	if (!selection) return false;
+	state.selection = selection;
+	state.interaction = { type: "idle" };
+	state.preferCachedRender = true;
+	copySelectedHistoryText(state, tui);
+	tui.requestRender?.();
+	return true;
 }
 
 function isOnScrollbar(view: ScrollView, mouse: ConversationMouse): boolean {
 	const scrollbar = view.scrollbar;
-	const row = mouse.y - 1;
+	const row = mouseRow(mouse);
 	return Boolean(scrollbar && row >= 0 && row < view.rows && mouse.x >= scrollbar.xStart && mouse.x <= scrollbar.xEnd);
 }
 
@@ -226,6 +288,22 @@ function clearScrollAnimation(state: ScrollState, store: ConversationScrollStore
 		store.animationTimers.delete(timer);
 	}
 	state.scrollAnimation = undefined;
+}
+
+function clearSelectionAutoScroll(state: ScrollState, store: ConversationScrollStore): void {
+	if (!state.selectionAutoScrollTimer) return;
+	clearTimeout(state.selectionAutoScrollTimer);
+	store.animationTimers.delete(state.selectionAutoScrollTimer);
+	state.selectionAutoScrollTimer = undefined;
+}
+
+function clearHistorySelection(state: ScrollState, store: ConversationScrollStore): boolean {
+	const hadSelection = Boolean(state.selection || state.interaction.type === "selecting");
+	clearSelectionAutoScroll(state, store);
+	state.selection = undefined;
+	state.interaction = { type: "idle" };
+	state.preferCachedRender = true;
+	return hadSelection;
 }
 
 function lockScrollStart(state: ScrollState, start: number): void {
@@ -376,13 +454,64 @@ function applyScrollbarMouseRow(tui: any, state: ScrollState, store: Conversatio
 	return animateOffsetFromBottom(tui, state, store, scrollOffsetFromStart(view, start), { targetStart: start, lockAtEnd: true });
 }
 
-function railSectionRangeAtMouse(state: ScrollState, mouse: ConversationMouse): RailSectionRange | undefined {
+function autoScrollSelectionOnce(tui: any, state: ScrollState, store: ConversationScrollStore, mouse: ConversationMouse): void {
+	const view = state.view;
+	if (!view || state.interaction.type !== "selecting") return;
+
+	const row = mouseRow(mouse);
+	const direction = row <= 0 ? 1 : row >= view.rows ? -1 : 0;
+	if (direction === 0) {
+		clearSelectionAutoScroll(state, store);
+		return;
+	}
+
+	if (setOffsetFromBottomImmediate(state, store, state.offsetFromBottom + direction, true)) {
+		const maxStart = Math.max(0, view.lineCount - view.rows);
+		const nextStart = clamp(view.start - direction, 0, maxStart);
+		const line = direction > 0 ? nextStart : Math.min(view.lineCount - 1, nextStart + view.rows - 1);
+		const anchor = state.interaction.type === "selecting" ? state.interaction.anchor : undefined;
+		state.selection = anchor
+			? {
+				anchor,
+				active: normalizePointForSelection(state, { line, col: direction > 0 ? 0 : view.width }),
+			}
+			: state.selection;
+		tui.requestRender?.(true);
+	}
+
+	if (!state.selectionAutoScrollTimer) {
+		const timer = setTimeout(() => {
+			store.animationTimers.delete(timer);
+			if (state.selectionAutoScrollTimer !== timer) return;
+			state.selectionAutoScrollTimer = undefined;
+			autoScrollSelectionOnce(tui, state, store, mouse);
+		}, SELECTION_AUTO_SCROLL_MS);
+		state.selectionAutoScrollTimer = timer;
+		store.animationTimers.add(timer);
+	}
+}
+
+function railSectionRangeAtMouse(state: ScrollState, mouse: ConversationMouse, includeLeadingToggleRow = false): RailSectionRange | undefined {
 	const view = state.view;
 	if (!view) return undefined;
 
-	const row = mouse.y - 1;
-	if (row < 0 || row >= view.rows) return undefined;
-	return railSectionRangeAtLine(state, view.start + row);
+	const line = mouseHistoryLine(view, mouse);
+	if (line === undefined) return undefined;
+	const range = railSectionRangeAtLine(state, line);
+	if (range) return range;
+	if (!includeLeadingToggleRow) return undefined;
+
+	const nextRange = railSectionRangeAtLine(state, line + 1);
+	const currentLine = state.renderCache?.historyLines[line];
+	if (
+		nextRange
+		&& nextRange.start === line + 1
+		&& canToggleRailSection(nextRange.section)
+		&& stripAnsi(currentLine ?? "").trim().length === 0
+	) {
+		return nextRange;
+	}
+	return undefined;
 }
 
 function setRailSectionSelectionFromMouse(
@@ -394,38 +523,35 @@ function setRailSectionSelectionFromMouse(
 	selecting: boolean,
 ): boolean {
 	const anchor = pointForMouse(state, { x: pending.x, y: pending.y, action: "press" });
-	const active = pointForMouse(state, mouse);
-	if (!anchor || !active) return false;
+	const selection = anchor ? inclusiveSelectionForMouse(state, anchor, mouse) : undefined;
+	if (!anchor || !selection) return false;
 
-	state.interaction = selecting ? { type: "selecting" } : { type: "idle" };
-	state.selection = { anchor, active };
+	state.interaction = selecting ? { type: "selecting", x: pending.x, y: pending.y, moved: true, anchor } : { type: "idle" };
+	state.selection = selection;
 	const range = selectionRange(state.selection);
-	if (range && selecting) scheduleSelectedHistoryCopy(state);
-	else clearSelectionCopyTimer(state);
 	if (!range && !selecting) state.selection = undefined;
-	else if (range && !selecting) copySelectedHistoryTextNow(state);
+	else if (range && !selecting) copySelectedHistoryText(state, tui);
+	if (!selecting) clearSelectionAutoScroll(state, store);
 	state.preferCachedRender = true;
 	if (selecting) requestCoalescedInteractionRender(tui, state, store);
 	else tui.requestRender?.();
 	return true;
 }
 
-function handleRailSectionMouse(tui: any, data: string, store: ConversationScrollStore): boolean {
-	const mouse = parseConversationMouse(data);
-	if (!mouse) return false;
-
+function handleRailSectionMouse(tui: any, mouse: ConversationMouse, store: ConversationScrollStore): boolean {
 	const state = stateFor(tui, store);
 	if (mouse.action === "copy") return false;
 
 	if (mouse.action === "press") {
-		const range = railSectionRangeAtMouse(state, mouse);
+		const range = railSectionRangeAtMouse(state, mouse, true);
 		if (!range) return false;
+		if (mouse.clickCount && mouse.clickCount >= 2 && !canToggleRailSection(range.section)) return false;
 
-		clearSelectionCopyTimer(state);
+		const hadSelection = clearHistorySelection(state, store);
 		clearScrollAnimation(state, store);
 		if (state.view) lockScrollStart(state, state.view.start);
-		state.selection = undefined;
 		state.interaction = { type: "railSectionClick", section: range.section, x: mouse.x, y: mouse.y, moved: false };
+		if (hadSelection) tui.requestRender?.();
 		return true;
 	}
 
@@ -433,7 +559,7 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 	const pending = state.interaction;
 
 	if (mouse.action === "drag") {
-		if (railSectionMoved(pending, mouse.x, mouse.y)) {
+		if (mouseMovedFrom(pending, mouse)) {
 			pending.moved = true;
 			setRailSectionSelectionFromMouse(tui, state, store, pending, mouse, true);
 		}
@@ -442,12 +568,12 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 
 	if (mouse.action === "release") {
 		state.interaction = { type: "idle" };
-		if (pending.moved || railSectionMoved(pending, mouse.x, mouse.y)) {
+		if (pending.moved || mouseMovedFrom(pending, mouse)) {
 			setRailSectionSelectionFromMouse(tui, state, store, pending, mouse, false);
 			return true;
 		}
 
-		const range = railSectionRangeAtMouse(state, mouse);
+		const range = railSectionRangeAtMouse(state, mouse, true);
 		if (sameRailSection(range?.section, pending.section) && canToggleRailSection(pending.section)) {
 			toggleRailSection(pending.section);
 			state.historyDirty = true;
@@ -461,17 +587,12 @@ function handleRailSectionMouse(tui: any, data: string, store: ConversationScrol
 }
 
 function isOnFooter(view: ScrollView, mouse: ConversationMouse): boolean {
-	const row = mouse.y - 1;
+	const row = mouseRow(mouse);
 	return row >= view.footerTopRow && row < view.footerBottomRow;
 }
 
-function pointerMoved(click: { x: number; y: number }, x: number, y: number): boolean {
-	return click.x !== x || click.y !== y;
-}
-
-function handleFooterMouse(tui: any, data: string, store: ConversationScrollStore): boolean {
-	const mouse = parseConversationMouse(data);
-	if (!mouse || mouse.action === "copy") return false;
+function handleFooterMouse(tui: any, mouse: ConversationMouse, store: ConversationScrollStore): boolean {
+	if (mouse.action === "copy") return false;
 
 	const state = stateFor(tui, store);
 	const view = state.view;
@@ -482,10 +603,10 @@ function handleFooterMouse(tui: any, data: string, store: ConversationScrollStor
 
 	if (mouse.action === "press") {
 		if (!isOnFooter(view, mouse)) return false;
-		clearSelectionCopyTimer(state);
+		const hadSelection = clearHistorySelection(state, store);
 		clearScrollAnimation(state, store);
-		state.selection = undefined;
 		state.interaction = { type: "footerClick", x: mouse.x, y: mouse.y, moved: false };
+		if (hadSelection) tui.requestRender?.();
 		return true;
 	}
 
@@ -493,13 +614,13 @@ function handleFooterMouse(tui: any, data: string, store: ConversationScrollStor
 	const pending = state.interaction;
 
 	if (mouse.action === "drag") {
-		if (pointerMoved(pending, mouse.x, mouse.y)) pending.moved = true;
+		if (mouseMovedFrom(pending, mouse)) pending.moved = true;
 		return true;
 	}
 
 	if (mouse.action === "release") {
 		state.interaction = { type: "idle" };
-		if (!pending.moved && !pointerMoved(pending, mouse.x, mouse.y) && isOnFooter(view, mouse)) {
+		if (!pending.moved && !mouseMovedFrom(pending, mouse) && isOnFooter(view, mouse)) {
 			toggleFooterExpanded();
 			state.preferCachedRender = true;
 			tui.requestRender?.();
@@ -510,10 +631,8 @@ function handleFooterMouse(tui: any, data: string, store: ConversationScrollStor
 	return false;
 }
 
-function handleConversationScrollbarDrag(tui: any, data: string, store: ConversationScrollStore): boolean {
+function handleConversationScrollbarDrag(tui: any, mouse: ConversationMouse, store: ConversationScrollStore): boolean {
 	if (!CONVERSATION_SCROLLBAR_STYLE.dragEnabled) return false;
-	const mouse = parseConversationMouse(data);
-	if (!mouse) return false;
 
 	const state = stateFor(tui, store);
 	const view = state.view;
@@ -523,16 +642,14 @@ function handleConversationScrollbarDrag(tui: any, data: string, store: Conversa
 		return false;
 	}
 
-	const row = mouse.y - 1;
+	const row = mouseRow(mouse);
 	const onScrollbar = isOnScrollbar(view, mouse);
 	if (mouse.action === "copy" && onScrollbar) return true;
 
 	if (mouse.action === "press") {
 		if (!onScrollbar) return false;
 
-		clearSelectionCopyTimer(state);
-		const hadSelection = Boolean(state.selection || state.interaction.type === "selecting");
-		state.selection = undefined;
+		const hadSelection = clearHistorySelection(state, store);
 		const insideThumb = row >= metrics.thumbStart && row < metrics.thumbStart + metrics.thumbSize;
 		const pointerOffsetRows = insideThumb ? row - metrics.thumbStart : Math.floor(metrics.thumbSize / 2);
 		state.interaction = { type: "scrollbarDrag", pointerOffsetRows: clamp(pointerOffsetRows, 0, Math.max(0, metrics.thumbSize - 1)) };
@@ -557,50 +674,53 @@ function handleConversationScrollbarDrag(tui: any, data: string, store: Conversa
 	return false;
 }
 
-function handleConversationSelection(tui: any, data: string, store: ConversationScrollStore): boolean {
-	const mouse = parseConversationMouse(data);
-	if (!mouse) return false;
-
+function handleConversationSelection(tui: any, mouse: ConversationMouse, store: ConversationScrollStore): boolean {
 	const state = stateFor(tui, store);
 	const view = state.view;
 	if (!view) return false;
 
-	const row = mouse.y - 1;
+	const row = mouseRow(mouse);
 	const startsInHistory = row >= 0 && row < view.rows;
 	if (mouse.action === "copy") {
-		clearSelectionCopyTimer(state);
-		return startsInHistory && copySelectedHistoryTextNow(state);
+		return startsInHistory && copySelectedHistoryText(state, tui);
 	}
 	if (mouse.action === "press" && !startsInHistory) {
-		if (state.selection) {
-			clearSelectionCopyTimer(state);
-			state.selection = undefined;
-			state.interaction = { type: "idle" };
-			tui.requestRender?.();
-		}
+		if (clearHistorySelection(state, store)) tui.requestRender?.();
 		return false;
 	}
 	if (mouse.action !== "press" && state.interaction.type !== "selecting") return false;
 
-	const pos = pointForMouse(state, mouse);
-	if (!pos) return false;
-
 	if (mouse.action === "press") {
-		clearSelectionCopyTimer(state);
+		const pos = pointForMouse(state, mouse);
+		if (!pos) return false;
+		const clickCount = mouse.clickCount ?? 1;
+		if (clickCount >= 2 && applyClickSelection(tui, state, pos, clickCount)) return true;
+		const hadSelection = clearHistorySelection(state, store);
 		clearScrollAnimation(state, store);
 		lockScrollStart(state, view.start);
-		state.interaction = { type: "selecting" };
-		state.selection = { anchor: pos, active: pos };
+		state.interaction = { type: "selecting", x: mouse.x, y: mouse.y, moved: false, anchor: pos };
+		state.selection = undefined;
+		if (hadSelection) tui.requestRender?.();
 	} else if (mouse.action === "drag") {
-		state.interaction = { type: "selecting" };
-		state.selection = state.selection ? { ...state.selection, active: pos } : { anchor: pos, active: pos };
-		if (selectionRange(state.selection)) scheduleSelectedHistoryCopy(state);
+		const pending = state.interaction.type === "selecting" ? state.interaction : undefined;
+		const anchor = pending?.anchor;
+		const selection = anchor ? inclusiveSelectionForMouse(state, anchor, mouse) : undefined;
+		if (!selection || !pending) return false;
+		const moved = pending.moved || mouseMovedFrom(pending, mouse);
+		state.interaction = { type: "selecting", x: mouse.x, y: mouse.y, moved, anchor };
+		state.selection = moved ? selection : undefined;
+		autoScrollSelectionOnce(tui, state, store, mouse);
 	} else {
-		if (state.selection) state.selection.active = pos;
+		const pending = state.interaction.type === "selecting" ? state.interaction : undefined;
+		const anchor = pending?.anchor;
+		const selection = anchor ? inclusiveSelectionForMouse(state, anchor, mouse) : undefined;
+		if (!selection || !pending) return false;
+		const moved = pending.moved || mouseMovedFrom(pending, mouse);
+		if (moved) state.selection = selection;
 		state.interaction = { type: "idle" };
-		clearSelectionCopyTimer(state);
-		if (!selectionRange(state.selection)) state.selection = undefined;
-		else copySelectedHistoryTextNow(state);
+		clearSelectionAutoScroll(state, store);
+		if (!moved || !selectionRange(state.selection)) state.selection = undefined;
+		else copySelectedHistoryText(state, tui);
 	}
 
 	state.preferCachedRender = true;
@@ -616,9 +736,13 @@ export function handleConversationInput(tui: any, data: string, originalHandleIn
 		return originalHandleInput.call(tui, data);
 	}
 
+	const state = stateFor(tui, store);
+	if (data === "\x03" && selectionRange(state.selection)) {
+		if (copySelectedHistoryText(state, tui)) return;
+	}
+
 	const wheel = parseWheel(data);
 	if (wheel) {
-		const state = stateFor(tui, store);
 		const row = wheel.y - 1;
 		const view = state.view;
 		if (!view || (row >= view.editorTopRow && row < view.editorBottomRow)) {
@@ -631,11 +755,14 @@ export function handleConversationInput(tui: any, data: string, originalHandleIn
 		return;
 	}
 
-	if (handleConversationScrollbarDrag(tui, data, store)) return;
-	if (handleFooterMouse(tui, data, store)) return;
-	if (handleRailSectionMouse(tui, data, store)) return;
-	if (handleConversationSelection(tui, data, store)) return;
-	const state = stateFor(tui, store);
+	const mouse = parseConversationMouse(data);
+	if (mouse) {
+		if (mouse.action === "press") mouse.clickCount = clickCountForMouse(state, mouse);
+		if (handleConversationScrollbarDrag(tui, mouse, store)) return;
+		if (handleFooterMouse(tui, mouse, store)) return;
+		if (handleRailSectionMouse(tui, mouse, store)) return;
+		if (handleConversationSelection(tui, mouse, store)) return;
+	}
 	if (HISTORY_MUTATING_KEYS.has(data)) {
 		state.historyDirty = true;
 		state.preferCachedRender = false;

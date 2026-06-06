@@ -33,7 +33,7 @@ export type ScrollSelection = { anchor: Position; active: Position };
 
 export type ActiveInteraction =
 	| { type: "idle" }
-	| { type: "selecting" }
+	| { type: "selecting"; x: number; y: number; moved: boolean; anchor: Position }
 	| { type: "scrollbarDrag"; pointerOffsetRows: number }
 	| { type: "footerClick"; x: number; y: number; moved: boolean }
 	| { type: "railSectionClick"; section: RailSectionDefinition; x: number; y: number; moved: boolean };
@@ -78,7 +78,7 @@ export type ScrollState = {
 	historyDirty?: boolean;
 	renderCache?: RenderCache;
 	viewportLayoutSignature?: string;
-	copyTimer?: ReturnType<typeof setTimeout>;
+	selectionAutoScrollTimer?: ReturnType<typeof setTimeout>;
 };
 
 export type ConversationScrollStore = {

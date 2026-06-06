@@ -3,6 +3,8 @@ import { DEFAULT_MAX_BYTES, formatSize, truncateHead } from "@earendil-works/pi-
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 const CHROME_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
@@ -20,7 +22,8 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 		description:
 			"Make an HTTP request using curl. Returns structured { status, headers, body } " +
 			"with status code and response headers. Use for fetching web content, calling APIs, " +
-			"or accessing any HTTP endpoint. By default emulates a Chrome browser User-Agent.",
+			"or accessing any HTTP endpoint. By default emulates a Chrome browser User-Agent. " +
+			"Response body previews are truncated to maxBytes; set outputPath to save the full body.",
 		promptSnippet: "Make HTTP requests with configurable method, headers, body, proxy, and timeout",
 
 		parameters: Type.Object({
@@ -60,17 +63,30 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 					default: 10,
 				}),
 			),
+			maxBytes: Type.Optional(
+				Type.Number({
+					description: `Maximum response body preview bytes. Default ${DEFAULT_MAX_BYTES}.`,
+					default: DEFAULT_MAX_BYTES,
+				}),
+			),
+			outputPath: Type.Optional(
+				Type.String({
+					description: "Optional file path to save the complete response body. Relative paths are resolved from cwd.",
+				}),
+			),
 		}),
 
-		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const url = params.url as string;
 			const method = (params.method as string) ?? "GET";
 			const userHeaders = (params.headers as Record<string, string> | undefined) ?? {};
 			const body = params.body as string | undefined;
 			const timeout = (params.timeout as number | undefined) ?? 30;
 			const proxy = params.proxy as string | undefined;
-		const followRedirects = (params.followRedirects as boolean | undefined) ?? true;
-		const maxRedirects = (params.maxRedirects as number | undefined) ?? 10;
+			const followRedirects = (params.followRedirects as boolean | undefined) ?? true;
+			const maxRedirects = (params.maxRedirects as number | undefined) ?? 10;
+			const maxBytes = Math.max(0, Math.floor((params.maxBytes as number | undefined) ?? DEFAULT_MAX_BYTES));
+			const outputPath = params.outputPath as string | undefined;
 
 			// Merge: user headers override defaults
 			const mergedHeaders: Record<string, string> = {};
@@ -112,13 +128,22 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 			const { statusCode, responseHeaders, responseBody, redirectUrls } =
 				parseCurlOutput(stdout);
 
-			const truncation = truncateHead(responseBody, { maxBytes: DEFAULT_MAX_BYTES });
+			let savedOutputPath: string | undefined;
+			if (outputPath) {
+				savedOutputPath = path.isAbsolute(outputPath) ? outputPath : path.resolve(ctx.cwd, outputPath);
+				await fs.mkdir(path.dirname(savedOutputPath), { recursive: true });
+				await fs.writeFile(savedOutputPath, responseBody, "utf8");
+			}
+
+			const truncation = truncateHead(responseBody, { maxBytes });
 			let displayBody = truncation.content;
 
 			if (truncation.truncated) {
 				displayBody +=
-					`\n\n[Output truncated: ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}. ` +
-					`Use the read tool with offset/limit to inspect the remaining content if saved to a file.]`;
+					`\n\n[Output truncated: ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}.` +
+					(savedOutputPath
+						? ` Full response body saved to ${savedOutputPath}.]`
+						: " Set outputPath to save the complete response body.]");
 			}
 
 			const output = JSON.stringify(
@@ -127,9 +152,10 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 					headers: Object.fromEntries(responseHeaders.slice(0, 20)),
 					body: displayBody,
 					truncated: truncation.truncated,
+					...(savedOutputPath ? { outputPath: savedOutputPath } : {}),
 					...(redirectUrls.length > 0
-					? { redirectCount: redirectUrls.length, redirectUrls }
-					: {}),
+						? { redirectCount: redirectUrls.length, redirectUrls }
+						: {}),
 				},
 				null,
 				2,
@@ -141,7 +167,9 @@ export function registerWebFetchTool(pi: ExtensionAPI): void {
 					status: statusCode,
 					headerCount: responseHeaders.length,
 					bodySize: truncation.totalBytes,
+					previewBytes: truncation.outputBytes,
 					truncated: truncation.truncated,
+					...(savedOutputPath ? { outputPath: savedOutputPath } : {}),
 					redirectCount: redirectUrls.length,
 				},
 			};

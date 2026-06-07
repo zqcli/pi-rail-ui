@@ -246,8 +246,8 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 		`${style.sky}${state.modelShort}`,
 		`${style.amber}${state.thinking}`,
 		stateText(state, style),
-		selectionNoticeText(style),
 		state.pending ? `${style.amber}queued` : undefined,
+		selectionNoticeText(style),
 	], `${style.muted} · `);
 	const right = visibleJoin([
 		usageText(stats, state, style),
@@ -264,8 +264,8 @@ function renderExpandedFooter(width: number, state: FooterLiveState, stats: Foot
 		state.branch ? `${style.mint}branch ${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : undefined,
 		state.sessionName ? `${style.muted}session ${style.text}${fitToWidth(state.sessionName, SESSION_MAX_WIDTH)}` : undefined,
 		stateText(state, style),
-		selectionNoticeText(style),
 		state.pending ? `${style.amber}queued` : undefined,
+		selectionNoticeText(style),
 	], `${style.muted} · `);
 	const toolText = state.activeTools.length === 0 && state.allToolCount === 0
 		? undefined

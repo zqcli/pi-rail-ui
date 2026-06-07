@@ -6,7 +6,7 @@ import {
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
 import { RailEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays, installSelectorOverlay, uninstallSelectorOverlay } from "./components/editor";
-import { createRailFooter, setFooterExpanded } from "./components/footer";
+import { createRailFooter, setFooterExpanded, setTurnEndTime, setTurnStartTime } from "./components/footer";
 import { ensureConversationAlternateScreen, installConversationScroll, installTerminalOutputCoalescing, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll, uninstallTerminalOutputCoalescing } from "./components/chat-view";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
@@ -116,6 +116,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
+		setTurnStartTime(Date.now());
 		if (ctx.hasUI && enabled) {
 			installFooter(ctx);
 			refreshUserMessageTimestamps(ctx);
@@ -134,6 +135,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
+		setTurnEndTime();
 		if (ctx.hasUI && enabled) installFooter(ctx);
 	});
 

@@ -34,7 +34,13 @@ export type FooterLiveState = {
 	usingSubscription?: boolean;
 };
 
-type FooterStore = { expanded: boolean; selectionNoticeUntil: number; selectionNoticeTimer?: ReturnType<typeof setTimeout> };
+type FooterStore = {
+	expanded: boolean;
+	selectionNoticeUntil: number;
+	selectionNoticeTimer?: ReturnType<typeof setTimeout>;
+	turnStartTime?: number;
+	turnDuration?: number;
+};
 
 const FOOTER_STORE_KEY = Symbol.for("pi-rail-ui.footer-state");
 const SIMPLE_MODEL_MAX_WIDTH = Math.max(12, FOOTER_LAYOUT.modelMaxWidth);
@@ -43,7 +49,7 @@ const SESSION_MAX_WIDTH = 28;
 const STATUS_MAX_WIDTH = 32;
 
 function footerStore(): FooterStore {
-	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { expanded: false, selectionNoticeUntil: 0 } satisfies FooterStore);
+	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { expanded: false, selectionNoticeUntil: 0, turnStartTime: undefined, turnDuration: undefined } satisfies FooterStore);
 }
 
 export function isFooterExpanded(): boolean {
@@ -70,6 +76,31 @@ export function showFooterSelectionNotice(tui?: any, durationMs = 1800): void {
 		tui?.requestRender?.();
 	}, durationMs);
 	tui?.requestRender?.();
+}
+
+export function setTurnStartTime(time: number): void {
+	const store = footerStore();
+	store.turnStartTime = time;
+	store.turnDuration = undefined;
+}
+
+export function setTurnEndTime(): void {
+	const store = footerStore();
+	if (store.turnStartTime !== undefined) store.turnDuration = Date.now() - store.turnStartTime;
+	store.turnStartTime = undefined;
+}
+
+function formatDuration(ms: number, style: FooterStyle): string {
+	const totalMinutes = Math.floor(ms / 60000);
+	if (totalMinutes < 60) return `${style.amber}${totalMinutes}m`;
+	return `${style.amber}${Math.floor(totalMinutes / 60)}h${totalMinutes % 60}m`;
+}
+
+function turnDurationText(state: FooterLiveState, style: FooterStyle): string | undefined {
+	const store = footerStore();
+	if (!state.idle && store.turnStartTime !== undefined) return formatDuration(Date.now() - store.turnStartTime, style);
+	if (store.turnDuration !== undefined) return formatDuration(store.turnDuration, style);
+	return undefined;
 }
 
 function selectionNoticeText(style: FooterStyle): string | undefined {
@@ -246,6 +277,7 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 		`${style.sky}${state.modelShort}`,
 		`${style.amber}${state.thinking}`,
 		stateText(state, style),
+		turnDurationText(state, style),
 		state.pending ? `${style.amber}queued` : undefined,
 		selectionNoticeText(style),
 	], `${style.muted} · `);
@@ -264,6 +296,7 @@ function renderExpandedFooter(width: number, state: FooterLiveState, stats: Foot
 		state.branch ? `${style.mint}branch ${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : undefined,
 		state.sessionName ? `${style.muted}session ${style.text}${fitToWidth(state.sessionName, SESSION_MAX_WIDTH)}` : undefined,
 		stateText(state, style),
+		turnDurationText(state, style),
 		state.pending ? `${style.amber}queued` : undefined,
 		selectionNoticeText(style),
 	], `${style.muted} · `);

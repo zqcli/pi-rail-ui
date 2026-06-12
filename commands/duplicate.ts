@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { getParentSessionFile } from "../utils/session-utils";
@@ -14,16 +15,21 @@ export async function handleDuplicateCommand(ctx: ExtensionContext): Promise<voi
 		const sessionDir = ctx.sessionManager.getSessionDir();
 		const parentSession = getParentSessionFile(ctx.sessionManager);
 
-		const newSessionManager = SessionManager.create(currentCwd, sessionDir, { parentSession });
-
-		const entries = ctx.sessionManager.getEntries();
-		for (const entry of entries) {
-			if (entry.type === "message") {
-				newSessionManager.appendMessage(entry.message);
-			}
+		const tempSessionManager = SessionManager.forkFrom(currentSessionFile, currentCwd, sessionDir);
+		const newSessionFile = tempSessionManager.getSessionFile();
+		if (!newSessionFile) {
+			ctx.ui.notify("Failed to create session file", "error");
+			return;
 		}
 
-		const newSessionId = newSessionManager.getSessionId();
+		const content = readFileSync(newSessionFile, "utf8");
+		const lines = content.split("\n");
+		const header = JSON.parse(lines[0]);
+		header.parentSession = parentSession;
+		lines[0] = JSON.stringify(header);
+		writeFileSync(newSessionFile, lines.join("\n"));
+
+		const newSessionId = tempSessionManager.getSessionId();
 		ctx.ui.notify(`Sibling session created: ${newSessionId}. Use /resume to switch.`, "info");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

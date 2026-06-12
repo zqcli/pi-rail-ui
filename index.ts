@@ -7,6 +7,7 @@ import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
 import { RailEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays, installSelectorOverlay, uninstallSelectorOverlay } from "./components/editor";
 import { createRailFooter, setFooterExpanded, setTurnEndTime, setTurnStartTime } from "./components/footer";
+import { handleDuplicateCommand } from "./commands/duplicate";
 import { ensureConversationAlternateScreen, installConversationScroll, installTerminalOutputCoalescing, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll, uninstallTerminalOutputCoalescing } from "./components/chat-view";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
@@ -107,6 +108,13 @@ export default async function piRailUi(pi: ExtensionAPI) {
 				uninstall(ctx);
 				ctx.ui.notify("Pi rail UI disabled", "info");
 			}
+		},
+	});
+
+	pi.registerCommand("duplicate", {
+		description: "Duplicate current session as a sibling (same parent)",
+		handler: async (_args, ctx) => {
+			await handleDuplicateCommand(ctx);
 		},
 	});
 

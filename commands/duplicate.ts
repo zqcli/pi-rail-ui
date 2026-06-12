@@ -29,7 +29,7 @@ export async function handleDuplicateCommand(ctx: ExtensionContext): Promise<voi
 		lines[0] = JSON.stringify(header);
 		writeFileSync(newSessionFile, lines.join("\n"));
 
-		const newSessionId = tempSessionManager.getSessionId();
+		const newSessionId = header.id;
 		ctx.ui.notify(`Sibling session created: ${newSessionId}. Use /resume to switch.`, "info");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

@@ -37,15 +37,25 @@ After editing or installing it, reload Pi with:
 
 Pi should discover this directory extension automatically.
 
-## Toggle Command
+## Commands
 
-Pi Rail UI registers a slash command:
+Pi Rail UI registers the following slash commands:
 
-```text
-/rail-ui
-```
+### `/rail-ui`
 
-It toggles the extension on or off for the current UI session.
+Toggles the extension on or off for the current UI session.
+
+### `/duplicate`
+
+Duplicates the current session as a sibling session (sharing the same parent).
+
+The new session:
+- Inherits all conversation history, compaction records, model changes, and thinking level changes from the source session.
+- Shares the same `parentSession` as the source, making it a sibling rather than a child.
+- Appears above the source session in `/resume` (sorted by creation time).
+- Can be switched to using `/resume <session-id>`.
+
+This is useful for exploring alternative approaches or experimenting with different continuations from the same conversation state.
 
 ## Main Features
 

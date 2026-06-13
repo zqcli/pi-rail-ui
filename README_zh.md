@@ -37,15 +37,25 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地 TUI 界面扩展。它把�
 
 Pi 会自动发现并加载该目录扩展。
 
-## 开关命令
+## 命令
 
-Pi Rail UI 注册了一个 slash command：
+Pi Rail UI 注册了以下 slash 命令：
 
-```text
-/rail-ui
-```
+### `/rail-ui`
 
 用于在当前 UI 会话中启用或禁用该扩展。
+
+### `/duplicate`
+
+将当前 session 复制为同级 session（共享相同的 parent）。
+
+新 session 的特点：
+- 继承源 session 的所有会话历史、compaction 记录、model 切换、thinking level 切换。
+- 和源 session 共享相同的 `parentSession`，因此是同级关系而非父子关系。
+- 在 `/resume` 中排在源 session 上方（按创建时间排序）。
+- 可通过 `/resume <session-id>` 切换到新 session。
+
+该命令适用于从相同会话状态探索不同方案或实验不同的后续对话。
 
 ## 主要功能
 

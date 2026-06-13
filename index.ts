@@ -179,10 +179,16 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		enabled = true;
 	});
 
-	process.on("exit", () => {
-		disableMouseTracking();
-		releaseConversationAlternateScreen();
-	});
+	// The extension entry runs again on /reload; guard the process-level hook so
+	// listeners do not accumulate across reloads.
+	const exitHookKey = Symbol.for("pi-rail-ui.exit-hook-installed");
+	if (!(globalThis as any)[exitHookKey]) {
+		(globalThis as any)[exitHookKey] = true;
+		process.on("exit", () => {
+			disableMouseTracking();
+			releaseConversationAlternateScreen();
+		});
+	}
 
 	// Conversation scroll is patched during extension load so startup's first TUI
 	// render uses the fixed app viewport. The patched TUI.start() enters the

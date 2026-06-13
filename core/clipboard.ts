@@ -45,7 +45,9 @@ export function copyToClipboard(text: string): boolean {
 	const now = Date.now();
 	if (text === lastCopiedText && now - lastCopyAt < DUPLICATE_COPY_SKIP_MS) return true;
 
-	const copied = copyViaOsc52(text) || copyViaPlatformClipboard(text);
+	// OSC 52 reports success on any TTY even when the terminal ignores it, so
+	// prefer the platform clipboard and use OSC 52 only as a remote/SSH fallback.
+	const copied = copyViaPlatformClipboard(text) || copyViaOsc52(text);
 	if (copied) {
 		lastCopiedText = text;
 		lastCopyAt = now;

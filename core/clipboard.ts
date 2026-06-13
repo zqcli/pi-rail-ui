@@ -20,8 +20,9 @@ function writeClipboardProcess(command: string, args: string[], text: string): b
 }
 
 function copyViaPlatformClipboard(text: string): boolean {
+	// Windows: defer to OSC 52 (better encoding support in Windows Terminal/MSYS2)
+	if (process.platform === "win32") return false;
 	if (process.platform === "darwin") return writeClipboardProcess("pbcopy", [], text);
-	if (process.platform === "win32") return writeClipboardProcess("clip.exe", [], text);
 	return (
 		writeClipboardProcess("wl-copy", [], text) ||
 		writeClipboardProcess("xclip", ["-selection", "clipboard"], text) ||

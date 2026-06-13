@@ -282,7 +282,10 @@ export class MouseSelectableRailEditor extends CustomEditor {
 				return;
 			}
 
-			if (data.length === 1 && data.charCodeAt(0) >= 32) {
+			// Printable input replaces the selection. Check only the first char so
+			// multi-char IME commits behave like single ASCII keystrokes; escape
+			// sequences and control keys (charCode < 32) still fall through below.
+			if (data.charCodeAt(0) >= 32) {
 				if (this.deleteSelection()) {
 					super.handleInput(data);
 					return;

@@ -178,14 +178,17 @@ function usageText(stats: FooterUsageStats, state: FooterLiveState, style: Foote
 		], " ");
 }
 
-export function collectFooterUsageStats(ctx: ExtensionContext): FooterUsageStats {
+function footerUsageEntries(ctx: ExtensionContext): any[] {
+	return ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch();
+}
+
+function usageStatsFromEntries(entries: any[]): FooterUsageStats {
 	let inputTokens = 0;
 	let outputTokens = 0;
 	let cacheReadTokens = 0;
 	let cacheWriteTokens = 0;
 	let cost = 0;
 
-	const entries = ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch();
 	for (const entry of entries) {
 		if (entry?.type !== "message") continue;
 		const usage = entry.message?.usage;
@@ -198,6 +201,10 @@ export function collectFooterUsageStats(ctx: ExtensionContext): FooterUsageStats
 	}
 
 	return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cost };
+}
+
+export function collectFooterUsageStats(ctx: ExtensionContext): FooterUsageStats {
+	return usageStatsFromEntries(footerUsageEntries(ctx));
 }
 
 function collectFooterLiveState(ctx: ExtensionContext, pi: ExtensionAPI, footerData: any): FooterLiveState {
@@ -341,7 +348,7 @@ export function renderFooter(
 }
 
 class RailFooterComponent {
-	private usageCache?: FooterUsageStats;
+	private usageCache?: { entryCount: number; lastEntry: any; stats: FooterUsageStats };
 	private readonly unsubscribe?: () => void;
 
 	constructor(
@@ -360,13 +367,24 @@ class RailFooterComponent {
 	}
 
 	invalidate(): void {
-		this.usageCache = undefined;
+		// Usage stats are keyed by session entries below; recomputing them on
+		// every invalidate would rescan the whole session each frame.
+	}
+
+	private usageStats(): FooterUsageStats {
+		const entries = footerUsageEntries(this.ctx);
+		const lastEntry = entries[entries.length - 1];
+		let cache = this.usageCache;
+		if (!cache || cache.entryCount !== entries.length || cache.lastEntry !== lastEntry) {
+			cache = { entryCount: entries.length, lastEntry, stats: usageStatsFromEntries(entries) };
+			this.usageCache = cache;
+		}
+		return cache.stats;
 	}
 
 	render(width: number): string[] {
-		this.usageCache ??= collectFooterUsageStats(this.ctx);
 		const state = collectFooterLiveState(this.ctx, this.pi, this.footerData);
-		return renderFooterRows(width, state, this.usageCache, RAIL_FOOTER_STYLE);
+		return renderFooterRows(width, state, this.usageStats(), RAIL_FOOTER_STYLE);
 	}
 
 	handleFooterToggle(): void {

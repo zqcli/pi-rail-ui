@@ -738,7 +738,12 @@ export function handleConversationInput(tui: any, data: string, originalHandleIn
 
 	const state = stateFor(tui, store);
 	if (data === "\x03" && selectionRange(state.selection)) {
-		if (copySelectedHistoryText(state, tui)) return;
+		const copied = copySelectedHistoryText(state, tui);
+		// Drop the selection either way so the next Ctrl+C reaches the native
+		// handler (abort/clear) instead of being swallowed by a stale selection.
+		clearHistorySelection(state, store);
+		tui.requestRender?.();
+		if (copied) return;
 	}
 
 	const wheel = parseWheel(data);

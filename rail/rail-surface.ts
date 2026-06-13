@@ -77,17 +77,22 @@ export class EditorSurfaceRenderer {
 	renderSurfaceRow(width: number, content = ""): string {
 		const key = `${width}\u001f${content}`;
 		const cached = this.rowCache.get(key);
-		if (cached !== undefined) return cached;
+		if (cached !== undefined) {
+			// LRU touch: re-insert so frequently rendered rows survive eviction.
+			this.rowCache.delete(key);
+			this.rowCache.set(key, cached);
+			return cached;
+		}
 		const targetWidth = Math.max(0, width - this.contentStart);
 		const contentWidth = visibleWidth(content);
 		const rawFitted = contentWidth <= targetWidth ? content + " ".repeat(targetWidth - contentWidth) : padToWidth(content, targetWidth);
 		const fitted = this.restoreSurfaceAfterResets(rawFitted);
 		const row = `${this._rowPrefix}${fitted}${this._rowSuffix}`;
-		if (this.rowCache.size > 2048) {
-			const entries = [...this.rowCache.entries()];
-			this.rowCache = new Map(entries.slice(entries.length >> 1));
-		}
 		this.rowCache.set(key, row);
+		if (this.rowCache.size > 2048) {
+			const oldestKey = this.rowCache.keys().next().value;
+			if (oldestKey !== undefined) this.rowCache.delete(oldestKey);
+		}
 		return row;
 	}
 

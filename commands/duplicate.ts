@@ -30,11 +30,6 @@ export async function handleDuplicateCommand(ctx: ExtensionContext): Promise<voi
 		lines[0] = JSON.stringify(header);
 		writeFileSync(newSessionFile, lines.join("\n"));
 
-		// The copy inherits the source's session_info name verbatim; suffix it so
-		// the two sessions are distinguishable in /resume.
-		const name = ctx.sessionManager.getSessionName();
-		if (name) SessionManager.open(newSessionFile).appendSessionInfo(`${name} (copy)`);
-
 		ctx.ui.notify(`Sibling session created: ${header.id}. Use /resume to switch.`, "info");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

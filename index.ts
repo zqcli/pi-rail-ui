@@ -15,7 +15,6 @@ import { setRailUiActive } from "./rail";
 import { registerWebFetchTool } from "./tools/web-fetch";
 
 export * from "./config";
-export * from "./core/clipboard";
 export * from "./core/patching";
 export * from "./core/utils";
 export * from "./rail";

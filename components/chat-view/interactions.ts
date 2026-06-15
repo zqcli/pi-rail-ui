@@ -1,5 +1,5 @@
 import { TUI, visibleWidth } from "@earendil-works/pi-tui";
-import { copyToClipboard } from "../../core/clipboard";
+import { copyToClipboard } from "@earendil-works/pi-coding-agent";
 import { showFooterSelectionNotice, toggleFooterExpanded } from "../footer";
 import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE } from "../../config";
 import {
@@ -103,9 +103,17 @@ function selectedHistoryText(state: ScrollState): string | undefined {
 
 function copySelectedHistoryText(state: ScrollState, tui?: any): boolean {
 	const text = selectedHistoryText(state);
-	const copied = Boolean(text && copyToClipboard(text));
-	if (copied) showFooterSelectionNotice(tui);
-	return copied;
+	if (!text) return false;
+	// pi's copyToClipboard is async (native addon + OSC52 fallback) and throws on
+	// failure. Fire-and-forget so the input handler stays synchronous; the boolean
+	// now reports "had text to copy", which is all callers use it for.
+	void copyToClipboard(text).then(
+		() => showFooterSelectionNotice(tui),
+		() => {
+			// Stay silent on clipboard failure.
+		},
+	);
+	return true;
 }
 
 function shouldPreferHistoryCacheForInput(data: string): boolean {

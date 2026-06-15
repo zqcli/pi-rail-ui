@@ -12,7 +12,6 @@ import { ensureConversationAlternateScreen, installConversationScroll, installTe
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
-import { registerWebFetchTool } from "./tools/web-fetch";
 
 export * from "./config";
 export * from "./core/patching";
@@ -25,8 +24,6 @@ export * from "./components/executions";
 export * from "./components/chat-view";
 
 export default async function piRailUi(pi: ExtensionAPI) {
-	registerWebFetchTool(pi);
-
 	let enabled = true;
 	let mouseEnabled = false;
 

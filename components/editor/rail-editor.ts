@@ -3,6 +3,8 @@ import { CURSOR_MARKER, SelectList, matchesKey, visibleWidth, type Component, ty
 import { SlashCommandOverlay } from "./slash-autocomplete";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED, EDITOR_PASTE_MARKER_STYLE, SLASH_COMMAND_LAYOUT, RAIL_EDITOR_STYLE, applyTextColor } from "../../config";
 import { selectorOutputSurfaceForTheme, railEditorSurface, type EditorSurfaceRenderer } from "../../rail/rail-surface";
+import { copyToClipboard } from "@earendil-works/pi-coding-agent";
+import { showFooterSelectionNotice } from "../footer";
 import {
 	CURSOR_POSITION_RE,
 	SGR_MOUSE_RE,
@@ -195,7 +197,9 @@ export class MouseSelectableRailEditor extends CustomEditor {
 		}
 
 		if (this.selection) this.selection.active = pos;
-		if (!this.getSelectionRange()) this.selection = undefined;
+		const range = this.getSelectionRange();
+		if (range) this.copySelectionToClipboard(range);
+		else this.selection = undefined;
 		this.tui.requestRender();
 	}
 
@@ -240,6 +244,29 @@ export class MouseSelectableRailEditor extends CustomEditor {
 
 	protected handleMouseWheel(_wheel: ParsedWheel): boolean {
 		return false;
+	}
+
+	private selectionText(range: { start: Position; end: Position }): string {
+		const lines = this.editorLinesRef();
+		const start = clampPosition(range.start, lines);
+		const end = clampPosition(range.end, lines);
+		if (start.line === end.line) return (lines[start.line] ?? "").slice(start.col, end.col);
+		const out = [(lines[start.line] ?? "").slice(start.col)];
+		for (let line = start.line + 1; line < end.line; line++) out.push(lines[line] ?? "");
+		out.push((lines[end.line] ?? "").slice(0, end.col));
+		return out.join("\n");
+	}
+
+	private copySelectionToClipboard(range: { start: Position; end: Position }): void {
+		const text = this.selectionText(range);
+		if (!text) return;
+		void copyToClipboard(text).then(
+			() => showFooterSelectionNotice(this.tui),
+			() => {
+				// pi's copyToClipboard throws on failure; selection copy should stay
+				// silent rather than interrupt the editing flow.
+			},
+		);
 	}
 
 	handleInput(data: string): void {

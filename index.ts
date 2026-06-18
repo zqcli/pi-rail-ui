@@ -107,7 +107,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("duplicate", {
+	pi.registerCommand("rail-duplicate", {
 		description: "Duplicate current session as a sibling (same parent)",
 		handler: async (_args, ctx) => {
 			await handleDuplicateCommand(ctx);

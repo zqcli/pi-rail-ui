@@ -45,7 +45,7 @@ Pi Rail UI registers the following slash commands:
 
 Toggles the extension on or off for the current UI session.
 
-### `/duplicate`
+### `/rail-duplicate`
 
 Duplicates the current session as a sibling session (sharing the same parent).
 

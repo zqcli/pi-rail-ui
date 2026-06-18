@@ -45,7 +45,7 @@ Pi Rail UI 注册了以下 slash 命令：
 
 用于在当前 UI 会话中启用或禁用该扩展。
 
-### `/duplicate`
+### `/rail-duplicate`
 
 将当前 session 复制为同级 session（共享相同的 parent）。
 

@@ -1,8 +1,9 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, CONVERSATION_SELECTION_STYLE, FOOTER_LAYOUT, RAIL_EDITOR_STYLE } from "../../config";
+import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, FOOTER_LAYOUT } from "../../config";
 import { getInteractiveModeConstructors, restorePrototypePatches } from "../../core/patching";
-import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, applyColumnHighlight, clamp, padToWidth } from "../../core/utils";
+import { clamp } from "../../core/utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
+import { addGlobalLeftGutterToRows, composeHistoryRows } from "./viewport-compose";
 import { handleConversationInput, selectionRange } from "./interactions";
 import {
 	getConversationScrollStore,
@@ -154,86 +155,6 @@ function getScrollbarMetrics(visibleRows: number, totalRows: number, start: numb
 	};
 }
 
-function renderScrollbar(line: string, rowIndex: number, metrics: ScrollbarMetrics | undefined, width: number): string {
-	if (!metrics) return padToWidth(line, width);
-
-	const isThumb = rowIndex >= metrics.thumbStart && rowIndex < metrics.thumbStart + metrics.thumbSize;
-	const content = padToWidth(`${line}${RAIL_EDITOR_STYLE.reset}`, width - metrics.width);
-	return `${content}${isThumb ? metrics.thumbBar : metrics.trackBar}`;
-}
-
-const LEADING_ZERO_WIDTH_ROW_MARKERS = [OSC133_ZONE_START, OSC133_ZONE_END, OSC133_ZONE_FINAL] as const;
-const GLOBAL_LEFT_GUTTER_ROW_CACHE_LIMIT = 8192;
-const GLOBAL_LEFT_GUTTER_ROW_CACHE_MAX_LINE_LENGTH = 16384;
-const globalLeftGutterRowCache = {
-	width: -1,
-	gutter: -1,
-	rows: new Map<string, string>(),
-};
-
-function splitLeadingZeroWidthRowMarkers(line: string): { markers: string; body: string } {
-	let markers = "";
-	let body = line;
-	let matched = true;
-	while (matched) {
-		matched = false;
-		for (const marker of LEADING_ZERO_WIDTH_ROW_MARKERS) {
-			if (!body.startsWith(marker)) continue;
-			markers += marker;
-			body = body.slice(marker.length);
-			matched = true;
-			break;
-		}
-	}
-	return { markers, body };
-}
-
-function addGlobalLeftGutter(line: string, width: number, gutter: number): string {
-	if (globalLeftGutterRowCache.width !== width || globalLeftGutterRowCache.gutter !== gutter) {
-		globalLeftGutterRowCache.width = width;
-		globalLeftGutterRowCache.gutter = gutter;
-		globalLeftGutterRowCache.rows.clear();
-	}
-
-	const cached = globalLeftGutterRowCache.rows.get(line);
-	if (cached !== undefined) {
-		globalLeftGutterRowCache.rows.delete(line);
-		globalLeftGutterRowCache.rows.set(line, cached);
-		return cached;
-	}
-
-	const prefixWidth = Math.min(gutter, Math.max(0, width - 1));
-	const contentWidth = Math.max(0, width - prefixWidth);
-	const { markers, body } = splitLeadingZeroWidthRowMarkers(line);
-	const rendered = `${markers}${" ".repeat(prefixWidth)}${padToWidth(body, contentWidth)}`;
-	if (line.length <= GLOBAL_LEFT_GUTTER_ROW_CACHE_MAX_LINE_LENGTH) {
-		globalLeftGutterRowCache.rows.set(line, rendered);
-		while (globalLeftGutterRowCache.rows.size > GLOBAL_LEFT_GUTTER_ROW_CACHE_LIMIT) {
-			const oldestKey = globalLeftGutterRowCache.rows.keys().next().value;
-			if (oldestKey === undefined) break;
-			globalLeftGutterRowCache.rows.delete(oldestKey);
-		}
-	}
-	return rendered;
-}
-
-function addGlobalLeftGutterToRows(lines: string[], width: number, gutter: number): string[] {
-	return lines.map((line) => addGlobalLeftGutter(line, width, gutter));
-}
-
-function highlightHistoryLine(
-	line: string,
-	lineIndex: number,
-	range: { start: { line: number; col: number }; end: { line: number; col: number } } | undefined,
-	width: number,
-): string {
-	if (!range || lineIndex < range.start.line || lineIndex > range.end.line) return line;
-
-	const startCol = lineIndex === range.start.line ? range.start.col : 0;
-	const endCol = lineIndex === range.end.line ? range.end.col : width;
-	return applyColumnHighlight(line, startCol, endCol, CONVERSATION_SELECTION_STYLE, RAIL_EDITOR_STYLE.reset);
-}
-
 function fitToTerminalRows(lines: string[], terminalRows: number): string[] {
 	return lines.length > terminalRows ? lines.slice(lines.length - terminalRows) : lines;
 }
@@ -247,7 +168,7 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 		const leftGutterWidth = appLeftGutterWidth(width);
 		const contentWidth = Math.max(1, width - leftGutterWidth);
 		const sections = getRenderedSections(children, contentWidth, state);
-		const { historyLines, pendingLines, statusLines, aboveLines, editorLines, belowLines, footerLines } = sections;
+		const { historyLines, historyRevision, pendingLines, statusLines, aboveLines, editorLines, belowLines, footerLines } = sections;
 		const footerBottomGapLines = Array.from({ length: FOOTER_LAYOUT.bottomGapRows }, () => "");
 		const fixedLines = addGlobalLeftGutterToRows([
 			...pendingLines,
@@ -293,12 +214,16 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 		const scrollbar = getScrollbarMetrics(historyRows, historyLines.length, start, width);
 		state.view = { start, rows: historyRows, lineCount: historyLines.length, width: contentWidth, leftGutterWidth, editorTopRow, editorBottomRow, footerTopRow, footerBottomRow, scrollbar };
 		const selection = selectionRange(state.selection);
-		const historyWithScrollbar: string[] = [];
-		for (let index = 0; index < historyRows; index++) {
-			const lineIndex = start + index;
-			const line = historyLines[lineIndex] ?? "";
-			const highlighted = highlightHistoryLine(line, lineIndex, selection, contentWidth);
-			historyWithScrollbar.push(renderScrollbar(addGlobalLeftGutter(highlighted, width, leftGutterWidth), index, scrollbar, width));
+		const scrollbarSig = scrollbar ? `${scrollbar.width}:${scrollbar.thumbStart}:${scrollbar.thumbSize}` : "none";
+		const selSig = selection ? `${selection.start.line}:${selection.start.col}:${selection.end.line}:${selection.end.col}` : "nosel";
+		const rowsSignature = `${historyRevision}${start}${historyRows}${width}${leftGutterWidth}${contentWidth}${scrollbarSig}${selSig}`;
+		const memo = state.viewportRowsCache;
+		let historyWithScrollbar: string[];
+		if (memo && memo.historyLinesRef === historyLines && memo.signature === rowsSignature) {
+			historyWithScrollbar = memo.rows;
+		} else {
+			historyWithScrollbar = composeHistoryRows(historyLines, start, historyRows, width, leftGutterWidth, contentWidth, scrollbar, selection);
+			state.viewportRowsCache = { historyLinesRef: historyLines, signature: rowsSignature, rows: historyWithScrollbar };
 		}
 		return fitToTerminalRows([...historyWithScrollbar, ...fixedLines], terminalRows);
 	} catch {

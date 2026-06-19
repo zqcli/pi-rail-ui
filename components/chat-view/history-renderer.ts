@@ -2,6 +2,7 @@ import { CONVERSATION_SCROLL_LAYOUT } from "../../config";
 import { renderedRailSectionRange, resolveRailSection, type RailSectionRange } from "../../rail/rail-section";
 import { stripAnsi } from "../../core/utils";
 import type { HistoryRenderResult, RenderCache, ScrollState } from "./state";
+import { nextHistoryRevision } from "./history-revision";
 
 function renderChild(child: any, width: number): string[] {
 	const childLines = child?.render?.(width);
@@ -229,16 +230,19 @@ function historyFromCache(cache: RenderCache): HistoryRenderResult {
 
 export function getRenderedSections(children: any[], width: number, state: ScrollState): RenderCache {
 	const historyChildren = historyRenderableChildren(children);
-	const history = state.preferCachedRender && canReuseFullHistory(state.renderCache, historyChildren, width, state)
-		? historyFromCache(state.renderCache)
+	const previousCache = state.renderCache;
+	const reusedFullHistory = state.preferCachedRender && canReuseFullHistory(previousCache, historyChildren, width, state);
+	const history = reusedFullHistory
+		? historyFromCache(previousCache)
 		: renderHistoryChildren(
 			historyChildren,
 			width,
-			state.renderCache,
-			reusablePrefixChildCount(state.renderCache, historyChildren, width, state),
+			previousCache,
+			reusablePrefixChildCount(previousCache, historyChildren, width, state),
 		);
 	const cache: RenderCache = {
 		width,
+		historyRevision: nextHistoryRevision(previousCache?.historyRevision, reusedFullHistory),
 		children: [...children],
 		...history,
 		pendingLines: renderChild(children[2], width),

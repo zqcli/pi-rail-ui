@@ -57,6 +57,7 @@ export type HistoryRenderResult = {
 };
 
 export type RenderCache = HistoryRenderResult & {
+	historyRevision: number;
 	width: number;
 	children: any[];
 	pendingLines: string[];
@@ -78,6 +79,10 @@ export type ScrollState = {
 	historyDirty?: boolean;
 	renderCache?: RenderCache;
 	viewportLayoutSignature?: string;
+	// Memoized composited history rows (gutter + scrollbar). Reused when the
+	// rendered history revision and viewport presentation state are unchanged, so
+	// footer ticks and cursor blinks skip the per-visible-row composition work.
+	viewportRowsCache?: { historyLinesRef: string[]; signature: string; rows: string[] };
 	selectionAutoScrollTimer?: ReturnType<typeof setTimeout>;
 };
 

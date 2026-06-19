@@ -3,6 +3,7 @@ import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-cod
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
+import { getConversationScrollStore, stateFor } from "../chat-view/state";
 
 export type FooterUsageStats = {
 	inputTokens: number;
@@ -52,6 +53,13 @@ function footerStore(): FooterStore {
 	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { expanded: false, selectionNoticeUntil: 0, turnStartTime: undefined, turnDuration: undefined } satisfies FooterStore);
 }
 
+function requestFooterRender(tui?: any): void {
+	if (tui && typeof tui === "object") {
+		stateFor(tui, getConversationScrollStore()).preferCachedRender = true;
+	}
+	tui?.requestRender?.();
+}
+
 export function isFooterExpanded(): boolean {
 	return footerStore().expanded;
 }
@@ -73,9 +81,9 @@ export function showFooterSelectionNotice(tui?: any, durationMs = 1800): void {
 	store.selectionNoticeTimer = setTimeout(() => {
 		store.selectionNoticeTimer = undefined;
 		store.selectionNoticeUntil = 0;
-		tui?.requestRender?.();
+		requestFooterRender(tui);
 	}, durationMs);
-	tui?.requestRender?.();
+	requestFooterRender(tui);
 }
 
 export function setTurnStartTime(time: number): void {
@@ -358,7 +366,7 @@ class RailFooterComponent {
 		private readonly footerData: any,
 	) {
 		this.unsubscribe = footerData.onBranchChange?.(() => {
-			this.tui.requestRender?.();
+			requestFooterRender(this.tui);
 		});
 	}
 
@@ -388,7 +396,7 @@ class RailFooterComponent {
 	}
 
 	handleFooterToggle(): void {
-		this.tui.requestRender?.();
+		requestFooterRender(this.tui);
 	}
 }
 

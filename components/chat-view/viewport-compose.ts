@@ -101,7 +101,7 @@ export function composeHistoryRows(
 			continue;
 		}
 		const isThumb = index >= scrollbar.thumbStart && index < scrollbar.thumbStart + scrollbar.thumbSize;
-		rows.push(`${guttered}${isThumb ? scrollbar.thumbBar : scrollbar.trackBar}`);
+		rows.push(`${guttered}${RAIL_EDITOR_STYLE.reset}${isThumb ? scrollbar.thumbBar : scrollbar.trackBar}`);
 	}
 	return rows;
 }

@@ -71,6 +71,14 @@ test("scrollbar column: thumb glyph on thumb rows, space on track rows", () => {
 	});
 });
 
+test("history row style is reset before scrollbar", () => {
+	const sb = makeScrollbar(1, 0, 1);
+	const row = composeHistoryRows(["open\x1b[1m"], 0, 1, WIDTH, GUTTER, CONTENT, sb, undefined)[0]!;
+	const scrollbarStart = row.indexOf("\x1b[38;2;120;120;120m");
+	assert(scrollbarStart > 0, "thumb style should be present");
+	assert(row.slice(0, scrollbarStart).endsWith("\x1b[0m"), "row should reset before scrollbar");
+});
+
 test("gutter prefix preserved (leading spaces) and content visible", () => {
 	const rows = composeHistoryRows(lines, 0, 1, WIDTH, GUTTER, CONTENT, undefined, undefined);
 	const plain = stripAnsi(rows[0]!);

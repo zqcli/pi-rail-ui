@@ -1,5 +1,5 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, FOOTER_LAYOUT } from "../../config";
+import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, FOOTER_LAYOUT, RAIL_EDITOR_STYLE } from "../../config";
 import { getInteractiveModeConstructors, restorePrototypePatches } from "../../core/patching";
 import { clamp } from "../../core/utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";

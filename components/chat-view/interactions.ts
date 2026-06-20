@@ -1,6 +1,6 @@
 import { TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
-import { showFooterSelectionNotice, toggleFooterExpanded } from "../footer";
+import { showFooterSelectionNotice } from "../footer";
 import { CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE } from "../../config";
 import {
 	canToggleRailSection,
@@ -628,11 +628,6 @@ function handleFooterMouse(tui: any, mouse: ConversationMouse, store: Conversati
 
 	if (mouse.action === "release") {
 		state.interaction = { type: "idle" };
-		if (!pending.moved && !mouseMovedFrom(pending, mouse) && isOnFooter(view, mouse)) {
-			toggleFooterExpanded();
-			state.preferCachedRender = true;
-			tui.requestRender?.();
-		}
 		return true;
 	}
 
@@ -711,18 +706,18 @@ function handleConversationSelection(tui: any, mouse: ConversationMouse, store: 
 		if (hadSelection) tui.requestRender?.();
 	} else if (mouse.action === "drag") {
 		const pending = state.interaction.type === "selecting" ? state.interaction : undefined;
-		const anchor = pending?.anchor;
-		const selection = anchor ? inclusiveSelectionForMouse(state, anchor, mouse) : undefined;
-		if (!selection || !pending) return false;
+		if (!pending) return false;
+		const selection = inclusiveSelectionForMouse(state, pending.anchor, mouse);
+		if (!selection) return false;
 		const moved = pending.moved || mouseMovedFrom(pending, mouse);
-		state.interaction = { type: "selecting", x: mouse.x, y: mouse.y, moved, anchor };
+		state.interaction = { type: "selecting", x: mouse.x, y: mouse.y, moved, anchor: pending.anchor };
 		state.selection = moved ? selection : undefined;
 		autoScrollSelectionOnce(tui, state, store, mouse);
 	} else {
 		const pending = state.interaction.type === "selecting" ? state.interaction : undefined;
-		const anchor = pending?.anchor;
-		const selection = anchor ? inclusiveSelectionForMouse(state, anchor, mouse) : undefined;
-		if (!selection || !pending) return false;
+		if (!pending) return false;
+		const selection = inclusiveSelectionForMouse(state, pending.anchor, mouse);
+		if (!selection) return false;
 		const moved = pending.moved || mouseMovedFrom(pending, mouse);
 		if (moved) state.selection = selection;
 		state.interaction = { type: "idle" };

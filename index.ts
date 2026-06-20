@@ -6,7 +6,7 @@ import {
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED } from "./config";
 import { RailEditor, disableMouseTracking, enableMouseTracking, hideAllEditorOverlays, installSelectorOverlay, uninstallSelectorOverlay } from "./components/editor";
-import { createRailFooter, setFooterExpanded, setTurnEndTime, setTurnStartTime } from "./components/footer";
+import { createRailFooter, openRailSessionModal, setTurnEndTime, setTurnStartTime } from "./components/footer";
 import { handleDuplicateCommand } from "./commands/duplicate";
 import { ensureConversationAlternateScreen, installConversationScroll, installTerminalOutputCoalescing, releaseConversationAlternateScreen, resetConversationScrollState, uninstallConversationScroll, uninstallTerminalOutputCoalescing } from "./components/chat-view";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
@@ -118,8 +118,14 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (event, ctx) => {
-		if (event.reason === "reload") setFooterExpanded(false);
+	pi.registerCommand("rail-session", {
+		description: "Show Pi rail session details",
+		handler: async (_args, ctx) => {
+			await openRailSessionModal(ctx, pi);
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
 		await install(ctx);
 	});
 

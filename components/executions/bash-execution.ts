@@ -1,6 +1,6 @@
 import { truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import { railSectionConfig, type ThemeLike } from "../../config";
-import { padToWidth, stripAnsi } from "../../core/utils";
+import { stripAnsi } from "../../core/utils";
 import { collapseHint } from "../../rail/rail-section";
 import { bashExecutionSurfaceForTheme } from "../../rail/rail-surface";
 import { cachedRender } from "../../rail/render-cache";

@@ -26,8 +26,8 @@ import {
 // Assistant thinking/reply surface patch
 // -----------------------------------------------------------------------------
 
-type AssistantMessageWithInternals = AssistantMessageComponent & {
-	contentContainer: { clear(): void; addChild(component: Component): void };
+type AssistantMessageWithInternals = {
+	contentContainer: { children?: Component[]; clear(): void; addChild(component: Component): void };
 	hideThinkingBlock: boolean;
 	hiddenThinkingLabel: string;
 	markdownTheme: ConstructorParameters<typeof Markdown>[3];
@@ -55,7 +55,6 @@ const ASSISTANT_THINKING_EXPANDED_KEY = Symbol.for("pi-rail-ui.assistant-thinkin
 const ASSISTANT_THINKING_MANUAL_KEY = Symbol.for("pi-rail-ui.assistant-thinking-manual");
 const ASSISTANT_THINKING_BLOCKS_KEY = Symbol.for("pi-rail-ui.assistant-thinking-blocks");
 const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
-const USER_MESSAGE_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.user-message-render-cache");
 
 const getAssistantMessageRailPatchStore = createStore<AssistantMessageRailPatchStore>("assistant-message-rail-patch", () => ({
 	active: false,
@@ -91,7 +90,6 @@ type AssistantThinkingRailOptions = {
 	rawText: string;
 	markdownTheme: ConstructorParameters<typeof Markdown>[3];
 	hidden: boolean;
-	hiddenLabel: string;
 };
 
 class AssistantThinkingRailBlock implements Component {
@@ -106,7 +104,6 @@ class AssistantThinkingRailBlock implements Component {
 	private rawLines: string[] = [];
 	private hidden = false;
 	private markdownTheme: ConstructorParameters<typeof Markdown>[3];
-	private hiddenLabel = "";
 
 	constructor(
 		inner: Component,
@@ -132,7 +129,6 @@ class AssistantThinkingRailBlock implements Component {
 		this.rawLines = this.rawText ? this.rawText.split(/\r?\n/u) : [];
 		this.hidden = options.hidden;
 		this.markdownTheme = options.markdownTheme;
-		this.hiddenLabel = options.hiddenLabel;
 		if (this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] === true) this.expanded = this.owner[ASSISTANT_THINKING_EXPANDED_KEY] !== false;
 		this.invalidate();
 	}
@@ -230,7 +226,7 @@ function updateAssistantMessageWithRail(
 	component.lastMessage = message;
 	component.contentContainer.clear();
 
-	const content = Array.isArray(message?.content) ? message.content : [];
+	const content: any[] = Array.isArray(message?.content) ? message.content : [];
 	const hasVisibleAfter = visibleAssistantSuffixMap(content);
 	if (hasVisibleAfter[0]) component.contentContainer.addChild(new Spacer(1));
 
@@ -251,7 +247,6 @@ function updateAssistantMessageWithRail(
 				rawText: part.thinking,
 				markdownTheme: component.markdownTheme,
 				hidden,
-				hiddenLabel: component.hiddenThinkingLabel,
 			}));
 			if (hasVisibleContentAfter) component.contentContainer.addChild(new Spacer(1));
 		}

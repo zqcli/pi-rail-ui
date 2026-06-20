@@ -1,19 +1,16 @@
-import { CURSOR_MARKER, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import {
 	RAIL_EDITOR_HEIGHT,
 	RAIL_EDITOR_SURFACE_STYLE,
 	RAIL_EDITOR_STYLE,
 	RAIL_THINKING_STYLE,
 	RAIL_USER_MESSAGE_STYLE,
-	RAIL_SLASH_COMMAND_STYLE,
 	RAIL_BASH_EXECUTION_STYLE,
 	BASH_EXECUTION_RAIL_COLOR,
 	THINKING_RAIL_COLOR,
-	SLASH_COMMAND_RAIL_COLOR,
 	railAnsiForTheme,
 	railSectionConfig,
 	type EditorHeightPolicy,
-	type EditorSurfaceStyle,
 	type RailSectionKind,
 	type RailSurfaceStyle,
 	type ThemeLike,
@@ -23,13 +20,7 @@ import {
 	SGR_RESET,
 	SGR_RESET_RE,
 	applyColumnHighlight,
-	buildVisualMap,
 	padToWidth,
-	splitDefaultEditor,
-	visibleBodySlice,
-	type ColumnRange,
-	type MouseLayout,
-	type VisualRow,
 } from "../core/utils";
 
 export type { EditorHeightPolicy, EditorSurfaceStyle, RailSurfaceStyle } from "../config";
@@ -113,8 +104,6 @@ export class EditorSurfaceRenderer {
 export const railEditorSurface = new EditorSurfaceRenderer(RAIL_EDITOR_STYLE, RAIL_EDITOR_HEIGHT);
 export const railThinkingSurface = new EditorSurfaceRenderer(RAIL_THINKING_STYLE);
 export const railUserMessageSurface = new EditorSurfaceRenderer(RAIL_USER_MESSAGE_STYLE);
-export const railSlashCommandSurface = new EditorSurfaceRenderer(RAIL_SLASH_COMMAND_STYLE);
-export const railBashExecutionSurface = new EditorSurfaceRenderer(RAIL_BASH_EXECUTION_STYLE);
 
 export function railSectionSurfaceStyle(kind: RailSectionKind, theme?: ThemeLike): RailSurfaceStyle {
 	const config = railSectionConfig(kind);
@@ -148,17 +137,11 @@ export function thinkingSurfaceForTheme(theme: ThemeLike): EditorSurfaceRenderer
 	});
 }
 
-export function slashCommandSurfaceForTheme(theme: ThemeLike): EditorSurfaceRenderer {
-	return new EditorSurfaceRenderer({
-		...RAIL_SLASH_COMMAND_STYLE,
-		rail: railAnsiForTheme(theme, SLASH_COMMAND_RAIL_COLOR) ?? RAIL_SLASH_COMMAND_STYLE.rail,
-	});
-}
-
 let _bashSurfaceCache: { theme: ThemeLike | undefined; surface: EditorSurfaceRenderer } | undefined;
 
 export function bashExecutionSurfaceForTheme(theme: ThemeLike | undefined): EditorSurfaceRenderer {
-	if (_bashSurfaceCache?.theme === theme) return _bashSurfaceCache.surface;
+	const cached = _bashSurfaceCache;
+	if (cached !== undefined && cached.theme === theme) return cached.surface;
 	let rail = RAIL_BASH_EXECUTION_STYLE.rail;
 	try {
 		if (theme) rail = railAnsiForTheme(theme, BASH_EXECUTION_RAIL_COLOR) ?? rail;
@@ -224,76 +207,4 @@ export class SurfaceContentInsetBlock implements Component {
 		this.cached = { width, innerLines, rows };
 		return rows;
 	}
-}
-
-export type EditorSurfaceRenderOptions = {
-	defaultEditorRows: string[];
-	logicalLines: string[];
-	terminalRows: number;
-	paddingX: number;
-	selectionForRow?: (row: VisualRow) => ColumnRange | undefined;
-	renderCompletions?: boolean;
-	visualMapStart?: number;
-	precomputedVisibleMap?: VisualRow[];
-};
-
-export type EditorSurfaceRenderResult = {
-	rows: string[];
-	mouseLayout: MouseLayout;
-};
-
-export function renderEditorSurface(
-	width: number,
-	options: EditorSurfaceRenderOptions,
-	surface: EditorSurfaceRenderer = railEditorSurface,
-): EditorSurfaceRenderResult {
-	const contentWidth = surface.contentWidth(width);
-	const split = splitDefaultEditor(options.defaultEditorRows);
-	const targetInputHeight = surface.targetInputHeight(split.body.length, options.terminalRows);
-	const bodySlice = visibleBodySlice(split.body, targetInputHeight, CURSOR_MARKER);
-	const body = bodySlice.lines;
-
-	const innerWidth = Math.max(1, contentWidth - options.paddingX * 2);
-	const layoutWidth = Math.max(1, innerWidth - (options.paddingX ? 0 : 1));
-	const visibleMap = options.precomputedVisibleMap ?? (() => {
-		const fullMap = buildVisualMap(options.logicalLines, layoutWidth);
-		const visualMapStart = options.visualMapStart === undefined ? bodySlice.start : options.visualMapStart + bodySlice.start;
-		return fullMap.slice(visualMapStart, visualMapStart + body.length);
-	})();
-
-	const blankRows = Math.max(0, targetInputHeight - body.length);
-	const topPadding = Math.floor(blankRows / 2);
-	const bottomPadding = blankRows - topPadding;
-
-	const rows: string[] = [];
-	for (let i = 0; i < topPadding; i++) rows.push(surface.renderSurfaceRow(width));
-	for (let index = 0; index < body.length; index++) {
-		const line = body[index] ?? "";
-		const row = visibleMap[index];
-		const selection = row ? options.selectionForRow?.(row) : undefined;
-		const displayLine = selection
-			? surface.highlightColumns(line, selection.startCol + options.paddingX, selection.endCol + options.paddingX)
-			: line;
-		rows.push(surface.renderSurfaceRow(width, displayLine));
-	}
-	for (let i = 0; i < bottomPadding; i++) rows.push(surface.renderSurfaceRow(width));
-	if (options.renderCompletions !== false) {
-		for (const line of split.completions) rows.push(surface.renderCompletion(width, line));
-	}
-
-	const cursorLocalRow = rows.findIndex((line) => line.includes(CURSOR_MARKER));
-	const cursorLine = cursorLocalRow >= 0 ? rows[cursorLocalRow]! : rows[0] ?? "";
-	const markerIndex = cursorLine.indexOf(CURSOR_MARKER);
-
-	return {
-		rows,
-		mouseLayout: {
-			contentStartCol: surface.contentStartCol(),
-			contentWidth,
-			topPadding,
-			visibleMap,
-			cursorLocalRow: Math.max(0, cursorLocalRow),
-			cursorLocalCol: markerIndex >= 0 ? visibleWidth(cursorLine.slice(0, markerIndex)) : 0,
-		},
-	};
 }

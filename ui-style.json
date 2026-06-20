@@ -61,8 +61,6 @@
     "timestampColor": { "rgb": [127, 132, 156] }
   },
   "slashCommand": {
-    "background": { "rgb": [49, 50, 68] },
-    "rail": { "rgb": [148, 226, 213] },
     "selectedText": { "rgb": [137, 180, 250] },
     "textGapWidth": 1,
     "bottomReservedRows": 1,

@@ -20,6 +20,7 @@ import {
 	type ColumnRange,
 	type MouseLayout,
 	type ParsedMouse,
+	type ParsedWheel,
 	type Position,
 	type VisualRow,
 } from "../../core/utils";
@@ -28,8 +29,6 @@ import {
 // scrollback while the app-level chat viewport is active.
 const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1007h";
 const DISABLE_MOUSE = "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1007l";
-const ENTER_ALT_SCREEN = "\x1b[?1049h";
-const EXIT_ALT_SCREEN = "\x1b[?1049l";
 const PASTE_MARKER_RE = /\[paste #\d+(?: (?:\+\d+ lines|\d+ chars))?\]/g;
 
 function parseMouse(data: string): ParsedMouse | undefined {
@@ -67,14 +66,6 @@ export function enableMouseTracking(): void {
 
 export function disableMouseTracking(): void {
 	if (process.stdout.isTTY) process.stdout.write(DISABLE_MOUSE);
-}
-
-export function enterAlternateScreen(): void {
-	if (process.stdout.isTTY) process.stdout.write(ENTER_ALT_SCREEN);
-}
-
-export function exitAlternateScreen(): void {
-	if (process.stdout.isTTY) process.stdout.write(EXIT_ALT_SCREEN);
 }
 
 export class MouseSelectableRailEditor extends CustomEditor {
@@ -368,6 +359,7 @@ export class RailEditor extends MouseSelectableRailEditor {
 		super(tui, themedEditorTheme, keybindings);
 		this.selectListTheme = themedEditorTheme.selectList;
 		this.slashOverlaySurface = selectorOutputSurfaceForTheme(appTheme);
+		(this as any).createAutocompleteList = (prefix: string, items: any[]) => this.createRailAutocompleteList(prefix, items);
 		this.setAutocompleteMaxVisible(Math.max(SLASH_COMMAND_LAYOUT.firstLevelMaxRows, SLASH_COMMAND_LAYOUT.nestedMaxRows));
 		activeRailEditors.add(this);
 	}
@@ -401,7 +393,7 @@ export class RailEditor extends MouseSelectableRailEditor {
 		return level === "top" ? SLASH_COMMAND_LAYOUT.firstLevelMaxRows : SLASH_COMMAND_LAYOUT.nestedMaxRows;
 	}
 
-	createAutocompleteList(prefix: string, items: any[]): SelectList {
+	private createRailAutocompleteList(prefix: string, items: any[]): SelectList {
 		const level = this.slashLevelFromEditorText(prefix);
 		const maxVisible = level ? this.slashRowsForLevel(level) : this.getAutocompleteMaxVisible();
 		const layout = level

@@ -61,8 +61,6 @@
     "timestampColor": "theme:thinkingText"
   },
   "slashCommand": {
-    "background": "editor.background",
-    "rail": "theme:thinkingText",
     "selectedText": "editor.rail",
     "textGapWidth": 1,
     "bottomReservedRows": 1,

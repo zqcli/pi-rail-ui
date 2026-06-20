@@ -10,6 +10,7 @@ import type {
 	EditorSurfaceStyle,
 	FooterLayout,
 	FooterStyle,
+	ColorReference,
 	RailSectionKind,
 	RailSectionLayoutConfig,
 	RailSectionRawConfig,
@@ -19,6 +20,7 @@ import type {
 	RailSectionResolvedConfig,
 	RailSectionSelectionConfig,
 	RailSectionSpacingConfig,
+	RailSectionStyleConfig,
 	RailSurfaceStyle,
 	SlashCommandLayout,
 	StyleFile,
@@ -90,7 +92,17 @@ function sectionContentStart(layout: RailSectionRawLayout, fallback: Partial<Rai
 	return borderWidth + borderGap;
 }
 
-function resolveRailSectionConfig(kind: RailSectionKind, fallback: Partial<RailSectionResolvedConfig> = {}): RailSectionResolvedConfig {
+type RailSectionConfigFallback = Partial<Omit<RailSectionResolvedConfig, "layout" | "style" | "selection">> & {
+	layout?: Partial<RailSectionLayoutConfig>;
+	style?: Partial<RailSectionStyleConfig>;
+	selection?: Partial<RailSectionSelectionConfig>;
+};
+
+function sectionRailColor(rail: RailSectionRawStyle["rail"] | undefined, fallback: ColorReference) {
+	return resolveTextColor(rail === undefined || rail === false ? fallback : rail, { editorRail });
+}
+
+function resolveRailSectionConfig(kind: RailSectionKind, fallback: RailSectionConfigFallback = {}): RailSectionResolvedConfig {
 	const defaults = railSectionDefaultRaw();
 	const raw = railSectionRaw(kind);
 	const layout = mergeRaw(defaults.layout, raw.layout) as RailSectionRawLayout;
@@ -232,10 +244,7 @@ export const RAIL_EDITOR_STYLE: EditorSurfaceStyle = {
 };
 
 const thinkingSectionStyle = rawSectionStyle("assistantThinking");
-export const THINKING_RAIL_COLOR = resolveTextColor(
-	thinkingSectionStyle?.rail && thinkingSectionStyle.rail !== false ? thinkingSectionStyle.rail : style.thinking.rail,
-	{ editorRail },
-);
+export const THINKING_RAIL_COLOR = sectionRailColor(thinkingSectionStyle?.rail, style.thinking.rail);
 export const RAIL_THINKING_STYLE: RailSurfaceStyle = {
 	...RAIL_EDITOR_SURFACE_STYLE,
 	background: resolveBackground(thinkingSectionStyle?.background ?? style.thinking.background, editorBackground),
@@ -249,17 +258,13 @@ export const USER_MESSAGE_LAYOUT: UserMessageLayout = {
 };
 
 const userMessageSectionStyle = rawSectionStyle("userMessage");
-const userRailColor = resolveTextColor(
-	userMessageSectionStyle?.rail && userMessageSectionStyle.rail !== false ? userMessageSectionStyle.rail : style.userMessage.rail,
-	{ editorRail },
-);
+const userRailColor = sectionRailColor(userMessageSectionStyle?.rail, style.userMessage.rail);
 export const RAIL_USER_MESSAGE_STYLE: RailSurfaceStyle = {
 	...RAIL_EDITOR_SURFACE_STYLE,
 	background: resolveBackground(userMessageSectionStyle?.background ?? style.userMessage.background, editorBackground),
 	rail: userRailColor.ansi ?? editorRail,
 };
 
-export const SLASH_COMMAND_RAIL_COLOR = resolveTextColor(style.slashCommand.rail, { editorRail });
 export const SLASH_COMMAND_LAYOUT: SlashCommandLayout = {
 	textGapWidth: Math.max(0, style.slashCommand.textGapWidth),
 	bottomReservedRows: Math.max(0, style.slashCommand.bottomReservedRows),
@@ -268,12 +273,6 @@ export const SLASH_COMMAND_LAYOUT: SlashCommandLayout = {
 	minPrimaryColumnWidth: Math.max(1, style.slashCommand.minPrimaryColumnWidth),
 	maxPrimaryColumnWidth: Math.max(1, style.slashCommand.maxPrimaryColumnWidth),
 	selectedText: resolveTextColor(style.slashCommand.selectedText, { editorRail }),
-};
-
-export const RAIL_SLASH_COMMAND_STYLE: RailSurfaceStyle = {
-	...RAIL_EDITOR_SURFACE_STYLE,
-	background: resolveBackground(style.slashCommand.background, editorBackground),
-	rail: SLASH_COMMAND_RAIL_COLOR.ansi ?? editorRail,
 };
 
 const bashExecutionSectionStyle = rawSectionStyle("bashExecution");
@@ -288,7 +287,9 @@ export const BASH_EXECUTION_LAYOUT: BashExecutionLayout = {
 };
 
 export const BASH_EXECUTION_RAIL_COLOR = resolveTextColor(
-	bashExecutionSectionStyle?.rail && bashExecutionSectionStyle.rail !== false ? bashExecutionSectionStyle.rail : style.bashExecution?.rail ?? "theme:bashMode",
+	bashExecutionSectionStyle?.rail === undefined || bashExecutionSectionStyle.rail === false
+		? style.bashExecution?.rail ?? "theme:bashMode"
+		: bashExecutionSectionStyle.rail,
 	{ editorRail },
 );
 export const RAIL_BASH_EXECUTION_STYLE: RailSurfaceStyle = {
@@ -316,7 +317,7 @@ const contentOnlySelection: RailSectionSelectionConfig = {
 
 export const RAIL_SECTION_CONFIGS: Record<RailSectionKind, RailSectionResolvedConfig> = Object.fromEntries(
 	RAIL_SECTION_KINDS.map((kind) => {
-		const fallbackByKind: Partial<Record<RailSectionKind, Partial<RailSectionResolvedConfig>>> = {
+		const fallbackByKind: Partial<Record<RailSectionKind, RailSectionConfigFallback>> = {
 			assistantMessage: { selectable: true, layout: { contentStartCol: surfaceContentStart }, selection: contentOnlySelection },
 			assistantThinking: { selectable: true, layout: { contentStartCol: surfaceContentStart }, selection: contentOnlySelection },
 			assistantReply: { selectable: true, layout: { contentStartCol: surfaceContentStart, alignWith: "assistantThinking" }, selection: contentOnlySelection },

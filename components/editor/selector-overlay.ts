@@ -342,7 +342,7 @@ function showSettingsOverlay(instance: any, create: SelectorFactory, store: Sele
 		anchor: "bottom-left",
 		margin: { bottom: bottomMargin },
 	});
-	store.handles.add(handle);
+	if (handle) store.handles.add(handle);
 }
 
 function patchRender(

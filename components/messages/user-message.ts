@@ -6,7 +6,7 @@ import { cachedRender } from "../../rail/render-cache";
 import { EditorSurfaceRenderer, railUserMessageSurface } from "../../rail/rail-surface";
 import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, padToWidth } from "../../core/utils";
 
-type UserMessageWithInternals = UserMessageComponent & {
+type UserMessageWithInternals = {
 	contentBox?: { children?: Component[] };
 };
 

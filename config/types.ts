@@ -114,8 +114,6 @@ export type StyleFile = {
 		timestampColor: ColorReference;
 	};
 	slashCommand: {
-		background: ColorReference;
-		rail: ColorReference;
 		selectedText: ColorReference;
 		textGapWidth: number;
 		bottomReservedRows: number;

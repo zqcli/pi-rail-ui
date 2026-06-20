@@ -62,8 +62,8 @@ function asInput(args: unknown): ApplyPatchInput {
 	if (typeof args === "string") return { input: args };
 	if (args && typeof args === "object") {
 		const record = args as Record<string, unknown>;
-		if (typeof record.input === "string") return { input: record.input };
-		if (typeof record.patch === "string") return { input: record.patch };
+		if (typeof record["input"] === "string") return { input: record["input"] };
+		if (typeof record["patch"] === "string") return { input: record["patch"] };
 	}
 	return { input: "" };
 }
@@ -74,7 +74,7 @@ function displayPath(path: string, cwd: string): string {
 		const normalizedCwd = resolvePatchPath(".", cwd);
 		if (absolutePath === normalizedCwd) return ".";
 		if (absolutePath.startsWith(`${normalizedCwd}/`)) return absolutePath.slice(normalizedCwd.length + 1);
-		const home = process.env.HOME;
+		const home = process.env["HOME"];
 		if (home && absolutePath.startsWith(`${home}/`)) return `~/${absolutePath.slice(home.length + 1)}`;
 		return absolutePath;
 	} catch {

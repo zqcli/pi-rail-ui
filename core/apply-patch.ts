@@ -25,7 +25,7 @@ export type ApplyPatchAction = "add" | "delete" | "update";
 export type ApplyPatchFileSummary = {
 	action: ApplyPatchAction;
 	path: string;
-	movePath?: string;
+	movePath?: string | undefined;
 };
 
 export type HunkLine = {
@@ -34,7 +34,7 @@ export type HunkLine = {
 };
 
 export type PatchHunk = {
-	header?: string;
+	header?: string | undefined;
 	lines: HunkLine[];
 	endOfFile: boolean;
 };
@@ -53,7 +53,7 @@ export type DeleteFileChange = {
 export type UpdateFileChange = {
 	action: "update";
 	path: string;
-	movePath?: string;
+	movePath?: string | undefined;
 	hunks: PatchHunk[];
 };
 
@@ -65,12 +65,12 @@ export type ParsedApplyPatch = {
 
 export type AppliedPatchFile = ApplyPatchFileSummary & {
 	absolutePath: string;
-	absoluteMovePath?: string;
+	absoluteMovePath?: string | undefined;
 	diff: string;
 	patch: string;
 	additions: number;
 	deletions: number;
-	firstChangedLine?: number;
+	firstChangedLine?: number | undefined;
 };
 
 export type ApplyPatchResult = {
@@ -92,7 +92,7 @@ export type ApplyPatchOperations = {
 
 export type ApplyPatchOptions = {
 	cwd: string;
-	signal?: AbortSignal;
+	signal?: AbortSignal | undefined;
 	operations?: ApplyPatchOperations;
 };
 
@@ -128,6 +128,10 @@ function isFileHeader(line: string): boolean {
 	return line.startsWith(ADD_FILE) || line.startsWith(DELETE_FILE) || line.startsWith(UPDATE_FILE);
 }
 
+function lineAt(lines: readonly string[], index: number): string {
+	return lines[index] ?? "";
+}
+
 function parseHeaderPath(line: string, prefix: string, lineIndex: number): string {
 	const value = line.slice(prefix.length).trim();
 	if (!value) throw formatError(`Missing path after ${prefix.trimEnd()}`, lineIndex);
@@ -143,22 +147,23 @@ export function parseApplyPatch(input: string): ParsedApplyPatch {
 	if (lines[0] !== PATCH_PREFIX) throw formatError(`Patch must start with ${PATCH_PREFIX}`);
 
 	let endIndex = lines.length - 1;
-	while (endIndex > 0 && lines[endIndex] === "") endIndex--;
-	if (lines[endIndex] !== PATCH_SUFFIX) throw formatError(`Patch must end with ${PATCH_SUFFIX}`);
+	while (endIndex > 0 && lineAt(lines, endIndex) === "") endIndex--;
+	if (lineAt(lines, endIndex) !== PATCH_SUFFIX) throw formatError(`Patch must end with ${PATCH_SUFFIX}`);
 
 	const changes: ApplyPatchChange[] = [];
 	let i = 1;
 	while (i < endIndex) {
-		const line = lines[i];
+		const line = lineAt(lines, i);
 		if (line.startsWith(ADD_FILE)) {
 			const path = parseHeaderPath(line, ADD_FILE, i);
 			const content: string[] = [];
 			i++;
-			while (i < endIndex && !isFileHeader(lines[i])) {
-				if (!lines[i].startsWith("+")) {
+			while (i < endIndex && !isFileHeader(lineAt(lines, i))) {
+				const contentLine = lineAt(lines, i);
+				if (!contentLine.startsWith("+")) {
 					throw formatError("Add File lines must start with +, including blank lines", i);
 				}
-				content.push(lines[i].slice(1));
+				content.push(contentLine.slice(1));
 				i++;
 			}
 			changes.push({ action: "add", path, lines: content });
@@ -177,25 +182,27 @@ export function parseApplyPatch(input: string): ParsedApplyPatch {
 			const hunks: PatchHunk[] = [];
 			let movePath: string | undefined;
 			i++;
-			if (i < endIndex && lines[i].startsWith(MOVE_TO)) {
-				movePath = parseHeaderPath(lines[i], MOVE_TO, i);
+			if (i < endIndex && lineAt(lines, i).startsWith(MOVE_TO)) {
+				movePath = parseHeaderPath(lineAt(lines, i), MOVE_TO, i);
 				i++;
 			}
 
-			while (i < endIndex && !isFileHeader(lines[i])) {
-				if (!lines[i].startsWith("@@")) throw formatError("Update File sections must contain @@ hunks", i);
-				const header = lines[i].slice(2).trim() || undefined;
+			while (i < endIndex && !isFileHeader(lineAt(lines, i))) {
+				const hunkHeaderLine = lineAt(lines, i);
+				if (!hunkHeaderLine.startsWith("@@")) throw formatError("Update File sections must contain @@ hunks", i);
+				const header = hunkHeaderLine.slice(2).trim() || undefined;
 				const hunkLines: HunkLine[] = [];
 				let endOfFile = false;
 				i++;
 
-				while (i < endIndex && !lines[i].startsWith("@@") && !isFileHeader(lines[i])) {
-					if (lines[i] === END_OF_FILE) {
+				while (i < endIndex && !lineAt(lines, i).startsWith("@@") && !isFileHeader(lineAt(lines, i))) {
+					const hunkLine = lineAt(lines, i);
+					if (hunkLine === END_OF_FILE) {
 						endOfFile = true;
 						i++;
 						break;
 					}
-					const prefix = lines[i][0];
+					const prefix = hunkLine[0];
 					if (prefix !== " " && prefix !== "-" && prefix !== "+") {
 						throw formatError(
 							"Hunk lines must start with space, -, or +; unchanged blank lines need a single leading space",
@@ -204,7 +211,7 @@ export function parseApplyPatch(input: string): ParsedApplyPatch {
 					}
 					hunkLines.push({
 						kind: prefix === " " ? "context" : prefix === "-" ? "remove" : "add",
-						text: lines[i].slice(1),
+						text: hunkLine.slice(1),
 					});
 					i++;
 				}
@@ -240,7 +247,7 @@ function summarizePatchHeaders(input: string): ApplyPatchFileSummary[] {
 	const lines = normalizePatchText(input).split("\n");
 	const summaries: ApplyPatchFileSummary[] = [];
 	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i];
+		const line = lineAt(lines, i);
 		if (line.startsWith(ADD_FILE)) {
 			summaries.push({ action: "add", path: line.slice(ADD_FILE.length).trim() });
 		} else if (line.startsWith(DELETE_FILE)) {
@@ -287,7 +294,7 @@ function restoreLineEndings(content: string, ending: "\n" | "\r\n"): string {
 
 function findLineContaining(lines: readonly string[], needle: string, start: number): number {
 	for (let i = Math.max(0, start); i < lines.length; i++) {
-		if (lines[i].includes(needle)) return i;
+		if (lineAt(lines, i).includes(needle)) return i;
 	}
 	return -1;
 }
@@ -295,7 +302,7 @@ function findLineContaining(lines: readonly string[], needle: string, start: num
 function linesMatchAt(lines: readonly string[], needle: readonly string[], start: number): boolean {
 	if (start < 0 || start + needle.length > lines.length) return false;
 	for (let i = 0; i < needle.length; i++) {
-		if (lines[start + i] !== needle[i]) return false;
+		if (lineAt(lines, start + i) !== needle[i]!) return false;
 	}
 	return true;
 }

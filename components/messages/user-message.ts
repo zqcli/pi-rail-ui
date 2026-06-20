@@ -19,7 +19,7 @@ type UserMessageRailPatchStore = {
 	installed: boolean;
 	targets: PrototypePatchTarget[];
 	surface: EditorSurfaceRenderer;
-	theme?: Theme;
+	theme?: Theme | undefined;
 	timestampsByText: Map<string, number[]>;
 	timestampCursorByText: Map<string, number>;
 	assignedTimestamps: WeakMap<object, number>;

@@ -32,7 +32,7 @@ function shouldApplyGenericToolCollapse(component: any): boolean {
 
 function displayPath(value: unknown): string | undefined {
 	if (typeof value !== "string" || !value) return undefined;
-	const home = process.env.HOME;
+	const home = process.env["HOME"];
 	return home && value.startsWith(home) ? `~${value.slice(home.length)}` : value;
 }
 

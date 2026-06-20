@@ -14,7 +14,7 @@ export type ScrollView = {
 	editorBottomRow: number;
 	footerTopRow: number;
 	footerBottomRow: number;
-	scrollbar?: ScrollbarMetrics;
+	scrollbar?: ScrollbarMetrics | undefined;
 };
 
 export type ScrollbarMetrics = {
@@ -41,11 +41,11 @@ export type ActiveInteraction =
 export type ScrollAnimation = {
 	startOffsetFromBottom: number;
 	targetOffsetFromBottom: number;
-	targetStart?: number;
-	lockAtEnd?: boolean;
+	targetStart?: number | undefined;
+	lockAtEnd?: boolean | undefined;
 	startedAt: number;
 	durationMs: number;
-	timer?: ReturnType<typeof setTimeout>;
+	timer?: ReturnType<typeof setTimeout> | undefined;
 };
 
 export type HistoryRenderResult = {
@@ -71,19 +71,19 @@ export type RenderCache = HistoryRenderResult & {
 export type ScrollState = {
 	offsetFromBottom: number;
 	interaction: ActiveInteraction;
-	view?: ScrollView;
-	selection?: ScrollSelection;
-	scrollAnimation?: ScrollAnimation;
-	lockedStart?: number;
-	preferCachedRender?: boolean;
-	historyDirty?: boolean;
-	renderCache?: RenderCache;
-	viewportLayoutSignature?: string;
+	view?: ScrollView | undefined;
+	selection?: ScrollSelection | undefined;
+	scrollAnimation?: ScrollAnimation | undefined;
+	lockedStart?: number | undefined;
+	preferCachedRender?: boolean | undefined;
+	historyDirty?: boolean | undefined;
+	renderCache?: RenderCache | undefined;
+	viewportLayoutSignature?: string | undefined;
 	// Memoized composited history rows (gutter + scrollbar). Reused when the
 	// rendered history revision and viewport presentation state are unchanged, so
 	// footer ticks and cursor blinks skip the per-visible-row composition work.
-	viewportRowsCache?: { historyLinesRef: string[]; signature: string; rows: string[] };
-	selectionAutoScrollTimer?: ReturnType<typeof setTimeout>;
+	viewportRowsCache?: { historyLinesRef: string[]; signature: string; rows: string[] } | undefined;
+	selectionAutoScrollTimer?: ReturnType<typeof setTimeout> | undefined;
 };
 
 export type ConversationScrollStore = {

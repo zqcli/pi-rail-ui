@@ -66,7 +66,7 @@ function shouldCollapseLeadingBlankRow(
 	);
 }
 
-type MutableHistoryRender = HistoryRenderResult & { previousSectionKind?: string };
+type MutableHistoryRender = HistoryRenderResult & { previousSectionKind?: string | undefined };
 
 function emptyHistoryRender(historyChildren: any[]): MutableHistoryRender {
 	return {

@@ -14,7 +14,7 @@ export type FooterUsageStats = {
 };
 
 type RailSessionStats = {
-	sessionFile?: string;
+	sessionFile?: string | undefined;
 	sessionId: string;
 	userMessages: number;
 	assistantMessages: number;
@@ -34,29 +34,29 @@ type RailSessionStats = {
 export type FooterLiveState = {
 	cwd: string;
 	cwdShort: string;
-	branch?: string | null;
-	sessionName?: string;
+	branch?: string | null | undefined;
+	sessionName?: string | undefined;
 	idle: boolean;
 	pending: boolean;
-	modelId?: string;
+	modelId?: string | undefined;
 	modelShort: string;
-	provider?: string;
+	provider?: string | undefined;
 	thinking: string;
 	activeTools: string[];
 	allToolCount: number;
 	extensionStatuses: string[];
-	contextTokens?: number | null;
-	contextWindow?: number;
-	contextPercent?: number | null;
-	usingSubscription?: boolean;
+	contextTokens?: number | null | undefined;
+	contextWindow?: number | undefined;
+	contextPercent?: number | null | undefined;
+	usingSubscription?: boolean | undefined;
 };
 
 type FooterStore = {
 	selectionNoticeUntil: number;
-	selectionNoticeTimer?: ReturnType<typeof setTimeout>;
-	turnStartTime?: number;
-	turnDuration?: number;
-	footerData?: ReadonlyFooterDataProvider;
+	selectionNoticeTimer?: ReturnType<typeof setTimeout> | undefined;
+	turnStartTime?: number | undefined;
+	turnDuration?: number | undefined;
+	footerData?: ReadonlyFooterDataProvider | undefined;
 };
 
 const FOOTER_STORE_KEY = Symbol.for("pi-rail-ui.footer-state");
@@ -280,7 +280,7 @@ function latestFooterData(): ReadonlyFooterDataProvider | undefined {
 
 function collectFooterLiveState(ctx: ExtensionContext, pi: ExtensionAPI, footerData?: ReadonlyFooterDataProvider, options: { details?: boolean } = {}): FooterLiveState {
 	const rawCwd = ctx.sessionManager.getCwd?.() ?? ctx.cwd;
-	const home = process.env.HOME || process.env.USERPROFILE;
+	const home = process.env["HOME"] || process.env["USERPROFILE"];
 	const includeDetails = options.details === true;
 	const contextUsage = ctx.getContextUsage();
 	let activeTools: string[] = [];
@@ -584,7 +584,7 @@ export function renderFooter(
 }
 
 class RailFooterComponent {
-	private usageCache?: { entryCount: number; lastEntry: any; stats: FooterUsageStats };
+	private usageCache?: { entryCount: number; lastEntry: any; stats: FooterUsageStats } | undefined;
 	private readonly unsubscribe?: () => void;
 
 	constructor(

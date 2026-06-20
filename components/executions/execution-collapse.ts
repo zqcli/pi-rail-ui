@@ -8,7 +8,7 @@ export type RenderableCtor = { prototype: { render(width: number): string[]; set
 export type ExecutionRailPatchStore = {
 	active: boolean;
 	targets: Array<{ ctor: any; methodName: string; original: any }>;
-	theme?: ThemeLike;
+	theme?: ThemeLike | undefined;
 };
 
 export const BASH_PREVIEW_LINES = 20;

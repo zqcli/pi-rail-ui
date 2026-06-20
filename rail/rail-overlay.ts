@@ -8,13 +8,13 @@ export type RailOverlayBodyRenderer = (contentWidth: number) => string[];
 export type RailOverlayRenderOptions = {
 	surface?: EditorSurfaceRenderer;
 	textGapWidth?: number;
-	maxRows?: number | (() => number);
+	maxRows?: number | (() => number) | undefined;
 };
 
 export type RailOverlayPanelOptions = RailOverlayRenderOptions & {
 	renderBody: RailOverlayBodyRenderer;
-	focusTarget?: any;
-	invalidateTarget?: Component;
+	focusTarget?: any | undefined;
+	invalidateTarget?: Component | undefined;
 };
 
 function resolvedMaxRows(maxRows: RailOverlayRenderOptions["maxRows"]): number {

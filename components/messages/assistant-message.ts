@@ -47,7 +47,7 @@ type AssistantMessageRailPatchStore = {
 	active: boolean;
 	installed: boolean;
 	targets: PrototypePatchTarget[];
-	theme?: Theme;
+	theme?: Theme | undefined;
 	surface: EditorSurfaceRenderer;
 };
 
@@ -95,8 +95,8 @@ type AssistantThinkingRailOptions = {
 class AssistantThinkingRailBlock implements Component {
 	expanded = true;
 	private autoSetting = false;
-	private fullCache?: { width: number; rows: string[] };
-	private collapsedCache?: { width: number; limit: number; rows: string[] };
+	private fullCache?: { width: number; rows: string[] } | undefined;
+	private collapsedCache?: { width: number; limit: number; rows: string[] } | undefined;
 	private inner: Component;
 	private surface: EditorSurfaceRenderer;
 	private appTheme: Theme;

@@ -157,7 +157,7 @@ export function bashExecutionSurfaceForTheme(theme: ThemeLike | undefined): Edit
 }
 
 export class SurfaceRailBlock implements Component {
-	private cached?: { width: number; innerLines: string[]; rows: string[] };
+	private cached?: { width: number; innerLines: string[]; rows: string[] } | undefined;
 
 	constructor(
 		private readonly inner: Component,
@@ -182,7 +182,7 @@ export class SurfaceRailBlock implements Component {
 export class ThinkingRailBlock extends SurfaceRailBlock {}
 
 export class SurfaceContentInsetBlock implements Component {
-	private cached?: { width: number; innerLines: string[]; rows: string[] };
+	private cached?: { width: number; innerLines: string[]; rows: string[] } | undefined;
 
 	constructor(
 		private readonly inner: Component,

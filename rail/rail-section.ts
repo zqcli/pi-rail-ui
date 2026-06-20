@@ -19,8 +19,8 @@ export type RailSectionOverrides = Partial<Omit<RailSectionResolvedConfig, "kind
 
 export type RailSectionMetadata = {
 	kind: RailSectionKind;
-	component?: any;
-	overrides?: RailSectionOverrides;
+	component?: any | undefined;
+	overrides?: RailSectionOverrides | undefined;
 };
 
 export type RailSectionDefinition = {
@@ -208,7 +208,7 @@ export function collapseHint(theme: ThemeLike | undefined, hiddenLineCount: numb
 
 export class RailSectionBlock implements Component {
 	private readonly config: RailSectionResolvedConfig;
-	private cached?: { width: number; innerLines: string[]; rows: string[] };
+	private cached?: { width: number; innerLines: string[]; rows: string[] } | undefined;
 
 	constructor(private readonly inner: Component, kind: RailSectionKind, overrides?: RailSectionOverrides) {
 		this.config = mergeSectionConfig(kind, overrides);

@@ -69,8 +69,8 @@ export function disableMouseTracking(): void {
 }
 
 export class MouseSelectableRailEditor extends CustomEditor {
-	protected selection?: { anchor: Position; active: Position };
-	private pendingMouse?: ParsedMouse;
+	protected selection?: { anchor: Position; active: Position } | undefined;
+	private pendingMouse?: ParsedMouse | undefined;
 	private mouseLayout?: MouseLayout;
 	private screenOrigin?: {
 		topRow: number;
@@ -78,7 +78,7 @@ export class MouseSelectableRailEditor extends CustomEditor {
 		visibleRows: number;
 		contentWidth: number;
 		contentStartCol: number;
-	};
+	} | undefined;
 
 	setSelectionRange(anchor: Position, active: Position): void {
 		this.selection = { anchor, active };
@@ -260,7 +260,7 @@ export class MouseSelectableRailEditor extends CustomEditor {
 		);
 	}
 
-	handleInput(data: string): void {
+	override handleInput(data: string): void {
 		if (data.charCodeAt(0) === 0x1b) {
 			const wheel = parseWheel(data);
 			if (wheel && this.handleMouseWheel(wheel)) return;
@@ -337,16 +337,16 @@ export function hideAllEditorOverlays(): void {
 type SlashAutocompleteLevel = "top" | "nested";
 
 export class RailEditor extends MouseSelectableRailEditor {
-	private slashOverlay?: OverlayHandle;
-	private slashOverlaySignature?: string;
+	private slashOverlay?: OverlayHandle | undefined;
+	private slashOverlaySignature?: string | undefined;
 	private readonly slashOverlaySurface: EditorSurfaceRenderer;
 	private readonly selectListTheme: EditorTheme["selectList"];
 	private editorScrollOffset = 0;
 	private editorScrollMax = 0;
 	private editorManualScroll = false;
-	private visualMapCache?: { layoutWidth: number; lineRows: Array<{ text: string; rows: VisualRow[] }>; map: VisualRow[] };
+	private visualMapCache?: { layoutWidth: number; lineRows: Array<{ text: string; rows: VisualRow[] }>; map: VisualRow[] } | undefined;
 	private rowRenderCache = new Map<string, string>();
-	private renderCache?: { signature: string; linesRef: string[]; rows: string[] };
+	private renderCache?: { signature: string; linesRef: string[]; rows: string[] } | undefined;
 
 	constructor(
 		tui: TUI,
@@ -567,7 +567,7 @@ export class RailEditor extends MouseSelectableRailEditor {
 		};
 	}
 
-	protected handleMouseWheel(wheel: ParsedWheel): boolean {
+	protected override handleMouseWheel(wheel: ParsedWheel): boolean {
 		if (!EDITOR_MOUSE_TRACKING_ENABLED && !CONVERSATION_SCROLL_LAYOUT.enabled) return false;
 		this.editorManualScroll = true;
 		this.editorScrollOffset = Math.max(
@@ -578,19 +578,19 @@ export class RailEditor extends MouseSelectableRailEditor {
 		return true;
 	}
 
-	setText(text: string): void {
+	override setText(text: string): void {
 		this.visualMapCache = undefined;
 		this.rowRenderCache.clear();
 		this.renderCache = undefined;
 		super.setText(text);
 	}
 
-	insertTextAtCursor(text: string): void {
+	override insertTextAtCursor(text: string): void {
 		this.renderCache = undefined;
 		super.insertTextAtCursor(text);
 	}
 
-	handleInput(data: string): void {
+	override handleInput(data: string): void {
 		const isEscapeSequence = data.charCodeAt(0) === 0x1b;
 		const isMouseOrCursor = isEscapeSequence && Boolean(parseWheel(data) || parseMouse(data) || parseCursorPosition(data));
 		if (!isMouseOrCursor) {
@@ -690,7 +690,7 @@ export class RailEditor extends MouseSelectableRailEditor {
 		].join("\u001f");
 	}
 
-	render(width: number): string[] {
+	override render(width: number): string[] {
 		if (width < this.surface.minRenderableWidth()) {
 			this.hideSlashOverlay();
 			return super.render(width);

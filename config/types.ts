@@ -165,8 +165,8 @@ export type EditorHeightPolicy = {
 export type EditorSurfaceStyle = RailSurfaceStyle & EditorHeightPolicy;
 
 export type TextColorTarget = {
-	themeKey?: string;
-	ansi?: string;
+	themeKey?: string | undefined;
+	ansi?: string | undefined;
 };
 
 export type UserMessageLayout = {
@@ -215,7 +215,7 @@ export type RailSectionLayoutConfig = {
 	verticalSpacingRows: number;
 	spacing: RailSectionSpacingConfig;
 	contentStartCol: number;
-	alignWith?: string;
+	alignWith?: string | undefined;
 };
 
 export type RailSectionResolvedConfig = {
@@ -223,10 +223,10 @@ export type RailSectionResolvedConfig = {
 	selectable: boolean;
 	collapsible: boolean;
 	clickToToggle: boolean;
-	autoCollapseAfterRows?: number;
+	autoCollapseAfterRows?: number | undefined;
 	preserveScrollOnToggle: boolean;
 	preserveScrollOnUpdate: boolean;
-	collapseByDefault?: string[];
+	collapseByDefault?: string[] | undefined;
 	collapsedRenderMode: RailSectionCollapsedRenderMode;
 	layout: RailSectionLayoutConfig;
 	style: RailSectionStyleConfig;

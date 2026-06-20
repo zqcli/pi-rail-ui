@@ -17,7 +17,7 @@ type SelectorFactory = (done: () => void) => { component: Component; focus: any 
 type SelectorOverlayPatchStore = {
 	targets: PrototypePatchTarget[];
 	handles: Set<OverlayHandle>;
-	theme?: ThemeLike;
+	theme?: ThemeLike | undefined;
 	surface: EditorSurfaceRenderer;
 };
 

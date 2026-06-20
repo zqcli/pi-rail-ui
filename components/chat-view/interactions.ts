@@ -402,7 +402,7 @@ function animateOffsetFromBottom(
 	state: ScrollState,
 	store: ConversationScrollStore,
 	offset: number,
-	options: { targetStart?: number; lockAtEnd?: boolean } = {},
+	options: { targetStart?: number | undefined; lockAtEnd?: boolean | undefined } = {},
 ): boolean {
 	const view = state.view;
 	if (!view) return false;

@@ -37,6 +37,22 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地 TUI 界面扩展。它把�
 
 Pi 会自动发现并加载该目录扩展。
 
+## 测试
+
+测试用例统一放在 `tests/` 下，使用 Node 内置 `node:test`，并通过 `tsx` 加载 TypeScript。
+
+```bash
+npm run typecheck
+npm test
+npm run check
+```
+
+Viewport composition 的 micro-benchmark 不放进单元测试套件，可单独运行：
+
+```bash
+npm run bench:viewport
+```
+
 ## 命令
 
 Pi Rail UI 注册了以下 slash 命令：

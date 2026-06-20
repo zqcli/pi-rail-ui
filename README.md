@@ -37,6 +37,23 @@ After editing or installing it, reload Pi with:
 
 Pi should discover this directory extension automatically.
 
+## Testing
+
+The test suite is centralized under `tests/` and uses Node's built-in `node:test`
+runner with TypeScript loaded through `tsx`.
+
+```bash
+npm run typecheck
+npm test
+npm run check
+```
+
+The viewport composition micro-benchmark is kept out of the unit test suite:
+
+```bash
+npm run bench:viewport
+```
+
 ## Commands
 
 Pi Rail UI registers the following slash commands:

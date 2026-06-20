@@ -98,6 +98,17 @@ type RailSectionConfigFallback = Partial<Omit<RailSectionResolvedConfig, "layout
 	selection?: Partial<RailSectionSelectionConfig>;
 };
 
+const DEFAULT_RAIL_SECTION_SELECTION: RailSectionSelectionConfig = {
+	mode: "contentOnly",
+	stripAnsi: true,
+	trimRight: true,
+	includeRail: false,
+	includeGap: false,
+	includeLeadingBlankRows: false,
+	includeTrailingBlankRows: false,
+	includeTimestamp: false,
+};
+
 function sectionRailColor(rail: RailSectionRawStyle["rail"] | undefined, fallback: ColorReference) {
 	return resolveTextColor(rail === undefined || rail === false ? fallback : rail, { editorRail });
 }
@@ -131,26 +142,16 @@ function resolveRailSectionConfig(kind: RailSectionKind, fallback: RailSectionCo
 		alignWith: layout.alignWith ?? fallbackLayout.alignWith,
 	};
 
-	const defaultSelection: RailSectionSelectionConfig = {
-		mode: "contentOnly",
-		stripAnsi: true,
-		trimRight: true,
-		includeRail: false,
-		includeGap: false,
-		includeLeadingBlankRows: false,
-		includeTrailingBlankRows: false,
-		includeTimestamp: false,
-	};
-	const fallbackSelection = fallback.selection ?? defaultSelection;
+	const fallbackSelection = fallback.selection ?? DEFAULT_RAIL_SECTION_SELECTION;
 	const resolvedSelection: RailSectionSelectionConfig = {
-		mode: sectionSelection.mode ?? fallbackSelection.mode ?? defaultSelection.mode,
-		stripAnsi: sectionSelection.stripAnsi ?? fallbackSelection.stripAnsi ?? defaultSelection.stripAnsi,
-		trimRight: sectionSelection.trimRight ?? fallbackSelection.trimRight ?? defaultSelection.trimRight,
-		includeRail: sectionSelection.includeRail ?? fallbackSelection.includeRail ?? defaultSelection.includeRail,
-		includeGap: sectionSelection.includeGap ?? fallbackSelection.includeGap ?? defaultSelection.includeGap,
-		includeLeadingBlankRows: sectionSelection.includeLeadingBlankRows ?? fallbackSelection.includeLeadingBlankRows ?? defaultSelection.includeLeadingBlankRows,
-		includeTrailingBlankRows: sectionSelection.includeTrailingBlankRows ?? fallbackSelection.includeTrailingBlankRows ?? defaultSelection.includeTrailingBlankRows,
-		includeTimestamp: sectionSelection.includeTimestamp ?? fallbackSelection.includeTimestamp ?? defaultSelection.includeTimestamp,
+		mode: sectionSelection.mode ?? fallbackSelection.mode ?? DEFAULT_RAIL_SECTION_SELECTION.mode,
+		stripAnsi: sectionSelection.stripAnsi ?? fallbackSelection.stripAnsi ?? DEFAULT_RAIL_SECTION_SELECTION.stripAnsi,
+		trimRight: sectionSelection.trimRight ?? fallbackSelection.trimRight ?? DEFAULT_RAIL_SECTION_SELECTION.trimRight,
+		includeRail: sectionSelection.includeRail ?? fallbackSelection.includeRail ?? DEFAULT_RAIL_SECTION_SELECTION.includeRail,
+		includeGap: sectionSelection.includeGap ?? fallbackSelection.includeGap ?? DEFAULT_RAIL_SECTION_SELECTION.includeGap,
+		includeLeadingBlankRows: sectionSelection.includeLeadingBlankRows ?? fallbackSelection.includeLeadingBlankRows ?? DEFAULT_RAIL_SECTION_SELECTION.includeLeadingBlankRows,
+		includeTrailingBlankRows: sectionSelection.includeTrailingBlankRows ?? fallbackSelection.includeTrailingBlankRows ?? DEFAULT_RAIL_SECTION_SELECTION.includeTrailingBlankRows,
+		includeTimestamp: sectionSelection.includeTimestamp ?? fallbackSelection.includeTimestamp ?? DEFAULT_RAIL_SECTION_SELECTION.includeTimestamp,
 	};
 
 	const fallbackStyle = fallback.style;
@@ -304,33 +305,21 @@ const surfaceContentStart = style.surfaceLayout.leftBorderWidth + style.surfaceL
 const outerContentStart = 0;
 const bashContentStart = style.surfaceLayout.leftBorderWidth
 	+ Math.max(0, Math.round(bashExecutionSectionLayout?.borderContentGapWidth ?? style.bashExecution?.borderContentGapWidth ?? style.surfaceLayout.borderContentGapWidth));
-const contentOnlySelection: RailSectionSelectionConfig = {
-	mode: "contentOnly",
-	stripAnsi: true,
-	trimRight: true,
-	includeRail: false,
-	includeGap: false,
-	includeLeadingBlankRows: false,
-	includeTrailingBlankRows: false,
-	includeTimestamp: false,
+const RAIL_SECTION_FALLBACKS: Record<RailSectionKind, RailSectionConfigFallback> = {
+	assistantMessage: { selectable: true, layout: { contentStartCol: surfaceContentStart }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	assistantThinking: { selectable: true, layout: { contentStartCol: surfaceContentStart }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	assistantReply: { selectable: true, layout: { contentStartCol: surfaceContentStart, alignWith: "assistantThinking" }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	userMessage: { selectable: true, layout: { contentStartCol: surfaceContentStart + Math.max(0, style.userMessage.textGapWidth), spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	toolExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	bashExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: bashContentStart, spacing: { beforeRows: BASH_EXECUTION_LAYOUT.verticalSpacingRows, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	commandOutput: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	resourceStatus: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	selectorOutput: { selectable: false, layout: { contentStartCol: surfaceContentStart }, selection: DEFAULT_RAIL_SECTION_SELECTION },
+	custom: { selectable: true, layout: { contentStartCol: outerContentStart }, selection: DEFAULT_RAIL_SECTION_SELECTION },
 };
 
 export const RAIL_SECTION_CONFIGS: Record<RailSectionKind, RailSectionResolvedConfig> = Object.fromEntries(
-	RAIL_SECTION_KINDS.map((kind) => {
-		const fallbackByKind: Partial<Record<RailSectionKind, RailSectionConfigFallback>> = {
-			assistantMessage: { selectable: true, layout: { contentStartCol: surfaceContentStart }, selection: contentOnlySelection },
-			assistantThinking: { selectable: true, layout: { contentStartCol: surfaceContentStart }, selection: contentOnlySelection },
-			assistantReply: { selectable: true, layout: { contentStartCol: surfaceContentStart, alignWith: "assistantThinking" }, selection: contentOnlySelection },
-			userMessage: { selectable: true, layout: { contentStartCol: surfaceContentStart + Math.max(0, style.userMessage.textGapWidth), spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: contentOnlySelection },
-			toolExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: contentOnlySelection },
-			bashExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: bashContentStart, spacing: { beforeRows: BASH_EXECUTION_LAYOUT.verticalSpacingRows, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: contentOnlySelection },
-			commandOutput: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: contentOnlySelection },
-			resourceStatus: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: contentOnlySelection },
-			selectorOutput: { selectable: false, layout: { contentStartCol: surfaceContentStart }, selection: contentOnlySelection },
-			custom: { selectable: true, layout: { contentStartCol: outerContentStart }, selection: contentOnlySelection },
-		};
-		return [kind, resolveRailSectionConfig(kind, fallbackByKind[kind])];
-	}),
+	RAIL_SECTION_KINDS.map((kind) => [kind, resolveRailSectionConfig(kind, RAIL_SECTION_FALLBACKS[kind])]),
 ) as Record<RailSectionKind, RailSectionResolvedConfig>;
 
 export function railSectionConfig(kind: RailSectionKind): RailSectionResolvedConfig {

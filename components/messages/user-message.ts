@@ -16,7 +16,6 @@ type UserMessageConstructor = {
 
 type UserMessageRailPatchStore = {
 	active: boolean;
-	installed: boolean;
 	targets: PrototypePatchTarget[];
 	surface: EditorSurfaceRenderer;
 	theme?: Theme | undefined;
@@ -30,7 +29,6 @@ const USER_MESSAGE_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.user-message-render
 
 const getUserMessageRailPatchStore = createStore<UserMessageRailPatchStore>("user-message-rail-patch", () => ({
 	active: false,
-	installed: false,
 	targets: [],
 	surface: railUserMessageSurface,
 	timestampsByText: new Map<string, number[]>(),
@@ -206,7 +204,6 @@ export async function installUserMessageRail(ctx: ExtensionContext): Promise<voi
 		store.targets.push({ ctor, methodName: "render", original });
 	}
 
-	store.installed = store.targets.length > 0;
 }
 
 export function uninstallUserMessageRail(): void {
@@ -217,6 +214,5 @@ export function uninstallUserMessageRail(): void {
 	store.timestampCursorByText.clear();
 	store.assignedTimestamps = new WeakMap<object, number>();
 	store.fallbackTimestamps = new WeakMap<object, number>();
-	restorePrototypePatches(store.targets, "render");
-	store.installed = false;
+	restorePrototypePatches(store.targets);
 }

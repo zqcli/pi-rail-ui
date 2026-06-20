@@ -18,13 +18,21 @@ export async function resolveNativePiExport<T>(relativeModule: string, exportNam
 	}
 }
 
-export function restorePrototypePatches(targets: PrototypePatchTarget[], defaultMethodName?: string): void {
+export function restorePrototypePatches(targets: PrototypePatchTarget[]): void {
 	for (const target of targets) {
-		const methodName = target.methodName ?? defaultMethodName;
-		if (!methodName) continue;
-		target.ctor.prototype[methodName] = target.original;
+		target.ctor.prototype[target.methodName] = target.original;
 	}
 	targets.length = 0;
+}
+
+export async function resolveNativeTuiExport<T>(exportName: string): Promise<T | undefined> {
+	try {
+		const packageUrl = import.meta.resolve("@earendil-works/pi-tui");
+		const nativeModule = (await import(packageUrl)) as Record<string, T | undefined>;
+		return nativeModule[exportName];
+	} catch {
+		return undefined;
+	}
 }
 
 export function createStore<T extends object>(key: string, defaults: () => T): () => T {

@@ -114,8 +114,7 @@ export function collapsedSimpleRows(
 function estimatedExpandedRows(component: any, kind: ExecutionKind): number | undefined {
 	if (kind === "bashExecution") {
 		const commandRows = lineCount(typeof component.command === "string" ? `$ ${component.command}` : component.getCommand?.());
-		const statusRows = component.status === "running" ? 1 : 1;
-		return Math.max(1, commandRows) + bashOutputLines(component).length + statusRows;
+		return Math.max(1, commandRows) + bashOutputLines(component).length + 1;
 	}
 
 	if (component?.hasRendererDefinition?.() === true) return undefined;

@@ -362,10 +362,6 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 	return [fitAligned(left, right, width)];
 }
 
-function renderFooterRows(width: number, state: FooterLiveState, stats: FooterUsageStats, style: FooterStyle): string[] {
-	return renderSimpleFooter(width, state, stats, style);
-}
-
 type RailSessionSnapshot = {
 	state: FooterLiveState;
 	session: RailSessionStats;
@@ -580,7 +576,7 @@ export function renderFooter(
 	stats: FooterUsageStats = collectFooterUsageStats(ctx),
 	style: FooterStyle = RAIL_FOOTER_STYLE,
 ): string[] {
-	return renderFooterRows(width, collectFooterLiveState(ctx, pi, footerData), stats, style);
+	return renderSimpleFooter(width, collectFooterLiveState(ctx, pi, footerData), stats, style);
 }
 
 class RailFooterComponent {
@@ -621,7 +617,7 @@ class RailFooterComponent {
 
 	render(width: number): string[] {
 		const state = collectFooterLiveState(this.ctx, this.pi, this.footerData);
-		return renderFooterRows(width, state, this.usageStats(), RAIL_FOOTER_STYLE);
+		return renderSimpleFooter(width, state, this.usageStats(), RAIL_FOOTER_STYLE);
 	}
 
 }

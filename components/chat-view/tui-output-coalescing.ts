@@ -1,5 +1,5 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { createStore, restorePrototypePatches, type PrototypePatchTarget } from "../../core/patching";
+import { createStore, resolveNativeTuiExport, restorePrototypePatches, type PrototypePatchTarget } from "../../core/patching";
 
 const BEGIN_SYNCHRONIZED_OUTPUT = "\x1b[?2026h";
 const END_SYNCHRONIZED_OUTPUT = "\x1b[?2026l";
@@ -17,16 +17,6 @@ const getTerminalOutputCoalescingStore = createStore<TerminalOutputCoalescingSto
 	"terminal-output-coalescing",
 	() => ({ targets: [] }),
 );
-
-async function resolveNativeTuiExport<T>(exportName: string): Promise<T | undefined> {
-	try {
-		const packageUrl = import.meta.resolve("@earendil-works/pi-tui");
-		const nativeModule = (await import(packageUrl)) as Record<string, T | undefined>;
-		return nativeModule[exportName];
-	} catch {
-		return undefined;
-	}
-}
 
 export function coalesceTerminalOutputChunks(chunks: string[]): string {
 	if (chunks.length === 0) return "";

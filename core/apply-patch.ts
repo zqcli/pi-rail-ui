@@ -327,11 +327,11 @@ export function applyPatchHunks(content: string, hunks: readonly PatchHunk[], fi
 			.filter((line) => line.kind !== "remove")
 			.map((line) => line.text);
 
-		const anchor = hunk.header
-			? findLineContaining(lines, hunk.header, cursor) !== -1
-				? findLineContaining(lines, hunk.header, cursor)
-				: findLineContaining(lines, hunk.header, 0)
-			: -1;
+		let anchor = -1;
+		if (hunk.header) {
+			anchor = findLineContaining(lines, hunk.header, cursor);
+			if (anchor === -1) anchor = findLineContaining(lines, hunk.header, 0);
+		}
 
 		if (oldLines.length === 0 && newLines.length === 0) {
 			if (hunk.header && anchor === -1) throw contextError(file, `Could not find hunk header "${hunk.header}"`);

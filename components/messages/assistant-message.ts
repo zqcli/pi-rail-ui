@@ -45,7 +45,6 @@ type InteractiveModeConstructor = {
 
 type AssistantMessageRailPatchStore = {
 	active: boolean;
-	installed: boolean;
 	targets: PrototypePatchTarget[];
 	theme?: Theme | undefined;
 	surface: EditorSurfaceRenderer;
@@ -58,7 +57,6 @@ const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache
 
 const getAssistantMessageRailPatchStore = createStore<AssistantMessageRailPatchStore>("assistant-message-rail-patch", () => ({
 	active: false,
-	installed: false,
 	targets: [],
 	surface: railThinkingSurface,
 }));
@@ -337,7 +335,6 @@ export async function installAssistantMessageRail(theme: Theme): Promise<void> {
 
 	for (const ctor of await getInteractiveModeConstructors()) patchGlobalRailSectionExpansion(ctor, store);
 
-	store.installed = store.targets.length > 0;
 }
 
 export function uninstallAssistantMessageRail(): void {
@@ -345,5 +342,4 @@ export function uninstallAssistantMessageRail(): void {
 	store.active = false;
 	store.theme = undefined;
 	restorePrototypePatches(store.targets);
-	store.installed = false;
 }

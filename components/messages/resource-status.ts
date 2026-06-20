@@ -100,33 +100,38 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRa
 
 	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showLoadedResources")) {
 		const original = ctor.prototype.showLoadedResources;
-		ctor.prototype.showLoadedResources = function patchedShowLoadedResources(this: any, options: any) {
-			const currentStore = getResourceStatusRailPatchStore();
-			if (!currentStore.active || typeof original !== "function") return original?.call(this, options);
-			return withGappedResourceChildren(this, () => original.call(this, options));
-		};
-		store.targets.push({ ctor, methodName: "showLoadedResources", original });
+		if (typeof original === "function") {
+			ctor.prototype.showLoadedResources = function patchedShowLoadedResources(this: any, options: any) {
+				const currentStore = getResourceStatusRailPatchStore();
+				if (!currentStore.active) return original.call(this, options);
+				return withGappedResourceChildren(this, () => original.call(this, options));
+			};
+			store.targets.push({ ctor, methodName: "showLoadedResources", original });
+		}
 	}
 
 	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showStatus")) {
 		const original = ctor.prototype.showStatus;
-		ctor.prototype.showStatus = function patchedShowStatus(this: any, message: string) {
-			const currentStore = getResourceStatusRailPatchStore();
-			if (!currentStore.active || typeof original !== "function") return original?.call(this, message);
+		if (typeof original === "function") {
+			ctor.prototype.showStatus = function patchedShowStatus(this: any, message: string) {
+				const currentStore = getResourceStatusRailPatchStore();
+				if (!currentStore.active) return original.call(this, message);
 
-			const result = original.call(this, message);
-			wrapLastStatusLine(this);
-			return result;
-		};
-		store.targets.push({ ctor, methodName: "showStatus", original });
+				const result = original.call(this, message);
+				wrapLastStatusLine(this);
+				return result;
+			};
+			store.targets.push({ ctor, methodName: "showStatus", original });
+		}
 	}
 
 	for (const methodName of ["showError", "showWarning"] as const) {
 		if (store.targets.some((target) => target.ctor === ctor && target.methodName === methodName)) continue;
 		const original = ctor.prototype[methodName];
+		if (typeof original !== "function") continue;
 		ctor.prototype[methodName] = function patchedCommandStatusOutput(this: any, message: string) {
 			const currentStore = getResourceStatusRailPatchStore();
-			if (!currentStore.active || typeof original !== "function") return original?.call(this, message);
+			if (!currentStore.active) return original.call(this, message);
 
 			const result = original.call(this, message);
 			wrapLastCommandOutputChild(this);

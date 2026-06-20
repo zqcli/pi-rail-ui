@@ -12,11 +12,14 @@ import { ensureConversationAlternateScreen, installConversationScroll, installTe
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
+import { installApplyPatchTool } from "./tools";
 
 export * from "./config";
 export * from "./core/patching";
+export * from "./core/apply-patch";
 export * from "./core/utils";
 export * from "./rail";
+export * from "./tools";
 export * from "./components/editor";
 export * from "./components/footer";
 export * from "./components/messages";
@@ -27,6 +30,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	let enabled = true;
 	let mouseEnabled = false;
 
+	installApplyPatchTool(pi);
 	await installTerminalOutputCoalescing();
 	await installConversationScroll();
 	if (!CONVERSATION_SCROLL_LAYOUT.enabled || !CONVERSATION_SCROLL_LAYOUT.alternateScreen) releaseConversationAlternateScreen();

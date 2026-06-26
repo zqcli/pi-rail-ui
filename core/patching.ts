@@ -25,6 +25,20 @@ export function restorePrototypePatches(targets: PrototypePatchTarget[]): void {
 	targets.length = 0;
 }
 
+export function patchPrototypeMethod(
+	targets: PrototypePatchTarget[],
+	ctor: { prototype: any } | undefined,
+	methodName: string,
+	patch: (original: (...args: any[]) => any) => (...args: any[]) => any,
+): boolean {
+	if (!ctor?.prototype || targets.some((target) => target.ctor === ctor && target.methodName === methodName)) return false;
+	const original = ctor.prototype[methodName];
+	if (typeof original !== "function") return false;
+	ctor.prototype[methodName] = patch(original);
+	targets.push({ ctor, methodName, original });
+	return true;
+}
+
 export async function resolveNativeTuiExport<T>(exportName: string): Promise<T | undefined> {
 	try {
 		const packageUrl = import.meta.resolve("@earendil-works/pi-tui");

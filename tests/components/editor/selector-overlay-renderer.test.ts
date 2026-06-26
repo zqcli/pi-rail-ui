@@ -125,4 +125,77 @@ describe("selector overlay renderer", () => {
 		assert.equal(requested, true);
 		assert.equal(currentStore.handles.size, 0);
 	});
+
+	test("keeps selector overlay rows live after model selector loads items", () => {
+		let capturedPanel: any;
+		const renderable = {
+			scope: "all",
+			searchInput: { getText: () => "", render: () => ["> "] },
+			filteredModels: [] as any[],
+			selectedIndex: 0,
+			filterModels() {},
+		};
+		const instance = {
+			editor: { render: () => ["editor"], hideSlashOverlay() {} },
+			editorContainer: { children: [], clear() {}, addChild() {} },
+			ui: {
+				terminal: { columns: 80, rows: 24 },
+				setFocus() {},
+				requestRender() {},
+				showOverlay(panel: any, options: any) {
+					capturedPanel = { panel, options };
+					return { hide() {} };
+				},
+			},
+		};
+
+		showSelectorOverlay(instance, () => ({ component: renderable as any, focus: renderable }), store());
+
+		renderable.filteredModels = [
+			{ id: "gpt-5", provider: "openai", model: { id: "gpt-5", provider: "openai", name: "GPT 5" } },
+		];
+		const text = stripAnsi(capturedPanel.panel.render(72).join("\n"));
+
+		assert.match(text, /gpt-5/);
+		assert.match(text, /GPT 5/);
+		assert.doesNotMatch(text, /No matching models/);
+	});
+
+	test("keeps selector overlay rows live as scoped model selection moves", () => {
+		let capturedPanel: any;
+		const renderable = {
+			searchInput: { getText: () => "", render: () => ["> "] },
+			modelsById: new Map([
+				["openai/alpha", { id: "alpha", provider: "openai", name: "Alpha" }],
+				["openai/beta", { id: "beta", provider: "openai", name: "Beta" }],
+			]),
+			filteredItems: [
+				{ fullId: "openai/alpha", model: { id: "alpha", provider: "openai", name: "Alpha" }, enabled: true },
+				{ fullId: "openai/beta", model: { id: "beta", provider: "openai", name: "Beta" }, enabled: true },
+			],
+			selectedIndex: 0,
+			maxVisible: 8,
+			enabledIds: null,
+			getFooterText: () => "footer",
+		};
+		const instance = {
+			editor: { render: () => ["editor"], hideSlashOverlay() {} },
+			editorContainer: { children: [], clear() {}, addChild() {} },
+			ui: {
+				terminal: { columns: 80, rows: 24 },
+				setFocus() {},
+				requestRender() {},
+				showOverlay(panel: any, options: any) {
+					capturedPanel = { panel, options };
+					return { hide() {} };
+				},
+			},
+		};
+
+		showSelectorOverlay(instance, () => ({ component: renderable as any, focus: renderable }), store());
+		assert.match(stripAnsi(capturedPanel.panel.render(72).join("\n")), /Model Name: Alpha/);
+
+		renderable.selectedIndex = 1;
+		assert.match(stripAnsi(capturedPanel.panel.render(72).join("\n")), /Model Name: Beta/);
+	});
 });

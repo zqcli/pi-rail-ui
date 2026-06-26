@@ -39,7 +39,8 @@ export function renderSelectorSurface(
 }
 
 function selectorBodyRenderer(component: any, store: SelectorOverlayRenderStore): RailOverlayBodyRenderer | undefined {
-	return selectorOverlayPresentationFor(component, store.theme)?.renderBody;
+	if (!selectorOverlayPresentationFor(component, store.theme)) return undefined;
+	return (contentWidth) => selectorOverlayPresentationFor(component, store.theme)?.renderBody(contentWidth) ?? [];
 }
 
 function renderedEditorRows(instance: any, width: number): number {

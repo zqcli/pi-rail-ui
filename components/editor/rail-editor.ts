@@ -193,6 +193,7 @@ export class RailEditor extends MouseSelectableRailEditor {
 	private slashOverlaySignature?: string | undefined;
 	private readonly slashOverlaySurface: EditorSurfaceRenderer;
 	private readonly selectListTheme: EditorTheme["selectList"];
+	private readonly keybindingManager: KeybindingsManager;
 	private readonly frameRenderer = new RailEditorFrameRenderer();
 
 	constructor(
@@ -204,6 +205,7 @@ export class RailEditor extends MouseSelectableRailEditor {
 	) {
 		const themedEditorTheme = selectListThemeForRailSlashMenu(theme, appTheme);
 		super(tui, themedEditorTheme, keybindings);
+		this.keybindingManager = keybindings;
 		this.selectListTheme = themedEditorTheme.selectList;
 		this.slashOverlaySurface = selectorOutputSurfaceForTheme(appTheme);
 		(this as any).createAutocompleteList = (prefix: string, items: any[]) => this.createRailAutocompleteList(prefix, items);
@@ -269,12 +271,43 @@ export class RailEditor extends MouseSelectableRailEditor {
 		super.insertTextAtCursor(text);
 	}
 
+	private completeSkillCommandWithoutSubmit(data: string): boolean {
+		if (!this.keybindingManager.matches(data, "tui.select.confirm")) return false;
+
+		const editor = this as any;
+		const prefix = editor.autocompletePrefix;
+		const selected = editor.autocompleteList?.getSelectedItem?.();
+		if (!editor.autocompleteState || !editor.autocompleteProvider || typeof prefix !== "string" || !prefix.startsWith("/")) {
+			return false;
+		}
+		if (!selected || typeof selected.value !== "string" || !selected.value.startsWith("skill:")) return false;
+
+		editor.pushUndoSnapshot?.();
+		editor.lastAction = null;
+		const result = editor.autocompleteProvider.applyCompletion(
+			editor.state.lines,
+			editor.state.cursorLine,
+			editor.state.cursorCol,
+			selected,
+			prefix,
+		);
+		editor.state.lines = result.lines;
+		editor.state.cursorLine = result.cursorLine;
+		if (typeof editor.setCursorCol === "function") editor.setCursorCol(result.cursorCol);
+		else editor.state.cursorCol = result.cursorCol;
+		editor.cancelAutocomplete?.();
+		editor.onChange?.(this.getText());
+		this.tui.requestRender();
+		return true;
+	}
+
 	override handleInput(data: string): void {
 		const isEscapeSequence = data.charCodeAt(0) === 0x1b;
 		const isMouseOrCursor = isEscapeSequence && Boolean(parseWheel(data) || parseMouse(data) || parseCursorPosition(data));
 		if (!isMouseOrCursor) {
 			this.frameRenderer.markTextInput();
 		}
+		if (this.completeSkillCommandWithoutSubmit(data)) return;
 		super.handleInput(data);
 	}
 

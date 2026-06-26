@@ -1,5 +1,5 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { createStore, resolveNativeTuiExport, restorePrototypePatches, type PrototypePatchTarget } from "../../core/patching";
+import { createPatchLifecycle, resolveNativeTuiExport } from "../../core/patching";
 
 const BEGIN_SYNCHRONIZED_OUTPUT = "\x1b[?2026h";
 const END_SYNCHRONIZED_OUTPUT = "\x1b[?2026l";
@@ -9,14 +9,7 @@ const CAPTURE_ACTIVE = Symbol.for("pi-rail-ui.tui-output-coalescing.active");
 
 type TuiCtor = { prototype: any };
 
-type TerminalOutputCoalescingStore = {
-	targets: PrototypePatchTarget[];
-};
-
-const getTerminalOutputCoalescingStore = createStore<TerminalOutputCoalescingStore>(
-	"terminal-output-coalescing",
-	() => ({ targets: [] }),
-);
+const terminalOutputCoalescingLifecycle = createPatchLifecycle("terminal-output-coalescing", () => ({}));
 
 export function coalesceTerminalOutputChunks(chunks: string[]): string {
 	if (chunks.length === 0) return "";
@@ -74,24 +67,20 @@ export function withCoalescedTerminalOutput<T>(tui: any, render: () => T): T {
 	return result;
 }
 
-function patchTuiOutputCoalescing(ctor: TuiCtor | undefined, store: TerminalOutputCoalescingStore): void {
+function patchTuiOutputCoalescing(ctor: TuiCtor | undefined): void {
 	if (!ctor?.prototype || typeof ctor.prototype.doRender !== "function") return;
-	if (store.targets.some((target) => target.ctor === ctor && target.methodName === "doRender")) return;
 
-	const originalDoRender = ctor.prototype.doRender;
-	ctor.prototype.doRender = function patchedRailUiDoRender(this: any, ...args: any[]) {
+	terminalOutputCoalescingLifecycle.patchMethod(ctor, "doRender", (originalDoRender) => function patchedRailUiDoRender(this: any, ...args: any[]) {
 		return withCoalescedTerminalOutput(this, () => originalDoRender.apply(this, args));
-	};
-	store.targets.push({ ctor, methodName: "doRender", original: originalDoRender });
+	});
 }
 
 export async function installTerminalOutputCoalescing(): Promise<void> {
-	const store = getTerminalOutputCoalescingStore();
-	patchTuiOutputCoalescing(TUI as unknown as TuiCtor, store);
-	patchTuiOutputCoalescing(await resolveNativeTuiExport<TuiCtor>("TUI"), store);
+	terminalOutputCoalescingLifecycle.activate();
+	patchTuiOutputCoalescing(TUI as unknown as TuiCtor);
+	patchTuiOutputCoalescing(await resolveNativeTuiExport<TuiCtor>("TUI"));
 }
 
 export function uninstallTerminalOutputCoalescing(): void {
-	const store = getTerminalOutputCoalescingStore();
-	restorePrototypePatches(store.targets);
+	terminalOutputCoalescingLifecycle.deactivate();
 }

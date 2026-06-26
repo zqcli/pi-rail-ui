@@ -1,7 +1,7 @@
 import { UserMessageComponent, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { USER_MESSAGE_LAYOUT, applyTextColor } from "../../config";
-import { createStore, resolveNativePiExport, restorePrototypePatches, type PrototypePatchTarget } from "../../core/patching";
+import { createPatchLifecycle, resolveNativePiExport } from "../../core/patching";
 import { cachedRender } from "../../rail/render-cache";
 import { EditorSurfaceRenderer, railUserMessageSurface } from "../../rail/rail-surface";
 import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, padToWidth } from "../../core/utils";
@@ -16,8 +16,6 @@ type UserMessageConstructor = {
 };
 
 type UserMessageRailPatchStore = {
-	active: boolean;
-	targets: PrototypePatchTarget[];
 	surface: EditorSurfaceRenderer;
 	theme?: Theme | undefined;
 	timestamps: UserMessageTimestampRegistry;
@@ -25,12 +23,11 @@ type UserMessageRailPatchStore = {
 
 const USER_MESSAGE_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.user-message-render-cache");
 
-const getUserMessageRailPatchStore = createStore<UserMessageRailPatchStore>("user-message-rail-patch", () => ({
-	active: false,
-	targets: [],
+const userMessageLifecycle = createPatchLifecycle<UserMessageRailPatchStore>("user-message-rail-patch", () => ({
 	surface: railUserMessageSurface,
 	timestamps: new UserMessageTimestampRegistry(),
 }));
+const getUserMessageRailPatchStore = () => userMessageLifecycle.state();
 
 export function rememberUserMessageTimestamp(message: any, entry?: any): void {
 	getUserMessageRailPatchStore().timestamps.remember(message, entry);
@@ -98,17 +95,14 @@ function renderUserMessageWithSurface(
 }
 
 export async function installUserMessageRail(ctx: ExtensionContext): Promise<void> {
-	const store = getUserMessageRailPatchStore();
-	store.surface = railUserMessageSurface;
-	store.theme = ctx.ui.theme;
+	userMessageLifecycle.activate((store) => {
+		store.surface = railUserMessageSurface;
+		store.theme = ctx.ui.theme;
+	});
 	refreshUserMessageTimestamps(ctx);
-	store.active = true;
 
 	for (const ctor of await getUserMessageConstructors()) {
-		if (store.targets.some((target) => target.ctor === ctor)) continue;
-
-		const original = ctor.prototype.render;
-		ctor.prototype.render = function patchedUserMessageRender(this: UserMessageWithInternals, width: number) {
+		userMessageLifecycle.patchMethod(ctor, "render", (original) => function patchedUserMessageRender(this: UserMessageWithInternals, width: number) {
 			const currentStore = getUserMessageRailPatchStore();
 			if (!currentStore.active) return original.call(this, width);
 			try {
@@ -116,16 +110,14 @@ export async function installUserMessageRail(ctx: ExtensionContext): Promise<voi
 			} catch {
 				return original.call(this, width);
 			}
-		};
-		store.targets.push({ ctor, methodName: "render", original });
+		});
 	}
 
 }
 
 export function uninstallUserMessageRail(): void {
-	const store = getUserMessageRailPatchStore();
-	store.active = false;
-	store.theme = undefined;
-	store.timestamps.clear();
-	restorePrototypePatches(store.targets);
+	userMessageLifecycle.deactivate((store) => {
+		store.theme = undefined;
+		store.timestamps.clear();
+	});
 }

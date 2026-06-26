@@ -1,17 +1,10 @@
-import { createStore, restorePrototypePatches, getInteractiveModeConstructors, patchPrototypeMethod, type PrototypePatchTarget } from "../../core/patching";
+import { createPatchLifecycle, getInteractiveModeConstructors } from "../../core/patching";
 import { withRailSectionChatChildren, wrapLastRailSectionChatChild } from "./chat-child-rail-injection";
 
 type InteractiveModeCtor = { prototype: any };
 
-type ResourceStatusRailPatchStore = {
-	active: boolean;
-	targets: PrototypePatchTarget[];
-};
-
-const getResourceStatusRailPatchStore = createStore<ResourceStatusRailPatchStore>("resource-status-rail-patch", () => ({
-	active: false,
-	targets: [],
-}));
+const resourceStatusLifecycle = createPatchLifecycle("resource-status-rail-patch", () => ({}));
+const getResourceStatusRailPatchStore = () => resourceStatusLifecycle.state();
 
 const STATUS_ORIGINAL_PADDING_X_KEY = Symbol.for("pi-rail-ui.status-original-padding-x");
 
@@ -37,10 +30,10 @@ function wrapLastCommandOutputChild(mode: any): void {
 	wrapLastRailSectionChatChild(mode, "resourceStatus", { normalizeChild: normalizeStatusPaddingForGap });
 }
 
-function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRailPatchStore): void {
+function patchInteractiveMode(ctor: InteractiveModeCtor): void {
 	if (!ctor?.prototype) return;
 
-	patchPrototypeMethod(store.targets, ctor, "showLoadedResources", (original) => function patchedShowLoadedResources(this: any, options: any) {
+	resourceStatusLifecycle.patchMethod(ctor, "showLoadedResources", (original) => function patchedShowLoadedResources(this: any, options: any) {
 		const currentStore = getResourceStatusRailPatchStore();
 		if (!currentStore.active) return original.call(this, options);
 		return withRailSectionChatChildren(this, "resourceStatus", () => original.call(this, options), {
@@ -48,7 +41,7 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRa
 		});
 	});
 
-	patchPrototypeMethod(store.targets, ctor, "showStatus", (original) => function patchedShowStatus(this: any, message: string) {
+	resourceStatusLifecycle.patchMethod(ctor, "showStatus", (original) => function patchedShowStatus(this: any, message: string) {
 		const currentStore = getResourceStatusRailPatchStore();
 		if (!currentStore.active) return original.call(this, message);
 
@@ -58,7 +51,7 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRa
 	});
 
 	for (const methodName of ["showError", "showWarning"] as const) {
-		patchPrototypeMethod(store.targets, ctor, methodName, (original) => function patchedCommandStatusOutput(this: any, message: string) {
+		resourceStatusLifecycle.patchMethod(ctor, methodName, (original) => function patchedCommandStatusOutput(this: any, message: string) {
 			const currentStore = getResourceStatusRailPatchStore();
 			if (!currentStore.active) return original.call(this, message);
 
@@ -70,13 +63,10 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRa
 }
 
 export async function installResourceStatusRail(): Promise<void> {
-	const store = getResourceStatusRailPatchStore();
-	store.active = true;
-	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor, store);
+	resourceStatusLifecycle.activate();
+	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor);
 }
 
 export function uninstallResourceStatusRail(): void {
-	const store = getResourceStatusRailPatchStore();
-	store.active = false;
-	restorePrototypePatches(store.targets);
+	resourceStatusLifecycle.deactivate();
 }

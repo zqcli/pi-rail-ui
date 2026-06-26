@@ -39,6 +39,58 @@ export function patchPrototypeMethod(
 	return true;
 }
 
+export type PatchLifecycleStore<TState extends object> = TState & {
+	active: boolean;
+	targets: PrototypePatchTarget[];
+};
+
+export class PatchLifecycle<TState extends object> {
+	private readonly getStore: () => PatchLifecycleStore<TState>;
+
+	constructor(key: string, defaults: () => TState) {
+		this.getStore = createStore<PatchLifecycleStore<TState>>(key, () => ({
+			...defaults(),
+			active: false,
+			targets: [],
+		}));
+	}
+
+	state(): PatchLifecycleStore<TState> {
+		return this.getStore();
+	}
+
+	activate(update?: (store: PatchLifecycleStore<TState>) => void): PatchLifecycleStore<TState> {
+		const store = this.state();
+		update?.(store);
+		store.active = true;
+		return store;
+	}
+
+	patchMethod(
+		ctor: { prototype: any } | undefined,
+		methodName: string,
+		patch: (original: (...args: any[]) => any) => (...args: any[]) => any,
+	): boolean {
+		return patchPrototypeMethod(this.state().targets, ctor, methodName, patch);
+	}
+
+	restore(): void {
+		restorePrototypePatches(this.state().targets);
+	}
+
+	deactivate(reset?: (store: PatchLifecycleStore<TState>) => void): PatchLifecycleStore<TState> {
+		const store = this.state();
+		store.active = false;
+		this.restore();
+		reset?.(store);
+		return store;
+	}
+}
+
+export function createPatchLifecycle<TState extends object>(key: string, defaults: () => TState): PatchLifecycle<TState> {
+	return new PatchLifecycle(key, defaults);
+}
+
 export async function resolveNativeTuiExport<T>(exportName: string): Promise<T | undefined> {
 	try {
 		const packageUrl = import.meta.resolve("@earendil-works/pi-tui");

@@ -11,8 +11,14 @@ export type ExecutionKind = "bashExecution" | "toolExecution";
 export type RenderableCtor = { prototype: { render(width: number): string[]; setExpanded?(expanded: boolean): void } };
 export type ExecutionRailPatchStore = {
 	active: boolean;
-	targets: Array<{ ctor: any; methodName: string; original: any }>;
 	theme?: ThemeLike | undefined;
+};
+export type ExecutionRailPatcher = {
+	patchMethod(
+		ctor: { prototype: any } | undefined,
+		methodName: string,
+		patch: (original: (...args: any[]) => any) => (...args: any[]) => any,
+	): boolean;
 };
 
 export const EXECUTION_RENDERED_KEY = Symbol.for("pi-rail-ui.execution-rendered");
@@ -125,13 +131,9 @@ export function collapsedExecutionRows(
 	return [...rows.slice(0, limit), renderedHint];
 }
 
-export function patchExecutionSetExpanded(ctor: RenderableCtor, store: ExecutionRailPatchStore): void {
-	if (store.targets.some((target) => target.ctor === ctor && target.methodName === "setExpanded")) return;
-	const original = ctor.prototype.setExpanded;
-	if (typeof original !== "function") return;
-	ctor.prototype.setExpanded = function patchedExecutionSetExpanded(this: any, expanded: boolean): void {
+export function patchExecutionSetExpanded(patcher: ExecutionRailPatcher, ctor: RenderableCtor): void {
+	patcher.patchMethod(ctor, "setExpanded", (original) => function patchedExecutionSetExpanded(this: any, expanded: boolean): void {
 		if (!this?.[AUTO_COLLAPSE_RENDERING_KEY] && this?.[EXECUTION_RENDERED_KEY]) markRailSectionManuallyToggled(this);
 		return original.call(this, expanded);
-	};
-	store.targets.push({ ctor, methodName: "setExpanded", original });
+	});
 }

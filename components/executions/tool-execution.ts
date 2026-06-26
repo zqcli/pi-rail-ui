@@ -1,6 +1,6 @@
 import { BashExecutionComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { ThemeLike } from "../../config";
-import { createStore, resolveNativePiExport, restorePrototypePatches } from "../../core/patching";
+import { createPatchLifecycle, resolveNativePiExport } from "../../core/patching";
 import { renderExecutionRail } from "./execution-rail";
 import {
 	EXECUTION_RENDERED_KEY,
@@ -9,10 +9,8 @@ import {
 	type RenderableCtor,
 } from "./execution-collapse";
 
-const getExecutionRailPatchStore = createStore<ExecutionRailPatchStore>("execution-rail-patch", () => ({
-	active: false,
-	targets: [],
-}));
+const executionRailLifecycle = createPatchLifecycle<Omit<ExecutionRailPatchStore, "active" | "targets">>("execution-rail-patch", () => ({}));
+const getExecutionRailPatchStore = () => executionRailLifecycle.state();
 
 async function resolveTheme(): Promise<ThemeLike | undefined> {
 	return resolveNativePiExport<ThemeLike>("./modes/interactive/theme/theme.js", "theme");
@@ -37,10 +35,8 @@ async function getExecutionConstructors(): Promise<RenderableCtor[]> {
 	return ctors;
 }
 
-function patchRender(ctor: RenderableCtor, store: ExecutionRailPatchStore): void {
-	if (store.targets.some((target) => target.ctor === ctor && target.methodName === "render")) return;
-	const original = ctor.prototype.render;
-	ctor.prototype.render = function patchedExecutionRender(this: any, width: number): string[] {
+function patchRender(ctor: RenderableCtor): void {
+	executionRailLifecycle.patchMethod(ctor, "render", (original) => function patchedExecutionRender(this: any, width: number): string[] {
 		const currentStore = getExecutionRailPatchStore();
 		if (!currentStore.active) return original.call(this, width);
 		try {
@@ -51,24 +47,21 @@ function patchRender(ctor: RenderableCtor, store: ExecutionRailPatchStore): void
 			this[EXECUTION_RENDERED_KEY] = true;
 			return original.call(this, width);
 		}
-	};
-	store.targets.push({ ctor, methodName: "render", original });
+	});
 }
 
 export async function installExecutionRails(): Promise<void> {
-	const store = getExecutionRailPatchStore();
-	store.active = true;
-	store.theme = await resolveTheme();
+	const theme = await resolveTheme();
+	executionRailLifecycle.activate((currentStore) => {
+		currentStore.theme = theme;
+	});
 
 	for (const ctor of await getExecutionConstructors()) {
-		patchExecutionSetExpanded(ctor, store);
-		patchRender(ctor, store);
+		patchExecutionSetExpanded(executionRailLifecycle, ctor);
+		patchRender(ctor);
 	}
 }
 
 export function uninstallExecutionRails(): void {
-	const store = getExecutionRailPatchStore();
-	store.active = false;
-	restorePrototypePatches(store.targets);
-	store.targets = [];
+	executionRailLifecycle.deactivate();
 }

@@ -1,16 +1,10 @@
-import { createStore, restorePrototypePatches, getInteractiveModeConstructors, patchPrototypeMethod, type PrototypePatchTarget } from "../../core/patching";
+import { createPatchLifecycle, getInteractiveModeConstructors } from "../../core/patching";
 import { withRailSectionChatChildren } from "./chat-child-rail-injection";
 
 type InteractiveModeCtor = { prototype: any };
-type CommandOutputRailPatchStore = {
-	active: boolean;
-	targets: PrototypePatchTarget[];
-};
 
-const getCommandOutputRailPatchStore = createStore<CommandOutputRailPatchStore>("command-output-rail-patch", () => ({
-	active: false,
-	targets: [],
-}));
+const commandOutputLifecycle = createPatchLifecycle("command-output-rail-patch", () => ({}));
+const getCommandOutputRailPatchStore = () => commandOutputLifecycle.state();
 
 const COMMAND_OUTPUT_METHODS = [
 	"handleNameCommand",
@@ -26,11 +20,11 @@ const COMMAND_OUTPUT_METHODS = [
 	"showPackageUpdateNotification",
 ] as const;
 
-function patchInteractiveMode(ctor: InteractiveModeCtor, store: CommandOutputRailPatchStore): void {
+function patchInteractiveMode(ctor: InteractiveModeCtor): void {
 	if (!ctor?.prototype) return;
 
 	for (const methodName of COMMAND_OUTPUT_METHODS) {
-		patchPrototypeMethod(store.targets, ctor, methodName, (original) => function patchedCommandOutputMethod(this: any, ...args: any[]) {
+		commandOutputLifecycle.patchMethod(ctor, methodName, (original) => function patchedCommandOutputMethod(this: any, ...args: any[]) {
 			const currentStore = getCommandOutputRailPatchStore();
 			if (!currentStore.active) return original.apply(this, args);
 			return withRailSectionChatChildren(this, "commandOutput", () => original.apply(this, args));
@@ -39,13 +33,10 @@ function patchInteractiveMode(ctor: InteractiveModeCtor, store: CommandOutputRai
 }
 
 export async function installCommandOutputRail(): Promise<void> {
-	const store = getCommandOutputRailPatchStore();
-	store.active = true;
-	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor, store);
+	commandOutputLifecycle.activate();
+	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor);
 }
 
 export function uninstallCommandOutputRail(): void {
-	const store = getCommandOutputRailPatchStore();
-	store.active = false;
-	restorePrototypePatches(store.targets);
+	commandOutputLifecycle.deactivate();
 }

@@ -1,15 +1,13 @@
 import { TUI } from "@earendil-works/pi-tui";
-import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT, CONVERSATION_SCROLLBAR_STYLE, FOOTER_LAYOUT, RAIL_EDITOR_STYLE } from "../../config";
+import { appLeftGutterWidth, CONVERSATION_SCROLL_LAYOUT } from "../../config";
 import { getInteractiveModeConstructors, resolveNativeTuiExport, restorePrototypePatches } from "../../core/patching";
-import { clamp } from "../../core/utils";
 import { getRenderedSections, isInteractiveRoot } from "./history-renderer";
-import { addGlobalLeftGutterToRows, composeHistoryRows } from "./viewport-compose";
-import { handleConversationInput, selectionRange } from "./interactions";
+import { handleConversationInput } from "./interactions";
+import { composeConversationViewportFrame } from "./viewport-frame";
 import {
 	getConversationScrollStore,
 	stateFor,
 	type ConversationScrollStore,
-	type ScrollbarMetrics,
 	type TuiCtor,
 } from "./state";
 
@@ -22,9 +20,6 @@ const ENABLE_ALT_SCROLL_MODE = "\x1b[?1007h";
 const DISABLE_ALT_SCROLL_MODE = "\x1b[?1007l";
 const ENTER_ALT_SCREEN = `\x1b[?1049h${ENABLE_ALT_SCROLL_MODE}${CLEAR_SCREEN_AND_SCROLLBACK}`;
 const EXIT_ALT_SCREEN = `${DISABLE_ALT_SCROLL_MODE}\x1b[?1049l`;
-const MAX_SCROLLBAR_THUMB_RATIO = 0.65;
-const MIN_SCROLLBAR_HITBOX_WIDTH = 2;
-const SCROLLBAR_THUMB_GLYPH = "█";
 
 function writeTerminalControl(sequence: string): void {
 	if (process.stdout.isTTY) process.stdout.write(sequence);
@@ -70,30 +65,6 @@ function clearViewportRenderMemory(tui: any): void {
 	resetTuiRenderMemory(tui);
 }
 
-function fixedViewportLayoutSignature(parts: {
-	leftGutterWidth: number;
-	historyRows: number;
-	pendingRows: number;
-	statusRows: number;
-	aboveRows: number;
-	editorRows: number;
-	belowRows: number;
-	footerRows: number;
-	footerBottomGapRows: number;
-}): string {
-	return [
-		parts.leftGutterWidth,
-		parts.historyRows,
-		parts.pendingRows,
-		parts.statusRows,
-		parts.aboveRows,
-		parts.editorRows,
-		parts.belowRows,
-		parts.footerRows,
-		parts.footerBottomGapRows,
-	].join("\u001f");
-}
-
 export function ensureConversationAlternateScreen(tui?: any): void {
 	if (!CONVERSATION_SCROLL_LAYOUT.enabled || !CONVERSATION_SCROLL_LAYOUT.alternateScreen) return;
 	const store = getConversationScrollStore();
@@ -110,41 +81,6 @@ export function releaseConversationAlternateScreen(): void {
 	store.alternateScreenActive = false;
 }
 
-function foregroundFromBackgroundAnsi(ansi: string): string {
-	return ansi.replace(/\x1b\[48([;:])/g, "\x1b[38$1");
-}
-
-function getScrollbarMetrics(visibleRows: number, totalRows: number, start: number, width: number): ScrollbarMetrics | undefined {
-	if (!CONVERSATION_SCROLLBAR_STYLE.visible) return undefined;
-	const barWidth = CONVERSATION_SCROLLBAR_STYLE.width;
-	if (width <= barWidth || totalRows <= visibleRows || visibleRows <= 0) return undefined;
-
-	const rawThumbSize = Math.max(1, Math.floor((visibleRows * visibleRows) / totalRows));
-	const maxVisibleThumbSize = Math.max(1, Math.floor(visibleRows * MAX_SCROLLBAR_THUMB_RATIO));
-	// When startup resources overflow by only a few rows, a proportional thumb
-	// covers most of the viewport. Clamp the thumb instead of hiding it so the
-	// scrollbar remains visible and draggable during resume/startup frames.
-	const thumbSize = Math.min(rawThumbSize, maxVisibleThumbSize);
-	const maxThumbStart = Math.max(0, visibleRows - thumbSize);
-	const maxScrollStart = Math.max(1, totalRows - visibleRows);
-	const thumbStart = Math.round((start / maxScrollStart) * maxThumbStart);
-	const hitboxWidth = Math.max(barWidth, MIN_SCROLLBAR_HITBOX_WIDTH);
-	const fill = " ".repeat(barWidth);
-	const thumb = SCROLLBAR_THUMB_GLYPH.repeat(barWidth);
-	const thumbColor = foregroundFromBackgroundAnsi(CONVERSATION_SCROLLBAR_STYLE.thumbBackground) || RAIL_EDITOR_STYLE.rail;
-	return {
-		width: barWidth,
-		thumbSize,
-		thumbStart,
-		maxThumbStart,
-		maxScrollStart,
-		xStart: Math.max(1, width - hitboxWidth + 1),
-		xEnd: width,
-		thumbBar: `${thumbColor}${thumb}${CONVERSATION_SCROLLBAR_STYLE.reset}`,
-		trackBar: `${CONVERSATION_SCROLLBAR_STYLE.trackBackground}${fill}${CONVERSATION_SCROLLBAR_STYLE.reset}`,
-	};
-}
-
 function fitToTerminalRows(lines: string[], terminalRows: number): string[] {
 	return lines.length > terminalRows ? lines.slice(lines.length - terminalRows) : lines;
 }
@@ -158,64 +94,17 @@ function renderStickyConversation(tui: any, width: number, originalRender: (widt
 		const leftGutterWidth = appLeftGutterWidth(width);
 		const contentWidth = Math.max(1, width - leftGutterWidth);
 		const sections = getRenderedSections(children, contentWidth, state);
-		const { historyLines, historyRevision, pendingLines, statusLines, aboveLines, editorLines, belowLines, footerLines } = sections;
-		const footerBottomGapLines = Array.from({ length: FOOTER_LAYOUT.bottomGapRows }, () => "");
-		const fixedLines = addGlobalLeftGutterToRows([
-			...pendingLines,
-			...statusLines,
-			...aboveLines,
-			...editorLines,
-			...belowLines,
-			...footerLines,
-			...footerBottomGapLines,
-		], width, leftGutterWidth);
 		const terminalRows = Math.max(1, tui.terminal?.rows ?? 24);
-		const historyRows = Math.max(1, terminalRows - fixedLines.length);
-		const editorTopRow = historyRows + pendingLines.length + statusLines.length + aboveLines.length;
-		const editorBottomRow = editorTopRow + editorLines.length;
-		const footerTopRow = editorBottomRow + belowLines.length;
-		const footerBottomRow = footerTopRow + footerLines.length;
-		const layoutSignature = fixedViewportLayoutSignature({
+		const frame = composeConversationViewportFrame({
+			sections,
+			state,
+			width,
+			terminalRows,
 			leftGutterWidth,
-			historyRows,
-			pendingRows: pendingLines.length,
-			statusRows: statusLines.length,
-			aboveRows: aboveLines.length,
-			editorRows: editorLines.length,
-			belowRows: belowLines.length,
-			footerRows: footerLines.length,
-			footerBottomGapRows: FOOTER_LAYOUT.bottomGapRows,
 		});
-		const fixedLayoutChanged = state.viewportLayoutSignature !== undefined && state.viewportLayoutSignature !== layoutSignature;
-		state.viewportLayoutSignature = layoutSignature;
-		if (fixedLayoutChanged && historyLines.length > historyRows) clearViewportRenderMemory(tui);
-
-		const maxStart = Math.max(0, historyLines.length - historyRows);
-		let start: number;
-		if (state.lockedStart !== undefined) {
-			start = clamp(Math.round(state.lockedStart), 0, maxStart);
-			state.offsetFromBottom = maxStart - start;
-		} else {
-			state.offsetFromBottom = clamp(state.offsetFromBottom, 0, maxStart);
-			start = maxStart - state.offsetFromBottom;
-		}
-
-		clearBeforeOverflowRender(tui, store, historyLines.length > historyRows);
-		const scrollbar = getScrollbarMetrics(historyRows, historyLines.length, start, width);
-		state.view = { start, rows: historyRows, lineCount: historyLines.length, width: contentWidth, leftGutterWidth, editorTopRow, editorBottomRow, footerTopRow, footerBottomRow, scrollbar };
-		const selection = selectionRange(state.selection);
-		const scrollbarSig = scrollbar ? `${scrollbar.width}:${scrollbar.thumbStart}:${scrollbar.thumbSize}` : "none";
-		const selSig = selection ? `${selection.start.line}:${selection.start.col}:${selection.end.line}:${selection.end.col}` : "nosel";
-		const rowsSignature = `${historyRevision}${start}${historyRows}${width}${leftGutterWidth}${contentWidth}${scrollbarSig}${selSig}`;
-		const memo = state.viewportRowsCache;
-		let historyWithScrollbar: string[];
-		if (memo && memo.historyLinesRef === historyLines && memo.signature === rowsSignature) {
-			historyWithScrollbar = memo.rows;
-		} else {
-			historyWithScrollbar = composeHistoryRows(historyLines, start, historyRows, width, leftGutterWidth, contentWidth, scrollbar, selection);
-			state.viewportRowsCache = { historyLinesRef: historyLines, signature: rowsSignature, rows: historyWithScrollbar };
-		}
-		return fitToTerminalRows([...historyWithScrollbar, ...fixedLines], terminalRows);
+		if (frame.shouldClearViewportMemory) clearViewportRenderMemory(tui);
+		clearBeforeOverflowRender(tui, store, frame.historyOverflow);
+		return frame.rows;
 	} catch {
 		const terminalRows = Math.max(1, tui.terminal?.rows ?? 24);
 		return fitToTerminalRows(originalRender.call(tui, width), terminalRows);

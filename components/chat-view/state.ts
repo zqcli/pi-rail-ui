@@ -1,6 +1,6 @@
 import { createStore, type PrototypePatchTarget } from "../../core/patching";
 import type { RailSectionDefinition, RailSectionRange } from "../../rail/rail-section";
-import type { Position } from "../../core/utils";
+import { comparePosition, samePosition, type Position } from "../../core/utils";
 
 export type TuiCtor = { prototype: any };
 
@@ -109,4 +109,11 @@ export function stateFor(tui: object, store: ConversationScrollStore): ScrollSta
 		store.states.set(tui, state);
 	}
 	return state;
+}
+
+export function selectionRange(selection?: ScrollSelection | undefined): { start: Position; end: Position } | undefined {
+	if (!selection || samePosition(selection.anchor, selection.active)) return undefined;
+	return comparePosition(selection.anchor, selection.active) <= 0
+		? { start: selection.anchor, end: selection.active }
+		: { start: selection.active, end: selection.anchor };
 }

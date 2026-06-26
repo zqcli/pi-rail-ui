@@ -1,4 +1,4 @@
-import { createStore, type PrototypePatchTarget } from "../../core/patching";
+import { createPatchLifecycle, type PatchLifecycleStore } from "../../core/patching";
 import type { RailSectionDefinition, RailSectionRange } from "../../rail/rail-section";
 import { comparePosition, samePosition, type Position } from "../../core/utils";
 
@@ -86,21 +86,22 @@ export type ScrollState = {
 	selectionAutoScrollTimer?: ReturnType<typeof setTimeout> | undefined;
 };
 
-export type ConversationScrollStore = {
-	targets: PrototypePatchTarget[];
+type ConversationScrollLifecycleState = {
 	states: WeakMap<object, ScrollState>;
 	animationTimers: Set<ReturnType<typeof setTimeout>>;
 	alternateScreenActive: boolean;
 	clearOnNextOverflowRender: boolean;
 };
 
-export const getConversationScrollStore = createStore<ConversationScrollStore>("conversation-scroll-patch", () => ({
-	targets: [],
+export type ConversationScrollStore = PatchLifecycleStore<ConversationScrollLifecycleState>;
+
+export const conversationScrollLifecycle = createPatchLifecycle<ConversationScrollLifecycleState>("conversation-scroll-patch", () => ({
 	states: new WeakMap<object, ScrollState>(),
 	animationTimers: new Set<ReturnType<typeof setTimeout>>(),
 	alternateScreenActive: false,
 	clearOnNextOverflowRender: false,
 }));
+export const getConversationScrollStore = () => conversationScrollLifecycle.state();
 
 export function stateFor(tui: object, store: ConversationScrollStore): ScrollState {
 	let state = store.states.get(tui);
@@ -109,6 +110,11 @@ export function stateFor(tui: object, store: ConversationScrollStore): ScrollSta
 		store.states.set(tui, state);
 	}
 	return state;
+}
+
+export function markConversationViewportCachePreferred(tui?: any, store: ConversationScrollStore = getConversationScrollStore()): void {
+	if (!tui || typeof tui !== "object") return;
+	stateFor(tui, store).preferCachedRender = true;
 }
 
 export function selectionRange(selection?: ScrollSelection | undefined): { start: Position; end: Position } | undefined {

@@ -2,7 +2,7 @@ import { type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext,
 import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
-import { getConversationScrollStore, stateFor } from "../chat-view/state";
+import { markConversationViewportCachePreferred } from "../chat-view/state";
 import {
 	collectFooterLiveState,
 	collectFooterUsageStats,
@@ -34,9 +34,7 @@ function footerStore(): FooterStore {
 }
 
 function requestFooterRender(tui?: any): void {
-	if (tui && typeof tui === "object") {
-		stateFor(tui, getConversationScrollStore()).preferCachedRender = true;
-	}
+	markConversationViewportCachePreferred(tui);
 	tui?.requestRender?.();
 }
 

@@ -22,6 +22,7 @@ import {
 	applyColumnHighlight,
 	padToWidth,
 } from "../core/utils";
+import { cachedRailRows, type RailRowsCache } from "./surface-primitives";
 
 export type { EditorHeightPolicy, EditorSurfaceStyle, RailSurfaceStyle } from "../config";
 
@@ -157,7 +158,7 @@ export function bashExecutionSurfaceForTheme(theme: ThemeLike | undefined): Edit
 }
 
 export class SurfaceRailBlock implements Component {
-	private cached?: { width: number; innerLines: string[]; rows: string[] } | undefined;
+	private cached?: RailRowsCache | undefined;
 
 	constructor(
 		private readonly inner: Component,
@@ -172,17 +173,16 @@ export class SurfaceRailBlock implements Component {
 	render(width: number): string[] {
 		if (!isRailUiActive() || width < this.surface.minRenderableWidth()) return this.inner.render(width);
 		const innerLines = this.inner.render(this.surface.contentWidth(width));
-		if (this.cached?.width === width && this.cached.innerLines === innerLines) return this.cached.rows;
-		const rows = innerLines.map((line) => this.surface.renderSurfaceRow(width, line));
-		this.cached = { width, innerLines, rows };
-		return rows;
+		const result = cachedRailRows(this.cached, width, innerLines, () => innerLines.map((line) => this.surface.renderSurfaceRow(width, line)));
+		this.cached = result.cache;
+		return result.rows;
 	}
 }
 
 export class ThinkingRailBlock extends SurfaceRailBlock {}
 
 export class SurfaceContentInsetBlock implements Component {
-	private cached?: { width: number; innerLines: string[]; rows: string[] } | undefined;
+	private cached?: RailRowsCache | undefined;
 
 	constructor(
 		private readonly inner: Component,
@@ -201,10 +201,9 @@ export class SurfaceContentInsetBlock implements Component {
 
 		const innerWidth = Math.max(1, width - inset);
 		const innerLines = this.inner.render(innerWidth);
-		if (this.cached?.width === width && this.cached.innerLines === innerLines) return this.cached.rows;
 		const prefix = " ".repeat(inset);
-		const rows = innerLines.map((line) => prefix + padToWidth(line, innerWidth));
-		this.cached = { width, innerLines, rows };
-		return rows;
+		const result = cachedRailRows(this.cached, width, innerLines, () => innerLines.map((line) => prefix + padToWidth(line, innerWidth)));
+		this.cached = result.cache;
+		return result.rows;
 	}
 }

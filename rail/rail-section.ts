@@ -1,13 +1,11 @@
-import type { Component } from "@earendil-works/pi-tui";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import {
 	railSectionConfig,
-	RAIL_EDITOR_STYLE,
 	type RailSectionKind,
 	type RailSectionResolvedConfig,
 	type ThemeLike,
 } from "../config";
-import { padToWidth, stripAnsi, type Position } from "../core/utils";
+import { stripAnsi, type Position } from "../core/utils";
 
 export type { RailSectionKind, RailSectionResolvedConfig } from "../config";
 
@@ -54,7 +52,7 @@ export function isRailUiActive(): boolean {
 	return (globalThis as any)[RAIL_UI_ACTIVE_KEY] !== false;
 }
 
-function mergeSectionConfig(kind: RailSectionKind, overrides?: RailSectionOverrides): RailSectionResolvedConfig {
+export function railSectionConfigWithOverrides(kind: RailSectionKind, overrides?: RailSectionOverrides): RailSectionResolvedConfig {
 	const base = railSectionConfig(kind);
 	if (!overrides) return base;
 	return {
@@ -93,7 +91,7 @@ export function resolveRailSection(component: any): RailSectionDefinition | unde
 		return {
 			kind: metadata.kind,
 			component: metadata.component ?? component,
-			config: mergeSectionConfig(metadata.kind, metadata.overrides),
+			config: railSectionConfigWithOverrides(metadata.kind, metadata.overrides),
 		};
 	}
 
@@ -206,51 +204,4 @@ export function collapseHint(theme: ThemeLike | undefined, hiddenLineCount: numb
 	}
 }
 
-export class RailSectionBlock implements Component {
-	private readonly config: RailSectionResolvedConfig;
-	private cached?: { width: number; innerLines: string[]; rows: string[] } | undefined;
-
-	constructor(private readonly inner: Component, kind: RailSectionKind, overrides?: RailSectionOverrides) {
-		this.config = mergeSectionConfig(kind, overrides);
-		defineRailSection(this, kind, overrides, inner);
-	}
-
-	setText(text: string): void {
-		(this.inner as any).setText?.(text);
-		this.cached = undefined;
-	}
-
-	unwrap(): Component {
-		return this.inner;
-	}
-
-	invalidate(): void {
-		this.cached = undefined;
-		this.inner.invalidate?.();
-	}
-
-	render(width: number): string[] {
-		if (!isRailUiActive()) return this.inner.render(width);
-		const layout = this.config.layout;
-		const railAnsi = this.config.style.rail.ansi ?? "";
-		const hasRail = this.config.style.railEnabled && railAnsi.length > 0 && layout.leftBorderWidth > 0;
-		const hasBackground = this.config.style.background.length > 0;
-		if (!hasRail && !hasBackground) return this.inner.render(width);
-
-		const contentStart = hasRail ? layout.leftBorderWidth + layout.borderContentGapWidth : 0;
-		if (width <= contentStart + 1) return this.inner.render(width);
-
-		const innerWidth = Math.max(1, width - contentStart);
-		const innerLines = this.inner.render(innerWidth);
-		if (this.cached?.width === width && this.cached.innerLines === innerLines) return this.cached.rows;
-
-		const border = hasRail ? `${railAnsi}${layout.leftBorder}${RAIL_EDITOR_STYLE.reset}` : "";
-		const borderGap = hasRail ? " ".repeat(layout.borderContentGapWidth) : "";
-		const rows = innerLines.map((line) => {
-			const content = `${this.config.style.background}${padToWidth(line, innerWidth)}${RAIL_EDITOR_STYLE.reset}`;
-			return `${border}${borderGap}${content}`;
-		});
-		this.cached = { width, innerLines, rows };
-		return rows;
-	}
-}
+export { RailSectionBlock } from "./rail-section-block";

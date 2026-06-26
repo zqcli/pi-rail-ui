@@ -5,6 +5,7 @@ import { createStore, resolveNativePiExport, restorePrototypePatches, type Proto
 import { cachedRender } from "../../rail/render-cache";
 import { EditorSurfaceRenderer, railUserMessageSurface } from "../../rail/rail-surface";
 import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, padToWidth } from "../../core/utils";
+import { UserMessageTimestampRegistry, formatUserMessageTimestamp } from "./user-message-timestamps";
 
 type UserMessageWithInternals = {
 	contentBox?: { children?: Component[] };
@@ -19,10 +20,7 @@ type UserMessageRailPatchStore = {
 	targets: PrototypePatchTarget[];
 	surface: EditorSurfaceRenderer;
 	theme?: Theme | undefined;
-	timestampsByText: Map<string, number[]>;
-	timestampCursorByText: Map<string, number>;
-	assignedTimestamps: WeakMap<object, number>;
-	fallbackTimestamps: WeakMap<object, number>;
+	timestamps: UserMessageTimestampRegistry;
 };
 
 const USER_MESSAGE_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.user-message-render-cache");
@@ -31,63 +29,15 @@ const getUserMessageRailPatchStore = createStore<UserMessageRailPatchStore>("use
 	active: false,
 	targets: [],
 	surface: railUserMessageSurface,
-	timestampsByText: new Map<string, number[]>(),
-	timestampCursorByText: new Map<string, number>(),
-	assignedTimestamps: new WeakMap<object, number>(),
-	fallbackTimestamps: new WeakMap<object, number>(),
+	timestamps: new UserMessageTimestampRegistry(),
 }));
 
-function textFromUserMessage(message: any): string | undefined {
-	if (message?.role !== "user") return undefined;
-	const content = message.content;
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return undefined;
-
-	let text = "";
-	for (const part of content) {
-		if (part?.type !== "text" || typeof part.text !== "string") continue;
-		text += text ? `\n${part.text}` : part.text;
-	}
-	return text || undefined;
-}
-
-function timestampFromMessageOrEntry(message: any, entry?: any): number | undefined {
-	const raw = message?.timestamp ?? entry?.timestamp;
-	if (typeof raw === "number" && Number.isFinite(raw)) return raw;
-	if (typeof raw === "string") {
-		const parsed = new Date(raw).getTime();
-		return Number.isNaN(parsed) ? undefined : parsed;
-	}
-	return undefined;
-}
-
-function rememberTimestamp(text: string, timestamp: number): void {
-	const store = getUserMessageRailPatchStore();
-	const timestamps = store.timestampsByText.get(text) ?? [];
-	if (timestamps[timestamps.length - 1] !== timestamp) timestamps.push(timestamp);
-	store.timestampsByText.set(text, timestamps);
-}
-
 export function rememberUserMessageTimestamp(message: any, entry?: any): void {
-	const text = textFromUserMessage(message);
-	const timestamp = timestampFromMessageOrEntry(message, entry);
-	if (!text || timestamp === undefined) return;
-	rememberTimestamp(text, timestamp);
+	getUserMessageRailPatchStore().timestamps.remember(message, entry);
 }
 
 export function refreshUserMessageTimestamps(ctx: ExtensionContext): void {
-	const store = getUserMessageRailPatchStore();
-	store.timestampsByText.clear();
-	store.timestampCursorByText.clear();
-	store.assignedTimestamps = new WeakMap<object, number>();
-	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.type !== "message") continue;
-		rememberUserMessageTimestamp((entry as any).message, entry);
-	}
-	if (store.timestampsByText.size > 200) {
-		const entries = [...store.timestampsByText.entries()];
-		store.timestampsByText = new Map(entries.slice(entries.length - 200));
-	}
+	getUserMessageRailPatchStore().timestamps.refresh(ctx.sessionManager.getBranch());
 }
 
 function getMarkdownSourceText(component: Component | undefined): string | undefined {
@@ -95,42 +45,8 @@ function getMarkdownSourceText(component: Component | undefined): string | undef
 	return typeof text === "string" ? text : undefined;
 }
 
-const userMessageTimeFormatter = new Intl.DateTimeFormat("en-US", {
-	hour: "numeric",
-	minute: "2-digit",
-	hour12: true,
-});
-const userMessageDateFormatter = new Intl.DateTimeFormat("en-US", {
-	month: "numeric",
-	day: "numeric",
-	year: "numeric",
-});
-
-function formatUserMessageTimestamp(timestamp: number): string {
-	const date = new Date(timestamp);
-	return `${userMessageTimeFormatter.format(date)} · ${userMessageDateFormatter.format(date)}`;
-}
-
 function timestampForUserMessage(component: object, sourceText: string | undefined): number {
-	const store = getUserMessageRailPatchStore();
-	const assigned = store.assignedTimestamps.get(component);
-	if (assigned !== undefined) return assigned;
-
-	const timestamps = sourceText ? store.timestampsByText.get(sourceText) : undefined;
-	if (sourceText && timestamps?.length) {
-		const cursor = store.timestampCursorByText.get(sourceText) ?? 0;
-		const timestamp = timestamps[Math.min(cursor, timestamps.length - 1)]!;
-		store.timestampCursorByText.set(sourceText, cursor + 1);
-		store.assignedTimestamps.set(component, timestamp);
-		return timestamp;
-	}
-
-	let fallback = store.fallbackTimestamps.get(component);
-	if (fallback === undefined) {
-		fallback = Date.now();
-		store.fallbackTimestamps.set(component, fallback);
-	}
-	return fallback;
+	return getUserMessageRailPatchStore().timestamps.timestampFor(component, sourceText);
 }
 
 async function getUserMessageConstructors(): Promise<UserMessageConstructor[]> {
@@ -210,9 +126,6 @@ export function uninstallUserMessageRail(): void {
 	const store = getUserMessageRailPatchStore();
 	store.active = false;
 	store.theme = undefined;
-	store.timestampsByText.clear();
-	store.timestampCursorByText.clear();
-	store.assignedTimestamps = new WeakMap<object, number>();
-	store.fallbackTimestamps = new WeakMap<object, number>();
+	store.timestamps.clear();
 	restorePrototypePatches(store.targets);
 }

@@ -1,5 +1,5 @@
-import { createStore, restorePrototypePatches, getInteractiveModeConstructors, type PrototypePatchTarget } from "../../core/patching";
-import { RailSectionBlock, resolveRailSection } from "../../rail/rail-section";
+import { createStore, restorePrototypePatches, getInteractiveModeConstructors, patchPrototypeMethod, type PrototypePatchTarget } from "../../core/patching";
+import { withRailSectionChatChildren, wrapLastRailSectionChatChild } from "./chat-child-rail-injection";
 
 type InteractiveModeCtor = { prototype: any };
 
@@ -15,29 +15,6 @@ const getResourceStatusRailPatchStore = createStore<ResourceStatusRailPatchStore
 
 const STATUS_ORIGINAL_PADDING_X_KEY = Symbol.for("pi-rail-ui.status-original-padding-x");
 
-function shouldWrapResourceChild(child: any): boolean {
-	return Boolean(child && typeof child.render === "function" && child.constructor?.name !== "Spacer" && !resolveRailSection(child));
-}
-
-function resourceRailBlock(child: any): RailSectionBlock {
-	return new RailSectionBlock(child, "resourceStatus");
-}
-
-function withGappedResourceChildren<T>(mode: any, renderResources: () => T): T {
-	const chatContainer = mode?.chatContainer;
-	const originalAddChild = chatContainer?.addChild;
-	if (typeof originalAddChild !== "function") return renderResources();
-
-	chatContainer.addChild = function patchedResourceAddChild(this: any, child: any) {
-		return originalAddChild.call(this, shouldWrapResourceChild(child) ? resourceRailBlock(child) : child);
-	};
-	try {
-		return renderResources();
-	} finally {
-		chatContainer.addChild = originalAddChild;
-	}
-}
-
 function normalizeStatusPaddingForGap(statusText: any): void {
 	if (typeof statusText?.paddingX !== "number") return;
 	if (statusText[STATUS_ORIGINAL_PADDING_X_KEY] === undefined) {
@@ -49,95 +26,46 @@ function normalizeStatusPaddingForGap(statusText: any): void {
 	}
 }
 
-function lastRenderableResourceChildIndex(children: any[]): number {
-	for (let index = children.length - 1; index >= 0; index--) {
-		const child = children[index];
-		if (resolveRailSection(child) || shouldWrapResourceChild(child)) return index;
-	}
-	return -1;
-}
-
 function wrapLastStatusLine(mode: any): void {
-	const children = mode?.chatContainer?.children;
-	if (!Array.isArray(children) || children.length === 0) return;
-
-	const lastIndex = lastRenderableResourceChildIndex(children);
-	if (lastIndex < 0) return;
-	const last = children[lastIndex];
-	const existingSection = resolveRailSection(last);
-	if (existingSection) {
-		normalizeStatusPaddingForGap(existingSection.component);
-		mode.lastStatusText = last;
-		return;
-	}
-	if (!shouldWrapResourceChild(last)) return;
-
-	normalizeStatusPaddingForGap(last);
-	const wrapped = resourceRailBlock(last);
-	children[lastIndex] = wrapped;
-	if (mode.lastStatusText === last) mode.lastStatusText = wrapped;
+	wrapLastRailSectionChatChild(mode, "resourceStatus", {
+		normalizeChild: normalizeStatusPaddingForGap,
+		assignTo: "lastStatusText",
+	});
 }
 
 function wrapLastCommandOutputChild(mode: any): void {
-	const children = mode?.chatContainer?.children;
-	if (!Array.isArray(children) || children.length === 0) return;
-
-	const lastIndex = lastRenderableResourceChildIndex(children);
-	if (lastIndex < 0) return;
-	const last = children[lastIndex];
-	const existingSection = resolveRailSection(last);
-	if (existingSection) {
-		normalizeStatusPaddingForGap(existingSection.component);
-		return;
-	}
-	if (!shouldWrapResourceChild(last)) return;
-	normalizeStatusPaddingForGap(last);
-	children[lastIndex] = resourceRailBlock(last);
+	wrapLastRailSectionChatChild(mode, "resourceStatus", { normalizeChild: normalizeStatusPaddingForGap });
 }
 
 function patchInteractiveMode(ctor: InteractiveModeCtor, store: ResourceStatusRailPatchStore): void {
 	if (!ctor?.prototype) return;
 
-	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showLoadedResources")) {
-		const original = ctor.prototype.showLoadedResources;
-		if (typeof original === "function") {
-			ctor.prototype.showLoadedResources = function patchedShowLoadedResources(this: any, options: any) {
-				const currentStore = getResourceStatusRailPatchStore();
-				if (!currentStore.active) return original.call(this, options);
-				return withGappedResourceChildren(this, () => original.call(this, options));
-			};
-			store.targets.push({ ctor, methodName: "showLoadedResources", original });
-		}
-	}
+	patchPrototypeMethod(store.targets, ctor, "showLoadedResources", (original) => function patchedShowLoadedResources(this: any, options: any) {
+		const currentStore = getResourceStatusRailPatchStore();
+		if (!currentStore.active) return original.call(this, options);
+		return withRailSectionChatChildren(this, "resourceStatus", () => original.call(this, options), {
+			normalizeChild: normalizeStatusPaddingForGap,
+		});
+	});
 
-	if (!store.targets.some((target) => target.ctor === ctor && target.methodName === "showStatus")) {
-		const original = ctor.prototype.showStatus;
-		if (typeof original === "function") {
-			ctor.prototype.showStatus = function patchedShowStatus(this: any, message: string) {
-				const currentStore = getResourceStatusRailPatchStore();
-				if (!currentStore.active) return original.call(this, message);
+	patchPrototypeMethod(store.targets, ctor, "showStatus", (original) => function patchedShowStatus(this: any, message: string) {
+		const currentStore = getResourceStatusRailPatchStore();
+		if (!currentStore.active) return original.call(this, message);
 
-				const result = original.call(this, message);
-				wrapLastStatusLine(this);
-				return result;
-			};
-			store.targets.push({ ctor, methodName: "showStatus", original });
-		}
-	}
+		const result = original.call(this, message);
+		wrapLastStatusLine(this);
+		return result;
+	});
 
 	for (const methodName of ["showError", "showWarning"] as const) {
-		if (store.targets.some((target) => target.ctor === ctor && target.methodName === methodName)) continue;
-		const original = ctor.prototype[methodName];
-		if (typeof original !== "function") continue;
-		ctor.prototype[methodName] = function patchedCommandStatusOutput(this: any, message: string) {
+		patchPrototypeMethod(store.targets, ctor, methodName, (original) => function patchedCommandStatusOutput(this: any, message: string) {
 			const currentStore = getResourceStatusRailPatchStore();
 			if (!currentStore.active) return original.call(this, message);
 
 			const result = original.call(this, message);
 			wrapLastCommandOutputChild(this);
 			return result;
-		};
-		store.targets.push({ ctor, methodName, original });
+		});
 	}
 }
 

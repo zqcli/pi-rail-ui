@@ -1,6 +1,7 @@
 import { CustomEditor, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { SelectList, matchesKey, type Component, type EditorTheme, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
 import { SlashCommandOverlay } from "./slash-autocomplete";
+import { completeSkillCommandWithoutSubmit } from "./rail-editor-autocomplete";
 import { CONVERSATION_SCROLL_LAYOUT, EDITOR_MOUSE_TRACKING_ENABLED, SLASH_COMMAND_LAYOUT, applyTextColor } from "../../config";
 import { selectorOutputSurfaceForTheme, railEditorSurface, type EditorSurfaceRenderer } from "../../rail/rail-surface";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
@@ -271,43 +272,13 @@ export class RailEditor extends MouseSelectableRailEditor {
 		super.insertTextAtCursor(text);
 	}
 
-	private completeSkillCommandWithoutSubmit(data: string): boolean {
-		if (!this.keybindingManager.matches(data, "tui.select.confirm")) return false;
-
-		const editor = this as any;
-		const prefix = editor.autocompletePrefix;
-		const selected = editor.autocompleteList?.getSelectedItem?.();
-		if (!editor.autocompleteState || !editor.autocompleteProvider || typeof prefix !== "string" || !prefix.startsWith("/")) {
-			return false;
-		}
-		if (!selected || typeof selected.value !== "string" || !selected.value.startsWith("skill:")) return false;
-
-		editor.pushUndoSnapshot?.();
-		editor.lastAction = null;
-		const result = editor.autocompleteProvider.applyCompletion(
-			editor.state.lines,
-			editor.state.cursorLine,
-			editor.state.cursorCol,
-			selected,
-			prefix,
-		);
-		editor.state.lines = result.lines;
-		editor.state.cursorLine = result.cursorLine;
-		if (typeof editor.setCursorCol === "function") editor.setCursorCol(result.cursorCol);
-		else editor.state.cursorCol = result.cursorCol;
-		editor.cancelAutocomplete?.();
-		editor.onChange?.(this.getText());
-		this.tui.requestRender();
-		return true;
-	}
-
 	override handleInput(data: string): void {
 		const isEscapeSequence = data.charCodeAt(0) === 0x1b;
 		const isMouseOrCursor = isEscapeSequence && Boolean(parseWheel(data) || parseMouse(data) || parseCursorPosition(data));
 		if (!isMouseOrCursor) {
 			this.frameRenderer.markTextInput();
 		}
-		if (this.completeSkillCommandWithoutSubmit(data)) return;
+		if (completeSkillCommandWithoutSubmit({ editor: this, data, keybindings: this.keybindingManager, requestRender: () => this.tui.requestRender() })) return;
 		super.handleInput(data);
 	}
 

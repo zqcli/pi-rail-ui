@@ -4,7 +4,9 @@ import { stripAnsi } from "../../../core/utils";
 import { railSelectorOutputSurface } from "../../../rail/rail-surface";
 import {
 	renderSelectorOverlaySnapshot,
+	selectorOverlaySnapshotFor,
 	type ModelSelectorSnapshot,
+	type SettingsSelectorSnapshot,
 } from "../../../components/editor/selector-overlay-presenter";
 import {
 	renderSelectorSurface,
@@ -68,6 +70,39 @@ describe("selector overlay renderer", () => {
 		assert.match(text, /Scope:/);
 		assert.match(text, /gpt-5/);
 		assert.doesNotMatch(text, /fallback/);
+	});
+
+	test("keeps settings target behind the selector presentation adapter", () => {
+		let renderedWidth = 0;
+		const settingsList = {
+			items: [{ id: "enableSkillCommands", currentValue: "true" }],
+			selectedIndex: 0,
+			submenuComponent: {},
+			searchInput: { getValue: () => "skill" },
+			theme: {
+				label: (text: string, _selected: boolean) => `old:${text}`,
+				value: (text: string, _selected: boolean) => `old:${text}`,
+				cursor: "old:→ ",
+			},
+			render(width: number) {
+				renderedWidth = width;
+				return [
+					this.theme.cursor,
+					this.theme.label("Skill Commands", true),
+					this.theme.value("true", true),
+				];
+			},
+		};
+
+		const snapshot = selectorOverlaySnapshotFor({ settingsList }) as SettingsSelectorSnapshot;
+		const rows = renderSelectorOverlaySnapshot(snapshot, 48, theme as any);
+
+		assert.equal((snapshot.list as any).target, undefined);
+		assert.equal(snapshot.list.itemCount, 1);
+		assert.equal(snapshot.list.hasSubmenu, true);
+		assert.equal(snapshot.list.searchText, "skill");
+		assert.equal(renderedWidth, 48);
+		assert.deepEqual(rows.map(stripAnsi), ["→ ", "Skill Commands", "true"]);
 	});
 
 	test("shows a rail overlay panel and restores editor focus on done", () => {

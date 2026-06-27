@@ -41,12 +41,12 @@ export type ScopedModelsSelectorSnapshot = {
 };
 
 type SettingsListAdapter = {
-	target: any;
-	items: any[];
 	selectedIndex: number;
-	submenuComponent?: any | undefined;
+	itemCount: number;
+	hasSubmenu: boolean;
 	searchText: string;
-	render(width: number): string[];
+	valuesSignature: string;
+	render(width: number, theme: ThemeLike | undefined): string[];
 };
 
 export type SettingsSelectorSnapshot = {
@@ -160,15 +160,19 @@ function settingsListFor(instance: any): any {
 function settingsSnapshotFor(instance: any): SettingsSelectorSnapshot | undefined {
 	const settingsList = settingsListFor(instance);
 	if (!isSettingsList(settingsList)) return undefined;
+	const items = settingsList.items;
 	return {
 		kind: "settings",
 		list: {
-			target: settingsList,
-			items: settingsList.items,
 			selectedIndex: typeof settingsList.selectedIndex === "number" ? settingsList.selectedIndex : 0,
-			submenuComponent: settingsList.submenuComponent,
+			itemCount: items.length,
+			hasSubmenu: Boolean(settingsList.submenuComponent),
 			searchText: String(settingsList.searchInput?.getValue?.() ?? settingsList.searchInput?.getText?.() ?? ""),
-			render: (width: number) => safeRows(settingsList.render(Math.max(1, width))),
+			valuesSignature: settingsListValuesSignature(items),
+			render: (width: number, theme: ThemeLike | undefined) => {
+				restyleSettingsList(settingsList, theme);
+				return safeRows(settingsList.render(Math.max(1, width)));
+			},
 		},
 	};
 }
@@ -302,8 +306,7 @@ function renderScopedModelsSelectorBody(snapshot: ScopedModelsSelectorSnapshot, 
 }
 
 function renderSettingsMenuBody(snapshot: SettingsSelectorSnapshot, contentWidth: number, theme: ThemeLike | undefined): string[] {
-	restyleSettingsList(snapshot.list.target, theme);
-	return snapshot.list.render(contentWidth);
+	return snapshot.list.render(contentWidth, theme);
 }
 
 export function renderSelectorOverlaySnapshot(snapshot: SelectorOverlaySnapshot, contentWidth: number, theme: ThemeLike | undefined): string[] {
@@ -319,6 +322,12 @@ export function renderSelectorOverlaySnapshot(snapshot: SelectorOverlaySnapshot,
 
 function serializeItems(items: Array<Record<string, unknown>>): string {
 	return items.map((item) => Object.values(item).join(":")).join("\u001e");
+}
+
+function settingsListValuesSignature(items: any[]): string {
+	return items
+		.map((item: any) => `${item?.id ?? item?.label ?? ""}:${item?.currentValue ?? ""}`)
+		.join("\u001e");
 }
 
 export function selectorOverlaySnapshotSignature(snapshot: SelectorOverlaySnapshot, width: number): string {
@@ -346,17 +355,14 @@ export function selectorOverlaySnapshotSignature(snapshot: SelectorOverlaySnapsh
 				serializeItems(snapshot.items),
 			].join("\u001f");
 		case "settings": {
-			const values = snapshot.list.items
-				.map((item: any) => `${item?.id ?? item?.label ?? ""}:${item?.currentValue ?? ""}`)
-				.join("\u001e");
 			return [
 				snapshot.kind,
 				width,
 				snapshot.list.selectedIndex,
-				snapshot.list.items.length,
-				snapshot.list.submenuComponent ? 1 : 0,
+				snapshot.list.itemCount,
+				snapshot.list.hasSubmenu ? 1 : 0,
 				snapshot.list.searchText,
-				values,
+				snapshot.list.valuesSignature,
 			].join("\u001f");
 		}
 	}
@@ -382,10 +388,21 @@ function isScopedModelsSelectorComponent(component: any): boolean {
 	return Boolean(component?.searchInput && Array.isArray(component?.filteredItems) && component?.modelsById instanceof Map);
 }
 
-function selectorOverlaySnapshotFor(component: any): SelectorOverlaySnapshot | undefined {
-	if (isSettingsSelectorComponent(component)) return settingsSnapshotFor(component);
-	if (isModelSelectorComponent(component)) return modelSnapshotFor(component);
-	if (isScopedModelsSelectorComponent(component)) return scopedModelsSnapshotFor(component);
+type SelectorOverlayAdapter = {
+	matches(component: any): boolean;
+	snapshot(component: any): SelectorOverlaySnapshot | undefined;
+};
+
+const SELECTOR_OVERLAY_ADAPTERS: SelectorOverlayAdapter[] = [
+	{ matches: isSettingsSelectorComponent, snapshot: settingsSnapshotFor },
+	{ matches: isModelSelectorComponent, snapshot: modelSnapshotFor },
+	{ matches: isScopedModelsSelectorComponent, snapshot: scopedModelsSnapshotFor },
+];
+
+export function selectorOverlaySnapshotFor(component: any): SelectorOverlaySnapshot | undefined {
+	for (const adapter of SELECTOR_OVERLAY_ADAPTERS) {
+		if (adapter.matches(component)) return adapter.snapshot(component);
+	}
 	return undefined;
 }
 

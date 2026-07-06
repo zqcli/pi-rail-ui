@@ -12,10 +12,35 @@ function isPlainContainer(component: any): boolean {
 	return component?.constructor?.name === "Container" && Array.isArray(component.children);
 }
 
+const FIXED_VIEWPORT_CHILD_COUNT = 6;
+
+type FixedViewportChildren = {
+	historyContainers: any[];
+	pendingChild: any;
+	statusChild: any;
+	aboveChild: any;
+	editorChild: any;
+	belowChild: any;
+	footerChild: any;
+};
+
+function splitInteractiveChildren(children: any[]): FixedViewportChildren {
+	const fixedStartIndex = Math.max(0, children.length - FIXED_VIEWPORT_CHILD_COUNT);
+	const fixedChildren = children.slice(fixedStartIndex);
+	return {
+		historyContainers: children.slice(0, fixedStartIndex),
+		pendingChild: fixedChildren[0],
+		statusChild: fixedChildren[1],
+		aboveChild: fixedChildren[2],
+		editorChild: fixedChildren[3],
+		belowChild: fixedChildren[4],
+		footerChild: fixedChildren[5],
+	};
+}
+
 function historyRenderableChildren(children: any[]): any[] {
 	const refs: any[] = [];
-	for (let index = 0; index < 2; index++) {
-		const child = children[index];
+	for (const child of children) {
 		if (isPlainContainer(child)) {
 			for (const nested of child.children) refs.push(nested);
 		} else if (child) {
@@ -187,7 +212,9 @@ function renderHistoryChildren(historyChildren: any[], width: number, cache?: Re
 
 export function isInteractiveRoot(tui: any): boolean {
 	const children = tui?.children;
-	return Array.isArray(children) && children.length >= 8 && Array.isArray(children[5]?.children);
+	if (!Array.isArray(children) || children.length < FIXED_VIEWPORT_CHILD_COUNT + 2) return false;
+	const editorChild = children[children.length - 3];
+	return Array.isArray(editorChild?.children);
 }
 
 function sameRefs(a: any[], b: any[]): boolean {
@@ -228,7 +255,8 @@ function historyFromCache(cache: RenderCache): HistoryRenderResult {
 }
 
 export function getRenderedSections(children: any[], width: number, state: ScrollState): RenderCache {
-	const historyChildren = historyRenderableChildren(children);
+	const parts = splitInteractiveChildren(children);
+	const historyChildren = historyRenderableChildren(parts.historyContainers);
 	const previousCache = state.renderCache;
 	const reusedFullHistory = state.preferCachedRender === true && canReuseFullHistory(previousCache, historyChildren, width, state);
 	const history = reusedFullHistory
@@ -245,12 +273,12 @@ export function getRenderedSections(children: any[], width: number, state: Scrol
 		historyRevision: reusedFullHistory ? previousHistoryRevision : previousHistoryRevision + 1,
 		children: [...children],
 		...history,
-		pendingLines: renderChild(children[2], width),
-		statusLines: renderChild(children[3], width),
-		aboveLines: renderChild(children[4], width),
-		editorLines: renderChild(children[5], width),
-		belowLines: renderChild(children[6], width),
-		footerLines: renderChild(children[7], width),
+		pendingLines: renderChild(parts.pendingChild, width),
+		statusLines: renderChild(parts.statusChild, width),
+		aboveLines: renderChild(parts.aboveChild, width),
+		editorLines: renderChild(parts.editorChild, width),
+		belowLines: renderChild(parts.belowChild, width),
+		footerLines: renderChild(parts.footerChild, width),
 	};
 	state.renderCache = cache;
 	state.preferCachedRender = false;

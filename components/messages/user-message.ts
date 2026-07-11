@@ -9,6 +9,7 @@ import { UserMessageTimestampRegistry, formatUserMessageTimestamp } from "./user
 
 type UserMessageWithInternals = {
 	contentBox?: { children?: Component[] };
+	children?: Component[];
 };
 
 type UserMessageConstructor = {
@@ -42,6 +43,18 @@ function getMarkdownSourceText(component: Component | undefined): string | undef
 	return typeof text === "string" ? text : undefined;
 }
 
+function getUserMessageMarkdown(component: UserMessageWithInternals): Component | undefined {
+	const containers: Array<{ children?: Component[] } | undefined> = [
+		component.contentBox,
+		component.children?.[0] as ({ children?: Component[] } | undefined),
+	];
+	for (const container of containers) {
+		const candidate = container?.children?.[0];
+		if (typeof candidate?.render === "function" && getMarkdownSourceText(candidate) !== undefined) return candidate;
+	}
+	return undefined;
+}
+
 function timestampForUserMessage(component: object, sourceText: string | undefined): number {
 	return getUserMessageRailPatchStore().timestamps.timestampFor(component, sourceText);
 }
@@ -65,7 +78,7 @@ function renderUserMessageWithSurface(
 ): string[] {
 	if (width < surface.minRenderableWidth()) return fallback.call(component, width);
 
-	const markdown = component.contentBox?.children?.[0];
+	const markdown = getUserMessageMarkdown(component);
 	if (!markdown) return fallback.call(component, width);
 
 	const contentWidth = surface.contentWidth(width);

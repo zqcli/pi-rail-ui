@@ -3,6 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@eare
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
 import { markConversationViewportCachePreferred } from "../chat-view/state";
+import { railFastFooterLabel } from "../../commands/rail-fast";
 import {
 	collectFooterLiveState,
 	collectFooterUsageStats,
@@ -135,10 +136,12 @@ function latestFooterData(): ReadonlyFooterDataProvider | undefined {
 
 function renderSimpleFooter(width: number, state: FooterLiveState, stats: FooterUsageStats, style: FooterStyle): string[] {
 	const identity = `${style.text}▸ ${fitToWidth(state.cwdShort, FOOTER_LAYOUT.cwdMaxWidth)}${state.branch ? `${style.mint}@${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : ""}`;
+	const fastLabel = railFastFooterLabel();
 	const left = visibleJoin([
 		identity,
 		`${style.sky}${state.modelShort}`,
 		`${style.amber}${state.thinking}`,
+		fastLabel ? `${style.sky}${fastLabel}` : undefined,
 		stateText(state, style),
 		turnDurationText(state, style),
 		state.pending ? `${style.amber}queued` : undefined,

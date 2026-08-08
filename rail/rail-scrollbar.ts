@@ -19,6 +19,19 @@ function thumbCell(): string {
 	return `${color}${"█".repeat(width)}${CONVERSATION_SCROLLBAR_STYLE.reset}`;
 }
 
+/**
+ * Paint the Rail thumb over the rightmost cell of one screen row.
+ * Plain rows (no ANSI) use a direct slice; styled rows fall back to
+ * compositeTuiLine so escape sequences and wide graphemes stay intact.
+ */
+function styleRailThumbCell(line: string, column: number, barWidth: number, totalWidth: number): string {
+	if (!line) return thumbCell();
+	if (line.indexOf("\x1b") === -1) {
+		return `${line.slice(0, column)}${thumbCell()}${line.slice(column + barWidth)}`;
+	}
+	return compositeTuiLine(line, thumbCell(), column, barWidth, totalWidth);
+}
+
 export function markRailScrollbarView(scrollView: any): void {
 	if (!scrollView || scrollView[RAIL_SCROLLBAR_MARKED_KEY] === true) return;
 	scrollView[RAIL_SCROLLBAR_MARKED_KEY] = true;
@@ -72,11 +85,10 @@ export function drawRailScrollbar(screen: string[], layout: any, terminalColumns
 	const maxScrollStart = Math.max(0, totalRows - trackHeight);
 	const thumbStart = maxScrollStart === 0 ? 0 : Math.round((scrollView.currentScrollTop / maxScrollStart) * maxThumbStart);
 	const thumbTop = trackTop + thumbStart;
-	const cell = thumbCell();
 	const barWidth = Math.max(1, Math.round(CONVERSATION_SCROLLBAR_STYLE.width));
 
 	for (let row = Math.max(0, thumbTop); row < Math.min(screen.length, thumbTop + thumbSize); row++) {
-		screen[row] = compositeTuiLine(screen[row] ?? "", cell, column, barWidth, terminalColumns);
+		screen[row] = styleRailThumbCell(screen[row] ?? "", column, barWidth, terminalColumns);
 	}
 	return screen;
 }

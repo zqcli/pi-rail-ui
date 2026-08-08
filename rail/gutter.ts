@@ -16,6 +16,8 @@ const installedRestores: GutterRestore[] = [];
  * prompt navigation keeps working.
  */
 export class GutterContainer implements Component {
+	private cached?: { width: number; gutter: number; innerLines: string[]; rows: string[] } | undefined;
+
 	constructor(private readonly inner: any) {
 		inner[GUTTER_WRAPPED_KEY] = this;
 		(this as any)[GUTTER_WRAPPED_KEY] = this;
@@ -41,12 +43,20 @@ export class GutterContainer implements Component {
 		const gutter = appLeftGutterWidth(width);
 		if (gutter <= 0) return this.inner.render(width);
 		const innerWidth = Math.max(1, width - gutter);
+		const innerLines = this.inner.render(innerWidth);
+		// Inner Rail blocks already reuse their row arrays across scroll frames;
+		// skip the per-row prefix pass when the source lines did not change.
+		const cached = this.cached;
+		if (cached?.width === innerWidth && cached.gutter === gutter && cached.innerLines === innerLines) return cached.rows;
+
 		const prefix = " ".repeat(gutter);
-		return this.inner.render(innerWidth).map((line: string) => {
+		const rows = innerLines.map((line: string) => {
 			if (!line) return line;
 			const zones = line.match(OSC133_ZONE_PREFIX_RE)?.[0] ?? "";
 			return zones + prefix + line.slice(zones.length);
 		});
+		this.cached = { width: innerWidth, gutter, innerLines, rows };
+		return rows;
 	}
 }
 

@@ -366,6 +366,8 @@ pi-rail-ui/
 - 长消息与工具输出使用 component/surface render cache。
 - Execution preview 缓存和按需宽度格式化。
 - 已完成的 simple tool/bash preview 会跨滚动帧复用，不再重复扫描大型参数或输出。
+- Fullscreen 左 gutter 在 transcript 内容未变化时复用已加前缀的行。
+- 滚动条 thumb 对纯文本行直接用 slice 绘制，仅 ANSI 样式行走完整 overlay 合成；原生拖动几何不做任何改动。
 - Transcript layout、viewport 和原生选择性能由 Pi 管理。
 - Fullscreen 滚动条是 Rail 自己绘制的单列 overlay，只读取 Pi 的滚动状态，不接管 viewport 或输入。
 

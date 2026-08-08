@@ -42,13 +42,19 @@ function findScrollBox(root: any, scrollView: any): any | undefined {
 
 /**
  * Draw the legacy Rail scrollbar (blue thumb, transparent track) over the
- * rightmost column of the transcript region, and keep Pi's native scrollbar
- * hidden. Mirrors the old viewport metrics.
+ * rightmost column of the transcript region. The native scrollbar stays in
+ * "auto" mode so Pi's drag/hover/click handling works on the same thumb
+ * geometry; our thumb is painted on top and simply reuses it.
  */
 export function drawRailScrollbar(screen: string[], layout: any, terminalColumns: number): string[] {
 	const scrollView = layout?.primaryScrollView;
 	if (!isRailScrollbarView(scrollView)) return screen;
-	if (scrollView.currentScrollbar !== "hidden") scrollView.setScrollbar?.("hidden");
+	// Keep the native bar interactable: "auto" mode plus an always-visible
+	// transient state makes Pi's getScrollbarGeometry/handleScrollbarMouseEvent
+	// accept the thumb as a drag target without reserving a layout column.
+	if (scrollView.currentScrollbar !== "auto") scrollView.setScrollbar?.("auto");
+	scrollView.hideTransientScrollbar?.();
+	scrollView.transientScrollbarVisible = true;
 
 	const box = findScrollBox(layout.root, scrollView);
 	if (!box) return screen;
@@ -59,13 +65,12 @@ export function drawRailScrollbar(screen: string[], layout: any, terminalColumns
 	const column = box.rect.x + box.rect.width - 1;
 	if (column < 0 || column >= terminalColumns) return screen;
 
-	const thumbSize = Math.min(
-		Math.max(1, Math.floor((trackHeight * trackHeight) / totalRows)),
-		Math.max(1, Math.floor(trackHeight * 0.65)),
-	);
+	// Must match Pi's getScrollbarGeometry exactly: the native drag logic
+	// (grabOffset, thumbOffset, scrollTo) is computed from the same numbers.
+	const thumbSize = Math.max(2, Math.min(trackHeight, Math.round((trackHeight * trackHeight) / totalRows)));
 	const maxThumbStart = Math.max(0, trackHeight - thumbSize);
-	const maxScrollStart = Math.max(1, totalRows - trackHeight);
-	const thumbStart = Math.round((scrollView.currentScrollTop / maxScrollStart) * maxThumbStart);
+	const maxScrollStart = Math.max(0, totalRows - trackHeight);
+	const thumbStart = maxScrollStart === 0 ? 0 : Math.round((scrollView.currentScrollTop / maxScrollStart) * maxThumbStart);
 	const thumbTop = trackTop + thumbStart;
 	const cell = thumbCell();
 	const barWidth = Math.max(1, Math.round(CONVERSATION_SCROLLBAR_STYLE.width));
@@ -108,6 +113,7 @@ export function uninstallRailScrollbar(): void {
 	for (const scrollView of markedScrollViews) {
 		const original = scrollView[RAIL_SCROLLBAR_ORIGINAL_KEY];
 		if (original !== undefined) scrollView.setScrollbar?.(original);
+		scrollView.hideTransientScrollbar?.();
 		delete scrollView[RAIL_SCROLLBAR_MARKED_KEY];
 		delete scrollView[RAIL_SCROLLBAR_ORIGINAL_KEY];
 	}

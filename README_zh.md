@@ -220,7 +220,7 @@ ui-style.json
 }
 ```
 
-需要固定 editor/footer dock 和 transcript 滚动时，请使用 Pi 的 `tuiMode: "fullscreen"` 设置。fullscreen 下 Rail 会隐藏 Pi 内置滚动条，改绘旧版 Rail 滚动条：单列蓝色 thumb（`editor.rail` / `conversationScroll.scrollbar.thumbBackground`），透明 track，仅在 transcript 溢出时显示。
+需要固定 editor/footer dock 和 transcript 滚动时，请使用 Pi 的 `tuiMode: "fullscreen"` 设置。fullscreen 下 Rail 保持 Pi 原生 scrollbar 的 auto 模式（拖动、hover 和 track 几何全部原生处理），并在其上覆盖旧版 Rail 滚动条：单列蓝色 thumb（`editor.rail` / `conversationScroll.scrollbar.thumbBackground`），透明 track，仅在 transcript 溢出时显示；拖动 thumb 即可滚动 transcript。
 
 ### `bashExecution`
 
@@ -372,7 +372,7 @@ pi-rail-ui/
 ## 限制和注意事项
 
 - 部分视觉 component patch 以及窄范围 fullscreen copy/click seam 仍依赖 Pi 内部结构，component 或 mouse handler shape 变化时可能需要同步更新。
-- Fullscreen mode、transcript 滚动、终端鼠标选择和 selector 生命周期由 Pi 原生管理；Rail 只替换滚动条的视觉呈现。
+- Fullscreen mode、transcript 滚动、终端鼠标选择和 selector 生命周期由 Pi 原生管理；Rail 只覆盖滚动条的视觉呈现，拖动几何复用 Pi 原生 auto 模式。
 - 终端模拟器自身的滚动条（iTerm2 的 "Save lines to scrollback in alternate screen"）不在转义序列可控范围内；若它与 Rail 滚动条同时出现，请在 iTerm2 profile 设置中关闭该选项。
 - 使用固定 dock 和原生 transcript viewport 时，请把 Pi 的 `tuiMode` 设置为 `fullscreen`。
 - 标准终端协议通常不支持应用可靠改变系统鼠标指针形状。

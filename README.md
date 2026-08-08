@@ -221,7 +221,7 @@ Conversation scrolling is delegated to Pi. The legacy section remains configurab
 }
 ```
 
-Use Pi's `tuiMode: "fullscreen"` setting for the native fixed editor/footer dock and transcript scrolling. In fullscreen, Rail hides Pi's built-in scrollbar and draws the legacy Rail scrollbar instead: a one-column blue thumb (`editor.rail` / `conversationScroll.scrollbar.thumbBackground`) over a transparent track, shown only while the transcript overflows.
+Use Pi's `tuiMode: "fullscreen"` setting for the native fixed editor/footer dock and transcript scrolling. In fullscreen, Rail keeps Pi's scrollbar in auto mode so drag, hover, and track geometry stay native, and paints the legacy Rail scrollbar over it: a one-column blue thumb (`editor.rail` / `conversationScroll.scrollbar.thumbBackground`) over a transparent track, shown only while the transcript overflows. Dragging the thumb scrolls the transcript.
 
 ### `bashExecution`
 
@@ -368,12 +368,12 @@ The extension includes several optimizations for long sessions:
 - Cached execution previews and width-aware formatting where needed.
 - Completed simple tool/bash previews are reused across scroll frames instead of rescanning large arguments or output.
 - Pi owns transcript layout, viewport, scrolling, and native selection performance.
-- Fullscreen scrollbar rendering is Rail's own one-column overlay, drawn from Pi's scroll state without taking over the viewport or input.
+- Fullscreen scrollbar rendering is Rail's own one-column overlay; Pi's native auto-mode geometry keeps the thumb draggable.
 
 ## Limitations and Caveats
 
 - Visual component patches and the narrow fullscreen copy/click seams depend on selected Pi internals and may need updates when component or mouse-handler shapes change.
-- Pi owns fullscreen mode, transcript scrolling, terminal mouse selection, and selector lifecycle; Rail replaces only the scrollbar's visual presentation.
+- Pi owns fullscreen mode, transcript scrolling, terminal mouse selection, and selector lifecycle; Rail replaces only the scrollbar's visual presentation while reusing Pi's drag geometry.
 - The terminal emulator's own scrollbar (iTerm2 "Save lines to scrollback in alternate screen") is outside the escape-code surface; disable that profile setting if it appears alongside Rail's scrollbar.
 - Set Pi's `tuiMode` to `fullscreen` to use its fixed dock and native transcript viewport.
 - Standard terminal protocols do not reliably allow changing the OS cursor shape on hover.

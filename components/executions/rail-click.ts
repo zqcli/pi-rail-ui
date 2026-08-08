@@ -1,16 +1,14 @@
-import { railSectionConfig } from "../../config";
 import { resolveNativeTuiExport } from "../../core/patching";
-import { markRailSectionManuallyToggled } from "../../rail/rail-section";
-import { isBashExecution } from "./bash-execution";
+import { canToggleRailSection, markRailSectionManuallyToggled, resolveRailSection } from "../../rail/rail-section";
 import type { ExecutionRailPatcher } from "./execution-collapse";
 
-const EXECUTION_MARKER_ID_KEY = Symbol.for("pi-rail-ui.execution-marker-id");
-const EXECUTION_MARKED_ROWS_CACHE_KEY = Symbol.for("pi-rail-ui.execution-marked-rows-cache");
-const MARKER_START_RE = /\x1b_pi-rail-execution:start:(\d+)\x07/gu;
-const MARKER_END_RE = /\x1b_pi-rail-execution:end:(\d+)\x07/gu;
+const RAIL_CLICK_MARKER_ID_KEY = Symbol.for("pi-rail-ui.rail-click-marker-id");
+const RAIL_CLICK_MARKED_ROWS_CACHE_KEY = Symbol.for("pi-rail-ui.rail-click-marked-rows-cache");
+const MARKER_START_RE = /\x1b_pi-rail-click:start:(\d+)\x07/gu;
+const MARKER_END_RE = /\x1b_pi-rail-click:end:(\d+)\x07/gu;
 
-let nextExecutionMarkerId = 1;
-const executionComponents = new Map<number, any>();
+let nextRailClickMarkerId = 1;
+const railClickComponents = new Map<number, any>();
 
 type AltScreenConstructor = {
 	prototype: {
@@ -18,29 +16,29 @@ type AltScreenConstructor = {
 	};
 };
 
-function executionMarkerId(component: any): number {
-	let id = component?.[EXECUTION_MARKER_ID_KEY] as number | undefined;
+function railClickMarkerId(component: any): number {
+	let id = component?.[RAIL_CLICK_MARKER_ID_KEY] as number | undefined;
 	if (id === undefined) {
-		id = nextExecutionMarkerId++;
-		component[EXECUTION_MARKER_ID_KEY] = id;
+		id = nextRailClickMarkerId++;
+		component[RAIL_CLICK_MARKER_ID_KEY] = id;
 	}
-	executionComponents.set(id, component);
+	railClickComponents.set(id, component);
 	return id;
 }
 
-export function markExecutionRows(component: any, rows: string[]): string[] {
+export function markRailClickRows(component: any, rows: string[]): string[] {
 	if (rows.length === 0) return rows;
-	const id = executionMarkerId(component);
-	const cached = component?.[EXECUTION_MARKED_ROWS_CACHE_KEY] as { source: string[]; rows: string[] } | undefined;
+	const id = railClickMarkerId(component);
+	const cached = component?.[RAIL_CLICK_MARKED_ROWS_CACHE_KEY] as { source: string[]; rows: string[] } | undefined;
 	if (cached?.source === rows) return cached.rows;
 
-	const start = `\x1b_pi-rail-execution:start:${id}\x07`;
-	const end = `\x1b_pi-rail-execution:end:${id}\x07`;
+	const start = `\x1b_pi-rail-click:start:${id}\x07`;
+	const end = `\x1b_pi-rail-click:end:${id}\x07`;
 	const marked = [...rows];
 	marked[0] = `${start}${marked[0] ?? ""}`;
 	const last = marked.length - 1;
 	marked[last] = `${marked[last] ?? ""}${end}`;
-	component[EXECUTION_MARKED_ROWS_CACHE_KEY] = { source: rows, rows: marked };
+	component[RAIL_CLICK_MARKED_ROWS_CACHE_KEY] = { source: rows, rows: marked };
 	return marked;
 }
 
@@ -49,7 +47,7 @@ function markerIds(line: string, pattern: RegExp): number[] {
 	return Array.from(line.matchAll(pattern), (match) => Number(match[1]));
 }
 
-export function executionComponentAtRow(lines: string[], row: number): any | undefined {
+export function railClickComponentAtRow(lines: string[], row: number): any | undefined {
 	const ranges = new Map<number, { start: number; end?: number }>();
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index] ?? "";
@@ -65,7 +63,7 @@ export function executionComponentAtRow(lines: string[], row: number): any | und
 		if (row < range.start || row > (range.end ?? range.start)) continue;
 		if (!match || range.start >= match.start) match = { id, start: range.start };
 	}
-	return match ? executionComponents.get(match.id) : undefined;
+	return match ? railClickComponents.get(match.id) : undefined;
 }
 
 function scrollContentLines(tui: any, scrollView: any): string[] | undefined {
@@ -91,7 +89,7 @@ function clearNativeSelection(tui: any): void {
 	tui.selectionDragged = false;
 }
 
-export function handleExecutionClick(tui: any, event: any): boolean {
+export function handleRailSectionClick(tui: any, event: any): boolean {
 	if (!event?.release || (event.button & 3) !== 0) return false;
 	if (!tui?.selectionPressActive || tui.selectionDragged || tui.selectionInitialRange || tui.pressedUrl) return false;
 
@@ -101,12 +99,11 @@ export function handleExecutionClick(tui: any, event: any): boolean {
 	if (!point || point.scrollView !== anchor.scrollView || point.row !== anchor.row || point.col !== anchor.col) return false;
 
 	const lines = scrollContentLines(tui, anchor.scrollView);
-	const component = lines ? executionComponentAtRow(lines, anchor.row) : undefined;
+	const component = lines ? railClickComponentAtRow(lines, anchor.row) : undefined;
 	if (!component || typeof component.setExpanded !== "function") return false;
 
-	const kind = isBashExecution(component) ? "bashExecution" : "toolExecution";
-	const config = railSectionConfig(kind);
-	if (!config.collapsible || !config.clickToToggle) return false;
+	const section = resolveRailSection(component);
+	if (!section || !canToggleRailSection(section)) return false;
 
 	clearNativeSelection(tui);
 	markRailSectionManuallyToggled(component);
@@ -115,17 +112,17 @@ export function handleExecutionClick(tui: any, event: any): boolean {
 	return true;
 }
 
-export async function patchExecutionClickHandling(patcher: ExecutionRailPatcher): Promise<void> {
+export async function patchRailSectionClickHandling(patcher: ExecutionRailPatcher): Promise<void> {
 	const ctor = await resolveNativeTuiExport<AltScreenConstructor>("TuiAltScreen");
 	patcher.patchMethod(ctor, "handleSelectionMouseEvent", (original) => function patchedSelectionMouseEvent(
 		this: any,
 		event: any,
 	): void {
-		if (handleExecutionClick(this, event)) return;
+		if (handleRailSectionClick(this, event)) return;
 		return original.call(this, event);
 	});
 }
 
-export function clearExecutionClickRegistry(): void {
-	executionComponents.clear();
+export function clearRailClickRegistry(): void {
+	railClickComponents.clear();
 }

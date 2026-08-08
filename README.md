@@ -9,7 +9,7 @@ It customizes visual surfaces and tool presentation while preserving Pi's normal
 - Slate-gray editor with a thin left rail.
 - Rail-styled editor and message surfaces.
 - Pi-native fullscreen mode provides the fixed editor/footer dock and independently scrolling transcript.
-- Pi-native mouse selection, scrolling, scrollbar, and selector lifecycle.
+- Pi-native mouse selection, scrolling, and selector lifecycle; Rail keeps the legacy blue scrollbar over the native transcript.
 - Rail collapse presentation follows Pi's native `Ctrl+O` expansion state and supports single-click tool/bash toggles in fullscreen mode.
 - User messages, assistant thinking, assistant replies, tool output, and command output use a consistent left-gap layout.
 - Centralized visual configuration in `ui-style.json`.
@@ -151,7 +151,7 @@ Slash autocomplete stays inside Pi's native editor lifecycle and list implementa
 
 ### 9. Tool Execution Layout
 
-Tool and `!bash` execution results keep their Rail surfaces, compact previews, and theme-derived colors. Pi's native `Ctrl+O` behavior controls global expansion. In fullscreen mode, a plain single click on a tool/bash block toggles only that block; drag selection, links, wheel scrolling, the scrollbar, and scroll anchoring remain owned by Pi.
+Tool, `!bash`, and assistant thinking blocks keep their Rail surfaces, compact previews, and theme-derived colors. Pi's native `Ctrl+O` behavior controls global expansion. In fullscreen mode, a plain single click on a tool, bash, or thinking block toggles only that block (during streaming and after completion); drag selection, links, wheel scrolling, the scrollbar, and scroll anchoring remain owned by Pi.
 
 ### 10. Command and Reload Output Alignment
 
@@ -185,11 +185,11 @@ Important sections:
 
 ### `appLayout`
 
-Retained for legacy style compatibility. Pi's native viewport does not apply a Rail-managed global gutter:
+Controls the blank columns kept between the terminal's left edge and the fullscreen transcript and dock (messages, header, loaded resources, status line, widgets, editor, and footer). Rail wraps Pi's layout containers with this gutter instead of re-owning the viewport:
 
 ```json
 {
-  "leftGutterWidth": 2
+  "leftGutterWidth": 1
 }
 ```
 
@@ -221,7 +221,7 @@ Conversation scrolling is delegated to Pi. The legacy section remains configurab
 }
 ```
 
-Use Pi's `tuiMode: "fullscreen"` setting for the native fixed editor/footer dock, transcript scrolling, scrollbar, and mouse selection. Rail does not duplicate those behaviors.
+Use Pi's `tuiMode: "fullscreen"` setting for the native fixed editor/footer dock and transcript scrolling. In fullscreen, Rail hides Pi's built-in scrollbar and draws the legacy Rail scrollbar instead: a one-column blue thumb (`editor.rail` / `conversationScroll.scrollbar.thumbBackground`) over a transparent track, shown only while the transcript overflows.
 
 ### `bashExecution`
 
@@ -290,7 +290,7 @@ Each section can use the same shape:
 }
 ```
 
-`assistantThinking`, `toolExecution`, and `bashExecution` enable Rail collapse presentation; each defaults to `autoCollapseAfterRows: 20`, so short blocks open by default while long blocks fold automatically. Pi's native `Ctrl+O` action controls the global expanded state. For `toolExecution` and `bashExecution`, `clickToToggle: true` enables a narrow fullscreen single-click hook without replacing Pi's mouse router or selection logic. The selection fields remain compatibility metadata. `spacing.beforeRows` / `spacing.afterRows` insert plain blank rows outside the section content. `scope: "group"` applies leading spacing only to the first item in a consecutive run of the same section kind; this is used by `commandOutput` and `resourceStatus` so `/session` and `/reload` outputs are separated from previous history without adding gaps between every resource/status child.
+`assistantThinking`, `toolExecution`, and `bashExecution` enable Rail collapse presentation; each defaults to `autoCollapseAfterRows: 20`, so short blocks open by default while long blocks fold automatically. Pi's native `Ctrl+O` action controls the global expanded state, and `clickToToggle: true` enables a narrow fullscreen single-click hook for all three kinds (thinking included, during streaming and after) without replacing Pi's mouse router or selection logic. The selection fields remain compatibility metadata. `spacing.beforeRows` / `spacing.afterRows` insert plain blank rows outside the section content. `scope: "group"` applies leading spacing only to the first item in a consecutive run of the same section kind; this is used by `commandOutput` and `resourceStatus` so `/session` and `/reload` outputs are separated from previous history without adding gaps between every resource/status child.
 
 `selectorOutput` remains in the style schema for compatibility only. Pi's built-in `/settings`, `/model`, `/models`, and editor autocomplete components are used unchanged so selector disposal, focus, and refresh behavior remain native.
 
@@ -318,7 +318,9 @@ pi-rail-ui/
 │   ├── index.ts                     # Rail primitive exports
 │   ├── rail-surface.ts              # Shared rail/surface renderers and section-derived surface styles
 │   ├── rail-section.ts              # Rail metadata, collapse state, and wrapper helpers
-│   └── render-cache.ts              # Width/signature render cache helper
+│   ├── render-cache.ts              # Width/signature render cache helper
+│   ├── gutter.ts                    # Fullscreen left-gutter container wrapping
+│   └── rail-scrollbar.ts            # Legacy Rail scrollbar over the native transcript
 └── components/
     ├── editor/
     │   ├── index.ts                 # Editor feature exports
@@ -365,12 +367,14 @@ The extension includes several optimizations for long sessions:
 - Component and surface render caches for long messages and tool output.
 - Cached execution previews and width-aware formatting where needed.
 - Completed simple tool/bash previews are reused across scroll frames instead of rescanning large arguments or output.
-- Pi owns transcript layout, viewport, scrollbar, and native selection performance.
+- Pi owns transcript layout, viewport, scrolling, and native selection performance.
+- Fullscreen scrollbar rendering is Rail's own one-column overlay, drawn from Pi's scroll state without taking over the viewport or input.
 
 ## Limitations and Caveats
 
 - Visual component patches and the narrow fullscreen copy/click seams depend on selected Pi internals and may need updates when component or mouse-handler shapes change.
-- Pi owns fullscreen mode, transcript scrolling, scrollbar behavior, terminal mouse selection, and selector lifecycle.
+- Pi owns fullscreen mode, transcript scrolling, terminal mouse selection, and selector lifecycle; Rail replaces only the scrollbar's visual presentation.
+- The terminal emulator's own scrollbar (iTerm2 "Save lines to scrollback in alternate screen") is outside the escape-code surface; disable that profile setting if it appears alongside Rail's scrollbar.
 - Set Pi's `tuiMode` to `fullscreen` to use its fixed dock and native transcript viewport.
 - Standard terminal protocols do not reliably allow changing the OS cursor shape on hover.
 - Pi's Markdown renderer is terminal-oriented, not GitHub/web Markdown:

@@ -1,6 +1,7 @@
 import { type Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { railSectionConfig } from "../../config";
+import { markRailClickRows } from "../executions/rail-click";
 import {
 	EditorSurfaceRenderer,
 	SurfaceContentInsetBlock,
@@ -138,13 +139,15 @@ class AssistantThinkingRailBlock implements Component {
 		if (!isRailUiActive()) return this.inner.render(width);
 		const config = railSectionConfig("assistantThinking");
 		const limit = config.collapsible ? config.autoCollapseAfterRows : undefined;
+		let rows: string[];
 		if (!limit || this.hidden || this.rawLines.length <= limit) {
 			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.setExpandedAutomatically(true);
-			return this.fullRows(width);
+			rows = this.fullRows(width);
+		} else {
+			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.setExpandedAutomatically(false);
+			rows = this.expanded ? this.fullRows(width) : this.collapsedRows(width, limit);
 		}
-
-		if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.setExpandedAutomatically(false);
-		return this.expanded ? this.fullRows(width) : this.collapsedRows(width, limit);
+		return markRailClickRows(this, rows);
 	}
 }
 

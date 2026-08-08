@@ -9,7 +9,7 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地视觉扩展。它为长时�
 - Slate 灰色输入框，带细左侧 rail。
 - Rail 风格的输入框和消息 surface。
 - Pi 原生 fullscreen mode 提供固定 editor/footer dock 和独立滚动 transcript。
-- Pi 原生负责鼠标选择、滚动、滚动条和 selector 生命周期。
+- Pi 原生负责鼠标选择、滚动和 selector 生命周期；Rail 在原生 transcript 上保留旧版蓝色滚动条。
 - Rail presentation 跟随 Pi 原生 `Ctrl+O` 全局状态，并支持 fullscreen 下单击 tool/bash 块单独展开或收起。
 - 用户消息、assistant thinking、assistant 正文、工具输出、命令输出使用统一的左侧 gap 对齐。
 - 所有主要视觉配置集中在 `ui-style.json`。
@@ -150,7 +150,7 @@ Slash autocomplete 保持在 Pi 原生 editor lifecycle 和 list 实现中。Rai
 
 ### 9. 工具执行块布局
 
-Tool 和 `!bash` 执行结果继续使用 Rail surface、紧凑 preview 和主题颜色。Pi 原生 `Ctrl+O` 控制全局展开状态；fullscreen 下普通单击 tool/bash 块会只切换该块。拖动选择、链接、滚轮、滚动条和滚动锚定仍由 Pi 原生管理。
+Tool、`!bash` 和 assistant thinking 块继续使用 Rail surface、紧凑 preview 和主题颜色。Pi 原生 `Ctrl+O` 控制全局展开状态；fullscreen 下普通单击 tool/bash/thinking 块会只切换该块（流式期间和完成后都可用）。拖动选择、链接、滚轮、滚动条和滚动锚定仍由 Pi 原生管理。
 
 ### 10. 命令输出和 `/reload` 输出对齐
 
@@ -184,11 +184,11 @@ ui-style.json
 
 ### `appLayout`
 
-为旧样式配置兼容保留。Pi 原生 viewport 不会应用 Rail 管理的全局 gutter：
+控制终端左边缘与 fullscreen transcript/dock（消息、header、加载资源、状态行、widgets、输入框和 footer）之间保留的空白列数。Rail 通过包裹 Pi 的布局容器实现该 gutter，不重新接管 viewport：
 
 ```json
 {
-  "leftGutterWidth": 2
+  "leftGutterWidth": 1
 }
 ```
 
@@ -220,7 +220,7 @@ ui-style.json
 }
 ```
 
-需要固定 editor/footer dock、transcript 滚动、滚动条和鼠标选择时，请使用 Pi 的 `tuiMode: "fullscreen"` 设置。Rail 不再重复实现这些功能。
+需要固定 editor/footer dock 和 transcript 滚动时，请使用 Pi 的 `tuiMode: "fullscreen"` 设置。fullscreen 下 Rail 会隐藏 Pi 内置滚动条，改绘旧版 Rail 滚动条：单列蓝色 thumb（`editor.rail` / `conversationScroll.scrollbar.thumbBackground`），透明 track，仅在 transcript 溢出时显示。
 
 ### `bashExecution`
 
@@ -289,7 +289,7 @@ ui-style.json
 }
 ```
 
-`assistantThinking`、`toolExecution` 和 `bashExecution` 启用 Rail 的折叠展示；三者默认 `autoCollapseAfterRows: 20`，短块展开，长块自动折叠。全局展开状态由 Pi 原生 `Ctrl+O` 管理。对 `toolExecution` 和 `bashExecution`，`clickToToggle: true` 会启用一个窄的 fullscreen 单击 release hook，但不会替换 Pi 的鼠标路由或选择逻辑。selection 字段继续作为兼容 metadata。`spacing.beforeRows` / `spacing.afterRows` 会在 section 内容之外插入纯空白行。`scope: "group"` 表示连续同类 section 只在第一项前加前置空行；`commandOutput` 和 `resourceStatus` 使用该模式，因此 `/session` 和 `/reload` 会和前一段历史隔开，但不会在每个资源/状态子块之间插空行。
+`assistantThinking`、`toolExecution` 和 `bashExecution` 启用 Rail 的折叠展示；三者默认 `autoCollapseAfterRows: 20`，短块展开，长块自动折叠。全局展开状态由 Pi 原生 `Ctrl+O` 管理；`clickToToggle: true` 为这三种 section 启用窄的 fullscreen 单击 release hook（含 thinking，流式期间和完成后均可用），但不会替换 Pi 的鼠标路由或选择逻辑。selection 字段继续作为兼容 metadata。`spacing.beforeRows` / `spacing.afterRows` 会在 section 内容之外插入纯空白行。`scope: "group"` 表示连续同类 section 只在第一项前加前置空行；`commandOutput` 和 `resourceStatus` 使用该模式，因此 `/session` 和 `/reload` 会和前一段历史隔开，但不会在每个资源/状态子块之间插空行。
 
 `selectorOutput` 仅为旧 style schema 兼容保留。内置 `/settings`、`/model`、`/models` 和 editor autocomplete 均保持 Pi 原生 component，从而保留 selector dispose、focus 和 refresh 生命周期。
 
@@ -317,7 +317,9 @@ pi-rail-ui/
 │   ├── index.ts                     # Rail 基础能力导出
 │   ├── rail-surface.ts              # 共享 rail/surface 渲染器
 │   ├── rail-section.ts              # Rail metadata、折叠状态和 wrapper 辅助
-│   └── render-cache.ts              # 基于宽度/signature 的渲染缓存
+│   ├── render-cache.ts              # 基于宽度/signature 的渲染缓存
+│   ├── gutter.ts                    # Fullscreen 左侧 gutter 容器包裹
+│   └── rail-scrollbar.ts            # 在原生 transcript 上绘制旧版 Rail 滚动条
 └── components/
     ├── editor/
     │   ├── index.ts                 # Editor 功能导出
@@ -364,12 +366,14 @@ pi-rail-ui/
 - 长消息与工具输出使用 component/surface render cache。
 - Execution preview 缓存和按需宽度格式化。
 - 已完成的 simple tool/bash preview 会跨滚动帧复用，不再重复扫描大型参数或输出。
-- Transcript layout、viewport、scrollbar 和原生选择性能由 Pi 管理。
+- Transcript layout、viewport 和原生选择性能由 Pi 管理。
+- Fullscreen 滚动条是 Rail 自己绘制的单列 overlay，只读取 Pi 的滚动状态，不接管 viewport 或输入。
 
 ## 限制和注意事项
 
 - 部分视觉 component patch 以及窄范围 fullscreen copy/click seam 仍依赖 Pi 内部结构，component 或 mouse handler shape 变化时可能需要同步更新。
-- Fullscreen mode、transcript 滚动、scrollbar、终端鼠标选择和 selector 生命周期由 Pi 原生管理。
+- Fullscreen mode、transcript 滚动、终端鼠标选择和 selector 生命周期由 Pi 原生管理；Rail 只替换滚动条的视觉呈现。
+- 终端模拟器自身的滚动条（iTerm2 的 "Save lines to scrollback in alternate screen"）不在转义序列可控范围内；若它与 Rail 滚动条同时出现，请在 iTerm2 profile 设置中关闭该选项。
 - 使用固定 dock 和原生 transcript viewport 时，请把 Pi 的 `tuiMode` 设置为 `fullscreen`。
 - 标准终端协议通常不支持应用可靠改变系统鼠标指针形状。
 - Pi 的 Markdown 渲染是终端 Markdown，不是 GitHub/Web Markdown：

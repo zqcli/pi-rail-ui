@@ -9,10 +9,10 @@ import {
 	type RenderableCtor,
 } from "./execution-collapse";
 import {
-	clearExecutionClickRegistry,
-	markExecutionRows,
-	patchExecutionClickHandling,
-} from "./execution-click";
+	clearRailClickRegistry,
+	markRailClickRows,
+	patchRailSectionClickHandling,
+} from "./rail-click";
 
 const executionRailLifecycle = createPatchLifecycle<Omit<ExecutionRailPatchStore, "active" | "targets">>("execution-rail-patch", () => ({}));
 const getExecutionRailPatchStore = () => executionRailLifecycle.state();
@@ -47,7 +47,7 @@ function patchRender(ctor: RenderableCtor): void {
 		try {
 			const rows = renderExecutionRail(this, width, original, currentStore);
 			this[EXECUTION_RENDERED_KEY] = true;
-			return markExecutionRows(this, rows);
+			return markRailClickRows(this, rows);
 		} catch {
 			this[EXECUTION_RENDERED_KEY] = true;
 			return original.call(this, width);
@@ -65,10 +65,10 @@ export async function installExecutionRails(): Promise<void> {
 		patchExecutionSetExpanded(executionRailLifecycle, ctor);
 		patchRender(ctor);
 	}
-	await patchExecutionClickHandling(executionRailLifecycle);
+	await patchRailSectionClickHandling(executionRailLifecycle);
 }
 
 export function uninstallExecutionRails(): void {
 	executionRailLifecycle.deactivate();
-	clearExecutionClickRegistry();
+	clearRailClickRegistry();
 }

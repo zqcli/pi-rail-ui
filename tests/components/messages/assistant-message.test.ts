@@ -18,6 +18,12 @@ class NativeMarkdown {
 	invalidate(): void {}
 }
 
+class MultiLineMarkdown {
+	constructor(readonly text: string) {}
+	render(): string[] { return this.text.split("\n"); }
+	invalidate(): void {}
+}
+
 class NativeError {
 	render(): string[] { return ["native error"]; }
 	invalidate(): void {}
@@ -91,6 +97,73 @@ test("wraps native assistant children without rebuilding Markdown or error conte
 	assert.equal(component.contentContainer.children[5], error);
 	assert.equal(resolveRailSection(component.contentContainer.children[1])?.kind, "assistantThinking");
 	assert.equal(resolveRailSection(component.contentContainer.children[3])?.kind, "assistantReply");
+});
+
+test("keeps a manually expanded thinking block expanded across streaming updates", () => {
+	const thinking = new MultiLineMarkdown("line1\nline2\nline3\nline4\nline5");
+	const children: any[] = [new Spacer(), thinking];
+	const component: any = {
+		contentContainer: {
+			children,
+			clear() { this.children = []; },
+			addChild(child: unknown) { this.children.push(child); },
+		},
+		hideThinkingBlock: false,
+		hiddenThinkingLabel: "Thinking...",
+		hasToolCalls: false,
+	};
+
+	renderAssistantMessageRail(
+		component,
+		{ content: [{ type: "thinking", thinking: "line1\nline2\nline3\nline4\nline5" }] },
+		theme() as any,
+		railThinkingSurface,
+	);
+	const block = component.contentContainer.children[1] as any;
+	block.render(80); // auto-collapse state is applied lazily during render
+	assert.equal(block.expanded, false);
+
+	block.setExpanded(true);
+	// Simulate Pi's native updateContent replacing children with fresh native components.
+	component.contentContainer.children = [new Spacer(), new MultiLineMarkdown("line1\nline2\nline3\nline4\nline5\nline6")];
+	renderAssistantMessageRail(
+		component,
+		{ content: [{ type: "thinking", thinking: "line1\nline2\nline3\nline4\nline5\nline6" }] },
+		theme() as any,
+		railThinkingSurface,
+	);
+
+	assert.equal(component.contentContainer.children[1], block);
+	const rows = block.render(80).map((row: string) => stripAnsi(row));
+	assert.equal(rows.some((row: string) => row.includes("line6")), true);
+	assert.equal(rows.some((row: string) => /more lines/.test(row)), false);
+});
+
+test("marks thinking rows so a plain click can expand them", () => {
+	const thinking = new MultiLineMarkdown("line1\nline2\nline3\nline4");
+	const children: any[] = [new Spacer(), thinking];
+	const component: any = {
+		contentContainer: {
+			children,
+			clear() { this.children = []; },
+			addChild(child: unknown) { this.children.push(child); },
+		},
+		hideThinkingBlock: false,
+		hiddenThinkingLabel: "Thinking...",
+		hasToolCalls: false,
+	};
+
+	renderAssistantMessageRail(
+		component,
+		{ content: [{ type: "thinking", thinking: "line1\nline2\nline3\nline4" }] },
+		theme() as any,
+		railThinkingSurface,
+	);
+	const block = component.contentContainer.children[1] as any;
+	const rows = block.render(80);
+
+	assert.equal(rows[0]!.includes("\x1b_pi-rail-click:start:"), true);
+	assert.equal(rows[rows.length - 1]!.includes("\x1b_pi-rail-click:end:"), true);
 });
 
 test("preserves native outputPad, transformers, streaming context, and length status", async () => {

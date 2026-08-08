@@ -11,6 +11,8 @@ import { installRailFast } from "./commands/rail-fast";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
+import { installGutter, uninstallGutter } from "./rail/gutter";
+import { installRailScrollbar, uninstallRailScrollbar } from "./rail/rail-scrollbar";
 import { installApplyPatchTool } from "./tools";
 
 export * from "./config";
@@ -46,6 +48,8 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		setRailUiActive(true);
 		installEditor(ctx);
 		installFooter(ctx);
+		await installGutter();
+		await installRailScrollbar();
 		await installFooterCopyFeedback();
 		await installAssistantMessageRail(ctx.ui.theme);
 		await installUserMessageRail(ctx);
@@ -59,6 +63,8 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		setRailUiActive(false);
 		ctx.ui.setEditorComponent(undefined);
 		ctx.ui.setFooter(undefined);
+		uninstallGutter();
+		uninstallRailScrollbar();
 		uninstallFooterCopyFeedback();
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();
@@ -135,6 +141,8 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		setRailUiActive(false);
 		// Pi owns session replacement, terminal input, and renderer cleanup. Rail
 		// only tears down its style and narrow interaction patches.
+		uninstallGutter();
+		uninstallRailScrollbar();
 		uninstallFooterCopyFeedback();
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();

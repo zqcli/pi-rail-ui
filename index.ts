@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { RailEditor } from "./components/editor";
-import { createRailFooter, openRailSessionModal, setTurnEndTime, setTurnStartTime } from "./components/footer";
+import { createRailFooter, installFooterCopyFeedback, openRailSessionModal, setTurnEndTime, setTurnStartTime, uninstallFooterCopyFeedback } from "./components/footer";
 import { handleDuplicateCommand } from "./commands/duplicate";
 import { installRailFast } from "./commands/rail-fast";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
@@ -46,6 +46,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		setRailUiActive(true);
 		installEditor(ctx);
 		installFooter(ctx);
+		await installFooterCopyFeedback();
 		await installAssistantMessageRail(ctx.ui.theme);
 		await installUserMessageRail(ctx);
 		await installExecutionRails();
@@ -58,6 +59,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		setRailUiActive(false);
 		ctx.ui.setEditorComponent(undefined);
 		ctx.ui.setFooter(undefined);
+		uninstallFooterCopyFeedback();
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();
 		uninstallExecutionRails();
@@ -132,7 +134,8 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event) => {
 		setRailUiActive(false);
 		// Pi owns session replacement, terminal input, and renderer cleanup. Rail
-		// only tears down its component patches.
+		// only tears down its style and narrow interaction patches.
+		uninstallFooterCopyFeedback();
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();
 		uninstallExecutionRails();

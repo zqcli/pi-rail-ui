@@ -8,6 +8,7 @@ import {
 	collapsedSimpleLine,
 	executionHiddenLineCount,
 } from "../../../components/executions/execution-collapse";
+import { renderExecutionRail } from "../../../components/executions/execution-rail";
 
 class BashComponent {
 	expanded: boolean;
@@ -68,6 +69,28 @@ describe("collapsed simple rendering", () => {
 		assert.equal(rows[0], "title ");
 		assert.equal(rows[1], "detail value");
 		assert.match(rows[2] ?? "", /\.\.\. \(3 more lines,/);
+	});
+
+	test("reuses completed collapsed tool rows while the transcript scrolls", () => {
+		const component = {
+			expanded: false,
+			isPartial: false,
+			result: { isError: false },
+			args: { content: "line\n".repeat(5000), path: "/tmp/output.txt" },
+			toolCallId: "call-cache",
+			toolName: "write",
+			hasRendererDefinition: () => false,
+			getTextOutput: () => "created",
+			setExpanded(expanded: boolean) {
+				this.expanded = expanded;
+			},
+		};
+		const original = () => assert.fail("collapsed simple tools should not use the native expanded renderer");
+
+		const first = renderExecutionRail(component, 80, original, { active: true });
+		const second = renderExecutionRail(component, 80, original, { active: true });
+
+		assert.strictEqual(second, first);
 	});
 });
 

@@ -100,12 +100,14 @@ function renderBashExecutionRail(
 	const contentWidth = surface.contentWidth(width);
 	const simpleMode = railSectionConfig("bashExecution").collapsedRenderMode === "simple";
 	applyDefaultAutoCollapse(component, "bashExecution", () => renderedChildLines(component.contentContainer, contentWidth), { avoidExpandedRender: simpleMode });
+	const signature = bashRenderSignature(component, width, contentWidth);
 
 	if (simpleMode && !component.expanded) {
-		return collapsedBashSimpleRows(component, store.theme).map((line) => line ? surface.renderSurfaceRow(width, line) : line);
+		return cachedRender(component, BASH_SURFACE_CACHE_KEY, signature, () =>
+			collapsedBashSimpleRows(component, store.theme).map((line) => line ? surface.renderSurfaceRow(width, line) : line),
+		);
 	}
 
-	const signature = bashRenderSignature(component, width, contentWidth);
 	return cachedRender(component, BASH_SURFACE_CACHE_KEY, signature, () => {
 		const directPreview = collapsedBashPreviewRows(component, contentWidth, store.theme);
 		const lines = directPreview ?? (() => {
@@ -178,20 +180,20 @@ function renderToolExecutionRail(
 	const config = railSectionConfig(kind);
 	const simpleMode = config.collapsedRenderMode === "simple";
 	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, width), { avoidExpandedRender: simpleMode });
-
-	if (simpleMode && !component.expanded) {
-		return collapsedToolSimpleRows(component, width, store.theme);
-	}
-
 	const cacheable = Boolean(component.result && component.isPartial === false && (!Array.isArray(component.imageComponents) || component.imageComponents.length === 0));
 	if (cacheable) {
-		const signature = [width, component.expanded ? 1 : 0].join("\u001f");
+		const signature = [width, component.expanded ? 1 : 0, simpleMode ? 1 : 0].join("\u001f");
 		return cachedRender(component, TOOL_RAIL_CACHE_KEY, signature, () => {
+			if (simpleMode && !component.expanded) return collapsedToolSimpleRows(component, width, store.theme);
 			const renderedRows = originalRender.call(component, width);
 			return shouldApplyGenericToolCollapse(component)
 				? collapsedExecutionRows(component, kind, renderedRows, width, store.theme)
 				: renderedRows;
 		}, { result: component.result, args: component.args });
+	}
+
+	if (simpleMode && !component.expanded) {
+		return collapsedToolSimpleRows(component, width, store.theme);
 	}
 
 	const renderedRows = originalRender.call(component, width);

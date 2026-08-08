@@ -10,7 +10,7 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地视觉扩展。它为长时�
 - Rail 风格的输入框和消息 surface。
 - Pi 原生 fullscreen mode 提供固定 editor/footer dock 和独立滚动 transcript。
 - Pi 原生负责鼠标选择、滚动、滚动条和 selector 生命周期。
-- Rail presentation 仍可为工具执行块提供单独展开/收起。
+- Rail presentation 跟随 Pi 原生 `Ctrl+O` 全局状态，并支持 fullscreen 下单击 tool/bash 块单独展开或收起。
 - 用户消息、assistant thinking、assistant 正文、工具输出、命令输出使用统一的左侧 gap 对齐。
 - 所有主要视觉配置集中在 `ui-style.json`。
 
@@ -86,9 +86,10 @@ Pi Rail UI 注册了以下 slash 命令：
 
 ### 1. 基于 Rail 的输入框界面
 
-输入框被渲染为带左侧细 rail 的 slate 灰色 surface。换行、高度、光标、autocomplete、粘贴处理和输入框内部滚动由 Pi 原生 `CustomEditor` 管理；Rail 只给原生输出行包上一层配置好的 surface：
+输入框被渲染为带左侧细 rail 的 slate 灰色 surface。换行、光标、autocomplete、粘贴处理和输入框内部滚动由 Pi 原生 `CustomEditor` 管理；Rail 移除原生横向 frame、应用 `editor.height`，再给其余原生输出行包上配置好的 surface：
 
-- Pi 原生 editor border 和滚动提示会保留在 surface 内。
+- Pi 原生 editor 上下边框会被 Rail surface 完全替换。
+- `editor.height.min`、`max` 和 `maxRatio` 控制可见输入区域高度。
 - 左侧使用可配置的 rail 字符。
 - 粘贴标记会被高亮显示。
 - 继承 Pi 原生 `CustomEditor`，保留标准编辑行为。
@@ -119,7 +120,7 @@ Transcript layout、wheel/page scrolling、scrollbar、prompt navigation 和文�
 
 ### 4. 原生选择和剪贴板
 
-Fullscreen transcript 的选择与复制使用 Pi 原生 TUI 行为，包括选词、选段和边缘自动滚动。Rail 不再全局启用或禁用 terminal mouse tracking。
+Fullscreen transcript 的选择与复制使用 Pi 原生 TUI 行为，包括选词、选段和边缘自动滚动。Rail 不再全局启用或禁用 terminal mouse tracking；它只把 Pi 位于右上角 flash stack 的临时 `Copied!` 提示转移到 Rail footer。
 
 ### 5. Assistant Thinking 和正文对齐
 
@@ -149,7 +150,7 @@ Slash autocomplete 保持在 Pi 原生 editor lifecycle 和 list 实现中。Rai
 
 ### 9. 工具执行块布局
 
-Tool 和 `!bash` 执行结果继续使用 Rail surface、紧凑 preview 和主题颜色。展开/收起交给 Pi 原生 `Ctrl+O` 行为；Rail 不再截获 transcript 鼠标输入来实现单块点击切换或滚动锚定。
+Tool 和 `!bash` 执行结果继续使用 Rail surface、紧凑 preview 和主题颜色。Pi 原生 `Ctrl+O` 控制全局展开状态；fullscreen 下普通单击 tool/bash 块会只切换该块。拖动选择、链接、滚轮、滚动条和滚动锚定仍由 Pi 原生管理。
 
 ### 10. 命令输出和 `/reload` 输出对齐
 
@@ -205,7 +206,7 @@ ui-style.json
 
 ### `editor`
 
-控制 Rail 输入框的颜色、surface 几何和粘贴标记样式。`editor.height` 和 `editor.mouseTracking` 仍可读取旧 style 文件，但输入框高度、滚动以及鼠标/输入处理由 Pi 原生 `CustomEditor` 管理。
+控制 Rail 输入框的颜色、surface 几何、粘贴标记样式和可见输入高度。`height.min` 是静止高度，`height.max` 与 `height.maxRatio` 限制长输入增长。`editor.mouseTracking` 仍可读取旧 style 文件，但鼠标和输入处理保持 Pi 原生。
 
 ### `conversationScroll`
 
@@ -288,7 +289,7 @@ ui-style.json
 }
 ```
 
-`assistantThinking`、`toolExecution` 和 `bashExecution` 启用 Rail 的折叠展示；三者默认 `autoCollapseAfterRows: 20`，短块展开，长块自动折叠。全局展开状态由 Pi 原生 `Ctrl+O` 管理。`clickToToggle` 和 selection 字段仍保留在 schema 中以兼容旧配置，但 Rail 不再安装 transcript 鼠标路由。`spacing.beforeRows` / `spacing.afterRows` 会在 section 内容之外插入纯空白行。`scope: "group"` 表示连续同类 section 只在第一项前加前置空行；`commandOutput` 和 `resourceStatus` 使用该模式，因此 `/session` 和 `/reload` 会和前一段历史隔开，但不会在每个资源/状态子块之间插空行。
+`assistantThinking`、`toolExecution` 和 `bashExecution` 启用 Rail 的折叠展示；三者默认 `autoCollapseAfterRows: 20`，短块展开，长块自动折叠。全局展开状态由 Pi 原生 `Ctrl+O` 管理。对 `toolExecution` 和 `bashExecution`，`clickToToggle: true` 会启用一个窄的 fullscreen 单击 release hook，但不会替换 Pi 的鼠标路由或选择逻辑。selection 字段继续作为兼容 metadata。`spacing.beforeRows` / `spacing.afterRows` 会在 section 内容之外插入纯空白行。`scope: "group"` 表示连续同类 section 只在第一项前加前置空行；`commandOutput` 和 `resourceStatus` 使用该模式，因此 `/session` 和 `/reload` 会和前一段历史隔开，但不会在每个资源/状态子块之间插空行。
 
 `selectorOutput` 仅为旧 style schema 兼容保留。内置 `/settings`、`/model`、`/models` 和 editor autocomplete 均保持 Pi 原生 component，从而保留 selector dispose、focus 和 refresh 生命周期。
 
@@ -323,7 +324,8 @@ pi-rail-ui/
     │   └── rail-editor.ts           # 原生 CustomEditor surface wrapper 和 autocomplete 样式
     ├── footer/
     │   ├── index.ts                 # Footer 功能导出
-    │   └── footer.ts                # Footer 统计、布局、缓存和渲染
+    │   ├── footer.ts                # Footer 统计、布局、缓存和渲染
+    │   └── copy-feedback.ts         # 将 fullscreen 复制提示转移到 footer
     ├── messages/
     │   ├── index.ts                 # Message 功能导出
     │   ├── assistant-message.ts     # Assistant thinking/reply rail patch
@@ -334,6 +336,7 @@ pi-rail-ui/
         ├── index.ts                 # Execution 功能导出
         ├── bash-execution.ts        # Bash execution rail surface 和 preview 规范化
         ├── tool-execution.ts        # Tool execution rail install/uninstall patch
+        ├── execution-click.ts       # Fullscreen execution 单击切换 seam
         └── execution-collapse.ts    # 共享 execution auto-collapse 辅助
 ```
 
@@ -349,7 +352,7 @@ pi-rail-ui/
    输入框、thinking、用户消息和命令/工具输出复用同一个 rail 几何模型。Pi 原生 selector 和 fullscreen viewport 不再由 Rail 重复实现。
 
 4. **原生 Pi 行为优先**
-   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择、同步输出和 selector ownership。Prototype patch 仅用于没有等价公开 renderer hook 的视觉 component。
+   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择引擎、同步输出和 selector ownership。原生 integration patch 仅限视觉 component、复制提示位置，以及实现单块 execution 点击所需的普通单击 release seam。
 
 5. **优化热路径性能**
    Rail 缓存 component 和 surface 渲染，但不再持有 Pi 原生 transcript scroll state。
@@ -360,11 +363,12 @@ pi-rail-ui/
 
 - 长消息与工具输出使用 component/surface render cache。
 - Execution preview 缓存和按需宽度格式化。
-- Editor layout、transcript viewport、scrollbar 和原生鼠标交互性能由 Pi 管理。
+- 已完成的 simple tool/bash preview 会跨滚动帧复用，不再重复扫描大型参数或输出。
+- Transcript layout、viewport、scrollbar 和原生选择性能由 Pi 管理。
 
 ## 限制和注意事项
 
-- 部分视觉 component patch 仍依赖 Pi 内部结构，消息 component shape 变化时可能需要同步更新。
+- 部分视觉 component patch 以及窄范围 fullscreen copy/click seam 仍依赖 Pi 内部结构，component 或 mouse handler shape 变化时可能需要同步更新。
 - Fullscreen mode、transcript 滚动、scrollbar、终端鼠标选择和 selector 生命周期由 Pi 原生管理。
 - 使用固定 dock 和原生 transcript viewport 时，请把 Pi 的 `tuiMode` 设置为 `fullscreen`。
 - 标准终端协议通常不支持应用可靠改变系统鼠标指针形状。

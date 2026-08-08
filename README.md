@@ -10,7 +10,7 @@ It customizes visual surfaces and tool presentation while preserving Pi's normal
 - Rail-styled editor and message surfaces.
 - Pi-native fullscreen mode provides the fixed editor/footer dock and independently scrolling transcript.
 - Pi-native mouse selection, scrolling, scrollbar, and selector lifecycle.
-- Rail collapse presentation follows Pi's native `Ctrl+O` expansion state.
+- Rail collapse presentation follows Pi's native `Ctrl+O` expansion state and supports single-click tool/bash toggles in fullscreen mode.
 - User messages, assistant thinking, assistant replies, tool output, and command output use a consistent left-gap layout.
 - Centralized visual configuration in `ui-style.json`.
 
@@ -87,9 +87,10 @@ It is active for Pi's documented `samplingParams` request paths: `openai-complet
 
 ### 1. Rail-Based Editor Surface
 
-The input editor is rendered as a slate-gray surface with a left rail. Pi's native `CustomEditor` owns wrapping, height, cursor placement, autocomplete, paste handling, and internal editor scrolling; Rail only wraps its rendered rows with the configured surface:
+The input editor is rendered as a slate-gray surface with a left rail. Pi's native `CustomEditor` owns wrapping, cursor placement, autocomplete, paste handling, and internal editor scrolling; Rail removes the native horizontal frame, applies `editor.height`, and wraps the remaining native rows with the configured surface:
 
-- Pi's native editor borders and scroll indicators are preserved inside the surface.
+- Pi's native top/bottom editor borders are replaced by the Rail surface.
+- `editor.height.min`, `max`, and `maxRatio` control the visible input window.
 - Thin left rail using the configured rail glyph.
 - Paste markers are highlighted for better visibility.
 - Standard Pi editor behavior is preserved through inheritance from Pi's `CustomEditor`.
@@ -120,7 +121,7 @@ Pi's regular/fullscreen renderer owns transcript layout, wheel and page scrollin
 
 ### 4. Native Selection and Clipboard
 
-Fullscreen transcript selection and copy use Pi's native TUI behavior, including its word/paragraph selection and autoscroll support. Rail does not enable or disable terminal mouse tracking globally.
+Fullscreen transcript selection and copy use Pi's native TUI behavior, including its word/paragraph selection and autoscroll support. Rail does not enable or disable terminal mouse tracking globally; it only redirects Pi's transient `Copied!` confirmation from the top-right flash stack into the Rail footer.
 
 ### 5. Assistant Thinking and Reply Alignment
 
@@ -150,7 +151,7 @@ Slash autocomplete stays inside Pi's native editor lifecycle and list implementa
 
 ### 9. Tool Execution Layout
 
-Tool and `!bash` execution results keep their Rail surfaces, compact previews, and theme-derived colors. Expansion is routed through Pi's native `Ctrl+O` behavior; Rail no longer intercepts transcript mouse input for per-block toggling or scroll anchoring.
+Tool and `!bash` execution results keep their Rail surfaces, compact previews, and theme-derived colors. Pi's native `Ctrl+O` behavior controls global expansion. In fullscreen mode, a plain single click on a tool/bash block toggles only that block; drag selection, links, wheel scrolling, the scrollbar, and scroll anchoring remain owned by Pi.
 
 ### 10. Command and Reload Output Alignment
 
@@ -206,7 +207,7 @@ Controls the shared rail geometry inside the app gutter:
 
 ### `editor`
 
-Controls Rail editor colors, surface geometry, and paste-marker styling. `editor.height` and `editor.mouseTracking` remain readable for old style files but Pi's native `CustomEditor` owns editor height, scrolling, and mouse/input handling.
+Controls Rail editor colors, surface geometry, paste-marker styling, and the visible input height. `height.min` is the resting height, while `height.max` and `height.maxRatio` cap growth for long input. `editor.mouseTracking` remains readable for old style files, but mouse/input handling stays native.
 
 ### `conversationScroll`
 
@@ -289,7 +290,7 @@ Each section can use the same shape:
 }
 ```
 
-`assistantThinking`, `toolExecution`, and `bashExecution` enable Rail collapse presentation; each defaults to `autoCollapseAfterRows: 20`, so short blocks open by default while long blocks fold automatically. Pi's native `Ctrl+O` action controls the global expanded state. `clickToToggle` and the selection fields remain in the schema for compatibility, but Rail no longer installs a transcript mouse router. `spacing.beforeRows` / `spacing.afterRows` insert plain blank rows outside the section content. `scope: "group"` applies leading spacing only to the first item in a consecutive run of the same section kind; this is used by `commandOutput` and `resourceStatus` so `/session` and `/reload` outputs are separated from previous history without adding gaps between every resource/status child.
+`assistantThinking`, `toolExecution`, and `bashExecution` enable Rail collapse presentation; each defaults to `autoCollapseAfterRows: 20`, so short blocks open by default while long blocks fold automatically. Pi's native `Ctrl+O` action controls the global expanded state. For `toolExecution` and `bashExecution`, `clickToToggle: true` enables a narrow fullscreen single-click hook without replacing Pi's mouse router or selection logic. The selection fields remain compatibility metadata. `spacing.beforeRows` / `spacing.afterRows` insert plain blank rows outside the section content. `scope: "group"` applies leading spacing only to the first item in a consecutive run of the same section kind; this is used by `commandOutput` and `resourceStatus` so `/session` and `/reload` outputs are separated from previous history without adding gaps between every resource/status child.
 
 `selectorOutput` remains in the style schema for compatibility only. Pi's built-in `/settings`, `/model`, `/models`, and editor autocomplete components are used unchanged so selector disposal, focus, and refresh behavior remain native.
 
@@ -324,7 +325,8 @@ pi-rail-ui/
     │   └── rail-editor.ts           # Native CustomEditor surface wrapper and autocomplete styling
     ├── footer/
     │   ├── index.ts                 # Footer feature exports
-    │   └── footer.ts                # Footer stats, layout, cache, and render logic
+    │   ├── footer.ts                # Footer stats, layout, cache, and render logic
+    │   └── copy-feedback.ts         # Routes fullscreen copy confirmation into the footer
     ├── messages/
     │   ├── index.ts                 # Message feature exports
     │   ├── assistant-message.ts     # Assistant thinking/reply rail patches
@@ -335,6 +337,7 @@ pi-rail-ui/
         ├── index.ts                 # Execution feature exports
         ├── bash-execution.ts        # Bash execution rail surface and preview normalization
         ├── tool-execution.ts        # Tool execution rail install/uninstall patches
+        ├── execution-click.ts       # Fullscreen single-click execution toggle seam
         └── execution-collapse.ts    # Shared execution auto-collapse helpers
 ```
 
@@ -350,7 +353,7 @@ pi-rail-ui/
    Editor, thinking, user messages, and command/tool output share the same rail geometry. Pi's native selectors and fullscreen viewport are not reimplemented by Rail.
 
 4. **Prefer native Pi behavior**
-   Rail avoids patching Pi's renderer lifecycle, alternate screen, transcript viewport, mouse selection, synchronized output, and selector ownership. Prototype patches are limited to visual components that have no equivalent public renderer hook.
+   Rail avoids patching Pi's renderer lifecycle, alternate screen, transcript viewport, mouse selection engine, synchronized output, and selector ownership. Native integration patches are limited to visual components, copy-feedback placement, and the plain-click release seam required for per-block execution toggles.
 
 5. **Optimize hot paths**
    Rail caches component and surface rendering without taking ownership of Pi's native transcript scroll state.
@@ -361,11 +364,12 @@ The extension includes several optimizations for long sessions:
 
 - Component and surface render caches for long messages and tool output.
 - Cached execution previews and width-aware formatting where needed.
-- Pi owns editor layout, transcript viewport, scrollbar, and native mouse interaction performance.
+- Completed simple tool/bash previews are reused across scroll frames instead of rescanning large arguments or output.
+- Pi owns transcript layout, viewport, scrollbar, and native selection performance.
 
 ## Limitations and Caveats
 
-- Visual component patches still depend on selected Pi internals and may need updates when message component shapes change.
+- Visual component patches and the narrow fullscreen copy/click seams depend on selected Pi internals and may need updates when component or mouse-handler shapes change.
 - Pi owns fullscreen mode, transcript scrolling, scrollbar behavior, terminal mouse selection, and selector lifecycle.
 - Set Pi's `tuiMode` to `fullscreen` to use its fixed dock and native transcript viewport.
 - Standard terminal protocols do not reliably allow changing the OS cursor shape on hover.

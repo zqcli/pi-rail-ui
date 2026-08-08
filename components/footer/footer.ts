@@ -46,7 +46,15 @@ export function showFooterSelectionNotice(tui?: any, durationMs = 1800): void {
 		store.selectionNoticeUntil = 0;
 		requestFooterRender(tui);
 	}, durationMs);
+	store.selectionNoticeTimer.unref?.();
 	requestFooterRender(tui);
+}
+
+export function clearFooterSelectionNotice(): void {
+	const store = footerStore();
+	if (store.selectionNoticeTimer) clearTimeout(store.selectionNoticeTimer);
+	store.selectionNoticeTimer = undefined;
+	store.selectionNoticeUntil = 0;
 }
 
 export function setTurnStartTime(time: number): void {

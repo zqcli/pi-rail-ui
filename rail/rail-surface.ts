@@ -1,5 +1,6 @@
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import {
+	RAIL_EDITOR_HEIGHT,
 	RAIL_EDITOR_STYLE,
 	RAIL_THINKING_STYLE,
 	RAIL_USER_MESSAGE_STYLE,
@@ -7,6 +8,7 @@ import {
 	BASH_EXECUTION_RAIL_COLOR,
 	THINKING_RAIL_COLOR,
 	railAnsiForTheme,
+	type EditorHeightPolicy,
 	type RailSurfaceStyle,
 	type ThemeLike,
 } from "../config";
@@ -28,7 +30,10 @@ export class EditorSurfaceRenderer {
 	private readonly _rowSuffix: string;
 	private rowCache = new Map<string, string>();
 
-	constructor(style: RailSurfaceStyle = RAIL_EDITOR_STYLE) {
+	constructor(
+		style: RailSurfaceStyle = RAIL_EDITOR_STYLE,
+		private readonly heightPolicy?: EditorHeightPolicy,
+	) {
 		this.style = style;
 		this.contentStart = style.leftBorderWidth + style.borderContentGapWidth;
 		this.transparentGap = " ".repeat(style.borderContentGapWidth);
@@ -46,6 +51,21 @@ export class EditorSurfaceRenderer {
 
 	contentWidth(width: number): number {
 		return Math.max(1, width - this.contentStart);
+	}
+
+	maxInputHeight(terminalRows: number): number | undefined {
+		const policy = this.heightPolicy;
+		if (!policy) return undefined;
+		return Math.max(
+			policy.minHeight,
+			Math.min(policy.maxHeight, Math.floor(terminalRows * policy.maxHeightRatio)),
+		);
+	}
+
+	targetInputHeight(bodyRows: number, terminalRows: number): number {
+		const responsiveMax = this.maxInputHeight(terminalRows);
+		if (responsiveMax === undefined) return Math.max(1, bodyRows);
+		return Math.max(this.heightPolicy!.minHeight, Math.min(responsiveMax, bodyRows));
 	}
 
 	renderSurfaceRow(width: number, content = ""): string {
@@ -76,7 +96,7 @@ export class EditorSurfaceRenderer {
 	}
 }
 
-export const railEditorSurface = new EditorSurfaceRenderer(RAIL_EDITOR_STYLE);
+export const railEditorSurface = new EditorSurfaceRenderer(RAIL_EDITOR_STYLE, RAIL_EDITOR_HEIGHT);
 export const railThinkingSurface = new EditorSurfaceRenderer(RAIL_THINKING_STYLE);
 export const railUserMessageSurface = new EditorSurfaceRenderer(RAIL_USER_MESSAGE_STYLE);
 

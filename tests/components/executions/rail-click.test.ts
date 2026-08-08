@@ -94,6 +94,38 @@ describe("rail section click handling", () => {
 		assert.equal(component.expanded, false);
 	});
 
+	test("pins the scroll position so expansion stays at the clicked row", () => {
+		const component: any = defineRailSection({
+			expanded: false,
+			setExpanded(expanded: boolean) {
+				this.expanded = expanded;
+			},
+			invalidate() {},
+		}, "assistantThinking");
+		const lines = markRailClickRows(component, ["thinking", "detail"]);
+		const scrollView = { followingEnd: true };
+		const anchor = { row: 0, col: 2, scrollView };
+		const tui = {
+			selectionPressActive: true,
+			selectionDragged: false,
+			selectionInitialRange: undefined,
+			pressedUrl: undefined,
+			selectionAnchor: anchor,
+			selectionFocus: anchor,
+			selectionGranularity: "character",
+			currentLayout: {
+				root: { children: [{ scrollView, scrollContentLines: lines, children: [] }] },
+			},
+			getSelectionPoint: () => anchor,
+			stopSelectionAutoScroll() {},
+			requestRender() {},
+		};
+
+		assert.equal(handleRailSectionClick(tui, { release: true, button: 0 }), true);
+		assert.equal(component.expanded, true);
+		assert.equal(scrollView.followingEnd, false);
+	});
+
 	test("does not toggle sections without clickToToggle", () => {
 		const component: any = defineRailSection({
 			expanded: false,

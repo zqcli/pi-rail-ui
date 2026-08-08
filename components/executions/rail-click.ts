@@ -108,6 +108,10 @@ export function handleRailSectionClick(tui: any, event: any): boolean {
 	clearNativeSelection(tui);
 	markRailSectionManuallyToggled(component);
 	component.setExpanded(!Boolean(component.expanded));
+	// Pin the transcript at the clicked row: with follow:end active, growing or
+	// shrinking content would otherwise re-anchor the viewport at the bottom
+	// and scroll the toggled section out of view.
+	if (anchor.scrollView && typeof anchor.scrollView === "object") anchor.scrollView.followingEnd = false;
 	tui.requestRender?.();
 	return true;
 }

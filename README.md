@@ -369,6 +369,7 @@ The extension includes several optimizations for long sessions:
 - Completed simple tool/bash previews are reused across scroll frames instead of rescanning large arguments or output.
 - The fullscreen left gutter reuses its prefixed rows while the transcript content is unchanged between frames.
 - The scrollbar thumb paints plain rows with a direct slice and only falls back to full overlay compositing for ANSI-styled rows; the native drag geometry stays untouched.
+- While the fullscreen scrollbar is being dragged, renders are suspended (scroll state still updates) and one final render happens on release; a 300ms inactivity timeout guards against a lost mouse-up.
 - Pi owns transcript layout, viewport, scrolling, and native selection performance.
 - Fullscreen scrollbar rendering is Rail's own one-column overlay; Pi's native auto-mode geometry keeps the thumb draggable.
 

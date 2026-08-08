@@ -9,6 +9,59 @@ const RAIL_SCROLLBAR_ORIGINAL_KEY = Symbol.for("pi-rail-ui.rail-scrollbar-origin
 const scrollbarLifecycle = createPatchLifecycle("rail-scrollbar-patch", () => ({}));
 const markedScrollViews = new Set<any>();
 
+const RAIL_DRAG_INACTIVITY_MS = 300;
+let railDragActive = false;
+let railRenderPending = false;
+let railDragTimeout: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * While the Rail scrollbar is being dragged, renders are suspended so the
+ * transcript is not redrawn on every mouse-motion event; the release (or an
+ * inactivity timeout) performs one final render. Scroll state still updates.
+ */
+export function beginRailDrag(tui: any): void {
+	railDragActive = true;
+	railRenderPending = false;
+	bumpRailDrag(tui);
+}
+
+export function bumpRailDrag(tui: any): void {
+	if (!railDragActive) return;
+	if (railDragTimeout) clearTimeout(railDragTimeout);
+	railDragTimeout = setTimeout(() => endRailDrag(tui), RAIL_DRAG_INACTIVITY_MS);
+	railDragTimeout.unref?.();
+}
+
+export function railRequestRender(tui: any): void {
+	if (railDragActive) {
+		railRenderPending = true;
+		return;
+	}
+	tui.requestRender?.();
+}
+
+export function endRailDrag(tui: any): void {
+	if (!railDragActive) return;
+	railDragActive = false;
+	if (railDragTimeout) {
+		clearTimeout(railDragTimeout);
+		railDragTimeout = undefined;
+	}
+	if (railRenderPending) {
+		railRenderPending = false;
+		tui.requestRender?.();
+	}
+}
+
+function resetRailDrag(): void {
+	railDragActive = false;
+	railRenderPending = false;
+	if (railDragTimeout) {
+		clearTimeout(railDragTimeout);
+		railDragTimeout = undefined;
+	}
+}
+
 function foregroundFromBackgroundAnsi(ansi: string): string {
 	return ansi.replace(/\x1b\[48([;:])/g, "\x1b[38$1");
 }
@@ -118,10 +171,32 @@ export async function installRailScrollbar(): Promise<void> {
 			return result;
 		}
 	});
+	scrollbarLifecycle.patchMethod(ctor, "handleScrollbarMouseEvent", (original) => function patchedScrollbarMouseEvent(
+		this: any,
+		_event: any,
+	): boolean {
+		const wasDragging = Boolean(this.scrollbarDrag);
+		const result = original.apply(this, arguments as unknown as [event: any]);
+		const isDragging = Boolean(this.scrollbarDrag);
+		if (isDragging && !wasDragging) beginRailDrag(this);
+		else if (isDragging) bumpRailDrag(this);
+		else if (wasDragging) endRailDrag(this);
+		return result;
+	});
+	scrollbarLifecycle.patchMethod(ctor, "requestRender", (original) => function patchedRequestRender(
+		this: any,
+	): void {
+		if (railDragActive) {
+			railRenderPending = true;
+			return;
+		}
+		return original.apply(this, arguments as unknown as []);
+	});
 }
 
 export function uninstallRailScrollbar(): void {
 	scrollbarLifecycle.deactivate();
+	resetRailDrag();
 	for (const scrollView of markedScrollViews) {
 		const original = scrollView[RAIL_SCROLLBAR_ORIGINAL_KEY];
 		if (original !== undefined) scrollView.setScrollbar?.(original);

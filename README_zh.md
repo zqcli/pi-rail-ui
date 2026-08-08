@@ -368,6 +368,7 @@ pi-rail-ui/
 - 已完成的 simple tool/bash preview 会跨滚动帧复用，不再重复扫描大型参数或输出。
 - Fullscreen 左 gutter 在 transcript 内容未变化时复用已加前缀的行。
 - 滚动条 thumb 对纯文本行直接用 slice 绘制，仅 ANSI 样式行走完整 overlay 合成；原生拖动几何不做任何改动。
+- 拖动 fullscreen 滚动条期间挂起渲染（滚动状态照常更新），松手后执行一次最终渲染；300ms 无事件超时防止 mouse-up 丢失时画面永久冻结。
 - Transcript layout、viewport 和原生选择性能由 Pi 管理。
 - Fullscreen 滚动条是 Rail 自己绘制的单列 overlay，只读取 Pi 的滚动状态，不接管 viewport 或输入。
 

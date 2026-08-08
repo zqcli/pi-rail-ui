@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
+import { describe, mock, test } from "node:test";
 import { getScrollbarGeometry } from "@earendil-works/pi-tui/dist/layout.js";
-import { drawRailScrollbar, isRailScrollbarView, markRailScrollbarView } from "../../rail/rail-scrollbar";
+import {
+	beginRailDrag,
+	bumpRailDrag,
+	drawRailScrollbar,
+	endRailDrag,
+	isRailScrollbarView,
+	markRailScrollbarView,
+	railRequestRender,
+} from "../../rail/rail-scrollbar";
 
 const THUMB_CELL = "\x1b[38;2;137;180;250m█\x1b[0m";
 
@@ -88,6 +96,44 @@ describe("rail scrollbar", () => {
 		const out = drawRailScrollbar(screen(24), layout, 80);
 
 		assert.equal(out[0]!.includes(THUMB_CELL), false);
+	});
+
+	test("suspends renders while dragging and renders once on release", () => {
+		let renders = 0;
+		const tui = { requestRender: () => renders++ };
+
+		beginRailDrag(tui);
+		railRequestRender(tui);
+		railRequestRender(tui);
+		assert.equal(renders, 0);
+
+		bumpRailDrag(tui);
+		railRequestRender(tui);
+		assert.equal(renders, 0);
+
+		endRailDrag(tui);
+		assert.equal(renders, 1);
+	});
+
+	test("inactivity during a drag releases the suspension", () => {
+		mock.timers.enable({ apis: ["setTimeout"] });
+		try {
+			let renders = 0;
+			const tui = { requestRender: () => renders++ };
+
+			beginRailDrag(tui);
+			railRequestRender(tui);
+			assert.equal(renders, 0);
+
+			mock.timers.tick(400);
+			assert.equal(renders, 1);
+
+			// A later render outside the drag window renders normally.
+			railRequestRender(tui);
+			assert.equal(renders, 2);
+		} finally {
+			mock.timers.reset();
+		}
 	});
 
 	test("ignores unmarked scroll views", () => {

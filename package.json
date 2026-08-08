@@ -8,7 +8,6 @@
   "scripts": {
     "typecheck": "npm exec --package typescript -- tsc --noEmit -p tsconfig.json",
     "test": "npm exec --package tsx -- tsx --test \"tests/**/*.test.ts\"",
-    "check": "npm run typecheck && npm test",
-    "bench:viewport": "npm exec --package tsx -- tsx tests/perf/viewport-compose.bench.ts"
+    "check": "npm run typecheck && npm test"
   }
 }

@@ -2,7 +2,6 @@ import { type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext,
 import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
-import { markConversationViewportCachePreferred } from "../chat-view/state";
 import { railFastFooterLabel } from "../../commands/rail-fast";
 import {
 	collectFooterLiveState,
@@ -35,7 +34,6 @@ function footerStore(): FooterStore {
 }
 
 function requestFooterRender(tui?: any): void {
-	markConversationViewportCachePreferred(tui);
 	tui?.requestRender?.();
 }
 

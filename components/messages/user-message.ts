@@ -59,6 +59,17 @@ function timestampForUserMessage(component: object, sourceText: string | undefin
 	return getUserMessageRailPatchStore().timestamps.timestampFor(component, sourceText);
 }
 
+function renderNativeUserRow(line: string, width: number, surface: EditorSurfaceRenderer): string {
+	let zones = "";
+	let content = line;
+	for (const marker of [OSC133_ZONE_START, OSC133_ZONE_END, OSC133_ZONE_FINAL]) {
+		if (!content.startsWith(marker)) continue;
+		zones += marker;
+		content = content.slice(marker.length);
+	}
+	return zones + surface.renderSurfaceRow(width, content);
+}
+
 async function getUserMessageConstructors(): Promise<UserMessageConstructor[]> {
 	const ctors: UserMessageConstructor[] = [UserMessageComponent as unknown as UserMessageConstructor];
 	const nativeCtor = await resolveNativePiExport<UserMessageConstructor>(
@@ -83,28 +94,28 @@ function renderUserMessageWithSurface(
 
 	const contentWidth = surface.contentWidth(width);
 	const textGapWidth = USER_MESSAGE_LAYOUT.textGapWidth;
-	const markdownWidth = Math.max(1, contentWidth - textGapWidth);
-	const textGap = " ".repeat(textGapWidth);
 	const sourceText = getMarkdownSourceText(markdown);
 	const timestamp = timestampForUserMessage(component, sourceText);
-	const signature = [width, contentWidth, markdownWidth, textGapWidth, timestamp, sourceText ?? ""].join("\u001f");
+	const signature = [width, contentWidth, textGapWidth, timestamp, sourceText ?? ""].join("\u001f");
 	return cachedRender(component, USER_MESSAGE_RENDER_CACHE_KEY, signature, () => {
+		// Keep Pi's complete native user-message render. This preserves its
+		// outputPad, Markdown transformer chain, OSC 133 markers, and future
+		// component changes; Rail only wraps the resulting rows and adds time.
+		const nativeRows = fallback.call(component, contentWidth);
+		const rows = nativeRows.map((line) => renderNativeUserRow(line, width, surface));
 		const timeText = formatUserMessageTimestamp(timestamp);
 		const timeLine = applyTextColor(theme, USER_MESSAGE_LAYOUT.timestampColor, timeText);
-
-		const rows: string[] = [];
-		for (let i = 0; i < USER_MESSAGE_LAYOUT.verticalPaddingRows; i++) rows.push(surface.renderSurfaceRow(width));
-		for (const line of markdown.render(markdownWidth)) {
-			rows.push(surface.renderSurfaceRow(width, textGap + padToWidth(line, markdownWidth)));
-		}
-		rows.push(surface.renderSurfaceRow(width, textGap + padToWidth(timeLine, markdownWidth)));
-		for (let i = 0; i < USER_MESSAGE_LAYOUT.verticalPaddingRows; i++) rows.push(surface.renderSurfaceRow(width));
-
-		if (rows.length === 0) return rows;
-		rows[0] = OSC133_ZONE_START + rows[0];
-		rows[rows.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + rows[rows.length - 1];
+		const timestampWidth = Math.max(0, contentWidth - textGapWidth);
+		const timestampRow = surface.renderSurfaceRow(
+			width,
+			" ".repeat(textGapWidth) + padToWidth(timeLine, timestampWidth),
+		);
+		if (rows.length === 0) return [timestampRow];
+		// Native Box padding leaves a final row for the bottom padding. Put the
+		// timestamp immediately before it instead of rebuilding the whole box.
+		rows.splice(Math.max(0, rows.length - 1), 0, timestampRow);
 		return rows;
-	}, { markdown });
+	}, { markdown, nativeChildren: component.children });
 }
 
 export async function installUserMessageRail(ctx: ExtensionContext): Promise<void> {

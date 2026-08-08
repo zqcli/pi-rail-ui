@@ -5,12 +5,9 @@ import {
 	RailSectionBlock,
 	canToggleRailSection,
 	defineRailSection,
-	normalizeRailSectionPosition,
-	renderedRailSectionRange,
 	resolveRailSection,
 	setRailSectionExpanded,
 	setRailUiActive,
-	toggleRailSection,
 	wasRailSectionManuallyToggled,
 } from "../../rail/rail-section";
 
@@ -72,37 +69,14 @@ describe("rail section metadata", () => {
 	});
 });
 
-describe("rail section ranges and selection positions", () => {
-	test("trims blank leading and trailing rows by default", () => {
-		const component = defineRailSection({}, "custom");
-		const section = resolveRailSection(component);
-		assert.ok(section);
-
-		const range = renderedRailSectionRange(10, ["", " \x1b[0m", "content", ""], section);
-
-		assert.deepEqual(range && { start: range.start, end: range.end }, { start: 12, end: 13 });
-	});
-
-	test("normalizes content-only selection starts to the section content column", () => {
-		const component = defineRailSection({}, "custom", { layout: { contentStartCol: 4 } });
-		const section = resolveRailSection(component);
-		assert.ok(section);
-
-		const range = { start: 0, end: 1, section };
-
-		assert.deepEqual(normalizeRailSectionPosition({ line: 0, col: 1 }, range), { line: 0, col: 4 });
-		assert.deepEqual(normalizeRailSectionPosition({ line: 0, col: 6 }, range), { line: 0, col: 6 });
-	});
-});
-
 describe("rail section toggling", () => {
-	test("toggles collapsible sections and marks them as manual", () => {
+	test("expands collapsible sections and marks them as manual", () => {
 		const component = new ToggleableTool();
 		const section = resolveRailSection(component);
 		assert.ok(section);
 
 		assert.equal(canToggleRailSection(section), true);
-		toggleRailSection(section);
+		setRailSectionExpanded(section, true);
 
 		assert.equal(component.expanded, true);
 		assert.equal(component.invalidated, true);

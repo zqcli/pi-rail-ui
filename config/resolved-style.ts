@@ -5,7 +5,6 @@ import type {
 	BashExecutionLayout,
 	ColorReference,
 	ConversationScrollLayout,
-	ConversationScrollMode,
 	ConversationScrollbarStyle,
 	EditorHeightPolicy,
 	EditorPasteMarkerStyle,
@@ -91,15 +90,13 @@ export function resolveStyleConfig(style: StyleFile): ResolvedStyleConfig {
 		bold: style.editor.pasteMarker?.bold === true ? "\x1b[1m" : "",
 		reset: style.surfaceLayout.reset,
 	};
-	const conversationScrollMode: ConversationScrollMode = style.conversationScroll?.mode
-		?? (style.conversationScroll?.enabled === false ? "native" : "app");
-	const conversationScrollEnabled = style.conversationScroll?.mode === "app"
-		? style.conversationScroll.enabled !== false
-		: style.conversationScroll?.enabled === true;
 	const CONVERSATION_SCROLL_LAYOUT: ConversationScrollLayout = {
-		mode: conversationScrollMode,
-		enabled: conversationScrollMode === "app" && conversationScrollEnabled,
-		alternateScreen: style.conversationScroll?.alternateScreen !== false,
+		// Pi 0.84 owns the active transcript viewport and alternate screen.
+		// Legacy style values remain readable for compatibility, but cannot
+		// reactivate Rail's retired renderer/input patches.
+		mode: "native",
+		enabled: false,
+		alternateScreen: false,
 		wheelStepRows: Math.max(1, Math.round(style.conversationScroll?.wheelStepRows ?? 3)),
 		historyTailRenderWindow: Math.max(1, Math.round(style.conversationScroll?.performance?.historyTailRenderWindow ?? 8)),
 	};

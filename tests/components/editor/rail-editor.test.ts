@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { CombinedAutocompleteProvider, type EditorTheme } from "@earendil-works/pi-tui";
-import { RailEditor, hideAllEditorOverlays } from "../../../components/editor";
+import { RailEditor } from "../../../components/editor";
 
 const passthrough = (text: string) => text;
 
@@ -30,9 +30,6 @@ describe("RailEditor", () => {
 			requestRender() {
 				renderRequests += 1;
 			},
-			showOverlay() {
-				return { hide() {} };
-			},
 		};
 		const keybindings = {
 			matches(data: string, keybinding: string) {
@@ -46,32 +43,28 @@ describe("RailEditor", () => {
 		let submitted: string | undefined;
 		let changed: string | undefined;
 
-		try {
-			editor.setAutocompleteProvider(provider);
-			editor.setText("/ski");
-			editor.onSubmit = (text) => {
-				submitted = text;
-			};
-			editor.onChange = (text) => {
-				changed = text;
-			};
-			Object.assign(editor as any, {
-				autocompleteState: {},
-				autocompletePrefix: "/ski",
-				autocompleteList: {
-					getSelectedItem: () => ({ value: "skill:web-access", label: "skill:web-access" }),
-				},
-			});
+		editor.setAutocompleteProvider(provider);
+		editor.setText("/ski");
+		editor.onSubmit = (text) => {
+			submitted = text;
+		};
+		editor.onChange = (text) => {
+			changed = text;
+		};
+		Object.assign(editor as any, {
+			autocompleteState: {},
+			autocompletePrefix: "/ski",
+			autocompleteList: {
+			getSelectedItem: () => ({ value: "skill:web-access", label: "skill:web-access" }),
+		},
+		});
 
-			editor.handleInput("enter");
+		editor.handleInput("enter");
 
-			assert.equal(submitted, undefined);
-			assert.equal(editor.getText(), "/skill:web-access ");
-			assert.equal(changed, "/skill:web-access ");
-			assert.equal((editor as any).autocompleteState, null);
-			assert.ok(renderRequests > 0);
-		} finally {
-			hideAllEditorOverlays();
-		}
+		assert.equal(submitted, undefined);
+		assert.equal(editor.getText(), "/skill:web-access ");
+		assert.equal(changed, "/skill:web-access ");
+		assert.equal((editor as any).autocompleteState, null);
+		assert.ok(renderRequests > 0);
 	});
 });

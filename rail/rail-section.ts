@@ -5,7 +5,6 @@ import {
 	type RailSectionResolvedConfig,
 	type ThemeLike,
 } from "../config";
-import { stripAnsi, type Position } from "../core/utils";
 
 export type { RailSectionKind, RailSectionResolvedConfig } from "../config";
 
@@ -25,19 +24,6 @@ export type RailSectionDefinition = {
 	kind: RailSectionKind;
 	component: any;
 	config: RailSectionResolvedConfig;
-};
-
-export type RailSectionRange = {
-	start: number;
-	end: number;
-	section: RailSectionDefinition;
-};
-
-export type RailSectionClickState = {
-	section: RailSectionDefinition;
-	x: number;
-	y: number;
-	moved: boolean;
 };
 
 const RAIL_SECTION_METADATA_KEY = Symbol.for("pi-rail-ui.rail-section-metadata");
@@ -100,48 +86,6 @@ export function resolveRailSection(component: any): RailSectionDefinition | unde
 	return { kind, component, config: railSectionConfig(kind) };
 }
 
-export function isBlankRailSectionLine(line: string): boolean {
-	return stripAnsi(line).trim().length === 0;
-}
-
-export function renderedRailSectionRange(
-	start: number,
-	lines: string[],
-	section: RailSectionDefinition,
-): RailSectionRange | undefined {
-	let first = 0;
-	let last = lines.length;
-	if (!section.config.selection.includeLeadingBlankRows) {
-		while (first < last && isBlankRailSectionLine(lines[first]!)) first++;
-	}
-	if (!section.config.selection.includeTrailingBlankRows) {
-		while (last > first && isBlankRailSectionLine(lines[last - 1]!)) last--;
-	}
-	return last > first ? { start: start + first, end: start + last, section } : undefined;
-}
-
-export function sameRailSection(a: RailSectionDefinition | undefined, b: RailSectionDefinition | undefined): boolean {
-	return Boolean(a && b && a.component === b.component && a.kind === b.kind);
-}
-
-export function railSectionMoved(click: RailSectionClickState, x: number, y: number): boolean {
-	return click.x !== x || click.y !== y;
-}
-
-export function railSectionSelectionStartCol(section: RailSectionDefinition): number {
-	const selection = section.config.selection;
-	const layout = section.config.layout;
-	if (selection.mode !== "contentOnly") return 0;
-	if (selection.includeGap || selection.includeRail) return 0;
-	return layout.contentStartCol;
-}
-
-export function normalizeRailSectionPosition(pos: Position, range: RailSectionRange | undefined): Position {
-	if (!range?.section.config.selectable) return pos;
-	const startCol = railSectionSelectionStartCol(range.section);
-	return { line: pos.line, col: Math.max(pos.col, startCol) };
-}
-
 export function canToggleRailSection(section: RailSectionDefinition): boolean {
 	return Boolean(section.config.collapsible && section.config.clickToToggle && typeof section.component?.setExpanded === "function");
 }
@@ -160,11 +104,6 @@ export function setRailSectionExpanded(section: RailSectionDefinition, expanded:
 	markRailSectionManuallyToggled(component);
 	if (Boolean(component.expanded) !== expanded) component.setExpanded?.(expanded);
 	component.invalidate?.();
-}
-
-export function toggleRailSection(section: RailSectionDefinition): void {
-	if (!canToggleRailSection(section)) return;
-	setRailSectionExpanded(section, !Boolean(section.component.expanded));
 }
 
 function railSectionChildren(component: any): any[] {

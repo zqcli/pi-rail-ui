@@ -24,15 +24,12 @@
       "background": { "rgb": [69, 71, 90] },
       "foreground": "editor.rail",
       "bold": true
-    },
-    "mouseTracking": {
-      "enabled": false
     }
   },
   "conversationScroll": {
-    "mode": "app",
-    "enabled": true,
-    "alternateScreen": true,
+    "mode": "native",
+    "enabled": false,
+    "alternateScreen": false,
     "wheelStepRows": 3,
     "performance": {
       "historyTailRenderWindow": 4

@@ -1,5 +1,5 @@
 import { type Theme } from "@earendil-works/pi-coding-agent";
-import { Markdown, Spacer, Text, type Component } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
 import { railSectionConfig } from "../../config";
 import {
 	EditorSurfaceRenderer,
@@ -18,14 +18,29 @@ export type AssistantMessageRailHost = {
 	contentContainer: { children?: Component[]; clear(): void; addChild(component: Component): void };
 	hideThinkingBlock: boolean;
 	hiddenThinkingLabel: string;
-	markdownTheme: ConstructorParameters<typeof Markdown>[3];
 	lastMessage?: any;
 	hasToolCalls: boolean;
 };
 
+export function updateNativeAssistantContent<T>(
+	component: AssistantMessageRailHost,
+	message: any,
+	isStreaming: boolean | undefined,
+	original: (this: AssistantMessageRailHost, message: any, isStreaming?: boolean) => T,
+	decorate: () => void,
+): T {
+	const result = original.call(component, message, isStreaming);
+	try {
+		decorate();
+	} catch {
+		// Native children are already valid; a Rail decoration failure must not
+		// trigger a second native rebuild.
+	}
+	return result;
+}
+
 type AssistantThinkingRailOptions = {
 	rawText: string;
-	markdownTheme: ConstructorParameters<typeof Markdown>[3];
 	hidden: boolean;
 };
 
@@ -33,29 +48,6 @@ const ASSISTANT_THINKING_EXPANDED_KEY = Symbol.for("pi-rail-ui.assistant-thinkin
 const ASSISTANT_THINKING_MANUAL_KEY = Symbol.for("pi-rail-ui.assistant-thinking-manual");
 const ASSISTANT_THINKING_BLOCKS_KEY = Symbol.for("pi-rail-ui.assistant-thinking-blocks");
 export const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
-
-function isAssistantVisiblePart(part: any): boolean {
-	return (part?.type === "text" && !!part.text?.trim()) || (part?.type === "thinking" && !!part.thinking?.trim());
-}
-
-function visibleAssistantSuffixMap(content: any[]): boolean[] {
-	const suffix = new Array<boolean>(content.length + 1).fill(false);
-	for (let i = content.length - 1; i >= 0; i--) {
-		suffix[i] = suffix[i + 1]! || isAssistantVisiblePart(content[i]);
-	}
-	return suffix;
-}
-
-function makeThinkingMarkdown(text: string, markdownTheme: ConstructorParameters<typeof Markdown>[3], appTheme: Theme): Markdown {
-	return new Markdown(text.trim(), 1, 0, markdownTheme, {
-		color: (value) => appTheme.fg("thinkingText", value),
-		italic: true,
-	});
-}
-
-function makeHiddenThinkingLabel(label: string, appTheme: Theme): Text {
-	return new Text(appTheme.italic(appTheme.fg("thinkingText", label)), 1, 0);
-}
 
 class AssistantThinkingRailBlock implements Component {
 	expanded = true;
@@ -68,7 +60,6 @@ class AssistantThinkingRailBlock implements Component {
 	private rawText = "";
 	private rawLines: string[] = [];
 	private hidden = false;
-	private markdownTheme: ConstructorParameters<typeof Markdown>[3];
 
 	constructor(
 		inner: Component,
@@ -80,7 +71,6 @@ class AssistantThinkingRailBlock implements Component {
 		this.inner = inner;
 		this.surface = surface;
 		this.appTheme = appTheme;
-		this.markdownTheme = options.markdownTheme;
 		this.update(inner, surface, appTheme, options);
 		defineRailSection(this, "assistantThinking");
 		if (owner?.[ASSISTANT_THINKING_MANUAL_KEY] === true) this.expanded = owner[ASSISTANT_THINKING_EXPANDED_KEY] !== false;
@@ -93,7 +83,6 @@ class AssistantThinkingRailBlock implements Component {
 		this.rawText = options.rawText.trim();
 		this.rawLines = this.rawText ? this.rawText.split(/\r?\n/u) : [];
 		this.hidden = options.hidden;
-		this.markdownTheme = options.markdownTheme;
 		if (this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] === true) this.expanded = this.owner[ASSISTANT_THINKING_EXPANDED_KEY] !== false;
 		this.invalidate();
 	}
@@ -126,9 +115,10 @@ class AssistantThinkingRailBlock implements Component {
 		if (this.collapsedCache?.width === width && this.collapsedCache.limit === limit) return this.collapsedCache.rows;
 		if (this.hidden || this.rawLines.length <= limit) return this.fullRows(width);
 
-		const previewText = this.rawLines.slice(0, limit).join("\n");
-		const previewInner = makeThinkingMarkdown(previewText, this.markdownTheme, this.appTheme);
-		const previewRows = new ThinkingRailBlock(previewInner, this.surface).render(width);
+		// Keep Pi's already-rendered child so Mermaid, LaTeX, outputPad, and
+		// extension Markdown transformers remain native. Only truncate rows for
+		// the optional Rail collapse presentation; never rebuild Markdown here.
+		const previewRows = this.fullRows(width).slice(0, Math.max(1, limit));
 		const hidden = Math.max(0, this.rawLines.length - limit);
 		const rows = [...previewRows, this.surface.renderSurfaceRow(width, collapseHint(this.appTheme, hidden))];
 		this.collapsedCache = { width, limit, rows };
@@ -182,6 +172,38 @@ function trimAssistantThinkingBlocks(component: AssistantMessageRailHost, count:
 	if (blocks) blocks.length = count;
 }
 
+type AssistantRailBlock = {
+	kind: "reply" | "thinking";
+	rawText: string;
+};
+
+function nativeAssistantRailBlocks(message: any): AssistantRailBlock[] {
+	const blocks: AssistantRailBlock[] = [];
+	let thinkingParts: string[] = [];
+
+	const flushThinking = () => {
+		if (thinkingParts.length > 0) {
+			blocks.push({ kind: "thinking", rawText: thinkingParts.join("\n\n") });
+			thinkingParts = [];
+		}
+	};
+
+	for (const part of Array.isArray(message?.content) ? message.content : []) {
+		if (part?.type === "thinking") {
+			if (part.thinking?.trim()) thinkingParts.push(part.thinking.trim());
+			continue;
+		}
+		flushThinking();
+		if (part?.type === "text" && part.text?.trim()) blocks.push({ kind: "reply", rawText: part.text.trim() });
+	}
+	flushThinking();
+	return blocks;
+}
+
+function isNativeSpacer(child: any): boolean {
+	return child?.constructor?.name === "Spacer";
+}
+
 export function renderAssistantMessageRail(
 	component: AssistantMessageRailHost,
 	message: any,
@@ -189,47 +211,47 @@ export function renderAssistantMessageRail(
 	surface: EditorSurfaceRenderer,
 ): void {
 	component.lastMessage = message;
-	component.contentContainer.clear();
-
-	const content: any[] = Array.isArray(message?.content) ? message.content : [];
-	const hasVisibleAfter = visibleAssistantSuffixMap(content);
-	if (hasVisibleAfter[0]) component.contentContainer.addChild(new Spacer(1));
-
+	const nativeChildren = [...(component.contentContainer.children ?? [])];
+	const blocks = nativeAssistantRailBlocks(message);
+	const nextChildren: Component[] = [];
+	let blockIndex = 0;
 	let thinkingIndex = 0;
-	for (let i = 0; i < content.length; i++) {
-		const part = content[i];
-		if (part?.type === "text" && part.text?.trim()) {
-			const reply = new SurfaceContentInsetBlock(new Markdown(part.text.trim(), 1, 0, component.markdownTheme), surface);
-			defineRailSection(reply, "assistantReply");
-			component.contentContainer.addChild(reply);
-		} else if (part?.type === "thinking" && part.thinking?.trim()) {
-			const hasVisibleContentAfter = hasVisibleAfter[i + 1];
-			const hidden = component.hideThinkingBlock;
-			const inner = hidden
-				? makeHiddenThinkingLabel(component.hiddenThinkingLabel, appTheme)
-				: makeThinkingMarkdown(part.thinking, component.markdownTheme, appTheme);
-			component.contentContainer.addChild(assistantThinkingBlockFor(component, thinkingIndex++, inner, surface, appTheme, {
-				rawText: part.thinking,
-				markdownTheme: component.markdownTheme,
-				hidden,
-			}));
-			if (hasVisibleContentAfter) component.contentContainer.addChild(new Spacer(1));
+
+	for (const child of nativeChildren) {
+		if (isNativeSpacer(child)) {
+			nextChildren.push(child);
+			continue;
 		}
+
+		const block = blocks[blockIndex++];
+		if (!block) {
+			// Native status/error children are intentionally left untouched.
+			nextChildren.push(child);
+			continue;
+		}
+
+		if (block.kind === "reply") {
+			const reply = new SurfaceContentInsetBlock(child, surface);
+			defineRailSection(reply, "assistantReply");
+			nextChildren.push(reply);
+			continue;
+		}
+
+		nextChildren.push(assistantThinkingBlockFor(component, thinkingIndex++, child, surface, appTheme, {
+			rawText: block.rawText,
+			hidden: component.hideThinkingBlock,
+		}));
+	}
+
+	component.contentContainer.clear();
+	try {
+		for (const child of nextChildren) component.contentContainer.addChild(child);
+	} catch (error) {
+		component.contentContainer.clear();
+		for (const child of nativeChildren) component.contentContainer.addChild(child);
+		throw error;
 	}
 	trimAssistantThinkingBlocks(component, thinkingIndex);
 
-	const hasToolCalls = content.some((part) => part?.type === "toolCall");
-	component.hasToolCalls = hasToolCalls;
-	if (hasToolCalls) return;
-
-	if (message?.stopReason === "aborted") {
-		const abortMessage =
-			message.errorMessage && message.errorMessage !== "Request was aborted" ? message.errorMessage : "Operation aborted";
-		component.contentContainer.addChild(new Spacer(1));
-		component.contentContainer.addChild(new Text(appTheme.fg("error", abortMessage), 1, 0));
-	} else if (message?.stopReason === "error") {
-		const errorMsg = message.errorMessage || "Unknown error";
-		component.contentContainer.addChild(new Spacer(1));
-		component.contentContainer.addChild(new Text(appTheme.fg("error", `Error: ${errorMsg}`), 1, 0));
-	}
+	component.hasToolCalls = (Array.isArray(message?.content) ? message.content : []).some((part: any) => part?.type === "toolCall");
 }

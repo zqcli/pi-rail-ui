@@ -10,7 +10,7 @@ import {
 	railThinkingSurface,
 } from "../../rail/rail-surface";
 import { setCollapsibleRailSectionsExpanded } from "../../rail/rail-section";
-import { ASSISTANT_RENDER_CACHE_KEY, renderAssistantMessageRail, type AssistantMessageRailHost } from "./assistant-message-rail";
+import { ASSISTANT_RENDER_CACHE_KEY, renderAssistantMessageRail, updateNativeAssistantContent, type AssistantMessageRailHost } from "./assistant-message-rail";
 
 // -----------------------------------------------------------------------------
 // Assistant thinking/reply surface patch
@@ -19,7 +19,7 @@ import { ASSISTANT_RENDER_CACHE_KEY, renderAssistantMessageRail, type AssistantM
 type AssistantMessageWithInternals = AssistantMessageRailHost;
 
 type AssistantMessageConstructor = {
-	prototype: AssistantMessageWithInternals & { updateContent(message: any): void; render(width: number): string[] };
+	prototype: AssistantMessageWithInternals & { updateContent(message: any, isStreaming?: boolean): void; render(width: number): string[] };
 };
 
 type InteractiveModeConstructor = {
@@ -79,15 +79,13 @@ export async function installAssistantMessageRail(theme: Theme): Promise<void> {
 	});
 
 	for (const ctor of await getAssistantMessageConstructors()) {
-		assistantMessageLifecycle.patchMethod(ctor, "updateContent", (original) => function patchedUpdateContent(this: AssistantMessageWithInternals, message: any) {
+		assistantMessageLifecycle.patchMethod(ctor, "updateContent", (original) => function patchedUpdateContent(this: AssistantMessageWithInternals, message: any, isStreaming?: boolean) {
 			delete (this as any)[ASSISTANT_RENDER_CACHE_KEY];
 			const currentStore = getAssistantMessageRailPatchStore();
-			if (!currentStore.active || !currentStore.theme) return original.call(this, message);
-			try {
-				return renderAssistantMessageRail(this, message, currentStore.theme, currentStore.surface);
-			} catch {
-				return original.call(this, message);
-			}
+			if (!currentStore.active || !currentStore.theme) return original.call(this, message, isStreaming);
+			return updateNativeAssistantContent(this, message, isStreaming, original, () => {
+				renderAssistantMessageRail(this, message, currentStore.theme!, currentStore.surface);
+			});
 		});
 		patchAssistantRenderCache(ctor);
 	}

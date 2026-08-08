@@ -1,34 +1,47 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_KEY = "railfast";
-const SUPPORTED_APIS = new Set(["openai-responses", "openai-codex-responses"]);
-const SUPPORTED_MODELS = new Set([
-	"gpt-5.4",
-	"gpt-5.5",
-	"gpt-5.6-luna",
-	"gpt-5.6-sol",
-	"gpt-5.6-terra",
+const SUPPORTED_APIS = new Set([
+	"openai-completions",
+	"openai-responses",
+	"azure-openai-responses",
 ]);
+
+type NativeFastModel = {
+	api: string;
+	id: string;
+	samplingParams?: Record<string, unknown>;
+};
+
+type AppliedFastMode = {
+	model: NativeFastModel;
+	originalSamplingParams: Record<string, unknown> | undefined;
+};
 
 let enabled = false;
 let activeForCurrentModel = false;
+let appliedFastMode: AppliedFastMode | undefined;
 
-type ModelRef = {
-	api: string;
-	id: string;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+export function supportsNativeFastMode(model: NativeFastModel | undefined): model is NativeFastModel {
+	return model !== undefined && SUPPORTED_APIS.has(model.api);
 }
 
-export function supportsRailFastModel(model: ModelRef | undefined): boolean {
-	return model !== undefined && SUPPORTED_APIS.has(model.api) && SUPPORTED_MODELS.has(model.id);
+export function applyNativeFastMode(model: NativeFastModel | undefined): boolean {
+	if (!supportsNativeFastMode(model)) return false;
+	if (appliedFastMode?.model === model && model.samplingParams?.["service_tier"] === "priority") return true;
+
+	restoreNativeFastMode();
+	appliedFastMode = { model, originalSamplingParams: model.samplingParams };
+	model.samplingParams = { ...model.samplingParams, service_tier: "priority" };
+	return true;
 }
 
-export function withPriorityServiceTier(payload: unknown): Record<string, unknown> | undefined {
-	if (!isRecord(payload)) return undefined;
-	return { ...payload, service_tier: "priority" };
+export function restoreNativeFastMode(): void {
+	const applied = appliedFastMode;
+	if (!applied) return;
+	if (applied.originalSamplingParams === undefined) delete applied.model.samplingParams;
+	else applied.model.samplingParams = applied.originalSamplingParams;
+	appliedFastMode = undefined;
 }
 
 export function railFastFooterLabel(): string | undefined {
@@ -37,7 +50,13 @@ export function railFastFooterLabel(): string | undefined {
 }
 
 function updateStatus(ctx: ExtensionContext): void {
-	activeForCurrentModel = supportsRailFastModel(ctx.model);
+	const model = ctx.model as NativeFastModel | undefined;
+	if (!enabled || !supportsNativeFastMode(model)) {
+		restoreNativeFastMode();
+		activeForCurrentModel = false;
+	} else {
+		activeForCurrentModel = applyNativeFastMode(model);
+	}
 	if (!ctx.hasUI) return;
 	const status = enabled
 		? activeForCurrentModel ? "FAST" : "FAST (inactive)"
@@ -46,6 +65,7 @@ function updateStatus(ctx: ExtensionContext): void {
 }
 
 function notifyStatus(ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
 	if (!enabled) {
 		ctx.ui.notify("Rail fast mode disabled.", "info");
 		return;
@@ -57,13 +77,13 @@ function notifyStatus(ctx: ExtensionContext): void {
 
 export function installRailFast(pi: ExtensionAPI): void {
 	pi.registerCommand("railfast", {
-		description: "Enable, disable, or inspect OpenAI fast mode",
+		description: "Toggle Pi native OpenAI fast mode for the current model",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
 			if (action === "on") enabled = true;
 			else if (action === "off") enabled = false;
 			else if (action !== "status") {
-				ctx.ui.notify("Usage: /railfast on|off|status", "warning");
+				if (ctx.hasUI) ctx.ui.notify("Usage: /railfast on|off|status", "warning");
 				return;
 			}
 
@@ -81,8 +101,9 @@ export function installRailFast(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 	});
 
-	pi.on("before_provider_request", (event, ctx) => {
-		if (!enabled || !supportsRailFastModel(ctx.model)) return;
-		return withPriorityServiceTier(event.payload);
+	pi.on("session_shutdown", async () => {
+		restoreNativeFastMode();
+		enabled = false;
+		activeForCurrentModel = false;
 	});
 }

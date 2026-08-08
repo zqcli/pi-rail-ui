@@ -1,7 +1,5 @@
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import {
-	RAIL_EDITOR_HEIGHT,
-	RAIL_EDITOR_SURFACE_STYLE,
 	RAIL_EDITOR_STYLE,
 	RAIL_THINKING_STYLE,
 	RAIL_USER_MESSAGE_STYLE,
@@ -9,9 +7,6 @@ import {
 	BASH_EXECUTION_RAIL_COLOR,
 	THINKING_RAIL_COLOR,
 	railAnsiForTheme,
-	railSectionConfig,
-	type EditorHeightPolicy,
-	type RailSectionKind,
 	type RailSurfaceStyle,
 	type ThemeLike,
 } from "../config";
@@ -19,7 +14,6 @@ import { isRailUiActive } from "./rail-section";
 import {
 	SGR_RESET,
 	SGR_RESET_RE,
-	applyColumnHighlight,
 	padToWidth,
 } from "../core/utils";
 import { cachedRailRows, type RailRowsCache } from "./surface-primitives";
@@ -30,19 +24,14 @@ export class EditorSurfaceRenderer {
 	readonly style: RailSurfaceStyle;
 	private readonly contentStart: number;
 	private readonly transparentGap: string;
-	private readonly completionPrefix: string;
 	private readonly _rowPrefix: string;
 	private readonly _rowSuffix: string;
 	private rowCache = new Map<string, string>();
 
-	constructor(
-		style: RailSurfaceStyle = RAIL_EDITOR_STYLE,
-		private readonly heightPolicy?: EditorHeightPolicy,
-	) {
+	constructor(style: RailSurfaceStyle = RAIL_EDITOR_STYLE) {
 		this.style = style;
 		this.contentStart = style.leftBorderWidth + style.borderContentGapWidth;
 		this.transparentGap = " ".repeat(style.borderContentGapWidth);
-		this.completionPrefix = " ".repeat(this.contentStart);
 		this._rowPrefix = `${style.rail}${style.leftBorder}${style.reset}${this.transparentGap}${style.background}`;
 		this._rowSuffix = style.reset;
 	}
@@ -57,13 +46,6 @@ export class EditorSurfaceRenderer {
 
 	contentWidth(width: number): number {
 		return Math.max(1, width - this.contentStart);
-	}
-
-	targetInputHeight(bodyRows: number, terminalRows: number): number {
-		const policy = this.heightPolicy;
-		if (!policy) return Math.max(1, bodyRows);
-		const responsiveMax = Math.max(policy.minHeight, Math.min(policy.maxHeight, Math.floor(terminalRows * policy.maxHeightRatio)));
-		return Math.max(policy.minHeight, Math.min(responsiveMax, bodyRows));
 	}
 
 	renderSurfaceRow(width: number, content = ""): string {
@@ -88,48 +70,15 @@ export class EditorSurfaceRenderer {
 		return row;
 	}
 
-	renderCompletion(width: number, line: string): string {
-		return this.completionPrefix + padToWidth(line, Math.max(0, width - this.contentStart));
-	}
-
-	highlightColumns(line: string, startCol: number, endCol: number): string {
-		return applyColumnHighlight(line, startCol, endCol, this.style.selection, this.style.reset);
-	}
-
 	private restoreSurfaceAfterResets(text: string): string {
 		if (!this.style.background || !text.includes(SGR_RESET)) return text;
 		return text.replace(SGR_RESET_RE, `${this.style.reset}${this.style.background}`);
 	}
 }
 
-export const railEditorSurface = new EditorSurfaceRenderer(RAIL_EDITOR_STYLE, RAIL_EDITOR_HEIGHT);
+export const railEditorSurface = new EditorSurfaceRenderer(RAIL_EDITOR_STYLE);
 export const railThinkingSurface = new EditorSurfaceRenderer(RAIL_THINKING_STYLE);
 export const railUserMessageSurface = new EditorSurfaceRenderer(RAIL_USER_MESSAGE_STYLE);
-
-export function railSectionSurfaceStyle(kind: RailSectionKind, theme?: ThemeLike): RailSurfaceStyle {
-	const config = railSectionConfig(kind);
-	const rail = config.style.railEnabled
-		? (theme ? railAnsiForTheme(theme, config.style.rail) : undefined) ?? config.style.rail.ansi ?? ""
-		: "";
-	return {
-		...RAIL_EDITOR_SURFACE_STYLE,
-		leftBorder: config.style.railEnabled ? config.layout.leftBorder : "",
-		leftBorderWidth: config.style.railEnabled ? config.layout.leftBorderWidth : 0,
-		borderContentGapWidth: config.style.railEnabled ? config.layout.borderContentGapWidth : 0,
-		background: config.style.background,
-		rail,
-	};
-}
-
-export function railSectionSurfaceForTheme(kind: RailSectionKind, theme?: ThemeLike): EditorSurfaceRenderer {
-	return new EditorSurfaceRenderer(railSectionSurfaceStyle(kind, theme));
-}
-
-export const railSelectorOutputSurface = railSectionSurfaceForTheme("selectorOutput");
-
-export function selectorOutputSurfaceForTheme(theme: ThemeLike | undefined): EditorSurfaceRenderer {
-	return railSectionSurfaceForTheme("selectorOutput", theme);
-}
 
 export function thinkingSurfaceForTheme(theme: ThemeLike): EditorSurfaceRenderer {
 	return new EditorSurfaceRenderer({

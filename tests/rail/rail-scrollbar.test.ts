@@ -1,15 +1,8 @@
 import assert from "node:assert/strict";
-import { describe, mock, test } from "node:test";
+import { describe, test } from "node:test";
+import { Container, ScrollView, TuiAltScreen, VStack } from "@earendil-works/pi-tui";
 import { getScrollbarGeometry } from "@earendil-works/pi-tui/dist/layout.js";
-import {
-	beginRailDrag,
-	bumpRailDrag,
-	drawRailScrollbar,
-	endRailDrag,
-	isRailScrollbarView,
-	markRailScrollbarView,
-	railRequestRender,
-} from "../../rail/rail-scrollbar";
+import { drawRailScrollbar, isRailScrollbarView, markRailScrollbarView } from "../../rail/rail-scrollbar";
 
 const THUMB_CELL = "\x1b[38;2;137;180;250m█\x1b[0m";
 
@@ -48,15 +41,14 @@ function screen(rows: number): string[] {
 }
 
 describe("rail scrollbar", () => {
-	test("keeps the native scrollbar auto-interactive and draws the legacy blue thumb", () => {
+	test("hides the native paint path and draws the legacy blue thumb", () => {
 		const scrollView = fakeScrollView();
 		markRailScrollbarView(scrollView);
 		const layout = fakeLayout(scrollView, 100);
 
 		const out = drawRailScrollbar(screen(24), layout, 80);
 
-		assert.equal(scrollView.currentScrollbar, "auto");
-		assert.equal(scrollView.transientScrollbarVisible, true);
+		assert.equal(scrollView.currentScrollbar, "hidden");
 		// thumbSize = max(2, min(20, round(20^2/100))) = 4; thumbTop = round(10/80*16) = 2
 		assert.equal(out[2]!.includes(THUMB_CELL), true);
 		assert.equal(out[5]!.includes(THUMB_CELL), true);
@@ -85,7 +77,7 @@ describe("rail scrollbar", () => {
 		markRailScrollbarView(scrollView);
 
 		assert.equal(isRailScrollbarView(scrollView), true);
-		assert.equal(scrollView.currentScrollbar, "auto");
+		assert.equal(scrollView.currentScrollbar, "hidden");
 	});
 
 	test("draws nothing when content fits the viewport", () => {
@@ -98,42 +90,84 @@ describe("rail scrollbar", () => {
 		assert.equal(out[0]!.includes(THUMB_CELL), false);
 	});
 
-	test("suspends renders while dragging and renders once on release", () => {
-		let renders = 0;
-		const tui = { requestRender: () => renders++ };
-
-		beginRailDrag(tui);
-		railRequestRender(tui);
-		railRequestRender(tui);
-		assert.equal(renders, 0);
-
-		bumpRailDrag(tui);
-		railRequestRender(tui);
-		assert.equal(renders, 0);
-
-		endRailDrag(tui);
-		assert.equal(renders, 1);
-	});
-
-	test("inactivity during a drag releases the suspension", () => {
-		mock.timers.enable({ apis: ["setTimeout"] });
-		try {
-			let renders = 0;
-			const tui = { requestRender: () => renders++ };
-
-			beginRailDrag(tui);
-			railRequestRender(tui);
-			assert.equal(renders, 0);
-
-			mock.timers.tick(400);
-			assert.equal(renders, 1);
-
-			// A later render outside the drag window renders normally.
-			railRequestRender(tui);
-			assert.equal(renders, 2);
-		} finally {
-			mock.timers.reset();
+	test("keeps content frozen during drag, previews the thumb, and commits on release", async () => {
+		class Line {
+			constructor(readonly text: string) {}
+			render(): string[] { return [this.text]; }
+			invalidate(): void {}
 		}
+
+		const writes: string[] = [];
+		const terminal: any = {
+			columns: 100,
+			rows: 40,
+			write(data: string) { writes.push(data); },
+			onData() {},
+			hideCursor() {},
+			showCursor() {},
+		};
+		const altScreen: any = new TuiAltScreen(terminal, false, undefined, {});
+		const documentContainer = new Container();
+		for (let index = 0; index < 200; index++) documentContainer.addChild(new Line(`line ${index}`));
+		const scrollView: any = new ScrollView(documentContainer, { follow: "end", primary: true, scrollbar: "auto" });
+		altScreen.setLayoutRoot(new VStack([{ component: scrollView, basis: 0, grow: 1, shrink: 1, minSize: 1 }]));
+		altScreen.altScreenActive = true;
+
+		let renders = 0;
+		const originalDoRender = altScreen.doRender.bind(altScreen);
+		altScreen.doRender = () => {
+			renders++;
+			return originalDoRender();
+		};
+
+		const originalScrollbarStyle = scrollView.scrollbarStyle;
+		const { installRailScrollbar, uninstallRailScrollbar } = await import("../../rail/rail-scrollbar");
+		await installRailScrollbar();
+		try {
+			altScreen.doRender();
+			scrollView.scrollToEnd();
+			altScreen.cancelRenderTimer?.();
+			altScreen.renderRequested = false;
+			altScreen.doRender();
+			writes.length = 0;
+			renders = 0;
+
+			const layout = altScreen.currentLayout;
+			const scrollBox = layout.root.children.find((child: any) => child.scrollView === layout.primaryScrollView);
+			const totalRows = scrollBox.scrollContentLines.length;
+			const trackHeight = scrollBox.rect.height;
+			const thumbHeight = Math.max(2, Math.min(trackHeight, Math.round((trackHeight * trackHeight) / totalRows)));
+			const thumbTop = scrollBox.rect.y + Math.round((scrollView.scrollTop / (totalRows - trackHeight)) * (trackHeight - thumbHeight));
+			const column = scrollBox.rect.x + scrollBox.rect.width - 1;
+			const initialScrollTop = scrollView.scrollTop;
+			const mouse = (button: number, x: number, y: number, release = false) =>
+				`\x1b[<${button};${x + 1};${y + 1}${release ? "m" : "M"}`;
+			let scrollCalls = 0;
+			const originalScrollTo = scrollView.scrollTo.bind(scrollView);
+			scrollView.scrollTo = (value: number) => {
+				scrollCalls++;
+				originalScrollTo(value);
+			};
+
+			altScreen.handleViewportInput(mouse(0, column, thumbTop + 1));
+			altScreen.handleViewportInput(mouse(32, column, thumbTop - 8));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			assert.equal(scrollView.scrollTop, initialScrollTop);
+			assert.equal(scrollCalls, 0);
+			assert.equal(renders, 0);
+			assert.ok(writes.some((write) => write.includes(THUMB_CELL)));
+
+			altScreen.handleViewportInput(mouse(0, column, thumbTop - 8, true));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.notEqual(scrollView.scrollTop, initialScrollTop);
+			assert.equal(renders, 1);
+		} finally {
+			uninstallRailScrollbar();
+		}
+		assert.equal(scrollView.currentScrollbar, "auto");
+		assert.equal(scrollView.scrollbarStyle, originalScrollbarStyle);
 	});
 
 	test("ignores unmarked scroll views", () => {

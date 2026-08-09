@@ -116,7 +116,7 @@ Pi Rail UI 注册了以下 slash 命令：
 
 ### 3. 原生聊天历史
 
-Transcript layout、wheel/page scrolling、scrollbar、prompt navigation 和文本选择由 Pi 的 regular/fullscreen renderer 管理。Rail 不再安装竞争性的 viewport、mouse router 或终端 screen-control sequence。
+Transcript layout、wheel/page scrolling、prompt navigation 和文本选择由 Pi 的 regular/fullscreen renderer 管理。Rail 不再安装竞争性的 viewport 或通用 mouse router；fullscreen 滚动条拖动只通过一个窄的 Rail 输入 seam，并直接向终端写 thumb preview。
 
 ### 4. 原生选择和剪贴板
 
@@ -150,7 +150,7 @@ Slash autocomplete 保持在 Pi 原生 editor lifecycle 和 list 实现中。Rai
 
 ### 9. 工具执行块布局
 
-Tool、`!bash` 和 assistant thinking 块继续使用 Rail surface、紧凑 preview 和主题颜色。Pi 原生 `Ctrl+O` 控制全局展开状态；fullscreen 下普通单击 tool/bash/thinking 块会只切换该块（流式期间和完成后都可用）。拖动选择、链接、滚轮、滚动条和滚动锚定仍由 Pi 原生管理。
+Tool、`!bash` 和 assistant thinking 块继续使用 Rail surface、紧凑 preview 和主题颜色。Pi 原生 `Ctrl+O` 控制全局展开状态；fullscreen 下普通单击 tool/bash/thinking 块会只切换该块（流式期间和完成后都可用）。拖动选择、链接、滚轮和滚动锚定仍由 Pi 原生管理，滚动条 thumb 拖动使用 Rail 的窄 preview/commit seam。
 
 ### 10. 命令输出和 `/reload` 输出对齐
 
@@ -220,7 +220,7 @@ ui-style.json
 }
 ```
 
-需要固定 editor/footer dock 和 transcript 滚动时，请使用 Pi 的 `tuiMode: "fullscreen"` 设置。fullscreen 下 Rail 保持 Pi 原生 scrollbar 的 auto 模式（拖动、hover 和 track 几何全部原生处理），并在其上覆盖旧版 Rail 滚动条：单列蓝色 thumb（`editor.rail` / `conversationScroll.scrollbar.thumbBackground`），透明 track，仅在 transcript 溢出时显示；拖动 thumb 即可滚动 transcript。
+需要固定 editor/footer dock 和 transcript 滚动时，请使用 Pi 的 `tuiMode: "fullscreen"` 设置。fullscreen 下 Rail 隐藏 Pi 的 scrollbar 绘制路径，自己绘制旧版 Rail 滚动条：单列蓝色 thumb（`editor.rail` / `conversationScroll.scrollbar.thumbBackground`），透明 track，仅在 transcript 溢出时显示。拖动期间只预览 thumb，松手后才提交 scroll position 并渲染 transcript。
 
 ### `bashExecution`
 
@@ -368,14 +368,14 @@ pi-rail-ui/
 - 已完成的 simple tool/bash preview 会跨滚动帧复用，不再重复扫描大型参数或输出。
 - Fullscreen 左 gutter 在 transcript 内容未变化时复用已加前缀的行。
 - 滚动条 thumb 对纯文本行直接用 slice 绘制，仅 ANSI 样式行走完整 overlay 合成；原生拖动几何不做任何改动。
-- 拖动 fullscreen 滚动条期间挂起渲染（滚动状态照常更新），松手后执行一次最终渲染；300ms 无事件超时防止 mouse-up 丢失时画面永久冻结。
-- Transcript layout、viewport 和原生选择性能由 Pi 管理。
-- Fullscreen 滚动条是 Rail 自己绘制的单列 overlay，只读取 Pi 的滚动状态，不接管 viewport 或输入。
+- 拖动 fullscreen 滚动条期间挂起 Pi transcript render；Rail 只用窄的终端写入更新 thumb preview，松手后提交 scroll position 并执行一次渲染。1000ms 无事件超时和 focus-out seam 防止 mouse-up 丢失时画面永久冻结。
+- Pi 管理 transcript layout、viewport、普通滚动和原生选择性能；Rail 的 drag state machine 只接管最右侧 scrollbar 列。
+- Rail scrollbar 几何复用 Pi 原生 thumb 公式，但不启用 Pi 原生 scrollbar 的绘制和 timer 路径。
 
 ## 限制和注意事项
 
 - 部分视觉 component patch 以及窄范围 fullscreen copy/click seam 仍依赖 Pi 内部结构，component 或 mouse handler shape 变化时可能需要同步更新。
-- Fullscreen mode、transcript 滚动、终端鼠标选择和 selector 生命周期由 Pi 原生管理；Rail 只覆盖滚动条的视觉呈现，拖动几何复用 Pi 原生 auto 模式。
+- Fullscreen mode、transcript 滚动、终端鼠标选择和 selector 生命周期由 Pi 原生管理；Rail 只在 fullscreen scrollbar 列处理拖动，并在卸载时恢复 Pi 原生 scrollbar mode/style。
 - 终端模拟器自身的滚动条（iTerm2 的 "Save lines to scrollback in alternate screen"）不在转义序列可控范围内；若它与 Rail 滚动条同时出现，请在 iTerm2 profile 设置中关闭该选项。
 - 使用固定 dock 和原生 transcript viewport 时，请把 Pi 的 `tuiMode` 设置为 `fullscreen`。
 - 标准终端协议通常不支持应用可靠改变系统鼠标指针形状。
@@ -396,7 +396,7 @@ pi-rail-ui/
 
 ### 原生 transcript 行为
 
-使用 Pi 的 `tuiMode: "fullscreen"` 和原生快捷键进行 transcript 滚动与选择。Rail 不再安装与其竞争的聊天 viewport 或 scrollbar。
+使用 Pi 的 `tuiMode: "fullscreen"` 和原生快捷键进行 transcript 滚动与选择。Rail 不安装竞争性的聊天 viewport；fullscreen scrollbar 是扩展侧窄 overlay，松手时才提交 transcript 滚动。
 
 ### 输入框增长太早或太晚
 

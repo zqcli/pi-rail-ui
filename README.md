@@ -117,7 +117,7 @@ The optional Rail footer remains visually lightweight:
 
 ### 3. Native Conversation History
 
-Pi's regular/fullscreen renderer owns transcript layout, wheel and page scrolling, scrollbar behavior, prompt navigation, and text selection. Rail installs no competing viewport, mouse router, or terminal screen-control sequences.
+Pi's regular/fullscreen renderer owns transcript layout, wheel and page scrolling, prompt navigation, and text selection. Rail installs no competing viewport or general mouse router; fullscreen scrollbar dragging uses one narrow Rail input seam and only writes the thumb preview directly to the terminal.
 
 ### 4. Native Selection and Clipboard
 
@@ -151,7 +151,7 @@ Slash autocomplete stays inside Pi's native editor lifecycle and list implementa
 
 ### 9. Tool Execution Layout
 
-Tool, `!bash`, and assistant thinking blocks keep their Rail surfaces, compact previews, and theme-derived colors. Pi's native `Ctrl+O` behavior controls global expansion. In fullscreen mode, a plain single click on a tool, bash, or thinking block toggles only that block (during streaming and after completion); drag selection, links, wheel scrolling, the scrollbar, and scroll anchoring remain owned by Pi.
+Tool, `!bash`, and assistant thinking blocks keep their Rail surfaces, compact previews, and theme-derived colors. Pi's native `Ctrl+O` behavior controls global expansion. In fullscreen mode, a plain single click on a tool, bash, or thinking block toggles only that block (during streaming and after completion); drag selection, links, wheel scrolling, and scroll anchoring remain owned by Pi, while scrollbar-thumb dragging uses Rail's narrow preview/commit seam.
 
 ### 10. Command and Reload Output Alignment
 
@@ -221,7 +221,7 @@ Conversation scrolling is delegated to Pi. The legacy section remains configurab
 }
 ```
 
-Use Pi's `tuiMode: "fullscreen"` setting for the native fixed editor/footer dock and transcript scrolling. In fullscreen, Rail keeps Pi's scrollbar in auto mode so drag, hover, and track geometry stay native, and paints the legacy Rail scrollbar over it: a one-column blue thumb (`editor.rail` / `conversationScroll.scrollbar.thumbBackground`) over a transparent track, shown only while the transcript overflows. Dragging the thumb scrolls the transcript.
+Use Pi's `tuiMode: "fullscreen"` setting for the native fixed editor/footer dock and transcript scrolling. In fullscreen, Rail hides Pi's scrollbar paint path and draws the legacy Rail scrollbar itself: a one-column blue thumb (`editor.rail` / `conversationScroll.scrollbar.thumbBackground`) over a transparent track, shown only while the transcript overflows. During a thumb drag, Rail previews only that thumb; the transcript is committed and rendered once on release.
 
 ### `bashExecution`
 
@@ -369,14 +369,14 @@ The extension includes several optimizations for long sessions:
 - Completed simple tool/bash previews are reused across scroll frames instead of rescanning large arguments or output.
 - The fullscreen left gutter reuses its prefixed rows while the transcript content is unchanged between frames.
 - The scrollbar thumb paints plain rows with a direct slice and only falls back to full overlay compositing for ANSI-styled rows; the native drag geometry stays untouched.
-- While the fullscreen scrollbar is being dragged, renders are suspended (scroll state still updates) and one final render happens on release; a 300ms inactivity timeout guards against a lost mouse-up.
-- Pi owns transcript layout, viewport, scrolling, and native selection performance.
-- Fullscreen scrollbar rendering is Rail's own one-column overlay; Pi's native auto-mode geometry keeps the thumb draggable.
+- While the fullscreen scrollbar is being dragged, Pi's transcript render is suspended; Rail updates only the thumb preview with a narrow terminal write, then commits the scroll position and performs one render on release. A 1000ms inactivity timeout and focus-out seam guard against a lost mouse-up.
+- Pi owns transcript layout, viewport, normal scrolling, and native selection performance; Rail's drag state machine only runs on the scrollbar column.
+- The Rail scrollbar geometry mirrors Pi's native thumb formula without enabling Pi's native scrollbar paint/timer path.
 
 ## Limitations and Caveats
 
 - Visual component patches and the narrow fullscreen copy/click seams depend on selected Pi internals and may need updates when component or mouse-handler shapes change.
-- Pi owns fullscreen mode, transcript scrolling, terminal mouse selection, and selector lifecycle; Rail replaces only the scrollbar's visual presentation while reusing Pi's drag geometry.
+- Pi owns fullscreen mode, transcript scrolling, terminal mouse selection, and selector lifecycle. Rail owns only the fullscreen scrollbar column during a drag and restores Pi's scrollbar mode/style on uninstall.
 - The terminal emulator's own scrollbar (iTerm2 "Save lines to scrollback in alternate screen") is outside the escape-code surface; disable that profile setting if it appears alongside Rail's scrollbar.
 - Set Pi's `tuiMode` to `fullscreen` to use its fixed dock and native transcript viewport.
 - Standard terminal protocols do not reliably allow changing the OS cursor shape on hover.
@@ -397,7 +397,7 @@ Run `/reload` and check the extension discovery output. It should include:
 
 ### Native transcript behavior
 
-Use Pi's `tuiMode: "fullscreen"` setting and native keybindings for transcript scrolling and selection. Rail intentionally does not install a competing chat viewport or scrollbar.
+Use Pi's `tuiMode: "fullscreen"` setting and native keybindings for transcript scrolling and selection. Rail does not install a competing chat viewport; its fullscreen scrollbar is a narrow extension-side overlay with a release-time transcript commit.
 
 ### Editor grows too much or too little
 

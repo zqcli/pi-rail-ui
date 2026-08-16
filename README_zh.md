@@ -116,11 +116,11 @@ Pi Rail UI 注册了以下 slash 命令：
 
 ### 3. 原生聊天历史
 
-Transcript layout、wheel/page scrolling、prompt navigation 和文本选择由 Pi 的 regular/fullscreen renderer 管理。Rail 不再安装竞争性的 viewport 或通用 mouse router；fullscreen 滚动条拖动只通过一个窄的 Rail 输入 seam，并直接向终端写 thumb preview。
+Transcript layout、wheel/page scrolling、prompt navigation 和文本选择由 Pi 的 regular/fullscreen renderer 管理。Rail 不再安装竞争性的 viewport 或通用 mouse router；fullscreen 滚动条拖动和可见 editor 文本内的单击定位分别使用窄范围 Rail 输入 seam。滚动条 motion 只直接向终端写 thumb preview。
 
 ### 4. 原生选择和剪贴板
 
-Fullscreen transcript 的选择与复制使用 Pi 原生 TUI 行为，包括选词、选段和边缘自动滚动。Rail 不再全局启用或禁用 terminal mouse tracking；它只把 Pi 位于右上角 flash stack 的临时 `Copied!` 提示转移到 Rail footer。
+Fullscreen transcript 的选择与复制使用 Pi 原生 TUI 行为，包括选词、选段和边缘自动滚动。Rail 不再全局启用或禁用 terminal mouse tracking；在 focused Rail editor 内，普通单击只会把可见原生 editor 行映射到 Pi cursor position。Rail 还会把 Pi 位于右上角 flash stack 的临时 `Copied!` 提示转移到 Rail footer。
 
 ### 5. Assistant Thinking 和正文对齐
 
@@ -354,7 +354,7 @@ pi-rail-ui/
    输入框、thinking、用户消息和命令/工具输出复用同一个 rail 几何模型。Pi 原生 selector 和 fullscreen viewport 不再由 Rail 重复实现。
 
 4. **原生 Pi 行为优先**
-   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择引擎、同步输出和 selector ownership。原生 integration patch 仅限视觉 component、复制提示位置，以及实现单块 execution 点击所需的普通单击 release seam。
+   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择引擎、同步输出和 selector ownership。原生 integration patch 仅限视觉 component、复制提示位置，以及一个 fullscreen click hook；该 hook 只会在各自 layout 区域内分发 editor cursor 定位或单块 execution 切换。
 
 5. **优化热路径性能**
    Rail 缓存 component 和 surface 渲染，但不再持有 Pi 原生 transcript scroll state。
@@ -375,7 +375,7 @@ pi-rail-ui/
 ## 限制和注意事项
 
 - 部分视觉 component patch 以及窄范围 fullscreen copy/click seam 仍依赖 Pi 内部结构，component 或 mouse handler shape 变化时可能需要同步更新。
-- Fullscreen mode、transcript 滚动、终端鼠标选择和 selector 生命周期由 Pi 原生管理；Rail 只在 fullscreen scrollbar 列处理拖动，并在卸载时恢复 Pi 原生 scrollbar mode/style。
+- Fullscreen mode、transcript 滚动、终端鼠标选择和 selector 生命周期由 Pi 原生管理；Rail 只在 fullscreen scrollbar 列处理拖动，并在 focused editor rect 内处理普通单击 cursor 定位；卸载时会恢复 Pi 原生 scrollbar mode/style。
 - 终端模拟器自身的滚动条（iTerm2 的 "Save lines to scrollback in alternate screen"）不在转义序列可控范围内；若它与 Rail 滚动条同时出现，请在 iTerm2 profile 设置中关闭该选项。
 - 使用固定 dock 和原生 transcript viewport 时，请把 Pi 的 `tuiMode` 设置为 `fullscreen`。
 - 标准终端协议通常不支持应用可靠改变系统鼠标指针形状。

@@ -117,11 +117,11 @@ The optional Rail footer remains visually lightweight:
 
 ### 3. Native Conversation History
 
-Pi's regular/fullscreen renderer owns transcript layout, wheel and page scrolling, prompt navigation, and text selection. Rail installs no competing viewport or general mouse router; fullscreen scrollbar dragging uses one narrow Rail input seam and only writes the thumb preview directly to the terminal.
+Pi's regular/fullscreen renderer owns transcript layout, wheel and page scrolling, prompt navigation, and text selection. Rail installs no competing viewport or general mouse router; fullscreen scrollbar dragging and click-to-position inside visible editor text use narrow Rail input seams. Scrollbar motion only writes the thumb preview directly to the terminal.
 
 ### 4. Native Selection and Clipboard
 
-Fullscreen transcript selection and copy use Pi's native TUI behavior, including its word/paragraph selection and autoscroll support. Rail does not enable or disable terminal mouse tracking globally; it only redirects Pi's transient `Copied!` confirmation from the top-right flash stack into the Rail footer.
+Fullscreen transcript selection and copy use Pi's native TUI behavior, including its word/paragraph selection and autoscroll support. Rail does not enable or disable terminal mouse tracking globally; inside the focused Rail editor, a plain click only remaps the visible native editor row to Pi's cursor position. Rail also redirects Pi's transient `Copied!` confirmation from the top-right flash stack into the Rail footer.
 
 ### 5. Assistant Thinking and Reply Alignment
 
@@ -355,7 +355,7 @@ pi-rail-ui/
    Editor, thinking, user messages, and command/tool output share the same rail geometry. Pi's native selectors and fullscreen viewport are not reimplemented by Rail.
 
 4. **Prefer native Pi behavior**
-   Rail avoids patching Pi's renderer lifecycle, alternate screen, transcript viewport, mouse selection engine, synchronized output, and selector ownership. Native integration patches are limited to visual components, copy-feedback placement, and the plain-click release seam required for per-block execution toggles.
+   Rail avoids patching Pi's renderer lifecycle, alternate screen, transcript viewport, mouse selection engine, synchronized output, and selector ownership. Native integration patches are limited to visual components, copy-feedback placement, and one fullscreen click hook that dispatches editor cursor placement or per-block execution toggles only inside their own layout regions.
 
 5. **Optimize hot paths**
    Rail caches component and surface rendering without taking ownership of Pi's native transcript scroll state.
@@ -376,7 +376,7 @@ The extension includes several optimizations for long sessions:
 ## Limitations and Caveats
 
 - Visual component patches and the narrow fullscreen copy/click seams depend on selected Pi internals and may need updates when component or mouse-handler shapes change.
-- Pi owns fullscreen mode, transcript scrolling, terminal mouse selection, and selector lifecycle. Rail owns only the fullscreen scrollbar column during a drag and restores Pi's scrollbar mode/style on uninstall.
+- Pi owns fullscreen mode, transcript scrolling, terminal mouse selection, and selector lifecycle. Rail owns only the fullscreen scrollbar column during a drag and plain-click cursor placement inside the focused editor rect; it restores Pi's scrollbar mode/style on uninstall.
 - The terminal emulator's own scrollbar (iTerm2 "Save lines to scrollback in alternate screen") is outside the escape-code surface; disable that profile setting if it appears alongside Rail's scrollbar.
 - Set Pi's `tuiMode` to `fullscreen` to use its fixed dock and native transcript viewport.
 - Standard terminal protocols do not reliably allow changing the OS cursor shape on hover.

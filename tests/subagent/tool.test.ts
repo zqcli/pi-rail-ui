@@ -80,6 +80,82 @@ test("stateful subagent tool creates by profile and continues by target without 
 	});
 });
 
+test("agent without alias or session runs stateless and does not create a broker instance", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	const statelessTasks: string[] = [];
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+		discoverProfiles: () => ({ agents: [reviewer], projectAgentsDir: null }),
+		runStateless: async (request: any) => {
+			statelessTasks.push(request.task);
+			return {
+				output: "one-off done",
+				exitCode: 0,
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+			};
+		},
+	});
+
+	const result = await tool.execute("call-stateless", {
+		agent: "reviewer",
+		target: "",
+		alias: "",
+		task: "one-off review",
+		cwd: "",
+		session: { mode: "fork", path: "" },
+		tasks: [],
+		chain: [],
+		agentScope: "both",
+		confirmProjectAgents: true,
+		confirmSessionAttach: true,
+	}, undefined, undefined, {
+		cwd: "/tmp/project",
+		hasUI: false,
+		model: { provider: "cus-resp", id: "gpt-5.6-sol" },
+		thinkingLevel: "xhigh",
+	});
+
+	assert.deepEqual(statelessTasks, ["one-off review"]);
+	assert.equal(broker.requests.length, 0);
+	assert.match(result.content[0].text, /Stateless subagent reviewer completed/);
+	assert.equal(result.details.results[0].persistent, false);
+});
+
+test("parallel mode can mix stateless work with a persistent instance", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	const statelessTasks: string[] = [];
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+		discoverProfiles: () => ({ agents: [reviewer], projectAgentsDir: null }),
+		runStateless: async (request: any) => {
+			statelessTasks.push(request.task);
+			return {
+				output: "one-off done",
+				exitCode: 0,
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+			};
+		},
+	});
+
+	const result = await tool.execute("call-mixed", {
+		tasks: [
+			{ agent: "reviewer", task: "quick check" },
+			{ agent: "reviewer", alias: "kept-review", task: "long review" },
+		],
+	}, undefined, undefined, {
+		cwd: "/tmp/project",
+		hasUI: false,
+		model: { provider: "cus-resp", id: "gpt-5.6-sol" },
+		thinkingLevel: "xhigh",
+	});
+
+	assert.deepEqual(statelessTasks, ["quick check"]);
+	assert.equal(broker.requests.length, 1);
+	assert.deepEqual(result.details.results.map((item: any) => item.persistent), [false, true]);
+});
+
 test("stateful subagent tool confirms before forking an ordinary session", async () => {
 	let tool: any;
 	let confirmations = 0;

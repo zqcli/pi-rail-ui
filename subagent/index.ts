@@ -1,13 +1,10 @@
 import * as path from "node:path";
 import {
 	getAgentDir,
-	SessionManager,
 	type ExtensionAPI,
-	type ExtensionCommandContext,
 	type ExtensionContext,
-	type SessionInfo,
 } from "@earendil-works/pi-coding-agent";
-import { discoverAgents, type AgentConfig, type AgentScope } from "./agents";
+import { discoverAgents } from "./agents";
 import { FileAgentInstanceStore } from "./instance-store";
 import {
 	applySubagentMentionCompletion,
@@ -16,8 +13,10 @@ import {
 	subagentMentionSuggestions,
 } from "./interaction";
 import type { RpcEvent } from "./rpc-worker";
+import { runRailAgentManager } from "./rail-agent-manager";
 import { SessionBroker } from "./session-broker";
 import { SessionAgentRoster } from "./session-links";
+import { createStatelessAgentRunner } from "./stateless-runner";
 import { installStatefulSubagentTool } from "./tool";
 import { createRpcWorkerFactory } from "./worker-factory";
 
@@ -26,16 +25,6 @@ interface SubagentRuntime {
 	broker: SessionBroker;
 	roster: SessionAgentRoster;
 	store: FileAgentInstanceStore;
-}
-
-function sessionTitle(info: SessionInfo, index: number): string {
-	const title = info.name?.trim() || info.firstMessage.trim().replace(/\s+/gu, " ").slice(0, 60) || info.id.slice(0, 8);
-	const cwd = path.basename(info.cwd || path.dirname(info.path));
-	return `${index + 1}. ${title} · ${cwd} · ${info.modified.toLocaleDateString()}`;
-}
-
-function profileTitle(profile: AgentConfig): string {
-	return `${profile.name} (${profile.source}) — ${profile.description}`;
 }
 
 function unique<T>(values: T[]): T[] {
@@ -107,6 +96,7 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 	installStatefulSubagentTool(pi, {
 		broker: () => getRuntime().broker,
 		discoverProfiles: discoverAgents,
+		runStateless: createStatelessAgentRunner(),
 	});
 
 	const installAutocomplete = (ctx: ExtensionContext) => {
@@ -145,93 +135,10 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 		}));
 	};
 
-	const attachExistingSession = async (ctx: ExtensionContext) => {
-		const active = getRuntime();
-		const scopeChoice = await ctx.ui.select("Session scope", ["Current project", "All projects"]);
-		if (!scopeChoice) return;
-		const sessions = (scopeChoice === "All projects" ? await SessionManager.listAll() : await SessionManager.list(ctx.cwd))
-			.filter((info) => info.path !== ctx.sessionManager.getSessionFile())
-			.sort((a, b) => b.modified.getTime() - a.modified.getTime())
-			.slice(0, 250);
-		if (sessions.length === 0) {
-			ctx.ui.notify("No attachable sessions found", "warning");
-			return;
-		}
-		const labels = sessions.map(sessionTitle);
-		const selectedLabel = await ctx.ui.select("Select a Pi session", labels);
-		if (!selectedLabel) return;
-		const selected = sessions[labels.indexOf(selectedLabel)];
-		if (!selected) return;
-
-		const managed = (await active.store.list()).find((instance) => instance.sessionFile === selected.path);
-		if (managed) {
-			const alias = await ctx.ui.input("Persistent alias", managed.alias);
-			if (!alias?.trim()) return;
-			active.roster.link(alias.trim(), managed.agentId);
-			ctx.ui.notify(`Attached managed subagent ${alias.trim()}`, "info");
-			return;
-		}
-
-		const profileScope: AgentScope = ctx.isProjectTrusted() ? "both" : "user";
-		const profiles = discoverAgents(ctx.cwd, profileScope).agents;
-		const profileLabels = profiles.map(profileTitle);
-		const selectedProfileLabel = await ctx.ui.select("Adopt session as profile", profileLabels);
-		if (!selectedProfileLabel) return;
-		const profile = profiles[profileLabels.indexOf(selectedProfileLabel)];
-		if (!profile) return;
-		if (profile.source === "project") {
-			const approved = await ctx.ui.confirm("Use project-local agent?", `${profile.name}\n${profile.filePath}`);
-			if (!approved) return;
-		}
-		const defaultAlias = `${profile.name}-${selected.id.slice(0, 6)}`;
-		const alias = await ctx.ui.input("Persistent alias", defaultAlias);
-		if (!alias?.trim()) return;
-		const modeLabel = await ctx.ui.select("Attach mode", ["Fork and adopt (recommended)", "Exclusive attach"]);
-		if (!modeLabel) return;
-		const mode = modeLabel.startsWith("Fork") ? "fork" as const : "exclusive" as const;
-		const approved = await ctx.ui.confirm(
-			"Attach session as subagent?",
-			`Alias: ${alias.trim()}\nProfile: ${profile.name}\nCWD: ${selected.cwd}\nMode: ${mode}`,
-		);
-		if (!approved) return;
-		const instance = await active.broker.attach({
-			agent: profile.name,
-			profile,
-			alias: alias.trim(),
-			cwd: selected.cwd || ctx.cwd,
-			session: { mode, path: selected.path },
-		});
-		ctx.ui.notify(`Attached ${instance.alias} (${instance.agentId})`, "info");
-	};
-
-	const manageAgents = async (_args: string, ctx: ExtensionCommandContext) => {
-		const active = getRuntime();
-		const action = await ctx.ui.select("Persistent subagents", ["List linked", "Attach existing session", "Detach"]);
-		if (!action) return;
-		if (action === "Attach existing session") {
-			await attachExistingSession(ctx);
-			return;
-		}
-		const instances = await active.broker.listLinked();
-		if (instances.length === 0) {
-			ctx.ui.notify("No persistent subagents linked to this session branch", "info");
-			return;
-		}
-		const labels = instances.map((instance) => `${instance.alias} · ${instance.profile.name} · ${instance.lastTask}`);
-		const selected = await ctx.ui.select(action === "Detach" ? "Detach subagent" : "Linked subagents", labels);
-		if (!selected) return;
-		const instance = instances[labels.indexOf(selected)];
-		if (!instance) return;
-		if (action === "Detach") {
-			await active.broker.detach(instance.alias);
-			ctx.ui.notify(`Detached ${instance.alias}; child session was kept`, "info");
-			return;
-		}
-		ctx.ui.notify(`${instance.alias} (${instance.agentId})\n${instance.profile.name}\n${instance.cwd}\n${instance.lastTask}`, "info");
-	};
-
-	pi.registerCommand("agents", { description: "Manage persistent subagents and attach saved Pi sessions", handler: manageAgents });
-	pi.registerCommand("subagents", { description: "Alias for /agents", handler: manageAgents });
+	pi.registerCommand("rail-agent", {
+		description: "Start, link, and manage Rail persistent agents",
+		handler: (_args, ctx) => runRailAgentManager(ctx, getRuntime()),
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (runtime) await runtime.broker.shutdown();
@@ -279,7 +186,10 @@ export * from "./instance-store";
 export * from "./interaction";
 export * from "./rpc-transport";
 export * from "./rpc-worker";
+export * from "./rail-agent-manager";
 export * from "./session-broker";
 export * from "./session-lease";
 export * from "./session-links";
+export * from "./session-picker";
+export * from "./stateless-runner";
 export * from "./tool";

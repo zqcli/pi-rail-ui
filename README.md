@@ -36,9 +36,9 @@ After editing or installing it, reload Pi with:
 
 Pi should discover this directory extension automatically.
 
-### Optional Stateful Subagent Extension
+### Optional Rail Subagent Extension
 
-This repository also contains a standalone persistent subagent extension. Point Pi's separate `subagent` entry at the bundled implementation instead of loading both it and the official stateless example:
+This repository also contains a standalone subagent extension for both one-off and persistent delegation. Point Pi's separate `subagent` entry at the bundled implementation instead of loading both it and the official stateless example:
 
 ```bash
 mv ~/.pi/agent/extensions/subagent \
@@ -52,11 +52,12 @@ The directory-level link is required because the entry point imports sibling mod
 - `@new/reviewer` (or another profile) to create a persistent agent instance.
 - `@agent/auth-review` to route a follow-up to that exact instance without conflicting with Pi's normal `@path` completion.
 - `new://reviewer` and `agent://auth-review` as equivalent transport-safe forms for CLI, print, JSON, and RPC prompts. Pi expands a leading `@...` CLI argument as a file before extensions receive it.
-- `/agents` to list linked instances, attach a saved Pi session, or detach an instance while keeping its child session.
-- `agent` plus `alias` tool parameters for creation, and `target` for later reuse.
+- `/rail-agent` opens the Rail agent manager. **Start persistent agent** inserts `@new/<profile>` so creation happens only after a task is submitted. Its TUI session popup supports typing to search by session name, first message, project path, or ID.
+- `agent` plus `task`, without `alias` or `session`, runs a stateless one-off agent and creates no instance or child session.
+- `agent` plus `alias` creates a persistent instance; `target` continues that same instance.
 - Single-writer leases and a per-agent queue so concurrent calls cannot write the same child JSONL session.
 
-Regular saved sessions use **Fork and adopt** by default. **Exclusive attach** must only be used when no other Pi process has that session open. Sessions currently active in another TUI are intentionally not live-attached in this version.
+The `/rail-agent` safe path uses **Fork and adopt** without asking users to choose an attach mode. **Exclusive attach** is isolated under an Advanced action and must only be used when no other Pi process has that session open. Sessions currently active in another TUI are intentionally not live-attached in this version. The former `/agents` and `/subagents` aliases are intentionally not registered.
 
 Instance metadata and leases live under `~/.pi/agent/stateful-subagents/`; the full child transcript remains in the child Pi session. Parent sessions persist only compact roster links and tool results, avoiding transcript duplication.
 

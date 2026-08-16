@@ -36,9 +36,9 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地视觉扩展。它为长时�
 
 Pi 会自动发现并加载该目录扩展。
 
-### 可选 Stateful Subagent 扩展
+### 可选 Rail Subagent 扩展
 
-本仓库还包含一个独立的持久化 subagent 扩展。应让 Pi 的独立 `subagent` 入口指向该实现，避免同时加载它和官方 stateless example：
+本仓库还包含一个同时支持一次性和持久化派发的独立 subagent 扩展。应让 Pi 的独立 `subagent` 入口指向该实现，避免同时加载它和官方 stateless example：
 
 ```bash
 mv ~/.pi/agent/extensions/subagent \
@@ -52,11 +52,12 @@ ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
 - 使用 `@new/reviewer`（或其他 profile）创建 persistent agent instance。
 - 使用 `@agent/auth-review` 把后续任务强制派发给该 instance，同时不和 Pi 原生 `@path` 文件补全冲突。
 - 在 CLI、print、JSON 和 RPC prompt 中使用等价的 `new://reviewer` 与 `agent://auth-review`。Pi 会在 extension 收到输入前，把位于 CLI 参数开头的 `@...` 当作文件展开。
-- 使用 `/agents` 查看当前分支已连接的 instance、接入已有 Pi session，或解除连接但保留 child session。
-- Tool 创建时使用 `agent` 加 `alias`，后续复用时使用 `target`。
+- 使用 `/rail-agent` 打开 Rail agent manager。**Start persistent agent** 会插入 `@new/<profile>`，直到用户提交任务时才真正创建。TUI session 弹窗支持按 session 名称、首条消息、项目路径和 ID 直接键入搜索。
+- Tool 只提供 `agent` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 agent，不创建 instance 或 child session。
+- 使用 `agent` 加 `alias` 创建 persistent instance；后续使用 `target` 复用同一个 instance。
 - 通过单 writer lease 和 per-agent queue，避免并发调用同时写入同一个 child JSONL session。
 
-普通历史 session 默认使用 **Fork and adopt**。只有确认没有其他 Pi 进程打开该 session 时，才可使用 **Exclusive attach**。当前版本不会 live attach 到另一个 TUI 正在运行的 session。
+`/rail-agent` 的普通流程固定使用安全的 **Fork and adopt**，不再要求用户理解 attach mode。**Exclusive attach** 被收进 Advanced action，且只有确认没有其他 Pi 进程打开该 session 时才可使用。当前版本不会 live attach 到另一个 TUI 正在运行的 session。旧 `/agents` 与 `/subagents` alias 不再注册。
 
 Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；完整 child transcript 仍保留在 child Pi session 中。父 session 只持久化精简 roster link 和 tool result，避免复制整份子对话。
 

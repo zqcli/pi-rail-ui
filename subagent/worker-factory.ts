@@ -1,5 +1,6 @@
-import * as fs from "node:fs";
+import { realpathSync } from "node:fs";
 import * as path from "node:path";
+import { resolvePiInvocation } from "./pi-invocation";
 import type { RpcEvent } from "./rpc-worker";
 import { buildRpcWorkerArgs, RpcSessionWorker } from "./rpc-worker";
 import { PiRpcProcessTransport } from "./rpc-transport";
@@ -14,21 +15,10 @@ export interface RpcWorkerFactoryOptions {
 	startupTimeoutMs?: number;
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/u.test(execName);
-	return isGenericRuntime ? { command: "pi", args } : { command: process.execPath, args };
-}
-
 function sessionLeaseKey(sessionPath: string): string {
 	let normalized = path.resolve(sessionPath);
 	try {
-		normalized = fs.realpathSync.native(normalized);
+		normalized = realpathSync.native(normalized);
 	} catch {
 		// A new child may report its path just before the session file is flushed.
 	}
@@ -85,7 +75,7 @@ export function createRpcWorkerFactory(options: RpcWorkerFactoryOptions): Sessio
 		let lease = await leases.acquire(startsWithSessionLease
 			? sessionLeaseKey(spec.sessionPath!)
 			: `agent:${spec.agentId}`);
-		const invocation = (options.resolveInvocation ?? getPiInvocation)(buildRpcWorkerArgs(spec));
+		const invocation = (options.resolveInvocation ?? resolvePiInvocation)(buildRpcWorkerArgs(spec));
 		const transport = new PiRpcProcessTransport({
 			command: invocation.command,
 			args: invocation.args,

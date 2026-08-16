@@ -205,10 +205,21 @@ function requestFinalRender(tui: any): void {
 function setScrollTopDirect(scrollView: any, value: number, maxScrollTop: number): boolean {
 	const next = Math.max(0, Math.min(maxScrollTop, Math.round(value)));
 	const current = scrollTopOf(scrollView);
-	if (next === current) return false;
-	if (typeof scrollView.currentScrollTop === "number") scrollView.currentScrollTop = next;
-	else scrollView.scrollTo?.(next);
-	if ("followingEnd" in scrollView) scrollView.followingEnd = false;
+	if (typeof scrollView.currentScrollTop !== "number") {
+		if (typeof scrollView.scrollTo !== "function") return false;
+		scrollView.scrollTo(next);
+		return next !== current;
+	}
+
+	const followsEnd = Boolean(scrollView.followEnd && next === maxScrollTop);
+	const changed = next !== current ||
+		("followingEnd" in scrollView && scrollView.followingEnd !== followsEnd) ||
+		("followSuppressedAtEnd" in scrollView && scrollView.followSuppressedAtEnd !== false);
+	if (!changed) return false;
+
+	scrollView.currentScrollTop = next;
+	if ("followingEnd" in scrollView) scrollView.followingEnd = followsEnd;
+	if ("followSuppressedAtEnd" in scrollView) scrollView.followSuppressedAtEnd = false;
 	return true;
 }
 

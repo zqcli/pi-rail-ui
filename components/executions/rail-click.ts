@@ -90,7 +90,9 @@ function clearNativeSelection(tui: any): void {
 }
 
 export function handleRailSectionClick(tui: any, event: any): boolean {
-	if (!event?.release || (event.button & 3) !== 0) return false;
+	if (!event?.release) return false;
+	const button = event.button & 3;
+	if (button !== 0 && button !== 3) return false;
 	if (!tui?.selectionPressActive || tui.selectionDragged || tui.selectionInitialRange || tui.pressedUrl) return false;
 
 	const anchor = tui.selectionAnchor;

@@ -163,6 +163,25 @@ describe("rail scrollbar", () => {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			assert.notEqual(scrollView.scrollTop, initialScrollTop);
 			assert.equal(renders, 1);
+
+			// Pi 0.84.2 search can leave the viewport at the end while explicitly
+			// suppressing follow. A scrollbar commit at the end must use the same
+			// state transition as native ScrollView.scrollTo(end).
+			scrollView.scrollToEnd();
+			altScreen.cancelRenderTimer?.();
+			altScreen.renderRequested = false;
+			altScreen.doRender();
+			scrollView.followingEnd = false;
+			scrollView.followSuppressedAtEnd = true;
+			renders = 0;
+
+			altScreen.handleViewportInput(mouse(0, column, thumbTop + 1));
+			altScreen.handleViewportInput(mouse(0, column, thumbTop + 1, true));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.equal(scrollView.followingEnd, true);
+			assert.equal(scrollView.followSuppressedAtEnd, false);
+			assert.equal(renders, 1);
 		} finally {
 			uninstallRailScrollbar();
 		}

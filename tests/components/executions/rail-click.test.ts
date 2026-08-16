@@ -58,6 +58,38 @@ describe("rail section click handling", () => {
 		assert.equal(handleRailSectionClick(tui, { release: true, button: 0 }), false);
 	});
 
+	test("accepts the generic SGR primary-button release code", () => {
+		const component = {
+			expanded: false,
+			toolName: "write",
+			setExpanded(expanded: boolean) {
+				this.expanded = expanded;
+			},
+			invalidate() {},
+		};
+		const lines = markRailClickRows(component, ["tool"]);
+		const scrollView = {};
+		const anchor = { row: 0, col: 2, scrollView };
+		const tui = {
+			selectionPressActive: true,
+			selectionDragged: false,
+			selectionInitialRange: undefined,
+			pressedUrl: undefined,
+			selectionAnchor: anchor,
+			selectionFocus: anchor,
+			selectionGranularity: "character",
+			currentLayout: {
+				root: { children: [{ scrollView, scrollContentLines: lines, children: [] }] },
+			},
+			getSelectionPoint: () => anchor,
+			stopSelectionAutoScroll() {},
+			requestRender() {},
+		};
+
+		assert.equal(handleRailSectionClick(tui, { release: true, button: 3 }), true);
+		assert.equal(component.expanded, true);
+	});
+
 	test("toggles a collapsible thinking section on plain click", () => {
 		const component: any = defineRailSection({
 			expanded: false,

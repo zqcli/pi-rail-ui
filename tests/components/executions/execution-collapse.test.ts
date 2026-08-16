@@ -103,8 +103,8 @@ describe("collapsed simple rendering", () => {
 		const second = renderExecutionRail(component, 80, original, { active: true });
 
 		assert.strictEqual(second, first);
-		assert.ok(first.some((row) => row.includes("\x1b[38;2;166;227;161m▎")));
-		assert.ok(first.some((row) => row.includes("\x1b[48;2;38;52;46m")));
+		assert.ok(first.some((row) => row.includes("\x1b[38;2;123;159;136m▎")));
+		assert.ok(first.some((row) => row.includes("\x1b[48;2;41;49;46m")));
 		assert.equal(first.filter(Boolean).every((row) => visibleWidth(row) === 80), true);
 	});
 });
@@ -137,8 +137,8 @@ describe("tool execution rail surface", () => {
 		assert.ok(widths.length > 0);
 		assert.deepEqual([...new Set(widths)], [79]);
 		assert.equal(rows.length, 1);
-		assert.ok((rows[0] ?? "").includes("\x1b[38;2;166;227;161m▎"));
-		assert.ok((rows[0] ?? "").includes("\x1b[48;2;38;52;46m"));
+		assert.ok((rows[0] ?? "").includes("\x1b[38;2;123;159;136m▎"));
+		assert.ok((rows[0] ?? "").includes("\x1b[48;2;41;49;46m"));
 		assert.equal((rows[0] ?? "").includes(nativeSuccessBg), false);
 		assert.ok((rows[0] ?? "").includes("\x1b[38;2;205;214;244m"));
 		assert.equal((rows[0] ?? "").includes(nativeTitleFg), false);
@@ -166,8 +166,8 @@ describe("tool execution rail surface", () => {
 		const rows = renderExecutionRail(component, 80, original, { active: true });
 
 		assert.equal(rows.length, 1);
-		assert.ok((rows[0] ?? "").includes("\x1b[38;2;243;139;168m▎"));
-		assert.ok((rows[0] ?? "").includes("\x1b[48;2;58;39;48m"));
+		assert.ok((rows[0] ?? "").includes("\x1b[38;2;188;120;136m▎"));
+		assert.ok((rows[0] ?? "").includes("\x1b[48;2;52;43;47m"));
 		assert.equal((rows[0] ?? "").includes(nativeErrorBg), false);
 		assert.equal(visibleWidth(rows[0] ?? ""), 80);
 	});

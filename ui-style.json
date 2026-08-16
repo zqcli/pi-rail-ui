@@ -127,8 +127,8 @@
         },
         "states": {
           "pending": { "background": { "rgb": [40, 43, 61] }, "rail": { "rgb": [137, 180, 250] } },
-          "success": { "background": { "rgb": [38, 52, 46] }, "rail": { "rgb": [166, 227, 161] } },
-          "error": { "background": { "rgb": [58, 39, 48] }, "rail": { "rgb": [243, 139, 168] } },
+          "success": { "background": { "rgb": [41, 49, 46] }, "rail": { "rgb": [123, 159, 136] } },
+          "error": { "background": { "rgb": [52, 43, 47] }, "rail": { "rgb": [188, 120, 136] } },
           "cancelled": { "background": { "rgb": [41, 42, 53] }, "rail": { "rgb": [127, 132, 156] } }
         }
       },

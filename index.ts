@@ -44,7 +44,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	}
 
 	async function install(ctx: ExtensionContext) {
-		if (!ctx.hasUI || !enabled) return;
+		if (ctx.mode !== "tui" || !enabled) return;
 		setRailUiActive(true);
 		installEditor(ctx);
 		installFooter(ctx);
@@ -59,7 +59,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	}
 
 	function uninstall(ctx: ExtensionContext) {
-		if (!ctx.hasUI) return;
+		if (ctx.mode !== "tui") return;
 		setRailUiActive(false);
 		ctx.ui.setEditorComponent(undefined);
 		ctx.ui.setFooter(undefined);
@@ -107,7 +107,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		setTurnStartTime(Date.now());
-		if (ctx.hasUI && enabled) {
+		if (ctx.mode === "tui" && enabled) {
 			installFooter(ctx);
 			refreshUserMessageTimestamps(ctx);
 		}
@@ -119,22 +119,22 @@ export default async function piRailUi(pi: ExtensionAPI) {
 
 	pi.on("message_end", async (event, ctx) => {
 		rememberUserMessageTimestamp(event.message);
-		if (event.message.role === "assistant" && ctx.hasUI && enabled) {
+		if (event.message.role === "assistant" && ctx.mode === "tui" && enabled) {
 			installFooter(ctx);
 		}
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		setTurnEndTime();
-		if (ctx.hasUI && enabled) installFooter(ctx);
+		if (ctx.mode === "tui" && enabled) installFooter(ctx);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
-		if (ctx.hasUI && enabled) installFooter(ctx);
+		if (ctx.mode === "tui" && enabled) installFooter(ctx);
 	});
 
 	pi.on("thinking_level_select", async (_event, ctx) => {
-		if (ctx.hasUI && enabled) installFooter(ctx);
+		if (ctx.mode === "tui" && enabled) installFooter(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event) => {

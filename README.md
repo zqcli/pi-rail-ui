@@ -36,6 +36,30 @@ After editing or installing it, reload Pi with:
 
 Pi should discover this directory extension automatically.
 
+### Optional Stateful Subagent Extension
+
+This repository also contains a standalone persistent subagent extension. Point Pi's separate `subagent` entry at the bundled implementation instead of loading both it and the official stateless example:
+
+```bash
+mv ~/.pi/agent/extensions/subagent \
+  ~/.pi/agent/extensions/subagent.stateless-example
+ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
+  ~/.pi/agent/extensions/subagent
+```
+
+The directory-level link is required because the entry point imports sibling modules. Reload Pi after changing the link. The standalone extension provides:
+
+- `@new/reviewer` (or another profile) to create a persistent agent instance.
+- `@agent/auth-review` to route a follow-up to that exact instance without conflicting with Pi's normal `@path` completion.
+- `new://reviewer` and `agent://auth-review` as equivalent transport-safe forms for CLI, print, JSON, and RPC prompts. Pi expands a leading `@...` CLI argument as a file before extensions receive it.
+- `/agents` to list linked instances, attach a saved Pi session, or detach an instance while keeping its child session.
+- `agent` plus `alias` tool parameters for creation, and `target` for later reuse.
+- Single-writer leases and a per-agent queue so concurrent calls cannot write the same child JSONL session.
+
+Regular saved sessions use **Fork and adopt** by default. **Exclusive attach** must only be used when no other Pi process has that session open. Sessions currently active in another TUI are intentionally not live-attached in this version.
+
+Instance metadata and leases live under `~/.pi/agent/stateful-subagents/`; the full child transcript remains in the child Pi session. Parent sessions persist only compact roster links and tool results, avoiding transcript duplication.
+
 ## Testing
 
 The test suite is centralized under `tests/` and uses Node's built-in `node:test`

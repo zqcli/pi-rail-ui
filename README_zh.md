@@ -36,6 +36,30 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地视觉扩展。它为长时�
 
 Pi 会自动发现并加载该目录扩展。
 
+### 可选 Stateful Subagent 扩展
+
+本仓库还包含一个独立的持久化 subagent 扩展。应让 Pi 的独立 `subagent` 入口指向该实现，避免同时加载它和官方 stateless example：
+
+```bash
+mv ~/.pi/agent/extensions/subagent \
+  ~/.pi/agent/extensions/subagent.stateless-example
+ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
+  ~/.pi/agent/extensions/subagent
+```
+
+入口文件会导入同目录模块，因此必须使用目录级 symlink。修改链接后执行 `/reload`。该独立扩展提供：
+
+- 使用 `@new/reviewer`（或其他 profile）创建 persistent agent instance。
+- 使用 `@agent/auth-review` 把后续任务强制派发给该 instance，同时不和 Pi 原生 `@path` 文件补全冲突。
+- 在 CLI、print、JSON 和 RPC prompt 中使用等价的 `new://reviewer` 与 `agent://auth-review`。Pi 会在 extension 收到输入前，把位于 CLI 参数开头的 `@...` 当作文件展开。
+- 使用 `/agents` 查看当前分支已连接的 instance、接入已有 Pi session，或解除连接但保留 child session。
+- Tool 创建时使用 `agent` 加 `alias`，后续复用时使用 `target`。
+- 通过单 writer lease 和 per-agent queue，避免并发调用同时写入同一个 child JSONL session。
+
+普通历史 session 默认使用 **Fork and adopt**。只有确认没有其他 Pi 进程打开该 session 时，才可使用 **Exclusive attach**。当前版本不会 live attach 到另一个 TUI 正在运行的 session。
+
+Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；完整 child transcript 仍保留在 child Pi session 中。父 session 只持久化精简 roster link 和 tool result，避免复制整份子对话。
+
 ## 测试
 
 测试用例统一放在 `tests/` 下，使用 Node 内置 `node:test`，并通过 `tsx` 加载 TypeScript。

@@ -14,6 +14,12 @@ export type RailSectionKind =
 	| "custom";
 export type RailSectionSelectionMode = "fullRow" | "contentOnly" | "visible";
 export type RailSectionCollapsedRenderMode = "review" | "simple";
+export type ToolExecutionState = "pending" | "success" | "error" | "cancelled";
+export type ToolExecutionRawTextStyle = {
+	title?: ColorReference;
+	output?: ColorReference;
+	muted?: ColorReference;
+};
 
 export type RailSectionRawStyle = {
 	background?: ColorReference;
@@ -61,6 +67,8 @@ export type RailSectionRawConfig = {
 	collapsedRenderMode?: RailSectionCollapsedRenderMode;
 	layout?: RailSectionRawLayout;
 	style?: RailSectionRawStyle;
+	states?: Partial<Record<ToolExecutionState, RailSectionRawStyle>>;
+	text?: ToolExecutionRawTextStyle;
 	selection?: RailSectionRawSelection;
 };
 
@@ -163,6 +171,8 @@ export type EditorHeightPolicy = {
 };
 
 export type EditorSurfaceStyle = RailSurfaceStyle & EditorHeightPolicy;
+export type ToolExecutionStateStyles = Record<ToolExecutionState, RailSurfaceStyle>;
+export type ToolExecutionTextStyle = Record<"title" | "output" | "muted", TextColorTarget>;
 
 export type TextColorTarget = {
 	themeKey?: string | undefined;

@@ -1,9 +1,16 @@
 import { truncateToVisualLines } from "@earendil-works/pi-coding-agent";
-import { railSectionConfig, type ThemeLike } from "../../config";
+import {
+	applyTextColor,
+	railAnsiForTheme,
+	railSectionConfig,
+	TOOL_EXECUTION_TEXT_STYLE,
+	type ThemeLike,
+	type ToolExecutionState,
+} from "../../config";
 import { stripAnsi } from "../../core/utils";
 import { collapseHint } from "../../rail/rail-section";
 import { cachedRender } from "../../rail/render-cache";
-import { bashExecutionSurfaceForTheme } from "../../rail/rail-surface";
+import { bashExecutionSurfaceForTheme, toolExecutionSurfaceForState } from "../../rail/rail-surface";
 import { isBashExecution } from "./bash-execution";
 import {
 	applyDefaultAutoCollapse,
@@ -21,6 +28,7 @@ import {
 
 const BASH_SURFACE_CACHE_KEY = Symbol.for("pi-rail-ui.bash-surface-cache");
 const TOOL_COLLAPSED_CONTENT_PADDING = 1;
+const TOOL_BACKGROUND_SGR_RE = /\x1b\[(?:4[0-9]|10[0-7]|48(?:(?:;|:)[0-9]*)+)m/g;
 
 function renderBashWithoutSurface(component: any, width: number, originalRender: (width: number) => string[]): string[] {
 	applyDefaultAutoCollapse(component, "bashExecution", () => originalRender.call(component, width));
@@ -126,6 +134,37 @@ function shouldApplyGenericToolCollapse(component: any): boolean {
 	}
 }
 
+function toolExecutionState(component: any): ToolExecutionState {
+	if (component?.isPartial !== false) return "pending";
+	return component?.result?.isError ? "error" : "success";
+}
+
+function isImageLineLike(line: string): boolean {
+	return line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
+}
+
+function restyleNativeToolForegrounds(line: string, theme?: ThemeLike): string {
+	if (!theme) return line;
+	for (const [sourceKey, target] of [
+		["toolTitle", TOOL_EXECUTION_TEXT_STYLE.title],
+		["toolOutput", TOOL_EXECUTION_TEXT_STYLE.output],
+	] as const) {
+		const source = railAnsiForTheme(theme, { themeKey: sourceKey });
+		const replacement = railAnsiForTheme(theme, target);
+		if (source && replacement && source !== replacement) line = line.replaceAll(source, replacement);
+	}
+	return line;
+}
+
+function renderToolSurfaceRows(component: any, rows: string[], width: number, theme?: ThemeLike): string[] {
+	const surface = toolExecutionSurfaceForState(toolExecutionState(component));
+	return rows.map((line) => {
+		if (!line || isImageLineLike(line)) return line;
+		const foregroundStyled = restyleNativeToolForegrounds(line, theme);
+		return surface.renderSurfaceRow(width, foregroundStyled.replace(TOOL_BACKGROUND_SGR_RE, ""));
+	});
+}
+
 function displayPath(value: unknown): string | undefined {
 	if (typeof value !== "string" || !value) return undefined;
 	const home = process.env["HOME"];
@@ -149,23 +188,30 @@ function compactArgs(args: any): string {
 }
 
 function toolTitle(component: any, theme: ThemeLike | undefined): string {
-	return fg(theme, "toolTitle", String(component?.toolName ?? "tool"));
+	return applyTextColor(theme, TOOL_EXECUTION_TEXT_STYLE.title, String(component?.toolName ?? "tool"));
 }
 
 function toolDetail(component: any, theme: ThemeLike | undefined): string {
 	const name = String(component?.toolName ?? "tool");
 	const args = component?.args ?? {};
 	const path = displayPath(args.path ?? args.file_path);
-	if (name === "bash") return fg(theme, "toolOutput", `$ ${String(args.command ?? "...")}`);
-	if (name === "read" && path) return `${fg(theme, "accent", path)}${formatRange(args)}`;
-	if ((name === "write" || name === "edit" || name === "ls") && path) return fg(theme, "accent", path);
-	if (name === "grep") return `${fg(theme, "toolOutput", String(args.pattern ?? "..."))}${path ? ` in ${fg(theme, "accent", path)}` : ""}`;
-	if (name === "find") return `${fg(theme, "toolOutput", String(args.pattern ?? "..."))}${path ? ` in ${fg(theme, "accent", path)}` : ""}`;
-	return fg(theme, "toolOutput", compactArgs(args));
+	const output = (value: string) => applyTextColor(theme, TOOL_EXECUTION_TEXT_STYLE.output, value);
+	if (name === "bash") return output(`$ ${String(args.command ?? "...")}`);
+	if (name === "read" && path) return output(`${path}${formatRange(args)}`);
+	if ((name === "write" || name === "edit" || name === "ls") && path) return output(path);
+	if (name === "grep") return output(`${String(args.pattern ?? "...")}${path ? ` in ${path}` : ""}`);
+	if (name === "find") return output(`${String(args.pattern ?? "...")}${path ? ` in ${path}` : ""}`);
+	return output(compactArgs(args));
 }
 
 function collapsedToolSimpleRows(component: any, contentWidth: number, theme: ThemeLike | undefined): string[] {
 	const rows = collapsedSimpleRows(toolTitle(component, theme), toolDetail(component, theme), executionHiddenLineCount(component, "toolExecution"), theme);
+	const mutedSource = theme ? railAnsiForTheme(theme, { themeKey: "muted" }) : undefined;
+	const mutedTarget = theme ? railAnsiForTheme(theme, TOOL_EXECUTION_TEXT_STYLE.muted) : undefined;
+	if (mutedSource && mutedTarget && mutedSource !== mutedTarget) {
+		const hintIndex = rows.length - 2;
+		if (hintIndex > 0) rows[hintIndex] = (rows[hintIndex] ?? "").replaceAll(mutedSource, mutedTarget);
+	}
 	const contentPadding = " ".repeat(TOOL_COLLAPSED_CONTENT_PADDING);
 	return rows.map((line) => line ? applyToolHintBackground(component, `${contentPadding}${line}`, contentWidth, theme) : line);
 }
@@ -178,28 +224,34 @@ function renderToolExecutionRail(
 ): string[] {
 	const kind = "toolExecution";
 	const config = railSectionConfig(kind);
+	const surface = toolExecutionSurfaceForState(toolExecutionState(component));
+	if (width < surface.minRenderableWidth()) return originalRender.call(component, width);
+	const contentWidth = surface.contentWidth(width);
 	const simpleMode = config.collapsedRenderMode === "simple";
-	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, width), { avoidExpandedRender: simpleMode });
+	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, contentWidth), { avoidExpandedRender: simpleMode });
 	const cacheable = Boolean(component.result && component.isPartial === false && (!Array.isArray(component.imageComponents) || component.imageComponents.length === 0));
 	if (cacheable) {
-		const signature = [width, component.expanded ? 1 : 0, simpleMode ? 1 : 0].join("\u001f");
+		const signature = [width, toolExecutionState(component), component.expanded ? 1 : 0, simpleMode ? 1 : 0].join("\u001f");
 		return cachedRender(component, TOOL_RAIL_CACHE_KEY, signature, () => {
-			if (simpleMode && !component.expanded) return collapsedToolSimpleRows(component, width, store.theme);
-			const renderedRows = originalRender.call(component, width);
-			return shouldApplyGenericToolCollapse(component)
-				? collapsedExecutionRows(component, kind, renderedRows, width, store.theme)
-				: renderedRows;
+			const renderedRows = simpleMode && !component.expanded
+				? collapsedToolSimpleRows(component, contentWidth, store.theme)
+				: originalRender.call(component, contentWidth);
+			const collapsedRows = simpleMode && !component.expanded || !shouldApplyGenericToolCollapse(component)
+				? renderedRows
+				: collapsedExecutionRows(component, kind, renderedRows, contentWidth, store.theme);
+			return renderToolSurfaceRows(component, collapsedRows, width, store.theme);
 		}, { result: component.result, args: component.args });
 	}
 
 	if (simpleMode && !component.expanded) {
-		return collapsedToolSimpleRows(component, width, store.theme);
+		return renderToolSurfaceRows(component, collapsedToolSimpleRows(component, contentWidth, store.theme), width, store.theme);
 	}
 
-	const renderedRows = originalRender.call(component, width);
-	return shouldApplyGenericToolCollapse(component)
-		? collapsedExecutionRows(component, kind, renderedRows, width, store.theme)
+	const renderedRows = originalRender.call(component, contentWidth);
+	const collapsedRows = shouldApplyGenericToolCollapse(component)
+		? collapsedExecutionRows(component, kind, renderedRows, contentWidth, store.theme)
 		: renderedRows;
+	return renderToolSurfaceRows(component, collapsedRows, width, store.theme);
 }
 
 export function renderExecutionRail(

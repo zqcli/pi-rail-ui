@@ -113,7 +113,25 @@
       "assistantThinking": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 3, "style": { "background": "transparent", "rail": { "rgb": [203, 166, 247] } } },
       "assistantReply": { "layout": { "alignWith": "assistantThinking" }, "style": { "background": "transparent", "rail": false } },
       "userMessage": { "style": { "background": { "rgb": [49, 50, 68] }, "rail": { "rgb": [137, 180, 250] } }, "selection": { "includeTimestamp": true } },
-      "toolExecution": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 20, "collapseByDefault": ["write"], "collapsedRenderMode": "simple", "style": { "background": "transparent", "rail": { "rgb": [166, 227, 161] } } },
+      "toolExecution": {
+        "collapsible": true,
+        "clickToToggle": true,
+        "autoCollapseAfterRows": 20,
+        "collapseByDefault": ["write"],
+        "collapsedRenderMode": "simple",
+        "style": { "background": "transparent", "rail": { "rgb": [137, 180, 250] } },
+        "text": {
+          "title": { "rgb": [205, 214, 244] },
+          "output": { "rgb": [166, 173, 200] },
+          "muted": { "rgb": [127, 132, 156] }
+        },
+        "states": {
+          "pending": { "background": { "rgb": [40, 43, 61] }, "rail": { "rgb": [137, 180, 250] } },
+          "success": { "background": { "rgb": [38, 52, 46] }, "rail": { "rgb": [166, 227, 161] } },
+          "error": { "background": { "rgb": [58, 39, 48] }, "rail": { "rgb": [243, 139, 168] } },
+          "cancelled": { "background": { "rgb": [41, 42, 53] }, "rail": { "rgb": [127, 132, 156] } }
+        }
+      },
       "bashExecution": {
         "collapsible": true,
         "clickToToggle": true,

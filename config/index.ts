@@ -3,6 +3,7 @@ import { resolveStyleConfig } from "./resolved-style";
 import type { StyleFile } from "./types";
 
 export type { EditorHeightPolicy, EditorSurfaceStyle, RailSurfaceStyle } from "./types";
+export type { ToolExecutionState, ToolExecutionStateStyles, ToolExecutionTextStyle } from "./types";
 export type { TextColorTarget, ThemeLike, RailSectionKind, RailSectionSelectionMode } from "./types";
 export type { AppLayout, UserMessageLayout, SlashCommandLayout, FooterStyle, BashExecutionLayout } from "./types";
 export type { RailSectionSelectionConfig, RailSectionStyleConfig, RailSectionSpacingConfig } from "./types";
@@ -34,6 +35,8 @@ export const EDITOR_PASTE_MARKER_STYLE = resolved.EDITOR_PASTE_MARKER_STYLE;
 export const CONVERSATION_SCROLL_LAYOUT = resolved.CONVERSATION_SCROLL_LAYOUT;
 export const CONVERSATION_SCROLLBAR_STYLE = resolved.CONVERSATION_SCROLLBAR_STYLE;
 export const RAIL_EDITOR_STYLE = resolved.RAIL_EDITOR_STYLE;
+export const TOOL_EXECUTION_STATE_STYLES = resolved.TOOL_EXECUTION_STATE_STYLES;
+export const TOOL_EXECUTION_TEXT_STYLE = resolved.TOOL_EXECUTION_TEXT_STYLE;
 export const THINKING_RAIL_COLOR = resolved.THINKING_RAIL_COLOR;
 export const RAIL_THINKING_STYLE = resolved.RAIL_THINKING_STYLE;
 export const USER_MESSAGE_LAYOUT = resolved.USER_MESSAGE_LAYOUT;

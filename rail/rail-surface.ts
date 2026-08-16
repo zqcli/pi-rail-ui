@@ -2,6 +2,7 @@ import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import {
 	RAIL_EDITOR_HEIGHT,
 	RAIL_EDITOR_STYLE,
+	TOOL_EXECUTION_STATE_STYLES,
 	RAIL_THINKING_STYLE,
 	RAIL_USER_MESSAGE_STYLE,
 	RAIL_BASH_EXECUTION_STYLE,
@@ -11,6 +12,7 @@ import {
 	type EditorHeightPolicy,
 	type RailSurfaceStyle,
 	type ThemeLike,
+	type ToolExecutionState,
 } from "../config";
 import { isRailUiActive } from "./rail-section";
 import {
@@ -99,6 +101,16 @@ export class EditorSurfaceRenderer {
 export const railEditorSurface = new EditorSurfaceRenderer(RAIL_EDITOR_STYLE, RAIL_EDITOR_HEIGHT);
 export const railThinkingSurface = new EditorSurfaceRenderer(RAIL_THINKING_STYLE);
 export const railUserMessageSurface = new EditorSurfaceRenderer(RAIL_USER_MESSAGE_STYLE);
+const toolExecutionSurfaces = Object.fromEntries(
+	(Object.keys(TOOL_EXECUTION_STATE_STYLES) as ToolExecutionState[]).map((state) => [
+		state,
+		new EditorSurfaceRenderer(TOOL_EXECUTION_STATE_STYLES[state]),
+	]),
+) as Record<ToolExecutionState, EditorSurfaceRenderer>;
+
+export function toolExecutionSurfaceForState(state: ToolExecutionState): EditorSurfaceRenderer {
+	return toolExecutionSurfaces[state];
+}
 
 export function thinkingSurfaceForTheme(theme: ThemeLike): EditorSurfaceRenderer {
 	return new EditorSurfaceRenderer({

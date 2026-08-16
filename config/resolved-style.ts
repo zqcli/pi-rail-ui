@@ -19,6 +19,9 @@ import type {
 	RailSurfaceStyle,
 	SlashCommandLayout,
 	StyleFile,
+	ToolExecutionState,
+	ToolExecutionStateStyles,
+	ToolExecutionTextStyle,
 	UserMessageLayout,
 } from "./types";
 
@@ -32,6 +35,8 @@ export type ResolvedStyleConfig = {
 	CONVERSATION_SCROLL_LAYOUT: ConversationScrollLayout;
 	CONVERSATION_SCROLLBAR_STYLE: ConversationScrollbarStyle;
 	RAIL_EDITOR_STYLE: EditorSurfaceStyle;
+	TOOL_EXECUTION_STATE_STYLES: ToolExecutionStateStyles;
+	TOOL_EXECUTION_TEXT_STYLE: ToolExecutionTextStyle;
 	THINKING_RAIL_COLOR: ReturnType<typeof resolveTextColor>;
 	RAIL_THINKING_STYLE: RailSurfaceStyle;
 	USER_MESSAGE_LAYOUT: UserMessageLayout;
@@ -115,6 +120,25 @@ export function resolveStyleConfig(style: StyleFile): ResolvedStyleConfig {
 		...RAIL_EDITOR_SURFACE_STYLE,
 		...RAIL_EDITOR_HEIGHT,
 	};
+	const toolExecutionSection = railSectionRaw("toolExecution");
+	const toolExecutionBaseStyle = toolExecutionSection.style ?? {};
+	const toolExecutionStates: ToolExecutionState[] = ["pending", "success", "error", "cancelled"];
+	const TOOL_EXECUTION_STATE_STYLES = Object.fromEntries(toolExecutionStates.map((state) => {
+		const stateStyle = toolExecutionSection.states?.[state] ?? {};
+		const rawRail = stateStyle.rail ?? toolExecutionBaseStyle.rail ?? "editor.rail";
+		const rail = resolveTextColor(rawRail === false ? "editor.rail" : rawRail, { editorRail });
+		return [state, {
+			...RAIL_EDITOR_SURFACE_STYLE,
+			background: resolveBackground(stateStyle.background ?? toolExecutionBaseStyle.background ?? "transparent", editorBackground),
+			rail: rail.ansi ?? editorRail,
+		}];
+	})) as ToolExecutionStateStyles;
+	const toolExecutionText = toolExecutionSection.text ?? {};
+	const TOOL_EXECUTION_TEXT_STYLE: ToolExecutionTextStyle = {
+		title: resolveTextColor(toolExecutionText.title ?? "theme:toolTitle", { editorRail }),
+		output: resolveTextColor(toolExecutionText.output ?? "theme:toolOutput", { editorRail }),
+		muted: resolveTextColor(toolExecutionText.muted ?? "theme:muted", { editorRail }),
+	};
 	const thinkingSectionStyle = rawSectionStyle("assistantThinking");
 	const THINKING_RAIL_COLOR = sectionRailColor(thinkingSectionStyle?.rail, style.thinking.rail);
 	const RAIL_THINKING_STYLE: RailSurfaceStyle = {
@@ -190,6 +214,8 @@ export function resolveStyleConfig(style: StyleFile): ResolvedStyleConfig {
 		CONVERSATION_SCROLL_LAYOUT,
 		CONVERSATION_SCROLLBAR_STYLE,
 		RAIL_EDITOR_STYLE,
+		TOOL_EXECUTION_STATE_STYLES,
+		TOOL_EXECUTION_TEXT_STYLE,
 		THINKING_RAIL_COLOR,
 		RAIL_THINKING_STYLE,
 		USER_MESSAGE_LAYOUT,

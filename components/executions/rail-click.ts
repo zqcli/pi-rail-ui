@@ -1,5 +1,5 @@
 import { resolveNativeTuiExport } from "../../core/patching";
-import { handleRailEditorClick } from "../editor/rail-editor-click";
+import { positionRailEditorCursor } from "../editor/rail-editor-click";
 import { canToggleRailSection, markRailSectionManuallyToggled, resolveRailSection } from "../../rail/rail-section";
 import type { ExecutionRailPatcher } from "./execution-collapse";
 
@@ -125,7 +125,7 @@ export async function patchRailSectionClickHandling(patcher: ExecutionRailPatche
 		this: any,
 		event: any,
 	): void {
-		if (handleRailEditorClick(this, event)) return;
+		if (positionRailEditorCursor(this, event)) return original.call(this, event);
 		if (handleRailSectionClick(this, event)) return;
 		return original.call(this, event);
 	});

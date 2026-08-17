@@ -65,6 +65,52 @@ test("clicking visible editor text moves the cursor through fullscreen mouse inp
 	}
 });
 
+test("dragging across editor text selects it and copies on release", async () => {
+	let copied: string | undefined;
+	const terminal: any = {
+		columns: 40,
+		rows: 20,
+		write() {},
+		onData() {},
+		hideCursor() {},
+		showCursor() {},
+	};
+	const tui: any = new TuiAltScreen(terminal, false, undefined, {
+		copySelection: async (text: string) => {
+			copied = text;
+			return true;
+		},
+	});
+	const editor = new RailEditor(tui, editorTheme, { matches: () => false } as any, appTheme as any);
+	editor.setText("alpha select omega");
+	tui.setLayoutRoot(new GutterContainer(editor));
+	tui.setFocus(editor);
+	tui.altScreenActive = true;
+
+	await installClickHandling();
+	try {
+		tui.doRender();
+		const rows = tui.currentLayout.lines.map(stripAnsi);
+		const row = rows.findIndex((line: string) => line.includes("alpha select omega"));
+		assert.notEqual(row, -1);
+		const startColumn = rows[row].indexOf("select");
+		const endColumn = startColumn + "select".length - 1;
+		assert.notEqual(startColumn, -1);
+		const mouse = (button: number, column: number, release = false) =>
+			`\x1b[<${button};${column + 1};${row + 1}${release ? "m" : "M"}`;
+
+		tui.handleViewportInput(mouse(0, startColumn));
+		assert.equal(tui.selectionPressActive, true);
+		tui.handleViewportInput(mouse(32, endColumn));
+		tui.handleViewportInput(mouse(0, endColumn, true));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		assert.equal(copied, "select");
+	} finally {
+		uninstallClickHandling();
+	}
+});
+
 test("maps a guttered click on a wrapped editor row to the logical cursor", async () => {
 	const terminal: any = {
 		columns: 40,

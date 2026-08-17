@@ -56,18 +56,7 @@ function pointInsideBox(box: any, x: number, y: number): boolean {
 	return x >= left && x < right && y >= top && y < bottom;
 }
 
-function clearNativeSelection(tui: any): void {
-	tui.stopSelectionAutoScroll?.();
-	tui.selectionPressActive = false;
-	tui.selectionAnchor = undefined;
-	tui.selectionFocus = undefined;
-	tui.selectionGranularity = "character";
-	tui.selectionInitialRange = undefined;
-	tui.pressedUrl = undefined;
-	tui.selectionDragged = false;
-}
-
-export function handleRailEditorClick(tui: any, event: any): boolean {
+export function positionRailEditorCursor(tui: any, event: any): boolean {
 	if (event?.release || (event?.button & 32) !== 0 || (event?.button & 3) !== 0) return false;
 	if (tui.hasOverlay?.()) return false;
 
@@ -82,6 +71,5 @@ export function handleRailEditorClick(tui: any, event: any): boolean {
 		event.x - (box.rect?.x ?? 0) - inset,
 	);
 	if (!moved) return false;
-	clearNativeSelection(tui);
 	return true;
 }

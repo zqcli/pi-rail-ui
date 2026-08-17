@@ -132,6 +132,12 @@ test("model plus alias creates a persistent session and target continues it", as
 	assert.match(continued.content[0].text, /done: check tests/);
 	assert.equal("messages" in continued.details.results[0], false);
 	assert.equal(continued.details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
+	assert.equal(continued.details.results[0].persistent, true);
+	const call = tool.renderCall({ target: "auth-review", task: "check tests" }, {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	});
+	assert.match(call.render(100).join("\n"), /persistent continue auth-review/);
 });
 
 test("model without alias or session runs stateless and creates no broker instance", async () => {

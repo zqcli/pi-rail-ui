@@ -601,9 +601,11 @@ export function renderSubagentTranscript(
 	const completed = boundedRuns.filter((run) => run.status === "completed").length;
 	const failed = boundedRuns.filter((run) => run.status === "failed").length;
 	const running = boundedRuns.length - completed - failed;
+	const persistent = boundedRuns.filter((run) => run.persistent).length;
+	const stateless = boundedRuns.length - persistent;
 	const header = boundedRuns.length === 1
-		? `${boundedRuns[0]!.status === "failed" ? theme.fg("error", "✗") : boundedRuns[0]!.status === "running" ? theme.fg("warning", "…") : theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(boundedRuns[0]!.alias))}${boundedRuns[0]!.model ? theme.fg("dim", ` · ${boundedRuns[0]!.model}`) : ""}`
-		: `${theme.fg("toolTitle", theme.bold(`${boundedRuns.length} model sessions`))}${theme.fg("dim", ` · ${completed} complete · ${running} running · ${failed} failed`)}`;
+		? `${boundedRuns[0]!.status === "failed" ? theme.fg("error", "✗") : boundedRuns[0]!.status === "running" ? theme.fg("warning", "…") : theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(boundedRuns[0]!.alias))}${theme.fg("dim", ` · ${boundedRuns[0]!.persistent ? "persistent" : "stateless"}`)}${boundedRuns[0]!.model ? theme.fg("dim", ` · ${boundedRuns[0]!.model}`) : ""}`
+		: `${theme.fg("toolTitle", theme.bold(`${boundedRuns.length} model sessions`))}${theme.fg("dim", ` · ${persistent} persistent · ${stateless} stateless · ${completed} complete · ${running} running · ${failed} failed`)}`;
 	const multiple = boundedRuns.length > 1;
 	let omittedEntries = 0;
 	for (const run of boundedRuns) {

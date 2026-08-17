@@ -430,9 +430,9 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				: args.tasks?.length
 					? `parallel (${args.tasks.length})`
 					: args.target
-						? `continue ${args.target}`
+						? `persistent continue ${args.target}`
 						: args.alias || args.session
-							? `persistent ${args.model || "current model"}`
+							? `persistent new ${args.model || "current model"}`
 							: `stateless ${args.model || "current model"}`;
 			const task = args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);

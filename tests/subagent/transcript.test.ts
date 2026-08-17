@@ -121,6 +121,7 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 	const lines = view.render(48);
 
 	assert.ok(lines.length <= 10);
+	assert.match(lines[0] ?? "", /persistent/);
 	assert.match(lines.join("\n"), /assistant message 9/);
 	assert.doesNotMatch(lines.join("\n"), /assistant message 0/);
 	assert.match(lines.join("\n"), /earlier activity hidden/);

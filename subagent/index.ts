@@ -5,6 +5,7 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { FileAgentInstanceStore } from "./instance-store";
+import { RailAgentManager } from "./agent-manager";
 import {
 	applySubagentMentionCompletion,
 	buildSubagentRosterPrompt,
@@ -16,6 +17,7 @@ import type { RpcEvent } from "./rpc-worker";
 import { runRailAgentManager } from "./rail-agent-manager";
 import { SessionBroker } from "./session-broker";
 import { SessionAgentRoster } from "./session-links";
+import { FileSessionLeaseManager } from "./session-lease";
 import { buildParentSessionLabel } from "./session-name";
 import { createStatelessAgentRunner } from "./stateless-runner";
 import { installStatefulSubagentTool } from "./tool";
@@ -26,6 +28,7 @@ interface SubagentRuntime {
 	broker: SessionBroker;
 	roster: SessionAgentRoster;
 	store: FileAgentInstanceStore;
+	manager: RailAgentManager;
 }
 
 function unique<T>(values: T[]): T[] {
@@ -154,8 +157,10 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 				ctx.sessionManager.getSessionId(),
 				ctx.cwd,
 			),
+			aliasLeaseManager: new FileSessionLeaseManager(stateDir),
 		});
-		runtime = { ctx, broker, roster, store };
+		const manager = new RailAgentManager(broker, store, roster, stateDir);
+		runtime = { ctx, broker, roster, store, manager };
 		if (ctx.mode === "tui") installAutocomplete(ctx);
 	});
 
@@ -182,6 +187,7 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 }
 
 export * from "./identity";
+export * from "./agent-manager";
 export * from "./instance-store";
 export * from "./interaction";
 export * from "./model-picker";
@@ -189,6 +195,7 @@ export * from "./models";
 export * from "./rpc-transport";
 export * from "./rpc-worker";
 export * from "./rail-agent-manager";
+export * from "./rail-agent-overlay";
 export * from "./searchable-picker";
 export * from "./session-broker";
 export * from "./session-lease";

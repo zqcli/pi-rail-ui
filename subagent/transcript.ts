@@ -37,6 +37,24 @@ export interface SubagentTranscriptRun {
 	output: string;
 	persistent: boolean;
 	transcript?: SubagentTranscriptSnapshot;
+	usage?: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		cost: number;
+		contextTokens: number;
+		turns: number;
+	};
+	durationMs?: number;
+	stopReason?: string;
+	errorMessage?: string;
+	step?: number;
+}
+
+export interface SubagentTranscriptRenderOptions {
+	isPartial?: boolean;
+	durationMs?: number;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -592,12 +610,184 @@ class BoundedTranscriptView implements Component {
 	}
 }
 
+function compactNumber(value: number): string {
+	if (value < 1000) return String(value);
+	const compact = (amount: number) => amount.toFixed(1).replace(/\.0$/u, "");
+	if (value < 1_000_000) return `${compact(value / 1000)}k`;
+	return `${compact(value / 1_000_000)}m`;
+}
+
+function compactDuration(durationMs: number | undefined): string {
+	if (durationMs === undefined) return "";
+	if (durationMs < 1000) return `${durationMs}ms`;
+	const seconds = durationMs / 1000;
+	if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+	const minutes = Math.floor(seconds / 60);
+	const remaining = Math.round(seconds % 60);
+	return `${minutes}m ${remaining}s`;
+}
+
+function usageText(run: SubagentTranscriptRun): string {
+	const usage = run.usage;
+	const parts: string[] = [];
+	if (usage) {
+		parts.push(`${compactNumber(usage.input)} in`, `${compactNumber(usage.output)} out`);
+		if (usage.cacheRead > 0) parts.push(`${compactNumber(usage.cacheRead)} cache read`);
+		if (usage.cacheWrite > 0) parts.push(`${compactNumber(usage.cacheWrite)} cache write`);
+		if (usage.contextTokens > 0) parts.push(`${compactNumber(usage.contextTokens)} context`);
+		if (usage.turns > 0) parts.push(`${usage.turns} ${usage.turns === 1 ? "turn" : "turns"}`);
+		if (usage.cost > 0) parts.push(`$${usage.cost.toFixed(usage.cost < 0.01 ? 4 : 3)}`);
+	}
+	const duration = compactDuration(run.durationMs);
+	if (duration) parts.push(duration);
+	if (run.stopReason) parts.push(run.stopReason);
+	return parts.join(" · ");
+}
+
+function identityText(run: SubagentTranscriptRun): string {
+	const step = run.step !== undefined ? `step ${run.step} · ` : "";
+	return `${step}${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}`;
+}
+
+function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
+	if (run.status === "failed") return theme.fg("error", "✗");
+	if (run.status === "running") return theme.fg("warning", "…");
+	return theme.fg("success", "✓");
+}
+
+function runGroups(run: SubagentTranscriptRun): RenderGroup[] {
+	return collectTranscriptGroups([run]).map((group) => ({
+		order: group.order,
+		entries: group.entries.map(({ entry }) => ({ entry })),
+	}));
+}
+
+class SubagentRunPanel implements Component {
+	constructor(
+		private readonly run: SubagentTranscriptRun,
+		private readonly expanded: boolean,
+		private readonly terminal: boolean,
+		private readonly boxed: boolean,
+		private readonly theme: Theme,
+	) {}
+
+	render(width: number): string[] {
+		const boxed = this.boxed && width >= 3;
+		const innerWidth = Math.max(1, width - (boxed ? 2 : 0));
+		const lines = [
+			`${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run)))}`,
+		];
+		if (this.terminal) lines.push(...this.renderCompleted(innerWidth));
+		else lines.push(...this.renderActivity(innerWidth));
+		const metrics = usageText(this.run);
+		if (metrics) lines.push(this.theme.fg("dim", metrics));
+		if (!boxed) return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
+
+		const borderColor = this.run.status === "failed" ? "error" : this.run.status === "running" ? "warning" : "borderAccent";
+		const border = (value: string) => this.theme.fg(borderColor, value);
+		const result = [border(`╭${"─".repeat(innerWidth)}╮`)];
+		for (const line of lines) {
+			for (const rendered of new Text(line, 0, 0).render(innerWidth)) {
+				result.push(`${border("│")}${truncateToWidth(rendered, innerWidth, "", true)}${border("│")}`);
+			}
+		}
+		result.push(border(`╰${"─".repeat(innerWidth)}╯`));
+		return result;
+	}
+
+	invalidate(): void {}
+
+	private renderCompleted(width: number): string[] {
+		const answer = this.run.output || this.run.errorMessage || "(no output)";
+		const rendered = new Text(answer, 0, 0).render(width);
+		if (this.expanded) {
+			const activity = this.run.transcript
+				? new BoundedTranscriptView(
+					this.theme.fg("dim", "Recent activity"),
+					runGroups(this.run),
+					this.run.transcript.omittedEntries,
+					EXPANDED_ROWS,
+					this.theme,
+				).render(width)
+				: [];
+			return [...activity, this.theme.fg("dim", "Final answer"), ...rendered];
+		}
+		const preview = rendered.slice(0, 2);
+		if (rendered.length > preview.length) preview.push(this.theme.fg("dim", "… expand for full answer"));
+		return preview;
+	}
+
+	private renderActivity(width: number): string[] {
+		if (!this.run.transcript) return new Text(this.run.output || "(running...)", 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
+		const view = new BoundedTranscriptView(
+			this.theme.fg("dim", "Activity"),
+			runGroups(this.run),
+			this.run.transcript.omittedEntries,
+			this.expanded ? 7 : 4,
+			this.theme,
+		);
+		return view.render(width);
+	}
+}
+
+class MultiSubagentPanelView implements Component {
+	constructor(
+		private readonly runs: SubagentTranscriptRun[],
+		private readonly expanded: boolean,
+		private readonly durationMs: number | undefined,
+		private readonly theme: Theme,
+	) {}
+
+	render(width: number): string[] {
+		const completed = this.runs.filter((run) => run.status === "completed").length;
+		const failed = this.runs.filter((run) => run.status === "failed").length;
+		const running = this.runs.length - completed - failed;
+		const total = this.runs.reduce((usage, run) => {
+			if (!run.usage) return usage;
+			usage.input += run.usage.input;
+			usage.output += run.usage.output;
+			usage.cacheRead += run.usage.cacheRead;
+			usage.cacheWrite += run.usage.cacheWrite;
+			usage.cost += run.usage.cost;
+			return usage;
+		}, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+		const summary = `${this.runs.length} model sessions · ${completed} complete · ${running} running · ${failed} failed`;
+		const metrics = [
+			`${compactNumber(total.input)} in`,
+			`${compactNumber(total.output)} out`,
+			...(total.cacheRead > 0 ? [`${compactNumber(total.cacheRead)} cache read`] : []),
+			...(total.cacheWrite > 0 ? [`${compactNumber(total.cacheWrite)} cache write`] : []),
+			...(total.cost > 0 ? [`$${total.cost.toFixed(total.cost < 0.01 ? 4 : 3)}`] : []),
+			...(this.durationMs !== undefined ? [`wall ${compactDuration(this.durationMs)}`] : []),
+		].join(" · ");
+		const lines = [
+			truncateToWidth(this.theme.fg("toolTitle", this.theme.bold(summary)), width, "", true),
+			...(metrics ? [truncateToWidth(this.theme.fg("dim", metrics), width, "", true)] : []),
+		];
+		for (const run of this.runs) {
+			const terminal = run.status !== "running";
+			lines.push(...new SubagentRunPanel(run, this.expanded, terminal, true, this.theme).render(width));
+		}
+		return lines;
+	}
+
+	invalidate(): void {}
+}
+
 export function renderSubagentTranscript(
 	runs: SubagentTranscriptRun[],
 	expanded: boolean,
 	theme: Theme,
+	options: SubagentTranscriptRenderOptions = {},
 ): Component {
 	const boundedRuns = boundSubagentRunTranscripts(runs);
+	if (boundedRuns.length > 1) {
+		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme);
+	}
+	const only = boundedRuns[0];
+	if (only && only.status !== "running") {
+		return new SubagentRunPanel(only, expanded, true, false, theme);
+	}
 	const completed = boundedRuns.filter((run) => run.status === "completed").length;
 	const failed = boundedRuns.filter((run) => run.status === "failed").length;
 	const running = boundedRuns.length - completed - failed;

@@ -52,18 +52,18 @@ ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
 - 使用 `@new/cus-resp/gpt-5.6-sol`（或其他 canonical Pi model reference）创建 persistent model session。
 - 使用 `@agent/auth-review` 把后续任务强制派发给该 instance，同时不和 Pi 原生 `@path` 文件补全冲突。
 - 在 CLI、print、JSON 和 RPC prompt 中使用等价的 `new://cus-resp/gpt-5.6-sol` 与 `agent://auth-review`。Pi 会在 extension 收到输入前，把位于 CLI 参数开头的 `@...` 当作文件展开。
-- 使用 `/rail-agent` 打开 Rail agent manager。**Start persistent model session** 会搜索 Pi `modelRegistry.getAvailable()` 中的全部可用模型，并插入 `@new/<provider>/<modelId>`，直到用户提交任务时才真正创建。当前模型优先显示，scoped model 仍保留其配置的 thinking level，但 scope 不再限制 subagent 派发。TUI session 弹窗支持按 session 名称、首条消息、项目路径和 ID 直接键入搜索。
+- 使用 `/rail-agent` 打开统一 TUI overlay，其中包含 **Current**、**All Persistent**、**Create / Adopt** 三个 tab。面板准确区分 `starting`、`running`、`queued`、`idle`、`not connected` 和 `error`；其他进程持有的 live lease 显示为 **In use elsewhere**，不会猜测它是否正在生成。Model 与 saved session 都在同一面板中通过可搜索 inline picker 选择；创建表单把选中的 model/thinking level 映射到一个独立 session，新 persistent agent 必须提供具体首个任务，adopt saved session 时保留原 cwd。
 - Tool 提供 `model` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 model session，不创建 persistent instance 或 child session；省略 `model` 时使用 Pi 当前模型。
 - 使用 `model` 加 `alias` 创建 persistent session；后续使用 `target` 复用该 session。同一个 model 换一个 alias 即可创建另一个独立 session。
 - 生命周期按连续性选择：已有 linked helper 使用 `target` 继续；已有 session 的历史或项目 cwd 有价值时用安全 `fork` 接入（常用于跨仓库工作）；只有具体首个任务预计需要后续追问时才创建新的 persistent alias，禁止创建空占位 session；其余使用 stateless 一次性派发。
 - Tool 提示会引导父 LLM 主动把代码搜索、聚焦分析、验证、比较和 review 等自包含工作派发为 stateless session；只有确实需要后续连续追问时才创建 persistent alias。Child session 当前不能递归调用 `subagent`，嵌套拆解仍由父 session 负责编排。
-- Subagent Tool Call 面板实时展示本次派发中的 user task、thinking、assistant 文本、tool call 参数和 tool result。它只保留最近 18 个事件并自动跟随最新活动；默认最多显示 10 行，展开后最多 16 行，较早内容以隐藏提示代替。
+- Subagent Tool Call 面板在运行中实时展示 user task、thinking、assistant 文本、tool call 参数和 tool result，并且只保留最近 18 个 activity 事件。完成后折叠态显示 final answer 预览；展开后显示保留的最后一条 assistant answer、近期 activity、input/output/cache/context token、turn、cost、耗时和 stop reason。Parallel 与 chain 调用为每个 child 渲染独立面板，同时提供汇总 token、cost、状态和 wall time。
 - Persistent child 在 `/resume` 中统一命名为 `subagent · <父 session> · <alias>`。创建它的父 session 名会写入 instance；父 session 未命名时使用 `<项目目录>-<sessionId 前缀>`。既有 managed session 会在下一次持有 lease 的 RPC worker open 时安全补名。Stateless 始终传入 `--no-session`，不创建 JSONL，也不会出现在 `/resume`。
 - 通过单 writer lease 和 per-agent queue，避免并发调用同时写入同一个 child JSONL session。
 
-`/rail-agent` 的普通流程固定使用安全的 **Fork and adopt**，不再要求用户理解 attach mode。**Exclusive attach** 被收进 Advanced action，且只有确认没有其他 Pi 进程打开该 session 时才可使用。当前版本不会 live attach 到另一个 TUI 正在运行的 session。旧 `/agents` 与 `/subagents` alias 不再注册。
+`/rail-agent` 默认使用安全的 **Safe copy**（`fork`）。**Exclusive in place** 是带明确警告的表单选项，且只有确认没有其他 Pi 进程打开该 session 时才可使用。面板可继续/link agent、在本地可控时修改 model 或 thinking level、停止 worker 但保留 session，或从当前父 session detach 并保留 child JSONL。在能够安全索引跨父 session 引用之前，面板刻意不提供永久删除 JSONL。另一个 TUI 正在使用的 session 不会被 live attach。旧 `/agents` 与 `/subagents` alias 不再注册。
 
-Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instance 保存的是 model reference，而不是 agent profile。完整 child transcript 仍保留在 child Pi session 中。父 session 只持久化精简 roster link、final output 和本次 Tool Call 的有界近期事件窗口，避免复制整份子对话或 persistent 历史。
+Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instance 保存的是 model reference，而不是 agent profile。Session lease 与短期 alias reservation 同时保证 single writer 和跨 Rail 进程的 persistent alias 唯一性。完整 child transcript 仍保留在 child Pi session 中。父 tool content 继续限制为 50KB；Tool Call details 只保留有界 final answer 与近期事件窗口，不复制无界 child 历史。
 
 ## 测试
 

@@ -1,4 +1,4 @@
-import { railModelKey } from "./models";
+import { railModelKey, type RailModelRef } from "./models";
 import { SubagentTranscript } from "./transcript";
 import type {
 	SessionWorker,
@@ -25,6 +25,8 @@ interface RpcState {
 	sessionFile?: string;
 	sessionName?: string;
 	isStreaming?: boolean;
+	model?: { provider?: string; id?: string; name?: string };
+	thinkingLevel?: RailModelRef["thinkingLevel"];
 }
 
 const EMPTY_USAGE: SubagentUsage = {
@@ -100,6 +102,7 @@ export class RpcSessionWorker implements SessionWorker {
 		let stopReason: string | undefined;
 		let errorMessage: string | undefined;
 		let settled = false;
+		let aborted = false;
 		let resolveSettled!: () => void;
 		let transportError: Error | undefined;
 		const transcript = new SubagentTranscript(task);
@@ -153,13 +156,20 @@ export class RpcSessionWorker implements SessionWorker {
 				resolveSettled();
 			}
 		});
-		const abort = () => { void this.transport.request({ type: "abort" }).catch(() => undefined); };
+		const abort = () => {
+			aborted = true;
+			void this.transport.request({ type: "abort" }).catch(() => undefined);
+		};
 		options.signal?.addEventListener("abort", abort, { once: true });
 
 		try {
 			await this.transport.request({ type: "prompt", message: task });
 			await settledPromise;
 			if (transportError) throw transportError;
+			if (aborted) {
+				stopReason = "aborted";
+				errorMessage = "Subagent request was aborted";
+			}
 			return {
 				output: output || "(no output)",
 				usage,
@@ -171,6 +181,34 @@ export class RpcSessionWorker implements SessionWorker {
 			if (updateTimer) clearTimeout(updateTimer);
 			options.signal?.removeEventListener("abort", abort);
 			unsubscribe();
+		}
+	}
+
+	async setModel(model: RailModelRef): Promise<RailModelRef> {
+		const previous = await this.transport.request({ type: "get_state" }) as RpcState;
+		try {
+			const selected = await this.transport.request({
+				type: "set_model",
+				provider: model.provider,
+				modelId: model.modelId,
+			}) as { provider?: string; id?: string; name?: string } | undefined;
+			if (model.thinkingLevel) {
+				await this.transport.request({ type: "set_thinking_level", level: model.thinkingLevel });
+			}
+			const state = await this.transport.request({ type: "get_state" }) as RpcState;
+			const effective = state.model ?? selected;
+			return {
+				provider: effective?.provider ?? model.provider,
+				modelId: effective?.id ?? model.modelId,
+				...(effective?.name ?? model.name ? { name: effective?.name ?? model.name } : {}),
+				...(state.thinkingLevel ?? model.thinkingLevel ? { thinkingLevel: state.thinkingLevel ?? model.thinkingLevel } : {}),
+			};
+		} catch (error) {
+			if (previous.model?.provider && previous.model.id) {
+				await this.transport.request({ type: "set_model", provider: previous.model.provider, modelId: previous.model.id }).catch(() => undefined);
+				if (previous.thinkingLevel) await this.transport.request({ type: "set_thinking_level", level: previous.thinkingLevel }).catch(() => undefined);
+			}
+			throw error;
 		}
 	}
 

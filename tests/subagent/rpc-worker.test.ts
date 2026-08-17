@@ -17,7 +17,10 @@ class FakeTransport implements RpcTransport {
 	constructor(
 		private readonly failPrompt = false,
 		private sessionName?: string,
+		private readonly waitForAbort = false,
 	) {}
+	private selectedModel = { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
+	private thinkingLevel = "xhigh";
 
 	onEvent(listener: (event: RpcEvent) => void): () => void {
 		this.listeners.add(listener);
@@ -27,13 +30,26 @@ class FakeTransport implements RpcTransport {
 	async request(command: Record<string, unknown>): Promise<unknown> {
 		this.commands.push(command);
 		if (command["type"] === "get_state") {
-			return { sessionId: "child-session", sessionFile: "/tmp/child.jsonl", sessionName: this.sessionName, isStreaming: false };
+			return { sessionId: "child-session", sessionFile: "/tmp/child.jsonl", sessionName: this.sessionName, isStreaming: false, model: this.selectedModel, thinkingLevel: this.thinkingLevel };
 		}
 		if (command["type"] === "set_session_name") {
 			this.sessionName = command["name"] as string;
 			return undefined;
 		}
+		if (command["type"] === "set_model") {
+			this.selectedModel = { provider: String(command["provider"]), id: String(command["modelId"]), name: String(command["modelId"]) };
+			return this.selectedModel;
+		}
+		if (command["type"] === "set_thinking_level") {
+			this.thinkingLevel = String(command["level"]);
+			return undefined;
+		}
+		if (command["type"] === "abort" && this.waitForAbort) {
+			queueMicrotask(() => this.emit({ type: "agent_settled" }));
+			return undefined;
+		}
 		if (command["type"] === "prompt") {
+			if (this.waitForAbort) return undefined;
 			queueMicrotask(() => {
 				if (this.failPrompt) {
 					this.emit({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -166,6 +182,28 @@ describe("RpcSessionWorker", () => {
 		assert.deepEqual(transport.commands.map((command) => command["type"]), ["get_state", "set_session_name"]);
 		assert.equal(transport.commands[1]?.["name"], "subagent · Main Auth Work · auth-review");
 		await worker.stop();
+	});
+
+	test("changes the child model and thinking level through RPC", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const selected = await worker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash", thinkingLevel: "high" });
+
+		assert.deepEqual(selected, { provider: "deepseek", modelId: "deepseek-v4-flash", name: "deepseek-v4-flash", thinkingLevel: "high" });
+		assert.deepEqual(transport.commands.slice(1).map((command) => command["type"]), ["get_state", "set_model", "set_thinking_level", "get_state"]);
+	});
+
+	test("classifies a locally aborted RPC run even when the child settles normally", async () => {
+		const transport = new FakeTransport(false, undefined, true);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const controller = new AbortController();
+		const pending = worker.send("long task", { signal: controller.signal });
+		await new Promise((resolve) => setImmediate(resolve));
+		controller.abort();
+
+		const result = await pending;
+		assert.equal(result.stopReason, "aborted");
+		assert.equal(result.errorMessage, "Subagent request was aborted");
 	});
 
 	test("keeps the child session and returns the settled assistant output", async () => {

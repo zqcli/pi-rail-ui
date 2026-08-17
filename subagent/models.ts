@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 
 export type RailThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
 
@@ -60,6 +60,16 @@ export function availableRailModels(ctx: Pick<ExtensionContext, "model" | "model
 		const item = scoped.get(railModelKey({ provider: model.provider, modelId: model.id }));
 		return railModelFromModel(model, item?.thinkingLevel);
 	});
+}
+
+export function availableThinkingLevels(
+	model: Pick<RailModelRef, "provider" | "modelId">,
+	ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+): RailThinkingLevel[] {
+	const resolved = ctx.modelRegistry.find(model.provider, model.modelId) ?? (
+		ctx.model?.provider === model.provider && ctx.model.id === model.modelId ? ctx.model : undefined
+	);
+	return resolved ? getSupportedThinkingLevels(resolved) as RailThinkingLevel[] : ["off"];
 }
 
 function findModel(reference: string, available: Model<Api>[]): Model<Api> | undefined {

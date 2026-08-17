@@ -130,6 +130,59 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 	assert.ok(view.render(10).every((line) => visibleWidth(line) <= 10));
 });
 
+test("completed expanded panels show the full final answer and usage metrics", () => {
+	const answer = Array.from({ length: 30 }, (_, index) => `final answer line ${index}`).join("\n");
+	const run = {
+		alias: "auth-review",
+		status: "completed" as const,
+		output: answer,
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		persistent: true,
+		usage: { input: 24812, output: 1946, cacheRead: 18220, cacheWrite: 120, cost: 0.0831, contextTokens: 43112, turns: 3 },
+		durationMs: 102800,
+		stopReason: "stop",
+	};
+	const collapsed = renderSubagentTranscript([run], false, theme as any).render(100).join("\n");
+	const expanded = renderSubagentTranscript([run], true, theme as any).render(100).join("\n");
+
+	assert.match(collapsed, /expand for full answer/);
+	assert.doesNotMatch(collapsed, /final answer line 29/);
+	assert.match(expanded, /final answer line 29/);
+	assert.match(expanded, /24\.8k in/);
+	assert.match(expanded, /18\.2k cache read/);
+	assert.match(expanded, /1m 43s/);
+	assert.match(expanded, /stop/);
+	assert.ok(expanded.split("\n").length > 16);
+});
+
+test("parallel runs render as independent panels with aggregate wall usage", () => {
+	const runs = [
+		{
+			alias: "alpha", model: "provider/model-a:high", status: "completed" as const, output: "alpha final",
+			persistent: false, durationMs: 1200,
+			usage: { input: 1000, output: 200, cacheRead: 500, cacheWrite: 0, cost: 0.01, contextTokens: 1700, turns: 1 },
+		},
+		{
+			alias: "beta", model: "provider/model-b:xhigh", status: "completed" as const, output: "beta final",
+			persistent: true, durationMs: 2400,
+			usage: { input: 2000, output: 300, cacheRead: 0, cacheWrite: 100, cost: 0.02, contextTokens: 2400, turns: 2 },
+		},
+	];
+	const text = renderSubagentTranscript(runs, true, theme as any, { durationMs: 2500 }).render(100).join("\n");
+
+	assert.match(text, /2 model sessions · 2 complete/);
+	assert.match(text, /3k in/);
+	assert.match(text, /wall 2\.5s/);
+	assert.match(text, /alpha · stateless · provider\/model-a:high/);
+	assert.match(text, /beta · persistent · provider\/model-b:xhigh/);
+	assert.match(text, /alpha final/);
+	assert.match(text, /beta final/);
+	assert.equal((text.match(/╭/gu) ?? []).length, 2);
+	for (const width of [1, 2]) {
+		assert.ok(renderSubagentTranscript(runs, false, theme as any).render(width).every((line) => visibleWidth(line) <= width));
+	}
+});
+
 test("parallel transcript ordering follows global activity rather than child creation time", () => {
 	const alpha = new SubagentTranscript("alpha");
 	const beta = new SubagentTranscript("beta");

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { assertValidAgentAlias } from "./identity";
 import type { RailModelRef } from "./models";
 import { buildSubagentSessionName } from "./session-name";
+import type { SessionLease } from "./session-lease";
 import type { SubagentTranscriptSnapshot } from "./transcript";
 
 export interface SubagentUsage {
@@ -43,6 +44,7 @@ export interface SessionWorker {
 	readonly sessionId: string;
 	readonly sessionFile: string;
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult>;
+	setModel?(model: RailModelRef): Promise<RailModelRef>;
 	stop(): Promise<void>;
 }
 
@@ -117,6 +119,16 @@ export interface AttachRequest {
 interface WorkerState {
 	worker: SessionWorker;
 	tail: Promise<void>;
+	active: boolean;
+	queued: number;
+}
+
+export type AgentRuntimePhase = "starting" | "running" | "queued" | "idle" | "stopped" | "error";
+
+export interface AgentRuntimeStatus {
+	phase: AgentRuntimePhase;
+	queued: number;
+	errorMessage?: string;
 }
 
 export interface SessionBrokerOptions {
@@ -125,6 +137,7 @@ export interface SessionBrokerOptions {
 	workerFactory: SessionWorkerFactory;
 	defaultCwd?: string;
 	parentSessionLabel?: string;
+	aliasLeaseManager?: { acquire(key: string): Promise<SessionLease> };
 }
 
 function generatedAlias(modelId: string, agentId: string): string {
@@ -153,6 +166,11 @@ export class SessionBroker {
 	private readonly workerFactory: SessionWorkerFactory;
 	private readonly defaultCwd: string;
 	private readonly parentSessionLabel: string;
+	private readonly aliasLeaseManager: { acquire(key: string): Promise<SessionLease> } | undefined;
+	private readonly runtimeListeners = new Set<() => void>();
+	private readonly runtimeErrors = new Map<string, string>();
+	private readonly stoppingAgents = new Set<string>();
+	private readonly modelChanges = new Map<string, Promise<AgentInstance>>();
 
 	constructor(options: SessionBrokerOptions) {
 		this.store = options.store;
@@ -160,10 +178,12 @@ export class SessionBroker {
 		this.workerFactory = options.workerFactory;
 		this.defaultCwd = options.defaultCwd ?? process.cwd();
 		this.parentSessionLabel = options.parentSessionLabel ?? "main";
+		this.aliasLeaseManager = options.aliasLeaseManager;
 	}
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
+		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
 		if (Boolean(request.model) === Boolean(request.target)) {
 			throw new Error("Provide exactly one of model (new instance) or target (existing instance)");
 		}
@@ -177,11 +197,24 @@ export class SessionBroker {
 			})
 			: await this.resolveInstance(request.target!, true);
 		request.onUpdate?.({ instance, run: { output: "(starting...)", usage: emptyUsage() } });
-		const state = await this.workerState(instance);
-		const run = await this.enqueue(state, () => state.worker.send(request.task, {
-			...(request.signal ? { signal: request.signal } : {}),
-			...(request.onUpdate ? { onUpdate: (partial) => request.onUpdate!({ instance, run: partial }) } : {}),
-		}));
+		let run: WorkerRunResult;
+		try {
+			const state = await this.workerState(instance);
+			run = await this.enqueue(state, () => state.worker.send(request.task, {
+				...(request.signal ? { signal: request.signal } : {}),
+				...(request.onUpdate ? { onUpdate: (partial) => request.onUpdate!({ instance, run: partial }) } : {}),
+			}));
+			this.runtimeErrors.delete(instance.agentId);
+			this.emitRuntimeChange();
+		} catch (error) {
+			if (this.stoppingAgents.has(instance.agentId) || request.signal?.aborted) this.runtimeErrors.delete(instance.agentId);
+			else {
+				this.runtimeErrors.set(instance.agentId, error instanceof Error ? error.message : String(error));
+				await this.retireFailedWorker(instance.agentId);
+			}
+			this.emitRuntimeChange();
+			throw error;
+		}
 		const stored = await this.store.get(instance.agentId) ?? instance;
 		const persisted: AgentInstance = {
 			...stored,
@@ -205,12 +238,83 @@ export class SessionBroker {
 		return values.filter((value): value is AgentInstance => value !== undefined);
 	}
 
+	runtimeStatus(agentId: string): AgentRuntimeStatus {
+		if (this.workerStarts.has(agentId)) return { phase: "starting", queued: 0 };
+		const errorMessage = this.runtimeErrors.get(agentId);
+		if (errorMessage) return { phase: "error", queued: 0, errorMessage };
+		const state = this.workers.get(agentId);
+		if (state) {
+			if (state.active) return { phase: "running", queued: state.queued };
+			if (state.queued > 0) return { phase: "queued", queued: state.queued };
+			return { phase: "idle", queued: 0 };
+		}
+		return { phase: "stopped", queued: 0 };
+	}
+
+	subscribeRuntime(listener: () => void): () => void {
+		this.runtimeListeners.add(listener);
+		return () => this.runtimeListeners.delete(listener);
+	}
+
+	async stop(target: string): Promise<AgentInstance | undefined> {
+		const instance = await this.resolveInstance(target).catch(() => undefined);
+		if (!instance) return undefined;
+		await this.stopWorker(instance.agentId);
+		return instance;
+	}
+
+	async changeModel(target: string, model: RailModelRef): Promise<AgentInstance> {
+		const instance = await this.resolveInstance(target);
+		if (this.workerStarts.has(instance.agentId)) throw new Error("Subagent worker is still starting");
+		if (this.modelChanges.has(instance.agentId)) throw new Error("Subagent model change is already pending");
+		const change = (async () => {
+			const state = this.workers.get(instance.agentId);
+			const apply = async () => {
+				const latest = await this.store.get(instance.agentId) ?? instance;
+				if (!state) {
+					const updated = { ...latest, model: structuredClone(model), updatedAt: new Date().toISOString() };
+					await this.store.put(updated);
+					return updated;
+				}
+				if (!state.worker.setModel) throw new Error("Subagent worker does not support model changes");
+				const effective = await state.worker.setModel(model);
+				const updated = { ...latest, model: structuredClone(effective), updatedAt: new Date().toISOString() };
+				try {
+					await this.store.put(updated);
+					return updated;
+				} catch (error) {
+					try {
+						await state.worker.setModel(latest.model);
+					} catch (rollbackError) {
+						const message = `Model metadata update failed and worker rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+						this.runtimeErrors.set(instance.agentId, message);
+						await this.retireFailedWorker(instance.agentId);
+						this.emitRuntimeChange();
+						throw new Error(message, { cause: error });
+					}
+					throw error;
+				}
+			};
+			const updated = state ? await this.enqueue(state, apply) : await apply();
+			this.runtimeErrors.delete(instance.agentId);
+			this.emitRuntimeChange();
+			return updated;
+		})();
+		this.modelChanges.set(instance.agentId, change);
+		try {
+			return await change;
+		} finally {
+			this.modelChanges.delete(instance.agentId);
+		}
+	}
+
 	async shutdown(): Promise<void> {
 		await Promise.allSettled(this.workerStarts.values());
 		const states = Array.from(this.workers.values());
 		this.workers.clear();
 		await Promise.allSettled(states.map((state) => state.worker.stop()));
 		await Promise.allSettled(states.map((state) => state.tail));
+		this.emitRuntimeChange();
 	}
 
 	async detach(target: string): Promise<AgentInstance | undefined> {
@@ -221,12 +325,7 @@ export class SessionBroker {
 			? target
 			: links.find((link) => link.agentId === instance.agentId)?.alias;
 		if (alias) this.roster.unlink(alias);
-		const state = this.workers.get(instance.agentId);
-		if (state) {
-			this.workers.delete(instance.agentId);
-			await state.worker.stop();
-			await state.tail.catch(() => undefined);
-		}
+		if (!this.roster.list().some((link) => link.agentId === instance.agentId)) await this.stopWorker(instance.agentId);
 		return instance;
 	}
 
@@ -235,15 +334,18 @@ export class SessionBroker {
 		const alias = request.alias?.trim() || generatedAlias(request.model.modelId, agentId);
 		assertValidAgentAlias(alias);
 		if (this.roster.resolve(alias) || this.pendingAliases.has(alias)) throw new Error(`Subagent alias already exists: ${alias}`);
-		const session = request.session ?? { mode: "new" as const };
-		if ((session.mode === "fork" || session.mode === "exclusive") && !session.path) {
-			throw new Error(`${session.mode} requires a session path`);
-		}
-		const cwd = request.cwd ?? this.defaultCwd;
-		const sessionName = buildSubagentSessionName(this.parentSessionLabel, alias);
 		this.pendingAliases.add(alias);
 		let worker: SessionWorker | undefined;
+		let aliasLease: SessionLease | undefined;
 		try {
+			aliasLease = await this.aliasLeaseManager?.acquire(`alias:${alias}`);
+			if ((await this.store.list()).some((instance) => instance.alias === alias)) throw new Error(`Persistent subagent alias already exists globally: ${alias}`);
+			const session = request.session ?? { mode: "new" as const };
+			if ((session.mode === "fork" || session.mode === "exclusive") && !session.path) {
+				throw new Error(`${session.mode} requires a session path`);
+			}
+			const cwd = request.cwd ?? this.defaultCwd;
+			const sessionName = buildSubagentSessionName(this.parentSessionLabel, alias);
 			worker = await this.workerFactory({
 				agentId,
 				mode: session.mode,
@@ -269,13 +371,15 @@ export class SessionBroker {
 			};
 			await this.store.put(instance);
 			this.roster.link(alias, agentId);
-			this.workers.set(agentId, { worker, tail: Promise.resolve() });
+			this.workers.set(agentId, { worker, tail: Promise.resolve(), active: false, queued: 0 });
+			this.emitRuntimeChange();
 			return instance;
 		} catch (error) {
 			if (worker) await worker.stop().catch(() => undefined);
 			throw error;
 		} finally {
 			this.pendingAliases.delete(alias);
+			await aliasLease?.release();
 		}
 	}
 
@@ -289,6 +393,11 @@ export class SessionBroker {
 	}
 
 	private async workerState(instance: AgentInstance): Promise<WorkerState> {
+		const changing = this.modelChanges.get(instance.agentId);
+		if (changing) {
+			await changing;
+			instance = await this.store.get(instance.agentId) ?? instance;
+		}
 		const existing = this.workers.get(instance.agentId);
 		if (existing) return existing;
 		const starting = this.workerStarts.get(instance.agentId);
@@ -305,21 +414,65 @@ export class SessionBroker {
 				cwd: instance.cwd,
 				sessionPath: instance.sessionFile,
 			});
-			const state = { worker, tail: Promise.resolve() };
+			const state = { worker, tail: Promise.resolve(), active: false, queued: 0 };
 			this.workers.set(instance.agentId, state);
+			this.emitRuntimeChange();
 			return state;
 		})();
 		this.workerStarts.set(instance.agentId, start);
+		this.emitRuntimeChange();
 		try {
 			return await start;
 		} finally {
 			this.workerStarts.delete(instance.agentId);
+			this.emitRuntimeChange();
 		}
 	}
 
 	private async enqueue<T>(state: WorkerState, operation: () => Promise<T>): Promise<T> {
-		const result = state.tail.then(operation, operation);
+		state.queued++;
+		this.emitRuntimeChange();
+		const run = async () => {
+			state.queued--;
+			state.active = true;
+			this.emitRuntimeChange();
+			try {
+				return await operation();
+			} finally {
+				state.active = false;
+				this.emitRuntimeChange();
+			}
+		};
+		const result = state.tail.then(run, run);
 		state.tail = result.then(() => undefined, () => undefined);
 		return result;
+	}
+
+	private async stopWorker(agentId: string): Promise<void> {
+		const starting = this.workerStarts.get(agentId);
+		if (starting) await starting.catch(() => undefined);
+		const state = this.workers.get(agentId);
+		if (!state) return;
+		this.stoppingAgents.add(agentId);
+		this.workers.delete(agentId);
+		try {
+			await state.worker.stop();
+			await state.tail.catch(() => undefined);
+			this.runtimeErrors.delete(agentId);
+		} finally {
+			this.stoppingAgents.delete(agentId);
+			this.emitRuntimeChange();
+		}
+	}
+
+	private async retireFailedWorker(agentId: string): Promise<void> {
+		const state = this.workers.get(agentId);
+		if (!state) return;
+		this.workers.delete(agentId);
+		await state.worker.stop().catch(() => undefined);
+	}
+
+	private emitRuntimeChange(): void {
+		for (const listener of this.runtimeListeners) listener();
 	}
 }

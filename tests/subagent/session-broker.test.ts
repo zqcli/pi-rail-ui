@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
+import { FileAgentInstanceStore } from "../../subagent/instance-store";
+import { FileSessionLeaseManager } from "../../subagent/session-lease";
 import {
 	SessionBroker,
 	type AgentInstance,
@@ -8,6 +13,7 @@ import {
 	type SessionWorker,
 	type SessionWorkerFactory,
 	type DispatchProgress,
+	type WorkerSendOptions,
 	type WorkerRunResult,
 	type WorkerStartSpec,
 } from "../../subagent/session-broker";
@@ -54,13 +60,14 @@ class FakeWorker implements SessionWorker {
 	active = 0;
 	maxActive = 0;
 	stopped = false;
+	model: RailModelRef | undefined;
 
 	constructor(
 		readonly sessionId: string,
 		readonly sessionFile: string,
 	) {}
 
-	async send(task: string): Promise<WorkerRunResult> {
+	async send(task: string, _options?: WorkerSendOptions): Promise<WorkerRunResult> {
 		this.active++;
 		this.maxActive = Math.max(this.maxActive, this.active);
 		this.tasks.push(task);
@@ -71,6 +78,11 @@ class FakeWorker implements SessionWorker {
 
 	async stop(): Promise<void> {
 		this.stopped = true;
+	}
+
+	async setModel(model: RailModelRef): Promise<RailModelRef> {
+		this.model = model;
+		return model;
 	}
 }
 
@@ -166,6 +178,19 @@ describe("SessionBroker", () => {
 		assert.equal((await store.get(created.instance.agentId))?.alias, "original");
 	});
 
+	test("detaching one alias keeps the worker alive while another alias remains linked", async () => {
+		const { broker, roster, workers } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "original", task: "initial" });
+		roster.link("auth-review", created.instance.agentId);
+
+		await broker.detach("auth-review");
+
+		assert.equal(roster.resolve("original"), created.instance.agentId);
+		assert.equal(roster.resolve("auth-review"), undefined);
+		assert.equal(workers[0]?.stopped, false);
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "idle", queued: 0 });
+	});
+
 	test("reopens the saved child session after the broker restarts", async () => {
 		const { broker, store, roster, workerFactory, starts } = setup();
 		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "review auth" });
@@ -234,6 +259,87 @@ describe("SessionBroker", () => {
 		assert.deepEqual(workers[0]?.tasks, ["initial", "one", "two"]);
 	});
 
+	test("reports running, queued, idle, and stopped runtime phases truthfully", async () => {
+		const { broker } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "idle", queued: 0 });
+
+		const one = broker.dispatch({ target: "auth-review", task: "one" });
+		const two = broker.dispatch({ target: "auth-review", task: "two" });
+		await new Promise((resolve) => setTimeout(resolve, 1));
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "running", queued: 1 });
+		await Promise.all([one, two]);
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "idle", queued: 0 });
+
+		await broker.stop("auth-review");
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "stopped", queued: 0 });
+	});
+
+	test("cancelling a queued request keeps the healthy worker idle", async () => {
+		const store = new MemoryInstanceStore();
+		const roster = new MemoryRoster();
+		let releaseHold!: () => void;
+		const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+		const worker = new FakeWorker("session-1", "/tmp/queued-cancel.jsonl");
+		worker.send = async (task, options) => {
+			if (task === "hold") await hold;
+			if (options?.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
+			return { output: `done: ${task}`, usage: emptyUsage() };
+		};
+		const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
+		const first = broker.dispatch({ target: "auth-review", task: "hold" });
+		const controller = new AbortController();
+		const second = broker.dispatch({ target: "auth-review", task: "cancelled", signal: controller.signal });
+		await new Promise((resolve) => setImmediate(resolve));
+		controller.abort();
+		releaseHold();
+
+		await first;
+		await assert.rejects(second, /aborted/);
+		assert.equal(worker.stopped, false);
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "idle", queued: 0 });
+	});
+
+	test("changes exactly one persistent session model while idle", async () => {
+		const { broker, store, workers } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
+		const replacement: RailModelRef = { provider: "deepseek", modelId: "deepseek-v4-flash", thinkingLevel: "high" };
+
+		const updated = await broker.changeModel(created.instance.agentId, replacement);
+
+		assert.deepEqual(updated.model, replacement);
+		assert.deepEqual(workers[0]?.model, replacement);
+		assert.deepEqual((await store.get(created.instance.agentId))?.model, replacement);
+	});
+
+	test("retires a failed transport and reports error until the next worker opens", async () => {
+		const store = new MemoryInstanceStore();
+		const roster = new MemoryRoster();
+		let starts = 0;
+		const broker = new SessionBroker({
+			store,
+			roster,
+			workerFactory: async (spec) => {
+				starts++;
+				const worker = new FakeWorker(`session-${starts}`, spec.mode === "open" ? spec.sessionPath! : "/tmp/failing.jsonl");
+				if (starts === 1) {
+					const send = worker.send.bind(worker);
+					worker.send = async (task) => task === "crash" ? Promise.reject(new Error("transport crashed")) : send(task);
+				}
+				return worker;
+			},
+		});
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
+
+		await assert.rejects(() => broker.dispatch({ target: "auth-review", task: "crash" }), /transport crashed/);
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "error", queued: 0, errorMessage: "transport crashed" });
+
+		await broker.dispatch({ target: "auth-review", task: "recover" });
+		assert.equal(starts, 2);
+		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "idle", queued: 0 });
+	});
+
 	test("single-flights worker startup before serializing concurrent messages after restart", async () => {
 		const { broker, store, roster, workerFactory, starts, workers } = setup();
 		await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
@@ -261,6 +367,34 @@ describe("SessionBroker", () => {
 		assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
 		assert.equal(results.filter((result) => result.status === "rejected").length, 1);
 		assert.equal(workers.length, 1);
+	});
+
+	test("reserves aliases across broker processes before creating persistent sessions", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-alias-reservation-"));
+		try {
+			const store = new FileAgentInstanceStore(dir);
+			const workerFactory: SessionWorkerFactory = async (spec) => new FakeWorker(`session-${spec.agentId}`, `/tmp/${spec.agentId}.jsonl`);
+			const first = new SessionBroker({
+				store, roster: new MemoryRoster(), workerFactory,
+				aliasLeaseManager: new FileSessionLeaseManager(dir),
+			});
+			const second = new SessionBroker({
+				store, roster: new MemoryRoster(), workerFactory,
+				aliasLeaseManager: new FileSessionLeaseManager(dir),
+			});
+
+			const results = await Promise.allSettled([
+				first.dispatch({ model: reviewerModel(), alias: "shared-review", task: "one" }),
+				second.dispatch({ model: reviewerModel(), alias: "shared-review", task: "two" }),
+			]);
+
+			assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+			assert.equal((await store.list()).filter((instance) => instance.alias === "shared-review").length, 1);
+			await first.shutdown();
+			await second.shutdown();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("stops a created worker when instance persistence fails", async () => {

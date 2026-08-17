@@ -78,4 +78,6 @@ test("stateless abort clears queued transcript updates before rejecting", async 
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
 	assert.equal(updates.length, settledCount);
 	assert.equal(updates.at(-1).transcript.entries.at(-1).text, "partial");
+	assert.equal(updates.at(-1).stopReason, "aborted");
+	assert.equal(updates.at(-1).errorMessage, "Subagent request was aborted");
 });

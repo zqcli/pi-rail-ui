@@ -27,6 +27,7 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CHAIN_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const OUTPUT_CAP = 50 * 1024;
+const DETAILS_TOTAL_CAP = 512 * 1024;
 
 const SessionSourceSchema = Type.Object({
 	mode: StringEnum(["fork", "exclusive"] as const, {
@@ -78,15 +79,18 @@ export interface StatefulSubagentRunDetails {
 	output: string;
 	transcript?: SubagentTranscriptSnapshot;
 	usage: SubagentUsage;
+	durationMs: number;
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
 	persistent: boolean;
+	outputTruncated?: boolean;
 }
 
 export interface StatefulSubagentDetails {
 	mode: "single" | "parallel" | "chain";
 	results: StatefulSubagentRunDetails[];
+	durationMs: number;
 }
 
 export interface StatefulSubagentToolOptions {
@@ -132,19 +136,61 @@ function emptyUsage(): SubagentUsage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
 }
 
-function truncateOutput(value: string): string {
+function utf8Prefix(value: string, maxBytes: number): string {
+	let low = 0;
+	let high = value.length;
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(value.slice(0, middle), "utf8") <= maxBytes) low = middle;
+		else high = middle - 1;
+	}
+	let result = value.slice(0, low);
+	if (result && /[\uD800-\uDBFF]$/u.test(result)) result = result.slice(0, -1);
+	return result;
+}
+
+function truncateUtf8(value: string, maxBytes: number, suffix: string): { value: string; truncated: boolean } {
 	const bytes = Buffer.byteLength(value, "utf8");
-	if (bytes <= OUTPUT_CAP) return value;
-	let result = value.slice(0, OUTPUT_CAP);
-	while (Buffer.byteLength(result, "utf8") > OUTPUT_CAP) result = result.slice(0, -1);
-	return `${result}\n\n[Output truncated: ${bytes - Buffer.byteLength(result, "utf8")} bytes omitted. Full output remains in the child session.]`;
+	if (bytes <= maxBytes) return { value, truncated: false };
+	const safeSuffix = utf8Prefix(suffix, maxBytes);
+	const target = Math.max(0, maxBytes - Buffer.byteLength(safeSuffix, "utf8"));
+	return { value: `${utf8Prefix(value, target)}${safeSuffix}`, truncated: true };
+}
+
+function truncateParentContent(value: string): string {
+	return truncateUtf8(
+		value,
+		OUTPUT_CAP,
+		"\n\n[Output truncated for the parent context. Expand the Tool Call for the retained final answer.]",
+	).value;
+}
+
+function boundDetailOutputs(results: StatefulSubagentRunDetails[]): StatefulSubagentRunDetails[] {
+	const metadataBounded = results.map((result) => ({
+		...result,
+		task: truncateUtf8(result.task, 8 * 1024, "\n[task truncated]").value,
+		...(result.errorMessage ? { errorMessage: truncateUtf8(result.errorMessage, 8 * 1024, "\n[error truncated]").value } : {}),
+	}));
+	const baseBytes = Buffer.byteLength(JSON.stringify(metadataBounded.map((result) => ({ ...result, output: "" }))), "utf8");
+	const outputBudget = Math.max(0, DETAILS_TOTAL_CAP - 4096 - baseBytes);
+	const perRun = Math.floor(outputBudget / Math.max(1, metadataBounded.length));
+	return metadataBounded.map((result) => {
+		const bounded = truncateUtf8(
+			result.output,
+			perRun,
+			result.persistent
+				? "\n\n[Final answer truncated in the parent session details. The full answer remains in the persistent child session.]"
+				: "\n\n[Final answer truncated in the parent session details.]",
+		);
+		return bounded.truncated ? { ...result, output: bounded.value, outputTruncated: true } : result;
+	});
 }
 
 function failedRun(run: WorkerRunResult): boolean {
 	return run.stopReason === "error" || run.stopReason === "aborted" || Boolean(run.errorMessage);
 }
 
-function compactPersistentResult(result: DispatchResult, task: string, step?: number): StatefulSubagentRunDetails {
+function compactPersistentResult(result: DispatchResult, task: string, durationMs: number, step?: number): StatefulSubagentRunDetails {
 	return {
 		agentId: result.instance.agentId,
 		alias: result.instance.alias,
@@ -152,9 +198,10 @@ function compactPersistentResult(result: DispatchResult, task: string, step?: nu
 		sessionId: result.instance.sessionId,
 		task,
 		status: failedRun(result.run) ? "failed" : "completed",
-		output: truncateOutput(result.run.output),
+		output: result.run.output,
 		...(result.run.transcript ? { transcript: result.run.transcript } : {}),
 		usage: result.run.usage,
+		durationMs,
 		...(result.run.stopReason ? { stopReason: result.run.stopReason } : {}),
 		...(result.run.errorMessage ? { errorMessage: result.run.errorMessage } : {}),
 		...(step !== undefined ? { step } : {}),
@@ -162,18 +209,19 @@ function compactPersistentResult(result: DispatchResult, task: string, step?: nu
 	};
 }
 
-function compactStatelessResult(model: RailModelRef, task: string, run: StatelessRunResult, step?: number): StatefulSubagentRunDetails {
+function compactStatelessResult(alias: string, model: RailModelRef, task: string, run: StatelessRunResult, durationMs: number, step?: number): StatefulSubagentRunDetails {
 	const reference = railModelReference(model);
 	return {
-		alias: railModelKey(model),
+		alias,
 		model: reference,
 		task,
 		status: run.exitCode !== 0 || failedRun(run) ? "failed" : "completed",
-		output: truncateOutput(run.output),
+		output: run.output,
 		...(run.transcript ? { transcript: run.transcript } : {}),
 		usage: run.usage,
+		durationMs,
 		...(run.stopReason ? { stopReason: run.stopReason } : {}),
-		...(run.errorMessage ? { errorMessage: truncateOutput(run.errorMessage) } : {}),
+		...(run.errorMessage ? { errorMessage: truncateParentContent(run.errorMessage) } : {}),
 		...(step !== undefined ? { step } : {}),
 		persistent: false,
 	};
@@ -182,6 +230,8 @@ function compactStatelessResult(model: RailModelRef, task: string, run: Stateles
 function errorResult(
 	item: TaskParams,
 	error: unknown,
+	durationMs: number,
+	aborted: boolean,
 	step?: number,
 	previous?: StatefulSubagentRunDetails,
 ): StatefulSubagentRunDetails {
@@ -192,10 +242,12 @@ function errorResult(
 		...(previous?.model ? { model: previous.model } : item.model ? { model: item.model } : {}),
 		task: item.task,
 		status: "failed",
-		output: truncateOutput(message),
+		output: truncateParentContent(message),
 		transcript: appendSubagentTranscriptFailure(previous?.transcript, item.task, message),
 		usage: previous?.usage ?? emptyUsage(),
-		errorMessage: truncateOutput(message),
+		durationMs,
+		stopReason: aborted ? "aborted" : "error",
+		errorMessage: truncateParentContent(message),
 		...(step !== undefined ? { step } : {}),
 		persistent: previous?.persistent ?? isPersistentTask(item),
 	};
@@ -227,21 +279,32 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T,
 }
 
 function finalText(result: StatefulSubagentRunDetails): string {
-	if (result.status === "failed") return `Subagent ${result.alias} failed: ${result.errorMessage ?? result.output}`;
-	if (!result.persistent) return `Stateless model session ${result.model ?? result.alias} completed.\n\n${truncateOutput(result.output)}`;
-	return [
+	if (result.status === "failed") return truncateParentContent(`Subagent ${result.alias} failed: ${result.errorMessage ?? result.output}`);
+	if (!result.persistent) return truncateParentContent(`Stateless model session ${result.model ?? result.alias} completed.\n\n${result.output}`);
+	return truncateParentContent([
 		`Persistent model session ${result.alias} (${result.agentId}) completed with ${result.model}.`,
 		`Reuse with target="${result.alias}" for related follow-up tasks.`,
 		"",
-		truncateOutput(result.output),
-	].join("\n");
+		result.output,
+	].join("\n"));
 }
 
 function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunDetails[]): string {
 	const succeeded = results.filter((result) => result.status === "completed").length;
-	return `${mode === "parallel" ? "Parallel" : "Chain"}: ${succeeded}/${results.length} succeeded\n\n${results
-		.map((result) => `### ${result.alias} [${result.status}]\n\n${truncateOutput(result.output)}`)
-		.join("\n\n---\n\n")}`;
+	const summary = [
+		`${mode === "parallel" ? "Parallel" : "Chain"}: ${succeeded}/${results.length} succeeded`,
+		...results.map((result) => {
+			const error = result.errorMessage?.replace(/\s+/gu, " ").trim();
+			return `- ${result.alias} · ${result.status} · ${result.model ?? "model unavailable"}${error ? ` · ${error.slice(0, 300)}` : ""}`;
+		}),
+	].join("\n");
+	const remaining = Math.max(1024, OUTPUT_CAP - Buffer.byteLength(summary, "utf8") - 512);
+	const perRun = Math.max(512, Math.floor(remaining / Math.max(1, results.length)));
+	const outputs = results.map((result) => {
+		const snippet = truncateUtf8(result.output, perRun, "\n[answer snippet truncated]").value;
+		return `### ${result.alias} [${result.status}]\n\n${snippet}`;
+	}).join("\n\n---\n\n");
+	return truncateParentContent(`${summary}\n\n${outputs}`);
 }
 
 export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulSubagentToolOptions): void {
@@ -275,11 +338,15 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			let toolStartedAt = performance.now();
 			const mode = modeFor(params);
 			const liveResults = new Map<number, StatefulSubagentRunDetails>();
+			const runStartedAt = new Map<number, number>();
+			const runDuration = (slot: number) => Math.max(0, Math.round(performance.now() - (runStartedAt.get(slot) ?? performance.now())));
 			const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => ({
 				mode,
-				results: boundSubagentRunTranscripts(results),
+				results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
+				durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
 			});
 			const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
 				liveResults.set(slot, result);
@@ -289,7 +356,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const details = resultDetails(results);
 				latestDetails.set(toolCallId, details);
 				onUpdate?.({
-					content: [{ type: "text", text: result.output || "(running...)" }],
+					content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") }],
 					details,
 				});
 			};
@@ -321,20 +388,26 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				);
 				if (!approved) throw new Error("Existing session attachment was not approved");
 			}
+			toolStartedAt = performance.now();
 
 			const dispatch = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
+				runStartedAt.set(slot, performance.now());
+				const duration = () => runDuration(slot);
+				if (signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
 				if (item.target && item.model) throw new Error("A follow-up target cannot also select a model");
 				const persistent = isPersistentTask(item);
 				if (!persistent) {
 					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
 					const model = resolveRailModel(item.model, ctx);
+					const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
 					publishLive(slot, {
-						alias: railModelKey(model),
+						alias,
 						model: railModelReference(model),
 						task: item.task,
 						status: "running",
 						output: "(starting...)",
 						usage: emptyUsage(),
+						durationMs: duration(),
 						...(step !== undefined ? { step } : {}),
 						persistent: false,
 					});
@@ -344,18 +417,19 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						cwd: item.cwd ?? ctx.cwd,
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => publishLive(slot, {
-							alias: railModelKey(model),
+							alias,
 							model: railModelReference(model),
 							task: item.task,
 							status: "running",
 							output: partial.output,
 							...(partial.transcript ? { transcript: partial.transcript } : {}),
 							usage: partial.usage,
+							durationMs: duration(),
 							...(step !== undefined ? { step } : {}),
 							persistent: false,
 						}),
 					});
-					const result = compactStatelessResult(model, item.task, run, step);
+					const result = compactStatelessResult(alias, model, item.task, run, duration(), step);
 					publishLive(slot, result);
 					return result;
 				}
@@ -378,12 +452,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						output: partial.output,
 						...(partial.transcript ? { transcript: partial.transcript } : {}),
 						usage: partial.usage,
+						durationMs: duration(),
 						...(step !== undefined ? { step } : {}),
 						persistent: true,
 					}),
 				};
 				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
-				const result = compactPersistentResult(await broker.dispatch(request), item.task, step);
+				const result = compactPersistentResult(await broker.dispatch(request), item.task, duration(), step);
 				publishLive(slot, result);
 				return result;
 			};
@@ -393,7 +468,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				try {
 					result = await dispatch(requestedItems[0]!, 0);
 				} catch (error) {
-					result = errorResult(requestedItems[0]!, error, undefined, liveResults.get(0));
+					result = errorResult(requestedItems[0]!, error, runDuration(0), signal?.aborted ?? false, undefined, liveResults.get(0));
 					publishLive(0, result);
 				}
 				if (result.status === "failed") throw new Error(finalText(result));
@@ -406,7 +481,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					try {
 						return await dispatch(item, index);
 					} catch (error) {
-						const result = errorResult(item, error, undefined, liveResults.get(index));
+						const result = errorResult(item, error, runDuration(index), signal?.aborted ?? false, undefined, liveResults.get(index));
 						publishLive(index, result);
 						return result;
 					}
@@ -426,7 +501,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					if (result.status === "failed") break;
 					previous = result.output;
 				} catch (error) {
-					const result = errorResult(item, error, index + 1, liveResults.get(index));
+					const result = errorResult(item, error, runDuration(index), signal?.aborted ?? false, index + 1, liveResults.get(index));
 					publishLive(index, result);
 					results.push(result);
 					break;
@@ -451,13 +526,16 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded, isPartial }, theme) {
 			const details = result.details as StatefulSubagentDetails | undefined;
 			if (!details?.results.length) {
 				const content = result.content[0];
 				return new Text(content?.type === "text" ? content.text : "(no output)", 0, 0);
 			}
-			return renderSubagentTranscript(details.results, expanded, theme);
+			return renderSubagentTranscript(details.results, expanded, theme, {
+				isPartial,
+				durationMs: details.durationMs,
+			});
 		},
 	});
 }

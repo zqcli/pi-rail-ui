@@ -151,6 +151,9 @@ test("model plus alias creates a persistent session and target continues it", as
 	assert.equal("messages" in continued.details.results[0], false);
 	assert.equal(continued.details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
 	assert.equal(continued.details.results[0].persistent, true);
+	assert.equal(typeof continued.details.durationMs, "number");
+	assert.equal(typeof continued.details.results[0].durationMs, "number");
+	assert.deepEqual(continued.details.results[0].usage, { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0.1, contextTokens: 12, turns: 1 });
 	assert.equal(continueUpdates[0].details.results[0].agentId, "agt_auth");
 	assert.equal(continueUpdates[0].details.results[0].sessionId, "session-auth");
 	assert.equal(continueUpdates[0].details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
@@ -163,6 +166,56 @@ test("model plus alias creates a persistent session and target continues it", as
 	assert.match(call.render(100).join("\n"), /persistent continue auth-review/);
 	const progressPanel = tool.renderResult(continueUpdates[0], { expanded: false }, theme);
 	assert.match(progressPanel.render(120)[0], /auth-review · persistent · cus-resp\/gpt-5\.6-sol:xhigh/);
+});
+
+test("parallel parent content is fair and details keep a bounded retained answer", async () => {
+	let tool: any;
+	const output = "界".repeat(100_000);
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+		runStateless: async () => ({
+			output,
+			exitCode: 0,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+		}),
+	});
+
+	const result = await tool.execute("call-large", {
+		tasks: [
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "alpha" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "beta" },
+		],
+	}, undefined, undefined, context());
+
+	assert.ok(Buffer.byteLength(result.content[0].text, "utf8") <= 50 * 1024);
+	assert.match(result.content[0].text, /cus-resp\/gpt-5\.6-sol #1 · completed/);
+	assert.match(result.content[0].text, /cus-resp\/gpt-5\.6-sol #2 · completed/);
+	assert.ok(Buffer.byteLength(result.details.results[0].output, "utf8") <= 256 * 1024);
+	assert.ok(Buffer.byteLength(result.details.results[1].output, "utf8") <= 256 * 1024);
+	assert.equal(result.details.results[0].outputTruncated, true);
+	assert.equal(result.details.results[1].outputTruncated, true);
+	assert.ok(Buffer.byteLength(JSON.stringify(result.details), "utf8") <= 512 * 1024);
+});
+
+test("an aborted parallel call does not create not-yet-dispatched persistent sessions", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+	});
+	const controller = new AbortController();
+	controller.abort();
+
+	const result = await tool.execute("call-aborted-parallel", {
+		tasks: Array.from({ length: 6 }, (_, index) => ({
+			model: "cus-resp/gpt-5.6-sol:xhigh",
+			alias: `persistent-${index}`,
+			task: `task ${index}`,
+		})),
+	}, controller.signal, undefined, context());
+
+	assert.equal(broker.requests.length, 0);
+	assert.equal(result.details.results.every((item: any) => item.stopReason === "aborted"), true);
 });
 
 test("model without alias or session runs stateless and creates no broker instance", async () => {

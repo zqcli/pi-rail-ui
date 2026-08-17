@@ -15,7 +15,7 @@ export interface RpcWorkerFactoryOptions {
 	startupTimeoutMs?: number;
 }
 
-function sessionLeaseKey(sessionPath: string): string {
+export function sessionLeaseKey(sessionPath: string): string {
 	let normalized = path.resolve(sessionPath);
 	try {
 		normalized = realpathSync.native(normalized);
@@ -55,6 +55,10 @@ class LeasedSessionWorker implements SessionWorker {
 
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult> {
 		return this.worker.send(task, options);
+	}
+
+	setModel(model: Parameters<NonNullable<SessionWorker["setModel"]>>[0]) {
+		return this.worker.setModel(model);
 	}
 
 	async stop(): Promise<void> {

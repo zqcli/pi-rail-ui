@@ -174,6 +174,8 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		});
 		if (updateTimer) clearTimeout(updateTimer);
 		if (aborted) {
+			stopReason = "aborted";
+			errorMessage = "Subagent request was aborted";
 			publishUpdate();
 			throw new Error("Subagent request was aborted");
 		}

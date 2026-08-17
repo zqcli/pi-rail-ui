@@ -2,8 +2,10 @@ import * as path from "node:path";
 import { SessionManager, type ExtensionCommandContext, type SessionInfo } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import type { FileAgentInstanceStore } from "./instance-store";
+import type { RailAgentManager } from "./agent-manager";
 import { pickRailModel } from "./model-picker";
-import { railModelReference, type RailModelRef } from "./models";
+import { availableRailModels, railModelReference, type RailModelRef } from "./models";
+import { showRailAgentOverlay } from "./rail-agent-overlay";
 import type { SessionBroker } from "./session-broker";
 import type { SessionAgentRoster } from "./session-links";
 import { pickSessionOverlay } from "./session-picker";
@@ -14,6 +16,7 @@ const ACTION_ADVANCED = "Advanced: link session in place";
 const STATUS_KEY = "rail-agent";
 
 export interface RailAgentManagerRuntime {
+	manager?: RailAgentManager;
 	broker: Pick<SessionBroker, "attach" | "detach" | "listLinked">;
 	roster: Pick<SessionAgentRoster, "link">;
 	store: Pick<FileAgentInstanceStore, "list">;
@@ -91,7 +94,10 @@ async function linkSavedSession(
 	const selected = await chooseSession(ctx, await listSessions());
 	if (!selected) return;
 	const managed = (await runtime.store.list()).find((instance) => path.resolve(instance.sessionFile) === path.resolve(selected.path));
-	if (managed) {
+	const managedView = managed && runtime.manager
+		? (await runtime.manager.snapshot()).agents.find((agent) => agent.instance.agentId === managed.agentId)
+		: undefined;
+	if (managed && managedView?.phase !== "in-use-elsewhere" && managedView?.phase !== "unknown") {
 		runtime.roster.link(managed.alias, managed.agentId);
 		insertMention(ctx, managed.alias);
 		ctx.ui.notify(`Linked ${managed.alias}; mention inserted in the editor`, "info");
@@ -157,6 +163,22 @@ export async function runRailAgentManager(
 ): Promise<void> {
 	if (!ctx.hasUI) throw new Error("/rail-agent requires TUI or RPC UI support");
 	const listSessions = dependencies.listSessions ?? (() => SessionManager.listAll());
+	if (ctx.mode === "tui") {
+		if (!runtime.manager) throw new Error("Rail agent manager runtime is not configured");
+		const parentFile = ctx.sessionManager.getSessionFile();
+		const sessions = (await listSessions())
+			.filter((session) => session.path !== parentFile)
+			.sort((left, right) => right.modified.getTime() - left.modified.getTime())
+			.slice(0, 250);
+		const models = availableRailModels(ctx);
+		return showRailAgentOverlay(ctx, {
+			manager: runtime.manager,
+			models,
+			sessions,
+			currentCwd: ctx.cwd,
+			insertMention: (alias) => insertMention(ctx, alias),
+		});
+	}
 	const linked = await runtime.broker.listLinked();
 	const linkedAction = `Linked model sessions (${linked.length})`;
 	const actions = linked.length > 0

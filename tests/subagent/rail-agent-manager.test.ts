@@ -10,13 +10,6 @@ const model = {
 	name: "GPT 5.6 Sol",
 };
 
-const railModel = {
-	provider: "cus-resp",
-	modelId: "gpt-5.6-sol",
-	name: "GPT 5.6 Sol",
-	thinkingLevel: "xhigh" as const,
-};
-
 function modelContext() {
 	return {
 		model,
@@ -28,12 +21,19 @@ function modelContext() {
 
 test("standalone extension exposes only the Rail-namespaced slash command", () => {
 	const commands: string[] = [];
-	installStatefulSubagent({
-		registerTool: () => undefined,
-		registerCommand: (name: string) => { commands.push(name); },
-		on: () => undefined,
-		appendEntry: () => undefined,
-	} as any);
+	const previousDepth = process.env["PI_SUBAGENT_DEPTH"];
+	process.env["PI_SUBAGENT_DEPTH"] = "0";
+	try {
+		installStatefulSubagent({
+			registerTool: () => undefined,
+			registerCommand: (name: string) => { commands.push(name); },
+			on: () => undefined,
+			appendEntry: () => undefined,
+		} as any);
+	} finally {
+		if (previousDepth === undefined) delete process.env["PI_SUBAGENT_DEPTH"];
+		else process.env["PI_SUBAGENT_DEPTH"] = previousDepth;
+	}
 
 	assert.deepEqual(commands, ["rail-agent"]);
 });
@@ -144,40 +144,37 @@ test("session popup search matches words across title, message, project, and id"
 	assert.deepEqual(filterSessions(sessions, "database indexes").map((item) => item.id), ["session-db"]);
 });
 
-test("TUI session linking uses a centered searchable overlay", async () => {
+test("TUI management uses one centered unified overlay", async () => {
 	const session = {
 		path: "/tmp/saved.jsonl", id: "saved-session", cwd: "/tmp/project",
 		created: new Date(), modified: new Date(), messageCount: 1,
 		firstMessage: "Review auth", allMessagesText: "Review auth",
 	};
 	const overlayOptions: any[] = [];
-	let customCalls = 0;
-	const attached: any[] = [];
 	const ctx = {
 		...modelContext(),
 		mode: "tui", cwd: "/tmp/project", hasUI: true,
-		sessionManager: { getSessionFile: () => "/tmp/current.jsonl" },
+		sessionManager: { getSessionFile: () => "/tmp/current.jsonl", getSessionId: () => "parent-session" },
 		ui: {
-			select: async (title: string, options: string[]) => title === "Rail agents" ? options.find((item) => item.startsWith("Link saved session")) : options[0],
-			custom: async (_factory: unknown, options: unknown) => {
-				overlayOptions.push(options);
-				return customCalls++ === 0 ? session : railModel;
-			},
+			custom: async (_factory: unknown, options: unknown) => { overlayOptions.push(options); },
 			confirm: async () => true,
 			notify: () => undefined,
-			setStatus: () => undefined,
 			getEditorText: () => "",
 			setEditorText: () => undefined,
 		},
 	};
 	await runRailAgentManager(ctx as any, {
-		broker: { listLinked: async () => [], attach: async (request: any) => { attached.push(request); return { alias: request.alias, agentId: "agt_1" }; } },
+		manager: {
+			snapshot: async () => ({ agents: [], counts: { linked: 0, global: 0, running: 0, queued: 0, idle: 0, stopped: 0, inUseElsewhere: 0, errors: 0 } }),
+			subscribe: () => () => undefined,
+		},
+		broker: { listLinked: async () => [] },
 		roster: { link: () => undefined },
 		store: { list: async () => [] },
 	} as any, { listSessions: async () => [session] });
 
-	assert.equal(overlayOptions.length, 2);
-	assert.equal(overlayOptions.every((options) => options.overlay === true), true);
-	assert.equal(overlayOptions.every((options) => options.overlayOptions.anchor === "center"), true);
-	assert.equal(attached[0].session.mode, "fork");
+	assert.equal(overlayOptions.length, 1);
+	assert.equal(overlayOptions[0].overlay, true);
+	assert.equal(overlayOptions[0].overlayOptions.anchor, "center");
+	assert.equal(overlayOptions[0].overlayOptions.width, "92%");
 });

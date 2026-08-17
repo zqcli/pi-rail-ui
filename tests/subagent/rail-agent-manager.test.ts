@@ -151,6 +151,7 @@ test("TUI management uses one centered unified overlay", async () => {
 		firstMessage: "Review auth", allMessagesText: "Review auth",
 	};
 	const overlayOptions: any[] = [];
+	let listSessionCalls = 0;
 	const ctx = {
 		...modelContext(),
 		mode: "tui", cwd: "/tmp/project", hasUI: true,
@@ -171,10 +172,11 @@ test("TUI management uses one centered unified overlay", async () => {
 		broker: { listLinked: async () => [] },
 		roster: { link: () => undefined },
 		store: { list: async () => [] },
-	} as any, { listSessions: async () => [session] });
+	} as any, { listSessions: async () => { listSessionCalls++; return [session]; } });
 
 	assert.equal(overlayOptions.length, 1);
 	assert.equal(overlayOptions[0].overlay, true);
 	assert.equal(overlayOptions[0].overlayOptions.anchor, "center");
 	assert.equal(overlayOptions[0].overlayOptions.width, "92%");
+	assert.equal(listSessionCalls, 0);
 });

@@ -167,6 +167,17 @@ export class RailAgentManager {
 		return this.broker.detach(target);
 	}
 
+	async delete(target: string): Promise<AgentInstance | undefined> {
+		const agent = await this.assertLocallyControllable(target);
+		if (agent.phase !== "stopped" && agent.phase !== "error") await this.broker.stop(target);
+		const lease = await this.leases.acquire(sessionLeaseKey(agent.instance.sessionFile));
+		try {
+			return await this.broker.delete(target);
+		} finally {
+			await lease.release();
+		}
+	}
+
 	async changeModel(target: string, model: RailModelRef): Promise<AgentInstance> {
 		const agent = await this.assertLocallyControllable(target);
 		if (agent.phase !== "stopped" && agent.phase !== "error") return this.broker.changeModel(target, model);

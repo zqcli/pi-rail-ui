@@ -41,6 +41,8 @@ describe("FileAgentInstanceStore", () => {
 			assert.deepEqual(await store.get("agt_old"), older);
 			assert.deepEqual((await store.list()).map((item) => item.agentId), ["agt_new", "agt_old"]);
 			assert.equal((await readFile(join(dir, "instances", "agt_old.json"), "utf8")).endsWith("\n"), true);
+			await store.delete("agt_old");
+			assert.equal(await store.get("agt_old"), undefined);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

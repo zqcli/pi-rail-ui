@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -28,6 +28,10 @@ class MemoryInstanceStore implements AgentInstanceStore {
 
 	async put(instance: AgentInstance): Promise<void> {
 		this.instances.set(instance.agentId, structuredClone(instance));
+	}
+
+	async delete(agentId: string): Promise<void> {
+		this.instances.delete(agentId);
 	}
 
 	async list(): Promise<AgentInstance[]> {
@@ -189,6 +193,39 @@ describe("SessionBroker", () => {
 		assert.equal(roster.resolve("auth-review"), undefined);
 		assert.equal(workers[0]?.stopped, false);
 		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "idle", queued: 0 });
+	});
+
+	test("permanently deletes the child JSONL, descriptor, and current roster links", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-delete-"));
+		try {
+			const sessionFile = join(dir, "child.jsonl");
+			await writeFile(sessionFile, "session\n");
+			const store = new MemoryInstanceStore();
+			const roster = new MemoryRoster();
+			const saved: AgentInstance = {
+				version: 2,
+				agentId: "agt_delete",
+				alias: "delete-review",
+				model: reviewerModel(),
+				sessionId: "session-delete",
+				sessionFile,
+				cwd: dir,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+				lastTask: "review",
+			};
+			await store.put(saved);
+			roster.link(saved.alias, saved.agentId);
+			const broker = new SessionBroker({ store, roster, workerFactory: async () => new FakeWorker(saved.sessionId, sessionFile) });
+
+			await broker.delete(saved.agentId);
+
+			assert.equal(await store.get(saved.agentId), undefined);
+			assert.equal(roster.resolve(saved.alias), undefined);
+			await assert.rejects(() => access(sessionFile));
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("reopens the saved child session after the broker restarts", async () => {
@@ -403,6 +440,7 @@ describe("SessionBroker", () => {
 			store: {
 				get: async () => undefined,
 				put: async () => { throw new Error("store failed"); },
+				delete: async () => undefined,
 				list: async () => [],
 			},
 			roster: new MemoryRoster(),

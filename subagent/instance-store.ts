@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isValidAgentAlias } from "./identity";
 import type { RailModelRef, RailThinkingLevel } from "./models";
@@ -158,6 +158,11 @@ export class FileAgentInstanceStore implements AgentInstanceStore {
 		const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
 		await writeFile(temporary, `${JSON.stringify(instance, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		await rename(temporary, target);
+	}
+
+	async delete(agentId: string): Promise<void> {
+		if (!AGENT_ID_RE.test(agentId)) throw new Error(`Invalid subagent id: ${agentId}`);
+		await rm(this.instancePath(agentId), { force: true });
 	}
 
 	async list(): Promise<AgentInstance[]> {

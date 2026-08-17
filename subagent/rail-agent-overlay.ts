@@ -22,7 +22,8 @@ type Picker =
 export interface RailAgentOverlayOptions {
 	manager: RailAgentManager;
 	models: RailModelRef[];
-	sessions: SessionInfo[];
+	sessions?: SessionInfo[];
+	loadSessions?: () => Promise<SessionInfo[]>;
 	currentCwd: string;
 	insertMention(alias: string): void;
 }
@@ -102,6 +103,8 @@ export class RailAgentOverlayComponent implements Focusable {
 	private readonly unsubscribe: () => void;
 	private readonly interval: NodeJS.Timeout;
 	private _focused = false;
+	private sessions: SessionInfo[];
+	private sessionsLoaded: boolean;
 
 	constructor(
 		private readonly tui: TUI,
@@ -115,6 +118,8 @@ export class RailAgentOverlayComponent implements Focusable {
 	) {
 		this.snapshot = initialSnapshot;
 		this.tab = initialTab;
+		this.sessions = options.sessions ?? [];
+		this.sessionsLoaded = options.sessions !== undefined;
 		const model = options.models[0] ?? { provider: "unavailable", modelId: "no-authenticated-model" };
 		const levels = availableThinkingLevels(model, ctx);
 		const thinkingLevel = model.thinkingLevel && levels.includes(model.thinkingLevel) ? model.thinkingLevel : levels.at(-1) ?? "off";
@@ -313,7 +318,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.picker) return "type to filter · ↑↓ navigate · enter select · esc back";
 		if (this.edit) return "enter apply · esc cancel";
 		if (this.tab === "create") return "↑↓ fields · enter edit/open · ←→ or tab switch tabs · esc close";
-		return "/ search · ↑↓ select · enter continue/link · m model · t thinking · s stop · d detach · n new";
+		return "/ search · ↑↓ select · enter continue/link · m model · t thinking · s stop · d detach · x delete · n new";
 	}
 
 	private handleAgentInput(data: string): void {
@@ -349,6 +354,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			else if (matchesKey(data, "t")) void this.cycleAgentThinking(selected);
 			else if (matchesKey(data, "s")) void this.stopAgent(selected);
 			else if (matchesKey(data, "d") && selected.linkedToCurrentSession) void this.detachAgent(selected);
+			else if (matchesKey(data, "x")) void this.deleteAgent(selected);
 		}
 		this.renderSoon();
 	}
@@ -372,7 +378,10 @@ export class RailAgentOverlayComponent implements Focusable {
 		}
 		if (field === "model") return this.openModelPicker();
 		if (field === "thinking") return this.cycleFormThinking();
-		if (field === "session") return this.openSessionPicker();
+		if (field === "session") {
+			void this.openSessionPicker();
+			return;
+		}
 		if (field === "adoptMode") {
 			this.form.adoptMode = this.form.adoptMode === "fork" ? "exclusive" : "fork";
 			return;
@@ -497,6 +506,25 @@ export class RailAgentOverlayComponent implements Focusable {
 		await this.runOperation("Detaching agent...", async () => {
 			await this.options.manager.detach(alias);
 			this.notice = `Detached ${alias}; child session retained`;
+		});
+	}
+
+	private async deleteAgent(agent: RailAgentView): Promise<void> {
+		if (agent.phase === "in-use-elsewhere" || agent.phase === "unknown") {
+			this.notice = "A session owned by another process cannot be deleted here";
+			this.renderSoon();
+			return;
+		}
+		const alias = agent.linkedAliases[0] ?? agent.instance.alias;
+		const approved = await this.ctx.ui.confirm(
+			"Delete persistent agent permanently?",
+			`${alias}\n${agent.instance.sessionFile}\n\nThis deletes the child JSONL and Rail descriptor. Other parent sessions are not rewritten; future calls from them will fail.`,
+		);
+		if (!approved) return;
+		await this.runOperation("Deleting persistent agent...", async () => {
+			await this.options.manager.delete(agent.instance.agentId);
+			this.notice = `Deleted ${alias} and its child JSONL`;
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
 		});
 	}
 
@@ -631,7 +659,14 @@ export class RailAgentOverlayComponent implements Focusable {
 		this.renderSoon();
 	}
 
-	private openSessionPicker(): void {
+	private async openSessionPicker(): Promise<void> {
+		if (!this.sessionsLoaded) {
+			await this.runOperation("Loading saved Pi sessions...", async () => {
+				this.sessions = await this.options.loadSessions?.() ?? [];
+				this.sessionsLoaded = true;
+			});
+			if (!this.sessionsLoaded) return;
+		}
 		this.picker = { kind: "session", query: new Input(), selected: 0 };
 		this.syncInputFocus();
 		this.renderSoon();
@@ -661,7 +696,7 @@ export class RailAgentOverlayComponent implements Focusable {
 
 	private filteredSessions(query: string): SessionInfo[] {
 		const terms = query.toLowerCase().trim().split(/\s+/u).filter(Boolean);
-		return terms.length === 0 ? this.options.sessions : this.options.sessions.filter((session) => terms.every((term) => sessionSearchText(session).includes(term)));
+		return terms.length === 0 ? this.sessions : this.sessions.filter((session) => terms.every((term) => sessionSearchText(session).includes(term)));
 	}
 
 	private switchTab(direction: number): void {

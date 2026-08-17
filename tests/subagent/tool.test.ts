@@ -88,6 +88,8 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /stateless one-off work/);
 	assert.match(guidance, /make the task self-contained/);
 	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
+	assert.match(guidance, /permanently deleted from the \/rail-agent panel/);
+	assert.match(guidance, /later target calls.*unknown persistent subagent/);
 	assert.equal(tool.promptGuidelines.some((line: string) => /cannot recursively call subagent/.test(line)), true);
 });
 

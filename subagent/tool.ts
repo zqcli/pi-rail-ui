@@ -320,7 +320,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate work to Pi model sessions using the lifecycle that matches expected continuity. Continue an already linked persistent helper with target+task. Adopt an existing saved Pi session with session (fork by default) when its conversation history or project context matters, especially for cross-project work. Create a new persistent long-term helper with model+alias+concrete task only when future follow-ups are expected. Use model+task with no alias/target/session for one-off stateless work; stateless runs create no saved JSONL and do not appear in /resume. Use tasks for independent parallel work and chain for sequential handoff. Child sessions can use normal Pi tools but cannot recursively call subagent.",
+		description: "Delegate work to Pi model sessions using the lifecycle that matches expected continuity. Continue an already linked persistent helper with target+task. Adopt an existing saved Pi session with session (fork by default) when its conversation history or project context matters, especially for cross-project work. Create a new persistent long-term helper with model+alias+concrete task only when future follow-ups are expected. Use model+task with no alias/target/session for one-off stateless work; stateless runs create no saved JSONL and do not appear in /resume. Persistent agents can be permanently deleted from /rail-agent; deletion removes only the Rail descriptor and child JSONL, intentionally does not rewrite other parent sessions, and their later calls will fail as unknown. Use tasks for independent parallel work and chain for sequential handoff. Child sessions can use normal Pi tools but cannot recursively call subagent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		promptGuidelines: [
 			"Choose the subagent lifecycle by continuity: use target for an already linked persistent helper; use session in fork mode to adopt an existing saved Pi session whose history or project context matters; use model+alias+task for a new long-term helper expected to receive follow-ups; otherwise use model+task as stateless one-off work.",
@@ -334,6 +334,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"When the user names @new/<provider>/<modelId> or new://<provider>/<modelId>, use subagent with model set to that canonical model reference and assign a concise alias.",
 			"Subagent child sessions cannot recursively call subagent. Keep nested decomposition and orchestration in the parent session.",
 			"In subagent calls, use session only to adopt an existing saved Pi session; do not set it for ordinary stateless work or a newly created persistent helper.",
+			"Persistent subagents may be permanently deleted from the /rail-agent panel. Deletion intentionally removes only that child JSONL and Rail descriptor; it does not rewrite links stored in other parent sessions, so later target calls from those sessions fail with an unknown persistent subagent error.",
 		],
 		parameters: SubagentParams,
 

@@ -166,15 +166,14 @@ export async function runRailAgentManager(
 	if (ctx.mode === "tui") {
 		if (!runtime.manager) throw new Error("Rail agent manager runtime is not configured");
 		const parentFile = ctx.sessionManager.getSessionFile();
-		const sessions = (await listSessions())
-			.filter((session) => session.path !== parentFile)
-			.sort((left, right) => right.modified.getTime() - left.modified.getTime())
-			.slice(0, 250);
 		const models = availableRailModels(ctx);
 		return showRailAgentOverlay(ctx, {
 			manager: runtime.manager,
 			models,
-			sessions,
+			loadSessions: async () => (await listSessions())
+				.filter((session) => session.path !== parentFile)
+				.sort((left, right) => right.modified.getTime() - left.modified.getTime())
+				.slice(0, 250),
 			currentCwd: ctx.cwd,
 			insertMention: (alias) => insertMention(ctx, alias),
 		});

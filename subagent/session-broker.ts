@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { assertValidAgentAlias } from "./identity";
 import type { RailModelRef } from "./models";
 import { buildSubagentSessionName } from "./session-name";
@@ -68,6 +69,7 @@ export interface AgentInstance {
 export interface AgentInstanceStore {
 	get(agentId: string): Promise<AgentInstance | undefined>;
 	put(instance: AgentInstance): Promise<void>;
+	delete(agentId: string): Promise<void>;
 	list(): Promise<AgentInstance[]>;
 }
 
@@ -326,6 +328,18 @@ export class SessionBroker {
 			: links.find((link) => link.agentId === instance.agentId)?.alias;
 		if (alias) this.roster.unlink(alias);
 		if (!this.roster.list().some((link) => link.agentId === instance.agentId)) await this.stopWorker(instance.agentId);
+		return instance;
+	}
+
+	async delete(target: string): Promise<AgentInstance | undefined> {
+		const instance = await this.resolveInstance(target).catch(() => undefined);
+		if (!instance) return undefined;
+		await this.stopWorker(instance.agentId);
+		await rm(instance.sessionFile, { force: true });
+		await this.store.delete(instance.agentId);
+		for (const link of this.roster.list().filter((item) => item.agentId === instance.agentId)) this.roster.unlink(link.alias);
+		this.runtimeErrors.delete(instance.agentId);
+		this.emitRuntimeChange();
 		return instance;
 	}
 

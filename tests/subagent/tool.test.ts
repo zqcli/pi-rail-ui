@@ -77,6 +77,10 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(tool.description, /model\+task with no alias\/target\/session for one-off stateless work/);
 	assert.match(tool.description, /model\+alias\+concrete task/);
 	assert.match(tool.description, /target\+task/);
+	assert.match(tool.description, /multiple sibling subagent calls in the same assistant turn/);
+	assert.match(tool.description, /do not use the tasks array/);
+	assert.match(tool.description, /one grouped parent Tool Call/);
+	assert.equal(tool.executionMode, "parallel");
 	const guidance = tool.promptGuidelines.join("\n");
 	assert.match(guidance, /lifecycle by continuity/);
 	assert.match(guidance, /existing saved Pi session/);
@@ -88,6 +92,9 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /stateless one-off work/);
 	assert.match(guidance, /make the task self-contained/);
 	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
+	assert.match(guidance, /separate top-level Tool Call panels/);
+	assert.match(guidance, /Pi preflights sibling calls in order and executes them concurrently/);
+	assert.match(guidance, /tasks array only when the user wants one grouped subagent Tool Call/);
 	assert.match(guidance, /permanently deleted from the \/rail-agent panel/);
 	assert.match(guidance, /later target calls.*unknown persistent subagent/);
 	assert.equal(tool.promptGuidelines.some((line: string) => /cannot recursively call subagent/.test(line)), true);

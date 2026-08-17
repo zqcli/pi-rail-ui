@@ -23,6 +23,7 @@ export interface RpcTransport {
 interface RpcState {
 	sessionId: string;
 	sessionFile?: string;
+	sessionName?: string;
 	isStreaming?: boolean;
 }
 
@@ -40,7 +41,7 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	const args = ["--mode", "rpc"];
 	if (spec.mode === "fork") args.push("--fork", spec.sessionPath!);
 	else if (spec.mode === "open" || spec.mode === "exclusive") args.push("--session", spec.sessionPath!);
-	if (spec.mode === "new" || spec.mode === "fork") args.push("--name", spec.alias);
+	if (spec.mode !== "open") args.push("--name", spec.sessionName ?? spec.alias);
 	args.push("--model", railModelKey(spec.model));
 	if (spec.model.thinkingLevel) args.push("--thinking", spec.model.thinkingLevel);
 	args.push("--exclude-tools", "subagent");
@@ -75,7 +76,7 @@ export class RpcSessionWorker implements SessionWorker {
 		private readonly transport: RpcTransport,
 	) {}
 
-	static async connect(_spec: WorkerStartSpec, transport: RpcTransport): Promise<RpcSessionWorker> {
+	static async connect(spec: WorkerStartSpec, transport: RpcTransport): Promise<RpcSessionWorker> {
 		const state = await transport.request({ type: "get_state" }) as RpcState;
 		if (!state?.sessionId || !state.sessionFile) {
 			await transport.stop();
@@ -84,6 +85,9 @@ export class RpcSessionWorker implements SessionWorker {
 		if (state.isStreaming) {
 			await transport.stop();
 			throw new Error("Subagent session is already streaming; live attach is not supported");
+		}
+		if (spec.mode === "open" && spec.sessionName && state.sessionName !== spec.sessionName) {
+			await transport.request({ type: "set_session_name", name: spec.sessionName });
 		}
 		const worker = new RpcSessionWorker(state.sessionId, state.sessionFile, transport);
 		return worker;

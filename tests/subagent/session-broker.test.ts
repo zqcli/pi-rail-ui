@@ -94,7 +94,7 @@ function setup() {
 		workers.push(worker);
 		return worker;
 	};
-	const broker = new SessionBroker({ store, roster, workerFactory });
+	const broker = new SessionBroker({ store, roster, workerFactory, parentSessionLabel: "Main Auth Work" });
 	return { broker, store, roster, starts, workers, workerFactory };
 }
 
@@ -106,10 +106,12 @@ describe("SessionBroker", () => {
 		const second = await broker.dispatch({ target: "auth-review", task: "check tests" });
 
 		assert.equal(first.instance.alias, "auth-review");
+		assert.equal(first.instance.sessionName, "subagent · Main Auth Work · auth-review");
 		assert.equal(second.instance.agentId, first.instance.agentId);
 		assert.equal(roster.resolve("auth-review"), first.instance.agentId);
 		assert.equal((await store.get(first.instance.agentId))?.sessionFile, "/tmp/session-1.jsonl");
 		assert.deepEqual(starts.map((start) => start.mode), ["new"]);
+		assert.equal(starts[0]?.sessionName, "subagent · Main Auth Work · auth-review");
 		assert.deepEqual(workers[0]?.tasks, ["review auth", "check tests"]);
 	});
 
@@ -169,7 +171,7 @@ describe("SessionBroker", () => {
 		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "review auth" });
 		await broker.shutdown();
 
-		const restarted = new SessionBroker({ store, roster, workerFactory });
+		const restarted = new SessionBroker({ store, roster, workerFactory, parentSessionLabel: "Main Auth Work" });
 		const resumed = await restarted.dispatch({ target: "auth-review", task: "continue" });
 
 		assert.equal(resumed.instance.agentId, first.instance.agentId);
@@ -177,12 +179,28 @@ describe("SessionBroker", () => {
 		assert.equal(starts.at(-1)?.sessionPath, first.instance.sessionFile);
 	});
 
+	test("lazily assigns a stable subagent session name to legacy descriptors on open", async () => {
+		const { broker, store, roster, workerFactory, starts } = setup();
+		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
+		const stored = await store.get(first.instance.agentId);
+		assert.ok(stored);
+		const { sessionName: _oldName, ...legacy } = stored;
+		await store.put(legacy);
+		await broker.shutdown();
+
+		const restarted = new SessionBroker({ store, roster, workerFactory, parentSessionLabel: "Main Auth Work" });
+		await restarted.dispatch({ target: "auth-review", task: "continue" });
+
+		assert.equal(starts.at(-1)?.sessionName, "subagent · Main Auth Work · auth-review");
+		assert.equal((await store.get(first.instance.agentId))?.sessionName, "subagent · Main Auth Work · auth-review");
+	});
+
 	test("links a globally addressed agentId into the current parent roster", async () => {
 		const { broker, store, workerFactory } = setup();
 		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "review auth" });
 		await broker.shutdown();
 		const emptyRoster = new MemoryRoster();
-		const restarted = new SessionBroker({ store, roster: emptyRoster, workerFactory });
+		const restarted = new SessionBroker({ store, roster: emptyRoster, workerFactory, parentSessionLabel: "Main Auth Work" });
 
 		await restarted.dispatch({ target: first.instance.agentId, task: "continue" });
 
@@ -220,7 +238,7 @@ describe("SessionBroker", () => {
 		const { broker, store, roster, workerFactory, starts, workers } = setup();
 		await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
 		await broker.shutdown();
-		const restarted = new SessionBroker({ store, roster, workerFactory });
+		const restarted = new SessionBroker({ store, roster, workerFactory, parentSessionLabel: "Main Auth Work" });
 
 		await Promise.all([
 			restarted.dispatch({ target: "auth-review", task: "one" }),

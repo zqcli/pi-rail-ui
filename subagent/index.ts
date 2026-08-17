@@ -16,6 +16,7 @@ import type { RpcEvent } from "./rpc-worker";
 import { runRailAgentManager } from "./rail-agent-manager";
 import { SessionBroker } from "./session-broker";
 import { SessionAgentRoster } from "./session-links";
+import { buildParentSessionLabel } from "./session-name";
 import { createStatelessAgentRunner } from "./stateless-runner";
 import { installStatefulSubagentTool } from "./tool";
 import { createRpcWorkerFactory } from "./worker-factory";
@@ -148,6 +149,11 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 			roster,
 			workerFactory: createRpcWorkerFactory({ stateDir, onUiRequest: handleChildUiRequest }),
 			defaultCwd: ctx.cwd,
+			parentSessionLabel: buildParentSessionLabel(
+				ctx.sessionManager.getSessionName(),
+				ctx.sessionManager.getSessionId(),
+				ctx.cwd,
+			),
 		});
 		runtime = { ctx, broker, roster, store };
 		if (ctx.mode === "tui") installAutocomplete(ctx);
@@ -187,6 +193,7 @@ export * from "./searchable-picker";
 export * from "./session-broker";
 export * from "./session-lease";
 export * from "./session-links";
+export * from "./session-name";
 export * from "./session-picker";
 export * from "./stateless-runner";
 export * from "./tool";

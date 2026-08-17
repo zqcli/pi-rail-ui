@@ -19,6 +19,7 @@ function instance(agentId: string, alias: string): AgentInstance {
 		model: { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" },
 		sessionId: `session-${agentId}`,
 		sessionFile: `/tmp/${agentId}.jsonl`,
+		sessionName: `subagent · Main · ${alias}`,
 		cwd: "/tmp/project",
 		createdAt: "2026-01-01T00:00:00.000Z",
 		updatedAt: "2026-01-01T00:00:00.000Z",

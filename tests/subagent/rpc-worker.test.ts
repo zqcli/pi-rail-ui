@@ -14,7 +14,10 @@ class FakeTransport implements RpcTransport {
 	readonly listeners = new Set<(event: RpcEvent) => void>();
 	stopped = false;
 
-	constructor(private readonly failPrompt = false) {}
+	constructor(
+		private readonly failPrompt = false,
+		private sessionName?: string,
+	) {}
 
 	onEvent(listener: (event: RpcEvent) => void): () => void {
 		this.listeners.add(listener);
@@ -24,7 +27,11 @@ class FakeTransport implements RpcTransport {
 	async request(command: Record<string, unknown>): Promise<unknown> {
 		this.commands.push(command);
 		if (command["type"] === "get_state") {
-			return { sessionId: "child-session", sessionFile: "/tmp/child.jsonl", isStreaming: false };
+			return { sessionId: "child-session", sessionFile: "/tmp/child.jsonl", sessionName: this.sessionName, isStreaming: false };
+		}
+		if (command["type"] === "set_session_name") {
+			this.sessionName = command["name"] as string;
+			return undefined;
 		}
 		if (command["type"] === "prompt") {
 			queueMicrotask(() => {
@@ -116,6 +123,7 @@ function spec(mode: WorkerStartSpec["mode"], sessionPath?: string): WorkerStartS
 		mode,
 		model: model(),
 		alias: "auth-review",
+		sessionName: "subagent · Main Auth Work · auth-review",
 		cwd: "/tmp/project",
 		...(sessionPath ? { sessionPath } : {}),
 	};
@@ -126,7 +134,7 @@ describe("RPC worker arguments", () => {
 		assert.deepEqual(buildRpcWorkerArgs(spec("fork", "/tmp/source.jsonl")), [
 			"--mode", "rpc",
 			"--fork", "/tmp/source.jsonl",
-			"--name", "auth-review",
+			"--name", "subagent · Main Auth Work · auth-review",
 			"--model", "cus-resp/gpt-5.6-sol",
 			"--thinking", "xhigh",
 			"--exclude-tools", "subagent",
@@ -137,10 +145,29 @@ describe("RPC worker arguments", () => {
 		const args = buildRpcWorkerArgs(spec("open", "/tmp/child.jsonl"));
 		assert.deepEqual(args.slice(0, 4), ["--mode", "rpc", "--session", "/tmp/child.jsonl"]);
 		assert.equal(args.includes("--fork"), false);
+		assert.equal(args.includes("--name"), false);
+	});
+
+	test("names an exclusively adopted session as a managed subagent", () => {
+		const args = buildRpcWorkerArgs(spec("exclusive", "/tmp/source.jsonl"));
+		assert.deepEqual(args.slice(0, 6), [
+			"--mode", "rpc",
+			"--session", "/tmp/source.jsonl",
+			"--name", "subagent · Main Auth Work · auth-review",
+		]);
 	});
 });
 
 describe("RpcSessionWorker", () => {
+	test("renames a legacy managed session when it is next opened", async () => {
+		const transport = new FakeTransport(false, "auth-review");
+		const worker = await RpcSessionWorker.connect(spec("open", "/tmp/child.jsonl"), transport);
+
+		assert.deepEqual(transport.commands.map((command) => command["type"]), ["get_state", "set_session_name"]);
+		assert.equal(transport.commands[1]?.["name"], "subagent · Main Auth Work · auth-review");
+		await worker.stop();
+	});
+
 	test("keeps the child session and returns the settled assistant output", async () => {
 		const transport = new FakeTransport();
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);

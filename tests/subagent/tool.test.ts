@@ -87,6 +87,7 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /do not create an empty, idle, or placeholder persistent session/);
 	assert.match(guidance, /stateless one-off work/);
 	assert.match(guidance, /make the task self-contained/);
+	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
 	assert.equal(tool.promptGuidelines.some((line: string) => /cannot recursively call subagent/.test(line)), true);
 });
 

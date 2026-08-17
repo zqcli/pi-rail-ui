@@ -29,6 +29,7 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 	assert.equal(capturedArgs.includes("--exclude-tools"), true);
 	assert.equal(capturedArgs.includes("--tools"), false);
 	assert.equal(capturedArgs.includes("--append-system-prompt"), false);
+	assert.equal(capturedArgs.includes("--name"), false);
 	assert.equal(result.output, "stateless done");
 	assert.equal(result.exitCode, 0);
 	assert.deepEqual(result.transcript?.entries.map((entry) => entry.kind), [

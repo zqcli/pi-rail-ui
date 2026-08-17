@@ -1,4 +1,5 @@
 let buffer = "";
+let sessionName;
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -14,8 +15,14 @@ process.stdin.on("data", (chunk) => {
 			write({ type: "response", id: command.id, command: "get_state", success: true, data: {
 				sessionId: "fixture-session",
 				sessionFile: "/tmp/fixture.jsonl",
+				sessionName,
 				isStreaming: false,
 			} });
+			continue;
+		}
+		if (command.type === "set_session_name") {
+			sessionName = command.name;
+			write({ type: "response", id: command.id, command: "set_session_name", success: true });
 			continue;
 		}
 		if (command.type === "prompt") {

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { assertValidAgentAlias } from "./identity";
 import type { RailModelRef } from "./models";
+import { buildSubagentSessionName } from "./session-name";
 import type { SubagentTranscriptSnapshot } from "./transcript";
 
 export interface SubagentUsage {
@@ -28,6 +29,7 @@ export interface WorkerStartSpec {
 	mode: WorkerStartMode;
 	model: RailModelRef;
 	alias: string;
+	sessionName?: string;
 	cwd: string;
 	sessionPath?: string;
 }
@@ -53,6 +55,7 @@ export interface AgentInstance {
 	model: RailModelRef;
 	sessionId: string;
 	sessionFile: string;
+	sessionName?: string;
 	cwd: string;
 	createdAt: string;
 	updatedAt: string;
@@ -121,6 +124,7 @@ export interface SessionBrokerOptions {
 	roster: AgentRoster;
 	workerFactory: SessionWorkerFactory;
 	defaultCwd?: string;
+	parentSessionLabel?: string;
 }
 
 function generatedAlias(modelId: string, agentId: string): string {
@@ -148,12 +152,14 @@ export class SessionBroker {
 	private readonly roster: AgentRoster;
 	private readonly workerFactory: SessionWorkerFactory;
 	private readonly defaultCwd: string;
+	private readonly parentSessionLabel: string;
 
 	constructor(options: SessionBrokerOptions) {
 		this.store = options.store;
 		this.roster = options.roster;
 		this.workerFactory = options.workerFactory;
 		this.defaultCwd = options.defaultCwd ?? process.cwd();
+		this.parentSessionLabel = options.parentSessionLabel ?? "main";
 	}
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
@@ -234,6 +240,7 @@ export class SessionBroker {
 			throw new Error(`${session.mode} requires a session path`);
 		}
 		const cwd = request.cwd ?? this.defaultCwd;
+		const sessionName = buildSubagentSessionName(this.parentSessionLabel, alias);
 		this.pendingAliases.add(alias);
 		let worker: SessionWorker | undefined;
 		try {
@@ -242,6 +249,7 @@ export class SessionBroker {
 				mode: session.mode,
 				model: request.model,
 				alias,
+				sessionName,
 				cwd,
 				...(session.path ? { sessionPath: session.path } : {}),
 			});
@@ -253,6 +261,7 @@ export class SessionBroker {
 				model: structuredClone(request.model),
 				sessionId: worker.sessionId,
 				sessionFile: worker.sessionFile,
+				sessionName,
 				cwd,
 				createdAt: now,
 				updatedAt: now,
@@ -285,11 +294,14 @@ export class SessionBroker {
 		const starting = this.workerStarts.get(instance.agentId);
 		if (starting) return starting;
 		const start = (async () => {
+			const sessionName = instance.sessionName ?? buildSubagentSessionName(this.parentSessionLabel, instance.alias);
+			if (!instance.sessionName) await this.store.put({ ...instance, sessionName });
 			const worker = await this.workerFactory({
 				agentId: instance.agentId,
 				mode: "open",
 				model: instance.model,
 				alias: instance.alias,
+				sessionName,
 				cwd: instance.cwd,
 				sessionPath: instance.sessionFile,
 			});

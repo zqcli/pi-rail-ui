@@ -43,7 +43,8 @@ function validIdentity(item: Partial<AgentInstance>): boolean {
 		&& typeof item.cwd === "string"
 		&& typeof item.createdAt === "string"
 		&& typeof item.updatedAt === "string"
-		&& typeof item.lastTask === "string";
+		&& typeof item.lastTask === "string"
+		&& (item.sessionName === undefined || typeof item.sessionName === "string");
 }
 
 function isAgentInstance(value: unknown): value is AgentInstance {

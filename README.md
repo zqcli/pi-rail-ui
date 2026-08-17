@@ -52,14 +52,16 @@ The directory-level link is required because the entry point imports sibling mod
 - `@new/cus-resp/gpt-5.6-sol` (or another canonical Pi model reference) to create a persistent model session.
 - `@agent/auth-review` to route a follow-up to that exact instance without conflicting with Pi's normal `@path` completion.
 - `new://cus-resp/gpt-5.6-sol` and `agent://auth-review` as equivalent transport-safe forms for CLI, print, JSON, and RPC prompts. Pi expands a leading `@...` CLI argument as a file before extensions receive it.
-- `/rail-agent` opens the Rail agent manager. **Start persistent model session** selects from Pi's scoped/available models and inserts `@new/<provider>/<modelId>` so creation happens only after a task is submitted. Its TUI session popup supports typing to search by session name, first message, project path, or ID.
+- `/rail-agent` opens the Rail agent manager. **Start persistent model session** searches all models from Pi's `modelRegistry.getAvailable()` and inserts `@new/<provider>/<modelId>` so creation happens only after a task is submitted. The current model appears first and scoped models retain their configured thinking levels, but scope does not restrict subagent dispatch. Its TUI session popup supports typing to search by session name, first message, project path, or ID.
 - `model` plus `task`, without `alias` or `session`, runs a stateless one-off model session and creates no persistent instance or child session. Omitting `model` uses Pi's current model.
 - `model` plus `alias` creates a persistent session; `target` continues that exact session. Reusing the same model with another alias creates another independent session.
+- Tool guidance tells the parent LLM to proactively use stateless sessions for self-contained code search, focused analysis, verification, comparison, and review, creating a persistent alias only when later follow-ups need the same child context. Child sessions cannot recursively call `subagent`; nested orchestration remains in the parent session.
+- The Subagent Tool Call panel streams the current dispatch's user task, thinking, assistant text, tool-call arguments, and tool results. It retains the latest 18 events and follows new activity automatically, showing at most 10 rows by default or 16 rows when expanded, with an earlier-activity marker when content rolls out of view.
 - Single-writer leases and a per-agent queue so concurrent calls cannot write the same child JSONL session.
 
 The `/rail-agent` safe path uses **Fork and adopt** without asking users to choose an attach mode. **Exclusive attach** is isolated under an Advanced action and must only be used when no other Pi process has that session open. Sessions currently active in another TUI are intentionally not live-attached in this version. The former `/agents` and `/subagents` aliases are intentionally not registered.
 
-Instance metadata and leases live under `~/.pi/agent/stateful-subagents/`; each instance stores a model reference rather than an agent profile. The full child transcript remains in the child Pi session. Parent sessions persist only compact roster links and tool results, avoiding transcript duplication.
+Instance metadata and leases live under `~/.pi/agent/stateful-subagents/`; each instance stores a model reference rather than an agent profile. The full child transcript remains in the child Pi session. Parent sessions persist only compact roster links, final output, and the current Tool Call's bounded recent-event window, avoiding duplication of the full child or persistent history.
 
 ## Testing
 

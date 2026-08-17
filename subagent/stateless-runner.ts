@@ -3,6 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
 import type { SubagentUsage, WorkerRunResult } from "./session-broker";
+import { SubagentTranscript } from "./transcript";
 
 const STDERR_CAP = 50 * 1024;
 
@@ -82,6 +83,28 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		let errorMessage: string | undefined;
 		let aborted = false;
 		let killTimer: NodeJS.Timeout | undefined;
+		let updateTimer: NodeJS.Timeout | undefined;
+		const transcript = new SubagentTranscript(request.task);
+		const publishUpdate = () => {
+			updateTimer = undefined;
+			request.onUpdate?.({
+				output: output || "(running...)",
+				exitCode: 0,
+				usage: { ...usage },
+				transcript: transcript.snapshot(),
+				...(stopReason ? { stopReason } : {}),
+				...(errorMessage ? { errorMessage } : {}),
+			});
+		};
+		const queueUpdate = (immediate = false) => {
+			if (!request.onUpdate) return;
+			if (immediate) {
+				if (updateTimer) clearTimeout(updateTimer);
+				publishUpdate();
+				return;
+			}
+			if (!updateTimer) updateTimer = setTimeout(publishUpdate, 80);
+		};
 		const exitCode = await new Promise<number>((resolve) => {
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: request.cwd,
@@ -103,19 +126,17 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 						if (!line.trim()) continue;
 						try {
 							const event = JSON.parse(line) as { type?: string; message?: JsonAssistantMessage };
-							if (event.type !== "message_end" || event.message?.role !== "assistant") continue;
-							const text = assistantText(event.message);
-							if (text) output = text;
-							addUsage(usage, event.message);
-							stopReason = event.message.stopReason;
-							errorMessage = event.message.errorMessage;
-							request.onUpdate?.({
-								output: output || "(running...)",
-								exitCode: 0,
-								usage: { ...usage },
-								...(stopReason ? { stopReason } : {}),
-								...(errorMessage ? { errorMessage } : {}),
-							});
+							const transcriptChanged = transcript.ingest(event);
+							if (event.type === "message_end" && event.message?.role === "assistant") {
+								const text = assistantText(event.message);
+								if (text) output = text;
+								addUsage(usage, event.message);
+								stopReason = event.message.stopReason;
+								errorMessage = event.message.errorMessage;
+								queueUpdate(true);
+							} else if (transcriptChanged) {
+								queueUpdate(event.type === "tool_execution_start" || event.type === "tool_execution_end");
+							}
 						} catch {
 							// Ignore non-JSON diagnostic output on stdout.
 						}
@@ -151,12 +172,17 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 					if (killTimer) clearTimeout(killTimer);
 				});
 		});
-		if (aborted) throw new Error("Subagent request was aborted");
+		if (updateTimer) clearTimeout(updateTimer);
+		if (aborted) {
+			publishUpdate();
+			throw new Error("Subagent request was aborted");
+		}
 		const failure = errorMessage ?? (exitCode === 0 ? undefined : stderr.trim() || `Subagent process exited with code ${exitCode}`);
 		return {
 			output: output || (failure ? failure : "(no output)"),
 			exitCode,
 			usage,
+			transcript: transcript.snapshot(),
 			...(stopReason ? { stopReason } : {}),
 			...(failure ? { errorMessage: failure } : {}),
 		};

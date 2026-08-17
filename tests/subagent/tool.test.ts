@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installStatefulSubagentTool } from "../../subagent/tool";
 import type { DispatchRequest, DispatchResult, SessionBroker } from "../../subagent/session-broker";
+import { SubagentTranscript } from "../../subagent/transcript";
 
 const model = {
 	provider: "cus-resp",
@@ -58,6 +59,55 @@ class FakeBroker {
 		};
 	}
 }
+
+test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestration rules", () => {
+	let tool: any;
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+	});
+
+	assert.match(tool.description, /model\+task with no alias\/session \(stateless\)/);
+	assert.match(tool.description, /model\+alias\+task/);
+	assert.match(tool.description, /target\+task/);
+	assert.equal(tool.promptGuidelines.some((line: string) => /proactively use stateless subagents/i.test(line)), true);
+	assert.equal(tool.promptGuidelines.some((line: string) => /Make the task self-contained/.test(line)), true);
+	assert.equal(tool.promptGuidelines.some((line: string) => /cannot recursively call subagent/.test(line)), true);
+});
+
+test("failed tool results restore the last streamed transcript through Pi's tool_result hook", async () => {
+	let tool: any;
+	let toolResultHandler: ((event: any) => any) | undefined;
+	installStatefulSubagentTool({
+		registerTool: (definition: any) => { tool = definition; },
+		on: (event: string, handler: (value: any) => any) => {
+			if (event === "tool_result") toolResultHandler = handler;
+		},
+	} as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+		runStateless: async (request) => {
+			const transcript = new SubagentTranscript(request.task);
+			transcript.ingest({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "before failure" } });
+			request.onUpdate?.({
+				output: "(running...)",
+				exitCode: 0,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				transcript: transcript.snapshot(),
+			});
+			throw new Error("child crashed");
+		},
+	});
+
+	await assert.rejects(() => tool.execute(
+		"call-failed",
+		{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "inspect failure" },
+		undefined,
+		() => {},
+		context(),
+	), /child crashed/);
+	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-failed", isError: true });
+	assert.equal(restored.details.results[0].status, "failed");
+	assert.deepEqual(restored.details.results[0].transcript.entries.map((entry: any) => entry.kind), ["user", "thinking", "assistant"]);
+});
 
 test("model plus alias creates a persistent session and target continues it", async () => {
 	let tool: any;
@@ -160,6 +210,44 @@ test("parallel mode allows one model to back stateless and persistent sessions",
 	assert.deepEqual(statelessTasks, ["quick check"]);
 	assert.equal(broker.requests.length, 1);
 	assert.deepEqual(result.details.results.map((item: any) => item.persistent), [false, true]);
+});
+
+test("parallel streaming updates retain the recent transcript from every active child", async () => {
+	let tool: any;
+	const updates: any[] = [];
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+		runStateless: async (request) => {
+			const transcript = new SubagentTranscript(request.task);
+			transcript.ingest({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: `thinking ${request.task}` } });
+			request.onUpdate?.({
+				output: "(running...)",
+				exitCode: 0,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				transcript: transcript.snapshot(),
+			});
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			transcript.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `done ${request.task}` }] } });
+			return {
+				output: `done ${request.task}`,
+				exitCode: 0,
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+				transcript: transcript.snapshot(),
+			};
+		},
+	});
+
+	const result = await tool.execute("call-parallel-transcript", {
+		tasks: [
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "alpha" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "beta" },
+		],
+	}, undefined, (update: any) => updates.push(update), context());
+
+	const combined = updates.find((update) => update.details.results.length === 2);
+	assert.ok(combined);
+	assert.deepEqual(combined.details.results.map((item: any) => item.transcript.entries[0].text), ["alpha", "beta"]);
+	assert.ok(result.details.results.reduce((total: number, item: any) => total + item.transcript.entries.length, 0) <= 18);
 });
 
 test("session attachment confirms before forking an ordinary session", async () => {

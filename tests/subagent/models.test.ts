@@ -17,13 +17,20 @@ function context(models = [sol, colonModel]) {
 	};
 }
 
-test("availableRailModels prefers Pi scoped models and preserves thinking levels", () => {
-	assert.deepEqual(availableRailModels({ ...context(), model: undefined } as any), [{
-		provider: "cus-resp",
-		modelId: "gpt-5.6-sol",
-		name: "GPT 5.6 Sol",
-		thinkingLevel: "xhigh",
-	}]);
+test("availableRailModels exposes all available models while preserving scoped thinking levels", () => {
+	assert.deepEqual(availableRailModels({ ...context(), model: undefined } as any), [
+		{
+			provider: "cus-resp",
+			modelId: "gpt-5.6-sol",
+			name: "GPT 5.6 Sol",
+			thinkingLevel: "xhigh",
+		},
+		{
+			provider: "openrouter",
+			modelId: "vendor/model:exacto",
+			name: "Exacto",
+		},
+	]);
 });
 
 test("availableRailModels also includes the current model when it is outside the configured scope", () => {
@@ -35,6 +42,7 @@ test("availableRailModels also includes the current model when it is outside the
 	} as any).map((item) => `${item.provider}/${item.modelId}`), [
 		"cus-resp/gpt-5.6-luna",
 		"cus-resp/gpt-5.6-sol",
+		"openrouter/vendor/model:exacto",
 	]);
 });
 
@@ -51,13 +59,19 @@ test("resolveRailModel accepts canonical references with an explicit thinking le
 });
 
 test("resolveRailModel treats a complete colon-bearing model id as exact before parsing thinking", () => {
-	assert.deepEqual(resolveRailModel("openrouter/vendor/model:exacto", {
-		...context(),
-		scopedModels: [],
-	} as any), {
+	assert.deepEqual(resolveRailModel("openrouter/vendor/model:exacto", context() as any), {
 		provider: "openrouter",
 		modelId: "vendor/model:exacto",
 		name: "Exacto",
+	});
+});
+
+test("resolveRailModel accepts an available model outside the main session scope", () => {
+	assert.deepEqual(resolveRailModel("openrouter/vendor/model:exacto:max", context() as any), {
+		provider: "openrouter",
+		modelId: "vendor/model:exacto",
+		name: "Exacto",
+		thinkingLevel: "max",
 	});
 });
 

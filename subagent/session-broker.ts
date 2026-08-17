@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { assertValidAgentAlias } from "./identity";
 import type { RailModelRef } from "./models";
+import type { SubagentTranscriptSnapshot } from "./transcript";
 
 export interface SubagentUsage {
 	input: number;
@@ -15,6 +16,7 @@ export interface SubagentUsage {
 export interface WorkerRunResult {
 	output: string;
 	usage: SubagentUsage;
+	transcript?: SubagentTranscriptSnapshot;
 	stopReason?: string;
 	errorMessage?: string;
 }

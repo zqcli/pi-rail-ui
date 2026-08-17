@@ -1,4 +1,5 @@
 import { railModelKey } from "./models";
+import { SubagentTranscript } from "./transcript";
 import type {
 	SessionWorker,
 	SubagentUsage,
@@ -97,10 +98,32 @@ export class RpcSessionWorker implements SessionWorker {
 		let settled = false;
 		let resolveSettled!: () => void;
 		let transportError: Error | undefined;
+		const transcript = new SubagentTranscript(task);
+		let updateTimer: NodeJS.Timeout | undefined;
+		const publishUpdate = () => {
+			updateTimer = undefined;
+			options.onUpdate?.({
+				output: output || "(running...)",
+				usage: { ...usage },
+				transcript: transcript.snapshot(),
+				...(stopReason ? { stopReason } : {}),
+				...(errorMessage ? { errorMessage } : {}),
+			});
+		};
+		const queueUpdate = (immediate = false) => {
+			if (!options.onUpdate) return;
+			if (immediate) {
+				if (updateTimer) clearTimeout(updateTimer);
+				publishUpdate();
+				return;
+			}
+			if (!updateTimer) updateTimer = setTimeout(publishUpdate, 80);
+		};
 		const settledPromise = new Promise<void>((resolve) => {
 			resolveSettled = resolve;
 		});
 		const unsubscribe = this.transport.onEvent((event) => {
+			const transcriptChanged = transcript.ingest(event);
 			if (event.type === "message_end") {
 				const text = assistantText(event.message);
 				if (text) output = text;
@@ -109,18 +132,18 @@ export class RpcSessionWorker implements SessionWorker {
 					stopReason = event.message.stopReason;
 					errorMessage = event.message.errorMessage;
 				}
-				options.onUpdate?.({
-					output: output || "(running...)",
-					usage: { ...usage },
-					...(stopReason ? { stopReason } : {}),
-					...(errorMessage ? { errorMessage } : {}),
-				});
+				queueUpdate(true);
+			}
+			if (transcriptChanged && event.type !== "message_end") {
+				queueUpdate(event.type === "tool_execution_start" || event.type === "tool_execution_end");
 			}
 			if (event.type === "agent_settled" && !settled) {
+				queueUpdate(true);
 				settled = true;
 				resolveSettled();
 			}
 			if (event.type === "transport_error" && !settled) {
+				queueUpdate(true);
 				settled = true;
 				transportError = new Error(event.error ?? "Subagent RPC transport failed");
 				resolveSettled();
@@ -136,10 +159,12 @@ export class RpcSessionWorker implements SessionWorker {
 			return {
 				output: output || "(no output)",
 				usage,
+				transcript: transcript.snapshot(),
 				...(stopReason ? { stopReason } : {}),
 				...(errorMessage ? { errorMessage } : {}),
 			};
 		} finally {
+			if (updateTimer) clearTimeout(updateTimer);
 			options.signal?.removeEventListener("abort", abort);
 			unsubscribe();
 		}

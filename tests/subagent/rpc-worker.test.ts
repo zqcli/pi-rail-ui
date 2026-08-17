@@ -29,9 +29,52 @@ class FakeTransport implements RpcTransport {
 		if (command["type"] === "prompt") {
 			queueMicrotask(() => {
 				if (this.failPrompt) {
+					this.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+					this.emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "before crash" } });
 					this.emit({ type: "transport_error", error: "child crashed" });
 					return;
 				}
+				this.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+				this.emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Inspect auth" } });
+				this.emit({
+					type: "message_update",
+					assistantMessageEvent: {
+						type: "toolcall_end",
+						contentIndex: 1,
+						toolCall: { type: "toolCall", id: "call-auth", name: "read", arguments: { path: "auth.ts" } },
+					},
+				});
+				this.emit({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [
+							{ type: "thinking", thinking: "Inspect auth" },
+							{ type: "toolCall", id: "call-auth", name: "read", arguments: { path: "auth.ts" } },
+						],
+						stopReason: "toolUse",
+					},
+				});
+				this.emit({ type: "tool_execution_start", toolCallId: "call-auth", toolName: "read", args: { path: "auth.ts" } });
+				this.emit({
+					type: "tool_execution_update",
+					toolCallId: "call-auth",
+					toolName: "read",
+					partialResult: { content: [{ type: "text", text: "partial auth" }] },
+				});
+				this.emit({
+					type: "tool_execution_end",
+					toolCallId: "call-auth",
+					toolName: "read",
+					result: { content: [{ type: "text", text: "auth source" }] },
+					isError: false,
+				});
+				this.emit({
+					type: "message_end",
+					message: { role: "toolResult", toolCallId: "call-auth", toolName: "read", content: [{ type: "text", text: "auth source" }], isError: false },
+				});
+				this.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+				this.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "review complete" } });
 				this.emit({
 					type: "message_end",
 					message: {
@@ -101,13 +144,22 @@ describe("RpcSessionWorker", () => {
 	test("keeps the child session and returns the settled assistant output", async () => {
 		const transport = new FakeTransport();
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
 
-		const result = await worker.send("review auth");
+		const result = await worker.send("review auth", { onUpdate: (update) => updates.push(update) });
 
 		assert.equal(worker.sessionId, "child-session");
 		assert.equal(worker.sessionFile, "/tmp/child.jsonl");
 		assert.deepEqual(transport.commands.map((command) => command["type"]), ["get_state", "prompt"]);
 		assert.equal(result.output, "review complete");
+		assert.deepEqual(result.transcript?.entries.map((entry) => entry.kind), [
+			"user",
+			"thinking",
+			"tool",
+			"toolResult",
+			"assistant",
+		]);
+		assert.equal(updates.some((update) => update.transcript?.entries.some((entry: any) => entry.kind === "toolResult")), true);
 		assert.deepEqual(result.usage, {
 			input: 100,
 			output: 20,
@@ -124,8 +176,10 @@ describe("RpcSessionWorker", () => {
 	test("rejects a run when the child exits after accepting the prompt", async () => {
 		const transport = new FakeTransport(true);
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
 
-		await assert.rejects(() => worker.send("review auth"), /child crashed/);
+		await assert.rejects(() => worker.send("review auth", { onUpdate: (update) => updates.push(update) }), /child crashed/);
+		assert.equal(updates.at(-1)?.transcript.entries.at(-1).text, "before crash");
 		await worker.stop();
 	});
 });

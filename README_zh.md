@@ -52,14 +52,16 @@ ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
 - 使用 `@new/cus-resp/gpt-5.6-sol`（或其他 canonical Pi model reference）创建 persistent model session。
 - 使用 `@agent/auth-review` 把后续任务强制派发给该 instance，同时不和 Pi 原生 `@path` 文件补全冲突。
 - 在 CLI、print、JSON 和 RPC prompt 中使用等价的 `new://cus-resp/gpt-5.6-sol` 与 `agent://auth-review`。Pi 会在 extension 收到输入前，把位于 CLI 参数开头的 `@...` 当作文件展开。
-- 使用 `/rail-agent` 打开 Rail agent manager。**Start persistent model session** 会从 Pi scoped/available models 中选择 model，并插入 `@new/<provider>/<modelId>`，直到用户提交任务时才真正创建。TUI session 弹窗支持按 session 名称、首条消息、项目路径和 ID 直接键入搜索。
+- 使用 `/rail-agent` 打开 Rail agent manager。**Start persistent model session** 会搜索 Pi `modelRegistry.getAvailable()` 中的全部可用模型，并插入 `@new/<provider>/<modelId>`，直到用户提交任务时才真正创建。当前模型优先显示，scoped model 仍保留其配置的 thinking level，但 scope 不再限制 subagent 派发。TUI session 弹窗支持按 session 名称、首条消息、项目路径和 ID 直接键入搜索。
 - Tool 提供 `model` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 model session，不创建 persistent instance 或 child session；省略 `model` 时使用 Pi 当前模型。
 - 使用 `model` 加 `alias` 创建 persistent session；后续使用 `target` 复用该 session。同一个 model 换一个 alias 即可创建另一个独立 session。
+- Tool 提示会引导父 LLM 主动把代码搜索、聚焦分析、验证、比较和 review 等自包含工作派发为 stateless session；只有确实需要后续连续追问时才创建 persistent alias。Child session 当前不能递归调用 `subagent`，嵌套拆解仍由父 session 负责编排。
+- Subagent Tool Call 面板实时展示本次派发中的 user task、thinking、assistant 文本、tool call 参数和 tool result。它只保留最近 18 个事件并自动跟随最新活动；默认最多显示 10 行，展开后最多 16 行，较早内容以隐藏提示代替。
 - 通过单 writer lease 和 per-agent queue，避免并发调用同时写入同一个 child JSONL session。
 
 `/rail-agent` 的普通流程固定使用安全的 **Fork and adopt**，不再要求用户理解 attach mode。**Exclusive attach** 被收进 Advanced action，且只有确认没有其他 Pi 进程打开该 session 时才可使用。当前版本不会 live attach 到另一个 TUI 正在运行的 session。旧 `/agents` 与 `/subagents` alias 不再注册。
 
-Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instance 保存的是 model reference，而不是 agent profile。完整 child transcript 仍保留在 child Pi session 中。父 session 只持久化精简 roster link 和 tool result，避免复制整份子对话。
+Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instance 保存的是 model reference，而不是 agent profile。完整 child transcript 仍保留在 child Pi session 中。父 session 只持久化精简 roster link、final output 和本次 Tool Call 的有界近期事件窗口，避免复制整份子对话或 persistent 历史。
 
 ## 测试
 

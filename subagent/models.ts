@@ -34,17 +34,32 @@ export function railModelFromModel(
 }
 
 export function availableRailModels(ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">): RailModelRef[] {
-	const models = ctx.scopedModels.length > 0
-		? ctx.scopedModels.map((item) => railModelFromModel(item.model, item.thinkingLevel))
-		: ctx.modelRegistry.getAvailable().map((model) => railModelFromModel(model));
+	const available = ctx.modelRegistry.getAvailable();
+	const scoped = new Map(ctx.scopedModels.map((item) => [
+		railModelKey({ provider: item.model.provider, modelId: item.model.id }),
+		item,
+	]));
+	const ordered: Model<Api>[] = [];
+	const seen = new Set<string>();
+	const add = (model: Model<Api> | undefined) => {
+		if (!model) return;
+		const key = railModelKey({ provider: model.provider, modelId: model.id });
+		if (seen.has(key)) return;
+		seen.add(key);
+		ordered.push(model);
+	};
+	add(ctx.model);
+	for (const item of ctx.scopedModels) add(available.find((model) => model.provider === item.model.provider && model.id === item.model.id));
+	for (const model of available) add(model);
+
 	const activeModel = ctx.model;
-	if (activeModel) {
-		const currentIndex = models.findIndex((model) => model.provider === activeModel.provider && model.modelId === activeModel.id);
-		const current = railModelFromModel(activeModel, ctx.thinkingLevel);
-		if (currentIndex >= 0) models[currentIndex] = current;
-		else models.unshift(current);
-	}
-	return models;
+	return ordered.map((model) => {
+		if (activeModel?.provider === model.provider && activeModel.id === model.id) {
+			return railModelFromModel(model, ctx.thinkingLevel);
+		}
+		const item = scoped.get(railModelKey({ provider: model.provider, modelId: model.id }));
+		return railModelFromModel(model, item?.thinkingLevel);
+	});
 }
 
 function findModel(reference: string, available: Model<Api>[]): Model<Api> | undefined {

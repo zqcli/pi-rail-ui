@@ -15,11 +15,13 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 			return { command: process.execPath, args: [fixture] };
 		},
 	});
+	const updates: any[] = [];
 
 	const result = await runner({
 		model,
 		task: "inspect auth",
 		cwd: process.cwd(),
+		onUpdate: (update) => updates.push(update),
 	});
 
 	assert.deepEqual(capturedArgs.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--model"]);
@@ -29,6 +31,14 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 	assert.equal(capturedArgs.includes("--append-system-prompt"), false);
 	assert.equal(result.output, "stateless done");
 	assert.equal(result.exitCode, 0);
+	assert.deepEqual(result.transcript?.entries.map((entry) => entry.kind), [
+		"user",
+		"thinking",
+		"tool",
+		"toolResult",
+		"assistant",
+	]);
+	assert.equal(updates.some((update) => update.transcript?.entries.some((entry: any) => entry.kind === "toolResult")), true);
 	assert.deepEqual(result.usage, {
 		input: 12,
 		output: 3,
@@ -38,4 +48,33 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		contextTokens: 17,
 		turns: 1,
 	});
+});
+
+test("stateless abort clears queued transcript updates before rejecting", async () => {
+	const fixture = resolve("tests/fixtures/fake-pi-json-slow.mjs");
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: [fixture] }),
+	});
+	const controller = new AbortController();
+	const updates: any[] = [];
+	let abortSent = false;
+	const run = runner({
+		model,
+		task: "slow task",
+		cwd: process.cwd(),
+		signal: controller.signal,
+		onUpdate: (update) => {
+			updates.push(update);
+			if (!abortSent) {
+				abortSent = true;
+				controller.abort();
+			}
+		},
+	});
+
+	await assert.rejects(run, /aborted/);
+	const settledCount = updates.length;
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+	assert.equal(updates.length, settledCount);
+	assert.equal(updates.at(-1).transcript.entries.at(-1).text, "partial");
 });

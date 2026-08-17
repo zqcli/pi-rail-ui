@@ -55,6 +55,7 @@ ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
 - 使用 `/rail-agent` 打开 Rail agent manager。**Start persistent model session** 会搜索 Pi `modelRegistry.getAvailable()` 中的全部可用模型，并插入 `@new/<provider>/<modelId>`，直到用户提交任务时才真正创建。当前模型优先显示，scoped model 仍保留其配置的 thinking level，但 scope 不再限制 subagent 派发。TUI session 弹窗支持按 session 名称、首条消息、项目路径和 ID 直接键入搜索。
 - Tool 提供 `model` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 model session，不创建 persistent instance 或 child session；省略 `model` 时使用 Pi 当前模型。
 - 使用 `model` 加 `alias` 创建 persistent session；后续使用 `target` 复用该 session。同一个 model 换一个 alias 即可创建另一个独立 session。
+- 生命周期按连续性选择：已有 linked helper 使用 `target` 继续；已有 session 的历史或项目 cwd 有价值时用安全 `fork` 接入（常用于跨仓库工作）；只有具体首个任务预计需要后续追问时才创建新的 persistent alias，禁止创建空占位 session；其余使用 stateless 一次性派发。
 - Tool 提示会引导父 LLM 主动把代码搜索、聚焦分析、验证、比较和 review 等自包含工作派发为 stateless session；只有确实需要后续连续追问时才创建 persistent alias。Child session 当前不能递归调用 `subagent`，嵌套拆解仍由父 session 负责编排。
 - Subagent Tool Call 面板实时展示本次派发中的 user task、thinking、assistant 文本、tool call 参数和 tool result。它只保留最近 18 个事件并自动跟随最新活动；默认最多显示 10 行，展开后最多 16 行，较早内容以隐藏提示代替。
 - 通过单 writer lease 和 per-agent queue，避免并发调用同时写入同一个 child JSONL session。

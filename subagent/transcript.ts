@@ -416,7 +416,7 @@ export class SubagentTranscript {
 
 interface RenderEntry {
 	entry: SubagentTranscriptEntry;
-	alias?: string;
+	scope?: string;
 }
 
 interface RenderGroup {
@@ -558,7 +558,7 @@ class BoundedTranscriptView implements Component {
 		const label = entry.kind === "tool" ? `tool ${entry.label ?? ""}`.trim()
 			: entry.kind === "toolResult" ? `result ${entry.label ?? ""}`.trim()
 				: entry.kind;
-		const scope = item.alias ? `${item.alias} · ` : "";
+		const scope = item.scope ? `${item.scope} · ` : "";
 		const titleColor = failed ? "error" : entry.kind === "thinking" ? "dim" : entry.kind === "user" ? "accent" : "toolTitle";
 		const bodyColor = failed ? "error" : entry.kind === "thinking" ? "dim" : "toolOutput";
 		const logical = entry.text.split("\n");
@@ -603,8 +603,9 @@ export function renderSubagentTranscript(
 	const running = boundedRuns.length - completed - failed;
 	const persistent = boundedRuns.filter((run) => run.persistent).length;
 	const stateless = boundedRuns.length - persistent;
+	const identity = (run: SubagentTranscriptRun) => `${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}`;
 	const header = boundedRuns.length === 1
-		? `${boundedRuns[0]!.status === "failed" ? theme.fg("error", "✗") : boundedRuns[0]!.status === "running" ? theme.fg("warning", "…") : theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(boundedRuns[0]!.alias))}${theme.fg("dim", ` · ${boundedRuns[0]!.persistent ? "persistent" : "stateless"}`)}${boundedRuns[0]!.model ? theme.fg("dim", ` · ${boundedRuns[0]!.model}`) : ""}`
+		? `${boundedRuns[0]!.status === "failed" ? theme.fg("error", "✗") : boundedRuns[0]!.status === "running" ? theme.fg("warning", "…") : theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(boundedRuns[0]!.alias))}${theme.fg("dim", ` · ${boundedRuns[0]!.persistent ? "persistent" : "stateless"} · ${boundedRuns[0]!.model ?? "model unavailable"}`)}`
 		: `${theme.fg("toolTitle", theme.bold(`${boundedRuns.length} model sessions`))}${theme.fg("dim", ` · ${persistent} persistent · ${stateless} stateless · ${completed} complete · ${running} running · ${failed} failed`)}`;
 	const multiple = boundedRuns.length > 1;
 	let omittedEntries = 0;
@@ -617,7 +618,7 @@ export function renderSubagentTranscript(
 		order: group.order,
 		entries: group.entries.map(({ runIndex, entry }) => ({
 			entry,
-			...(multiple ? { alias: boundedRuns[runIndex]!.alias } : {}),
+			...(multiple ? { scope: identity(boundedRuns[runIndex]!) } : {}),
 		})),
 	}));
 	for (let runIndex = 0; runIndex < boundedRuns.length; runIndex++) {
@@ -633,7 +634,7 @@ export function renderSubagentTranscript(
 					status: run.status,
 					order: 0,
 				},
-				...(multiple ? { alias: run.alias } : {}),
+				...(multiple ? { scope: identity(run) } : {}),
 			}],
 		});
 	}

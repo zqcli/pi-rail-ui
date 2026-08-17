@@ -7,6 +7,7 @@ import {
 	type AgentRoster,
 	type SessionWorker,
 	type SessionWorkerFactory,
+	type DispatchProgress,
 	type WorkerRunResult,
 	type WorkerStartSpec,
 } from "../../subagent/session-broker";
@@ -110,6 +111,19 @@ describe("SessionBroker", () => {
 		assert.equal((await store.get(first.instance.agentId))?.sessionFile, "/tmp/session-1.jsonl");
 		assert.deepEqual(starts.map((start) => start.mode), ["new"]);
 		assert.deepEqual(workers[0]?.tasks, ["review auth", "check tests"]);
+	});
+
+	test("publishes persistent identity and model before the child produces output", async () => {
+		const { broker } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
+		const progress: DispatchProgress[] = [];
+
+		await broker.dispatch({ target: "auth-review", task: "continue", onUpdate: (update) => progress.push(update) });
+
+		assert.equal(progress[0]?.instance.agentId, created.instance.agentId);
+		assert.equal(progress[0]?.instance.sessionId, created.instance.sessionId);
+		assert.deepEqual(progress[0]?.instance.model, reviewerModel());
+		assert.equal(progress[0]?.run.output, "(starting...)");
 	});
 
 	test("allows one Pi model to own multiple independent sessions", async () => {

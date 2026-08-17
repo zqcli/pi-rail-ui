@@ -38,20 +38,28 @@ class FakeBroker {
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		this.requests.push(request);
 		const selectedModel = request.model ?? railModel;
-		return {
-			instance: {
-				version: 2,
-				agentId: "agt_auth",
-				alias: request.alias ?? request.target ?? "auth-review",
-				model: selectedModel,
-				sessionId: "session-auth",
-				sessionFile: "/tmp/auth.jsonl",
-				cwd: request.cwd ?? "/tmp/project",
-				createdAt: "2026-01-01T00:00:00.000Z",
-				updatedAt: "2026-01-01T00:00:00.000Z",
-				lastTask: request.task,
-				lastOutput: `done: ${request.task}`,
+		const instance = {
+			version: 2,
+			agentId: "agt_auth",
+			alias: request.alias ?? request.target ?? "auth-review",
+			model: selectedModel,
+			sessionId: "session-auth",
+			sessionFile: "/tmp/auth.jsonl",
+			cwd: request.cwd ?? "/tmp/project",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			lastTask: request.task,
+			lastOutput: `done: ${request.task}`,
+		} as const;
+		request.onUpdate?.({
+			instance,
+			run: {
+				output: "(starting...)",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			},
+		});
+		return {
+			instance,
 			run: {
 				output: `done: ${request.task}`,
 				usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0.1, contextTokens: 12, turns: 1 },
@@ -66,11 +74,19 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 		broker: new FakeBroker() as unknown as SessionBroker,
 	});
 
-	assert.match(tool.description, /model\+task with no alias\/session \(stateless\)/);
-	assert.match(tool.description, /model\+alias\+task/);
+	assert.match(tool.description, /model\+task with no alias\/target\/session for one-off stateless work/);
+	assert.match(tool.description, /model\+alias\+concrete task/);
 	assert.match(tool.description, /target\+task/);
-	assert.equal(tool.promptGuidelines.some((line: string) => /proactively use stateless subagents/i.test(line)), true);
-	assert.equal(tool.promptGuidelines.some((line: string) => /Make the task self-contained/.test(line)), true);
+	const guidance = tool.promptGuidelines.join("\n");
+	assert.match(guidance, /lifecycle by continuity/);
+	assert.match(guidance, /existing saved Pi session/);
+	assert.match(guidance, /fork by default/);
+	assert.match(guidance, /another repository/);
+	assert.match(guidance, /preserve that session's project cwd/);
+	assert.match(guidance, /new long-term helper expected to receive follow-ups/);
+	assert.match(guidance, /do not create an empty, idle, or placeholder persistent session/);
+	assert.match(guidance, /stateless one-off work/);
+	assert.match(guidance, /make the task self-contained/);
 	assert.equal(tool.promptGuidelines.some((line: string) => /cannot recursively call subagent/.test(line)), true);
 });
 
@@ -112,6 +128,7 @@ test("failed tool results restore the last streamed transcript through Pi's tool
 test("model plus alias creates a persistent session and target continues it", async () => {
 	let tool: any;
 	const broker = new FakeBroker();
+	const continueUpdates: any[] = [];
 	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
 		broker: broker as unknown as SessionBroker,
 	});
@@ -124,7 +141,7 @@ test("model plus alias creates a persistent session and target continues it", as
 	const continued = await tool.execute("call-2", {
 		target: "auth-review",
 		task: "check tests",
-	}, undefined, undefined, context());
+	}, undefined, (update: any) => continueUpdates.push(update), context());
 
 	assert.deepEqual(broker.requests[0]?.model, railModel);
 	assert.equal(broker.requests[1]?.target, "auth-review");
@@ -133,17 +150,25 @@ test("model plus alias creates a persistent session and target continues it", as
 	assert.equal("messages" in continued.details.results[0], false);
 	assert.equal(continued.details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
 	assert.equal(continued.details.results[0].persistent, true);
-	const call = tool.renderCall({ target: "auth-review", task: "check tests" }, {
+	assert.equal(continueUpdates[0].details.results[0].agentId, "agt_auth");
+	assert.equal(continueUpdates[0].details.results[0].sessionId, "session-auth");
+	assert.equal(continueUpdates[0].details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
+	assert.equal(continueUpdates[0].details.results[0].persistent, true);
+	const theme = {
 		fg: (_color: string, text: string) => text,
 		bold: (text: string) => text,
-	});
+	};
+	const call = tool.renderCall({ target: "auth-review", task: "check tests" }, theme);
 	assert.match(call.render(100).join("\n"), /persistent continue auth-review/);
+	const progressPanel = tool.renderResult(continueUpdates[0], { expanded: false }, theme);
+	assert.match(progressPanel.render(120)[0], /auth-review · persistent · cus-resp\/gpt-5\.6-sol:xhigh/);
 });
 
 test("model without alias or session runs stateless and creates no broker instance", async () => {
 	let tool: any;
 	const broker = new FakeBroker();
 	const statelessModels: unknown[] = [];
+	const statelessUpdates: any[] = [];
 	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
 		broker: broker as unknown as SessionBroker,
 		runStateless: async (request) => {
@@ -166,12 +191,14 @@ test("model without alias or session runs stateless and creates no broker instan
 		tasks: [],
 		chain: [],
 		confirmSessionAttach: true,
-	}, undefined, undefined, context());
+	}, undefined, (update: any) => statelessUpdates.push(update), context());
 
 	assert.deepEqual(statelessModels, [railModel]);
 	assert.equal(broker.requests.length, 0);
 	assert.match(result.content[0].text, /Stateless model session cus-resp\/gpt-5\.6-sol:xhigh completed/);
 	assert.equal(result.details.results[0].persistent, false);
+	assert.equal(statelessUpdates[0].details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
+	assert.equal(statelessUpdates[0].details.results[0].persistent, false);
 });
 
 test("omitting model uses the current Pi model for stateless work", async () => {
@@ -250,7 +277,8 @@ test("parallel streaming updates retain the recent transcript from every active 
 		],
 	}, undefined, (update: any) => updates.push(update), context());
 
-	const combined = updates.find((update) => update.details.results.length === 2);
+	const combined = updates.find((update) => update.details.results.length === 2
+		&& update.details.results.every((item: any) => item.transcript?.entries.length));
 	assert.ok(combined);
 	assert.deepEqual(combined.details.results.map((item: any) => item.transcript.entries[0].text), ["alpha", "beta"]);
 	assert.ok(result.details.results.reduce((total: number, item: any) => total + item.transcript.entries.length, 0) <= 18);

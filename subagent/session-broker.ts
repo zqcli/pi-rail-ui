@@ -91,10 +91,15 @@ export interface DispatchRequest {
 	cwd?: string;
 	session?: SessionSource;
 	signal?: AbortSignal;
-	onUpdate?: WorkerSendOptions["onUpdate"];
+	onUpdate?: (progress: DispatchProgress) => void;
 }
 
 export interface DispatchResult {
+	instance: AgentInstance;
+	run: WorkerRunResult;
+}
+
+export interface DispatchProgress {
 	instance: AgentInstance;
 	run: WorkerRunResult;
 }
@@ -131,6 +136,10 @@ function compactMetadata(value: string, maxLength: number): string {
 	return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }
 
+function emptyUsage(): SubagentUsage {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+}
+
 export class SessionBroker {
 	private readonly workers = new Map<string, WorkerState>();
 	private readonly workerStarts = new Map<string, Promise<WorkerState>>();
@@ -161,10 +170,11 @@ export class SessionBroker {
 				...(request.session ? { session: request.session } : {}),
 			})
 			: await this.resolveInstance(request.target!, true);
+		request.onUpdate?.({ instance, run: { output: "(starting...)", usage: emptyUsage() } });
 		const state = await this.workerState(instance);
 		const run = await this.enqueue(state, () => state.worker.send(request.task, {
 			...(request.signal ? { signal: request.signal } : {}),
-			...(request.onUpdate ? { onUpdate: request.onUpdate } : {}),
+			...(request.onUpdate ? { onUpdate: (partial) => request.onUpdate!({ instance, run: partial }) } : {}),
 		}));
 		const stored = await this.store.get(instance.agentId) ?? instance;
 		const persisted: AgentInstance = {

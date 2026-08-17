@@ -30,35 +30,35 @@ const OUTPUT_CAP = 50 * 1024;
 
 const SessionSourceSchema = Type.Object({
 	mode: StringEnum(["fork", "exclusive"] as const, {
-		description: "fork safely copies an existing saved session; exclusive opens it in place",
+		description: "How to adopt an existing saved Pi session: use fork by default to preserve the original; use exclusive only when the user explicitly wants in-place ownership and no other process has it open",
 	}),
-	path: Type.String({ description: "Existing Pi session path" }),
+	path: Type.String({ description: "Existing saved Pi session path whose conversation history and project context should be continued" }),
 });
 
 const TaskItem = Type.Object({
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. Use with no alias/session for stateless work or with alias to create a persistent session." })),
-	target: Type.Optional(Type.String({ description: "Persistent alias or agentId to continue; omit model when target is set" })),
-	alias: Type.Optional(Type.String({ description: "Alias for a new persistent model session; omit for stateless work" })),
-	task: Type.String({ description: "Self-contained task for stateless work, or a follow-up message for a persistent target" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for a new session" })),
+	target: Type.Optional(Type.String({ description: "Exact linked persistent alias or agentId whose existing conversation memory should continue; omit model when target is set" })),
+	alias: Type.Optional(Type.String({ description: "Alias for a new persistent long-term helper that is expected to receive follow-ups; omit for one-off stateless work" })),
+	task: Type.String({ description: "Self-contained one-off task for stateless work, concrete initial task for a new persistent helper, or follow-up message for target" }),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; when adopting a cross-project saved session, use its original project directory when known" })),
 	session: Type.Optional(SessionSourceSchema),
 });
 
 const ChainItem = Type.Object({
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model" })),
-	target: Type.Optional(Type.String({ description: "Persistent alias or agentId to continue; omit model when target is set" })),
-	alias: Type.Optional(Type.String({ description: "Alias for a new persistent model session; omit for stateless work" })),
-	task: Type.String({ description: "Task with optional {previous} placeholder" }),
-	cwd: Type.Optional(Type.String()),
+	target: Type.Optional(Type.String({ description: "Exact linked persistent alias or agentId to continue; omit model when target is set" })),
+	alias: Type.Optional(Type.String({ description: "Alias for a new persistent helper expected to receive follow-ups; omit for stateless work" })),
+	task: Type.String({ description: "Self-contained task, persistent initial/follow-up task, and optional {previous} placeholder" }),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session" })),
 	session: Type.Optional(SessionSourceSchema),
 });
 
 const SubagentParams = Type.Object({
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. In single mode, model+task without alias/session is stateless; model+alias+task creates persistent." })),
-	target: Type.Optional(Type.String({ description: "Continue the exact persistent alias or agentId in single mode; do not also set model" })),
-	alias: Type.Optional(Type.String({ description: "Create a new persistent model session in single mode; omit for stateless work" })),
-	task: Type.Optional(Type.String({ description: "Self-contained stateless task or persistent follow-up message (single mode)" })),
-	cwd: Type.Optional(Type.String({ description: "Working directory for a new session" })),
+	target: Type.Optional(Type.String({ description: "Continue the exact linked persistent alias or agentId and its existing conversation memory; do not also set model" })),
+	alias: Type.Optional(Type.String({ description: "Create a new persistent long-term helper expected to receive future follow-ups; omit for one-off stateless work" })),
+	task: Type.Optional(Type.String({ description: "Self-contained stateless task, concrete initial task for a new persistent helper, or persistent follow-up message" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
 	session: Type.Optional(SessionSourceSchema),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Independent model-session tasks to run in parallel; each item may be stateless or persistent" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
@@ -257,19 +257,20 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate work to isolated or persistent Pi model sessions. For one-off work use model+task with no alias/session (stateless). For work that needs later follow-up use model+alias+task once, then target+task to continue that exact session. Use tasks for independent parallel work and chain for sequential handoff. Stateless tasks must be self-contained because their context is discarded. Child sessions can use normal Pi tools but cannot recursively call subagent.",
+		description: "Delegate work to Pi model sessions using the lifecycle that matches expected continuity. Continue an already linked persistent helper with target+task. Adopt an existing saved Pi session with session (fork by default) when its conversation history or project context matters, especially for cross-project work. Create a new persistent long-term helper with model+alias+concrete task only when future follow-ups are expected. Use model+task with no alias/target/session for one-off stateless work. Use tasks for independent parallel work and chain for sequential handoff. Child sessions can use normal Pi tools but cannot recursively call subagent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		promptGuidelines: [
-			"For subagent delegation, proactively use stateless subagents for bounded, independent work such as codebase search, focused analysis, verification, comparison, or review when it can run without conversational memory.",
-			"For stateless subagent work, call subagent with task and optional model only. Omit alias, target, and session. Make the task self-contained with the relevant goal, scope, constraints, paths, and expected output because no state persists.",
+			"Choose the subagent lifecycle by continuity: use target for an already linked persistent helper; use session in fork mode to adopt an existing saved Pi session whose history or project context matters; use model+alias+task for a new long-term helper expected to receive follow-ups; otherwise use model+task as stateless one-off work.",
+			"For an existing linked subagent, continue with target+task and no model. Reuse the exact alias so the same child conversation memory, session, and working context continue.",
+			"When adopting an existing saved Pi session, use session mode fork by default so the original remains untouched. This is appropriate for continuing prior work or modifying another repository; preserve that session's project cwd when known. Use exclusive only with explicit user intent and no other writer.",
+			"Create a new persistent subagent only when future follow-ups need the same child context. The first model+alias call must include a concrete initial task; do not create an empty, idle, or placeholder persistent session. One model can back many aliases with independent histories.",
+			"For stateless subagent work, call subagent with task and optional model only. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists.",
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
-			"In subagent, create a persistent session only when future follow-ups need the same child context: call once with model+alias+task. One model can back many aliases with independent histories.",
-			"In subagent, continue persistent work with target+task and no model. Reuse the exact alias instead of creating a replacement session or routing to another alias using the same model.",
 			"In subagent, use tasks for independent parallel delegation. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
 			"When the user names @agent/<alias> or agent://<alias>, use subagent with target set to that exact alias.",
 			"When the user names @new/<provider>/<modelId> or new://<provider>/<modelId>, use subagent with model set to that canonical model reference and assign a concise alias.",
 			"Subagent child sessions cannot recursively call subagent. Keep nested decomposition and orchestration in the parent session.",
-			"In subagent calls, use session only to attach an existing saved Pi session; do not set it for ordinary stateless or new persistent work.",
+			"In subagent calls, use session only to adopt an existing saved Pi session; do not set it for ordinary stateless work or a newly created persistent helper.",
 		],
 		parameters: SubagentParams,
 
@@ -327,21 +328,31 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				if (!persistent) {
 					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
 					const model = resolveRailModel(item.model, ctx);
+					publishLive(slot, {
+						alias: railModelKey(model),
+						model: railModelReference(model),
+						task: item.task,
+						status: "running",
+						output: "(starting...)",
+						usage: emptyUsage(),
+						...(step !== undefined ? { step } : {}),
+						persistent: false,
+					});
 					const run = await options.runStateless({
 						model,
 						task: item.task,
 						cwd: item.cwd ?? ctx.cwd,
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => publishLive(slot, {
-									alias: railModelKey(model),
-									model: railModelReference(model),
-									task: item.task,
-									status: "running",
-									output: partial.output,
-									...(partial.transcript ? { transcript: partial.transcript } : {}),
-									usage: partial.usage,
-									...(step !== undefined ? { step } : {}),
-									persistent: false,
+							alias: railModelKey(model),
+							model: railModelReference(model),
+							task: item.task,
+							status: "running",
+							output: partial.output,
+							...(partial.transcript ? { transcript: partial.transcript } : {}),
+							usage: partial.usage,
+							...(step !== undefined ? { step } : {}),
+							persistent: false,
 						}),
 					});
 					const result = compactStatelessResult(model, item.task, run, step);
@@ -357,16 +368,18 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					...(item.cwd ? { cwd: item.cwd } : {}),
 					...(item.session ? { session: item.session } : {}),
 					...(signal ? { signal } : {}),
-					onUpdate: (partial) => publishLive(slot, {
-								alias: item.target ?? item.alias ?? (model ? railModelKey(model) : "model-session"),
-								...(model ? { model: railModelReference(model) } : {}),
-								task: item.task,
-								status: "running",
-								output: partial.output,
-								...(partial.transcript ? { transcript: partial.transcript } : {}),
-								usage: partial.usage,
-								...(step !== undefined ? { step } : {}),
-								persistent: true,
+					onUpdate: ({ instance, run: partial }) => publishLive(slot, {
+						agentId: instance.agentId,
+						alias: instance.alias,
+						model: railModelReference(instance.model),
+						sessionId: instance.sessionId,
+						task: item.task,
+						status: "running",
+						output: partial.output,
+						...(partial.transcript ? { transcript: partial.transcript } : {}),
+						usage: partial.usage,
+						...(step !== undefined ? { step } : {}),
+						persistent: true,
 					}),
 				};
 				const broker = typeof options.broker === "function" ? options.broker() : options.broker;

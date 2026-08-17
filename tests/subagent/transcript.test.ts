@@ -115,6 +115,7 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 		alias: "auth-review",
 		status: "running",
 		output: "assistant message 9",
+		model: "cus-resp/gpt-5.6-sol:xhigh",
 		persistent: true,
 		transcript,
 	}], false, theme as any);
@@ -122,6 +123,7 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 
 	assert.ok(lines.length <= 10);
 	assert.match(lines[0] ?? "", /persistent/);
+	assert.match(view.render(120)[0] ?? "", /cus-resp\/gpt-5\.6-sol:xhigh/);
 	assert.match(lines.join("\n"), /assistant message 9/);
 	assert.doesNotMatch(lines.join("\n"), /assistant message 0/);
 	assert.match(lines.join("\n"), /earlier activity hidden/);
@@ -137,11 +139,13 @@ test("parallel transcript ordering follows global activity rather than child cre
 	alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha newest" }] } });
 
 	const view = renderSubagentTranscript([
-		{ alias: "alpha", status: "running", output: "", persistent: false, transcript: alpha.snapshot() },
-		{ alias: "beta", status: "running", output: "", persistent: false, transcript: beta.snapshot() },
+		{ alias: "alpha", model: "provider/model-a:high", status: "running", output: "", persistent: true, transcript: alpha.snapshot() },
+		{ alias: "beta", model: "provider/model-b", status: "running", output: "", persistent: false, transcript: beta.snapshot() },
 	], false, theme as any);
-	const text = view.render(48).join("\n");
+	const text = view.render(160).join("\n");
 	assert.match(text, /alpha newest/);
+	assert.match(text, /alpha · persistent · provider\/model-a:high/);
+	assert.match(text, /beta · stateless · provider\/model-b/);
 });
 
 test("tool calls stay paired with their results when parallel completions and result messages use different orders", () => {

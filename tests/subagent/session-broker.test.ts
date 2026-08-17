@@ -10,7 +10,7 @@ import {
 	type WorkerRunResult,
 	type WorkerStartSpec,
 } from "../../subagent/session-broker";
-import type { AgentConfig } from "../../subagent/agents";
+import type { RailModelRef } from "../../subagent/models";
 
 class MemoryInstanceStore implements AgentInstanceStore {
 	readonly instances = new Map<string, AgentInstance>();
@@ -77,15 +77,8 @@ function emptyUsage() {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 };
 }
 
-function reviewer(): AgentConfig {
-	return {
-		name: "reviewer",
-		description: "Review code",
-		model: "cus-resp/gpt-5.6-sol:xhigh",
-		systemPrompt: "Review carefully.",
-		source: "user",
-		filePath: "/tmp/reviewer.md",
-	};
+function reviewerModel(): RailModelRef {
+	return { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" };
 }
 
 function setup() {
@@ -100,7 +93,7 @@ function setup() {
 		workers.push(worker);
 		return worker;
 	};
-	const broker = new SessionBroker({ profiles: [reviewer()], store, roster, workerFactory });
+	const broker = new SessionBroker({ store, roster, workerFactory });
 	return { broker, store, roster, starts, workers, workerFactory };
 }
 
@@ -108,7 +101,7 @@ describe("SessionBroker", () => {
 	test("creates a persistent instance and reuses it by alias", async () => {
 		const { broker, store, roster, starts, workers } = setup();
 
-		const first = await broker.dispatch({ agent: "reviewer", alias: "auth-review", task: "review auth" });
+		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "review auth" });
 		const second = await broker.dispatch({ target: "auth-review", task: "check tests" });
 
 		assert.equal(first.instance.alias, "auth-review");
@@ -119,11 +112,22 @@ describe("SessionBroker", () => {
 		assert.deepEqual(workers[0]?.tasks, ["review auth", "check tests"]);
 	});
 
+	test("allows one Pi model to own multiple independent sessions", async () => {
+		const { broker } = setup();
+
+		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "review auth" });
+		const second = await broker.dispatch({ model: reviewerModel(), alias: "db-review", task: "review db" });
+
+		assert.notEqual(first.instance.agentId, second.instance.agentId);
+		assert.notEqual(first.instance.sessionId, second.instance.sessionId);
+		assert.deepEqual(first.instance.model, second.instance.model);
+	});
+
 	test("attaches a session without injecting a synthetic task", async () => {
 		const { broker, workers } = setup();
 
 		const attached = await broker.attach({
-			agent: "reviewer",
+			model: reviewerModel(),
 			alias: "auth-review",
 			session: { mode: "fork", path: "/tmp/source.jsonl" },
 		});
@@ -135,7 +139,7 @@ describe("SessionBroker", () => {
 
 	test("uses the parent-session alias when a managed instance is linked under a new name", async () => {
 		const { broker, roster, store } = setup();
-		const created = await broker.dispatch({ agent: "reviewer", alias: "original", task: "initial" });
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "original", task: "initial" });
 		roster.link("auth-review", created.instance.agentId);
 
 		const continued = await broker.dispatch({ target: "auth-review", task: "continue" });
@@ -148,10 +152,10 @@ describe("SessionBroker", () => {
 
 	test("reopens the saved child session after the broker restarts", async () => {
 		const { broker, store, roster, workerFactory, starts } = setup();
-		const first = await broker.dispatch({ agent: "reviewer", alias: "auth-review", task: "review auth" });
+		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "review auth" });
 		await broker.shutdown();
 
-		const restarted = new SessionBroker({ profiles: [reviewer()], store, roster, workerFactory });
+		const restarted = new SessionBroker({ store, roster, workerFactory });
 		const resumed = await restarted.dispatch({ target: "auth-review", task: "continue" });
 
 		assert.equal(resumed.instance.agentId, first.instance.agentId);
@@ -161,10 +165,10 @@ describe("SessionBroker", () => {
 
 	test("links a globally addressed agentId into the current parent roster", async () => {
 		const { broker, store, workerFactory } = setup();
-		const first = await broker.dispatch({ agent: "reviewer", alias: "auth-review", task: "review auth" });
+		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "review auth" });
 		await broker.shutdown();
 		const emptyRoster = new MemoryRoster();
-		const restarted = new SessionBroker({ profiles: [reviewer()], store, roster: emptyRoster, workerFactory });
+		const restarted = new SessionBroker({ store, roster: emptyRoster, workerFactory });
 
 		await restarted.dispatch({ target: first.instance.agentId, task: "continue" });
 
@@ -175,7 +179,7 @@ describe("SessionBroker", () => {
 		const { broker, starts } = setup();
 
 		await broker.dispatch({
-			agent: "reviewer",
+			model: reviewerModel(),
 			alias: "legacy-review",
 			task: "continue the old review",
 			session: { mode: "fork", path: "/tmp/existing.jsonl" },
@@ -187,7 +191,7 @@ describe("SessionBroker", () => {
 
 	test("serializes concurrent messages sent to the same instance", async () => {
 		const { broker, workers } = setup();
-		await broker.dispatch({ agent: "reviewer", alias: "auth-review", task: "initial" });
+		await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
 
 		await Promise.all([
 			broker.dispatch({ target: "auth-review", task: "one" }),
@@ -200,9 +204,9 @@ describe("SessionBroker", () => {
 
 	test("single-flights worker startup before serializing concurrent messages after restart", async () => {
 		const { broker, store, roster, workerFactory, starts, workers } = setup();
-		await broker.dispatch({ agent: "reviewer", alias: "auth-review", task: "initial" });
+		await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
 		await broker.shutdown();
-		const restarted = new SessionBroker({ profiles: [reviewer()], store, roster, workerFactory });
+		const restarted = new SessionBroker({ store, roster, workerFactory });
 
 		await Promise.all([
 			restarted.dispatch({ target: "auth-review", task: "one" }),
@@ -218,8 +222,8 @@ describe("SessionBroker", () => {
 		const { broker, workers } = setup();
 
 		const results = await Promise.allSettled([
-			broker.dispatch({ agent: "reviewer", alias: "auth-review", task: "one" }),
-			broker.dispatch({ agent: "reviewer", alias: "auth-review", task: "two" }),
+			broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "one" }),
+			broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "two" }),
 		]);
 
 		assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
@@ -230,7 +234,6 @@ describe("SessionBroker", () => {
 	test("stops a created worker when instance persistence fails", async () => {
 		const worker = new FakeWorker("session-1", "/tmp/session-1.jsonl");
 		const broker = new SessionBroker({
-			profiles: [reviewer()],
 			store: {
 				get: async () => undefined,
 				put: async () => { throw new Error("store failed"); },
@@ -240,7 +243,7 @@ describe("SessionBroker", () => {
 			workerFactory: async () => worker,
 		});
 
-		await assert.rejects(() => broker.attach({ agent: "reviewer", alias: "auth-review" }), /store failed/);
+		await assert.rejects(() => broker.attach({ model: reviewerModel(), alias: "auth-review" }), /store failed/);
 		assert.equal(worker.stopped, true);
 	});
 });

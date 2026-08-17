@@ -47,19 +47,19 @@ ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
   ~/.pi/agent/extensions/subagent
 ```
 
-The directory-level link is required because the entry point imports sibling modules. Reload Pi after changing the link. The standalone extension provides:
+The directory-level link is required because the entry point imports sibling modules. Reload Pi after changing the link. Rail does not read `~/.pi/agent/agents` or inherit another subagent plugin's profile prompts/tools. It maps Pi's existing models to independent sessions, and one model can back any number of sessions.
 
-- `@new/reviewer` (or another profile) to create a persistent agent instance.
+- `@new/cus-resp/gpt-5.6-sol` (or another canonical Pi model reference) to create a persistent model session.
 - `@agent/auth-review` to route a follow-up to that exact instance without conflicting with Pi's normal `@path` completion.
-- `new://reviewer` and `agent://auth-review` as equivalent transport-safe forms for CLI, print, JSON, and RPC prompts. Pi expands a leading `@...` CLI argument as a file before extensions receive it.
-- `/rail-agent` opens the Rail agent manager. **Start persistent agent** inserts `@new/<profile>` so creation happens only after a task is submitted. Its TUI session popup supports typing to search by session name, first message, project path, or ID.
-- `agent` plus `task`, without `alias` or `session`, runs a stateless one-off agent and creates no instance or child session.
-- `agent` plus `alias` creates a persistent instance; `target` continues that same instance.
+- `new://cus-resp/gpt-5.6-sol` and `agent://auth-review` as equivalent transport-safe forms for CLI, print, JSON, and RPC prompts. Pi expands a leading `@...` CLI argument as a file before extensions receive it.
+- `/rail-agent` opens the Rail agent manager. **Start persistent model session** selects from Pi's scoped/available models and inserts `@new/<provider>/<modelId>` so creation happens only after a task is submitted. Its TUI session popup supports typing to search by session name, first message, project path, or ID.
+- `model` plus `task`, without `alias` or `session`, runs a stateless one-off model session and creates no persistent instance or child session. Omitting `model` uses Pi's current model.
+- `model` plus `alias` creates a persistent session; `target` continues that exact session. Reusing the same model with another alias creates another independent session.
 - Single-writer leases and a per-agent queue so concurrent calls cannot write the same child JSONL session.
 
 The `/rail-agent` safe path uses **Fork and adopt** without asking users to choose an attach mode. **Exclusive attach** is isolated under an Advanced action and must only be used when no other Pi process has that session open. Sessions currently active in another TUI are intentionally not live-attached in this version. The former `/agents` and `/subagents` aliases are intentionally not registered.
 
-Instance metadata and leases live under `~/.pi/agent/stateful-subagents/`; the full child transcript remains in the child Pi session. Parent sessions persist only compact roster links and tool results, avoiding transcript duplication.
+Instance metadata and leases live under `~/.pi/agent/stateful-subagents/`; each instance stores a model reference rather than an agent profile. The full child transcript remains in the child Pi session. Parent sessions persist only compact roster links and tool results, avoiding transcript duplication.
 
 ## Testing
 

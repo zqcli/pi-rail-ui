@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -13,16 +13,10 @@ import type { AgentInstance } from "../../subagent/session-broker";
 
 function instance(agentId: string, alias: string): AgentInstance {
 	return {
-		version: 1,
+		version: 2,
 		agentId,
 		alias,
-		profile: {
-			name: "reviewer",
-			description: "Review code",
-			systemPrompt: "Review carefully.",
-			source: "user",
-			filePath: "/tmp/reviewer.md",
-		},
+		model: { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" },
 		sessionId: `session-${agentId}`,
 		sessionFile: `/tmp/${agentId}.jsonl`,
 		cwd: "/tmp/project",
@@ -46,6 +40,36 @@ describe("FileAgentInstanceStore", () => {
 			assert.deepEqual(await store.get("agt_old"), older);
 			assert.deepEqual((await store.list()).map((item) => item.agentId), ["agt_new", "agt_old"]);
 			assert.equal((await readFile(join(dir, "instances", "agt_old.json"), "utf8")).endsWith("\n"), true);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("migrates a profile-backed descriptor from the child session model", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-migrate-"));
+		try {
+			const sessionFile = join(dir, "child.jsonl");
+			await writeFile(sessionFile, `${JSON.stringify({ type: "model_change", provider: "cus-resp", modelId: "gpt-5.6-terra" })}\n`);
+			await mkdir(join(dir, "instances"));
+			await writeFile(join(dir, "instances", "agt_legacy.json"), JSON.stringify({
+				version: 1,
+				agentId: "agt_legacy",
+				alias: "legacy",
+				profile: { model: "deepseek/deepseek-v4-flash:max", systemPrompt: "legacy prompt" },
+				sessionId: "session-legacy",
+				sessionFile,
+				cwd: "/tmp/project",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-02T00:00:00.000Z",
+				lastTask: "review",
+			}));
+
+			const migrated = await new FileAgentInstanceStore(dir).get("agt_legacy");
+
+			assert.equal(migrated?.version, 2);
+			assert.deepEqual(migrated?.model, { provider: "cus-resp", modelId: "gpt-5.6-terra" });
+			assert.equal("profile" in (migrated as unknown as Record<string, unknown>), false);
+			assert.equal(JSON.parse(await readFile(join(dir, "instances", "agt_legacy.json"), "utf8")).version, 2);
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { AgentConfig } from "./agents";
 import { assertValidAgentAlias } from "./identity";
+import type { RailModelRef } from "./models";
 
 export interface SubagentUsage {
 	input: number;
@@ -24,7 +24,7 @@ export type WorkerStartMode = "new" | "open" | "fork" | "exclusive";
 export interface WorkerStartSpec {
 	agentId: string;
 	mode: WorkerStartMode;
-	profile: AgentConfig;
+	model: RailModelRef;
 	alias: string;
 	cwd: string;
 	sessionPath?: string;
@@ -45,10 +45,10 @@ export interface SessionWorker {
 export type SessionWorkerFactory = (spec: WorkerStartSpec) => Promise<SessionWorker>;
 
 export interface AgentInstance {
-	version: 1;
+	version: 2;
 	agentId: string;
 	alias: string;
-	profile: AgentConfig;
+	model: RailModelRef;
 	sessionId: string;
 	sessionFile: string;
 	cwd: string;
@@ -82,8 +82,7 @@ export interface SessionSource {
 }
 
 export interface DispatchRequest {
-	agent?: string;
-	profile?: AgentConfig;
+	model?: RailModelRef;
 	target?: string;
 	alias?: string;
 	task: string;
@@ -99,8 +98,7 @@ export interface DispatchResult {
 }
 
 export interface AttachRequest {
-	agent: string;
-	profile?: AgentConfig;
+	model: RailModelRef;
 	alias?: string;
 	cwd?: string;
 	session?: SessionSource;
@@ -112,15 +110,14 @@ interface WorkerState {
 }
 
 export interface SessionBrokerOptions {
-	profiles: AgentConfig[];
 	store: AgentInstanceStore;
 	roster: AgentRoster;
 	workerFactory: SessionWorkerFactory;
 	defaultCwd?: string;
 }
 
-function generatedAlias(profileName: string, agentId: string): string {
-	const base = profileName.replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^[._-]+|[._-]+$/gu, "").slice(0, 48) || "agent";
+function generatedAlias(modelId: string, agentId: string): string {
+	const base = modelId.replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^[._-]+|[._-]+$/gu, "").slice(0, 48) || "model";
 	return `${base}-${agentId.slice(4, 10)}`;
 }
 
@@ -133,7 +130,6 @@ function compactMetadata(value: string, maxLength: number): string {
 }
 
 export class SessionBroker {
-	private readonly profiles = new Map<string, AgentConfig>();
 	private readonly workers = new Map<string, WorkerState>();
 	private readonly workerStarts = new Map<string, Promise<WorkerState>>();
 	private readonly pendingAliases = new Set<string>();
@@ -143,7 +139,6 @@ export class SessionBroker {
 	private readonly defaultCwd: string;
 
 	constructor(options: SessionBrokerOptions) {
-		for (const profile of options.profiles) this.profiles.set(profile.name, profile);
 		this.store = options.store;
 		this.roster = options.roster;
 		this.workerFactory = options.workerFactory;
@@ -152,14 +147,13 @@ export class SessionBroker {
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
-		if (Boolean(request.agent) === Boolean(request.target)) {
-			throw new Error("Provide exactly one of agent (new instance) or target (existing instance)");
+		if (Boolean(request.model) === Boolean(request.target)) {
+			throw new Error("Provide exactly one of model (new instance) or target (existing instance)");
 		}
 
-		const instance = request.agent
+		const instance = request.model
 			? await this.attach({
-				agent: request.agent,
-				...(request.profile ? { profile: request.profile } : {}),
+				model: request.model,
 				...(request.alias ? { alias: request.alias } : {}),
 				...(request.cwd ? { cwd: request.cwd } : {}),
 				...(request.session ? { session: request.session } : {}),
@@ -219,13 +213,8 @@ export class SessionBroker {
 	}
 
 	private async createInstance(request: AttachRequest, lastTask: string): Promise<AgentInstance> {
-		const profile = request.profile ?? this.profiles.get(request.agent);
-		if (!profile) {
-			const available = Array.from(this.profiles.keys()).join(", ") || "none";
-			throw new Error(`Unknown agent profile: ${request.agent}. Available: ${available}`);
-		}
 		const agentId = createAgentId();
-		const alias = request.alias?.trim() || generatedAlias(profile.name, agentId);
+		const alias = request.alias?.trim() || generatedAlias(request.model.modelId, agentId);
 		assertValidAgentAlias(alias);
 		if (this.roster.resolve(alias) || this.pendingAliases.has(alias)) throw new Error(`Subagent alias already exists: ${alias}`);
 		const session = request.session ?? { mode: "new" as const };
@@ -239,17 +228,17 @@ export class SessionBroker {
 			worker = await this.workerFactory({
 				agentId,
 				mode: session.mode,
-				profile,
+				model: request.model,
 				alias,
 				cwd,
 				...(session.path ? { sessionPath: session.path } : {}),
 			});
 			const now = new Date().toISOString();
 			const instance: AgentInstance = {
-				version: 1,
+				version: 2,
 				agentId,
 				alias,
-				profile: structuredClone(profile),
+				model: structuredClone(request.model),
 				sessionId: worker.sessionId,
 				sessionFile: worker.sessionFile,
 				cwd,
@@ -287,7 +276,7 @@ export class SessionBroker {
 			const worker = await this.workerFactory({
 				agentId: instance.agentId,
 				mode: "open",
-				profile: instance.profile,
+				model: instance.model,
 				alias: instance.alias,
 				cwd: instance.cwd,
 				sessionPath: instance.sessionFile,

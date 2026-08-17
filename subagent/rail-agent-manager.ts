@@ -1,13 +1,14 @@
 import * as path from "node:path";
 import { SessionManager, type ExtensionCommandContext, type SessionInfo } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { discoverAgents, type AgentConfig, type AgentDiscoveryResult, type AgentScope } from "./agents";
 import type { FileAgentInstanceStore } from "./instance-store";
+import { pickRailModel } from "./model-picker";
+import { railModelReference, type RailModelRef } from "./models";
 import type { SessionBroker } from "./session-broker";
 import type { SessionAgentRoster } from "./session-links";
 import { pickSessionOverlay } from "./session-picker";
 
-const ACTION_CREATE = "Start persistent agent";
+const ACTION_CREATE = "Start persistent model session";
 const ACTION_LINK = "Link saved session (safe copy)";
 const ACTION_ADVANCED = "Advanced: link session in place";
 const STATUS_KEY = "rail-agent";
@@ -20,7 +21,6 @@ export interface RailAgentManagerRuntime {
 
 export interface RailAgentManagerDependencies {
 	listSessions?: () => Promise<SessionInfo[]>;
-	discoverProfiles?: (cwd: string, scope: AgentScope) => AgentDiscoveryResult;
 }
 
 function compact(value: string, maxLength = 64): string {
@@ -35,12 +35,8 @@ function sessionLabel(info: SessionInfo, index: number, currentCwd: string): str
 	return `${index + 1}. ${current ? "Current" : project} · ${title} · ${info.modified.toLocaleDateString()}`;
 }
 
-function profileLabel(profile: AgentConfig): string {
-	return `${profile.name} (${profile.source}) — ${compact(profile.description, 80)}`;
-}
-
-function defaultAlias(profileName: string, seed: string): string {
-	const base = profileName.replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^[._-]+|[._-]+$/gu, "").slice(0, 40) || "agent";
+function defaultAlias(modelId: string, seed: string): string {
+	const base = modelId.replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^[._-]+|[._-]+$/gu, "").slice(0, 40) || "model";
 	const suffix = seed.replace(/[^A-Za-z0-9]+/gu, "").slice(0, 6).toLowerCase() || Date.now().toString(36).slice(-6);
 	return `${base}-${suffix}`;
 }
@@ -51,41 +47,18 @@ function insertMention(ctx: ExtensionCommandContext, alias: string): void {
 	ctx.ui.setEditorText(`${current}${separator}@agent/${alias} `);
 }
 
-function insertNewMention(ctx: ExtensionCommandContext, profile: string): void {
+function insertNewMention(ctx: ExtensionCommandContext, model: RailModelRef): void {
 	const current = ctx.ui.getEditorText();
 	const separator = current && !/\s$/u.test(current) ? " " : "";
-	ctx.ui.setEditorText(`${current}${separator}@new/${profile} `);
+	ctx.ui.setEditorText(`${current}${separator}@new/${railModelReference(model)} `);
 }
 
-async function chooseProfile(
-	ctx: ExtensionCommandContext,
-	discoverProfiles: (cwd: string, scope: AgentScope) => AgentDiscoveryResult,
-): Promise<AgentConfig | undefined> {
-	const discovery = discoverProfiles(ctx.cwd, ctx.isProjectTrusted() ? "both" : "user");
-	if (discovery.agents.length === 0) {
-		ctx.ui.notify("No agent profiles are available", "warning");
-		return undefined;
-	}
-	const labels = discovery.agents.map(profileLabel);
-	const selected = await ctx.ui.select("Agent profile", labels);
-	if (!selected) return undefined;
-	const profile = discovery.agents[labels.indexOf(selected)];
-	if (!profile) return undefined;
-	if (profile.source === "project") {
-		const approved = await ctx.ui.confirm("Use project-local agent?", `${profile.name}\n${profile.filePath}`);
-		if (!approved) return undefined;
-	}
-	return profile;
-}
-
-async function startPersistentAgent(
-	ctx: ExtensionCommandContext,
-	discoverProfiles: (cwd: string, scope: AgentScope) => AgentDiscoveryResult,
-): Promise<void> {
-	const profile = await chooseProfile(ctx, discoverProfiles);
-	if (!profile) return;
-	insertNewMention(ctx, profile.name);
-	ctx.ui.notify(`Describe the task after @new/${profile.name}; the persistent agent will be created when you submit`, "info");
+async function startPersistentSession(ctx: ExtensionCommandContext): Promise<void> {
+	const model = await pickRailModel(ctx);
+	if (!model) return;
+	insertNewMention(ctx, model);
+	const reference = railModelReference(model);
+	ctx.ui.notify(`Describe the task after @new/${reference}; a persistent session will be created when you submit`, "info");
 }
 
 async function chooseSession(ctx: ExtensionCommandContext, sessions: SessionInfo[]): Promise<SessionInfo | undefined> {
@@ -112,22 +85,21 @@ async function chooseSession(ctx: ExtensionCommandContext, sessions: SessionInfo
 async function linkSavedSession(
 	ctx: ExtensionCommandContext,
 	runtime: RailAgentManagerRuntime,
-	dependencies: Required<RailAgentManagerDependencies>,
+	listSessions: () => Promise<SessionInfo[]>,
 	mode: "fork" | "exclusive",
 ): Promise<void> {
-	const selected = await chooseSession(ctx, await dependencies.listSessions());
+	const selected = await chooseSession(ctx, await listSessions());
 	if (!selected) return;
 	const managed = (await runtime.store.list()).find((instance) => path.resolve(instance.sessionFile) === path.resolve(selected.path));
 	if (managed) {
-		const alias = managed.alias;
-		runtime.roster.link(alias, managed.agentId);
-		insertMention(ctx, alias);
-		ctx.ui.notify(`Linked ${alias}; mention inserted in the editor`, "info");
+		runtime.roster.link(managed.alias, managed.agentId);
+		insertMention(ctx, managed.alias);
+		ctx.ui.notify(`Linked ${managed.alias}; mention inserted in the editor`, "info");
 		return;
 	}
-	const profile = await chooseProfile(ctx, dependencies.discoverProfiles);
-	if (!profile) return;
-	const alias = defaultAlias(profile.name, selected.id);
+	const model = await pickRailModel(ctx);
+	if (!model) return;
+	const alias = defaultAlias(model.modelId, selected.id);
 	if (mode === "exclusive") {
 		const approved = await ctx.ui.confirm(
 			"Link session in place?",
@@ -138,27 +110,26 @@ async function linkSavedSession(
 	ctx.ui.setStatus(STATUS_KEY, mode === "fork" ? "Copying and linking session..." : "Linking session in place...");
 	try {
 		const instance = await runtime.broker.attach({
-			agent: profile.name,
-			profile,
+			model,
 			alias,
 			cwd: selected.cwd || ctx.cwd,
 			session: { mode, path: selected.path },
 		});
 		insertMention(ctx, instance.alias);
-		ctx.ui.notify(`Linked ${instance.alias}; mention inserted in the editor`, "info");
+		ctx.ui.notify(`Linked ${instance.alias} to ${railModelReference(model)}; mention inserted`, "info");
 	} finally {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	}
 }
 
-async function manageLinkedAgents(ctx: ExtensionCommandContext, runtime: RailAgentManagerRuntime): Promise<void> {
+async function manageLinkedSessions(ctx: ExtensionCommandContext, runtime: RailAgentManagerRuntime): Promise<void> {
 	const instances = await runtime.broker.listLinked();
 	if (instances.length === 0) {
-		ctx.ui.notify("No persistent agents are linked to this session branch", "info");
+		ctx.ui.notify("No persistent model sessions are linked to this conversation branch", "info");
 		return;
 	}
-	const labels = instances.map((instance) => `${instance.alias} · ${instance.profile.name} · ${compact(instance.lastTask)}`);
-	const selected = await ctx.ui.select("Linked agents", labels);
+	const labels = instances.map((instance) => `${instance.alias} · ${railModelReference(instance.model)} · ${compact(instance.lastTask)}`);
+	const selected = await ctx.ui.select("Linked model sessions", labels);
 	if (!selected) return;
 	const instance = instances[labels.indexOf(selected)];
 	if (!instance) return;
@@ -168,11 +139,11 @@ async function manageLinkedAgents(ctx: ExtensionCommandContext, runtime: RailAge
 		return;
 	}
 	if (action === "Show details") {
-		ctx.ui.notify(`${instance.alias} (${instance.agentId})\n${compact(instance.profile.name)}\n${compact(instance.cwd, 120)}\n${compact(instance.lastTask, 200)}`, "info");
+		ctx.ui.notify(`${instance.alias} (${instance.agentId})\n${railModelReference(instance.model)}\n${compact(instance.cwd, 120)}\n${compact(instance.lastTask, 200)}`, "info");
 		return;
 	}
 	if (action === "Detach") {
-		const approved = await ctx.ui.confirm("Detach persistent agent?", "The child session will be kept and can be linked again later.");
+		const approved = await ctx.ui.confirm("Detach model session?", "The child session will be kept and can be linked again later.");
 		if (!approved) return;
 		await runtime.broker.detach(instance.alias);
 		ctx.ui.notify(`Detached ${instance.alias}; child session was kept`, "info");
@@ -185,19 +156,16 @@ export async function runRailAgentManager(
 	dependencies: RailAgentManagerDependencies = {},
 ): Promise<void> {
 	if (!ctx.hasUI) throw new Error("/rail-agent requires TUI or RPC UI support");
-	const resolved: Required<RailAgentManagerDependencies> = {
-		listSessions: dependencies.listSessions ?? (() => SessionManager.listAll()),
-		discoverProfiles: dependencies.discoverProfiles ?? discoverAgents,
-	};
+	const listSessions = dependencies.listSessions ?? (() => SessionManager.listAll());
 	const linked = await runtime.broker.listLinked();
-	const linkedAction = `Linked agents (${linked.length})`;
+	const linkedAction = `Linked model sessions (${linked.length})`;
 	const actions = linked.length > 0
 		? [linkedAction, ACTION_CREATE, ACTION_LINK, ACTION_ADVANCED]
 		: [ACTION_CREATE, ACTION_LINK, ACTION_ADVANCED];
 	const action = await ctx.ui.select("Rail agents", actions);
 	if (!action) return;
-	if (action === ACTION_CREATE) return startPersistentAgent(ctx, resolved.discoverProfiles);
-	if (action === ACTION_LINK) return linkSavedSession(ctx, runtime, resolved, "fork");
-	if (action === ACTION_ADVANCED) return linkSavedSession(ctx, runtime, resolved, "exclusive");
-	if (action === linkedAction) return manageLinkedAgents(ctx, runtime);
+	if (action === ACTION_CREATE) return startPersistentSession(ctx);
+	if (action === ACTION_LINK) return linkSavedSession(ctx, runtime, listSessions, "fork");
+	if (action === ACTION_ADVANCED) return linkSavedSession(ctx, runtime, listSessions, "exclusive");
+	if (action === linkedAction) return manageLinkedSessions(ctx, runtime);
 }

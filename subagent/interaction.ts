@@ -1,9 +1,10 @@
 import type { AutocompleteItem, AutocompleteSuggestions } from "@earendil-works/pi-tui";
+import { railModelReference } from "./models";
 import type { AgentInstance } from "./session-broker";
 
 export interface SubagentMentions {
 	targets: string[];
-	profiles: string[];
+	models: string[];
 }
 
 export interface MentionAgentItem {
@@ -11,7 +12,7 @@ export interface MentionAgentItem {
 	description: string;
 }
 
-export type MentionProfileItem = string | { name: string; description: string; source?: "user" | "project" };
+export type MentionModelItem = string | { reference: string; description: string };
 
 function uniqueMatches(text: string, pattern: RegExp): string[] {
 	const values: string[] = [];
@@ -28,9 +29,9 @@ export function extractSubagentMentions(text: string): SubagentMentions {
 			...uniqueMatches(text, /@agent\/([A-Za-z0-9][A-Za-z0-9._-]*)/gu),
 			...uniqueMatches(text, /\bagent:\/\/([A-Za-z0-9][A-Za-z0-9._-]*)/gu),
 		])],
-		profiles: [...new Set([
-			...uniqueMatches(text, /@new\/([A-Za-z0-9][A-Za-z0-9._-]*)/gu),
-			...uniqueMatches(text, /\bnew:\/\/([A-Za-z0-9][A-Za-z0-9._-]*)/gu),
+		models: [...new Set([
+			...uniqueMatches(text, /@new\/([A-Za-z0-9][A-Za-z0-9._:/-]*)/gu),
+			...uniqueMatches(text, /\bnew:\/\/([A-Za-z0-9][A-Za-z0-9._:/-]*)/gu),
 		])],
 	};
 }
@@ -48,7 +49,7 @@ function mentionPrefix(beforeCursor: string): { namespace: "agent" | "new"; pref
 export function subagentMentionSuggestions(
 	beforeCursor: string,
 	agents: MentionAgentItem[],
-	profiles: MentionProfileItem[],
+	models: MentionModelItem[],
 ): AutocompleteSuggestions | null {
 	const mention = mentionPrefix(beforeCursor);
 	if (!mention) return null;
@@ -62,13 +63,13 @@ export function subagentMentionSuggestions(
 				description: agent.description,
 			}));
 	} else {
-		items = profiles
-			.map((profile) => typeof profile === "string" ? { name: profile, description: "create persistent subagent" } : profile)
-			.filter((profile) => profile.name.toLowerCase().startsWith(mention.query.toLowerCase()))
-			.map((profile) => ({
-				value: `@new/${profile.name}`,
-				label: `@new/${profile.name}`,
-				description: profile.description,
+		items = models
+			.map((model) => typeof model === "string" ? { reference: model, description: "start a persistent model session" } : model)
+			.filter((model) => model.reference.toLowerCase().startsWith(mention.query.toLowerCase()))
+			.map((model) => ({
+				value: `@new/${model.reference}`,
+				label: `@new/${model.reference}`,
+				description: model.description,
 			}));
 	}
 	return items.length > 0 ? { prefix: mention.prefix, items } : null;
@@ -93,35 +94,29 @@ function compactText(value: string, maxLength = 120): string {
 	return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, maxLength - 3)}...`;
 }
 
-export function buildSubagentRosterPrompt(
-	instances: AgentInstance[],
-	mentions: SubagentMentions,
-	profiles: Array<{ name: string; source: "user" | "project" }> = [],
-): string {
-	if (instances.length === 0 && mentions.targets.length === 0 && mentions.profiles.length === 0) return "";
+export function buildSubagentRosterPrompt(instances: AgentInstance[], mentions: SubagentMentions): string {
+	if (instances.length === 0 && mentions.targets.length === 0 && mentions.models.length === 0) return "";
 	const lines = [
-		"## Persistent Subagents",
+		"## Persistent Rail Model Sessions",
 		"",
-		"Use the subagent tool with `target` to continue a linked instance, or `agent` plus `alias` to create one.",
+		"Use the subagent tool with `target` to continue a linked session, or `model` plus `alias` to create one.",
 	];
 	for (const instance of instances) {
 		lines.push(
-			`- ${instance.alias} (${instance.agentId}) [${compactText(instance.profile.name)}, idle]`,
+			`- ${instance.alias} (${instance.agentId}) [${compactText(railModelReference(instance.model))}, idle]`,
 			`  CWD: ${compactText(instance.cwd)}`,
 			`  Last task: ${compactText(instance.lastTask)}`,
 		);
 	}
-	if (mentions.targets.length > 0 || mentions.profiles.length > 0) {
+	if (mentions.targets.length > 0 || mentions.models.length > 0) {
 		lines.push("", "Explicit routing from the current user message:");
 		for (const target of mentions.targets) {
-			lines.push(`- The user named @agent/${target}; you must call subagent with target="${target}" and must not substitute another instance.`);
+			lines.push(`- The user named @agent/${target}; you must call subagent with target="${target}" and must not substitute another session.`);
 		}
-		for (const profile of mentions.profiles) {
-			const source = profiles.find((item) => item.name === profile)?.source;
-			const scope = source === "project" ? " and agentScope=\"project\"" : "";
-			lines.push(`- The user named @new/${profile}; create a persistent subagent with agent="${profile}"${scope} and a concise unique alias.`);
+		for (const model of mentions.models) {
+			lines.push(`- The user named @new/${model}; create a persistent model session with model="${model}" and a concise unique alias.`);
 		}
 	}
-	lines.push("", "For a follow-up concerning an instance's previous files or task, prefer that same target instead of creating a new agent.");
+	lines.push("", "For follow-up work on the same files or topic, prefer the same target instead of creating a new session.");
 	return lines.join("\n");
 }

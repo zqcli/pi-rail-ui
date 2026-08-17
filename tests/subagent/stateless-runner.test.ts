@@ -1,17 +1,10 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import { test } from "node:test";
-import type { AgentConfig } from "../../subagent/agents";
+import type { RailModelRef } from "../../subagent/models";
 import { createStatelessAgentRunner } from "../../subagent/stateless-runner";
 
-const profile: AgentConfig = {
-	name: "scout",
-	description: "Scout quickly",
-	tools: ["read", "grep"],
-	systemPrompt: "Inspect quickly.",
-	source: "user",
-	filePath: "/tmp/scout.md",
-};
+const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
 test("stateless runner uses Pi JSON mode without creating a session", async () => {
 	let capturedArgs: string[] = [];
@@ -24,16 +17,16 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 	});
 
 	const result = await runner({
-		profile,
+		model,
 		task: "inspect auth",
 		cwd: process.cwd(),
-		defaultModel: "cus-resp/gpt-5.6-luna",
-		defaultThinkingLevel: "xhigh",
 	});
 
 	assert.deepEqual(capturedArgs.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--model"]);
 	assert.equal(capturedArgs.includes("--thinking"), true);
 	assert.equal(capturedArgs.includes("--exclude-tools"), true);
+	assert.equal(capturedArgs.includes("--tools"), false);
+	assert.equal(capturedArgs.includes("--append-system-prompt"), false);
 	assert.equal(result.output, "stateless done");
 	assert.equal(result.exitCode, 0);
 	assert.deepEqual(result.usage, {

@@ -3,15 +3,28 @@ import { test } from "node:test";
 import installStatefulSubagent from "../../subagent/index";
 import { runRailAgentManager } from "../../subagent/rail-agent-manager";
 import { filterSessions } from "../../subagent/session-picker";
-import type { AgentConfig } from "../../subagent/agents";
 
-const reviewer: AgentConfig = {
-	name: "reviewer",
-	description: "Review code",
-	systemPrompt: "Review carefully.",
-	source: "user",
-	filePath: "/tmp/reviewer.md",
+const model = {
+	provider: "cus-resp",
+	id: "gpt-5.6-sol",
+	name: "GPT 5.6 Sol",
 };
+
+const railModel = {
+	provider: "cus-resp",
+	modelId: "gpt-5.6-sol",
+	name: "GPT 5.6 Sol",
+	thinkingLevel: "xhigh" as const,
+};
+
+function modelContext() {
+	return {
+		model,
+		thinkingLevel: "xhigh",
+		scopedModels: [{ model, thinkingLevel: "xhigh" }],
+		modelRegistry: { getAvailable: () => [model] },
+	};
+}
 
 test("standalone extension exposes only the Rail-namespaced slash command", () => {
 	const commands: string[] = [];
@@ -25,16 +38,15 @@ test("standalone extension exposes only the Rail-namespaced slash command", () =
 	assert.deepEqual(commands, ["rail-agent"]);
 });
 
-test("safe session linking uses progressive disclosure and defaults to fork", async () => {
+test("safe session linking selects a Pi model and defaults to fork", async () => {
 	const selectTitles: string[] = [];
 	let editorText = "";
 	let confirmations = 0;
-	let inputs = 0;
 	const attached: any[] = [];
 	const ctx = {
+		...modelContext(),
 		cwd: "/tmp/project",
 		hasUI: true,
-		isProjectTrusted: () => true,
 		sessionManager: { getSessionFile: () => "/tmp/current.jsonl" },
 		ui: {
 			select: async (title: string, options: string[]) => {
@@ -42,7 +54,6 @@ test("safe session linking uses progressive disclosure and defaults to fork", as
 				if (title === "Rail agents") return options.find((option) => option.startsWith("Link saved session"));
 				return options[0];
 			},
-			input: async () => { inputs++; return ""; },
 			confirm: async () => { confirmations++; return true; },
 			notify: () => undefined,
 			setStatus: () => undefined,
@@ -73,28 +84,31 @@ test("safe session linking uses progressive disclosure and defaults to fork", as
 			firstMessage: "Review auth",
 			allMessagesText: "Review auth",
 		}],
-		discoverProfiles: () => ({ agents: [reviewer], projectAgentsDir: null }),
 	});
 
-	assert.deepEqual(selectTitles, ["Rail agents", "Saved Pi session", "Agent profile"]);
+	assert.deepEqual(selectTitles, ["Rail agents", "Saved Pi session", "Pi model"]);
 	assert.equal(confirmations, 0);
-	assert.equal(inputs, 0);
 	assert.equal(attached.length, 1);
+	assert.deepEqual(attached[0].model, {
+		provider: "cus-resp",
+		modelId: "gpt-5.6-sol",
+		name: "GPT 5.6 Sol",
+		thinkingLevel: "xhigh",
+	});
 	assert.deepEqual(attached[0].session, { mode: "fork", path: "/tmp/saved.jsonl" });
-	assert.match(attached[0].alias, /^reviewer-/);
+	assert.match(attached[0].alias, /^gpt-5\.6-sol-/);
 	assert.equal(editorText, `@agent/${attached[0].alias} `);
 });
 
-test("starting a persistent agent defers creation until the user submits a task", async () => {
+test("starting a persistent session selects a model and defers creation until task submission", async () => {
 	let editorText = "";
 	const attached: any[] = [];
 	const ctx = {
-		cwd: "/tmp/project", hasUI: true, isProjectTrusted: () => true,
+		...modelContext(),
+		cwd: "/tmp/project", hasUI: true,
 		ui: {
 			select: async (title: string, options: string[]) => title === "Rail agents" ? options.find((item) => item.startsWith("Start persistent")) : options[0],
-			confirm: async () => true,
 			notify: () => undefined,
-			setStatus: () => undefined,
 			getEditorText: () => editorText,
 			setEditorText: (value: string) => { editorText = value; },
 		},
@@ -106,10 +120,10 @@ test("starting a persistent agent defers creation until the user submits a task"
 		},
 		roster: { link: () => undefined },
 		store: { list: async () => [] },
-	} as any, { discoverProfiles: () => ({ agents: [reviewer], projectAgentsDir: null }) });
+	} as any);
 
 	assert.equal(attached.length, 0);
-	assert.equal(editorText, "@new/reviewer ");
+	assert.equal(editorText, "@new/cus-resp/gpt-5.6-sol:xhigh ");
 });
 
 test("session popup search matches words across title, message, project, and id", () => {
@@ -136,16 +150,19 @@ test("TUI session linking uses a centered searchable overlay", async () => {
 		created: new Date(), modified: new Date(), messageCount: 1,
 		firstMessage: "Review auth", allMessagesText: "Review auth",
 	};
-	let overlayOptions: any;
+	const overlayOptions: any[] = [];
+	let customCalls = 0;
 	const attached: any[] = [];
 	const ctx = {
+		...modelContext(),
 		mode: "tui", cwd: "/tmp/project", hasUI: true,
-		isProjectTrusted: () => true,
 		sessionManager: { getSessionFile: () => "/tmp/current.jsonl" },
 		ui: {
 			select: async (title: string, options: string[]) => title === "Rail agents" ? options.find((item) => item.startsWith("Link saved session")) : options[0],
-			custom: async (_factory: unknown, options: unknown) => { overlayOptions = options; return session; },
-			input: async () => "review-session",
+			custom: async (_factory: unknown, options: unknown) => {
+				overlayOptions.push(options);
+				return customCalls++ === 0 ? session : railModel;
+			},
 			confirm: async () => true,
 			notify: () => undefined,
 			setStatus: () => undefined,
@@ -157,12 +174,10 @@ test("TUI session linking uses a centered searchable overlay", async () => {
 		broker: { listLinked: async () => [], attach: async (request: any) => { attached.push(request); return { alias: request.alias, agentId: "agt_1" }; } },
 		roster: { link: () => undefined },
 		store: { list: async () => [] },
-	} as any, {
-		listSessions: async () => [session],
-		discoverProfiles: () => ({ agents: [reviewer], projectAgentsDir: null }),
-	});
+	} as any, { listSessions: async () => [session] });
 
-	assert.equal(overlayOptions.overlay, true);
-	assert.equal(overlayOptions.overlayOptions.anchor, "center");
+	assert.equal(overlayOptions.length, 2);
+	assert.equal(overlayOptions.every((options) => options.overlay === true), true);
+	assert.equal(overlayOptions.every((options) => options.overlayOptions.anchor === "center"), true);
 	assert.equal(attached[0].session.mode, "fork");
 });

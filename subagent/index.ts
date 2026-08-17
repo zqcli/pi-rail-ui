@@ -4,7 +4,6 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { discoverAgents } from "./agents";
 import { FileAgentInstanceStore } from "./instance-store";
 import {
 	applySubagentMentionCompletion,
@@ -12,6 +11,7 @@ import {
 	extractSubagentMentions,
 	subagentMentionSuggestions,
 } from "./interaction";
+import { availableRailModels, railModelReference } from "./models";
 import type { RpcEvent } from "./rpc-worker";
 import { runRailAgentManager } from "./rail-agent-manager";
 import { SessionBroker } from "./session-broker";
@@ -95,7 +95,6 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 
 	installStatefulSubagentTool(pi, {
 		broker: () => getRuntime().broker,
-		discoverProfiles: discoverAgents,
 		runStateless: createStatelessAgentRunner(),
 	});
 
@@ -108,14 +107,13 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 				const active = runtime;
 				if (active) {
 					const instances = await active.broker.listLinked();
-					const profiles = discoverAgents(ctx.cwd, ctx.isProjectTrusted() ? "both" : "user").agents;
+					const models = availableRailModels(ctx);
 					const suggestions = subagentMentionSuggestions(
 						beforeCursor,
-						instances.map((instance) => ({ alias: instance.alias, description: `${instance.profile.name} · ${instance.lastTask}` })),
-						profiles.map((profile) => ({
-							name: profile.name,
-							source: profile.source,
-							description: `${profile.source} · ${profile.description}`,
+						instances.map((instance) => ({ alias: instance.alias, description: `${railModelReference(instance.model)} · ${instance.lastTask}` })),
+						models.map((model) => ({
+							reference: railModelReference(model),
+							description: model.name ?? model.modelId,
 						})),
 					);
 					if (suggestions) return suggestions;
@@ -136,7 +134,7 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 	};
 
 	pi.registerCommand("rail-agent", {
-		description: "Start, link, and manage Rail persistent agents",
+		description: "Start, link, and manage Rail persistent model sessions",
 		handler: (_args, ctx) => runRailAgentManager(ctx, getRuntime()),
 	});
 
@@ -145,9 +143,7 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 		const store = new FileAgentInstanceStore(stateDir);
 		const roster = new SessionAgentRoster((customType, data) => pi.appendEntry(customType, data));
 		roster.restore(ctx.sessionManager.getBranch());
-		const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted() ? "both" : "user");
 		const broker = new SessionBroker({
-			profiles: discovery.agents,
 			store,
 			roster,
 			workerFactory: createRpcWorkerFactory({ stateDir, onUiRequest: handleChildUiRequest }),
@@ -167,8 +163,7 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 		const active = runtime;
 		if (!active) return;
 		const mentions = extractSubagentMentions(event.prompt);
-		const profiles = discoverAgents(active.ctx.cwd, active.ctx.isProjectTrusted() ? "both" : "user").agents;
-		const prompt = buildSubagentRosterPrompt(await active.broker.listLinked(), mentions, profiles);
+		const prompt = buildSubagentRosterPrompt(await active.broker.listLinked(), mentions);
 		if (!prompt) return;
 		return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
 	});
@@ -180,13 +175,15 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 	});
 }
 
-export * from "./agents";
 export * from "./identity";
 export * from "./instance-store";
 export * from "./interaction";
+export * from "./model-picker";
+export * from "./models";
 export * from "./rpc-transport";
 export * from "./rpc-worker";
 export * from "./rail-agent-manager";
+export * from "./searchable-picker";
 export * from "./session-broker";
 export * from "./session-lease";
 export * from "./session-links";

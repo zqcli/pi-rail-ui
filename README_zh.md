@@ -47,19 +47,19 @@ ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
   ~/.pi/agent/extensions/subagent
 ```
 
-入口文件会导入同目录模块，因此必须使用目录级 symlink。修改链接后执行 `/reload`。该独立扩展提供：
+入口文件会导入同目录模块，因此必须使用目录级 symlink。修改链接后执行 `/reload`。Rail 不读取 `~/.pi/agent/agents`，也不继承其他 subagent 插件预定义的 profile prompt/tools。它把 Pi 已有 model 映射到独立 session，同一个 model 可以关联任意多个 session。
 
-- 使用 `@new/reviewer`（或其他 profile）创建 persistent agent instance。
+- 使用 `@new/cus-resp/gpt-5.6-sol`（或其他 canonical Pi model reference）创建 persistent model session。
 - 使用 `@agent/auth-review` 把后续任务强制派发给该 instance，同时不和 Pi 原生 `@path` 文件补全冲突。
-- 在 CLI、print、JSON 和 RPC prompt 中使用等价的 `new://reviewer` 与 `agent://auth-review`。Pi 会在 extension 收到输入前，把位于 CLI 参数开头的 `@...` 当作文件展开。
-- 使用 `/rail-agent` 打开 Rail agent manager。**Start persistent agent** 会插入 `@new/<profile>`，直到用户提交任务时才真正创建。TUI session 弹窗支持按 session 名称、首条消息、项目路径和 ID 直接键入搜索。
-- Tool 只提供 `agent` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 agent，不创建 instance 或 child session。
-- 使用 `agent` 加 `alias` 创建 persistent instance；后续使用 `target` 复用同一个 instance。
+- 在 CLI、print、JSON 和 RPC prompt 中使用等价的 `new://cus-resp/gpt-5.6-sol` 与 `agent://auth-review`。Pi 会在 extension 收到输入前，把位于 CLI 参数开头的 `@...` 当作文件展开。
+- 使用 `/rail-agent` 打开 Rail agent manager。**Start persistent model session** 会从 Pi scoped/available models 中选择 model，并插入 `@new/<provider>/<modelId>`，直到用户提交任务时才真正创建。TUI session 弹窗支持按 session 名称、首条消息、项目路径和 ID 直接键入搜索。
+- Tool 提供 `model` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 model session，不创建 persistent instance 或 child session；省略 `model` 时使用 Pi 当前模型。
+- 使用 `model` 加 `alias` 创建 persistent session；后续使用 `target` 复用该 session。同一个 model 换一个 alias 即可创建另一个独立 session。
 - 通过单 writer lease 和 per-agent queue，避免并发调用同时写入同一个 child JSONL session。
 
 `/rail-agent` 的普通流程固定使用安全的 **Fork and adopt**，不再要求用户理解 attach mode。**Exclusive attach** 被收进 Advanced action，且只有确认没有其他 Pi 进程打开该 session 时才可使用。当前版本不会 live attach 到另一个 TUI 正在运行的 session。旧 `/agents` 与 `/subagents` alias 不再注册。
 
-Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；完整 child transcript 仍保留在 child Pi session 中。父 session 只持久化精简 roster link 和 tool result，避免复制整份子对话。
+Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instance 保存的是 model reference，而不是 agent profile。完整 child transcript 仍保留在 child Pi session 中。父 session 只持久化精简 roster link 和 tool result，避免复制整份子对话。
 
 ## 测试
 

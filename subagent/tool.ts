@@ -1,11 +1,13 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import {
-	CONFIG_DIR_NAME,
-	type ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { type AgentConfig, type AgentDiscoveryResult, type AgentScope } from "./agents";
+import {
+	railModelKey,
+	railModelReference,
+	resolveRailModel,
+	type RailModelRef,
+} from "./models";
 import type { StatelessAgentRunner, StatelessRunResult } from "./stateless-runner";
 import type {
 	DispatchRequest,
@@ -28,39 +30,32 @@ const SessionSourceSchema = Type.Object({
 });
 
 const TaskItem = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Agent profile to run; stateless unless alias or session is provided" })),
+	model: Type.Optional(Type.String({ description: "Pi model reference; defaults to the current model" })),
 	target: Type.Optional(Type.String({ description: "Persistent alias or agentId to continue" })),
-	alias: Type.Optional(Type.String({ description: "Alias for a newly created persistent instance" })),
+	alias: Type.Optional(Type.String({ description: "Alias for a new persistent model session" })),
 	task: Type.String({ description: "Task or follow-up message" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for a new instance" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new session" })),
 	session: Type.Optional(SessionSourceSchema),
 });
 
 const ChainItem = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Agent profile to run; stateless unless alias or session is provided" })),
+	model: Type.Optional(Type.String({ description: "Pi model reference; defaults to the current model" })),
 	target: Type.Optional(Type.String({ description: "Persistent alias or agentId to continue" })),
-	alias: Type.Optional(Type.String({ description: "Alias for a newly created persistent instance" })),
+	alias: Type.Optional(Type.String({ description: "Alias for a new persistent model session" })),
 	task: Type.String({ description: "Task with optional {previous} placeholder" }),
 	cwd: Type.Optional(Type.String()),
 	session: Type.Optional(SessionSourceSchema),
 });
 
-const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: `Agent profile scope. Project profiles come from ${CONFIG_DIR_NAME}/agents.`,
-	default: "user",
-});
-
-const StatefulSubagentParams = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Agent profile to run; stateless unless alias or session is provided (single mode)" })),
+const SubagentParams = Type.Object({
+	model: Type.Optional(Type.String({ description: "Pi model reference; defaults to the current model (single mode)" })),
 	target: Type.Optional(Type.String({ description: "Persistent alias or agentId to continue (single mode)" })),
-	alias: Type.Optional(Type.String({ description: "Alias for a newly created instance (single mode)" })),
+	alias: Type.Optional(Type.String({ description: "Alias for a new persistent model session (single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task or follow-up message (single mode)" })),
-	cwd: Type.Optional(Type.String({ description: "Working directory for a new instance" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new session" })),
 	session: Type.Optional(SessionSourceSchema),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel persistent subagent tasks" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel model-session tasks" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential tasks with optional {previous}" })),
-	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(Type.Boolean({ default: true })),
 	confirmSessionAttach: Type.Optional(Type.Boolean({
 		default: true,
 		description: "Confirm before forking or exclusively opening an existing session",
@@ -70,7 +65,7 @@ const StatefulSubagentParams = Type.Object({
 export interface StatefulSubagentRunDetails {
 	agentId?: string;
 	alias: string;
-	profile?: string;
+	model?: string;
 	sessionId?: string;
 	task: string;
 	status: "running" | "completed" | "failed";
@@ -89,12 +84,11 @@ export interface StatefulSubagentDetails {
 
 export interface StatefulSubagentToolOptions {
 	broker: SessionBroker | (() => SessionBroker);
-	discoverProfiles: (cwd: string, scope: AgentScope) => AgentDiscoveryResult;
 	runStateless?: StatelessAgentRunner;
 }
 
 type TaskParams = {
-	agent?: string;
+	model?: string;
 	target?: string;
 	alias?: string;
 	task: string;
@@ -112,13 +106,13 @@ function nonEmpty(value: string | undefined): string | undefined {
 }
 
 function normalizeTask(item: TaskParams): TaskParams {
-	const agent = nonEmpty(item.agent);
+	const model = nonEmpty(item.model);
 	const target = nonEmpty(item.target);
 	const alias = nonEmpty(item.alias);
 	const cwd = nonEmpty(item.cwd);
 	const sessionPath = nonEmpty(item.session?.path);
 	return {
-		...(agent ? { agent } : {}),
+		...(model ? { model } : {}),
 		...(target ? { target } : {}),
 		...(alias ? { alias } : {}),
 		task: item.task,
@@ -143,11 +137,11 @@ function failedRun(run: WorkerRunResult): boolean {
 	return run.stopReason === "error" || run.stopReason === "aborted" || Boolean(run.errorMessage);
 }
 
-function compactResult(result: DispatchResult, task: string, step?: number): StatefulSubagentRunDetails {
+function compactPersistentResult(result: DispatchResult, task: string, step?: number): StatefulSubagentRunDetails {
 	return {
 		agentId: result.instance.agentId,
 		alias: result.instance.alias,
-		profile: result.instance.profile.name,
+		model: railModelReference(result.instance.model),
 		sessionId: result.instance.sessionId,
 		task,
 		status: failedRun(result.run) ? "failed" : "completed",
@@ -160,10 +154,11 @@ function compactResult(result: DispatchResult, task: string, step?: number): Sta
 	};
 }
 
-function compactStatelessResult(profile: AgentConfig, task: string, run: StatelessRunResult, step?: number): StatefulSubagentRunDetails {
+function compactStatelessResult(model: RailModelRef, task: string, run: StatelessRunResult, step?: number): StatefulSubagentRunDetails {
+	const reference = railModelReference(model);
 	return {
-		alias: profile.name,
-		profile: profile.name,
+		alias: railModelKey(model),
+		model: reference,
 		task,
 		status: run.exitCode !== 0 || failedRun(run) ? "failed" : "completed",
 		output: truncateOutput(run.output),
@@ -178,8 +173,8 @@ function compactStatelessResult(profile: AgentConfig, task: string, run: Statele
 function errorResult(item: TaskParams, error: unknown, step?: number): StatefulSubagentRunDetails {
 	const message = error instanceof Error ? error.message : String(error);
 	return {
-		alias: item.target ?? item.alias ?? item.agent ?? "unknown",
-		...(item.agent ? { profile: item.agent } : {}),
+		alias: item.target ?? item.alias ?? item.model ?? "current-model",
+		...(item.model ? { model: item.model } : {}),
 		task: item.task,
 		status: "failed",
 		output: truncateOutput(message),
@@ -190,10 +185,10 @@ function errorResult(item: TaskParams, error: unknown, step?: number): StatefulS
 	};
 }
 
-type StatefulSubagentParamsValue = Static<typeof StatefulSubagentParams>;
+type SubagentParamsValue = Static<typeof SubagentParams>;
 
-function modeFor(params: StatefulSubagentParamsValue): "single" | "parallel" | "chain" {
-	const hasSingle = Boolean(params.task && (params.agent || params.target));
+function modeFor(params: SubagentParamsValue): "single" | "parallel" | "chain" {
+	const hasSingle = Boolean(params.task?.trim());
 	const hasParallel = (params.tasks?.length ?? 0) > 0;
 	const hasChain = (params.chain?.length ?? 0) > 0;
 	if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) !== 1) {
@@ -217,9 +212,9 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T,
 
 function finalText(result: StatefulSubagentRunDetails): string {
 	if (result.status === "failed") return `Subagent ${result.alias} failed: ${result.errorMessage ?? result.output}`;
-	if (!result.persistent) return `Stateless subagent ${result.profile ?? result.alias} completed.\n\n${truncateOutput(result.output)}`;
+	if (!result.persistent) return `Stateless model session ${result.model ?? result.alias} completed.\n\n${truncateOutput(result.output)}`;
 	return [
-		`Persistent subagent ${result.alias} (${result.agentId}) completed.`,
+		`Persistent model session ${result.alias} (${result.agentId}) completed with ${result.model}.`,
 		`Reuse with target="${result.alias}" for related follow-up tasks.`,
 		"",
 		truncateOutput(result.output),
@@ -237,23 +232,21 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Run one-off specialized agents or create/continue persistent instances. Use agent+task without alias/session for stateless work, agent+alias for a new persistent instance, target for later follow-ups, and session only to fork/exclusively attach an existing saved session. Supports single, parallel, and chain modes.",
-		promptSnippet: "Run stateless agents or create and continue persistent agents",
+		description: "Run a one-off Pi model session or create/continue persistent model sessions. Omit alias/session for stateless work, add alias for a new persistent session, use target for follow-ups, and use session only to attach an existing saved session. One model may own many independent sessions.",
+		promptSnippet: "Run stateless Pi model sessions or create and continue persistent model sessions",
 		promptGuidelines: [
-			"For one-off delegation, use agent+task without alias or session; this runs stateless and creates no persistent instance.",
+			"For one-off delegation, use model+task without alias or session; omit model to use the current Pi model.",
 			"When the user names @agent/<alias> or agent://<alias>, use subagent with target set to that exact alias.",
-			"When the user names @new/<profile> or new://<profile>, use subagent with agent set to that profile and assign a concise alias.",
-			"For follow-up work on the same files or feature, reuse the existing subagent target instead of creating a new instance.",
+			"When the user names @new/<provider>/<modelId> or new://<provider>/<modelId>, use subagent with model set to that canonical model reference and assign a concise alias.",
+			"For follow-up work on the same files or feature, reuse the existing target instead of creating a new session.",
 		],
-		parameters: StatefulSubagentParams,
+		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const mode = modeFor(params);
-			const scope: AgentScope = params.agentScope ?? "user";
-			const discovery = options.discoverProfiles(ctx.cwd, scope);
 			const rawItems: TaskParams[] = mode === "single"
 				? [{
-					...(params.agent ? { agent: params.agent } : {}),
+					...(params.model ? { model: params.model } : {}),
 					...(params.target ? { target: params.target } : {}),
 					...(params.alias ? { alias: params.alias } : {}),
 					task: params.task!,
@@ -268,56 +261,36 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 			}
-
-			const profiles = new Map(discovery.agents.map((profile) => [profile.name, profile]));
-			const projectProfiles = requestedItems
-				.map((item) => item.agent ? profiles.get(item.agent) : undefined)
-				.filter((profile): profile is AgentConfig => profile?.source === "project");
-			if (projectProfiles.length > 0 && (params.confirmProjectAgents ?? true)) {
-				if (!ctx.hasUI) throw new Error("Project-local subagents require UI confirmation or confirmProjectAgents=false");
-				const names = [...new Set(projectProfiles.map((profile) => profile.name))].join(", ");
-				const approved = await ctx.ui.confirm(
-					"Run project-local subagents?",
-					`Agents: ${names}\nSource: ${discovery.projectAgentsDir ?? "unknown"}`,
-				);
-				if (!approved) throw new Error("Project-local subagents were not approved");
-			}
 			const sessionAttachments = requestedItems.filter((item) => item.session !== undefined);
 			if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
 				if (!ctx.hasUI) throw new Error("Attaching an existing session requires UI confirmation or confirmSessionAttach=false");
 				const approved = await ctx.ui.confirm(
-					"Attach existing session as subagent?",
+					"Attach existing session as a Rail model session?",
 					sessionAttachments
-						.map((item) => `${item.alias ?? item.agent}: ${item.session!.mode} ${item.session!.path}`)
+						.map((item) => `${item.alias ?? item.model ?? "current-model"}: ${item.session!.mode} ${item.session!.path}`)
 						.join("\n"),
 				);
 				if (!approved) throw new Error("Existing session attachment was not approved");
 			}
 
 			const dispatch = async (item: TaskParams, step?: number): Promise<StatefulSubagentRunDetails> => {
-				if (Boolean(item.agent) === Boolean(item.target)) throw new Error("Each task needs exactly one of agent or target");
-				const profile = item.agent ? profiles.get(item.agent) : undefined;
-				if (item.agent && !profile) {
-					throw new Error(`Unknown agent profile: ${item.agent}. Available: ${Array.from(profiles.keys()).join(", ") || "none"}`);
-				}
+				if (item.target && item.model) throw new Error("A follow-up target cannot also select a model");
 				const persistent = isPersistentTask(item);
 				if (!persistent) {
-					if (!profile) throw new Error(`Unknown agent profile: ${item.agent}`);
-					if (!options.runStateless) throw new Error("Stateless subagent runner is not configured");
+					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
+					const model = resolveRailModel(item.model, ctx);
 					const run = await options.runStateless({
-						profile,
+						model,
 						task: item.task,
 						cwd: item.cwd ?? ctx.cwd,
-						...(ctx.model ? { defaultModel: `${ctx.model.provider}/${ctx.model.id}` } : {}),
-						...(ctx.thinkingLevel ? { defaultThinkingLevel: ctx.thinkingLevel } : {}),
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => onUpdate?.({
 							content: [{ type: "text", text: partial.output || "(running...)" }],
 							details: {
 								mode,
 								results: [{
-									alias: profile.name,
-									profile: profile.name,
+									alias: railModelKey(model),
+									model: railModelReference(model),
 									task: item.task,
 									status: "running",
 									output: partial.output,
@@ -328,12 +301,12 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 							},
 						}),
 					});
-					return compactStatelessResult(profile, item.task, run, step);
+					return compactStatelessResult(model, item.task, run, step);
 				}
+				const model = item.target ? undefined : resolveRailModel(item.model, ctx);
 				const request: DispatchRequest = {
-					...(item.agent ? { agent: item.agent } : {}),
+					...(model ? { model } : {}),
 					...(item.target ? { target: item.target } : {}),
-					...(profile ? { profile } : {}),
 					...(item.alias ? { alias: item.alias } : {}),
 					task: item.task,
 					...(item.cwd ? { cwd: item.cwd } : {}),
@@ -344,8 +317,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						details: {
 							mode,
 							results: [{
-								alias: item.target ?? item.alias ?? item.agent ?? "subagent",
-								...(item.agent ? { profile: item.agent } : {}),
+								alias: item.target ?? item.alias ?? (model ? railModelKey(model) : "model-session"),
+								...(model ? { model: railModelReference(model) } : {}),
 								task: item.task,
 								status: "running",
 								output: partial.output,
@@ -357,7 +330,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					}),
 				};
 				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
-				return compactResult(await broker.dispatch(request), item.task, step);
+				return compactPersistentResult(await broker.dispatch(request), item.task, step);
 			};
 
 			if (mode === "single") {
@@ -375,7 +348,6 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				});
 				return { content: [{ type: "text", text: aggregateText(mode, results) }], details: { mode, results } };
 			}
-
 			const results: StatefulSubagentRunDetails[] = [];
 			let previous = "";
 			for (let index = 0; index < requestedItems.length; index++) {
@@ -402,8 +374,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					: args.target
 						? `continue ${args.target}`
 						: args.alias || args.session
-							? `persistent ${args.agent ?? "..."}`
-							: `stateless ${args.agent ?? "..."}`;
+							? `persistent ${args.model || "current model"}`
+							: `stateless ${args.model || "current model"}`;
 			const task = args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},

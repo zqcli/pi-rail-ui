@@ -1,4 +1,4 @@
-import type { AgentConfig } from "./agents";
+import { railModelKey } from "./models";
 import type {
 	SessionWorker,
 	SubagentUsage,
@@ -13,7 +13,6 @@ export interface RpcEvent {
 	error?: string;
 	[key: string]: unknown;
 }
-
 export interface RpcTransport {
 	request(command: Record<string, unknown>): Promise<unknown>;
 	onEvent(listener: (event: RpcEvent) => void): () => void;
@@ -41,10 +40,9 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	if (spec.mode === "fork") args.push("--fork", spec.sessionPath!);
 	else if (spec.mode === "open" || spec.mode === "exclusive") args.push("--session", spec.sessionPath!);
 	if (spec.mode === "new" || spec.mode === "fork") args.push("--name", spec.alias);
-	if (spec.profile.model) args.push("--model", spec.profile.model);
-	if (spec.profile.tools?.length) args.push("--tools", spec.profile.tools.join(","));
+	args.push("--model", railModelKey(spec.model));
+	if (spec.model.thinkingLevel) args.push("--thinking", spec.model.thinkingLevel);
 	args.push("--exclude-tools", "subagent");
-	if (spec.profile.systemPrompt.trim()) args.push("--append-system-prompt", spec.profile.systemPrompt);
 	return args;
 }
 
@@ -151,5 +149,3 @@ export class RpcSessionWorker implements SessionWorker {
 		await this.transport.stop();
 	}
 }
-
-export type { AgentConfig };

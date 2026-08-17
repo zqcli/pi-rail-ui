@@ -6,7 +6,7 @@ import {
 	type RpcEvent,
 	type RpcTransport,
 } from "../../subagent/rpc-worker";
-import type { AgentConfig } from "../../subagent/agents";
+import type { RailModelRef } from "../../subagent/models";
 import type { WorkerStartSpec } from "../../subagent/session-broker";
 
 class FakeTransport implements RpcTransport {
@@ -63,23 +63,15 @@ class FakeTransport implements RpcTransport {
 	}
 }
 
-function profile(): AgentConfig {
-	return {
-		name: "reviewer",
-		description: "Review code",
-		tools: ["read", "grep"],
-		model: "cus-resp/gpt-5.6-sol:xhigh",
-		systemPrompt: "Review carefully.",
-		source: "user",
-		filePath: "/tmp/reviewer.md",
-	};
+function model(): RailModelRef {
+	return { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" };
 }
 
 function spec(mode: WorkerStartSpec["mode"], sessionPath?: string): WorkerStartSpec {
 	return {
 		agentId: "agt_auth",
 		mode,
-		profile: profile(),
+		model: model(),
 		alias: "auth-review",
 		cwd: "/tmp/project",
 		...(sessionPath ? { sessionPath } : {}),
@@ -87,15 +79,14 @@ function spec(mode: WorkerStartSpec["mode"], sessionPath?: string): WorkerStartS
 }
 
 describe("RPC worker arguments", () => {
-	test("starts a forked child session with the pinned agent profile", () => {
+	test("starts a forked child session with the selected Pi model", () => {
 		assert.deepEqual(buildRpcWorkerArgs(spec("fork", "/tmp/source.jsonl")), [
 			"--mode", "rpc",
 			"--fork", "/tmp/source.jsonl",
 			"--name", "auth-review",
-			"--model", "cus-resp/gpt-5.6-sol:xhigh",
-			"--tools", "read,grep",
+			"--model", "cus-resp/gpt-5.6-sol",
+			"--thinking", "xhigh",
 			"--exclude-tools", "subagent",
-			"--append-system-prompt", "Review carefully.",
 		]);
 	});
 

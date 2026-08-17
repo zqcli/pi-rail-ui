@@ -1,21 +1,15 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig } from "./agents";
+import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
 import type { SubagentUsage, WorkerRunResult } from "./session-broker";
 
 const STDERR_CAP = 50 * 1024;
 
 export interface StatelessRunRequest {
-	profile: AgentConfig;
+	model: RailModelRef;
 	task: string;
 	cwd: string;
-	defaultModel?: string;
-	defaultThinkingLevel?: NonNullable<ExtensionContext["thinkingLevel"]>;
 	signal?: AbortSignal;
 	onUpdate?: (result: StatelessRunResult) => void;
 }
@@ -75,21 +69,9 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 	return async (request) => {
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
-		const args = ["--mode", "json", "-p", "--no-session"];
-		const inheritsModel = !request.profile.model;
-		const model = request.profile.model ?? request.defaultModel;
-		if (model) args.push("--model", model);
-		if (inheritsModel && request.defaultThinkingLevel) args.push("--thinking", request.defaultThinkingLevel);
-		if (request.profile.tools?.length) args.push("--tools", request.profile.tools.join(","));
+		const args = ["--mode", "json", "-p", "--no-session", "--model", railModelKey(request.model)];
+		if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
 		args.push("--exclude-tools", "subagent");
-
-		let promptDir: string | undefined;
-		if (request.profile.systemPrompt.trim()) {
-			promptDir = await mkdtemp(join(tmpdir(), "pi-stateless-subagent-"));
-			const promptPath = join(promptDir, "system.md");
-			await writeFile(promptPath, request.profile.systemPrompt, { encoding: "utf8", mode: 0o600 });
-			args.push("--append-system-prompt", promptPath);
-		}
 		args.push(`Task: ${request.task}`);
 
 		const invocation = (options.resolveInvocation ?? resolvePiInvocation)(args);
@@ -100,8 +82,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		let errorMessage: string | undefined;
 		let aborted = false;
 		let killTimer: NodeJS.Timeout | undefined;
-		try {
-			const exitCode = await new Promise<number>((resolve) => {
+		const exitCode = await new Promise<number>((resolve) => {
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: request.cwd,
 					env: {
@@ -169,18 +150,15 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 					request.signal?.removeEventListener("abort", abort);
 					if (killTimer) clearTimeout(killTimer);
 				});
-			});
-			if (aborted) throw new Error("Subagent request was aborted");
-			const failure = errorMessage ?? (exitCode === 0 ? undefined : stderr.trim() || `Subagent process exited with code ${exitCode}`);
-			return {
-				output: output || (failure ? failure : "(no output)"),
-				exitCode,
-				usage,
-				...(stopReason ? { stopReason } : {}),
-				...(failure ? { errorMessage: failure } : {}),
-			};
-		} finally {
-			if (promptDir) await rm(promptDir, { recursive: true, force: true });
-		}
+		});
+		if (aborted) throw new Error("Subagent request was aborted");
+		const failure = errorMessage ?? (exitCode === 0 ? undefined : stderr.trim() || `Subagent process exited with code ${exitCode}`);
+		return {
+			output: output || (failure ? failure : "(no output)"),
+			exitCode,
+			usage,
+			...(stopReason ? { stopReason } : {}),
+			...(failure ? { errorMessage: failure } : {}),
+		};
 	};
 }

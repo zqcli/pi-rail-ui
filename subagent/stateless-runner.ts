@@ -4,6 +4,7 @@ import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
 import type { SubagentUsage, WorkerRunResult } from "./session-broker";
 import { SubagentTranscript } from "./transcript";
+import { addCompletedAssistantUsage, emptySubagentUsage, providerReportedUsage, usageWithActiveTurn } from "./usage";
 
 const STDERR_CAP = 50 * 1024;
 
@@ -40,10 +41,6 @@ interface JsonAssistantMessage {
 	errorMessage?: string;
 }
 
-function emptyUsage(): SubagentUsage {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
-}
-
 function assistantText(message: unknown): string {
 	if (!message || typeof message !== "object") return "";
 	const value = message as { role?: string; content?: Array<{ type?: string; text?: string }> };
@@ -52,18 +49,6 @@ function assistantText(message: unknown): string {
 		.filter((part) => part.type === "text" && typeof part.text === "string")
 		.map((part) => part.text!)
 		.join("\n");
-}
-
-function addUsage(total: SubagentUsage, message: JsonAssistantMessage): void {
-	if (message?.role !== "assistant" || !message.usage) return;
-	const usage = message.usage;
-	total.input += usage.input ?? 0;
-	total.output += usage.output ?? 0;
-	total.cacheRead += usage.cacheRead ?? 0;
-	total.cacheWrite += usage.cacheWrite ?? 0;
-	total.cost += usage.cost?.total ?? 0;
-	total.contextTokens = usage.totalTokens ?? total.contextTokens;
-	total.turns++;
 }
 
 export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions = {}): StatelessAgentRunner {
@@ -76,7 +61,8 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		args.push(`Task: ${request.task}`);
 
 		const invocation = (options.resolveInvocation ?? resolvePiInvocation)(args);
-		const usage = emptyUsage();
+		const usage = emptySubagentUsage();
+		let activeUsage: SubagentUsage | undefined;
 		let output = "";
 		let stderr = "";
 		let stopReason: string | undefined;
@@ -90,7 +76,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 			request.onUpdate?.({
 				output: output || "(running...)",
 				exitCode: 0,
-				usage: { ...usage },
+				usage: usageWithActiveTurn(usage, activeUsage),
 				transcript: transcript.snapshot(),
 				...(stopReason ? { stopReason } : {}),
 				...(errorMessage ? { errorMessage } : {}),
@@ -125,16 +111,21 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 						buffer = buffer.slice(newline + 1);
 						if (!line.trim()) continue;
 						try {
-							const event = JSON.parse(line) as { type?: string; message?: JsonAssistantMessage };
+							const event = JSON.parse(line) as { type?: string; message?: JsonAssistantMessage; usage?: unknown };
 							const transcriptChanged = transcript.ingest(event);
+							if (event.type === "message_update") {
+								const reported = providerReportedUsage(event.usage);
+								if (reported) activeUsage = reported;
+							}
 							if (event.type === "message_end" && event.message?.role === "assistant") {
 								const text = assistantText(event.message);
 								if (text) output = text;
-								addUsage(usage, event.message);
+								addCompletedAssistantUsage(usage, event.message);
+								activeUsage = undefined;
 								stopReason = event.message.stopReason;
 								errorMessage = event.message.errorMessage;
 								queueUpdate(true);
-							} else if (transcriptChanged) {
+							} else if (transcriptChanged || (event.type === "message_update" && activeUsage !== undefined)) {
 								queueUpdate(event.type === "tool_execution_start" || event.type === "tool_execution_end");
 							}
 						} catch {
@@ -183,7 +174,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		return {
 			output: output || (failure ? failure : "(no output)"),
 			exitCode,
-			usage,
+			usage: usageWithActiveTurn(usage, activeUsage),
 			transcript: transcript.snapshot(),
 			...(stopReason ? { stopReason } : {}),
 			...(failure ? { errorMessage: failure } : {}),

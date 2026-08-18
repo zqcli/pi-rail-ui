@@ -53,7 +53,11 @@ class FakeTransport implements RpcTransport {
 			queueMicrotask(() => {
 				if (this.failPrompt) {
 					this.emit({ type: "message_start", message: { role: "assistant", content: [] } });
-					this.emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "before crash" } });
+					this.emit({
+						type: "message_update",
+						usage: { input: 7, output: 1, cacheRead: 2, cacheWrite: 0, totalTokens: 10, cost: { total: 0.01 } },
+						assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "before crash" },
+					});
 					this.emit({ type: "transport_error", error: "child crashed" });
 					return;
 				}
@@ -245,6 +249,15 @@ describe("RpcSessionWorker", () => {
 
 		await assert.rejects(() => worker.send("review auth", { onUpdate: (update) => updates.push(update) }), /child crashed/);
 		assert.equal(updates.at(-1)?.transcript.entries.at(-1).text, "before crash");
+		assert.deepEqual(updates.at(-1)?.usage, {
+			input: 7,
+			output: 1,
+			cacheRead: 2,
+			cacheWrite: 0,
+			cost: 0.01,
+			contextTokens: 10,
+			turns: 1,
+		});
 		await worker.stop();
 	});
 });

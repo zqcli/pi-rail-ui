@@ -7,6 +7,7 @@ import type {
 	WorkerSendOptions,
 	WorkerStartSpec,
 } from "./session-broker";
+import { addCompletedAssistantUsage, emptySubagentUsage, providerReportedUsage, usageWithActiveTurn } from "./usage";
 
 export interface RpcEvent {
 	type: string;
@@ -29,16 +30,6 @@ interface RpcState {
 	thinkingLevel?: RailModelRef["thinkingLevel"];
 }
 
-const EMPTY_USAGE: SubagentUsage = {
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	cost: 0,
-	contextTokens: 0,
-	turns: 0,
-};
-
 export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	const args = ["--mode", "rpc"];
 	if (spec.mode === "fork") args.push("--fork", spec.sessionPath!);
@@ -56,19 +47,6 @@ function assistantText(message: any): string {
 		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
 		.map((part: any) => part.text)
 		.join("\n");
-}
-
-function addAssistantUsage(total: SubagentUsage, message: any): void {
-	if (message?.role !== "assistant") return;
-	const usage = message.usage;
-	if (!usage) return;
-	total.input += usage.input ?? 0;
-	total.output += usage.output ?? 0;
-	total.cacheRead += usage.cacheRead ?? 0;
-	total.cacheWrite += usage.cacheWrite ?? 0;
-	total.cost += usage.cost?.total ?? 0;
-	total.contextTokens = usage.totalTokens ?? total.contextTokens;
-	total.turns++;
 }
 
 export class RpcSessionWorker implements SessionWorker {
@@ -97,7 +75,8 @@ export class RpcSessionWorker implements SessionWorker {
 
 	async send(task: string, options: WorkerSendOptions = {}): Promise<WorkerRunResult> {
 		if (options.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
-		const usage = { ...EMPTY_USAGE };
+		const usage = emptySubagentUsage();
+		let activeUsage: SubagentUsage | undefined;
 		let output = "";
 		let stopReason: string | undefined;
 		let errorMessage: string | undefined;
@@ -111,7 +90,7 @@ export class RpcSessionWorker implements SessionWorker {
 			updateTimer = undefined;
 			options.onUpdate?.({
 				output: output || "(running...)",
-				usage: { ...usage },
+				usage: usageWithActiveTurn(usage, activeUsage),
 				transcript: transcript.snapshot(),
 				...(stopReason ? { stopReason } : {}),
 				...(errorMessage ? { errorMessage } : {}),
@@ -131,17 +110,22 @@ export class RpcSessionWorker implements SessionWorker {
 		});
 		const unsubscribe = this.transport.onEvent((event) => {
 			const transcriptChanged = transcript.ingest(event);
+			if (event.type === "message_update") {
+				const reported = providerReportedUsage(event["usage"]);
+				if (reported) activeUsage = reported;
+			}
 			if (event.type === "message_end") {
 				const text = assistantText(event.message);
 				if (text) output = text;
-				addAssistantUsage(usage, event.message);
+				addCompletedAssistantUsage(usage, event.message);
+				if (event.message?.role === "assistant") activeUsage = undefined;
 				if (event.message?.role === "assistant") {
 					stopReason = event.message.stopReason;
 					errorMessage = event.message.errorMessage;
 				}
 				queueUpdate(true);
 			}
-			if (transcriptChanged && event.type !== "message_end") {
+			if ((transcriptChanged || (event.type === "message_update" && activeUsage !== undefined)) && event.type !== "message_end") {
 				queueUpdate(event.type === "tool_execution_start" || event.type === "tool_execution_end");
 			}
 			if (event.type === "agent_settled" && !settled) {
@@ -172,7 +156,7 @@ export class RpcSessionWorker implements SessionWorker {
 			}
 			return {
 				output: output || "(no output)",
-				usage,
+				usage: usageWithActiveTurn(usage, activeUsage),
 				transcript: transcript.snapshot(),
 				...(stopReason ? { stopReason } : {}),
 				...(errorMessage ? { errorMessage } : {}),

@@ -548,19 +548,23 @@ class BoundedTranscriptView implements Component {
 		private readonly omittedEntries: number,
 		private readonly maxRows: number,
 		private readonly theme: Theme,
+		private readonly statusLine?: string,
 	) {}
 
 	render(width: number): string[] {
 		const headerLines = new Text(this.header, 0, 0).render(width).slice(0, 1);
+		const statusLines = this.statusLine
+			? [truncateToWidth(this.theme.fg("dim", this.statusLine), Math.max(1, width), "", true)]
+			: [];
 		const rendered = this.groups.map((group) => group.entries.flatMap((item) => this.renderEntry(item, width)));
-		const budget = Math.max(0, this.maxRows - headerLines.length);
+		const budget = Math.max(0, this.maxRows - headerLines.length - statusLines.length);
 		let selected = this.selectLatest(rendered, budget);
 		const hidden = this.omittedEntries > 0 || selected.hidden;
 		if (hidden && budget > 0) selected = this.selectLatest(rendered, Math.max(0, budget - 1));
 		const marker = hidden
 			? [truncateToWidth(this.theme.fg("dim", `… earlier activity hidden${this.omittedEntries > 0 ? ` (${this.omittedEntries}+ events)` : ""}`), Math.max(1, width), "", true)]
 			: [];
-		return [...headerLines, ...marker, ...selected.lines].slice(0, this.maxRows);
+		return [...headerLines, ...statusLines, ...marker, ...selected.lines].slice(0, this.maxRows);
 	}
 
 	invalidate(): void {}
@@ -677,10 +681,11 @@ class SubagentRunPanel implements Component {
 		const lines = [
 			`${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run)))}`,
 		];
+		const metrics = usageText(this.run);
+		if (!this.terminal && metrics) lines.push(truncateToWidth(this.theme.fg("dim", `Usage · ${metrics}`), innerWidth, "", true));
 		if (this.terminal) lines.push(...this.renderCompleted(innerWidth));
 		else lines.push(...this.renderActivity(innerWidth));
-		const metrics = usageText(this.run);
-		if (metrics) lines.push(this.theme.fg("dim", metrics));
+		if (this.terminal && metrics) lines.push(this.theme.fg("dim", metrics));
 		if (!boxed) return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
 		const borderColor = this.run.status === "failed" ? "error" : this.run.status === "running" ? "warning" : "borderAccent";
@@ -829,5 +834,13 @@ export function renderSubagentTranscript(
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	return new BoundedTranscriptView(header, groups, omittedEntries, expanded ? EXPANDED_ROWS : COLLAPSED_ROWS, theme);
+	const liveUsage = only?.status === "running" ? usageText(only) : "";
+	return new BoundedTranscriptView(
+		header,
+		groups,
+		omittedEntries,
+		expanded ? EXPANDED_ROWS : COLLAPSED_ROWS,
+		theme,
+		liveUsage ? `Usage · ${liveUsage}` : undefined,
+	);
 }

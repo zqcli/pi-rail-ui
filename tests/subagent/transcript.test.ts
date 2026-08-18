@@ -118,15 +118,27 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 		model: "cus-resp/gpt-5.6-sol:xhigh",
 		persistent: true,
 		transcript,
+		usage: { input: 1234, output: 56, cacheRead: 107, cacheWrite: 8, cost: 0.012, contextTokens: 1405, turns: 2 },
+		durationMs: 3400,
 	}], false, theme as any);
 	const lines = view.render(48);
+	const text = lines.join("\n");
+	const wideText = view.render(120).join("\n");
 
 	assert.ok(lines.length <= 10);
+	assert.ok(view.render(120).length <= 10);
 	assert.match(lines[0] ?? "", /persistent/);
 	assert.match(view.render(120)[0] ?? "", /cus-resp\/gpt-5\.6-sol:xhigh/);
-	assert.match(lines.join("\n"), /assistant message 9/);
-	assert.doesNotMatch(lines.join("\n"), /assistant message 0/);
-	assert.match(lines.join("\n"), /earlier activity hidden/);
+	assert.match(text, /assistant message 9/);
+	assert.doesNotMatch(text, /assistant message 0/);
+	assert.match(text, /1\.2k in/);
+	assert.match(wideText, /107 cache read/);
+	assert.match(wideText, /1\.4k context/);
+	assert.match(wideText, /2 turns/);
+	assert.match(wideText, /\$0\.012/);
+	assert.match(wideText, /3\.4s/);
+	assert.match(text, /earlier activity hidden/);
+	assert.ok(text.indexOf("1.2k in") < text.indexOf("earlier activity hidden"));
 	assert.ok(view.render(10).every((line) => visibleWidth(line) <= 10));
 });
 
@@ -199,6 +211,30 @@ test("parallel transcript ordering follows global activity rather than child cre
 	assert.match(text, /alpha newest/);
 	assert.match(text, /alpha · persistent · provider\/model-a:high/);
 	assert.match(text, /beta · stateless · provider\/model-b/);
+});
+
+test("running parallel child panels show live usage before activity", () => {
+	const alpha = new SubagentTranscript("alpha", { maxEntries: 2 });
+	alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha old" }] } });
+	alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha latest" }] } });
+	const beta = new SubagentTranscript("beta");
+	beta.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "beta latest" }] } });
+
+	const text = renderSubagentTranscript([
+		{
+			alias: "alpha", model: "provider/model-a", status: "running", output: "", persistent: false,
+			transcript: alpha.snapshot(), usage: { input: 101, output: 11, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 112, turns: 1 }, durationMs: 1200,
+		},
+		{
+			alias: "beta", model: "provider/model-b", status: "running", output: "", persistent: true,
+			transcript: beta.snapshot(), usage: { input: 202, output: 22, cacheRead: 20, cacheWrite: 0, cost: 0.02, contextTokens: 244, turns: 1 }, durationMs: 2300,
+		},
+	], false, theme as any, { durationMs: 2500 }).render(100).join("\n");
+
+	const alphaPanel = text.slice(text.indexOf("alpha · stateless"), text.indexOf("beta · persistent"));
+	const betaPanel = text.slice(text.indexOf("beta · persistent"));
+	assert.ok(alphaPanel.indexOf("Usage · 101 in") < alphaPanel.indexOf("Activity"));
+	assert.ok(betaPanel.indexOf("Usage · 202 in") < betaPanel.indexOf("Activity"));
 });
 
 test("tool calls stay paired with their results when parallel completions and result messages use different orders", () => {

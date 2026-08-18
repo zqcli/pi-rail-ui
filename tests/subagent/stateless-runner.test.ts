@@ -40,6 +40,7 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		"assistant",
 	]);
 	assert.equal(updates.some((update) => update.transcript?.entries.some((entry: any) => entry.kind === "toolResult")), true);
+	assert.equal(updates.some((update) => update.usage.input === 12 && update.usage.output === 3), true);
 	assert.deepEqual(result.usage, {
 		input: 12,
 		output: 3,

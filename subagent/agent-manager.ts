@@ -7,8 +7,10 @@ import type {
 	AgentRuntimePhase,
 	DispatchProgress,
 	DispatchResult,
+	ControlResult,
 	SessionBroker,
 	SessionSource,
+	WorkerControlRequest,
 } from "./session-broker";
 import { sessionLeaseKey } from "./worker-factory";
 
@@ -146,6 +148,14 @@ export class RailAgentManager {
 
 	continue(target: string, task: string, signal?: AbortSignal): Promise<DispatchResult> {
 		return this.broker.dispatch({ target, task, ...(signal ? { signal } : {}) });
+	}
+
+	async control(target: string, request: WorkerControlRequest, signal?: AbortSignal): Promise<ControlResult> {
+		const agent = await this.assertLocallyControllable(target);
+		if (agent.phase !== "running") {
+			throw new Error(`Subagent ${agent.instance.alias} is not currently running; use continue for an idle or stopped session`);
+		}
+		return this.broker.control({ target: agent.instance.agentId, ...request, ...(signal ? { signal } : {}) });
 	}
 
 	adopt(request: AdoptRailAgentRequest): Promise<AgentInstance> {

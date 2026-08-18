@@ -32,6 +32,10 @@ process.stdin.on("data", (chunk) => {
 			write({ type: "agent_settled" });
 			continue;
 		}
+		if (command.type === "steer" || command.type === "follow_up") {
+			write({ type: "response", id: command.id, command: command.type, success: true });
+			continue;
+		}
 		write({ type: "response", id: command.id, command: command.type, success: false, error: "unsupported" });
 	}
 });

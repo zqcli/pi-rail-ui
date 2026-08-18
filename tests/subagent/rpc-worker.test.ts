@@ -18,6 +18,7 @@ class FakeTransport implements RpcTransport {
 		private readonly failPrompt = false,
 		private sessionName?: string,
 		private readonly waitForAbort = false,
+		private readonly failControl = false,
 	) {}
 	private selectedModel = { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
 	private thinkingLevel = "xhigh";
@@ -46,6 +47,10 @@ class FakeTransport implements RpcTransport {
 		}
 		if (command["type"] === "abort" && this.waitForAbort) {
 			queueMicrotask(() => this.emit({ type: "agent_settled" }));
+			return undefined;
+		}
+		if (command["type"] === "steer" || command["type"] === "follow_up") {
+			if (this.failControl) throw new Error("connection lost after write");
 			return undefined;
 		}
 		if (command["type"] === "prompt") {
@@ -195,6 +200,29 @@ describe("RpcSessionWorker", () => {
 
 		assert.deepEqual(selected, { provider: "deepseek", modelId: "deepseek-v4-flash", name: "deepseek-v4-flash", thinkingLevel: "high" });
 		assert.deepEqual(transport.commands.slice(1).map((command) => command["type"]), ["get_state", "set_model", "set_thinking_level", "get_state"]);
+	});
+
+	test("maps child controls to Pi steer and follow_up RPC commands", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+
+		await worker.control({ delivery: "steer", message: "Focus on tests" });
+		await worker.control({ delivery: "followUp", message: "Then summarize risks" });
+
+		assert.deepEqual(transport.commands.slice(1), [
+			{ type: "steer", message: "Focus on tests" },
+			{ type: "follow_up", message: "Then summarize risks" },
+		]);
+	});
+
+	test("classifies a lost control acknowledgement as unknown delivery", async () => {
+		const transport = new FakeTransport(false, undefined, false, true);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+
+		await assert.rejects(
+			() => worker.control({ delivery: "steer", message: "Focus on tests" }),
+			/outcome is unknown.*connection lost after write/,
+		);
 	});
 
 	test("classifies a locally aborted RPC run even when the child settles normally", async () => {

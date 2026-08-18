@@ -9,7 +9,7 @@ const EXPANDED_ROWS = 16;
 const MAX_ENTRY_ROWS = 5;
 
 export type SubagentTranscriptKind = "user" | "assistant" | "thinking" | "tool" | "toolResult";
-export type SubagentTranscriptStatus = "running" | "completed" | "failed";
+export type SubagentTranscriptStatus = "running" | "completed" | "accepted" | "failed";
 
 export interface SubagentTranscriptEntry {
 	id: string;
@@ -656,6 +656,7 @@ function identityText(run: SubagentTranscriptRun): string {
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
 	if (run.status === "failed") return theme.fg("error", "✗");
 	if (run.status === "running") return theme.fg("warning", "…");
+	if (run.status === "accepted") return theme.fg("accent", "↪");
 	return theme.fg("success", "✓");
 }
 
@@ -715,7 +716,8 @@ class SubagentRunPanel implements Component {
 					this.theme,
 				).render(width)
 				: [];
-			return [...activity, this.theme.fg("dim", "Final answer"), ...rendered];
+			const label = this.run.status === "accepted" ? "Control acknowledgement" : "Final answer";
+			return [...activity, this.theme.fg("dim", label), ...rendered];
 		}
 		const preview = rendered.slice(0, 2);
 		if (rendered.length > preview.length) preview.push(this.theme.fg("dim", "… expand for full answer"));
@@ -745,8 +747,9 @@ class MultiSubagentPanelView implements Component {
 
 	render(width: number): string[] {
 		const completed = this.runs.filter((run) => run.status === "completed").length;
+		const accepted = this.runs.filter((run) => run.status === "accepted").length;
 		const failed = this.runs.filter((run) => run.status === "failed").length;
-		const running = this.runs.length - completed - failed;
+		const running = this.runs.length - completed - accepted - failed;
 		const total = this.runs.reduce((usage, run) => {
 			if (!run.usage) return usage;
 			usage.input += run.usage.input;
@@ -756,7 +759,7 @@ class MultiSubagentPanelView implements Component {
 			usage.cost += run.usage.cost;
 			return usage;
 		}, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-		const summary = `${this.runs.length} model sessions · ${completed} complete · ${running} running · ${failed} failed`;
+		const summary = `${this.runs.length} model sessions · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running · ${failed} failed`;
 		const metrics = [
 			`${compactNumber(total.input)} in`,
 			`${compactNumber(total.output)} out`,
@@ -794,14 +797,15 @@ export function renderSubagentTranscript(
 		return new SubagentRunPanel(only, expanded, true, false, theme);
 	}
 	const completed = boundedRuns.filter((run) => run.status === "completed").length;
+	const accepted = boundedRuns.filter((run) => run.status === "accepted").length;
 	const failed = boundedRuns.filter((run) => run.status === "failed").length;
-	const running = boundedRuns.length - completed - failed;
+	const running = boundedRuns.length - completed - accepted - failed;
 	const persistent = boundedRuns.filter((run) => run.persistent).length;
 	const stateless = boundedRuns.length - persistent;
 	const identity = (run: SubagentTranscriptRun) => `${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}`;
 	const header = boundedRuns.length === 1
 		? `${boundedRuns[0]!.status === "failed" ? theme.fg("error", "✗") : boundedRuns[0]!.status === "running" ? theme.fg("warning", "…") : theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(boundedRuns[0]!.alias))}${theme.fg("dim", ` · ${boundedRuns[0]!.persistent ? "persistent" : "stateless"} · ${boundedRuns[0]!.model ?? "model unavailable"}`)}`
-		: `${theme.fg("toolTitle", theme.bold(`${boundedRuns.length} model sessions`))}${theme.fg("dim", ` · ${persistent} persistent · ${stateless} stateless · ${completed} complete · ${running} running · ${failed} failed`)}`;
+		: `${theme.fg("toolTitle", theme.bold(`${boundedRuns.length} model sessions`))}${theme.fg("dim", ` · ${persistent} persistent · ${stateless} stateless · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running · ${failed} failed`)}`;
 	const multiple = boundedRuns.length > 1;
 	let omittedEntries = 0;
 	for (const run of boundedRuns) {

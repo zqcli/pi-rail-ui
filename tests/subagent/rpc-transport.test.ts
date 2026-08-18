@@ -39,3 +39,11 @@ test("PiRpcProcessTransport surfaces RPC failures", async () => {
 	await assert.rejects(() => transport.request({ type: "unknown" }), /unsupported/);
 	await transport.stop();
 });
+
+test("PiRpcProcessTransport rejects requests once shutdown starts", async () => {
+	const transport = new PiRpcProcessTransport({ command: process.execPath, args: [fixture], cwd: process.cwd() });
+	await transport.start();
+	const stopping = transport.stop();
+	await assert.rejects(() => transport.request({ type: "get_state" }), /not running/);
+	await stopping;
+});

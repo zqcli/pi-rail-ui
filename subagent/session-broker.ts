@@ -39,12 +39,32 @@ export interface WorkerStartSpec {
 export interface WorkerSendOptions {
 	signal?: AbortSignal;
 	onUpdate?: (result: WorkerRunResult) => void;
+	onAccepted?: () => void;
+}
+
+export type WorkerControlDelivery = "steer" | "followUp";
+
+export interface WorkerControlRequest {
+	delivery: WorkerControlDelivery;
+	message: string;
+}
+
+export class WorkerControlError extends Error {
+	constructor(
+		message: string,
+		readonly outcome: "rejected" | "unknown",
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.name = "WorkerControlError";
+	}
 }
 
 export interface SessionWorker {
 	readonly sessionId: string;
 	readonly sessionFile: string;
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult>;
+	control?(request: WorkerControlRequest): Promise<void>;
 	setModel?(model: RailModelRef): Promise<RailModelRef>;
 	stop(): Promise<void>;
 }
@@ -111,6 +131,16 @@ export interface DispatchProgress {
 	run: WorkerRunResult;
 }
 
+export interface ControlRequest extends WorkerControlRequest {
+	target: string;
+	signal?: AbortSignal;
+}
+
+export interface ControlResult {
+	instance: AgentInstance;
+	delivery: WorkerControlDelivery;
+}
+
 export interface AttachRequest {
 	model: RailModelRef;
 	alias?: string;
@@ -119,9 +149,18 @@ export interface AttachRequest {
 }
 
 interface WorkerState {
+	instance: AgentInstance;
 	worker: SessionWorker;
 	tail: Promise<void>;
+	controlTail: Promise<void>;
 	active: boolean;
+	activeRunId: number | undefined;
+	activeRunAccepted: boolean;
+	nextRunId: number;
+	stopping: boolean;
+	unknownControlRunId: number | undefined;
+	controlPoisoned: boolean;
+	controlErrorMessage: string | undefined;
 	queued: number;
 }
 
@@ -162,6 +201,7 @@ function emptyUsage(): SubagentUsage {
 export class SessionBroker {
 	private readonly workers = new Map<string, WorkerState>();
 	private readonly workerStarts = new Map<string, Promise<WorkerState>>();
+	private readonly instanceCreations = new Set<Promise<AgentInstance>>();
 	private readonly pendingAliases = new Set<string>();
 	private readonly store: AgentInstanceStore;
 	private readonly roster: AgentRoster;
@@ -170,6 +210,8 @@ export class SessionBroker {
 	private readonly parentSessionLabel: string;
 	private readonly aliasLeaseManager: { acquire(key: string): Promise<SessionLease> } | undefined;
 	private readonly runtimeListeners = new Set<() => void>();
+	private shuttingDown = false;
+	private readonly lifecycleEpochs = new Map<string, number>();
 	private readonly runtimeErrors = new Map<string, string>();
 	private readonly stoppingAgents = new Set<string>();
 	private readonly modelChanges = new Map<string, Promise<AgentInstance>>();
@@ -184,12 +226,16 @@ export class SessionBroker {
 	}
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
 		if (Boolean(request.model) === Boolean(request.target)) {
 			throw new Error("Provide exactly one of model (new instance) or target (existing instance)");
 		}
 
+		const requestedAgentId = request.target ? (this.roster.resolve(request.target) ?? request.target) : undefined;
+		const expectedEpoch = requestedAgentId ? this.lifecycleEpoch(requestedAgentId) : undefined;
+		if (requestedAgentId && this.stoppingAgents.has(requestedAgentId)) throw new Error("Subagent worker is stopping");
 		const instance = request.model
 			? await this.attach({
 				model: request.model,
@@ -197,15 +243,26 @@ export class SessionBroker {
 				...(request.cwd ? { cwd: request.cwd } : {}),
 				...(request.session ? { session: request.session } : {}),
 			})
-			: await this.resolveInstance(request.target!, true);
+			: await this.resolveInstance(request.target!);
+		if (this.shuttingDown || this.stoppingAgents.has(instance.agentId)
+			|| (expectedEpoch !== undefined && this.lifecycleEpoch(instance.agentId) !== expectedEpoch)) {
+			throw new Error("Subagent dispatch was interrupted by stop or shutdown");
+		}
+		if (request.target && !this.roster.resolve(request.target)) this.roster.link(instance.alias, instance.agentId);
 		request.onUpdate?.({ instance, run: { output: "(starting...)", usage: emptyUsage() } });
 		let run: WorkerRunResult;
 		try {
-			const state = await this.workerState(instance);
+			const state = await this.workerState(instance, expectedEpoch);
 			run = await this.enqueue(state, () => state.worker.send(request.task, {
 				...(request.signal ? { signal: request.signal } : {}),
 				...(request.onUpdate ? { onUpdate: (partial) => request.onUpdate!({ instance, run: partial }) } : {}),
-			}));
+				onAccepted: () => {
+					if (state.activeRunId !== undefined && !state.stopping) {
+						state.activeRunAccepted = true;
+						this.emitRuntimeChange();
+					}
+				},
+			}), "run");
 			this.runtimeErrors.delete(instance.agentId);
 			this.emitRuntimeChange();
 		} catch (error) {
@@ -225,11 +282,70 @@ export class SessionBroker {
 			lastOutput: compactMetadata(run.output, 16 * 1024),
 		};
 		await this.store.put(persisted);
+		const liveState = this.workers.get(instance.agentId);
+		if (liveState) liveState.instance = persisted;
 		return { instance: { ...persisted, alias: instance.alias }, run };
 	}
 
+	async control(request: ControlRequest): Promise<ControlResult> {
+		const message = request.message.trim();
+		if (!message) throw new Error("Subagent control message cannot be empty");
+		if (request.signal?.aborted) throw new Error("Subagent control was aborted before delivery");
+		const agentId = this.roster.resolve(request.target) ?? request.target;
+		if (this.shuttingDown || this.stoppingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
+		if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
+		const state = this.workers.get(agentId);
+		if (!state) {
+			const instance = await this.store.get(agentId);
+			if (!instance) throw new Error(`Unknown persistent subagent: ${request.target}`);
+			throw new Error(`Subagent ${instance.alias} is not currently running; use target+task to continue an idle or stopped session`);
+		}
+		const instance = state.instance;
+		const runId = state.activeRunId;
+		if (runId === undefined || state.stopping) throw new Error(`Subagent ${instance.alias} is not currently running; use target+task to continue an idle or stopped session`);
+		if (!state.activeRunAccepted) throw new Error(`Subagent ${instance.alias} has not accepted the running prompt yet`);
+		if (!state.worker.control) throw new Error("Subagent worker does not support live controls");
+		if (state.unknownControlRunId === runId) {
+			throw new Error(`Subagent ${instance.alias} has an earlier control with unknown delivery outcome; wait for the current run to settle`);
+		}
+		const deliver = async () => {
+			if (request.signal?.aborted) throw new Error("Subagent control was aborted before delivery");
+			if (state.stopping || state.activeRunId !== runId || !state.activeRunAccepted) throw new Error(`Subagent ${instance.alias} finished before the control could be delivered`);
+			if (state.unknownControlRunId === runId) {
+				throw new Error(`Subagent ${instance.alias} has an earlier control with unknown delivery outcome; wait for the current run to settle`);
+			}
+			try {
+				await state.worker.control!({ delivery: request.delivery, message });
+				if (state.stopping || state.activeRunId !== runId) {
+					state.unknownControlRunId = runId;
+					state.controlPoisoned = true;
+					state.controlErrorMessage = `Subagent ${instance.alias} acknowledged a control after the target run ended`;
+					throw new WorkerControlError(`Subagent ${instance.alias} acknowledged the control after the target run ended; delivery outcome is unknown`, "unknown");
+				}
+			} catch (error) {
+				if (error instanceof WorkerControlError && error.outcome === "unknown") {
+					state.unknownControlRunId = runId;
+					state.controlPoisoned = true;
+					state.controlErrorMessage = error.message;
+				}
+				throw error;
+			}
+		};
+		const result = state.controlTail.then(deliver, deliver);
+		state.controlTail = result.then(() => undefined, () => undefined);
+		await result;
+		return { instance, delivery: request.delivery };
+	}
+
 	async attach(request: AttachRequest): Promise<AgentInstance> {
-		return this.createInstance(request, "(attached; no task yet)");
+		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
+		const creation = this.createInstance(request, "(attached; no task yet)");
+		this.instanceCreations.add(creation);
+		try {
+			return await creation;
+		} finally {
+			this.instanceCreations.delete(creation);
+		}
 	}
 
 	async listLinked(): Promise<AgentInstance[]> {
@@ -242,14 +358,16 @@ export class SessionBroker {
 
 	runtimeStatus(agentId: string): AgentRuntimeStatus {
 		if (this.workerStarts.has(agentId)) return { phase: "starting", queued: 0 };
-		const errorMessage = this.runtimeErrors.get(agentId);
-		if (errorMessage) return { phase: "error", queued: 0, errorMessage };
 		const state = this.workers.get(agentId);
 		if (state) {
-			if (state.active) return { phase: "running", queued: state.queued };
-			if (state.queued > 0) return { phase: "queued", queued: state.queued };
-			return { phase: "idle", queued: 0 };
+			if (state.activeRunId !== undefined) return { phase: state.activeRunAccepted ? "running" : "starting", queued: state.queued };
+			if (state.controlPoisoned) return { phase: "error", queued: state.queued, errorMessage: state.controlErrorMessage ?? "Subagent control delivery outcome is unknown" };
+			if (state.active || state.queued > 0) return { phase: "queued", queued: Math.max(1, state.queued) };
+			const stateError = this.runtimeErrors.get(agentId);
+			return stateError ? { phase: "error", queued: 0, errorMessage: stateError } : { phase: "idle", queued: 0 };
 		}
+		const errorMessage = this.runtimeErrors.get(agentId);
+		if (errorMessage) return { phase: "error", queued: 0, errorMessage };
 		return { phase: "stopped", queued: 0 };
 	}
 
@@ -259,10 +377,19 @@ export class SessionBroker {
 	}
 
 	async stop(target: string): Promise<AgentInstance | undefined> {
-		const instance = await this.resolveInstance(target).catch(() => undefined);
-		if (!instance) return undefined;
-		await this.stopWorker(instance.agentId);
-		return instance;
+		const agentId = this.roster.resolve(target) ?? target;
+		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
+		this.stoppingAgents.add(agentId);
+		const state = this.workers.get(agentId);
+		if (state) state.stopping = true;
+		try {
+			const instance = await this.resolveInstance(target).catch(() => undefined);
+			if (!instance) return undefined;
+			await this.stopWorker(instance.agentId);
+			return instance;
+		} finally {
+			this.stoppingAgents.delete(agentId);
+		}
 	}
 
 	async changeModel(target: string, model: RailModelRef): Promise<AgentInstance> {
@@ -298,6 +425,7 @@ export class SessionBroker {
 				}
 			};
 			const updated = state ? await this.enqueue(state, apply) : await apply();
+			if (state) state.instance = updated;
 			this.runtimeErrors.delete(instance.agentId);
 			this.emitRuntimeChange();
 			return updated;
@@ -311,11 +439,14 @@ export class SessionBroker {
 	}
 
 	async shutdown(): Promise<void> {
-		await Promise.allSettled(this.workerStarts.values());
+		this.shuttingDown = true;
+		for (const state of this.workers.values()) state.stopping = true;
+		await Promise.allSettled([...this.workerStarts.values(), ...this.instanceCreations]);
 		const states = Array.from(this.workers.values());
 		this.workers.clear();
+		for (const state of states) state.stopping = true;
 		await Promise.allSettled(states.map((state) => state.worker.stop()));
-		await Promise.allSettled(states.map((state) => state.tail));
+		await Promise.allSettled(states.flatMap((state) => [state.tail, state.controlTail]));
 		this.emitRuntimeChange();
 	}
 
@@ -344,6 +475,7 @@ export class SessionBroker {
 	}
 
 	private async createInstance(request: AttachRequest, lastTask: string): Promise<AgentInstance> {
+		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		const agentId = createAgentId();
 		const alias = request.alias?.trim() || generatedAlias(request.model.modelId, agentId);
 		assertValidAgentAlias(alias);
@@ -369,6 +501,7 @@ export class SessionBroker {
 				cwd,
 				...(session.path ? { sessionPath: session.path } : {}),
 			});
+			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 			const now = new Date().toISOString();
 			const instance: AgentInstance = {
 				version: 2,
@@ -384,8 +517,26 @@ export class SessionBroker {
 				lastTask,
 			};
 			await this.store.put(instance);
+			if (this.shuttingDown) {
+				await this.store.delete(agentId).catch(() => undefined);
+				throw new Error("Subagent broker is shutting down");
+			}
 			this.roster.link(alias, agentId);
-			this.workers.set(agentId, { worker, tail: Promise.resolve(), active: false, queued: 0 });
+			this.workers.set(agentId, {
+				instance,
+				worker,
+				tail: Promise.resolve(),
+				controlTail: Promise.resolve(),
+				active: false,
+				activeRunId: undefined,
+				activeRunAccepted: false,
+				nextRunId: 0,
+				stopping: false,
+				unknownControlRunId: undefined,
+				controlPoisoned: false,
+				controlErrorMessage: undefined,
+				queued: 0,
+			});
 			this.emitRuntimeChange();
 			return instance;
 		} catch (error) {
@@ -406,14 +557,18 @@ export class SessionBroker {
 		return linkedAgentId && target !== agentId ? { ...instance, alias: target } : instance;
 	}
 
-	private async workerState(instance: AgentInstance): Promise<WorkerState> {
+	private async workerState(instance: AgentInstance, expectedEpoch = this.lifecycleEpoch(instance.agentId)): Promise<WorkerState> {
+		if (this.shuttingDown || this.stoppingAgents.has(instance.agentId) || this.lifecycleEpoch(instance.agentId) !== expectedEpoch) {
+			throw new Error("Subagent dispatch was interrupted by stop or shutdown");
+		}
 		const changing = this.modelChanges.get(instance.agentId);
 		if (changing) {
 			await changing;
 			instance = await this.store.get(instance.agentId) ?? instance;
 		}
 		const existing = this.workers.get(instance.agentId);
-		if (existing) return existing;
+		if (existing && !existing.controlPoisoned) return existing;
+		if (existing?.controlPoisoned) await this.retireFailedWorker(instance.agentId);
 		const starting = this.workerStarts.get(instance.agentId);
 		if (starting) return starting;
 		const start = (async () => {
@@ -428,7 +583,25 @@ export class SessionBroker {
 				cwd: instance.cwd,
 				sessionPath: instance.sessionFile,
 			});
-			const state = { worker, tail: Promise.resolve(), active: false, queued: 0 };
+			if (this.shuttingDown || this.stoppingAgents.has(instance.agentId) || this.lifecycleEpoch(instance.agentId) !== expectedEpoch) {
+				await worker.stop().catch(() => undefined);
+				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
+			}
+			const state: WorkerState = {
+				instance: { ...instance, sessionName },
+				worker,
+				tail: Promise.resolve(),
+				controlTail: Promise.resolve(),
+				active: false,
+				activeRunId: undefined,
+				activeRunAccepted: false,
+				nextRunId: 0,
+				stopping: false,
+				unknownControlRunId: undefined,
+				controlPoisoned: false,
+				controlErrorMessage: undefined,
+				queued: 0,
+			};
 			this.workers.set(instance.agentId, state);
 			this.emitRuntimeChange();
 			return state;
@@ -443,17 +616,33 @@ export class SessionBroker {
 		}
 	}
 
-	private async enqueue<T>(state: WorkerState, operation: () => Promise<T>): Promise<T> {
+	private async enqueue<T>(state: WorkerState, operation: () => Promise<T>, kind: "run" | "maintenance" = "maintenance"): Promise<T> {
 		state.queued++;
 		this.emitRuntimeChange();
 		const run = async () => {
+			if (kind === "run") {
+				try {
+					await state.controlTail;
+					if (state.controlPoisoned) throw new WorkerControlError(state.controlErrorMessage ?? "Subagent control delivery outcome is unknown", "unknown");
+				} catch (error) {
+					state.queued--;
+					this.emitRuntimeChange();
+					throw error;
+				}
+			}
 			state.queued--;
 			state.active = true;
+			const runId = kind === "run" ? ++state.nextRunId : undefined;
+			state.activeRunId = runId;
+			state.activeRunAccepted = false;
+			if (runId !== undefined) state.unknownControlRunId = undefined;
 			this.emitRuntimeChange();
 			try {
 				return await operation();
 			} finally {
 				state.active = false;
+				state.activeRunId = undefined;
+				state.activeRunAccepted = false;
 				this.emitRuntimeChange();
 			}
 		};
@@ -469,9 +658,10 @@ export class SessionBroker {
 		if (!state) return;
 		this.stoppingAgents.add(agentId);
 		this.workers.delete(agentId);
+		state.stopping = true;
 		try {
 			await state.worker.stop();
-			await state.tail.catch(() => undefined);
+			await Promise.allSettled([state.tail, state.controlTail]);
 			this.runtimeErrors.delete(agentId);
 		} finally {
 			this.stoppingAgents.delete(agentId);
@@ -488,5 +678,9 @@ export class SessionBroker {
 
 	private emitRuntimeChange(): void {
 		for (const listener of this.runtimeListeners) listener();
+	}
+
+	private lifecycleEpoch(agentId: string): number {
+		return this.lifecycleEpochs.get(agentId) ?? 0;
 	}
 }

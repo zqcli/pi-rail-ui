@@ -7,6 +7,20 @@ interface PendingRequest {
 	reject: (error: Error) => void;
 }
 
+export class RpcCommandError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RpcCommandError";
+	}
+}
+
+export class RpcTransportError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "RpcTransportError";
+	}
+}
+
 export interface PiRpcProcessTransportOptions {
 	command: string;
 	args: string[];
@@ -74,8 +88,8 @@ export class PiRpcProcessTransport implements RpcTransport {
 
 	request(command: Record<string, unknown>): Promise<unknown> {
 		const proc = this.process;
-		if (!proc || proc.exitCode !== null || proc.stdin.destroyed) {
-			return Promise.reject(new Error("Subagent RPC process is not running"));
+		if (this.stopping || !proc || proc.exitCode !== null || proc.stdin.destroyed) {
+			return Promise.reject(new RpcTransportError("Subagent RPC process is not running"));
 		}
 		const id = `rail-subagent-${++this.requestId}`;
 		return new Promise<unknown>((resolve, reject) => {
@@ -149,7 +163,7 @@ export class PiRpcProcessTransport implements RpcTransport {
 			const pending = this.pending.get(value.id);
 			if (!pending) return;
 			this.pending.delete(value.id);
-			if (value.success === false) pending.reject(new Error(String(value.error ?? "Subagent RPC request failed")));
+			if (value.success === false) pending.reject(new RpcCommandError(String(value.error ?? "Subagent RPC request failed")));
 			else pending.resolve(value.data);
 			return;
 		}

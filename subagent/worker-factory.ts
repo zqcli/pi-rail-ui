@@ -6,7 +6,7 @@ import { buildRpcWorkerArgs, RpcSessionWorker } from "./rpc-worker";
 import { PiRpcProcessTransport } from "./rpc-transport";
 import type { SessionLease } from "./session-lease";
 import { FileSessionLeaseManager } from "./session-lease";
-import type { SessionWorker, SessionWorkerFactory, WorkerSendOptions, WorkerRunResult } from "./session-broker";
+import type { SessionWorker, SessionWorkerFactory, WorkerControlRequest, WorkerSendOptions, WorkerRunResult } from "./session-broker";
 
 export interface RpcWorkerFactoryOptions {
 	stateDir: string;
@@ -55,6 +55,11 @@ class LeasedSessionWorker implements SessionWorker {
 
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult> {
 		return this.worker.send(task, options);
+	}
+
+	control(request: WorkerControlRequest): Promise<void> {
+		if (this.stopped) return Promise.reject(new Error("Subagent worker is stopped"));
+		return this.worker.control(request);
 	}
 
 	setModel(model: Parameters<NonNullable<SessionWorker["setModel"]>>[0]) {

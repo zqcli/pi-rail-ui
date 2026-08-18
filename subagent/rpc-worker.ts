@@ -1,10 +1,13 @@
 import { railModelKey, type RailModelRef } from "./models";
+import { RpcCommandError } from "./rpc-transport";
+import { WorkerControlError } from "./session-broker";
 import { SubagentTranscript } from "./transcript";
 import type {
 	SessionWorker,
 	SubagentUsage,
 	WorkerRunResult,
 	WorkerSendOptions,
+	WorkerControlRequest,
 	WorkerStartSpec,
 } from "./session-broker";
 import { addCompletedAssistantUsage, emptySubagentUsage, providerReportedUsage, usageWithActiveTurn } from "./usage";
@@ -148,6 +151,7 @@ export class RpcSessionWorker implements SessionWorker {
 
 		try {
 			await this.transport.request({ type: "prompt", message: task });
+			options.onAccepted?.();
 			await settledPromise;
 			if (transportError) throw transportError;
 			if (aborted) {
@@ -165,6 +169,22 @@ export class RpcSessionWorker implements SessionWorker {
 			if (updateTimer) clearTimeout(updateTimer);
 			options.signal?.removeEventListener("abort", abort);
 			unsubscribe();
+		}
+	}
+
+	async control(request: WorkerControlRequest): Promise<void> {
+		const message = request.message.trim();
+		if (!message) throw new Error("Subagent control message cannot be empty");
+		try {
+			await this.transport.request({
+				type: request.delivery === "followUp" ? "follow_up" : "steer",
+				message,
+			});
+		} catch (error) {
+			if (error instanceof RpcCommandError) {
+				throw new WorkerControlError(`Subagent control was rejected: ${error.message}`, "rejected", { cause: error });
+			}
+			throw new WorkerControlError(`Subagent control delivery outcome is unknown: ${error instanceof Error ? error.message : String(error)}`, "unknown", { cause: error });
 		}
 	}
 

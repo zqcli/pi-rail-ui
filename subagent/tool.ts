@@ -36,6 +36,13 @@ const SessionSourceSchema = Type.Object({
 	path: Type.String({ description: "Existing saved Pi session path whose conversation history and project context should be continued" }),
 });
 
+const ControlSchema = Type.Object({
+	delivery: StringEnum(["steer", "followUp"] as const, {
+		description: "steer is delivered after the current child assistant turn and its tool calls, before the next model call; followUp runs after the child's current work finishes",
+	}),
+	message: Type.String({ description: "Control message for an already-running local persistent subagent" }),
+});
+
 const TaskItem = Type.Object({
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. Use with no alias/session for stateless work or with alias to create a persistent session." })),
 	target: Type.Optional(Type.String({ description: "Exact linked persistent alias or agentId whose existing conversation memory should continue; omit model when target is set" })),
@@ -61,6 +68,7 @@ const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Self-contained stateless task, concrete initial task for a new persistent helper, or persistent follow-up message" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
 	session: Type.Optional(SessionSourceSchema),
+	control: Type.Optional(ControlSchema),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Group independent model-session tasks inside one subagent Tool Call; each item may be stateless or persistent. Use only when one grouped parent Tool Call with child panels is desired." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
 	confirmSessionAttach: Type.Optional(Type.Boolean({
@@ -75,7 +83,7 @@ export interface StatefulSubagentRunDetails {
 	model?: string;
 	sessionId?: string;
 	task: string;
-	status: "running" | "completed" | "failed";
+	status: "running" | "completed" | "accepted" | "failed";
 	output: string;
 	transcript?: SubagentTranscriptSnapshot;
 	usage: SubagentUsage;
@@ -88,7 +96,7 @@ export interface StatefulSubagentRunDetails {
 }
 
 export interface StatefulSubagentDetails {
-	mode: "single" | "parallel" | "chain";
+	mode: "single" | "parallel" | "chain" | "control";
 	results: StatefulSubagentRunDetails[];
 	durationMs: number;
 }
@@ -255,14 +263,15 @@ function errorResult(
 
 type SubagentParamsValue = Static<typeof SubagentParams>;
 
-function modeFor(params: SubagentParamsValue): "single" | "parallel" | "chain" {
+function modeFor(params: SubagentParamsValue): "single" | "parallel" | "chain" | "control" {
 	const hasSingle = Boolean(params.task?.trim());
 	const hasParallel = (params.tasks?.length ?? 0) > 0;
 	const hasChain = (params.chain?.length ?? 0) > 0;
-	if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) !== 1) {
-		throw new Error("Provide exactly one mode: single, parallel, or chain");
+	const hasControl = params.control !== undefined;
+	if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) + Number(hasControl) !== 1) {
+		throw new Error("Provide exactly one mode: single, parallel, chain, or control");
 	}
-	return hasChain ? "chain" : hasParallel ? "parallel" : "single";
+	return hasControl ? "control" : hasChain ? "chain" : hasParallel ? "parallel" : "single";
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -320,7 +329,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate work to Pi model sessions using the lifecycle that matches expected continuity. Continue an already linked persistent helper with target+task. Adopt an existing saved Pi session with session (fork by default) when its conversation history or project context matters, especially for cross-project work. Create a new persistent long-term helper with model+alias+concrete task only when future follow-ups are expected. Use model+task with no alias/target/session for one-off stateless work; stateless runs create no saved JSONL and do not appear in /resume. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn, give each call one single-mode task, and do not use the tasks array; Pi executes those sibling calls concurrently. Use tasks only when one grouped parent Tool Call containing multiple child panels is desired. Use chain for sequential handoff. Persistent agents can be permanently deleted from /rail-agent; deletion removes only the Rail descriptor and child JSONL, intentionally does not rewrite other parent sessions, and their later calls will fail as unknown. Child sessions can use normal Pi tools but cannot recursively call subagent.",
+		description: "Delegate work to Pi model sessions using the lifecycle that matches expected continuity. Continue an already linked persistent helper with target+task. Adopt an existing saved Pi session with session (fork by default) when its conversation history or project context matters, especially for cross-project work. Create a new persistent long-term helper with model+alias+concrete task only when future follow-ups are expected. Use model+task with no alias/target/session for one-off stateless work; stateless runs create no saved JSONL and do not appear in /resume. Use target+control to send steer or followUp to an already-running local persistent helper: steer is delivered before its next model call, while followUp runs after its current work finishes. Controls do not start stopped or idle sessions and must not be issued as a sibling of the dispatch they intend to control. This mode is mainly for host-side or external orchestration because a parent LLM normally cannot issue another Tool Call while its own dispatch is still pending. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn, give each call one single-mode task, and do not use the tasks array; Pi executes those sibling calls concurrently. Use tasks only when one grouped parent Tool Call containing multiple child panels is desired. Use chain for sequential handoff. Persistent agents can be permanently deleted from /rail-agent; deletion removes only the Rail descriptor and child JSONL, intentionally does not rewrite other parent sessions, and their later calls will fail as unknown. Child sessions can use normal Pi tools but cannot recursively call subagent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
 		promptGuidelines: [
@@ -332,6 +341,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
 			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
 			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
+			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
+			"When a child asks for input or another specialist in its ordinary final answer (for example by using the plain-language labels needs_input or specialist_request), keep orchestration in the parent: resolve the question or dispatch the specialist, then continue the original persistent child with target+task. These labels are guidance, not a structured wire protocol. Do not enable recursive child subagent calls.",
 			"When the user names @agent/<alias> or agent://<alias>, use subagent with target set to that exact alias.",
 			"When the user names @new/<provider>/<modelId> or new://<provider>/<modelId>, use subagent with model set to that canonical model reference and assign a concise alias.",
 			"Subagent child sessions cannot recursively call subagent. Keep nested decomposition and orchestration in the parent session.",
@@ -351,6 +362,51 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
 				durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
 			});
+			if (mode === "control") {
+				if (!params.target?.trim()) throw new Error("Control mode requires target for an existing persistent subagent");
+				if (nonEmpty(params.model) || nonEmpty(params.alias) || nonEmpty(params.cwd) || nonEmpty(params.session?.path)) {
+					throw new Error("Control mode accepts only target and control");
+				}
+				const message = params.control!.message.trim();
+				if (!message) throw new Error("Subagent control message cannot be empty");
+				if (signal?.aborted) throw new Error("Subagent control was aborted before delivery");
+				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
+				try {
+					const controlled = await broker.control({
+						target: params.target.trim(),
+						delivery: params.control!.delivery,
+						message,
+						...(signal ? { signal } : {}),
+					});
+					const label = controlled.delivery === "steer" ? "Steer" : "Follow-up";
+					const output = `${label} accepted by ${controlled.instance.alias}`;
+					const result: StatefulSubagentRunDetails = {
+						agentId: controlled.instance.agentId,
+						alias: controlled.instance.alias,
+						model: railModelReference(controlled.instance.model),
+						sessionId: controlled.instance.sessionId,
+						task: message,
+						status: "accepted",
+						output,
+						usage: emptyUsage(),
+						durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
+						stopReason: "accepted",
+						persistent: true,
+					};
+					const details = resultDetails([result]);
+					latestDetails.set(toolCallId, details);
+					return { content: [{ type: "text", text: output }], details };
+				} catch (error) {
+					const failed = errorResult(
+						{ target: params.target.trim(), task: message },
+						error,
+						Math.max(0, Math.round(performance.now() - toolStartedAt)),
+						signal?.aborted ?? false,
+					);
+					latestDetails.set(toolCallId, resultDetails([failed]));
+					throw error;
+				}
+			}
 			const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
 				liveResults.set(slot, result);
 				const results = [...liveResults.entries()]
@@ -516,7 +572,9 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		},
 
 		renderCall(args, theme) {
-			const mode = args.chain?.length
+			const mode = args.control
+				? `control ${args.control.delivery} ${args.target ?? "target required"}`
+				: args.chain?.length
 				? `chain (${args.chain.length})`
 				: args.tasks?.length
 					? `parallel (${args.tasks.length})`
@@ -525,7 +583,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						: args.alias || args.session
 							? `persistent new ${args.model || "current model"}`
 							: `stateless ${args.model || "current model"}`;
-			const task = args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
+			const task = args.control?.message ?? args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},
 

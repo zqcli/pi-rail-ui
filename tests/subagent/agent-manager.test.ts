@@ -33,9 +33,11 @@ test("RailAgentManager combines current links, local runtime state, and foreign 
 		const foreignLock = join(dir, "leases", sessionLeaseDirectoryName(sessionLeaseKey(foreign.sessionFile)));
 		await mkdir(foreignLock, { recursive: true });
 		await writeFile(join(foreignLock, "owner.json"), JSON.stringify({ pid: 1, token: "foreign", createdAt: new Date().toISOString() }));
+		const controls: unknown[] = [];
 		const broker = {
 			runtimeStatus: (agentId: string) => agentId === local.agentId ? { phase: "running", queued: 2 } : { phase: "stopped", queued: 0 },
 			subscribeRuntime: () => () => undefined,
+			control: async (request: unknown) => { controls.push(request); return { instance: local, delivery: "steer" }; },
 		};
 		const manager = new RailAgentManager(
 			broker as any,
@@ -50,6 +52,16 @@ test("RailAgentManager combines current links, local runtime state, and foreign 
 		assert.equal(snapshot.agents.find((agent) => agent.instance.agentId === local.agentId)?.phase, "running");
 		assert.equal(snapshot.agents.find((agent) => agent.instance.agentId === foreign.agentId)?.phase, "in-use-elsewhere");
 		assert.equal(snapshot.agents.find((agent) => agent.instance.agentId === stopped.agentId)?.phase, "stopped");
+		await manager.control(local.agentId, { delivery: "steer", message: "Focus on tests" });
+		assert.deepEqual(controls, [{ target: local.agentId, delivery: "steer", message: "Focus on tests" }]);
+		await assert.rejects(
+			() => manager.control(stopped.agentId, { delivery: "followUp", message: "Summarize" }),
+			/not currently running/,
+		);
+		await assert.rejects(
+			() => manager.control(foreign.agentId, { delivery: "steer", message: "Focus" }),
+			/owned by process/,
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

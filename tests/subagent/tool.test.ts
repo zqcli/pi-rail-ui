@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installStatefulSubagentTool } from "../../subagent/tool";
-import type { DispatchRequest, DispatchResult, SessionBroker } from "../../subagent/session-broker";
+import { WorkerControlError, type ControlRequest, type ControlResult, type DispatchRequest, type DispatchResult, type SessionBroker } from "../../subagent/session-broker";
 import { SubagentTranscript } from "../../subagent/transcript";
 
 const model = {
@@ -34,6 +34,8 @@ function context() {
 
 class FakeBroker {
 	readonly requests: DispatchRequest[] = [];
+	readonly controls: ControlRequest[] = [];
+	controlError: Error | undefined;
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		this.requests.push(request);
@@ -66,6 +68,26 @@ class FakeBroker {
 			},
 		};
 	}
+
+	async control(request: ControlRequest): Promise<ControlResult> {
+		if (this.controlError) throw this.controlError;
+		this.controls.push(request);
+		return {
+			instance: {
+				version: 2,
+				agentId: "agt_auth",
+				alias: request.target,
+				model: railModel,
+				sessionId: "session-auth",
+				sessionFile: "/tmp/auth.jsonl",
+				cwd: "/tmp/project",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+				lastTask: "review auth",
+			},
+			delivery: request.delivery,
+		};
+	}
 }
 
 test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestration rules", () => {
@@ -80,6 +102,7 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(tool.description, /multiple sibling subagent calls in the same assistant turn/);
 	assert.match(tool.description, /do not use the tasks array/);
 	assert.match(tool.description, /one grouped parent Tool Call/);
+	assert.match(tool.description, /control.*steer.*followUp/);
 	assert.equal(tool.executionMode, "parallel");
 	const guidance = tool.promptGuidelines.join("\n");
 	assert.match(guidance, /lifecycle by continuity/);
@@ -95,9 +118,93 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /separate top-level Tool Call panels/);
 	assert.match(guidance, /Pi preflights sibling calls in order and executes them concurrently/);
 	assert.match(guidance, /tasks array only when the user wants one grouped subagent Tool Call/);
+	assert.match(guidance, /Live controls apply only to an already-running local persistent subagent/);
+	assert.match(guidance, /needs_input.*specialist_request/);
 	assert.match(guidance, /permanently deleted from the \/rail-agent panel/);
 	assert.match(guidance, /later target calls.*unknown persistent subagent/);
 	assert.equal(tool.promptGuidelines.some((line: string) => /cannot recursively call subagent/.test(line)), true);
+});
+
+test("control mode steers and queues follow-ups for an active persistent target", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+	});
+
+	const steer = await tool.execute("call-steer", {
+		model: "",
+		target: "auth-review",
+		alias: "",
+		cwd: "",
+		session: { mode: "fork", path: "" },
+		control: { delivery: "steer", message: "Focus on tests" },
+		tasks: [],
+		chain: [],
+	}, undefined, undefined, context());
+	const followUp = await tool.execute("call-follow-up", {
+		target: "auth-review",
+		control: { delivery: "followUp", message: "Then summarize risks" },
+	}, undefined, undefined, context());
+
+	assert.deepEqual(broker.controls, [
+		{ target: "auth-review", delivery: "steer", message: "Focus on tests" },
+		{ target: "auth-review", delivery: "followUp", message: "Then summarize risks" },
+	]);
+	assert.match(steer.content[0].text, /Steer accepted by auth-review/);
+	assert.match(followUp.content[0].text, /Follow-up accepted by auth-review/);
+	assert.equal(steer.details.mode, "control");
+	assert.equal(steer.details.results[0].status, "accepted");
+	assert.equal(steer.details.results[0].persistent, true);
+	assert.equal(steer.details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	assert.match(tool.renderCall({ target: "auth-review", control: { delivery: "steer", message: "Focus on tests" } }, theme).render(100).join("\n"), /control steer auth-review/);
+	const controlPanel = tool.renderResult(steer, { expanded: false }, theme).render(100).join("\n");
+	assert.match(controlPanel, /↪ auth-review/);
+	assert.match(controlPanel, /accepted/);
+	const expandedControlPanel = tool.renderResult(steer, { expanded: true }, theme).render(100).join("\n");
+	assert.match(expandedControlPanel, /Control acknowledgement/);
+	assert.doesNotMatch(expandedControlPanel, /Final answer/);
+	await assert.rejects(
+		() => tool.execute("call-invalid-control", {
+			target: "auth-review",
+			task: "continue",
+			control: { delivery: "steer", message: "Focus" },
+		}, undefined, undefined, context()),
+		/exactly one mode/,
+	);
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(
+		() => tool.execute("call-aborted-control", {
+			target: "auth-review",
+			control: { delivery: "steer", message: "Do not deliver" },
+		}, controller.signal, undefined, context()),
+		/aborted before delivery/,
+	);
+	assert.equal(broker.controls.length, 2);
+});
+
+test("control failures retain an explicit unknown-delivery result for the panel", async () => {
+	let tool: any;
+	let toolResultHandler: ((event: any) => any) | undefined;
+	const broker = new FakeBroker();
+	broker.controlError = new WorkerControlError("Subagent control delivery outcome is unknown", "unknown");
+	installStatefulSubagentTool({
+		registerTool: (definition: any) => { tool = definition; },
+		on: (event: string, handler: (value: any) => any) => {
+			if (event === "tool_result") toolResultHandler = handler;
+		},
+	} as any, { broker: broker as unknown as SessionBroker });
+
+	await assert.rejects(() => tool.execute("call-unknown-control", {
+		target: "auth-review",
+		control: { delivery: "steer", message: "Focus on tests" },
+	}, undefined, undefined, context()), /outcome is unknown/);
+	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-unknown-control", isError: true });
+	assert.equal(restored.details.mode, "control");
+	assert.equal(restored.details.results[0].status, "failed");
+	assert.match(restored.details.results[0].errorMessage, /outcome is unknown/);
 });
 
 test("failed tool results restore the last streamed transcript through Pi's tool_result hook", async () => {
@@ -306,6 +413,29 @@ test("parallel mode allows one model to back stateless and persistent sessions",
 	assert.deepEqual(statelessTasks, ["quick check"]);
 	assert.equal(broker.requests.length, 1);
 	assert.deepEqual(result.details.results.map((item: any) => item.persistent), [false, true]);
+});
+
+test("chain mode preserves ordering and substitutes the previous final output", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+	});
+
+	const result = await tool.execute("call-chain", {
+		chain: [
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "planner", task: "make a plan" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "reviewer", task: "review this: {previous}" },
+		],
+	}, undefined, undefined, context());
+
+	assert.equal(result.details.mode, "chain");
+	assert.deepEqual(broker.requests.map((request) => request.task), [
+		"make a plan",
+		"review this: done: make a plan",
+	]);
+	assert.deepEqual(result.details.results.map((item: any) => item.step), [1, 2]);
+	assert.match(result.content[0].text, /Chain: 2\/2 succeeded/);
 });
 
 test("parallel streaming updates retain the recent transcript from every active child", async () => {

@@ -17,6 +17,8 @@ test("new workers migrate from a startup lease to the same session lease used by
 	});
 	try {
 		const first = await factory({ agentId: "agt_first", mode: "new", model, alias: "first", cwd: process.cwd() });
+		await first.control?.({ delivery: "steer", message: "Focus on tests" });
+		await first.control?.({ delivery: "followUp", message: "Then summarize risks" });
 		await assert.rejects(
 			() => factory({
 				agentId: "agt_second",

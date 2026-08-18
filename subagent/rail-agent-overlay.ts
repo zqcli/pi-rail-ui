@@ -18,6 +18,12 @@ type EditField = "alias" | "cwd" | "task";
 type Picker =
 	| { kind: "model"; targetAgentId?: string; query: Input; selected: number }
 	| { kind: "session"; query: Input; selected: number };
+type ControlComposer = {
+	agentId: string;
+	alias: string;
+	delivery: "steer" | "followUp";
+	input: Input;
+};
 
 export interface RailAgentOverlayOptions {
 	manager: RailAgentManager;
@@ -92,6 +98,7 @@ export class RailAgentOverlayComponent implements Focusable {
 	private searching = false;
 	private picker: Picker | undefined;
 	private edit: { field: EditField; input: Input } | undefined;
+	private control: ControlComposer | undefined;
 	private form: CreateForm;
 	private formIndex = 0;
 	private aliasEdited = false;
@@ -157,6 +164,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		}
 		if (this.picker) return this.handlePickerInput(data);
 		if (this.edit) return this.handleEditInput(data);
+		if (this.control) return this.handleControlInput(data);
 		if (this.searching) return this.handleSearchInput(data);
 		if (this.isCancel(data)) {
 			this.done();
@@ -195,6 +203,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		this.searchInput.invalidate();
 		this.picker?.query.invalidate();
 		this.edit?.input.invalidate();
+		this.control?.input.invalidate();
 	}
 
 	dispose(): void {
@@ -241,13 +250,19 @@ export class RailAgentOverlayComponent implements Focusable {
 			lines.push(`${prefix}${selected ? this.theme.fg("accent", row) : row}`);
 		}
 		const selected = agents[this.selectedIndex];
-		if (selected) {
+		if (selected && !this.compactControlLayout()) {
 			lines.push("");
 			lines.push(` ${this.theme.fg("toolTitle", this.theme.bold(selected.linkedAliases[0] ?? selected.instance.alias))} ${this.theme.fg("dim", `· ${selected.instance.agentId}`)}`);
 			lines.push(` ${this.theme.fg("muted", compact(selected.instance.cwd, innerWidth - 2))}`);
 			lines.push(` ${this.theme.fg("dim", `Last task: ${compact(selected.instance.lastTask, innerWidth - 13)}`)}`);
 			if (selected.instance.lastOutput) lines.push(` ${this.theme.fg("dim", `Last answer: ${compact(selected.instance.lastOutput, innerWidth - 15)}`)}`);
 			if (selected.errorMessage) lines.push(` ${this.theme.fg("error", compact(selected.errorMessage, innerWidth - 2))}`);
+		}
+		if (this.control) {
+			const label = this.control.delivery === "steer" ? "Steer" : "Follow-up";
+			lines.push("");
+			lines.push(` ${this.theme.fg("toolTitle", this.theme.bold(`${label} ${this.control.alias}`))}`);
+			lines.push(` Message: ${this.control.input.render(Math.max(1, innerWidth - 11))[0] ?? ""}`);
 		}
 		return lines;
 	}
@@ -317,8 +332,9 @@ export class RailAgentOverlayComponent implements Focusable {
 	private helpText(): string {
 		if (this.picker) return "type to filter · ↑↓ navigate · enter select · esc back";
 		if (this.edit) return "enter apply · esc cancel";
+		if (this.control) return "type message · enter send · esc cancel";
 		if (this.tab === "create") return "↑↓ fields · enter edit/open · ←→ or tab switch tabs · esc close";
-		return "/ search · ↑↓ select · enter continue/link · m model · t thinking · s stop · d detach · x delete · n new";
+		return "/ search · ↑↓ select · enter continue/link · g steer · f follow-up · m model · t thinking · s stop · d detach · x delete · n new";
 	}
 
 	private handleAgentInput(data: string): void {
@@ -352,6 +368,8 @@ export class RailAgentOverlayComponent implements Focusable {
 				} else this.openModelPicker(selected.instance.agentId);
 			}
 			else if (matchesKey(data, "t")) void this.cycleAgentThinking(selected);
+			else if (matchesKey(data, "g")) this.startControl(selected, "steer");
+			else if (matchesKey(data, "f")) this.startControl(selected, "followUp");
 			else if (matchesKey(data, "s")) void this.stopAgent(selected);
 			else if (matchesKey(data, "d") && selected.linkedToCurrentSession) void this.detachAgent(selected);
 			else if (matchesKey(data, "x")) void this.deleteAgent(selected);
@@ -428,6 +446,33 @@ export class RailAgentOverlayComponent implements Focusable {
 		this.renderSoon();
 	}
 
+	private handleControlInput(data: string): void {
+		const control = this.control!;
+		if (this.isCancel(data)) {
+			this.control = undefined;
+			this.syncInputFocus();
+			this.renderSoon();
+			return;
+		}
+		if (this.keybindings.matches(data, "tui.select.confirm")) {
+			const message = control.input.getValue().trim();
+			if (!message) {
+				this.notice = "Control message cannot be empty";
+				this.renderSoon();
+				return;
+			}
+			this.control = undefined;
+			this.syncInputFocus();
+			void this.runOperation(control.delivery === "steer" ? "Sending steer..." : "Queueing follow-up...", async (signal) => {
+				await this.options.manager.control(control.agentId, { delivery: control.delivery, message }, signal);
+				this.notice = `${control.delivery === "steer" ? "Steer" : "Follow-up"} accepted by ${control.alias}`;
+			});
+			return;
+		}
+		control.input.handleInput(data);
+		this.renderSoon();
+	}
+
 	private handlePickerInput(data: string): void {
 		const picker = this.picker!;
 		if (this.isCancel(data)) {
@@ -483,6 +528,27 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (!agent.linkedToCurrentSession) await this.options.manager.link(agent.instance.agentId);
 		this.options.insertMention(agent.linkedAliases[0] ?? agent.instance.alias);
 		this.done();
+	}
+
+	private startControl(agent: RailAgentView, delivery: "steer" | "followUp"): void {
+		if (agent.phase !== "running") {
+			this.notice = agent.phase === "in-use-elsewhere"
+				? "Live controls cannot reach a worker owned by another process"
+				: agent.phase === "starting" || agent.phase === "queued"
+					? "Live controls require a running local agent; wait for the pending operation"
+					: "Live controls require a running local agent; use continue for an idle or stopped session";
+			this.renderSoon();
+			return;
+		}
+		this.control = {
+			agentId: agent.instance.agentId,
+			alias: agent.linkedAliases[0] ?? agent.instance.alias,
+			delivery,
+			input: new Input(),
+		};
+		this.notice = "";
+		this.syncInputFocus();
+		this.renderSoon();
 	}
 
 	private async stopAgent(agent: RailAgentView): Promise<void> {
@@ -712,6 +778,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		this.searchInput.focused = this._focused && this.searching;
 		if (this.picker) this.picker.query.focused = this._focused;
 		if (this.edit) this.edit.input.focused = this._focused;
+		if (this.control) this.control.input.focused = this._focused;
 	}
 
 	private async refresh(): Promise<void> {
@@ -732,7 +799,11 @@ export class RailAgentOverlayComponent implements Focusable {
 
 	private maxVisibleRows(): number {
 		const rows = this.tui.terminal?.rows ?? 30;
-		return Math.max(3, Math.min(MAX_VISIBLE_ROWS, rows - 13));
+		return Math.max(1, Math.min(MAX_VISIBLE_ROWS, rows - (this.control ? 16 : 13)));
+	}
+
+	private compactControlLayout(): boolean {
+		return this.control !== undefined && (this.tui.terminal?.rows ?? 30) < 22;
 	}
 
 	private isCancel(data: string): boolean {

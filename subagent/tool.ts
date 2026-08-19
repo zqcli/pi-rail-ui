@@ -262,16 +262,51 @@ function errorResult(
 }
 
 type SubagentParamsValue = Static<typeof SubagentParams>;
+type SubagentMode = "single" | "parallel" | "chain" | "control";
 
-function modeFor(params: SubagentParamsValue): "single" | "parallel" | "chain" | "control" {
+function modeFor(params: SubagentParamsValue): SubagentMode {
 	const hasSingle = Boolean(params.task?.trim());
 	const hasParallel = (params.tasks?.length ?? 0) > 0;
 	const hasChain = (params.chain?.length ?? 0) > 0;
-	const hasControl = params.control !== undefined;
+	const hasControl = Boolean(nonEmpty(params.control?.message));
 	if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) + Number(hasControl) !== 1) {
 		throw new Error("Provide exactly one mode: single, parallel, chain, or control");
 	}
 	return hasControl ? "control" : hasChain ? "chain" : hasParallel ? "parallel" : "single";
+}
+
+function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
+	const confirmSessionAttach = typeof params.confirmSessionAttach === "boolean"
+		? { confirmSessionAttach: params.confirmSessionAttach }
+		: {};
+	if (mode === "parallel") {
+		return { tasks: params.tasks!.map(normalizeTask), ...confirmSessionAttach };
+	}
+	if (mode === "chain") {
+		return { chain: params.chain!.map(normalizeTask), ...confirmSessionAttach };
+	}
+	if (mode === "control") {
+		const target = nonEmpty(params.target);
+		const message = nonEmpty(params.control?.message);
+		return {
+			...(target ? { target } : {}),
+			...(params.control && message ? { control: { delivery: params.control.delivery, message } } : {}),
+		};
+	}
+	const model = nonEmpty(params.model);
+	const target = nonEmpty(params.target);
+	const alias = nonEmpty(params.alias);
+	const cwd = nonEmpty(params.cwd);
+	const sessionPath = nonEmpty(params.session?.path);
+	return {
+		...(model ? { model } : {}),
+		...(target ? { target } : {}),
+		...(alias ? { alias } : {}),
+		task: params.task!,
+		...(cwd ? { cwd } : {}),
+		...(params.session && sessionPath ? { session: { mode: params.session.mode, path: sessionPath } } : {}),
+		...confirmSessionAttach,
+	};
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -350,10 +385,19 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"Persistent subagents may be permanently deleted from the /rail-agent panel. Deletion intentionally removes only that child JSONL and Rail descriptor; it does not rewrite links stored in other parent sessions, so later target calls from those sessions fail with an unknown persistent subagent error.",
 		],
 		parameters: SubagentParams,
+		prepareArguments(params: unknown): SubagentParamsValue {
+			const candidate = params as SubagentParamsValue;
+			try {
+				return filterParamsForMode(candidate, modeFor(candidate));
+			} catch {
+				return candidate;
+			}
+		},
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			let toolStartedAt = performance.now();
 			const mode = modeFor(params);
+			params = filterParamsForMode(params, mode);
 			const liveResults = new Map<number, StatefulSubagentRunDetails>();
 			const runStartedAt = new Map<number, number>();
 			const runDuration = (slot: number) => Math.max(0, Math.round(performance.now() - (runStartedAt.get(slot) ?? performance.now())));
@@ -364,9 +408,6 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			});
 			if (mode === "control") {
 				if (!params.target?.trim()) throw new Error("Control mode requires target for an existing persistent subagent");
-				if (nonEmpty(params.model) || nonEmpty(params.alias) || nonEmpty(params.cwd) || nonEmpty(params.session?.path)) {
-					throw new Error("Control mode accepts only target and control");
-				}
 				const message = params.control!.message.trim();
 				if (!message) throw new Error("Subagent control message cannot be empty");
 				if (signal?.aborted) throw new Error("Subagent control was aborted before delivery");
@@ -572,18 +613,19 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		},
 
 		renderCall(args, theme) {
-			const mode = args.control
-				? `control ${args.control.delivery} ${args.target ?? "target required"}`
+			const controlMessage = nonEmpty(args.control?.message);
+			const mode = controlMessage
+				? `control ${args.control!.delivery} ${args.target ?? "target required"}`
 				: args.chain?.length
 				? `chain (${args.chain.length})`
 				: args.tasks?.length
 					? `parallel (${args.tasks.length})`
-					: args.target
-						? `persistent continue ${args.target}`
-						: args.alias || args.session
+					: nonEmpty(args.target)
+						? `persistent continue ${args.target!.trim()}`
+						: nonEmpty(args.alias) || nonEmpty(args.session?.path)
 							? `persistent new ${args.model || "current model"}`
 							: `stateless ${args.model || "current model"}`;
-			const task = args.control?.message ?? args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
+			const task = controlMessage ?? args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},
 

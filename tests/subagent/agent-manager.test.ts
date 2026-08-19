@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +26,9 @@ function instance(agentId: string, alias: string, sessionFile: string) {
 
 test("RailAgentManager combines current links, local runtime state, and foreign leases", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-"));
+	const foreignOwner = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
 	try {
+		await once(foreignOwner, "spawn");
 		const local = instance("agt_local", "local-review", join(dir, "local.jsonl"));
 		const foreign = instance("agt_foreign", "foreign-review", join(dir, "foreign.jsonl"));
 		const stopped = instance("agt_stopped", "stopped-review", join(dir, "stopped.jsonl"));
@@ -32,7 +36,7 @@ test("RailAgentManager combines current links, local runtime state, and foreign 
 		const links = [{ alias: "local-review", agentId: local.agentId }];
 		const foreignLock = join(dir, "leases", sessionLeaseDirectoryName(sessionLeaseKey(foreign.sessionFile)));
 		await mkdir(foreignLock, { recursive: true });
-		await writeFile(join(foreignLock, "owner.json"), JSON.stringify({ pid: 1, token: "foreign", createdAt: new Date().toISOString() }));
+		await writeFile(join(foreignLock, "owner.json"), JSON.stringify({ pid: foreignOwner.pid, token: "foreign", createdAt: new Date().toISOString() }));
 		const controls: unknown[] = [];
 		const broker = {
 			runtimeStatus: (agentId: string) => agentId === local.agentId ? { phase: "running", queued: 2 } : { phase: "stopped", queued: 0 },
@@ -63,6 +67,11 @@ test("RailAgentManager combines current links, local runtime state, and foreign 
 			/owned by process/,
 		);
 	} finally {
+		if (foreignOwner.exitCode === null && foreignOwner.signalCode === null) {
+			const exited = once(foreignOwner, "exit");
+			foreignOwner.kill();
+			await exited;
+		}
 		await rm(dir, { recursive: true, force: true });
 	}
 });

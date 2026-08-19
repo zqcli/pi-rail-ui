@@ -132,16 +132,22 @@ test("control mode steers and queues follow-ups for an active persistent target"
 		broker: broker as unknown as SessionBroker,
 	});
 
-	const steer = await tool.execute("call-steer", {
-		model: "",
+	const rawSteer = {
+		model: "ignored/model",
 		target: "auth-review",
-		alias: "",
-		cwd: "",
-		session: { mode: "fork", path: "" },
-		control: { delivery: "steer", message: "Focus on tests" },
+		alias: "ignored-alias",
+		cwd: "/ignored/path",
+		session: { mode: "fork" as const, path: "/ignored/session.jsonl" },
+		control: { delivery: "steer" as const, message: "Focus on tests" },
 		tasks: [],
 		chain: [],
-	}, undefined, undefined, context());
+		unexpected: "ignored",
+	};
+	assert.deepEqual(tool.prepareArguments(rawSteer), {
+		target: "auth-review",
+		control: { delivery: "steer", message: "Focus on tests" },
+	});
+	const steer = await tool.execute("call-steer", rawSteer, undefined, undefined, context());
 	const followUp = await tool.execute("call-follow-up", {
 		target: "auth-review",
 		control: { delivery: "followUp", message: "Then summarize risks" },
@@ -252,8 +258,16 @@ test("model plus alias creates a persistent session and target continues it", as
 
 	const created = await tool.execute("call-1", {
 		model: "cus-resp/gpt-5.6-sol:xhigh",
+		target: "",
 		alias: "auth-review",
 		task: "review auth",
+		cwd: "",
+		session: { mode: "fork", path: "" },
+		control: { delivery: "steer", message: "" },
+		tasks: [],
+		chain: [],
+		confirmSessionAttach: false,
+		unexpected: "ignored",
 	}, undefined, undefined, context());
 	const continued = await tool.execute("call-2", {
 		target: "auth-review",
@@ -351,17 +365,25 @@ test("model without alias or session runs stateless and creates no broker instan
 		},
 	});
 
-	const result = await tool.execute("call-stateless", {
+	const rawStateless = {
 		model: "cus-resp/gpt-5.6-sol:xhigh",
 		target: "",
 		alias: "",
 		task: "one-off review",
 		cwd: "",
-		session: { mode: "fork", path: "" },
+		session: { mode: "fork" as const, path: "" },
+		control: { delivery: "steer" as const, message: "" },
 		tasks: [],
 		chain: [],
 		confirmSessionAttach: true,
-	}, undefined, (update: any) => statelessUpdates.push(update), context());
+		unexpected: "ignored",
+	};
+	assert.deepEqual(tool.prepareArguments(rawStateless), {
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		task: "one-off review",
+		confirmSessionAttach: true,
+	});
+	const result = await tool.execute("call-stateless", rawStateless, undefined, (update: any) => statelessUpdates.push(update), context());
 
 	assert.deepEqual(statelessModels, [railModel]);
 	assert.equal(broker.requests.length, 0);
@@ -369,6 +391,19 @@ test("model without alias or session runs stateless and creates no broker instan
 	assert.equal(result.details.results[0].persistent, false);
 	assert.equal(statelessUpdates[0].details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
 	assert.equal(statelessUpdates[0].details.results[0].persistent, false);
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const rendered = tool.renderCall({
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		target: "",
+		alias: "",
+		task: "one-off review",
+		session: { mode: "fork", path: "" },
+		control: { delivery: "steer", message: "" },
+		tasks: [],
+		chain: [],
+	}, theme).render(100).join("\n");
+	assert.match(rendered, /stateless cus-resp\/gpt-5\.6-sol:xhigh/);
+	assert.doesNotMatch(rendered, /control|persistent new/);
 });
 
 test("omitting model uses the current Pi model for stateless work", async () => {

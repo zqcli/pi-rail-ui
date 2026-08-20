@@ -14,6 +14,7 @@ export type SubagentTranscriptStatus = "running" | "completed" | "accepted" | "f
 export interface SubagentTranscriptEntry {
 	id: string;
 	kind: SubagentTranscriptKind;
+	initial?: boolean;
 	label?: string;
 	groupId?: string;
 	text: string;
@@ -55,6 +56,7 @@ export interface SubagentTranscriptRun {
 export interface SubagentTranscriptRenderOptions {
 	isPartial?: boolean;
 	durationMs?: number;
+	initialTasks?: readonly string[];
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -68,9 +70,16 @@ function groupKey(entry: SubagentTranscriptEntry): string {
 	return entry.groupId ?? entry.id;
 }
 
+function isInitialEntry(entry: SubagentTranscriptEntry): boolean {
+	return entry.initial === true;
+}
+
 function activityGroups(entries: SubagentTranscriptEntry[]): Map<string, number> {
 	const groups = new Map<string, number>();
-	for (const entry of entries) groups.set(groupKey(entry), Math.max(groups.get(groupKey(entry)) ?? 0, entry.order));
+	for (const entry of entries) {
+		if (isInitialEntry(entry)) continue;
+		groups.set(groupKey(entry), Math.max(groups.get(groupKey(entry)) ?? 0, entry.order));
+	}
 	return groups;
 }
 
@@ -90,14 +99,22 @@ function record(value: unknown): UnknownRecord | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : undefined;
 }
 
-function cleanText(value: string): string {
-	const clean = stripTerminalSequences(value)
+function normalizedText(value: string): string {
+	return stripTerminalSequences(value)
 		.replaceAll("\r\n", "\n")
 		.replaceAll("\r", "\n")
 		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "")
 		.trim();
+}
+
+function cleanText(value: string): string {
+	const clean = normalizedText(value);
 	if (clean.length <= MAX_ENTRY_CHARS) return clean;
 	return `[… earlier text omitted]\n${clean.slice(-(MAX_ENTRY_CHARS - 28))}`;
+}
+
+function cleanFullText(value: string): string {
+	return normalizedText(value);
 }
 
 function cleanStreamingText(value: string): string {
@@ -132,6 +149,45 @@ function toolCallText(toolCall: UnknownRecord): string {
 	return safeJson(toolCall["arguments"] ?? {});
 }
 
+function runsWithInitialTasks(
+	runs: SubagentTranscriptRun[],
+	initialTasks: readonly string[] | undefined,
+): SubagentTranscriptRun[] {
+	if (!initialTasks) return runs;
+	return runs.map((run, runIndex) => {
+		const task = initialTasks[runIndex];
+		if (task === undefined) return run;
+		const initial = {
+			id: "initial-task",
+			kind: "user" as const,
+			initial: true,
+			text: cleanFullText(task),
+			order: 0,
+		};
+		if (!run.transcript) {
+			return {
+				...run,
+				transcript: { entries: [initial], omittedEntries: 0 },
+			};
+		}
+		let found = false;
+		const entries = run.transcript.entries.map((entry) => {
+			if (!isInitialEntry(entry)) return entry;
+			found = true;
+			return { ...entry, text: initial.text };
+		});
+		if (!found) {
+			const firstUser = entries.findIndex((entry) => entry.kind === "user");
+			if (firstUser >= 0 && entries[firstUser]!.text === cleanText(task)) {
+				entries[firstUser] = { ...entries[firstUser]!, initial: true, text: initial.text };
+			} else {
+				entries.unshift(initial);
+			}
+		}
+		return { ...run, transcript: { ...run.transcript, entries } };
+	});
+}
+
 export class SubagentTranscript {
 	private readonly maxEntries: number;
 	private readonly entries: SubagentTranscriptEntry[] = [];
@@ -140,13 +196,14 @@ export class SubagentTranscript {
 	private assistantSequence = 0;
 	private userSequence = 0;
 	private anonymousResultSequence = 0;
+	private initialUserEchoPending = false;
 	private activeAssistant: number | undefined;
 	private readonly toolCallDrafts = new Map<string, string>();
 	private readonly toolCalls = new Map<string, { label: string; text: string }>();
 
 	constructor(task: string, options: SubagentTranscriptOptions = {}) {
 		this.maxEntries = Math.max(1, options.maxEntries ?? DEFAULT_MAX_ENTRIES);
-		this.addUser(task);
+		this.addUser(task, true);
 	}
 
 	ingest(value: unknown): boolean {
@@ -179,6 +236,7 @@ export class SubagentTranscript {
 
 	private messageStart(message: UnknownRecord | undefined): boolean {
 		if (message?.["role"] === "assistant") {
+			this.initialUserEchoPending = false;
 			this.activeAssistant = ++this.assistantSequence;
 			return false;
 		}
@@ -350,12 +408,22 @@ export class SubagentTranscript {
 		return this.activeAssistant;
 	}
 
-	private addUser(text: string): boolean {
-		const clean = cleanText(text);
+	private addUser(text: string, initial = false): boolean {
+		const clean = initial ? cleanFullText(text) : cleanText(text);
 		if (!clean) return false;
 		const previous = [...this.entries].reverse().find((entry) => entry.kind === "user");
+		if (initial) this.initialUserEchoPending = true;
+		else {
+			const isInitialEcho = this.initialUserEchoPending && previous?.initial === true && cleanText(previous.text) === clean;
+			if (isInitialEcho) return false;
+			this.initialUserEchoPending = false;
+		}
 		if (previous?.text === clean) return false;
-		return this.upsert(`user:${++this.userSequence}`, { kind: "user", text: clean });
+		return this.upsert(`user:${++this.userSequence}`, {
+			kind: "user",
+			text: clean,
+			...(initial ? { initial: true } : {}),
+		});
 	}
 
 	private upsert(
@@ -364,12 +432,16 @@ export class SubagentTranscript {
 		append = false,
 	): boolean {
 		const existing = this.byId.get(id);
-		const nextText = append && existing
-			? cleanStreamingText(`${existing.text}${value.text}`)
-			: cleanText(value.text);
+		const nextText = value.initial
+			? cleanFullText(append && existing ? `${existing.text}${value.text}` : value.text)
+			: append && existing
+				? cleanStreamingText(`${existing.text}${value.text}`)
+				: cleanText(value.text);
 		if (!nextText && !existing) return false;
 		if (existing) {
 			existing.kind = value.kind;
+			if (value.initial === undefined) delete existing.initial;
+			else existing.initial = value.initial;
 			if (value.label === undefined) delete existing.label;
 			else existing.label = value.label;
 			if (value.groupId === undefined) delete existing.groupId;
@@ -383,6 +455,7 @@ export class SubagentTranscript {
 		const entry: SubagentTranscriptEntry = {
 			id,
 			kind: value.kind,
+			...(value.initial ? { initial: true } : {}),
 			...(value.label ? { label: value.label } : {}),
 			...(value.groupId ? { groupId: value.groupId } : {}),
 			text: nextText,
@@ -452,12 +525,13 @@ interface LocatedGroup {
 	order: number;
 }
 
-function collectTranscriptGroups(runs: SubagentTranscriptRun[]): LocatedGroup[] {
+function collectTranscriptGroups(runs: SubagentTranscriptRun[], includeInitial = true): LocatedGroup[] {
 	const groups = new Map<string, LocatedGroup>();
 	for (let runIndex = 0; runIndex < runs.length; runIndex++) {
 		const transcript = runs[runIndex]!.transcript;
 		if (!transcript) continue;
 		for (const entry of transcript.entries) {
+			if (!includeInitial && isInitialEntry(entry)) continue;
 			const key = `${runIndex}:${entry.groupId ?? entry.id}`;
 			const group = groups.get(key);
 			if (group) {
@@ -482,7 +556,7 @@ export function boundSubagentRunTranscripts<T extends SubagentTranscriptRun>(
 	runs: T[],
 	maxEntries = DEFAULT_MAX_ENTRIES,
 ): T[] {
-	const groups = collectTranscriptGroups(runs);
+	const groups = collectTranscriptGroups(runs, false);
 	const selected = new Map<number, Set<string>>();
 	let remaining = Math.max(0, maxEntries);
 	for (let index = groups.length - 1; index >= 0; index--) {
@@ -498,12 +572,12 @@ export function boundSubagentRunTranscripts<T extends SubagentTranscriptRun>(
 	return runs.map((run, runIndex) => {
 		if (!run.transcript) return run;
 		const ids = selected.get(runIndex) ?? new Set<string>();
-		const entries = run.transcript.entries.filter((entry) => ids.has(entry.id));
+		const entries = run.transcript.entries.filter((entry) => isInitialEntry(entry) || ids.has(entry.id));
 		return {
 			...run,
 			transcript: {
 				entries,
-				omittedEntries: run.transcript.omittedEntries + run.transcript.entries.length - entries.length,
+				omittedEntries: run.transcript.omittedEntries + run.transcript.entries.filter((entry) => !isInitialEntry(entry) && !ids.has(entry.id)).length,
 			},
 		};
 	});
@@ -517,7 +591,8 @@ export function appendSubagentTranscriptFailure(
 	const entries = snapshot?.entries.map((entry) => ({ ...entry })) ?? [{
 		id: "user:1",
 		kind: "user" as const,
-		text: cleanText(task),
+		initial: true,
+		text: cleanFullText(task),
 		order: nextActivityOrder(),
 	}];
 	const order = nextActivityOrder();
@@ -529,7 +604,7 @@ export function appendSubagentTranscriptFailure(
 		order,
 	});
 	let omittedEntries = snapshot?.omittedEntries ?? 0;
-	while (entries.length > DEFAULT_MAX_ENTRIES) {
+	while (entries.filter((entry) => !isInitialEntry(entry)).length > DEFAULT_MAX_ENTRIES) {
 		const oldestGroup = oldestActivityGroup(entries);
 		if (!oldestGroup) break;
 		for (let index = entries.length - 1; index >= 0; index--) {
@@ -556,7 +631,10 @@ class BoundedTranscriptView implements Component {
 		const statusLines = this.statusLine
 			? [truncateToWidth(this.theme.fg("dim", this.statusLine), Math.max(1, width), "", true)]
 			: [];
-		const rendered = this.groups.map((group) => group.entries.flatMap((item) => this.renderEntry(item, width)));
+		const initialLines = this.renderInitial(width);
+		const rendered = this.groups
+			.map((group) => group.entries.filter((item) => !isInitialEntry(item.entry)).flatMap((item) => this.renderEntry(item, width)))
+			.filter((lines) => lines.length > 0);
 		const budget = Math.max(0, this.maxRows - headerLines.length - statusLines.length);
 		let selected = this.selectLatest(rendered, budget);
 		const hidden = this.omittedEntries > 0 || selected.hidden;
@@ -564,12 +642,20 @@ class BoundedTranscriptView implements Component {
 		const marker = hidden
 			? [truncateToWidth(this.theme.fg("dim", `… earlier activity hidden${this.omittedEntries > 0 ? ` (${this.omittedEntries}+ events)` : ""}`), Math.max(1, width), "", true)]
 			: [];
-		return [...headerLines, ...statusLines, ...marker, ...selected.lines].slice(0, this.maxRows);
+		const bounded = [...headerLines, ...statusLines, ...marker, ...selected.lines].slice(0, this.maxRows);
+		const initialIndex = Math.min(headerLines.length + statusLines.length, bounded.length);
+		return [...bounded.slice(0, initialIndex), ...initialLines, ...bounded.slice(initialIndex)];
 	}
 
 	invalidate(): void {}
 
-	private renderEntry(item: RenderEntry, width: number): string[] {
+	renderInitial(width: number): string[] {
+		const entries = this.groups.flatMap((group) => group.entries.filter((item) => isInitialEntry(item.entry)));
+		if (entries.length === 0) return [];
+		return entries.flatMap((item) => this.renderEntry(item, width, true));
+	}
+
+	private renderEntry(item: RenderEntry, width: number, unbounded = false): string[] {
 		const entry = item.entry;
 		const failed = entry.status === "failed";
 		const icon = entry.kind === "user" ? "›"
@@ -577,7 +663,8 @@ class BoundedTranscriptView implements Component {
 				: entry.kind === "thinking" ? "◇"
 					: entry.kind === "tool" ? (failed ? "✗" : entry.status === "completed" ? "✓" : "⚙")
 						: (failed ? "↳✗" : "↳");
-		const label = entry.kind === "tool" ? `tool ${entry.label ?? ""}`.trim()
+		const label = entry.initial ? "initial task"
+			: entry.kind === "tool" ? `tool ${entry.label ?? ""}`.trim()
 			: entry.kind === "toolResult" ? `result ${entry.label ?? ""}`.trim()
 				: entry.kind;
 		const scope = item.scope ? `${item.scope} · ` : "";
@@ -588,7 +675,7 @@ class BoundedTranscriptView implements Component {
 		const title = `${this.theme.fg(titleColor, `${icon} ${scope}${label}`)}${first ? this.theme.fg(bodyColor, `  ${first}`) : ""}`;
 		const rest = logical.map((line) => this.theme.fg(bodyColor, `   ${line}`));
 		const lines = new Text([title, ...rest].join("\n"), 0, 0).render(width);
-		if (lines.length <= MAX_ENTRY_ROWS) return lines;
+		if (unbounded || lines.length <= MAX_ENTRY_ROWS) return lines;
 		return [lines[0]!, this.theme.fg("dim", "   …"), ...lines.slice(-(MAX_ENTRY_ROWS - 2))];
 	}
 
@@ -719,9 +806,12 @@ class SubagentRunPanel implements Component {
 			const label = this.run.status === "accepted" ? "Control acknowledgement" : "Final answer";
 			return [...activity, this.theme.fg("dim", label), ...rendered];
 		}
+		const initial = this.run.transcript
+			? new BoundedTranscriptView("", runGroups(this.run), 0, 0, this.theme).renderInitial(width)
+			: [];
 		const preview = rendered.slice(0, 2);
 		if (rendered.length > preview.length) preview.push(this.theme.fg("dim", "… expand for full answer"));
-		return preview;
+		return [...initial, ...preview];
 	}
 
 	private renderActivity(width: number): string[] {
@@ -788,7 +878,7 @@ export function renderSubagentTranscript(
 	theme: Theme,
 	options: SubagentTranscriptRenderOptions = {},
 ): Component {
-	const boundedRuns = boundSubagentRunTranscripts(runs);
+	const boundedRuns = boundSubagentRunTranscripts(runsWithInitialTasks(runs, options.initialTasks));
 	if (boundedRuns.length > 1) {
 		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme);
 	}

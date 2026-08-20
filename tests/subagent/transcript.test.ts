@@ -75,6 +75,103 @@ test("SubagentTranscript assembles user, thinking, assistant, tool call, and too
 	assert.equal(snapshot.entries.at(-1)?.text, "Authentication is correct.");
 });
 
+test("initial task bypasses text and row caps while later user and tool activity stays bounded", () => {
+	const initialTask = [
+		"INITIAL TASK START",
+		...Array.from({ length: 24 }, (_, index) => `initial line ${index} ${"i".repeat(180)}`),
+		"INITIAL TASK END",
+	].join("\n");
+	const transcript = new SubagentTranscript(initialTask);
+	transcript.ingest({ type: "message_start", message: { role: "user", content: [{ type: "text", text: initialTask }] } });
+	transcript.ingest({
+		type: "message_end",
+		message: { role: "user", content: [{ type: "text", text: `FOLLOW-UP START ${"f".repeat(5000)} FOLLOW-UP END` }] },
+	});
+	transcript.ingest({
+		type: "tool_execution_start",
+		toolCallId: "long-tool",
+		toolName: "write",
+		args: { payload: `TOOL-ARGS-START ${"a".repeat(5000)} TOOL-ARGS-END` },
+	});
+	transcript.ingest({
+		type: "tool_execution_end",
+		toolCallId: "long-tool",
+		toolName: "write",
+		result: { content: [{ type: "text", text: `TOOL-RESULT-START ${"r".repeat(5000)} TOOL-RESULT-END` }] },
+		isError: false,
+	});
+
+	const snapshot = transcript.snapshot();
+	const initial = snapshot.entries.find((entry) => entry.initial);
+	const followUp = snapshot.entries.find((entry) => entry.kind === "user" && !entry.initial);
+	const tool = snapshot.entries.find((entry) => entry.kind === "tool");
+	const toolResult = snapshot.entries.find((entry) => entry.kind === "toolResult");
+	assert.equal(initial?.text, initialTask);
+	assert.equal(initial?.initial, true);
+	assert.equal(snapshot.entries.filter((entry) => entry.kind === "user").length, 2);
+	assert.ok(followUp && followUp.text.length <= 4000);
+	assert.ok(tool && tool.text.length <= 4000);
+	assert.ok(toolResult && toolResult.text.length <= 4000);
+	assert.doesNotMatch(followUp?.text ?? "", /FOLLOW-UP START/);
+	assert.doesNotMatch(tool?.text ?? "", /TOOL-ARGS-START/);
+	assert.doesNotMatch(toolResult?.text ?? "", /TOOL-RESULT-START/);
+
+	const rendered = renderSubagentTranscript([{
+		alias: "long-task",
+		status: "completed",
+		output: "done",
+		persistent: false,
+		transcript: snapshot,
+	}], true, theme as any).render(120).join("\n");
+	assert.match(rendered, /INITIAL TASK START/);
+	assert.match(rendered, /initial line 23/);
+	assert.match(rendered, /INITIAL TASK END/);
+	assert.doesNotMatch(rendered, /FOLLOW-UP START/);
+	assert.doesNotMatch(rendered, /TOOL-ARGS-START/);
+	assert.doesNotMatch(rendered, /TOOL-RESULT-START/);
+
+	const collapsed = renderSubagentTranscript([{
+		alias: "long-task",
+		status: "completed",
+		output: "done",
+		persistent: false,
+		transcript: snapshot,
+	}], false, theme as any).render(120).join("\n");
+	assert.match(collapsed, /initial line 23/);
+	assert.doesNotMatch(collapsed, /FOLLOW-UP START/);
+
+	const withoutInitial = (text: string): string[] => {
+		const lines = text.split("\n");
+		const start = lines.findIndex((line) => line.includes("initial task"));
+		const end = lines.findIndex((line, index) => index >= start && line.includes("INITIAL TASK END"));
+		assert.ok(start >= 0 && end >= start);
+		return [...lines.slice(0, start), ...lines.slice(end + 1)];
+	};
+	const running = {
+		alias: "long-task",
+		status: "running" as const,
+		output: "",
+		persistent: false,
+		transcript: snapshot,
+	};
+	assert.ok(withoutInitial(renderSubagentTranscript([running], false, theme as any).render(120).join("\n")).length <= 10);
+	assert.ok(withoutInitial(renderSubagentTranscript([running], true, theme as any).render(120).join("\n")).length <= 16);
+});
+
+test("a later user message is not reclassified as the initial task", () => {
+	const task = `same task ${"x".repeat(5000)}`;
+	const transcript = new SubagentTranscript(task);
+	transcript.ingest({ type: "message_start", message: { role: "user", content: [{ type: "text", text: task }] } });
+	transcript.ingest({ type: "message_start", message: { role: "assistant", content: [] } });
+	transcript.ingest({ type: "message_end", message: { role: "user", content: [{ type: "text", text: task }] } });
+
+	const users = transcript.snapshot().entries.filter((entry) => entry.kind === "user");
+	assert.equal(users.length, 2);
+	assert.equal(users[0]?.initial, true);
+	assert.equal(users[1]?.initial, undefined);
+	assert.ok((users[1]?.text.length ?? 0) <= 4000);
+});
+
 test("SubagentTranscript retains only the latest configured event window", () => {
 	const transcript = new SubagentTranscript("task", { maxEntries: 3 });
 	for (let index = 0; index < 5; index++) {
@@ -82,9 +179,10 @@ test("SubagentTranscript retains only the latest configured event window", () =>
 	}
 
 	const snapshot = transcript.snapshot();
-	assert.equal(snapshot.entries.length, 3);
-	assert.equal(snapshot.omittedEntries, 3);
-	assert.deepEqual(snapshot.entries.map((entry) => entry.text), ["answer 2", "answer 3", "answer 4"]);
+	assert.equal(snapshot.entries.length, 4);
+	assert.equal(snapshot.entries.filter((entry) => !entry.initial).length, 3);
+	assert.equal(snapshot.omittedEntries, 2);
+	assert.deepEqual(snapshot.entries.filter((entry) => !entry.initial).map((entry) => entry.text), ["answer 2", "answer 3", "answer 4"]);
 });
 
 test("SubagentTranscript surfaces assistant failures even when the model returned no text", () => {
@@ -213,6 +311,33 @@ test("parallel transcript ordering follows global activity rather than child cre
 	assert.match(text, /beta · stateless · provider\/model-b/);
 });
 
+test("grouped child panels keep each run's initial task complete and associated", () => {
+	const alphaTask = ["ALPHA INITIAL START", ...Array.from({ length: 24 }, (_, index) => `alpha line ${index} ${"a".repeat(180)}`), "ALPHA INITIAL END"].join("\n");
+	const betaTask = ["BETA INITIAL START", ...Array.from({ length: 24 }, (_, index) => `beta line ${index} ${"b".repeat(180)}`), "BETA INITIAL END"].join("\n");
+	const alpha = new SubagentTranscript(alphaTask);
+	const beta = new SubagentTranscript(betaTask);
+	for (let index = 0; index < 18; index++) {
+		alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `alpha activity ${index}` }] } });
+		beta.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `beta activity ${index}` }] } });
+	}
+	const runs = [
+		{ alias: "planner", model: "provider/model-a", status: "running" as const, output: "", persistent: false, step: 1, transcript: alpha.snapshot() },
+		{ alias: "reviewer", model: "provider/model-b", status: "running" as const, output: "", persistent: true, step: 2, transcript: beta.snapshot() },
+	];
+	const bounded = boundSubagentRunTranscripts(runs);
+	assert.equal(bounded[0]?.transcript?.entries.find((entry) => entry.initial)?.text, alphaTask);
+	assert.equal(bounded[1]?.transcript?.entries.find((entry) => entry.initial)?.text, betaTask);
+	assert.ok(bounded.reduce((total, run) => total + (run.transcript?.entries.filter((entry) => !entry.initial).length ?? 0), 0) <= 18);
+
+	const rendered = renderSubagentTranscript(runs, true, theme as any).render(120).join("\n");
+	const plannerHeader = rendered.indexOf("step 1 · planner · stateless · provider/model-a");
+	const reviewerHeader = rendered.indexOf("step 2 · reviewer · persistent · provider/model-b");
+	assert.ok(plannerHeader >= 0 && plannerHeader < rendered.indexOf("ALPHA INITIAL START"));
+	assert.ok(reviewerHeader >= 0 && reviewerHeader < rendered.indexOf("BETA INITIAL START"));
+	assert.match(rendered, /ALPHA INITIAL END/);
+	assert.match(rendered, /BETA INITIAL END/);
+});
+
 test("running parallel child panels show live usage before activity", () => {
 	const alpha = new SubagentTranscript("alpha", { maxEntries: 2 });
 	alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha old" }] } });
@@ -307,7 +432,7 @@ test("appending a failure to a full snapshot evicts complete groups", () => {
 	}
 	const failed = appendSubagentTranscriptFailure(transcript.snapshot(), "task", "crashed");
 
-	assert.ok(failed.entries.length <= 18);
+	assert.ok(failed.entries.filter((entry) => !entry.initial).length <= 18);
 	for (const result of failed.entries.filter((entry) => entry.kind === "toolResult")) {
 		assert.equal(failed.entries.some((entry) => entry.kind === "tool" && entry.groupId === result.groupId), true);
 	}
@@ -323,6 +448,7 @@ test("parallel Tool Call details retain at most 18 transcript events across all 
 	});
 
 	const bounded = boundSubagentRunTranscripts(runs);
-	assert.ok(bounded.reduce((total, run) => total + (run.transcript?.entries.length ?? 0), 0) <= 18);
+	assert.ok(bounded.reduce((total, run) => total + (run.transcript?.entries.filter((entry) => !entry.initial).length ?? 0), 0) <= 18);
+	assert.equal(bounded.reduce((total, run) => total + (run.transcript?.entries.filter((entry) => entry.initial).length ?? 0), 0), 8);
 	assert.ok(bounded.reduce((total, run) => total + (run.transcript?.omittedEntries ?? 0), 0) > 0);
 });

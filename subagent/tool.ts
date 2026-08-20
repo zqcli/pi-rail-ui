@@ -173,10 +173,20 @@ function truncateParentContent(value: string): string {
 	).value;
 }
 
+function boundDetailTranscript(snapshot: SubagentTranscriptSnapshot): SubagentTranscriptSnapshot {
+	return {
+		...snapshot,
+		entries: snapshot.entries.map((entry) => entry.initial
+			? { ...entry, text: truncateUtf8(entry.text, 8 * 1024, "\n[initial task truncated in parent details]").value }
+			: entry),
+	};
+}
+
 function boundDetailOutputs(results: StatefulSubagentRunDetails[]): StatefulSubagentRunDetails[] {
 	const metadataBounded = results.map((result) => ({
 		...result,
 		task: truncateUtf8(result.task, 8 * 1024, "\n[task truncated]").value,
+		...(result.transcript ? { transcript: boundDetailTranscript(result.transcript) } : {}),
 		...(result.errorMessage ? { errorMessage: truncateUtf8(result.errorMessage, 8 * 1024, "\n[error truncated]").value } : {}),
 	}));
 	const baseBytes = Buffer.byteLength(JSON.stringify(metadataBounded.map((result) => ({ ...result, output: "" }))), "utf8");
@@ -307,6 +317,13 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 		...(params.session && sessionPath ? { session: { mode: params.session.mode, path: sessionPath } } : {}),
 		...confirmSessionAttach,
 	};
+}
+
+function initialTasksForRender(args: SubagentParamsValue | undefined): string[] {
+	if (args?.chain?.length) return args.chain.map((item) => item.task);
+	if (args?.tasks?.length) return args.tasks.map((item) => item.task);
+	const task = nonEmpty(args?.task);
+	return task ? [task] : [];
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -629,7 +646,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},
 
-		renderResult(result, { expanded, isPartial }, theme) {
+		renderResult(result, { expanded, isPartial }, theme, context) {
 			const details = result.details as StatefulSubagentDetails | undefined;
 			if (!details?.results.length) {
 				const content = result.content[0];
@@ -638,6 +655,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			return renderSubagentTranscript(details.results, expanded, theme, {
 				isPartial,
 				durationMs: details.durationMs,
+				initialTasks: initialTasksForRender(context?.args),
 			});
 		},
 	});

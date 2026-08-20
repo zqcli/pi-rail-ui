@@ -327,6 +327,154 @@ test("parallel parent content is fair and details keep a bounded retained answer
 	assert.ok(Buffer.byteLength(JSON.stringify(result.details), "utf8") <= 512 * 1024);
 });
 
+test("full initial task rendering stays out of bounded parent details", async () => {
+	let tool: any;
+	const initialTask = [
+		"FULL INITIAL TASK START",
+		...Array.from({ length: 80 }, (_, index) => `initial detail ${index} ${"x".repeat(220)}`),
+		"FULL INITIAL TASK END",
+	].join("\n");
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+		runStateless: async (request) => ({
+			output: "done",
+			exitCode: 0,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+			transcript: new SubagentTranscript(request.task).snapshot(),
+		}),
+	});
+
+	const result = await tool.execute("call-full-initial", {
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		task: initialTask,
+	}, undefined, undefined, context());
+	const detailInitial = result.details.results[0].transcript.entries.find((entry: any) => entry.initial);
+	assert.ok(detailInitial);
+	assert.notEqual(detailInitial.text, initialTask);
+	assert.match(detailInitial.text, /initial task truncated in parent details/);
+	assert.ok(Buffer.byteLength(JSON.stringify(result.details), "utf8") <= 512 * 1024);
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const restored = structuredClone(result);
+	const panel = tool.renderResult(restored, { expanded: false }, theme, {
+		args: { model: "cus-resp/gpt-5.6-sol:xhigh", task: initialTask },
+	}).render(120).join("\n");
+	assert.match(panel, /FULL INITIAL TASK START/);
+	assert.match(panel, /FULL INITIAL TASK END/);
+
+	const legacy = structuredClone(result);
+	for (const entry of legacy.details.results[0].transcript.entries) {
+		delete entry.initial;
+		if (entry.kind === "user") entry.text = `[… earlier text omitted]\n${initialTask.slice(-(4000 - 28))}`;
+	}
+	const legacyPanel = tool.renderResult(legacy, { expanded: false }, theme, {
+		args: { model: "cus-resp/gpt-5.6-sol:xhigh", task: initialTask },
+	}).render(120).join("\n");
+	assert.equal((legacyPanel.match(/initial task/gu) ?? []).length, 1);
+	assert.match(legacyPanel, /FULL INITIAL TASK END/);
+});
+
+test("legacy restored details keep a follow-up user entry separate when the initial was evicted", async () => {
+	let tool: any;
+	const initialTask = [
+		"EVICTED INITIAL START",
+		...Array.from({ length: 80 }, (_, index) => `initial detail ${index} ${"q".repeat(220)}`),
+		"EVICTED INITIAL END",
+	].join("\n");
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+		runStateless: async (request) => ({
+			output: "done",
+			exitCode: 0,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+			transcript: new SubagentTranscript(request.task).snapshot(),
+		}),
+	});
+	const result = await tool.execute("call-legacy-evicted", {
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		task: initialTask,
+	}, undefined, undefined, context());
+	const legacy = structuredClone(result);
+	const firstUser = legacy.details.results[0].transcript.entries.find((entry: any) => entry.kind === "user");
+	assert.ok(firstUser);
+	delete firstUser.initial;
+	firstUser.text = "FOLLOW-UP AFTER INITIAL EVICTION";
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const panel = tool.renderResult(legacy, { expanded: true }, theme, {
+		args: { model: "cus-resp/gpt-5.6-sol:xhigh", task: initialTask },
+	}).render(120).join("\n");
+	assert.equal((panel.match(/initial task/gu) ?? []).length, 1);
+	assert.match(panel, /EVICTED INITIAL END/);
+	assert.match(panel, /FOLLOW-UP AFTER INITIAL EVICTION/);
+});
+
+test("restored grouped panels recover parallel and chain initial tasks from render args", async () => {
+	let tool: any;
+	const makeTask = (label: string) => [
+		`${label} START`,
+		...Array.from({ length: 50 }, (_, index) => `${label} detail ${index} ${"y".repeat(220)}`),
+		`${label} END`,
+	].join("\n");
+	const parallelTasks = [makeTask("PARALLEL ALPHA"), makeTask("PARALLEL BETA")];
+	const chainTasks = [makeTask("CHAIN FIRST"), makeTask("CHAIN SECOND")];
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+		runStateless: async (request) => ({
+			output: `done ${request.task.slice(0, 24)}`,
+			exitCode: 0,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+			transcript: new SubagentTranscript(request.task).snapshot(),
+		}),
+	});
+	const parallel = await tool.execute("call-restored-parallel", {
+		tasks: parallelTasks.map((task) => ({ model: "cus-resp/gpt-5.6-sol:xhigh", task })),
+	}, undefined, undefined, context());
+	const chain = await tool.execute("call-restored-chain", {
+		chain: chainTasks.map((task) => ({ model: "cus-resp/gpt-5.6-sol:xhigh", task })),
+	}, undefined, undefined, context());
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+	const parallelPanel = tool.renderResult(structuredClone(parallel), { expanded: false }, theme, {
+		args: { tasks: parallelTasks.map((task) => ({ model: "cus-resp/gpt-5.6-sol:xhigh", task })) },
+	}).render(120).join("\n");
+	assert.match(parallelPanel, /PARALLEL ALPHA START/);
+	assert.match(parallelPanel, /PARALLEL ALPHA END/);
+	assert.match(parallelPanel, /PARALLEL BETA START/);
+	assert.match(parallelPanel, /PARALLEL BETA END/);
+	assert.ok(parallelPanel.indexOf("PARALLEL ALPHA START") < parallelPanel.indexOf("PARALLEL BETA START"));
+
+	const chainPanel = tool.renderResult(structuredClone(chain), { expanded: false }, theme, {
+		args: { chain: chainTasks.map((task) => ({ model: "cus-resp/gpt-5.6-sol:xhigh", task })) },
+	}).render(120).join("\n");
+	assert.match(chainPanel, /CHAIN FIRST START/);
+	assert.match(chainPanel, /CHAIN FIRST END/);
+	assert.match(chainPanel, /CHAIN SECOND START/);
+	assert.match(chainPanel, /CHAIN SECOND END/);
+	assert.ok(chainPanel.indexOf("CHAIN FIRST START") < chainPanel.indexOf("CHAIN SECOND START"));
+});
+
+test("restored control panels keep control messages bounded and out of initial-task rendering", async () => {
+	let tool: any;
+	const message = ["CONTROL TASK START", ...Array.from({ length: 50 }, (_, index) => `control detail ${index} ${"z".repeat(220)}`), "CONTROL TASK END"].join("\n");
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+	});
+	const result = await tool.execute("call-restored-control", {
+		target: "auth-review",
+		control: { delivery: "steer", message },
+	}, undefined, undefined, context());
+	assert.ok(Buffer.byteLength(result.details.results[0].task, "utf8") <= 8 * 1024);
+	assert.notEqual(result.details.results[0].task, message);
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const panel = tool.renderResult(structuredClone(result), { expanded: false }, theme, {
+		args: { target: "auth-review", control: { delivery: "steer", message } },
+	}).render(120).join("\n");
+	assert.match(panel, /Steer accepted by auth-review/);
+	assert.doesNotMatch(panel, /CONTROL TASK END/);
+	assert.doesNotMatch(panel, /initial task/);
+});
+
 test("an aborted parallel call does not create not-yet-dispatched persistent sessions", async () => {
 	let tool: any;
 	const broker = new FakeBroker();

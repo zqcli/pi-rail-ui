@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const STATUS_KEY = "railfast";
+const STATUS_KEY = "rail-oai-fast";
 const SUPPORTED_APIS = new Set([
 	"openai-completions",
 	"openai-responses",
@@ -76,14 +76,14 @@ function notifyStatus(ctx: ExtensionContext): void {
 }
 
 export function installRailFast(pi: ExtensionAPI): void {
-	pi.registerCommand("railfast", {
+	pi.registerCommand("rail-oai-fast", {
 		description: "Toggle Pi native OpenAI fast mode for the current model",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
 			if (action === "on") enabled = true;
 			else if (action === "off") enabled = false;
 			else if (action !== "status") {
-				if (ctx.hasUI) ctx.ui.notify("Usage: /railfast on|off|status", "warning");
+				if (ctx.hasUI) ctx.ui.notify("Usage: /rail-oai-fast on|off|status", "warning");
 				return;
 			}
 

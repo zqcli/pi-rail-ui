@@ -103,12 +103,12 @@ Pi Rail UI 注册了以下 slash 命令：
 
 使用 Pi 原生 overlay 显示当前 Rail session 摘要。
 
-### `/railfast`
+### `/rail-oai-fast`
 
 切换当前模型的 Pi 0.84 原生 OpenAI-compatible priority service tier：
 
 ```text
-/railfast on|off|status
+/rail-oai-fast on|off|status
 ```
 
 该命令临时覆盖 `model.samplingParams.service_tier`；关闭、切换模型或 session shutdown 时会恢复原值。不维护模型白名单，也不重写 provider payload。

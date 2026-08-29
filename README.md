@@ -104,12 +104,12 @@ This is useful for exploring alternative approaches or experimenting with differ
 
 Shows the current Rail session summary in a Pi-native overlay.
 
-### `/railfast`
+### `/rail-oai-fast`
 
 Toggles Pi 0.84's native OpenAI-compatible priority service tier for the current model:
 
 ```text
-/railfast on|off|status
+/rail-oai-fast on|off|status
 ```
 
 The command temporarily overlays `model.samplingParams.service_tier` and restores the model's original value when disabled, when switching models, and when the session shuts down. It does not maintain a model allowlist or rewrite provider payloads.

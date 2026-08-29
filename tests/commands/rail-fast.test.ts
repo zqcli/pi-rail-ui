@@ -40,14 +40,18 @@ test("applies and restores service_tier through model samplingParams", () => {
 	assert.equal("samplingParams" in modelWithoutParams, false);
 });
 
-test("/railfast toggles the native model parameter without a provider hook", async () => {
+test("/rail-oai-fast toggles the native model parameter without a provider hook", async () => {
 	restoreNativeFastMode();
+	let commandName: string | undefined;
 	let command: any;
 	const handlers = new Map<string, any>();
 	const notices: string[] = [];
 	const statuses: Array<string | undefined> = [];
 	const pi = {
-		registerCommand: (_name: string, definition: any) => { command = definition; },
+		registerCommand: (name: string, definition: any) => {
+			commandName = name;
+			command = definition;
+		},
 		on: (event: string, handler: any) => { handlers.set(event, handler); },
 	};
 	const ctx: any = {
@@ -60,6 +64,7 @@ test("/railfast toggles the native model parameter without a provider hook", asy
 	};
 
 	installRailFast(pi as any);
+	assert.equal(commandName, "rail-oai-fast");
 	assert.equal(handlers.has("before_provider_request"), false);
 	await handlers.get("session_start")({}, ctx);
 	await command.handler("on", ctx);

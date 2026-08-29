@@ -32,6 +32,7 @@ let mode: RailOaiSearchMode = "off";
 let activeForCurrentModel = false;
 let turnActive = false;
 let searchRunning = false;
+let probeNextRequest = false;
 
 function isRecord(value: unknown): value is JsonObject {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -130,7 +131,7 @@ function updateStatus(ctx: ExtensionContext): void {
 		? "SEARCHING"
 		: mode === "off"
 		? undefined
-		: `SEARCH ${mode.toUpperCase()}${activeForCurrentModel ? "" : " (inactive)"}`;
+		: `SEARCH ${mode.toUpperCase()}${activeForCurrentModel ? "" : " (inactive)"}${probeNextRequest ? " · PROBE NEXT" : ""}`;
 	ctx.ui.setStatus(STATUS_KEY, status);
 }
 
@@ -158,17 +159,22 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 		description: "Set GPT native web search mode",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
-			if (action !== "live" && action !== "cached" && action !== "off") {
-				if (ctx.hasUI) ctx.ui.notify("Usage: /rail-oai-search live|cached|off", "warning");
+			if (action !== "live" && action !== "cached" && action !== "off" && action !== "probe") {
+				if (ctx.hasUI) ctx.ui.notify("Usage: /rail-oai-search live|cached|off|probe", "warning");
 				return;
 			}
 
 			await ctx.waitForIdle();
-			mode = action;
+			mode = action === "probe" ? "live" : action;
+			probeNextRequest = action === "probe";
 			searchRunning = false;
 			capture.sync(ctx, mode !== "off" && isActiveSearchModel(ctx.model));
 			updateStatus(ctx);
-			notifyStatus(ctx);
+			if (action === "probe") {
+				if (ctx.hasUI) ctx.ui.notify("Rail native search probe armed for the next eligible request.", "info");
+			} else {
+				notifyStatus(ctx);
+			}
 		},
 	});
 
@@ -176,6 +182,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 		mode = "off";
 		turnActive = false;
 		searchRunning = false;
+		probeNextRequest = false;
 		restoreHostedSearchActivities(ctx.sessionManager.getBranch());
 		capture.sync(ctx, false);
 		updateStatus(ctx);
@@ -217,7 +224,18 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 
 	pi.on("before_provider_request", async (event, ctx) => {
 		const transformed = transformNativeSearchPayload(ctx.model, turnActive ? mode : "off", event.payload);
-		return transformed === event.payload ? undefined : transformed;
+		if (transformed === event.payload) return undefined;
+		if (!probeNextRequest || !isRecord(transformed)) return transformed;
+		probeNextRequest = false;
+		updateStatus(ctx);
+		return {
+			...transformed,
+			tool_choice: {
+				type: "allowed_tools",
+				mode: "required",
+				tools: [{ type: "web_search" }],
+			},
+		};
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -225,6 +243,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 		activeForCurrentModel = false;
 		turnActive = false;
 		searchRunning = false;
+		probeNextRequest = false;
 		capture.shutdown();
 	});
 }

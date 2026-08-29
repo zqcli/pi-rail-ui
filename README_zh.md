@@ -120,10 +120,12 @@ Pi Rail UI 注册了以下 slash 命令：
 设置当前 session 中 GPT 模型的原生 hosted web search 模式：
 
 ```text
-/rail-oai-search live|cached|off
+/rail-oai-search live|cached|off|probe
 ```
 
 `live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。是否生效只根据 model ID 或显示名称中是否包含 `gpt` 判断，不限制 provider。Rail 仅修改 Responses 形态的 payload，在该请求中替换冲突的本地或 hosted `web_search`，保留已有 `include` 并请求 source metadata。切换到非 GPT 模型后，当前模式会保持为 inactive；切回 GPT 模型时自动恢复。
+
+`probe` 是一次性诊断模式：它会切换到 `live`，强制下一次 eligible Responses 请求调用 hosted `web_search`，随后立即恢复普通 `live`/`auto` 行为。它只用于验证 provider 注入和搜索活动面板，不改变正常搜索语义。
 
 对于可安全包装的 `openai-responses` 和 `azure-openai-responses` SSE provider，Rail 还会旁路观察真实 hosted `web_search_call` 流，并在对应 Assistant turn 内插入一个搜索活动区。只有观察到真实 hosted call 后才显示；搜索中自动展开，成功后自动折叠，并以有界列表展示动作和来源链接；可单击或按 `Ctrl+O` 展开/折叠。完成态 snapshot 作为 session custom entry 保存，不会进入 LLM context。Rail 不覆盖 native extension provider，也不改变 Codex 默认 WebSocket transport；这些路径仍可使用 hosted search，但只显示最终回答。
 

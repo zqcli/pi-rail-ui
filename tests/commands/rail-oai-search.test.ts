@@ -215,6 +215,26 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 	assert.deepEqual(cachedPayload.tools, [{ type: "web_search", external_web_access: false }]);
 	await handlers.get("turn_end")({ message: { provider: "another", model: "custom-gpt", stopReason: "stop" } }, ctx);
 
+	await command.handler("probe", ctx);
+	assert.equal(statuses.at(-1), "SEARCH LIVE · PROBE NEXT");
+	await handlers.get("turn_start")({}, ctx);
+	const probePayload = await handlers.get("before_provider_request")(
+		{ payload: { model: "custom-gpt", input: [], tools: [{ type: "function", name: "read" }] } },
+		ctx,
+	);
+	assert.deepEqual(probePayload.tool_choice, {
+		type: "allowed_tools",
+		mode: "required",
+		tools: [{ type: "web_search" }],
+	});
+	assert.equal(statuses.at(-1), "SEARCH LIVE");
+	const afterProbePayload = await handlers.get("before_provider_request")(
+		{ payload: { model: "custom-gpt", input: [] } },
+		ctx,
+	);
+	assert.equal(afterProbePayload.tool_choice, undefined);
+	await handlers.get("turn_end")({ message: { provider: "another", model: "custom-gpt", stopReason: "stop" } }, ctx);
+
 	await command.handler("off", ctx);
 	assert.equal(statuses.at(-1), undefined);
 	assert.equal(
@@ -226,8 +246,8 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 	);
 
 	await command.handler("status", ctx);
-	assert.match(notices.at(-1) ?? "", /Usage: \/rail-oai-search live\|cached\|off/);
-	assert.equal(waitForIdleCalls, 3);
+	assert.match(notices.at(-1) ?? "", /Usage: \/rail-oai-search live\|cached\|off\|probe/);
+	assert.equal(waitForIdleCalls, 4);
 	await handlers.get("session_shutdown")({}, ctx);
 });
 

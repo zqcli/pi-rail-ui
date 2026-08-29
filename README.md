@@ -121,10 +121,12 @@ It is active for Pi's documented `samplingParams` request paths: `openai-complet
 Sets the session-local native hosted web-search mode for GPT models:
 
 ```text
-/rail-oai-search live|cached|off
+/rail-oai-search live|cached|off|probe
 ```
 
 `live` allows external web access, while `cached` restricts the hosted tool to cached content. Eligibility is based on `gpt` appearing in the model ID or display name, regardless of provider. Rail only modifies Responses-shaped payloads, replaces competing local or hosted `web_search` tools for that request, and preserves existing `include` entries while requesting source metadata. Switching to a non-GPT model keeps the selected mode inactive so it resumes automatically after switching back.
+
+`probe` is a one-shot diagnostic mode: it switches to `live`, requires the next eligible Responses request to call hosted `web_search`, then immediately returns to normal `live`/`auto` behavior. It is intended to verify provider injection and the activity panel without changing regular search semantics.
 
 For safely wrappable `openai-responses` and `azure-openai-responses` SSE providers, Rail also observes the real hosted `web_search_call` stream and places one activity section inside the corresponding Assistant turn. The section stays invisible until a hosted call is observed, expands while searching, collapses after success, and lists bounded actions and source links; click it or use `Ctrl+O` to expand/collapse it. Completed snapshots are stored as session custom entries and never enter the LLM context. Native extension providers and Codex's default WebSocket transport are intentionally not overridden, so those paths still receive hosted search but show only the final answer.
 

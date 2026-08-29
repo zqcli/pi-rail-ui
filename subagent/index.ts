@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import {
 	getAgentDir,
+	getMarkdownTheme,
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -100,6 +101,7 @@ export default function installStatefulSubagent(pi: ExtensionAPI): void {
 	installStatefulSubagentTool(pi, {
 		broker: () => getRuntime().broker,
 		runStateless: createStatelessAgentRunner(),
+		getMarkdownTheme,
 	});
 
 	const installAutocomplete = (ctx: ExtensionContext) => {

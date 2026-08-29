@@ -1,5 +1,5 @@
-import type { Component } from "@earendil-works/pi-tui";
-import { stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { Component, MarkdownTheme } from "@earendil-works/pi-tui";
+import { Markdown, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_MAX_ENTRIES = 18;
@@ -51,12 +51,14 @@ export interface SubagentTranscriptRun {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	outputTruncated?: boolean;
 }
 
 export interface SubagentTranscriptRenderOptions {
 	isPartial?: boolean;
 	durationMs?: number;
 	initialTasks?: readonly string[];
+	markdownTheme?: MarkdownTheme;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -115,6 +117,10 @@ function cleanText(value: string): string {
 
 function cleanFullText(value: string): string {
 	return normalizedText(value);
+}
+
+function cleanDisplayText(value: string, fallback: string): string {
+	return cleanFullText(value) || fallback;
 }
 
 function cleanStreamingText(value: string): string {
@@ -743,6 +749,13 @@ function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
 	return theme.fg("success", "✓");
 }
 
+function canRenderAnswerMarkdown(run: SubagentTranscriptRun): boolean {
+	return run.status === "completed"
+		&& run.stopReason !== "length"
+		&& !run.outputTruncated
+		&& !run.output.includes("[Final answer truncated in the parent session details.");
+}
+
 function runGroups(run: SubagentTranscriptRun): RenderGroup[] {
 	return collectTranscriptGroups([run]).map((group) => ({
 		order: group.order,
@@ -751,13 +764,22 @@ function runGroups(run: SubagentTranscriptRun): RenderGroup[] {
 }
 
 class SubagentRunPanel implements Component {
+	private readonly answer: string;
+	private readonly answerMarkdown: Markdown | undefined;
+
 	constructor(
 		private readonly run: SubagentTranscriptRun,
 		private readonly expanded: boolean,
 		private readonly terminal: boolean,
 		private readonly boxed: boolean,
 		private readonly theme: Theme,
-	) {}
+		markdownTheme?: MarkdownTheme,
+	) {
+		this.answer = cleanDisplayText(run.output || run.errorMessage || "", "(no output)");
+		this.answerMarkdown = terminal && expanded && canRenderAnswerMarkdown(run) && markdownTheme
+			? new Markdown(this.answer, 0, 0, markdownTheme)
+			: undefined;
+	}
 
 	render(width: number): string[] {
 		const boxed = this.boxed && width >= 3;
@@ -783,11 +805,12 @@ class SubagentRunPanel implements Component {
 		return result;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.answerMarkdown?.invalidate();
+	}
 
 	private renderCompleted(width: number): string[] {
-		const answer = this.run.output || this.run.errorMessage || "(no output)";
-		const rendered = new Text(answer, 0, 0).render(width);
+		const rendered = this.answerMarkdown?.render(width) ?? new Text(this.answer, 0, 0).render(width);
 		if (this.expanded) {
 			const activity = this.run.transcript
 				? new BoundedTranscriptView(
@@ -810,7 +833,7 @@ class SubagentRunPanel implements Component {
 	}
 
 	private renderActivity(width: number): string[] {
-		if (!this.run.transcript) return new Text(this.run.output || "(running...)", 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
+		if (!this.run.transcript) return new Text(cleanDisplayText(this.run.output, "(running...)"), 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
 		const view = new BoundedTranscriptView(
 			this.theme.fg("dim", "Activity"),
 			runGroups(this.run),
@@ -823,12 +846,24 @@ class SubagentRunPanel implements Component {
 }
 
 class MultiSubagentPanelView implements Component {
+	private readonly panels: SubagentRunPanel[];
+
 	constructor(
 		private readonly runs: SubagentTranscriptRun[],
-		private readonly expanded: boolean,
+		expanded: boolean,
 		private readonly durationMs: number | undefined,
 		private readonly theme: Theme,
-	) {}
+		markdownTheme?: MarkdownTheme,
+	) {
+		this.panels = runs.map((run) => new SubagentRunPanel(
+			run,
+			expanded,
+			run.status !== "running",
+			true,
+			theme,
+			markdownTheme,
+		));
+	}
 
 	render(width: number): string[] {
 		const completed = this.runs.filter((run) => run.status === "completed").length;
@@ -857,14 +892,15 @@ class MultiSubagentPanelView implements Component {
 			truncateToWidth(this.theme.fg("toolTitle", this.theme.bold(summary)), width, "", true),
 			...(metrics ? [truncateToWidth(this.theme.fg("dim", metrics), width, "", true)] : []),
 		];
-		for (const run of this.runs) {
-			const terminal = run.status !== "running";
-			lines.push(...new SubagentRunPanel(run, this.expanded, terminal, true, this.theme).render(width));
+		for (const panel of this.panels) {
+			lines.push(...panel.render(width));
 		}
 		return lines;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		for (const panel of this.panels) panel.invalidate();
+	}
 }
 
 export function renderSubagentTranscript(
@@ -875,11 +911,11 @@ export function renderSubagentTranscript(
 ): Component {
 	const boundedRuns = boundSubagentRunTranscripts(runsWithInitialTasks(runs, options.initialTasks));
 	if (boundedRuns.length > 1) {
-		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme);
+		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme, options.markdownTheme);
 	}
 	const only = boundedRuns[0];
 	if (only && only.status !== "running") {
-		return new SubagentRunPanel(only, expanded, true, false, theme);
+		return new SubagentRunPanel(only, expanded, true, false, theme, options.markdownTheme);
 	}
 	const completed = boundedRuns.filter((run) => run.status === "completed").length;
 	const accepted = boundedRuns.filter((run) => run.status === "accepted").length;
@@ -914,7 +950,7 @@ export function renderSubagentTranscript(
 				entry: {
 					id: `fallback:${run.alias}`,
 					kind: "assistant",
-					text: run.output || "(running...)",
+					text: cleanDisplayText(run.output, "(running...)"),
 					status: run.status,
 					order: 0,
 				},

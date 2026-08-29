@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type MarkdownTheme, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import {
 	railModelKey,
@@ -104,6 +104,26 @@ export interface StatefulSubagentDetails {
 export interface StatefulSubagentToolOptions {
 	broker: SessionBroker | (() => SessionBroker);
 	runStateless?: StatelessAgentRunner;
+	getMarkdownTheme?: () => MarkdownTheme;
+}
+
+function markdownThemeFromTheme(theme: Theme): MarkdownTheme {
+	return {
+		heading: (text) => theme.fg("mdHeading", text),
+		link: (text) => theme.fg("mdLink", text),
+		linkUrl: (text) => theme.fg("mdLinkUrl", text),
+		code: (text) => theme.fg("mdCode", text),
+		codeBlock: (text) => theme.fg("mdCodeBlock", text),
+		codeBlockBorder: (text) => theme.fg("mdCodeBlockBorder", text),
+		quote: (text) => theme.fg("mdQuote", text),
+		quoteBorder: (text) => theme.fg("mdQuoteBorder", text),
+		hr: (text) => theme.fg("mdHr", text),
+		listBullet: (text) => theme.fg("mdListBullet", text),
+		bold: (text) => theme.bold(text),
+		italic: (text) => theme.italic(text),
+		strikethrough: (text) => theme.strikethrough(text),
+		underline: (text) => theme.underline(text),
+	};
 }
 
 type TaskParams = {
@@ -656,6 +676,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				isPartial,
 				durationMs: details.durationMs,
 				initialTasks: initialTasksForRender(context?.args),
+				markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),
 			});
 		},
 	});

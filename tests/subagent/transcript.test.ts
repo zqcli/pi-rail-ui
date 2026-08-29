@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { type MarkdownTheme, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	appendSubagentTranscriptFailure,
 	boundSubagentRunTranscripts,
@@ -12,6 +12,23 @@ import {
 const theme = {
 	fg: (_color: string, text: string) => text,
 	bold: (text: string) => text,
+};
+
+const markdownTheme: MarkdownTheme = {
+	heading: (text) => text,
+	link: (text) => text,
+	linkUrl: (text) => text,
+	code: (text) => text,
+	codeBlock: (text) => text,
+	codeBlockBorder: (text) => text,
+	quote: (text) => text,
+	quoteBorder: (text) => text,
+	hr: (text) => text,
+	listBullet: (text) => text,
+	bold: (text) => text,
+	italic: (text) => text,
+	strikethrough: (text) => text,
+	underline: (text) => text,
 };
 
 test("SubagentTranscript assembles user, thinking, assistant, tool call, and tool result events", () => {
@@ -269,6 +286,90 @@ test("completed expanded panels show the full final answer and usage metrics", (
 	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("Final answer"));
 	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("final answer line 0"));
 	assert.ok(expanded.split("\n").length > 16);
+});
+
+test("expanded completed answers render markdown while collapsed and unsafe terminal output stay literal", () => {
+	const output = [
+		"# Markdown heading",
+		"",
+		"A **bold** result with `inline code`.",
+		"",
+		"- first item",
+		"- second item",
+		"",
+		"```ts",
+		"const answer = 42;",
+		"```",
+	].join("\n");
+	const completed = {
+		alias: "markdown",
+		status: "completed" as const,
+		output,
+		persistent: false,
+	};
+	const collapsed = renderSubagentTranscript([completed], false, theme as any, { markdownTheme }).render(100).join("\n");
+	const expanded = renderSubagentTranscript([completed], true, theme as any, { markdownTheme }).render(100).join("\n");
+
+	assert.match(collapsed, /# Markdown heading/);
+	assert.doesNotMatch(expanded, /# Markdown heading/);
+	assert.match(expanded, /Markdown heading/);
+	assert.doesNotMatch(expanded, /\*\*bold\*\*/);
+	assert.match(expanded, /A bold result with inline code\./);
+	assert.match(expanded, /  const answer = 42;/);
+
+	for (const run of [
+		{ ...completed, alias: "truncated", outputTruncated: true },
+		{ ...completed, alias: "length", stopReason: "length" },
+		{ ...completed, alias: "legacy-truncated", output: `${output}\n\n[Final answer truncated in the parent session details.]` },
+		{ ...completed, alias: "failed", status: "failed" as const },
+		{ ...completed, alias: "control", status: "accepted" as const },
+	]) {
+		const text = renderSubagentTranscript([run], true, theme as any, { markdownTheme }).render(100).join("\n");
+		assert.match(text, /# Markdown heading/);
+		assert.match(text, /\*\*bold\*\*/);
+	}
+
+	const escaped = renderSubagentTranscript([{
+		...completed,
+		alias: "escaped",
+		output: "\u001b]8;;https://example.com\u0007# Safe heading\u001b]8;;\u0007\n\n**safe**",
+	}], true, theme as any, { markdownTheme }).render(100).join("\n");
+	assert.doesNotMatch(escaped, /\u001b|\u0007/);
+	assert.doesNotMatch(escaped, /# Safe heading/);
+	assert.doesNotMatch(escaped, /\*\*safe\*\*/);
+});
+
+test("parallel completed child markdown stays cached and within panel width", () => {
+	let headingRenders = 0;
+	const countingTheme: MarkdownTheme = {
+		...markdownTheme,
+		heading: (text) => {
+			headingRenders++;
+			return text;
+		},
+	};
+	const view = renderSubagentTranscript([
+		{ alias: "alpha", model: "provider/a", status: "completed", output: "# Alpha\n\n**done**", persistent: false },
+		{ alias: "beta", model: "provider/b", status: "failed", output: "# Beta\n\n**failed**", persistent: true },
+	], true, theme as any, { markdownTheme: countingTheme });
+	const first = view.render(72).join("\n");
+	const rendersAfterFirst = headingRenders;
+	const secondLines = view.render(72);
+
+	assert.doesNotMatch(first, /# Alpha/);
+	assert.doesNotMatch(first, /\*\*done\*\*/);
+	assert.match(first, /# Beta/);
+	assert.match(first, /\*\*failed\*\*/);
+	assert.ok(rendersAfterFirst > 0);
+	assert.equal(headingRenders, rendersAfterFirst);
+	assert.ok(secondLines.every((line) => visibleWidth(line) <= 72));
+	for (const width of [1, 2, 10, 30]) {
+		assert.ok(view.render(width).every((line) => visibleWidth(line) <= width));
+	}
+
+	view.invalidate();
+	view.render(72);
+	assert.ok(headingRenders > rendersAfterFirst);
 });
 
 test("parallel runs render as independent panels with aggregate wall usage", () => {

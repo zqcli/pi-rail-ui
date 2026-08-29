@@ -115,6 +115,16 @@ Pi Rail UI 注册了以下 slash 命令：
 
 生效范围是 Pi 文档明确透传 `samplingParams` 的 `openai-completions`、`openai-responses` 和 `azure-openai-responses`。`openai-codex-responses` 会显示为 inactive，因为 Pi 0.84.1 的 Codex builder 使用独立 `serviceTier` option，并不会转发模型 `samplingParams`。
 
+### `/rail-oai-search`
+
+设置当前 session 中 GPT 模型的原生 hosted web search 模式：
+
+```text
+/rail-oai-search live|cached|off
+```
+
+`live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。是否生效只根据 model ID 或显示名称中是否包含 `gpt` 判断，不限制 provider。Rail 仅修改 Responses 形态的 payload，在该请求中替换冲突的本地或 hosted `web_search`，保留已有 `include` 并请求 source metadata。切换到非 GPT 模型后，当前模式会保持为 inactive；切回 GPT 模型时自动恢复。Pi 0.84.4 当前可以渲染最终回答，但不会暴露 hosted search call 状态或结构化 citation annotations。
+
 ## 主要功能
 
 ### 1. 基于 Rail 的输入框界面

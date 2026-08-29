@@ -116,6 +116,16 @@ The command temporarily overlays `model.samplingParams.service_tier` and restore
 
 It is active for Pi's documented `samplingParams` request paths: `openai-completions`, `openai-responses`, and `azure-openai-responses`. `openai-codex-responses` remains inactive because Pi 0.84.1's Codex builder uses a separate `serviceTier` option and does not forward model `samplingParams`.
 
+### `/rail-oai-search`
+
+Sets the session-local native hosted web-search mode for GPT models:
+
+```text
+/rail-oai-search live|cached|off
+```
+
+`live` allows external web access, while `cached` restricts the hosted tool to cached content. Eligibility is based on `gpt` appearing in the model ID or display name, regardless of provider. Rail only modifies Responses-shaped payloads, replaces competing local or hosted `web_search` tools for that request, and preserves existing `include` entries while requesting source metadata. Switching to a non-GPT model keeps the selected mode inactive so it resumes automatically after switching back. Pi 0.84.4 currently renders the final answer but does not expose hosted search-call status or structured citation annotations.
+
 ## Main Features
 
 ### 1. Rail-Based Editor Surface

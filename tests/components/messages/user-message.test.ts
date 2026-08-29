@@ -70,27 +70,10 @@ test("preserves native user Markdown transformers and outputPad", async () => {
 	const rendered = stripAnsi(component.render(80).join("\n"));
 
 	assert.equal(contentBox.paddingX, 0);
-	if ("markdownTransformers" in component) {
-		assert.match(rendered, /transformed user message/);
-		assert.deepEqual(transformContexts.at(-1), {
-			messageType: "user",
-			isStreaming: false,
-			availableWidth: 79,
-		});
-	} else {
-		assert.match(rendered, /native user message/);
-	}
-});
-
-test("keeps compatibility with the pre-0.80.3 contentBox layout", async () => {
-	const text = "legacy user message";
-	const timestamp = new Date(2026, 0, 3, 10, 25).getTime();
-
-	await installUserMessageRail(extensionContextWithUserMessage(text, timestamp));
-	const component = new UserMessageComponent(text) as any;
-	component.contentBox = component.children[0];
-	component.children = [];
-	const rendered = component.render(80).map(stripAnsi).join("\n");
-
-	assert.match(rendered, /10:25 AM · 1\/3\/2026/);
+	assert.match(rendered, /transformed user message/);
+	assert.deepEqual(transformContexts.at(-1), {
+		messageType: "user",
+		isStreaming: false,
+		availableWidth: 79,
+	});
 });

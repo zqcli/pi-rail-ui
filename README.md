@@ -4,6 +4,8 @@ Pi Rail UI is a local visual extension for the Pi coding agent. It adds a rail-b
 
 It customizes visual surfaces and tool presentation while preserving Pi's normal editor behavior, keybindings, and native TUI features.
 
+Pi Rail UI requires Pi `0.84.4`. Earlier Pi releases, including `0.84.2`, are not supported.
+
 ## Highlights
 
 - Slate-gray editor with a thin left rail.

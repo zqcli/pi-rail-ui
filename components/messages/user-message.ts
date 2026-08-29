@@ -1,14 +1,13 @@
 import { UserMessageComponent, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { USER_MESSAGE_LAYOUT, applyTextColor } from "../../config";
-import { createPatchLifecycle, resolveNativePiExport } from "../../core/patching";
+import { createPatchLifecycle } from "../../core/patching";
 import { cachedRender } from "../../rail/render-cache";
 import { EditorSurfaceRenderer, railUserMessageSurface } from "../../rail/rail-surface";
 import { OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START, padToWidth } from "../../core/utils";
 import { UserMessageTimestampRegistry, formatUserMessageTimestamp } from "./user-message-timestamps";
 
 type UserMessageWithInternals = {
-	contentBox?: { children?: Component[] };
 	children?: Component[];
 };
 
@@ -44,15 +43,11 @@ function getMarkdownSourceText(component: Component | undefined): string | undef
 }
 
 function getUserMessageMarkdown(component: UserMessageWithInternals): Component | undefined {
-	const containers: Array<{ children?: Component[] } | undefined> = [
-		component.contentBox,
-		component.children?.[0] as ({ children?: Component[] } | undefined),
-	];
-	for (const container of containers) {
-		const candidate = container?.children?.[0];
-		if (typeof candidate?.render === "function" && getMarkdownSourceText(candidate) !== undefined) return candidate;
-	}
-	return undefined;
+	const container = component.children?.[0] as ({ children?: Component[] } | undefined);
+	const candidate = container?.children?.[0];
+	return typeof candidate?.render === "function" && getMarkdownSourceText(candidate) !== undefined
+		? candidate
+		: undefined;
 }
 
 function timestampForUserMessage(component: object, sourceText: string | undefined): number {
@@ -68,16 +63,6 @@ function renderNativeUserRow(line: string, width: number, surface: EditorSurface
 		content = content.slice(marker.length);
 	}
 	return zones + surface.renderSurfaceRow(width, content);
-}
-
-async function getUserMessageConstructors(): Promise<UserMessageConstructor[]> {
-	const ctors: UserMessageConstructor[] = [UserMessageComponent as unknown as UserMessageConstructor];
-	const nativeCtor = await resolveNativePiExport<UserMessageConstructor>(
-		"./modes/interactive/components/user-message.js",
-		"UserMessageComponent",
-	);
-	if (nativeCtor && !ctors.includes(nativeCtor)) ctors.push(nativeCtor);
-	return ctors;
 }
 
 function renderUserMessageWithSurface(
@@ -125,17 +110,16 @@ export async function installUserMessageRail(ctx: ExtensionContext): Promise<voi
 	});
 	refreshUserMessageTimestamps(ctx);
 
-	for (const ctor of await getUserMessageConstructors()) {
-		userMessageLifecycle.patchMethod(ctor, "render", (original) => function patchedUserMessageRender(this: UserMessageWithInternals, width: number) {
-			const currentStore = getUserMessageRailPatchStore();
-			if (!currentStore.active) return original.call(this, width);
-			try {
-				return renderUserMessageWithSurface(this, width, currentStore.surface, currentStore.theme, original);
-			} catch {
-				return original.call(this, width);
-			}
-		});
-	}
+	const ctor = UserMessageComponent as unknown as UserMessageConstructor;
+	userMessageLifecycle.patchMethod(ctor, "render", (original) => function patchedUserMessageRender(this: UserMessageWithInternals, width: number) {
+		const currentStore = getUserMessageRailPatchStore();
+		if (!currentStore.active) return original.call(this, width);
+		try {
+			return renderUserMessageWithSurface(this, width, currentStore.surface, currentStore.theme, original);
+		} catch {
+			return original.call(this, width);
+		}
+	});
 
 }
 

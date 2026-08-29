@@ -13,6 +13,8 @@ class FakeTransport implements RpcTransport {
 	readonly commands: Array<Record<string, unknown>> = [];
 	readonly listeners = new Set<(event: RpcEvent) => void>();
 	stopped = false;
+	failClearQueue = false;
+	clearQueueGate: Promise<void> | undefined;
 
 	constructor(
 		private readonly failPrompt = false,
@@ -44,6 +46,11 @@ class FakeTransport implements RpcTransport {
 		if (command["type"] === "set_thinking_level") {
 			this.thinkingLevel = String(command["level"]);
 			return undefined;
+		}
+		if (command["type"] === "clear_queue") {
+			if (this.failClearQueue) throw new Error("clear queue failed");
+			await this.clearQueueGate;
+			return { steering: [], followUp: [] };
 		}
 		if (command["type"] === "abort" && this.waitForAbort) {
 			queueMicrotask(() => this.emit({ type: "agent_settled" }));
@@ -236,6 +243,44 @@ describe("RpcSessionWorker", () => {
 		const result = await pending;
 		assert.equal(result.stopReason, "aborted");
 		assert.equal(result.errorMessage, "Subagent request was aborted");
+		assert.deepEqual(transport.commands.slice(2).map((command) => command["type"]), ["clear_queue", "abort"]);
+	});
+
+	test("still aborts when clearing the child queue fails", async () => {
+		const transport = new FakeTransport(false, undefined, true);
+		transport.failClearQueue = true;
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const controller = new AbortController();
+		const pending = worker.send("long task", { signal: controller.signal });
+		await new Promise((resolve) => setImmediate(resolve));
+		controller.abort();
+
+		const result = await pending;
+		assert.equal(result.stopReason, "aborted");
+		assert.deepEqual(transport.commands.slice(2).map((command) => command["type"]), ["clear_queue", "abort"]);
+	});
+
+	test("waits for the abort command chain after the child settles", async () => {
+		const transport = new FakeTransport(false, undefined, true);
+		let releaseClearQueue!: () => void;
+		transport.clearQueueGate = new Promise<void>((resolve) => { releaseClearQueue = resolve; });
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const controller = new AbortController();
+		let finished = false;
+		const pending = worker.send("long task", { signal: controller.signal }).then((result) => {
+			finished = true;
+			return result;
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		controller.abort();
+		transport.emit({ type: "agent_settled" });
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(finished, false);
+		releaseClearQueue();
+		const result = await pending;
+		assert.equal(result.stopReason, "aborted");
+		assert.deepEqual(transport.commands.slice(2).map((command) => command["type"]), ["clear_queue", "abort"]);
 	});
 
 	test("keeps the child session and returns the settled assistant output", async () => {

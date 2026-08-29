@@ -87,6 +87,7 @@ export class RpcSessionWorker implements SessionWorker {
 		let aborted = false;
 		let resolveSettled!: () => void;
 		let transportError: Error | undefined;
+		let abortRequest: Promise<void> | undefined;
 		const transcript = new SubagentTranscript(task);
 		let updateTimer: NodeJS.Timeout | undefined;
 		const publishUpdate = () => {
@@ -145,7 +146,14 @@ export class RpcSessionWorker implements SessionWorker {
 		});
 		const abort = () => {
 			aborted = true;
-			void this.transport.request({ type: "abort" }).catch(() => undefined);
+			abortRequest ??= (async () => {
+				try {
+					await this.transport.request({ type: "clear_queue" });
+				} catch {
+					// Aborting the active turn still matters if queue cleanup fails.
+				}
+				await this.transport.request({ type: "abort" }).catch(() => undefined);
+			})();
 		};
 		options.signal?.addEventListener("abort", abort, { once: true });
 
@@ -166,6 +174,7 @@ export class RpcSessionWorker implements SessionWorker {
 				...(errorMessage ? { errorMessage } : {}),
 			};
 		} finally {
+			await abortRequest;
 			if (updateTimer) clearTimeout(updateTimer);
 			options.signal?.removeEventListener("abort", abort);
 			unsubscribe();

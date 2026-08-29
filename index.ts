@@ -53,7 +53,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		await installFooterCopyFeedback();
 		await installAssistantMessageRail(ctx.ui.theme);
 		await installUserMessageRail(ctx);
-		await installExecutionRails();
+		await installExecutionRails(ctx.ui.theme);
 		await installResourceStatusRail();
 		await installCommandOutputRail();
 	}

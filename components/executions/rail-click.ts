@@ -1,4 +1,4 @@
-import { resolveNativeTuiExport } from "../../core/patching";
+import { getTuiAltScreenConstructor } from "../../core/patching";
 import { positionRailEditorCursor } from "../editor/rail-editor-click";
 import { canToggleRailSection, markRailSectionManuallyToggled, resolveRailSection } from "../../rail/rail-section";
 import type { ExecutionRailPatcher } from "./execution-collapse";
@@ -10,12 +10,6 @@ const MARKER_END_RE = /\x1b_pi-rail-click:end:(\d+)\x07/gu;
 
 let nextRailClickMarkerId = 1;
 const railClickComponents = new Map<number, any>();
-
-type AltScreenConstructor = {
-	prototype: {
-		handleSelectionMouseEvent(event: any): void;
-	};
-};
 
 function railClickMarkerId(component: any): number {
 	let id = component?.[RAIL_CLICK_MARKER_ID_KEY] as number | undefined;
@@ -120,7 +114,7 @@ export function handleRailSectionClick(tui: any, event: any): boolean {
 }
 
 export async function patchRailSectionClickHandling(patcher: ExecutionRailPatcher): Promise<void> {
-	const ctor = await resolveNativeTuiExport<AltScreenConstructor>("TuiAltScreen");
+	const ctor = await getTuiAltScreenConstructor();
 	patcher.patchMethod(ctor, "handleSelectionMouseEvent", (original) => function patchedSelectionMouseEvent(
 		this: any,
 		event: any,

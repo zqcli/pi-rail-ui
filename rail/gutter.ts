@@ -1,6 +1,6 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { appLeftGutterWidth } from "../config";
-import { createPatchLifecycle, getInteractiveModeConstructors } from "../core/patching";
+import { createPatchLifecycle, getInteractiveModeConstructor } from "../core/patching";
 
 const GUTTER_WRAPPED_KEY = Symbol.for("pi-rail-ui.gutter-wrapped");
 const OSC133_ZONE_PREFIX_RE = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
@@ -92,18 +92,17 @@ export function uninstallGutterWrappers(): void {
 
 export async function installGutter(): Promise<void> {
 	gutterLifecycle.activate();
-	for (const ctor of await getInteractiveModeConstructors()) {
-		gutterLifecycle.patchMethod(ctor, "renderInitialMessages", (original) => function patchedRenderInitialMessages(this: any, ...args: any[]) {
-			const result = original.apply(this, args);
-			if (gutterLifecycle.state().active) installGutterWrappers(this);
-			return result;
-		});
-		gutterLifecycle.patchMethod(ctor, "renderSessionEntries", (original) => function patchedRenderSessionEntries(this: any, ...args: any[]) {
-			const result = original.apply(this, args);
-			if (gutterLifecycle.state().active) installGutterWrappers(this);
-			return result;
-		});
-	}
+	const ctor = await getInteractiveModeConstructor();
+	gutterLifecycle.patchMethod(ctor, "renderInitialMessages", (original) => function patchedRenderInitialMessages(this: any, ...args: any[]) {
+		const result = original.apply(this, args);
+		if (gutterLifecycle.state().active) installGutterWrappers(this);
+		return result;
+	});
+	gutterLifecycle.patchMethod(ctor, "renderSessionEntries", (original) => function patchedRenderSessionEntries(this: any, ...args: any[]) {
+		const result = original.apply(this, args);
+		if (gutterLifecycle.state().active) installGutterWrappers(this);
+		return result;
+	});
 }
 
 export function uninstallGutter(): void {

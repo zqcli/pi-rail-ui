@@ -164,7 +164,7 @@ describe("rail scrollbar", () => {
 			assert.notEqual(scrollView.scrollTop, initialScrollTop);
 			assert.equal(renders, 1);
 
-			// Pi 0.84.2 search can leave the viewport at the end while explicitly
+			// Native search can leave the viewport at the end while explicitly
 			// suppressing follow. A scrollbar commit at the end must use the same
 			// state transition as native ScrollView.scrollTo(end).
 			scrollView.scrollToEnd();

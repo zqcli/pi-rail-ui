@@ -2,7 +2,7 @@ import {
 	AssistantMessageComponent,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { createPatchLifecycle, resolveNativePiExport, getInteractiveModeConstructors } from "../../core/patching";
+import { createPatchLifecycle, getInteractiveModeConstructor } from "../../core/patching";
 import { cachedRender } from "../../rail/render-cache";
 import {
 	EditorSurfaceRenderer,
@@ -37,16 +37,6 @@ const assistantMessageLifecycle = createPatchLifecycle<Omit<AssistantMessageRail
 }));
 const getAssistantMessageRailPatchStore = () => assistantMessageLifecycle.state();
 
-async function getAssistantMessageConstructors(): Promise<AssistantMessageConstructor[]> {
-	const ctors: AssistantMessageConstructor[] = [AssistantMessageComponent as unknown as AssistantMessageConstructor];
-	const nativeCtor = await resolveNativePiExport<AssistantMessageConstructor>(
-		"./modes/interactive/components/assistant-message.js",
-		"AssistantMessageComponent",
-	);
-	if (nativeCtor && !ctors.includes(nativeCtor)) ctors.push(nativeCtor);
-	return ctors;
-}
-
 function patchAssistantRenderCache(ctor: AssistantMessageConstructor): void {
 	assistantMessageLifecycle.patchMethod(ctor, "render", (original) => function patchedAssistantRender(this: AssistantMessageWithInternals, width: number): string[] {
 		const currentStore = getAssistantMessageRailPatchStore();
@@ -78,19 +68,18 @@ export async function installAssistantMessageRail(theme: Theme): Promise<void> {
 		currentStore.surface = thinkingSurfaceForTheme(theme);
 	});
 
-	for (const ctor of await getAssistantMessageConstructors()) {
-		assistantMessageLifecycle.patchMethod(ctor, "updateContent", (original) => function patchedUpdateContent(this: AssistantMessageWithInternals, message: any, isStreaming?: boolean) {
-			delete (this as any)[ASSISTANT_RENDER_CACHE_KEY];
-			const currentStore = getAssistantMessageRailPatchStore();
-			if (!currentStore.active || !currentStore.theme) return original.call(this, message, isStreaming);
-			return updateNativeAssistantContent(this, message, isStreaming, original, () => {
-				renderAssistantMessageRail(this, message, currentStore.theme!, currentStore.surface);
-			});
+	const assistantCtor = AssistantMessageComponent as unknown as AssistantMessageConstructor;
+	assistantMessageLifecycle.patchMethod(assistantCtor, "updateContent", (original) => function patchedUpdateContent(this: AssistantMessageWithInternals, message: any, isStreaming?: boolean) {
+		delete (this as any)[ASSISTANT_RENDER_CACHE_KEY];
+		const currentStore = getAssistantMessageRailPatchStore();
+		if (!currentStore.active || !currentStore.theme) return original.call(this, message, isStreaming);
+		return updateNativeAssistantContent(this, message, isStreaming, original, () => {
+			renderAssistantMessageRail(this, message, currentStore.theme!, currentStore.surface);
 		});
-		patchAssistantRenderCache(ctor);
-	}
+	});
+	patchAssistantRenderCache(assistantCtor);
 
-	for (const ctor of await getInteractiveModeConstructors()) patchGlobalRailSectionExpansion(ctor);
+	patchGlobalRailSectionExpansion(await getInteractiveModeConstructor());
 
 }
 

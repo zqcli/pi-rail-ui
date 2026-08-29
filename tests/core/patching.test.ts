@@ -1,6 +1,19 @@
 import assert from "node:assert/strict";
+import { InteractiveMode } from "@earendil-works/pi-coding-agent";
+import { TuiAltScreen } from "@earendil-works/pi-tui";
 import { describe, it } from "node:test";
-import { createPatchLifecycle } from "../../core/patching";
+import {
+	createPatchLifecycle,
+	getInteractiveModeConstructor,
+	getTuiAltScreenConstructor,
+} from "../../core/patching";
+
+describe("Pi 0.84.4 constructor targeting", () => {
+	it("resolves the same constructors exported to the extension", async () => {
+		assert.equal(await getTuiAltScreenConstructor(), TuiAltScreen);
+		assert.equal(await getInteractiveModeConstructor(), InteractiveMode);
+	});
+});
 
 describe("PatchLifecycle", () => {
 	it("patches methods once and restores originals", () => {

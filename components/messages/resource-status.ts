@@ -1,4 +1,4 @@
-import { createPatchLifecycle, getInteractiveModeConstructors } from "../../core/patching";
+import { createPatchLifecycle, getInteractiveModeConstructor } from "../../core/patching";
 import { withRailSectionChatChildren, wrapLastRailSectionChatChild } from "./chat-child-rail-injection";
 
 type InteractiveModeCtor = { prototype: any };
@@ -64,7 +64,7 @@ function patchInteractiveMode(ctor: InteractiveModeCtor): void {
 
 export async function installResourceStatusRail(): Promise<void> {
 	resourceStatusLifecycle.activate();
-	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor);
+	patchInteractiveMode(await getInteractiveModeConstructor());
 }
 
 export function uninstallResourceStatusRail(): void {

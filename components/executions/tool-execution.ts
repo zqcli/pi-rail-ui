@@ -1,6 +1,6 @@
 import { BashExecutionComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { ThemeLike } from "../../config";
-import { createPatchLifecycle, resolveNativePiExport } from "../../core/patching";
+import { createPatchLifecycle } from "../../core/patching";
 import { renderExecutionRail } from "./execution-rail";
 import {
 	EXECUTION_RENDERED_KEY,
@@ -17,29 +17,6 @@ import {
 const executionRailLifecycle = createPatchLifecycle<Omit<ExecutionRailPatchStore, "active" | "targets">>("execution-rail-patch", () => ({}));
 const getExecutionRailPatchStore = () => executionRailLifecycle.state();
 
-async function resolveTheme(): Promise<ThemeLike | undefined> {
-	return resolveNativePiExport<ThemeLike>("./modes/interactive/theme/theme.js", "theme");
-}
-
-async function getExecutionConstructors(): Promise<RenderableCtor[]> {
-	const ctors: RenderableCtor[] = [
-		ToolExecutionComponent as unknown as RenderableCtor,
-		BashExecutionComponent as unknown as RenderableCtor,
-	];
-	const nativeToolCtor = await resolveNativePiExport<RenderableCtor>(
-		"./modes/interactive/components/tool-execution.js",
-		"ToolExecutionComponent",
-	);
-	const nativeBashCtor = await resolveNativePiExport<RenderableCtor>(
-		"./modes/interactive/components/bash-execution.js",
-		"BashExecutionComponent",
-	);
-	for (const ctor of [nativeToolCtor, nativeBashCtor]) {
-		if (ctor && !ctors.includes(ctor)) ctors.push(ctor);
-	}
-	return ctors;
-}
-
 function patchRender(ctor: RenderableCtor): void {
 	executionRailLifecycle.patchMethod(ctor, "render", (original) => function patchedExecutionRender(this: any, width: number): string[] {
 		const currentStore = getExecutionRailPatchStore();
@@ -55,13 +32,15 @@ function patchRender(ctor: RenderableCtor): void {
 	});
 }
 
-export async function installExecutionRails(): Promise<void> {
-	const theme = await resolveTheme();
+export async function installExecutionRails(theme: ThemeLike): Promise<void> {
 	executionRailLifecycle.activate((currentStore) => {
 		currentStore.theme = theme;
 	});
 
-	for (const ctor of await getExecutionConstructors()) {
+	for (const ctor of [
+		ToolExecutionComponent as unknown as RenderableCtor,
+		BashExecutionComponent as unknown as RenderableCtor,
+	]) {
 		patchExecutionSetExpanded(executionRailLifecycle, ctor);
 		patchRender(ctor);
 	}

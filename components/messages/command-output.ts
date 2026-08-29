@@ -1,4 +1,4 @@
-import { createPatchLifecycle, getInteractiveModeConstructors } from "../../core/patching";
+import { createPatchLifecycle, getInteractiveModeConstructor } from "../../core/patching";
 import { withRailSectionChatChildren } from "./chat-child-rail-injection";
 
 type InteractiveModeCtor = { prototype: any };
@@ -34,7 +34,7 @@ function patchInteractiveMode(ctor: InteractiveModeCtor): void {
 
 export async function installCommandOutputRail(): Promise<void> {
 	commandOutputLifecycle.activate();
-	for (const ctor of await getInteractiveModeConstructors()) patchInteractiveMode(ctor);
+	patchInteractiveMode(await getInteractiveModeConstructor());
 }
 
 export function uninstallCommandOutputRail(): void {

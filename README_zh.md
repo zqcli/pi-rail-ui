@@ -4,6 +4,8 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地视觉扩展。它为长时�
 
 它只定制视觉 surface 和工具展示，并保留 Pi 原有编辑器行为、快捷键和原生 TUI 功能。
 
+Pi Rail UI 要求 Pi `0.84.4`，不再支持包括 `0.84.2` 在内的旧版 Pi。
+
 ## 功能概览
 
 - Slate 灰色输入框，带细左侧 rail。

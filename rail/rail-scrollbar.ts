@@ -1,6 +1,6 @@
 import { CURSOR_MARKER, compositeTuiLine, sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
 import { CONVERSATION_SCROLLBAR_STYLE, RAIL_EDITOR_STYLE } from "../config";
-import { createPatchLifecycle, resolveNativeTuiExport } from "../core/patching";
+import { createPatchLifecycle, getTuiAltScreenConstructor } from "../core/patching";
 import { isRailUiActive } from "./rail-section";
 
 const RAIL_SCROLLBAR_MARKED_KEY = Symbol.for("pi-rail-ui.rail-scrollbar-marked");
@@ -391,15 +391,9 @@ function beginRailScrollbarDrag(tui: any, target: { scrollView: any; geometry: R
 	scheduleDragIdleCheck(state);
 }
 
-type AltScreenConstructor = {
-	prototype: {
-		applySelection(screen: string[], layout?: any): string[];
-	};
-};
-
 export async function installRailScrollbar(): Promise<void> {
 	scrollbarLifecycle.activate();
-	const ctor = await resolveNativeTuiExport<AltScreenConstructor>("TuiAltScreen");
+	const ctor = await getTuiAltScreenConstructor();
 	scrollbarLifecycle.patchMethod(ctor, "applySelection", (original) => function patchedApplySelection(
 		this: any,
 		screen: string[],

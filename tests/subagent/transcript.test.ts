@@ -234,7 +234,7 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 	assert.match(wideText, /1\.4k context/);
 	assert.match(wideText, /2 turns/);
 	assert.match(wideText, /\$0\.012/);
-	assert.match(wideText, /3\.4s/);
+	assert.match(wideText, /<1m/);
 	assert.match(text, /earlier activity hidden/);
 	assert.ok(text.indexOf("1.2k in") < text.indexOf("earlier activity hidden"));
 	assert.ok(view.render(10).every((line) => visibleWidth(line) <= 10));
@@ -242,26 +242,32 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 
 test("completed expanded panels show the full final answer and usage metrics", () => {
 	const answer = Array.from({ length: 30 }, (_, index) => `final answer line ${index}`).join("\n");
+	const transcript = new SubagentTranscript("review authentication");
+	transcript.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "authentication reviewed" }] } });
 	const run = {
 		alias: "auth-review",
 		status: "completed" as const,
 		output: answer,
 		model: "cus-resp/gpt-5.6-sol:xhigh",
 		persistent: true,
+		transcript: transcript.snapshot(),
 		usage: { input: 24812, output: 1946, cacheRead: 18220, cacheWrite: 120, cost: 0.0831, contextTokens: 43112, turns: 3 },
 		durationMs: 102800,
 		stopReason: "stop",
 	};
-	const collapsed = renderSubagentTranscript([run], false, theme as any).render(100).join("\n");
-	const expanded = renderSubagentTranscript([run], true, theme as any).render(100).join("\n");
+	const collapsed = renderSubagentTranscript([run], false, theme as any).render(180).join("\n");
+	const expanded = renderSubagentTranscript([run], true, theme as any).render(180).join("\n");
 
 	assert.match(collapsed, /expand for full answer/);
 	assert.doesNotMatch(collapsed, /final answer line 29/);
 	assert.match(expanded, /final answer line 29/);
 	assert.match(expanded, /24\.8k in/);
 	assert.match(expanded, /18\.2k cache read/);
-	assert.match(expanded, /1m 43s/);
+	assert.match(expanded, /1m/);
 	assert.match(expanded, /stop/);
+	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("Recent activity"));
+	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("Final answer"));
+	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("final answer line 0"));
 	assert.ok(expanded.split("\n").length > 16);
 });
 
@@ -282,15 +288,37 @@ test("parallel runs render as independent panels with aggregate wall usage", () 
 
 	assert.match(text, /2 model sessions · 2 complete/);
 	assert.match(text, /3k in/);
-	assert.match(text, /wall 2\.5s/);
+	assert.match(text, /wall <1m/);
 	assert.match(text, /alpha · stateless · provider\/model-a:high/);
 	assert.match(text, /beta · persistent · provider\/model-b:xhigh/);
 	assert.match(text, /alpha final/);
 	assert.match(text, /beta final/);
+	const alphaPanel = text.slice(text.indexOf("alpha · stateless"), text.indexOf("beta · persistent"));
+	const betaPanel = text.slice(text.indexOf("beta · persistent"));
+	assert.ok(alphaPanel.indexOf("Usage ·") < alphaPanel.indexOf("alpha final"));
+	assert.ok(betaPanel.indexOf("Usage ·") < betaPanel.indexOf("beta final"));
 	assert.equal((text.match(/╭/gu) ?? []).length, 2);
 	for (const width of [1, 2]) {
 		assert.ok(renderSubagentTranscript(runs, false, theme as any).render(width).every((line) => visibleWidth(line) <= width));
 	}
+});
+
+test("usage elapsed time changes only at minute boundaries", () => {
+	const renderDuration = (durationMs: number): string => renderSubagentTranscript([{
+		alias: "timer",
+		status: "running",
+		output: "",
+		persistent: false,
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+		durationMs,
+	}], false, theme as any).render(100).join("\n");
+
+	assert.match(renderDuration(1_000), /Usage · .*<1m/);
+	assert.match(renderDuration(59_999), /Usage · .*<1m/);
+	assert.match(renderDuration(60_000), /Usage · .*1m/);
+	assert.doesNotMatch(renderDuration(60_000), /<1m/);
+	assert.match(renderDuration(119_999), /Usage · .*1m/);
+	assert.match(renderDuration(120_000), /Usage · .*2m/);
 });
 
 test("parallel transcript ordering follows global activity rather than child creation time", () => {

@@ -710,12 +710,8 @@ function compactNumber(value: number): string {
 
 function compactDuration(durationMs: number | undefined): string {
 	if (durationMs === undefined) return "";
-	if (durationMs < 1000) return `${durationMs}ms`;
-	const seconds = durationMs / 1000;
-	if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
-	const minutes = Math.floor(seconds / 60);
-	const remaining = Math.round(seconds % 60);
-	return `${minutes}m ${remaining}s`;
+	const minutes = Math.floor(durationMs / 60_000);
+	return minutes > 0 ? `${minutes}m` : "<1m";
 }
 
 function usageText(run: SubagentTranscriptRun): string {
@@ -770,10 +766,9 @@ class SubagentRunPanel implements Component {
 			`${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run)))}`,
 		];
 		const metrics = usageText(this.run);
-		if (!this.terminal && metrics) lines.push(truncateToWidth(this.theme.fg("dim", `Usage · ${metrics}`), innerWidth, "", true));
+		if (metrics) lines.push(truncateToWidth(this.theme.fg("dim", `Usage · ${metrics}`), innerWidth, "", true));
 		if (this.terminal) lines.push(...this.renderCompleted(innerWidth));
 		else lines.push(...this.renderActivity(innerWidth));
-		if (this.terminal && metrics) lines.push(this.theme.fg("dim", metrics));
 		if (!boxed) return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
 		const borderColor = this.run.status === "failed" ? "error" : this.run.status === "running" ? "warning" : "borderAccent";

@@ -113,6 +113,10 @@ class HostedSearchContent implements Component {
 		delete this.owner[ASSISTANT_RENDER_CACHE_KEY];
 	}
 
+	get visible(): boolean {
+		return this.activity.observed;
+	}
+
 	render(width: number): string[] {
 		if (!this.activity.observed) return [];
 		const snapshot = this.activity.snapshot();
@@ -161,6 +165,7 @@ export class HostedSearchRailBlock implements Component {
 	}
 
 	get expanded(): boolean { return this.content.expanded; }
+	get visible(): boolean { return isRailUiActive() && this.content.visible; }
 
 	setExpanded(expanded: boolean): void {
 		markRailSectionManuallyToggled(this.content);
@@ -183,7 +188,7 @@ export class HostedSearchRailBlock implements Component {
 	}
 
 	render(width: number): string[] {
-		if (!isRailUiActive()) return [];
+		if (!this.visible) return [];
 		return markRailClickRows(this, this.surface.render(width));
 	}
 }

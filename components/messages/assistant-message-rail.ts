@@ -1,5 +1,5 @@
 import { type Theme } from "@earendil-works/pi-coding-agent";
-import type { Component } from "@earendil-works/pi-tui";
+import { Spacer, type Component } from "@earendil-works/pi-tui";
 import { railSectionConfig } from "../../config";
 import { markRailClickRows } from "../executions/rail-click";
 import {
@@ -12,9 +12,10 @@ import {
 	defineRailSection,
 	isRailUiActive,
 	markRailSectionManuallyToggled,
+	resolveRailSection,
 	wasRailSectionManuallyToggled,
 } from "../../rail/rail-section";
-import { hostedSearchBlockForAssistant } from "./hosted-search-rail";
+import { HostedSearchRailBlock, hostedSearchBlockForAssistant } from "./hosted-search-rail";
 
 export type AssistantMessageRailHost = {
 	contentContainer: { children?: Component[]; clear(): void; addChild(component: Component): void };
@@ -45,6 +46,56 @@ type AssistantThinkingRailOptions = {
 	rawText: string;
 	hidden: boolean;
 };
+
+type SpacedAssistantSectionKind = "assistantThinking" | "assistantReply" | "hostedSearch";
+
+class HostedSearchGap implements Component {
+	constructor(private readonly search: HostedSearchRailBlock) {}
+
+	invalidate(): void {}
+
+	render(): string[] {
+		return this.search.visible ? [""] : [];
+	}
+}
+
+function spacedAssistantSectionKind(component: Component): SpacedAssistantSectionKind | undefined {
+	const kind = resolveRailSection(component)?.kind;
+	return kind === "assistantThinking" || kind === "assistantReply" || kind === "hostedSearch"
+		? kind
+		: undefined;
+}
+
+function withAssistantSectionSpacing(children: Component[]): Component[] {
+	const spaced: Component[] = [];
+	let previousKind: SpacedAssistantSectionKind | undefined;
+	let previousSection: Component | undefined;
+
+	for (const child of children) {
+		if (isNativeSpacer(child)) {
+			spaced.push(child);
+			continue;
+		}
+		const currentKind = spacedAssistantSectionKind(child);
+		if (
+			previousKind
+			&& currentKind
+			&& previousKind !== currentKind
+			&& !isNativeSpacer(spaced.at(-1))
+		) {
+			const search = previousSection instanceof HostedSearchRailBlock
+				? previousSection
+				: child instanceof HostedSearchRailBlock
+					? child
+					: undefined;
+			spaced.push(search ? new HostedSearchGap(search) : new Spacer(1));
+		}
+		spaced.push(child);
+		previousKind = currentKind;
+		previousSection = currentKind ? child : undefined;
+	}
+	return spaced;
+}
 
 const ASSISTANT_THINKING_EXPANDED_KEY = Symbol.for("pi-rail-ui.assistant-thinking-expanded");
 const ASSISTANT_THINKING_MANUAL_KEY = Symbol.for("pi-rail-ui.assistant-thinking-manual");
@@ -257,10 +308,11 @@ export function renderAssistantMessageRail(
 		}));
 	}
 	insertSearch();
+	const spacedChildren = withAssistantSectionSpacing(nextChildren);
 
 	component.contentContainer.clear();
 	try {
-		for (const child of nextChildren) component.contentContainer.addChild(child);
+		for (const child of spacedChildren) component.contentContainer.addChild(child);
 	} catch (error) {
 		component.contentContainer.clear();
 		for (const child of nativeChildren) component.contentContainer.addChild(child);

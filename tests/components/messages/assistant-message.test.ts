@@ -140,9 +140,64 @@ test("places hosted search activity between assistant thinking and reply", () =>
 	const replyIndex = component.contentContainer.children.findIndex((child: any) => resolveRailSection(child)?.kind === "assistantReply");
 	assert.equal(thinkingIndex < searchIndex && searchIndex < replyIndex, true);
 	assert.deepEqual(component.contentContainer.children[searchIndex].render(80), []);
+	const searchGap = component.contentContainer.children[searchIndex + 1];
+	assert.equal(searchGap.constructor.name, "HostedSearchGap");
+	assert.deepEqual(searchGap.render(80), []);
 
 	activity.upsertCall("ws_1", "searching", { type: "search", query: "latest commit" });
 	assert.match(stripAnsi(component.contentContainer.children[searchIndex].render(80).join("\n")), /latest commit/);
+	assert.deepEqual(searchGap.render(80), [""]);
+});
+
+test("separates hosted search, assistant reply, and later thinking with blank rows", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	activity.associateMessage({ provider: "custom", model: "gpt-5.6-luna", timestamp: 2468 });
+	activity.upsertCall("ws_1", "completed", { type: "search", query: "spacing" });
+	activity.complete();
+	setActiveHostedSearchActivity(activity);
+	const reply = new NativeMarkdown("interim reply");
+	const laterThinking = new NativeMarkdown("later thinking");
+	const component: any = {
+		contentContainer: {
+			children: [new Spacer(), reply, laterThinking] as any[],
+			clear() { this.children = []; },
+			addChild(child: unknown) { this.children.push(child); },
+		},
+		hideThinkingBlock: false,
+		hiddenThinkingLabel: "Thinking...",
+		hasToolCalls: false,
+	};
+	const message = {
+		provider: "custom",
+		model: "gpt-5.6-luna",
+		timestamp: 2468,
+		content: [
+			{ type: "text", text: "interim reply" },
+			{ type: "thinking", thinking: "later thinking" },
+		],
+	};
+
+	renderAssistantMessageRail(component, message, theme() as any, railThinkingSurface);
+	const layout = component.contentContainer.children.map((child: any) =>
+		resolveRailSection(child)?.kind ?? child.constructor.name,
+	);
+	assert.deepEqual(layout, [
+		"Spacer",
+		"hostedSearch",
+		"HostedSearchGap",
+		"assistantReply",
+		"Spacer",
+		"assistantThinking",
+	]);
+	assert.deepEqual(component.contentContainer.children[2].render(80), [""]);
+	const rows = component.contentContainer.children
+		.flatMap((child: any) => child.render(80))
+		.map((row: string) => stripAnsi(row));
+	const searchRow = rows.findIndex((row: string) => row.includes("WEB SEARCH"));
+	const replyRow = rows.findIndex((row: string) => row.includes("interim reply"));
+	const thinkingRow = rows.findIndex((row: string) => row.includes("later thinking"));
+	assert.equal(rows.slice(searchRow + 1, replyRow).some((row: string) => row.trim() === ""), true);
+	assert.equal(rows.slice(replyRow + 1, thinkingRow).some((row: string) => row.trim() === ""), true);
 });
 
 test("keeps a manually expanded thinking block expanded across streaming updates", () => {

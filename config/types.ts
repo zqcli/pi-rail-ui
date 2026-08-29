@@ -5,6 +5,7 @@ export type RailSectionKind =
 	| "assistantMessage"
 	| "assistantThinking"
 	| "assistantReply"
+	| "hostedSearch"
 	| "userMessage"
 	| "toolExecution"
 	| "bashExecution"

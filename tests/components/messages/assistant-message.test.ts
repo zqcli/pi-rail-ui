@@ -6,6 +6,11 @@ import { renderAssistantMessageRail, updateNativeAssistantContent } from "../../
 import { stripAnsi } from "../../../core/utils";
 import { resolveRailSection } from "../../../rail/rail-section";
 import { railThinkingSurface } from "../../../rail/rail-surface";
+import {
+	HostedSearchActivity,
+	resetHostedSearchActivities,
+	setActiveHostedSearchActivity,
+} from "../../../openai/hosted-search-activity";
 
 class Spacer {
 	render(): string[] { return [""]; }
@@ -30,7 +35,10 @@ class NativeError {
 }
 
 function theme() {
-	return { fg: (_name: string, value: string) => value };
+	return {
+		fg: (_name: string, value: string) => value,
+		bold: (value: string) => value,
+	};
 }
 
 before(() => {
@@ -39,6 +47,7 @@ before(() => {
 
 afterEach(() => {
 	uninstallAssistantMessageRail();
+	resetHostedSearchActivities();
 });
 
 test("native assistant update forwards streaming and never rebuilds twice", () => {
@@ -97,6 +106,43 @@ test("wraps native assistant children without rebuilding Markdown or error conte
 	assert.equal(component.contentContainer.children[5], error);
 	assert.equal(resolveRailSection(component.contentContainer.children[1])?.kind, "assistantThinking");
 	assert.equal(resolveRailSection(component.contentContainer.children[3])?.kind, "assistantReply");
+});
+
+test("places hosted search activity between assistant thinking and reply", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	activity.associateMessage({ provider: "custom", model: "gpt-5.6-luna", timestamp: 1234 });
+	setActiveHostedSearchActivity(activity);
+	const thinking = new NativeMarkdown("thinking");
+	const reply = new NativeMarkdown("reply");
+	const component: any = {
+		contentContainer: {
+			children: [new Spacer(), thinking, new Spacer(), reply] as any[],
+			clear() { this.children = []; },
+			addChild(child: unknown) { this.children.push(child); },
+		},
+		hideThinkingBlock: false,
+		hiddenThinkingLabel: "Thinking...",
+		hasToolCalls: false,
+	};
+	const message = {
+		provider: "custom",
+		model: "gpt-5.6-luna",
+		timestamp: 1234,
+		content: [
+			{ type: "thinking", thinking: "thinking" },
+			{ type: "text", text: "reply" },
+		],
+	};
+
+	renderAssistantMessageRail(component, message, theme() as any, railThinkingSurface);
+	const searchIndex = component.contentContainer.children.findIndex((child: any) => child.constructor.name === "HostedSearchRailBlock");
+	const thinkingIndex = component.contentContainer.children.findIndex((child: any) => resolveRailSection(child)?.kind === "assistantThinking");
+	const replyIndex = component.contentContainer.children.findIndex((child: any) => resolveRailSection(child)?.kind === "assistantReply");
+	assert.equal(thinkingIndex < searchIndex && searchIndex < replyIndex, true);
+	assert.deepEqual(component.contentContainer.children[searchIndex].render(80), []);
+
+	activity.upsertCall("ws_1", "searching", { type: "search", query: "latest commit" });
+	assert.match(stripAnsi(component.contentContainer.children[searchIndex].render(80).join("\n")), /latest commit/);
 });
 
 test("keeps a manually expanded thinking block expanded across streaming updates", () => {
@@ -206,4 +252,33 @@ test("preserves native outputPad, transformers, streaming context, and length st
 		assert.match(rendered, /native reply/);
 	}
 	assert.match(rendered, /truncated before completion|maximum output token limit/);
+});
+
+test("decorates existing native assistant components after Rail is enabled again", async () => {
+	const message = {
+		role: "assistant",
+		provider: "custom",
+		model: "gpt-5.6-luna",
+		timestamp: 4321,
+		content: [{ type: "text", text: "native reply" }],
+		stopReason: "stop",
+	};
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	activity.associateMessage(message);
+	activity.upsertCall("ws_existing", "completed", { type: "search", query: "existing" });
+	activity.complete();
+	setActiveHostedSearchActivity(activity);
+	const component = new (AssistantMessageComponent as any)(message);
+	assert.equal(component.contentContainer.children.some((child: any) => resolveRailSection(child)?.kind === "hostedSearch"), false);
+
+	await installAssistantMessageRail(theme() as any);
+	component.render(80);
+	assert.equal(component.contentContainer.children.some((child: any) => resolveRailSection(child)?.kind === "hostedSearch"), true);
+
+	uninstallAssistantMessageRail();
+	component.updateContent(message);
+	assert.equal(component.contentContainer.children.some((child: any) => resolveRailSection(child)?.kind === "hostedSearch"), false);
+	await installAssistantMessageRail(theme() as any);
+	component.render(80);
+	assert.equal(component.contentContainer.children.some((child: any) => resolveRailSection(child)?.kind === "hostedSearch"), true);
 });

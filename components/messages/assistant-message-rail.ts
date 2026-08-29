@@ -14,6 +14,7 @@ import {
 	markRailSectionManuallyToggled,
 	wasRailSectionManuallyToggled,
 } from "../../rail/rail-section";
+import { hostedSearchBlockForAssistant } from "./hosted-search-rail";
 
 export type AssistantMessageRailHost = {
 	contentContainer: { children?: Component[]; clear(): void; addChild(component: Component): void };
@@ -216,9 +217,17 @@ export function renderAssistantMessageRail(
 	component.lastMessage = message;
 	const nativeChildren = [...(component.contentContainer.children ?? [])];
 	const blocks = nativeAssistantRailBlocks(message);
+	const searchBlock = hostedSearchBlockForAssistant(component, message, appTheme);
 	const nextChildren: Component[] = [];
 	let blockIndex = 0;
 	let thinkingIndex = 0;
+	let searchInserted = false;
+	const insertSearch = () => {
+		if (searchBlock && !searchInserted) {
+			nextChildren.push(searchBlock);
+			searchInserted = true;
+		}
+	};
 
 	for (const child of nativeChildren) {
 		if (isNativeSpacer(child)) {
@@ -229,11 +238,13 @@ export function renderAssistantMessageRail(
 		const block = blocks[blockIndex++];
 		if (!block) {
 			// Native status/error children are intentionally left untouched.
+			insertSearch();
 			nextChildren.push(child);
 			continue;
 		}
 
 		if (block.kind === "reply") {
+			insertSearch();
 			const reply = new SurfaceContentInsetBlock(child, surface);
 			defineRailSection(reply, "assistantReply");
 			nextChildren.push(reply);
@@ -245,6 +256,7 @@ export function renderAssistantMessageRail(
 			hidden: component.hideThinkingBlock,
 		}));
 	}
+	insertSearch();
 
 	component.contentContainer.clear();
 	try {

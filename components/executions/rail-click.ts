@@ -9,7 +9,7 @@ const MARKER_START_RE = /\x1b_pi-rail-click:start:(\d+)\x07/gu;
 const MARKER_END_RE = /\x1b_pi-rail-click:end:(\d+)\x07/gu;
 
 let nextRailClickMarkerId = 1;
-const railClickComponents = new Map<number, any>();
+const railClickComponents = new Map<number, WeakRef<object>>();
 
 function railClickMarkerId(component: any): number {
 	let id = component?.[RAIL_CLICK_MARKER_ID_KEY] as number | undefined;
@@ -17,7 +17,7 @@ function railClickMarkerId(component: any): number {
 		id = nextRailClickMarkerId++;
 		component[RAIL_CLICK_MARKER_ID_KEY] = id;
 	}
-	railClickComponents.set(id, component);
+	railClickComponents.set(id, new WeakRef(component));
 	return id;
 }
 
@@ -58,7 +58,18 @@ export function railClickComponentAtRow(lines: string[], row: number): any | und
 		if (row < range.start || row > (range.end ?? range.start)) continue;
 		if (!match || range.start >= match.start) match = { id, start: range.start };
 	}
-	return match ? railClickComponents.get(match.id) : undefined;
+	if (!match) return undefined;
+	const component = railClickComponents.get(match.id)?.deref();
+	if (!component) railClickComponents.delete(match.id);
+	return component;
+}
+
+export function unregisterRailClickComponent(component: any): void {
+	const id = component?.[RAIL_CLICK_MARKER_ID_KEY] as number | undefined;
+	if (id === undefined) return;
+	railClickComponents.delete(id);
+	delete component[RAIL_CLICK_MARKER_ID_KEY];
+	delete component[RAIL_CLICK_MARKED_ROWS_CACHE_KEY];
 }
 
 function scrollContentLines(tui: any, scrollView: any): string[] | undefined {

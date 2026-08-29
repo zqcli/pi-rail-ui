@@ -6,9 +6,18 @@ import {
 	handleRailSectionClick,
 	markRailClickRows,
 	railClickComponentAtRow,
+	unregisterRailClickComponent,
 } from "../../../components/executions/rail-click";
 
 describe("rail section click handling", () => {
+	test("unregisters disposed click targets", () => {
+		const component = {};
+		const rows = markRailClickRows(component, ["row"]);
+		assert.equal(railClickComponentAtRow(rows, 0), component);
+		unregisterRailClickComponent(component);
+		assert.equal(railClickComponentAtRow(rows, 0), undefined);
+	});
+
 	test("marks clickable rows without adding visible text", () => {
 		const component = {};
 		const rows = markRailClickRows(component, ["first", "second"]);

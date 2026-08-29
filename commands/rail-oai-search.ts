@@ -1,4 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { HostedSearchProviderCapture } from "../openai/hosted-search-capture";
+import {
+	HOSTED_SEARCH_ENTRY_TYPE,
+	restoreHostedSearchActivities,
+} from "../openai/hosted-search-activity";
 
 const STATUS_KEY = "rail-oai-search";
 const SOURCE_INCLUDE = "web_search_call.action.sources";
@@ -25,6 +30,8 @@ type JsonObject = Record<string, unknown>;
 
 let mode: RailOaiSearchMode = "off";
 let activeForCurrentModel = false;
+let turnActive = false;
+let searchRunning = false;
 
 function isRecord(value: unknown): value is JsonObject {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -119,7 +126,9 @@ function updateStatus(ctx: ExtensionContext): void {
 	activeForCurrentModel = mode !== "off" && isActiveSearchModel(ctx.model);
 	if (!ctx.hasUI) return;
 
-	const status = mode === "off"
+	const status = searchRunning
+		? "SEARCHING"
+		: mode === "off"
 		? undefined
 		: `SEARCH ${mode.toUpperCase()}${activeForCurrentModel ? "" : " (inactive)"}`;
 	ctx.ui.setStatus(STATUS_KEY, status);
@@ -137,6 +146,14 @@ function notifyStatus(ctx: ExtensionContext): void {
 }
 
 export function installRailOaiSearch(pi: ExtensionAPI): void {
+	const capture = new HostedSearchProviderCapture(pi, {
+		isEnabled: (model) => mode !== "off" && isGptModel(model),
+		onActivityChanged: (activity, ctx) => {
+			searchRunning = activity.observed && !activity.terminal;
+			updateStatus(ctx);
+		},
+	});
+
 	pi.registerCommand("rail-oai-search", {
 		description: "Set GPT native web search mode",
 		handler: async (args, ctx) => {
@@ -146,7 +163,10 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 				return;
 			}
 
+			await ctx.waitForIdle();
 			mode = action;
+			searchRunning = false;
+			capture.sync(ctx, mode !== "off" && isActiveSearchModel(ctx.model));
 			updateStatus(ctx);
 			notifyStatus(ctx);
 		},
@@ -154,20 +174,57 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		mode = "off";
+		turnActive = false;
+		searchRunning = false;
+		restoreHostedSearchActivities(ctx.sessionManager.getBranch());
+		capture.sync(ctx, false);
 		updateStatus(ctx);
 	});
 
+	pi.on("session_tree", async (_event, ctx) => {
+		restoreHostedSearchActivities(ctx.sessionManager.getBranch());
+	});
+
 	pi.on("model_select", async (_event, ctx) => {
+		searchRunning = false;
+		capture.sync(ctx, mode !== "off" && isActiveSearchModel(ctx.model));
+		updateStatus(ctx);
+	});
+
+	pi.on("turn_start", async (_event, ctx) => {
+		turnActive = true;
+		capture.sync(ctx, mode !== "off" && isActiveSearchModel(ctx.model));
+		capture.startTurn();
+	});
+
+	pi.on("message_start", async (event) => {
+		if (event.message.role === "assistant") capture.associateMessage(event.message);
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role !== "assistant") return;
+		const snapshot = await capture.finishTurn(event.message);
+		searchRunning = false;
+		updateStatus(ctx);
+		if (snapshot) pi.appendEntry(HOSTED_SEARCH_ENTRY_TYPE, snapshot);
+	});
+
+	pi.on("turn_end", async (_event, ctx) => {
+		turnActive = false;
+		searchRunning = false;
 		updateStatus(ctx);
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
-		const transformed = transformNativeSearchPayload(ctx.model, mode, event.payload);
+		const transformed = transformNativeSearchPayload(ctx.model, turnActive ? mode : "off", event.payload);
 		return transformed === event.payload ? undefined : transformed;
 	});
 
 	pi.on("session_shutdown", async () => {
 		mode = "off";
 		activeForCurrentModel = false;
+		turnActive = false;
+		searchRunning = false;
+		capture.shutdown();
 	});
 }

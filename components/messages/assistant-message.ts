@@ -30,10 +30,14 @@ type AssistantMessageRailPatchStore = {
 	active: boolean;
 	theme?: Theme | undefined;
 	surface: EditorSurfaceRenderer;
+	generation: number;
 };
+
+const ASSISTANT_RAIL_DECORATION_KEY = Symbol.for("pi-rail-ui.assistant-rail-decoration");
 
 const assistantMessageLifecycle = createPatchLifecycle<Omit<AssistantMessageRailPatchStore, "active">>("assistant-message-rail-patch", () => ({
 	surface: railThinkingSurface,
+	generation: 0,
 }));
 const getAssistantMessageRailPatchStore = () => assistantMessageLifecycle.state();
 
@@ -41,6 +45,14 @@ function patchAssistantRenderCache(ctor: AssistantMessageConstructor): void {
 	assistantMessageLifecycle.patchMethod(ctor, "render", (original) => function patchedAssistantRender(this: AssistantMessageWithInternals, width: number): string[] {
 		const currentStore = getAssistantMessageRailPatchStore();
 		if (!currentStore.active) return original.call(this, width);
+		const decoration = (this as any)[ASSISTANT_RAIL_DECORATION_KEY] as { generation: number; message: unknown } | undefined;
+		if (
+			currentStore.theme
+			&& this.lastMessage
+			&& (decoration?.generation !== currentStore.generation || decoration.message !== this.lastMessage)
+		) {
+			(this as any).updateContent(this.lastMessage, (this as any).isStreaming);
+		}
 		const signature = [width, this.lastMessage ? 1 : 0, this.hasToolCalls ? 1 : 0, this.hideThinkingBlock ? 1 : 0, this.hiddenThinkingLabel ?? ""].join("\u001f");
 		const children = Array.isArray(this.contentContainer?.children) ? this.contentContainer.children : [];
 		return cachedRender(this, ASSISTANT_RENDER_CACHE_KEY, signature, () => original.call(this, width), { message: this.lastMessage, children });
@@ -64,6 +76,7 @@ function patchGlobalRailSectionExpansion(ctor: InteractiveModeConstructor): void
 
 export async function installAssistantMessageRail(theme: Theme): Promise<void> {
 	assistantMessageLifecycle.activate((currentStore) => {
+		currentStore.generation++;
 		currentStore.theme = theme;
 		currentStore.surface = thinkingSurfaceForTheme(theme);
 	});
@@ -75,6 +88,10 @@ export async function installAssistantMessageRail(theme: Theme): Promise<void> {
 		if (!currentStore.active || !currentStore.theme) return original.call(this, message, isStreaming);
 		return updateNativeAssistantContent(this, message, isStreaming, original, () => {
 			renderAssistantMessageRail(this, message, currentStore.theme!, currentStore.surface);
+			(this as any)[ASSISTANT_RAIL_DECORATION_KEY] = {
+				generation: currentStore.generation,
+				message,
+			};
 		});
 	});
 	patchAssistantRenderCache(assistantCtor);

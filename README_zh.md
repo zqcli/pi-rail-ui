@@ -123,7 +123,9 @@ Pi Rail UI 注册了以下 slash 命令：
 /rail-oai-search live|cached|off
 ```
 
-`live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。是否生效只根据 model ID 或显示名称中是否包含 `gpt` 判断，不限制 provider。Rail 仅修改 Responses 形态的 payload，在该请求中替换冲突的本地或 hosted `web_search`，保留已有 `include` 并请求 source metadata。切换到非 GPT 模型后，当前模式会保持为 inactive；切回 GPT 模型时自动恢复。Pi 0.84.4 当前可以渲染最终回答，但不会暴露 hosted search call 状态或结构化 citation annotations。
+`live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。是否生效只根据 model ID 或显示名称中是否包含 `gpt` 判断，不限制 provider。Rail 仅修改 Responses 形态的 payload，在该请求中替换冲突的本地或 hosted `web_search`，保留已有 `include` 并请求 source metadata。切换到非 GPT 模型后，当前模式会保持为 inactive；切回 GPT 模型时自动恢复。
+
+对于可安全包装的 `openai-responses` 和 `azure-openai-responses` SSE provider，Rail 还会旁路观察真实 hosted `web_search_call` 流，并在对应 Assistant turn 内插入一个搜索活动区。只有观察到真实 hosted call 后才显示；搜索中自动展开，成功后自动折叠，并以有界列表展示动作和来源链接；可单击或按 `Ctrl+O` 展开/折叠。完成态 snapshot 作为 session custom entry 保存，不会进入 LLM context。Rail 不覆盖 native extension provider，也不改变 Codex 默认 WebSocket transport；这些路径仍可使用 hosted search，但只显示最终回答。
 
 ## 主要功能
 

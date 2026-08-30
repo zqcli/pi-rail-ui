@@ -3,6 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@eare
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
 import { railFastFooterLabel } from "../../commands/rail-fast";
+import { railOaiSearchFooterLabel } from "../../commands/rail-oai-search";
 import {
 	collectFooterLiveState,
 	collectFooterUsageStats,
@@ -143,11 +144,13 @@ function latestFooterData(): ReadonlyFooterDataProvider | undefined {
 function renderSimpleFooter(width: number, state: FooterLiveState, stats: FooterUsageStats, style: FooterStyle): string[] {
 	const identity = `${style.text}▸ ${fitToWidth(state.cwdShort, FOOTER_LAYOUT.cwdMaxWidth)}${state.branch ? `${style.mint}@${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : ""}`;
 	const fastLabel = railFastFooterLabel();
+	const searchLabel = railOaiSearchFooterLabel();
 	const left = visibleJoin([
+		searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
+		fastLabel ? `${style.sky}${fastLabel}` : undefined,
 		identity,
 		`${style.sky}${state.modelShort}`,
 		`${style.amber}${state.thinking}`,
-		fastLabel ? `${style.sky}${fastLabel}` : undefined,
 		stateText(state, style),
 		turnDurationText(state, style),
 		state.pending ? `${style.amber}queued` : undefined,

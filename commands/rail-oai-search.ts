@@ -123,16 +123,16 @@ function isActiveSearchModel(model: SearchModel | undefined): boolean {
 	return isGptModel(model) && !KNOWN_NON_RESPONSES_APIS.has(model?.api?.toLowerCase() ?? "");
 }
 
+export function railOaiSearchFooterLabel(): string | undefined {
+	if (searchRunning) return "SEARCHING";
+	if (mode === "off") return undefined;
+	return `SEARCH ${mode.toUpperCase()}${activeForCurrentModel ? "" : " (inactive)"}${probeNextRequest ? " · PROBE NEXT" : ""}`;
+}
+
 function updateStatus(ctx: ExtensionContext): void {
 	activeForCurrentModel = mode !== "off" && isActiveSearchModel(ctx.model);
 	if (!ctx.hasUI) return;
-
-	const status = searchRunning
-		? "SEARCHING"
-		: mode === "off"
-		? undefined
-		: `SEARCH ${mode.toUpperCase()}${activeForCurrentModel ? "" : " (inactive)"}${probeNextRequest ? " · PROBE NEXT" : ""}`;
-	ctx.ui.setStatus(STATUS_KEY, status);
+	ctx.ui.setStatus(STATUS_KEY, railOaiSearchFooterLabel());
 }
 
 function notifyStatus(ctx: ExtensionContext): void {

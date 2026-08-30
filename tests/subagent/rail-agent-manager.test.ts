@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import installStatefulSubagent from "../../subagent/index";
-import { runRailAgentManager } from "../../subagent/rail-agent-manager";
-import { filterSessions } from "../../subagent/session-picker";
+import { installRailSubagent } from "../../tools/subagents";
+import { runRailAgentManager } from "../../tools/subagents/rail-agent-manager";
+import { filterSessions } from "../../tools/subagents/session-picker";
 
 const model = {
 	provider: "cus-resp",
@@ -19,12 +19,12 @@ function modelContext() {
 	};
 }
 
-test("standalone extension exposes only the Rail-namespaced slash command", () => {
+test("Rail subagent installer exposes only the Rail-namespaced slash command", () => {
 	const commands: string[] = [];
 	const previousDepth = process.env["PI_SUBAGENT_DEPTH"];
 	process.env["PI_SUBAGENT_DEPTH"] = "0";
 	try {
-		installStatefulSubagent({
+		installRailSubagent({
 			registerTool: () => undefined,
 			registerCommand: (name: string) => { commands.push(name); },
 			on: () => undefined,

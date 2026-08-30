@@ -3,13 +3,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { FileAgentInstanceStore } from "../../subagent/instance-store";
+import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
 import {
 	SUBAGENT_LINK_ENTRY_TYPE,
 	SessionAgentRoster,
 	type SubagentLinkEntry,
-} from "../../subagent/session-links";
-import type { AgentInstance } from "../../subagent/session-broker";
+} from "../../tools/subagents/session-links";
+import type { AgentInstance } from "../../tools/subagents/session-broker";
 
 function instance(agentId: string, alias: string): AgentInstance {
 	return {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { PiRpcProcessTransport } from "../../subagent/rpc-transport";
+import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
 
 const fixture = fileURLToPath(new URL("../fixtures/fake-pi-rpc.mjs", import.meta.url));
 

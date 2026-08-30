@@ -3,8 +3,8 @@ import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { FileAgentInstanceStore } from "../../subagent/instance-store";
-import { FileSessionLeaseManager } from "../../subagent/session-lease";
+import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
+import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
 import {
 	SessionBroker,
 	type AgentInstance,
@@ -17,8 +17,8 @@ import {
 	type WorkerRunResult,
 	type WorkerStartSpec,
 	WorkerControlError,
-} from "../../subagent/session-broker";
-import type { RailModelRef } from "../../subagent/models";
+} from "../../tools/subagents/session-broker";
+import type { RailModelRef } from "../../tools/subagents/models";
 
 class MemoryInstanceStore implements AgentInstanceStore {
 	readonly instances = new Map<string, AgentInstance>();

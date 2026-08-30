@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { FileSessionLeaseManager, sessionLeaseDirectoryName } from "../../subagent/session-lease";
+import { FileSessionLeaseManager, sessionLeaseDirectoryName } from "../../tools/subagents/session-lease";
 
 test("FileSessionLeaseManager grants one owner and releases cleanly", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-subagent-lease-"));

@@ -5,9 +5,9 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { RailAgentManager } from "../../subagent/agent-manager";
-import { sessionLeaseDirectoryName } from "../../subagent/session-lease";
-import { sessionLeaseKey } from "../../subagent/worker-factory";
+import { RailAgentManager } from "../../tools/subagents/agent-manager";
+import { sessionLeaseDirectoryName } from "../../tools/subagents/session-lease";
+import { sessionLeaseKey } from "../../tools/subagents/worker-factory";
 
 function instance(agentId: string, alias: string, sessionFile: string) {
 	return {

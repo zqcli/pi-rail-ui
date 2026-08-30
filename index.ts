@@ -14,11 +14,10 @@ import { installAssistantMessageRail, uninstallAssistantMessageRail, installComm
 import { setRailUiActive } from "./rail";
 import { installGutter, uninstallGutter } from "./rail/gutter";
 import { installRailScrollbar, uninstallRailScrollbar } from "./rail/rail-scrollbar";
-import { installApplyPatchTool } from "./tools";
+import { installApplyPatchTool, installRailSubagent } from "./tools";
 
 export * from "./config";
 export * from "./core/patching";
-export * from "./core/apply-patch";
 export * from "./core/utils";
 export * from "./rail";
 export * from "./tools";
@@ -153,6 +152,10 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		uninstallCommandOutputRail();
 		enabled = true;
 	});
+
+	// Keep the subagent runtime independent from /rail-ui while preserving Rail's
+	// UI-first session lifecycle ordering.
+	installRailSubagent(pi);
 
 	// Pi owns the conversation viewport, alternate screen, scrollbars, selection,
 	// and renderer lifecycle. Rail only supplies components and visual surfaces.

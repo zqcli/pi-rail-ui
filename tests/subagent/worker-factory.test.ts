@@ -3,8 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import type { RailModelRef } from "../../subagent/models";
-import { createRpcWorkerFactory } from "../../subagent/worker-factory";
+import type { RailModelRef } from "../../tools/subagents/models";
+import { createRpcWorkerFactory } from "../../tools/subagents/worker-factory";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 

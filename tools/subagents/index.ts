@@ -36,7 +36,7 @@ function unique<T>(values: T[]): T[] {
 	return [...new Set(values)];
 }
 
-export default function installStatefulSubagent(pi: ExtensionAPI): void {
+export function installRailSubagent(pi: ExtensionAPI): void {
 	if (Number(process.env["PI_SUBAGENT_DEPTH"] ?? "0") > 0) return;
 	const stateDir = path.join(getAgentDir(), "stateful-subagents");
 	let runtime: SubagentRuntime | undefined;

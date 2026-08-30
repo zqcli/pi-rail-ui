@@ -15,7 +15,7 @@ import {
 	type ApplyPatchResult,
 	resolvePatchPath,
 	summarizeApplyPatch,
-} from "../core/apply-patch";
+} from "./core";
 
 const applyPatchSchema = Type.Object({
 	input: Type.String({
@@ -213,3 +213,5 @@ const applyPatchTool = defineTool<typeof applyPatchSchema, ApplyPatchResult>({
 export function installApplyPatchTool(pi: ExtensionAPI): void {
 	pi.registerTool(applyPatchTool);
 }
+
+export * from "./core";

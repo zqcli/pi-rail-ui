@@ -5,8 +5,8 @@ import {
 	buildSubagentRosterPrompt,
 	extractSubagentMentions,
 	subagentMentionSuggestions,
-} from "../../subagent/interaction";
-import type { AgentInstance } from "../../subagent/session-broker";
+} from "../../tools/subagents/interaction";
+import type { AgentInstance } from "../../tools/subagents/session-broker";
 
 function instance(alias: string, agentId: string, lastTask: string): AgentInstance {
 	return {

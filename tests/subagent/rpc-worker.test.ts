@@ -5,9 +5,9 @@ import {
 	buildRpcWorkerArgs,
 	type RpcEvent,
 	type RpcTransport,
-} from "../../subagent/rpc-worker";
-import type { RailModelRef } from "../../subagent/models";
-import type { WorkerStartSpec } from "../../subagent/session-broker";
+} from "../../tools/subagents/rpc-worker";
+import type { RailModelRef } from "../../tools/subagents/models";
+import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
 
 class FakeTransport implements RpcTransport {
 	readonly commands: Array<Record<string, unknown>> = [];

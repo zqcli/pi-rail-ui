@@ -38,18 +38,20 @@ Pi Rail UI 要求 Pi `0.84.4`，不再支持包括 `0.84.2` 在内的旧版 Pi�
 
 Pi 会自动发现并加载该目录扩展。
 
-### 可选 Rail Subagent 扩展
+### Rail Subagents
 
-本仓库还包含一个同时支持一次性和持久化派发的独立 subagent 扩展。应让 Pi 的独立 `subagent` 入口指向该实现，避免同时加载它和官方 stateless example：
+Rail 会从根扩展自动加载内置的一次性与持久化 `subagent` tool，不应再同时安装第二个独立 `subagent` 扩展。从旧的 standalone 部署升级时，应先删除原 symlink，并把 extensions 目录中的非隐藏备份移出自动发现范围：
 
 ```bash
-mv ~/.pi/agent/extensions/subagent \
-  ~/.pi/agent/extensions/subagent.stateless-example
-ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
-  ~/.pi/agent/extensions/subagent
+rm -f ~/.pi/agent/extensions/subagent
+if [ -e ~/.pi/agent/extensions/subagent.stateless-example ]; then
+  mkdir -p ~/.pi/agent/extensions/.backups
+  mv ~/.pi/agent/extensions/subagent.stateless-example \
+    ~/.pi/agent/extensions/.backups/
+fi
 ```
 
-入口文件会导入同目录模块，因此必须使用目录级 symlink。修改链接后执行 `/reload`。Rail 不读取 `~/.pi/agent/agents`，也不继承其他 subagent 插件预定义的 profile prompt/tools。它把 Pi 已有 model 映射到独立 session，同一个 model 可以关联任意多个 session。
+安装或更新 Rail 后执行 `/reload`。Rail 不读取 `~/.pi/agent/agents`，也不继承其他 subagent 插件预定义的 profile prompt/tools。它把 Pi 已有 model 映射到独立 session，同一个 model 可以关联任意多个 session。
 
 - 使用 `@new/cus-resp/gpt-5.6-sol`（或其他 canonical Pi model reference）创建 persistent model session。
 - 使用 `@agent/auth-review` 把后续任务强制派发给该 instance，同时不和 Pi 原生 `@path` 文件补全冲突。

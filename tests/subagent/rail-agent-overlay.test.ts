@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
-import { RailAgentOverlayComponent } from "../../subagent/rail-agent-overlay";
-import type { RailModelRef } from "../../subagent/models";
+import { RailAgentOverlayComponent } from "../../tools/subagents/rail-agent-overlay";
+import type { RailModelRef } from "../../tools/subagents/models";
 
 const piModel = {
 	provider: "cus-resp",

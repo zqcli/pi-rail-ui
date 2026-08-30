@@ -38,18 +38,20 @@ After editing or installing it, reload Pi with:
 
 Pi should discover this directory extension automatically.
 
-### Optional Rail Subagent Extension
+### Rail Subagents
 
-This repository also contains a standalone subagent extension for both one-off and persistent delegation. Point Pi's separate `subagent` entry at the bundled implementation instead of loading both it and the official stateless example:
+Rail loads its bundled one-off and persistent `subagent` tool automatically from the root extension. Do not install a second standalone `subagent` extension alongside Rail. When upgrading from the previous standalone setup, remove the old symlink and move any non-hidden backup out of the auto-discovered extensions directory before reloading:
 
 ```bash
-mv ~/.pi/agent/extensions/subagent \
-  ~/.pi/agent/extensions/subagent.stateless-example
-ln -s ~/.pi/agent/extensions/pi-rail-ui/subagent \
-  ~/.pi/agent/extensions/subagent
+rm -f ~/.pi/agent/extensions/subagent
+if [ -e ~/.pi/agent/extensions/subagent.stateless-example ]; then
+  mkdir -p ~/.pi/agent/extensions/.backups
+  mv ~/.pi/agent/extensions/subagent.stateless-example \
+    ~/.pi/agent/extensions/.backups/
+fi
 ```
 
-The directory-level link is required because the entry point imports sibling modules. Reload Pi after changing the link. Rail does not read `~/.pi/agent/agents` or inherit another subagent plugin's profile prompts/tools. It maps Pi's existing models to independent sessions, and one model can back any number of sessions.
+Reload Pi after installing or updating Rail. Rail does not read `~/.pi/agent/agents` or inherit another subagent plugin's profile prompts/tools. It maps Pi's existing models to independent sessions, and one model can back any number of sessions.
 
 - `@new/cus-resp/gpt-5.6-sol` (or another canonical Pi model reference) to create a persistent model session.
 - `@agent/auth-review` to route a follow-up to that exact instance without conflicting with Pi's normal `@path` completion.

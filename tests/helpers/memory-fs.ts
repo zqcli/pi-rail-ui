@@ -1,4 +1,4 @@
-import type { ApplyPatchOperations } from "../../core/apply-patch";
+import type { ApplyPatchOperations } from "../../tools/apply-patch";
 
 export const TEST_CWD = "/repo";
 

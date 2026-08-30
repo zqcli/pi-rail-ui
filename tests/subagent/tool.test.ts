@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { installStatefulSubagentTool } from "../../subagent/tool";
-import { WorkerControlError, type ControlRequest, type ControlResult, type DispatchRequest, type DispatchResult, type SessionBroker } from "../../subagent/session-broker";
-import { SubagentTranscript } from "../../subagent/transcript";
+import { installStatefulSubagentTool } from "../../tools/subagents/tool";
+import { WorkerControlError, type ControlRequest, type ControlResult, type DispatchRequest, type DispatchResult, type SessionBroker } from "../../tools/subagents/session-broker";
+import { SubagentTranscript } from "../../tools/subagents/transcript";
 
 const model = {
 	provider: "cus-resp",

@@ -7,7 +7,7 @@ import {
 	parseApplyPatch,
 	resolvePatchPath,
 	summarizeApplyPatch,
-} from "../../core/apply-patch";
+} from "../../tools/apply-patch";
 import { MemoryFs, TEST_CWD } from "../helpers/memory-fs";
 
 async function assertApplyPatchRejects(fn: () => Promise<unknown>, code: string): Promise<void> {

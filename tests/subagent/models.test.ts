@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { availableRailModels, resolveRailModel } from "../../subagent/models";
+import { availableRailModels, resolveRailModel } from "../../tools/subagents/models";
 
 const sol = { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
 const colonModel = { provider: "openrouter", id: "vendor/model:exacto", name: "Exacto" };

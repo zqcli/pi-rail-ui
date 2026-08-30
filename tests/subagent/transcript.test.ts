@@ -7,7 +7,7 @@ import {
 	SubagentTranscript,
 	renderSubagentTranscript,
 	type SubagentTranscriptSnapshot,
-} from "../../subagent/transcript";
+} from "../../tools/subagents/transcript";
 
 const theme = {
 	fg: (_color: string, text: string) => text,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildParentSessionLabel, buildSubagentSessionName } from "../../subagent/session-name";
+import { buildParentSessionLabel, buildSubagentSessionName } from "../../tools/subagents/session-name";
 
 test("persistent child names include the subagent prefix, parent session name, and alias", () => {
 	assert.equal(

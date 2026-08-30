@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import { test } from "node:test";
-import type { RailModelRef } from "../../subagent/models";
-import { createStatelessAgentRunner } from "../../subagent/stateless-runner";
+import type { RailModelRef } from "../../tools/subagents/models";
+import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 

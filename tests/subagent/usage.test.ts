@@ -5,7 +5,7 @@ import {
 	emptySubagentUsage,
 	providerReportedUsage,
 	usageWithActiveTurn,
-} from "../../subagent/usage";
+} from "../../tools/subagents/usage";
 
 test("live provider usage overlays the active turn without double-counting completed turns", () => {
 	const completed = emptySubagentUsage();

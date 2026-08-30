@@ -1,6 +1,6 @@
 import { CustomEditor, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, type EditorTheme, type TUI, visibleWidth } from "@earendil-works/pi-tui";
-import { completeSkillCommandWithoutSubmit } from "./rail-editor-autocomplete";
+import { completeSlashCommandWithoutSubmit } from "./rail-editor-autocomplete";
 import { EDITOR_PASTE_MARKER_STYLE, SLASH_COMMAND_LAYOUT, applyTextColor } from "../../config";
 import { stripAnsi } from "../../core/utils";
 import { railEditorSurface, type EditorSurfaceRenderer } from "../../rail/rail-surface";
@@ -116,7 +116,7 @@ export class RailEditor extends CustomEditor {
 
 	override handleInput(data: string): void {
 		this.mouseVisualCache = undefined;
-		if (completeSkillCommandWithoutSubmit({
+		if (completeSlashCommandWithoutSubmit({
 			editor: this,
 			data,
 			keybindings: this.keybindingManager,

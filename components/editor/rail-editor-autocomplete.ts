@@ -25,26 +25,29 @@ type EditorAutocompleteInternals = {
 	getText?(): string;
 };
 
-export type SkillAutocompleteCompletionInput = {
+export type AutocompleteCompletionInput = {
 	editor: unknown;
 	data: string;
 	keybindings: Pick<KeybindingsManager, "matches">;
 	requestRender(): void;
 };
 
-function selectedSkillCommand(editor: EditorAutocompleteInternals): AutocompleteItem | undefined {
+const PARAMETERIZED_RAIL_COMMANDS = new Set(["rail-oai-fast", "rail-oai-search"]);
+
+function selectedCommandKeptInEditor(editor: EditorAutocompleteInternals): AutocompleteItem | undefined {
 	const selected = editor.autocompleteList?.getSelectedItem?.();
-	if (!selected || typeof selected.value !== "string" || !selected.value.startsWith("skill:")) return undefined;
+	if (!selected || typeof selected.value !== "string") return undefined;
+	if (!selected.value.startsWith("skill:") && !PARAMETERIZED_RAIL_COMMANDS.has(selected.value)) return undefined;
 	return selected;
 }
 
-export function completeSkillCommandWithoutSubmit(input: SkillAutocompleteCompletionInput): boolean {
+export function completeSlashCommandWithoutSubmit(input: AutocompleteCompletionInput): boolean {
 	if (!input.keybindings.matches(input.data, "tui.select.confirm")) return false;
 
 	const editor = input.editor as EditorAutocompleteInternals;
 	const prefix = editor.autocompletePrefix;
 	const state = editor.state;
-	const selected = selectedSkillCommand(editor);
+	const selected = selectedCommandKeptInEditor(editor);
 	if (!editor.autocompleteState || !editor.autocompleteProvider || typeof prefix !== "string" || !prefix.startsWith("/")) return false;
 	if (!state || !Array.isArray(state.lines) || !selected) return false;
 

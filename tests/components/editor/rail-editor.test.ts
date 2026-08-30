@@ -121,4 +121,49 @@ describe("RailEditor", () => {
 		assert.equal((editor as any).autocompleteState, null);
 		assert.ok(renderRequests > 0);
 	});
+
+	test("keeps parameterized Rail command autocomplete in the editor", () => {
+		let renderRequests = 0;
+		const tui = {
+			terminal: { rows: 24, columns: 80 },
+			requestRender() {
+				renderRequests += 1;
+			},
+		};
+		const keybindings = {
+			matches(data: string, keybinding: string) {
+				return data === "enter" && (keybinding === "tui.select.confirm" || keybinding === "tui.input.submit");
+			},
+		};
+		const editor = new RailEditor(tui as any, editorTheme, keybindings as any, appTheme as any);
+		const provider = new CombinedAutocompleteProvider([
+			{ name: "rail-oai-search", description: "Set native search mode" },
+		], process.cwd());
+		let submitted: string | undefined;
+		let changed: string | undefined;
+
+		editor.setAutocompleteProvider(provider);
+		editor.setText("/rail-oai-s");
+		editor.onSubmit = (text) => {
+			submitted = text;
+		};
+		editor.onChange = (text) => {
+			changed = text;
+		};
+		Object.assign(editor as any, {
+			autocompleteState: {},
+			autocompletePrefix: "/rail-oai-s",
+			autocompleteList: {
+				getSelectedItem: () => ({ value: "rail-oai-search", label: "rail-oai-search" }),
+			},
+		});
+
+		editor.handleInput("enter");
+
+		assert.equal(submitted, undefined);
+		assert.equal(editor.getText(), "/rail-oai-search ");
+		assert.equal(changed, "/rail-oai-search ");
+		assert.equal((editor as any).autocompleteState, null);
+		assert.ok(renderRequests > 0);
+	});
 });

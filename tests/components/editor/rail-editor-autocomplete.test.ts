@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { CombinedAutocompleteProvider } from "@earendil-works/pi-tui";
-import { completeSkillCommandWithoutSubmit } from "../../../components/editor/rail-editor-autocomplete";
+import { completeSlashCommandWithoutSubmit } from "../../../components/editor/rail-editor-autocomplete";
 
 describe("rail editor autocomplete seam", () => {
 	test("applies selected skill completion without crossing the submit path", () => {
@@ -31,7 +31,7 @@ describe("rail editor autocomplete seam", () => {
 			},
 		};
 
-		const handled = completeSkillCommandWithoutSubmit({
+		const handled = completeSlashCommandWithoutSubmit({
 			editor,
 			data: "enter",
 			keybindings: { matches: (data, keybinding) => data === "enter" && keybinding === "tui.select.confirm" },
@@ -46,7 +46,38 @@ describe("rail editor autocomplete seam", () => {
 		assert.equal(rendered, true);
 	});
 
-	test("leaves non-skill slash completions to the editor implementation", () => {
+	test("keeps parameterized Rail command completions in the editor", () => {
+		const provider = new CombinedAutocompleteProvider([{ name: "rail-oai-fast" }], process.cwd());
+		const editor = {
+			state: { lines: ["/rail-oai-f"], cursorLine: 0, cursorCol: 11 },
+			autocompleteState: {} as unknown,
+			autocompleteProvider: provider,
+			autocompletePrefix: "/rail-oai-f",
+			autocompleteList: { getSelectedItem: () => ({ value: "rail-oai-fast", label: "rail-oai-fast" }) },
+			setCursorCol(col: number) {
+				this.state.cursorCol = col;
+			},
+			cancelAutocomplete() {
+				this.autocompleteState = null;
+			},
+			getText() {
+				return this.state.lines.join("\n");
+			},
+		};
+
+		const handled = completeSlashCommandWithoutSubmit({
+			editor,
+			data: "enter",
+			keybindings: { matches: () => true },
+			requestRender: () => {},
+		});
+
+		assert.equal(handled, true);
+		assert.equal(editor.getText(), "/rail-oai-fast ");
+		assert.equal(editor.autocompleteState, null);
+	});
+
+	test("leaves slash commands without parameters to the editor implementation", () => {
 		const editor = {
 			state: { lines: ["/set"], cursorLine: 0, cursorCol: 4 },
 			autocompleteState: {},
@@ -55,7 +86,7 @@ describe("rail editor autocomplete seam", () => {
 			autocompleteList: { getSelectedItem: () => ({ value: "settings", label: "settings" }) },
 		};
 
-		const handled = completeSkillCommandWithoutSubmit({
+		const handled = completeSlashCommandWithoutSubmit({
 			editor,
 			data: "enter",
 			keybindings: { matches: () => true },

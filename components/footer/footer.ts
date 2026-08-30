@@ -109,6 +109,32 @@ function fitAligned(left: string, right: string, width: number): string {
 	return footerLine(`${fittedLeft}${gap}${right}`, width);
 }
 
+function fitPrioritizedFooterLeft(
+	prefixParts: Array<string | undefined>,
+	priorityParts: Array<string | undefined>,
+	suffixParts: Array<string | undefined>,
+	separator: string,
+	width: number,
+): string {
+	const full = visibleJoin([...prefixParts, ...priorityParts, ...suffixParts], separator);
+	if (visibleWidth(full) <= width) return full;
+
+	const prefix = visibleJoin(prefixParts, separator);
+	const priority = visibleJoin(priorityParts, separator);
+	if (!priority) return footerLine(full, width);
+	if (visibleWidth(priority) >= width) return footerLine(priority, width);
+
+	const separatorWidth = visibleWidth(separator);
+	const prefixWidth = Math.max(0, width - visibleWidth(priority) - (prefix ? separatorWidth : 0));
+	const fittedPrefix = fitToWidth(prefix, prefixWidth);
+	let fitted = visibleJoin([fittedPrefix, priority], separator);
+
+	const suffix = visibleJoin(suffixParts, separator);
+	const suffixWidth = width - visibleWidth(fitted) - (fitted && suffix ? separatorWidth : 0);
+	if (suffixWidth > 0) fitted = visibleJoin([fitted, fitToWidth(suffix, suffixWidth)], separator);
+	return footerLine(fitted, width);
+}
+
 function stateText(state: FooterLiveState, style: FooterStyle): string {
 	return state.idle ? `${style.mint}● ready` : `${style.amber}● working`;
 }
@@ -145,22 +171,30 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 	const identity = `${style.text}▸ ${fitToWidth(state.cwdShort, FOOTER_LAYOUT.cwdMaxWidth)}${state.branch ? `${style.mint}@${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : ""}`;
 	const fastLabel = railFastFooterLabel();
 	const searchLabel = railOaiSearchFooterLabel();
-	const left = visibleJoin([
-		searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
-		fastLabel ? `${style.sky}${fastLabel}` : undefined,
-		identity,
-		`${style.sky}${state.modelShort}`,
-		`${style.amber}${state.thinking}`,
-		stateText(state, style),
-		turnDurationText(state, style),
-		state.pending ? `${style.amber}queued` : undefined,
-		selectionNoticeText(style),
-	], `${style.muted} · `);
+	const separator = `${style.muted} · `;
 	const right = visibleJoin([
 		usageText(stats, style),
 		contextText(state, style),
 		stats.cost > 0 || state.usingSubscription ? costText(stats.cost, state.usingSubscription, style) : undefined,
-	], `${style.muted} · `);
+	], separator);
+	const rightWidth = visibleWidth(right);
+	const leftWidth = rightWidth >= width ? 0 : Math.max(0, width - rightWidth - (right ? 1 : 0));
+	const left = fitPrioritizedFooterLeft(
+		[identity, `${style.sky}${state.modelShort}`],
+		[
+			`${style.amber}${state.thinking}`,
+			fastLabel ? `${style.sky}${fastLabel}` : undefined,
+			searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
+		],
+		[
+			stateText(state, style),
+			turnDurationText(state, style),
+			state.pending ? `${style.amber}queued` : undefined,
+			selectionNoticeText(style),
+		],
+		separator,
+		leftWidth,
+	);
 	return [fitAligned(left, right, width)];
 }
 

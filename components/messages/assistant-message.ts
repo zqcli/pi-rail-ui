@@ -86,13 +86,14 @@ export async function installAssistantMessageRail(theme: Theme): Promise<void> {
 		delete (this as any)[ASSISTANT_RENDER_CACHE_KEY];
 		const currentStore = getAssistantMessageRailPatchStore();
 		if (!currentStore.active || !currentStore.theme) return original.call(this, message, isStreaming);
-		return updateNativeAssistantContent(this, message, isStreaming, original, () => {
+		const result = updateNativeAssistantContent(this, message, isStreaming, original, () => {
 			renderAssistantMessageRail(this, message, currentStore.theme!, currentStore.surface);
-			(this as any)[ASSISTANT_RAIL_DECORATION_KEY] = {
-				generation: currentStore.generation,
-				message,
-			};
 		});
+		(this as any)[ASSISTANT_RAIL_DECORATION_KEY] = {
+			generation: currentStore.generation,
+			message,
+		};
+		return result;
 	});
 	patchAssistantRenderCache(assistantCtor);
 

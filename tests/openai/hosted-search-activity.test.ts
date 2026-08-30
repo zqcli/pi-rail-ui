@@ -100,6 +100,67 @@ test("ignores malformed SSE and remains invisible without a real web_search_call
 	assert.equal(activity.phase, "pending");
 });
 
+test("sanitizes C1 controls and keeps generic provider error messages", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	const observer = new HostedSearchSseObserver(activity);
+	observer.push(sse("response.output_item.done", {
+		type: "response.output_item.done",
+		item: {
+			id: "ws_error",
+			type: "web_search_call",
+			status: "completed",
+			action: { type: "search", query: "safe\u009dhidden" },
+		},
+	}));
+	observer.push(sse("error", { type: "error", message: "provider\u009cexploded" }));
+	observer.end();
+
+	const snapshot = activity.snapshot();
+	assert.equal(snapshot.calls[0]?.query, "safehidden");
+	assert.equal(snapshot.phase, "failed");
+	assert.equal(snapshot.error, "providerexploded");
+});
+
+test("keeps a failed search call failed when the response completes", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
+	const observer = new HostedSearchSseObserver(activity);
+	observer.push(sse("response.output_item.done", {
+		type: "response.output_item.done",
+		item: {
+			id: "ws_failed",
+			type: "web_search_call",
+			status: "failed",
+			action: { type: "search", queries: ["alpha", "beta"] },
+		},
+	}));
+	observer.push(sse("response.output_text.annotation.added", {
+		type: "response.output_text.annotation.added",
+		annotation: { type: "url_citation", title: "Observed", url: "https://example.com/observed" },
+	}));
+	observer.push(sse("response.completed", {
+		type: "response.completed",
+		response: { id: "resp_failed_search", completed_at: 2, output: [] },
+	}));
+	observer.end();
+
+	const snapshot = activity.snapshot();
+	assert.equal(snapshot.phase, "failed");
+	assert.equal(snapshot.error, "Search call failed");
+	assert.equal(snapshot.endedAt, 2000);
+	assert.equal(snapshot.calls[0]?.query, "alpha · beta");
+	assert.deepEqual(snapshot.sources, [{ title: "Observed", url: "https://example.com/observed" }]);
+});
+
+test("preserves a persisted cancelled phase when a call failed before abort", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt", startedAt: 1000 });
+	activity.upsertCall("ws_failed", "failed", { type: "search", query: "before abort" });
+	activity.cancel(3000);
+	const snapshot = activity.snapshot();
+
+	assert.equal(snapshot.phase, "cancelled");
+	assert.deepEqual(HostedSearchActivity.restore(snapshot).snapshot(), snapshot);
+});
+
 test("drops oversized malformed SSE frames and resumes at the next event", () => {
 	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
 	const observer = new HostedSearchSseObserver(activity);

@@ -73,6 +73,36 @@ test("native assistant update forwards streaming and never rebuilds twice", () =
 	assert.equal(decorations, 1);
 });
 
+test("does not retry a failed Rail decoration on every render", async () => {
+	await installAssistantMessageRail(theme() as any);
+	const component = new (AssistantMessageComponent as any)();
+	const message = {
+		role: "assistant",
+		content: [{ type: "text", text: "native reply" }],
+		stopReason: "stop",
+	};
+	const originalAddChild = component.contentContainer.addChild.bind(component.contentContainer);
+	let additions = 0;
+	component.contentContainer.addChild = (child: unknown) => {
+		additions++;
+		if (additions === 3) throw new Error("decoration failure");
+		return originalAddChild(child);
+	};
+	const patchedUpdateContent = component.updateContent.bind(component);
+	let updates = 0;
+	component.updateContent = (...args: unknown[]) => {
+		updates++;
+		return patchedUpdateContent(...args);
+	};
+
+	component.updateContent(message);
+	component.render(80);
+	component.render(80);
+
+	assert.equal(updates, 1);
+	assert.match(stripAnsi(component.render(80).join("\n")), /native reply/);
+});
+
 test("wraps native assistant children without rebuilding Markdown or error content", () => {
 	const thinking = new NativeMarkdown("thinking");
 	const reply = new NativeMarkdown("reply");
@@ -147,6 +177,36 @@ test("places hosted search activity between assistant thinking and reply", () =>
 	activity.upsertCall("ws_1", "searching", { type: "search", query: "latest commit" });
 	assert.match(stripAnsi(component.contentContainer.children[searchIndex].render(80).join("\n")), /latest commit/);
 	assert.deepEqual(searchGap.render(80), [""]);
+});
+
+test("keeps a leading gap when search appears before Assistant content", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	const message = {
+		provider: "custom",
+		model: "gpt-5.6-luna",
+		timestamp: 1357,
+		content: [],
+	};
+	activity.associateMessage(message);
+	activity.upsertCall("ws_early", "searching", { type: "search", query: "early" });
+	setActiveHostedSearchActivity(activity);
+	const component: any = {
+		contentContainer: {
+			children: [] as unknown[],
+			clear() { this.children = []; },
+			addChild(child: unknown) { this.children.push(child); },
+		},
+		hideThinkingBlock: false,
+		hiddenThinkingLabel: "Thinking...",
+		hasToolCalls: false,
+	};
+
+	renderAssistantMessageRail(component, message, theme() as any, railThinkingSurface);
+
+	assert.deepEqual(component.contentContainer.children.map((child: any) =>
+		resolveRailSection(child)?.kind ?? child.constructor.name,
+	), ["HostedSearchGap", "hostedSearch"]);
+	assert.deepEqual(component.contentContainer.children[0].render(80), [""]);
 });
 
 test("separates hosted search, assistant reply, and later thinking with blank rows", () => {
@@ -327,8 +387,12 @@ test("decorates existing native assistant components after Rail is enabled again
 	assert.equal(component.contentContainer.children.some((child: any) => resolveRailSection(child)?.kind === "hostedSearch"), false);
 
 	await installAssistantMessageRail(theme() as any);
-	component.render(80);
+	const firstRender = stripAnsi(component.render(80).join("\n"));
+	assert.match(firstRender, /1 call/);
 	assert.equal(component.contentContainer.children.some((child: any) => resolveRailSection(child)?.kind === "hostedSearch"), true);
+	activity.upsertCall("ws_second", "completed", { type: "search", query: "second" });
+	const updatedRender = stripAnsi(component.render(80).join("\n"));
+	assert.match(updatedRender, /2 calls/);
 
 	uninstallAssistantMessageRail();
 	component.updateContent(message);

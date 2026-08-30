@@ -190,7 +190,7 @@ Duplicate user prompts are handled with timestamp assignment logic so repeated p
 
 ### 7. Native Slash Autocomplete
 
-Slash autocomplete stays inside Pi's native editor lifecycle and list implementation. Rail applies the configured selected-text color and keeps its skill-command completion seam, while Pi owns list layout, row limits, focus, cancellation, and rendering.
+Slash autocomplete stays inside Pi's native editor lifecycle and list implementation. Rail applies the configured selected-text color and keeps one narrow confirm seam for skill commands and Rail commands that require arguments, while Pi owns list layout, row limits, focus, cancellation, and rendering.
 
 ### 8. Native Settings and Model Selectors
 
@@ -402,7 +402,7 @@ pi-rail-ui/
    Editor, thinking, user messages, and command/tool output share the same rail geometry. Pi's native selectors and fullscreen viewport are not reimplemented by Rail.
 
 4. **Prefer native Pi behavior**
-   Rail avoids patching Pi's renderer lifecycle, alternate screen, transcript viewport, mouse selection engine, synchronized output, and selector ownership. Native integration patches are limited to visual components, copy-feedback placement, and one fullscreen click hook that dispatches editor cursor placement or per-block execution toggles only inside their own layout regions.
+   Rail avoids patching Pi's renderer lifecycle, alternate screen, transcript viewport, mouse selection engine, synchronized output, and selector ownership. Native integration patches are limited to visual components, copy-feedback placement, and one fullscreen click hook that dispatches editor cursor placement or per-block execution toggles only inside their own layout regions. Hosted search separately uses Pi's public payload and provider-registration seams for bounded Responses SSE observation.
 
 5. **Optimize hot paths**
    Rail caches component and surface rendering without taking ownership of Pi's native transcript scroll state.

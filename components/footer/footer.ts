@@ -119,20 +119,13 @@ function fitPrioritizedFooterLeft(
 	const full = visibleJoin([...prefixParts, ...priorityParts, ...suffixParts], separator);
 	if (visibleWidth(full) <= width) return full;
 
-	const prefix = visibleJoin(prefixParts, separator);
 	const priority = visibleJoin(priorityParts, separator);
-	if (!priority) return footerLine(full, width);
-	if (visibleWidth(priority) >= width) return footerLine(priority, width);
-
 	const separatorWidth = visibleWidth(separator);
-	const prefixWidth = Math.max(0, width - visibleWidth(priority) - (prefix ? separatorWidth : 0));
-	const fittedPrefix = fitToWidth(prefix, prefixWidth);
-	let fitted = visibleJoin([fittedPrefix, priority], separator);
-
+	const prefixWidth = Math.max(0, width - visibleWidth(priority) - separatorWidth);
+	const fitted = visibleJoin([fitToWidth(visibleJoin(prefixParts, separator), prefixWidth), priority], separator);
 	const suffix = visibleJoin(suffixParts, separator);
-	const suffixWidth = width - visibleWidth(fitted) - (fitted && suffix ? separatorWidth : 0);
-	if (suffixWidth > 0) fitted = visibleJoin([fitted, fitToWidth(suffix, suffixWidth)], separator);
-	return footerLine(fitted, width);
+	const suffixWidth = width - visibleWidth(fitted) - separatorWidth;
+	return footerLine(visibleJoin([fitted, suffixWidth > 0 ? fitToWidth(suffix, suffixWidth) : undefined], separator), width);
 }
 
 function stateText(state: FooterLiveState, style: FooterStyle): string {
@@ -172,30 +165,35 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 	const fastLabel = railFastFooterLabel();
 	const searchLabel = railOaiSearchFooterLabel();
 	const separator = `${style.muted} · `;
+	const prefixParts = [identity, `${style.sky}${state.modelShort}`];
+	const priorityParts = [
+		`${style.amber}${state.thinking}`,
+		fastLabel ? `${style.sky}${fastLabel}` : undefined,
+		searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
+	];
+	const suffixParts = [
+		stateText(state, style),
+		turnDurationText(state, style),
+		state.pending ? `${style.amber}queued` : undefined,
+		selectionNoticeText(style),
+	];
 	const right = visibleJoin([
 		usageText(stats, style),
 		contextText(state, style),
 		stats.cost > 0 || state.usingSubscription ? costText(stats.cost, state.usingSubscription, style) : undefined,
 	], separator);
-	const rightWidth = visibleWidth(right);
-	const leftWidth = rightWidth >= width ? 0 : Math.max(0, width - rightWidth - (right ? 1 : 0));
+	const priority = visibleJoin(priorityParts, separator);
+	const fittedRight = fitToWidth(right, Math.max(0, width - Math.min(width, visibleWidth(priority)) - 1));
+	const rightWidth = visibleWidth(fittedRight);
+	const leftWidth = rightWidth >= width ? 0 : Math.max(0, width - rightWidth - (fittedRight ? 1 : 0));
 	const left = fitPrioritizedFooterLeft(
-		[identity, `${style.sky}${state.modelShort}`],
-		[
-			`${style.amber}${state.thinking}`,
-			fastLabel ? `${style.sky}${fastLabel}` : undefined,
-			searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
-		],
-		[
-			stateText(state, style),
-			turnDurationText(state, style),
-			state.pending ? `${style.amber}queued` : undefined,
-			selectionNoticeText(style),
-		],
+		prefixParts,
+		priorityParts,
+		suffixParts,
 		separator,
 		leftWidth,
 	);
-	return [fitAligned(left, right, width)];
+	return [fitAligned(left, fittedRight, width)];
 }
 
 type RailSessionOverlayOptions = {

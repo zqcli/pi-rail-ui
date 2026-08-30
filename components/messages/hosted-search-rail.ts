@@ -4,6 +4,7 @@ import {
 	HostedSearchActivity,
 	hostedSearchActivityForMessage,
 	type HostedSearchCall,
+	type HostedSearchMessage,
 	type HostedSearchPhase,
 	type HostedSearchSnapshot,
 } from "../../openai/hosted-search-activity";
@@ -17,14 +18,7 @@ import {
 import { markRailClickRows, unregisterRailClickComponent } from "../executions/rail-click";
 
 const HOSTED_SEARCH_BLOCK_KEY = Symbol.for("pi-rail-ui.hosted-search-block");
-const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
-
-type SearchMessage = {
-	provider: string;
-	model: string;
-	responseId?: string | undefined;
-	timestamp?: number | undefined;
-};
+export const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
 
 type SearchOwner = {
 	[HOSTED_SEARCH_BLOCK_KEY]?: HostedSearchRailBlock;
@@ -81,7 +75,7 @@ class HostedSearchContent implements Component {
 	private activity: HostedSearchActivity;
 	private theme: Theme;
 	private unsubscribe: (() => void) | undefined;
-	private cached: { width: number; signature: string; rows: string[] } | undefined;
+	private cached: { width: number; rows: string[] } | undefined;
 
 	constructor(
 		activity: HostedSearchActivity,
@@ -121,8 +115,7 @@ class HostedSearchContent implements Component {
 		if (!this.activity.observed) return [];
 		const snapshot = this.activity.snapshot();
 		if (!wasRailSectionManuallyToggled(this)) this.expanded = snapshot.phase !== "completed";
-		const signature = JSON.stringify([this.expanded, snapshot]);
-		if (this.cached?.width === width && this.cached.signature === signature) return this.cached.rows;
+		if (this.cached?.width === width) return this.cached.rows;
 
 		const status = phaseLabel(snapshot.phase);
 		const duration = snapshot.endedAt === undefined ? "" : ` · ${durationLabel(snapshot)}`;
@@ -140,7 +133,7 @@ class HostedSearchContent implements Component {
 			const details = detailsMarkdown(snapshot);
 			if (details) rows.push(...new Markdown(details, 0, 0, getMarkdownTheme()).render(width));
 		}
-		this.cached = { width, signature, rows };
+		this.cached = { width, rows };
 		return rows;
 	}
 
@@ -195,7 +188,7 @@ export class HostedSearchRailBlock implements Component {
 
 export function hostedSearchBlockForAssistant(
 	owner: object,
-	message: SearchMessage,
+	message: HostedSearchMessage,
 	theme: Theme,
 ): HostedSearchRailBlock | undefined {
 	const searchOwner = owner as SearchOwner;

@@ -130,11 +130,6 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 	const providerConfigs = new Map<string, any>();
 	let waitForIdleCalls = 0;
 	const provider: any = {
-		id: "custom",
-		name: "Custom",
-		auth: {},
-		getModels: () => [],
-		stream: () => ({}),
 		streamSimple: () => ({}),
 	};
 	const pi = {
@@ -264,11 +259,6 @@ test("persists observed search state before the assistant entry without requirin
 		name: "GPT 5.6 Luna",
 	};
 	const provider: any = {
-		id: "custom",
-		name: "Custom",
-		auth: {},
-		getModels: () => [model],
-		stream: () => ({}),
 		streamSimple: (_model: unknown, _context: unknown, options: unknown) => {
 			lastStreamOptions = options;
 			return {};

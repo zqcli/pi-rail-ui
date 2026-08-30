@@ -15,21 +15,13 @@ import {
 	HostedSearchSseObserver,
 	indexHostedSearchActivity,
 	setActiveHostedSearchActivity,
+	type HostedSearchMessage,
 	type HostedSearchSnapshot,
 } from "./hosted-search-activity";
 
 // Codex Responses defaults to WebSocket transport in Pi 0.84.4, so a fetch-only observer
 // must not claim capture support for it.
 const CAPTURE_APIS = new Set(["openai-responses", "azure-openai-responses"]);
-
-type SearchAssistantMessage = {
-	provider: string;
-	model: string;
-	responseId?: string | undefined;
-	timestamp?: number | undefined;
-	stopReason?: string | undefined;
-	errorMessage?: string | undefined;
-};
 
 type ProviderLease = {
 	providerId: string;
@@ -50,8 +42,7 @@ function requestUrl(input: Parameters<FetchFunction>[0]): string {
 }
 
 function requestSignal(input: Parameters<FetchFunction>[0], init?: RequestInit): AbortSignal | undefined {
-	if (init?.signal) return init.signal;
-	return input instanceof Request ? input.signal : undefined;
+	return init?.signal ?? (input instanceof Request ? input.signal : undefined);
 }
 
 async function observeResponseBody(
@@ -126,11 +117,11 @@ export class HostedSearchProviderCapture {
 		setActiveHostedSearchActivity(undefined);
 	}
 
-	associateMessage(message: SearchAssistantMessage): void {
+	associateMessage(message: HostedSearchMessage): void {
 		this.turnActivity?.associateMessage(message);
 	}
 
-	async finishTurn(message: SearchAssistantMessage): Promise<HostedSearchSnapshot | undefined> {
+	async finishTurn(message: HostedSearchMessage): Promise<HostedSearchSnapshot | undefined> {
 		this.turnActive = false;
 		const activity = this.turnActivity;
 		if (!activity) return undefined;
@@ -196,8 +187,8 @@ export class HostedSearchProviderCapture {
 		};
 
 		this.pi.registerProvider(model.provider, { api: model.api, streamSimple: wrapper });
-		const token = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
-		if (!token || token.streamSimple !== wrapper) return false;
+		const installedConfig = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
+		if (!installedConfig || installedConfig.streamSimple !== wrapper) return false;
 		this.lease = {
 			providerId: model.provider,
 			api: model.api,

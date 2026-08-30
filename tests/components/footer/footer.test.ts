@@ -64,6 +64,8 @@ test("renders the active native search mode in the Rail footer", async () => {
 		assert.match(rendered, /SEARCH LIVE/);
 		assert.match(rendered, /FAST/);
 		assert.match(rendered, /xhigh.*FAST.*SEARCH LIVE/);
+		assert.match(rendered, /ctx 0\.00%/);
+		assert.match(stripAnsi(component.render(40).join("\n")), /SEARCH LIVE/);
 	} finally {
 		component.dispose();
 		for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);

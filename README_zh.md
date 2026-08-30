@@ -189,7 +189,7 @@ Assistant 普通回复会和 thinking 的正文列对齐，但不会显示 rail�
 
 ### 7. 原生 Slash Autocomplete
 
-Slash autocomplete 保持在 Pi 原生 editor lifecycle 和 list 实现中。Rail 只应用配置好的 selected-text 颜色，并保留 skill command completion seam；列表布局、行数、focus、取消和渲染均由 Pi 管理。
+Slash autocomplete 保持在 Pi 原生 editor lifecycle 和 list 实现中。Rail 只应用配置好的 selected-text 颜色，并为 skill command 和需要参数的 Rail command 保留一个窄 confirm seam；列表布局、行数、focus、取消和渲染均由 Pi 管理。
 
 ### 8. 原生 Settings 和 Model Selector
 
@@ -401,7 +401,7 @@ pi-rail-ui/
    输入框、thinking、用户消息和命令/工具输出复用同一个 rail 几何模型。Pi 原生 selector 和 fullscreen viewport 不再由 Rail 重复实现。
 
 4. **原生 Pi 行为优先**
-   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择引擎、同步输出和 selector ownership。原生 integration patch 仅限视觉 component、复制提示位置，以及一个 fullscreen click hook；该 hook 只会在各自 layout 区域内分发 editor cursor 定位或单块 execution 切换。
+   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择引擎、同步输出和 selector ownership。原生 integration patch 仅限视觉 component、复制提示位置，以及一个 fullscreen click hook；该 hook 只会在各自 layout 区域内分发 editor cursor 定位或单块 execution 切换。Hosted search 另行使用 Pi 的公开 payload 与 provider-registration seam，对 Responses SSE 做有界旁路观察。
 
 5. **优化热路径性能**
    Rail 缓存 component 和 surface 渲染，但不再持有 Pi 原生 transcript scroll state。

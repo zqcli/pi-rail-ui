@@ -112,7 +112,7 @@
       "assistantMessage": { "layout": { "alignWith": "assistantThinking" } },
       "assistantThinking": { "collapsible": true, "clickToToggle": true, "autoCollapseAfterRows": 3, "style": { "background": "transparent", "rail": { "rgb": [203, 166, 247] } } },
       "assistantReply": { "layout": { "alignWith": "assistantThinking" }, "style": { "background": "transparent", "rail": false } },
-      "hostedSearch": { "collapsible": true, "clickToToggle": true, "style": { "background": "transparent", "rail": { "rgb": [137, 180, 250] } }, "layout": { "alignWith": "assistantThinking" } },
+      "hostedSearch": { "collapsible": true, "clickToToggle": true, "style": { "rail": { "rgb": [137, 180, 250] } } },
       "userMessage": { "style": { "background": { "rgb": [49, 50, 68] }, "rail": { "rgb": [137, 180, 250] } }, "selection": { "includeTimestamp": true } },
       "toolExecution": {
         "collapsible": true,

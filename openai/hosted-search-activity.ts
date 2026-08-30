@@ -40,7 +40,7 @@ export type HostedSearchSnapshot = {
 
 type ActivityListener = () => void;
 
-type SearchMessage = Pick<AssistantMessage, "provider" | "model"> & {
+export type HostedSearchMessage = Pick<AssistantMessage, "provider" | "model"> & {
 	responseId?: string | undefined;
 	timestamp?: number | undefined;
 	stopReason?: string | undefined;
@@ -49,7 +49,7 @@ type SearchMessage = Pick<AssistantMessage, "provider" | "model"> & {
 
 function cleanText(value: unknown, maxLength = MAX_TEXT_LENGTH): string | undefined {
 	if (typeof value !== "string") return undefined;
-	const clean = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u009B]/gu, "").trim();
+	const clean = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, "").trim();
 	if (!clean) return undefined;
 	return clean.length <= maxLength ? clean : `${clean.slice(0, Math.max(0, maxLength - 1))}…`;
 }
@@ -110,9 +110,10 @@ export class HostedSearchActivity {
 			assistantTimestamp: snapshot.assistantTimestamp,
 		});
 		activity.endedAtValue = snapshot.endedAt;
-		activity.errorValue = cleanText(snapshot.error);
-		for (const call of snapshot.calls.slice(0, MAX_CALLS)) activity.upsertCall(call.id, call.status, call, false);
+		for (const call of snapshot.calls.slice(0, MAX_CALLS)) activity.upsertCall(call.id, call.status, call);
 		for (const source of snapshot.sources.slice(0, MAX_SOURCES)) activity.addSource(source.url, source.title, false);
+		activity.phaseValue = snapshot.phase;
+		activity.errorValue = cleanText(snapshot.error) ?? (snapshot.phase === "failed" ? activity.errorValue : undefined);
 		return activity;
 	}
 
@@ -134,7 +135,7 @@ export class HostedSearchActivity {
 		this.notify();
 	}
 
-	associateMessage(message: SearchMessage): void {
+	associateMessage(message: HostedSearchMessage): void {
 		if (message.provider !== this.provider || message.model !== this.model) return;
 		if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
 			this.assistantTimestampValue = message.timestamp;
@@ -143,7 +144,7 @@ export class HostedSearchActivity {
 		else this.notify();
 	}
 
-	upsertCall(id: unknown, status: unknown, action?: unknown, notify = true): void {
+	upsertCall(id: unknown, status: unknown, action?: unknown): void {
 		const callId = cleanText(id, 256);
 		if (!callId) return;
 		const existing = this.callsById.get(callId);
@@ -159,8 +160,13 @@ export class HostedSearchActivity {
 		this.callsById.set(callId, call);
 		if (call.url) this.addSource(call.url, undefined, false);
 		for (const source of normalized.sources) this.addSource(source.url, source.title, false);
-		if (!this.terminal) this.phaseValue = "running";
-		if (notify) this.notify();
+		if (call.status === "failed") {
+			this.phaseValue = "failed";
+			this.errorValue ??= "Search call failed";
+		} else if (!this.terminal) {
+			this.phaseValue = "running";
+		}
+		this.notify();
 	}
 
 	addSource(url: unknown, title?: unknown, notify = true): void {
@@ -178,7 +184,7 @@ export class HostedSearchActivity {
 
 	complete(endedAt = Date.now()): void {
 		if (!this.observed) return;
-		this.phaseValue = "completed";
+		if (!this.terminal) this.phaseValue = "completed";
 		this.endedAtValue = endedAt;
 		this.notify();
 	}
@@ -198,7 +204,7 @@ export class HostedSearchActivity {
 		this.notify();
 	}
 
-	finalizeFromMessage(message: SearchMessage): void {
+	finalizeFromMessage(message: HostedSearchMessage): void {
 		if (!this.observed) return;
 		if (message.responseId) this.setResponseId(message.responseId);
 		if (message.stopReason === "aborted") this.cancel();
@@ -247,8 +253,14 @@ function normalizeAction(action: unknown): {
 	const type: HostedSearchActionType = rawType === "search" || rawType === "open_page" || rawType === "find_in_page"
 		? rawType
 		: "other";
-	const queries = Array.isArray(action["queries"]) ? action["queries"] : [];
-	const query = cleanText(action["query"] ?? action["pattern"] ?? queries[0]);
+	const queries = Array.isArray(action["queries"])
+		? action["queries"].filter((query): query is string => typeof query === "string").join(" · ")
+		: "";
+	const query = type === "search"
+		? cleanText(queries) ?? cleanText(action["query"])
+		: type === "find_in_page"
+			? cleanText(action["pattern"])
+			: undefined;
 	const url = cleanUrl(action["url"]);
 	const sources: HostedSearchSource[] = [];
 	for (const source of Array.isArray(action["sources"]) ? action["sources"] : []) {
@@ -259,6 +271,11 @@ function normalizeAction(action: unknown): {
 	return { type, query, url, sources };
 }
 
+function citationFrom(annotation: unknown): { url: unknown; title?: unknown } | undefined {
+	if (!isRecord(annotation) || annotation["type"] !== "url_citation") return undefined;
+	return { url: annotation["url"], title: annotation["title"] };
+}
+
 function annotationsFrom(value: unknown): Array<{ url: unknown; title?: unknown }> {
 	if (!isRecord(value)) return [];
 	const content = Array.isArray(value["content"]) ? value["content"] : [];
@@ -266,8 +283,8 @@ function annotationsFrom(value: unknown): Array<{ url: unknown; title?: unknown 
 	for (const part of content) {
 		if (!isRecord(part) || !Array.isArray(part["annotations"])) continue;
 		for (const annotation of part["annotations"]) {
-			if (!isRecord(annotation) || annotation["type"] !== "url_citation") continue;
-			annotations.push({ url: annotation["url"], title: annotation["title"] });
+			const citation = citationFrom(annotation);
+			if (citation) annotations.push(citation);
 		}
 	}
 	return annotations;
@@ -370,6 +387,11 @@ export class HostedSearchSseObserver {
 			for (const annotation of annotationsFrom({ content: [value["part"]] })) this.activity.addSource(annotation.url, annotation.title);
 			return;
 		}
+		if (type === "response.output_text.annotation.added") {
+			const citation = citationFrom(value["annotation"]);
+			if (citation) this.activity.addSource(citation.url, citation.title);
+			return;
+		}
 		if (type === "response.completed" && isRecord(value["response"])) {
 			const response = value["response"];
 			this.activity.setResponseId(response["id"]);
@@ -378,7 +400,7 @@ export class HostedSearchSseObserver {
 			return;
 		}
 		if (type === "response.failed" || type === "error") {
-			const error = isRecord(value["response"]) ? value["response"]["error"] : value["error"];
+			const error = isRecord(value["response"]) ? value["response"]["error"] : value["message"] ?? value["error"];
 			this.activity.fail(isRecord(error) ? error["message"] : error);
 		}
 	}
@@ -394,7 +416,7 @@ export class HostedSearchSseObserver {
 }
 
 let activeActivity: HostedSearchActivity | undefined;
-const persistedActivities = new Map<string, HostedSearchSnapshot>();
+const indexedActivities = new Map<string, HostedSearchActivity>();
 
 function responseKey(provider: string, model: string, responseId: string): string {
 	return `${provider}\0${model}\0response:${responseId}`;
@@ -406,7 +428,7 @@ function timestampKey(provider: string, model: string, timestamp: number): strin
 
 export function resetHostedSearchActivities(): void {
 	activeActivity = undefined;
-	persistedActivities.clear();
+	indexedActivities.clear();
 }
 
 export function setActiveHostedSearchActivity(activity: HostedSearchActivity | undefined): void {
@@ -414,28 +436,26 @@ export function setActiveHostedSearchActivity(activity: HostedSearchActivity | u
 }
 
 export function indexHostedSearchActivity(activity: HostedSearchActivity): void {
-	const snapshot = activity.snapshot();
-	if (snapshot.responseId) {
-		persistedActivities.set(responseKey(snapshot.provider, snapshot.model, snapshot.responseId), snapshot);
+	if (activity.responseId) {
+		indexedActivities.set(responseKey(activity.provider, activity.model, activity.responseId), activity);
 	}
-	if (snapshot.assistantTimestamp !== undefined) {
-		persistedActivities.set(timestampKey(snapshot.provider, snapshot.model, snapshot.assistantTimestamp), snapshot);
+	if (activity.assistantTimestamp !== undefined) {
+		indexedActivities.set(timestampKey(activity.provider, activity.model, activity.assistantTimestamp), activity);
 	}
 }
 
-export function hostedSearchActivityForMessage(message: SearchMessage): HostedSearchActivity | undefined {
+export function hostedSearchActivityForMessage(message: HostedSearchMessage): HostedSearchActivity | undefined {
 	if (activeActivity && activeActivity.provider === message.provider && activeActivity.model === message.model) {
 		const sameResponse = Boolean(message.responseId && activeActivity.responseId === message.responseId);
 		const sameTimestamp = message.timestamp !== undefined && activeActivity.assistantTimestamp === message.timestamp;
 		if (sameResponse || sameTimestamp) return activeActivity;
 	}
-	const snapshot = (message.responseId
-		? persistedActivities.get(responseKey(message.provider, message.model, message.responseId))
+	return (message.responseId
+		? indexedActivities.get(responseKey(message.provider, message.model, message.responseId))
 		: undefined)
 		?? (message.timestamp !== undefined
-			? persistedActivities.get(timestampKey(message.provider, message.model, message.timestamp))
+			? indexedActivities.get(timestampKey(message.provider, message.model, message.timestamp))
 			: undefined);
-	return snapshot ? HostedSearchActivity.restore(snapshot) : undefined;
 }
 
 export function restoreHostedSearchActivities(entries: readonly unknown[]): void {

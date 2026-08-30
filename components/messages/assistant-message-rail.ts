@@ -15,7 +15,9 @@ import {
 	resolveRailSection,
 	wasRailSectionManuallyToggled,
 } from "../../rail/rail-section";
-import { HostedSearchRailBlock, hostedSearchBlockForAssistant } from "./hosted-search-rail";
+import { ASSISTANT_RENDER_CACHE_KEY, HostedSearchRailBlock, hostedSearchBlockForAssistant } from "./hosted-search-rail";
+
+export { ASSISTANT_RENDER_CACHE_KEY };
 
 export type AssistantMessageRailHost = {
 	contentContainer: { children?: Component[]; clear(): void; addChild(component: Component): void };
@@ -77,6 +79,9 @@ function withAssistantSectionSpacing(children: Component[]): Component[] {
 			continue;
 		}
 		const currentKind = spacedAssistantSectionKind(child);
+		if (child instanceof HostedSearchRailBlock && spaced.length === 0) {
+			spaced.push(new HostedSearchGap(child));
+		}
 		if (
 			previousKind
 			&& currentKind
@@ -100,7 +105,6 @@ function withAssistantSectionSpacing(children: Component[]): Component[] {
 const ASSISTANT_THINKING_EXPANDED_KEY = Symbol.for("pi-rail-ui.assistant-thinking-expanded");
 const ASSISTANT_THINKING_MANUAL_KEY = Symbol.for("pi-rail-ui.assistant-thinking-manual");
 const ASSISTANT_THINKING_BLOCKS_KEY = Symbol.for("pi-rail-ui.assistant-thinking-blocks");
-export const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
 
 class AssistantThinkingRailBlock implements Component {
 	expanded = true;

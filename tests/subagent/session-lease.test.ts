@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -82,6 +82,55 @@ test("only one contender can reclaim the same stale lease", async () => {
 
 		assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
 		for (const result of results) if (result.status === "fulfilled") await result.value.release();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+for (const ownerless of [false, true]) {
+	test(`recovers ${ownerless ? "legacy ownerless" : "dead-owner nested"} reclaim locks`, async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-abandoned-reclaim-"));
+		const key = "session:abandoned-reclaim";
+		const lockDir = join(dir, "leases", sessionLeaseDirectoryName(key));
+		const old = new Date(Date.now() - 10_000);
+		try {
+			for (let depth = 0; depth < 3; depth++) {
+				const target = lockDir + ".reclaim".repeat(depth);
+				await mkdir(target, { recursive: true });
+				if (!ownerless) await writeFile(join(target, "owner.json"), JSON.stringify({ pid: 999_999, token: `stale-${depth}`, createdAt: old.toISOString() }));
+				await utimes(target, old, old);
+			}
+			const manager = new FileSessionLeaseManager(dir);
+			const lease = await manager.acquire(key);
+			try {
+				assert.equal((await manager.inspect(key)).state, "owned");
+				await assert.rejects(manager.acquire(key), /already owned/);
+			} finally {
+				await lease.release();
+			}
+			const next = await manager.acquire(key);
+			await next.release();
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+}
+
+test("does not reclaim a live reclaimer or a newly created ownerless lock", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-subagent-live-reclaim-"));
+	const key = "session:live-reclaimer";
+	const lockDir = join(dir, "leases", sessionLeaseDirectoryName(key));
+	const reclaimDir = `${lockDir}.reclaim`;
+	try {
+		await mkdir(reclaimDir, { recursive: true });
+		const owner = { pid: process.pid, token: "live", createdAt: new Date().toISOString() };
+		await writeFile(join(reclaimDir, "owner.json"), JSON.stringify(owner));
+		const manager = new FileSessionLeaseManager(dir);
+		await assert.rejects(manager.acquire(key), /already owned|being reclaimed/);
+		assert.deepEqual(JSON.parse(await readFile(join(reclaimDir, "owner.json"), "utf8")), owner);
+		await rm(reclaimDir, { recursive: true });
+		await mkdir(lockDir);
+		await assert.rejects(manager.acquire(key), /already owned/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

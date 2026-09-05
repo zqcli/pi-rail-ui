@@ -93,7 +93,7 @@ async function linkSavedSession(
 ): Promise<void> {
 	const selected = await chooseSession(ctx, await listSessions());
 	if (!selected) return;
-	const managed = (await runtime.store.list()).find((instance) => path.resolve(instance.sessionFile) === path.resolve(selected.path));
+	const managed = mode === "exclusive" && (await runtime.store.list()).find((instance) => path.resolve(instance.sessionFile) === path.resolve(selected.path));
 	const managedView = managed && runtime.manager
 		? (await runtime.manager.snapshot()).agents.find((agent) => agent.instance.agentId === managed.agentId)
 		: undefined;

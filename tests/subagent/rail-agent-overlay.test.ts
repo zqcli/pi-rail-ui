@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
 import { RailAgentOverlayComponent } from "../../tools/subagents/rail-agent-overlay";
+import { RailAgentManager } from "../../tools/subagents/agent-manager";
 import type { RailModelRef } from "../../tools/subagents/models";
 
 const piModel = {
@@ -49,6 +50,11 @@ function setup(phase: "idle" | "running" = "idle", terminalRows = 30) {
 	currentSnapshot.counts.running = phase === "running" ? 1 : 0;
 	currentSnapshot.counts.idle = phase === "idle" ? 1 : 0;
 	const controls: unknown[] = [];
+	const sessions = [{
+		path: "/tmp/saved.jsonl", id: "saved-session", cwd: "/tmp/other",
+		created: new Date("2026-01-01"), modified: new Date("2026-01-02"), messageCount: 2,
+		name: "Saved Auth", firstMessage: "Review auth", allMessagesText: "Review auth",
+	}];
 	const manager = {
 		snapshot: async () => currentSnapshot,
 		subscribe: () => () => undefined,
@@ -91,18 +97,71 @@ function setup(phase: "idle" | "running" = "idle", terminalRows = 30) {
 		{
 			manager: manager as any,
 			models,
-			sessions: [{
-				path: "/tmp/saved.jsonl", id: "saved-session", cwd: "/tmp/other",
-				created: new Date("2026-01-01"), modified: new Date("2026-01-02"), messageCount: 2,
-				name: "Saved Auth", firstMessage: "Review auth", allMessagesText: "Review auth",
-			}],
+			sessions,
 			currentCwd: "/tmp/project",
 			insertMention: () => undefined,
 		},
 		currentSnapshot,
 	);
-	return { component, controls, manager, get renders() { return renders; }, get closed() { return closed; } };
+	return { component, controls, manager, sessions, get renders() { return renders; }, get closed() { return closed; } };
 }
+
+for (const mode of ["fork", "exclusive"] as const) test(`${mode} ${mode === "fork" ? "copies" : "links"} an already managed session`, async () => {
+	const state = setup();
+	const adopted: any[] = [];
+	let linked = 0;
+	state.sessions[0]!.path = snapshot.agents[0]!.instance.sessionFile;
+	state.manager.link = async () => { linked++; return snapshot.agents[0]!.instance; };
+	state.manager.adopt = (async (request: unknown) => {
+		adopted.push(request);
+		return snapshot.agents[0]!.instance;
+	}) as typeof state.manager.adopt;
+	try {
+		const ui = state.component;
+		ui.handleInput("n");
+		ui.handleInput("\r");
+		for (let index = 0; index < 4; index++) ui.handleInput("\u001b[B");
+		ui.handleInput("\r");
+		ui.handleInput("\r");
+		ui.handleInput("\u001b[B");
+		if (mode === "exclusive") ui.handleInput("\r");
+		for (let index = 0; index < 3; index++) ui.handleInput("\u001b[B");
+		ui.handleInput("\r");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(adopted.length, mode === "fork" ? 1 : 0);
+		assert.equal(linked, mode === "exclusive" ? 1 : 0);
+		if (mode === "fork") assert.deepEqual(adopted[0].session, { mode: "fork", path: "/tmp/auth.jsonl" });
+		assert.match(ui.render(100).join("\n"), mode === "fork" ? /a safe copy/ : /Linked existing Rail agent/);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("Create & Run displays a provider failure instead of reporting success", async () => {
+	const state = setup();
+	const manager = new RailAgentManager({
+		dispatch: async () => ({
+			instance: snapshot.agents[0]!.instance,
+			run: { output: "", stopReason: "error", errorMessage: "HTTP 401" },
+		}),
+	} as any, {} as any, {} as any, "/tmp");
+	state.manager.create = manager.create.bind(manager) as typeof state.manager.create;
+	try {
+		const ui = state.component;
+		ui.handleInput("n");
+		for (let index = 0; index < 5; index++) ui.handleInput("\u001b[B");
+		ui.handleInput("\r");
+		ui.handleInput("review");
+		ui.handleInput("\r");
+		ui.handleInput("\u001b[B");
+		ui.handleInput("\r");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(ui.render(100).join("\n"), /HTTP 401/);
+		assert.doesNotMatch(ui.render(100).join("\n"), /Created /);
+	} finally {
+		state.component.dispose();
+	}
+});
 
 test("Rail agent overlay shows current/global counts and truthful worker status", () => {
 	const state = setup();

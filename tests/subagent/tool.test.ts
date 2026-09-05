@@ -680,3 +680,32 @@ test("session attachment confirms before forking an ordinary session", async () 
 	assert.equal(confirmations, 1);
 	assert.deepEqual(broker.requests[0]?.session, { mode: "fork", path: "/tmp/source.jsonl" });
 });
+
+test("a later parallel slot keeps its own initial task while an earlier worker starts", async () => {
+	const broker = new FakeBroker();
+	const dispatch = broker.dispatch.bind(broker);
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	broker.dispatch = async (request) => { await gate; return dispatch(request); };
+	let tool: any;
+	installStatefulSubagentTool({ registerTool: (value: any) => { tool = value; } } as any, {
+		broker: broker as unknown as SessionBroker,
+		runStateless: async () => ({ exitCode: 0, output: "done", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } }),
+	});
+	const args = { tasks: [{ alias: "slow", task: "SLOW PERSISTENT TASK" }, { task: "FAST STATELESS TASK" }] };
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	let fastPanel = "";
+	const pending = tool.execute("parallel-slots", args, undefined, (result: any) => {
+		if (result.details.results.length === 1 && !result.details.results[0].persistent) {
+			fastPanel = tool.renderResult(result, { expanded: false, isPartial: true }, theme, { args }).render(100).join("\n");
+		}
+	}, context());
+	try {
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(fastPanel, /FAST STATELESS TASK/);
+		assert.doesNotMatch(fastPanel, /SLOW PERSISTENT TASK/);
+	} finally {
+		release();
+		await pending;
+	}
+});

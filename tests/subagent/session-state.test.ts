@@ -77,6 +77,22 @@ describe("FileAgentInstanceStore", () => {
 			await rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("concurrent writes in the same millisecond retain one complete descriptor", async (t) => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-concurrent-store-"));
+		t.mock.method(Date, "now", () => 12345678);
+		try {
+			const store = new FileAgentInstanceStore(dir);
+			const first = { ...instance("agt_shared", "review"), lastTask: "first" };
+			const second = { ...first, lastTask: "second".repeat(1000) };
+			await Promise.all([store.put(first), store.put(second)]);
+			const stored = await store.get(first.agentId);
+			assert.ok(stored?.lastTask === first.lastTask || stored?.lastTask === second.lastTask);
+			assert.equal((await store.list()).length, 1);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("SessionAgentRoster", () => {

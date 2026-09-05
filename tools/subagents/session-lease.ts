@@ -79,7 +79,24 @@ export class FileSessionLeaseManager {
 
 	async acquire(key: string): Promise<SessionLease> {
 		await mkdir(this.leasesDir, { recursive: true, mode: 0o700 });
-		const lockDir = join(this.leasesDir, sessionLeaseDirectoryName(key));
+		return this.acquireDirectory(join(this.leasesDir, sessionLeaseDirectoryName(key)));
+	}
+
+	private async assertAvailable(lockDir: string): Promise<void> {
+		const owner = await readOwner(lockDir);
+		if (owner) {
+			if (processExists(owner.pid)) throw new Error(`Subagent session is already owned by process ${owner.pid}`);
+			return;
+		}
+		try {
+			const age = Date.now() - (await stat(lockDir)).mtimeMs;
+			if (age < OWNER_WRITE_GRACE_MS) throw new Error("Subagent session is already owned by another process");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
+
+	private async acquireDirectory(lockDir: string): Promise<SessionLease> {
 		const reclaimDir = `${lockDir}.reclaim`;
 		const token = randomUUID();
 		const finish = async (): Promise<SessionLease> => {
@@ -92,41 +109,25 @@ export class FileSessionLeaseManager {
 				},
 			};
 		};
-		if (await pathExists(reclaimDir)) throw new Error("Subagent session lease is being reclaimed by another process");
-		try {
-			await mkdir(lockDir, { mode: 0o700 });
-			if (await pathExists(reclaimDir)) {
+		if (!(await pathExists(reclaimDir))) {
+			try {
+				await mkdir(lockDir, { mode: 0o700 });
+				if (!(await pathExists(reclaimDir))) return finish();
 				await rm(lockDir, { recursive: true, force: true });
-				throw new Error("Subagent session lease is being reclaimed by another process");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			}
-			return finish();
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
-		const owner = await readOwner(lockDir);
-		if (owner && processExists(owner.pid)) throw new Error(`Subagent session is already owned by process ${owner.pid}`);
-		if (!owner) {
-			const age = Date.now() - (await stat(lockDir)).mtimeMs;
-			if (age < OWNER_WRITE_GRACE_MS) throw new Error("Subagent session is already owned by another process");
-		}
+		await this.assertAvailable(lockDir);
+		// A reclaimer also needs an owner so an interrupted reclaim can itself be recovered.
+		const reclaim = await this.acquireDirectory(reclaimDir);
 		try {
-			await mkdir(reclaimDir, { mode: 0o700 });
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Subagent session lease is being reclaimed by another process");
-			throw error;
-		}
-		try {
-			const latestOwner = await readOwner(lockDir);
-			if (latestOwner && processExists(latestOwner.pid)) throw new Error(`Subagent session is already owned by process ${latestOwner.pid}`);
-			if (!latestOwner) {
-				const age = Date.now() - (await stat(lockDir)).mtimeMs;
-				if (age < OWNER_WRITE_GRACE_MS) throw new Error("Subagent session is already owned by another process");
-			}
+			await this.assertAvailable(lockDir);
 			await rm(lockDir, { recursive: true, force: true });
 			await mkdir(lockDir, { mode: 0o700 });
 			return await finish();
 		} finally {
-			await rm(reclaimDir, { recursive: true, force: true });
+			await reclaim.release();
 		}
 	}
 }

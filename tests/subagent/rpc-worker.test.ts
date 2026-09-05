@@ -61,6 +61,7 @@ class FakeTransport implements RpcTransport {
 			return undefined;
 		}
 		if (command["type"] === "prompt") {
+			this.emit({ type: "agent_start" });
 			if (this.waitForAbort) return undefined;
 			queueMicrotask(() => {
 				if (this.failPrompt) {
@@ -206,7 +207,7 @@ describe("RpcSessionWorker", () => {
 		const selected = await worker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash", thinkingLevel: "high" });
 
 		assert.deepEqual(selected, { provider: "deepseek", modelId: "deepseek-v4-flash", name: "deepseek-v4-flash", thinkingLevel: "high" });
-		assert.deepEqual(transport.commands.slice(1).map((command) => command["type"]), ["get_state", "set_model", "set_thinking_level", "get_state"]);
+		assert.deepEqual(transport.commands.slice(1).map((command) => command["type"]), ["set_model", "set_thinking_level", "get_state"]);
 	});
 
 	test("maps child controls to Pi steer and follow_up RPC commands", async () => {
@@ -222,6 +223,24 @@ describe("RpcSessionWorker", () => {
 		]);
 	});
 
+	test("a handled prompt without a run fails without opening control admission", async () => {
+		const transport = new FakeTransport();
+		const request = transport.request.bind(transport);
+		transport.request = async (command) => command["type"] === "prompt" ? undefined : request(command);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		let accepted = false;
+		const pending = worker.send("/handled-command", { onAccepted: () => { accepted = true; } });
+		const outcome = await Promise.race([
+			pending.then(() => "completed", (error: Error) => error.message),
+			new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 40)),
+		]);
+		transport.emit({ type: "transport_error", error: "test cleanup" });
+		await pending.catch(() => undefined);
+		assert.match(outcome, /handled without starting/);
+		assert.equal(accepted, false);
+		assert.equal(transport.listeners.size, 0);
+	});
+
 	test("classifies a lost control acknowledgement as unknown delivery", async () => {
 		const transport = new FakeTransport(false, undefined, false, true);
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
@@ -230,6 +249,25 @@ describe("RpcSessionWorker", () => {
 			() => worker.control({ delivery: "steer", message: "Focus on tests" }),
 			/outcome is unknown.*connection lost after write/,
 		);
+	});
+
+	test("a running prompt waits for settlement even when its start event is delayed", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const accepted = Promise.withResolvers<void>();
+		transport.request = async (command) => command["type"] === "get_state" ? { isStreaming: true } : undefined;
+		let finished = false;
+		const pending = worker.send("normal task", { onAccepted: () => accepted.resolve() }).then((result) => {
+			finished = true;
+			return result;
+		});
+		await accepted.promise;
+		assert.equal(finished, false);
+		transport.emit({ type: "agent_start" });
+		transport.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } });
+		transport.emit({ type: "agent_settled" });
+		assert.equal((await pending).output, "done");
+		assert.equal(transport.listeners.size, 0);
 	});
 
 	test("classifies a locally aborted RPC run even when the child settles normally", async () => {

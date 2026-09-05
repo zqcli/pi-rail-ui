@@ -32,6 +32,7 @@ export interface SubagentTranscriptOptions {
 }
 
 export interface SubagentTranscriptRun {
+	slot?: number;
 	alias: string;
 	model?: string;
 	status: SubagentTranscriptStatus;
@@ -161,7 +162,7 @@ function runsWithInitialTasks(
 ): SubagentTranscriptRun[] {
 	if (!initialTasks) return runs;
 	return runs.map((run, runIndex) => {
-		const task = initialTasks[runIndex];
+		const task = initialTasks[run.slot ?? runIndex];
 		if (task === undefined) return run;
 		const initial = {
 			id: "initial-task",

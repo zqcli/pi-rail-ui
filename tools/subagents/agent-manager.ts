@@ -1,11 +1,13 @@
 import type { RailModelRef } from "./models";
 import { FileSessionLeaseManager } from "./session-lease";
+import { runErrorMessage } from "./session-broker";
 import type {
 	AgentInstance,
 	AgentInstanceStore,
 	AgentRoster,
 	AgentRuntimePhase,
 	DispatchProgress,
+	DispatchRequest,
 	DispatchResult,
 	ControlResult,
 	SessionBroker,
@@ -135,19 +137,11 @@ export class RailAgentManager {
 	}
 
 	create(request: CreateRailAgentRequest): Promise<DispatchResult> {
-		return this.broker.dispatch({
-			model: request.model,
-			alias: request.alias,
-			task: request.task,
-			cwd: request.cwd,
-			...(request.session ? { session: request.session } : {}),
-			...(request.onUpdate ? { onUpdate: request.onUpdate } : {}),
-			...(request.signal ? { signal: request.signal } : {}),
-		});
+		return this.dispatch(request);
 	}
 
 	continue(target: string, task: string, signal?: AbortSignal): Promise<DispatchResult> {
-		return this.broker.dispatch({ target, task, ...(signal ? { signal } : {}) });
+		return this.dispatch({ target, task, ...(signal ? { signal } : {}) });
 	}
 
 	async control(target: string, request: WorkerControlRequest, signal?: AbortSignal): Promise<ControlResult> {
@@ -197,6 +191,13 @@ export class RailAgentManager {
 		} finally {
 			await lease.release();
 		}
+	}
+
+	private async dispatch(request: DispatchRequest): Promise<DispatchResult> {
+		const result = await this.broker.dispatch(request);
+		const error = runErrorMessage(result.run);
+		if (error) throw new Error(error);
+		return result;
 	}
 
 	private async assertLocallyControllable(target: string): Promise<RailAgentView> {

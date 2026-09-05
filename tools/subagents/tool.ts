@@ -9,17 +9,18 @@ import {
 	type RailModelRef,
 } from "./models";
 import type { StatelessAgentRunner, StatelessRunResult } from "./stateless-runner";
+import { runErrorMessage } from "./session-broker";
 import type {
 	DispatchRequest,
 	DispatchResult,
 	SessionBroker,
 	SubagentUsage,
-	WorkerRunResult,
 } from "./session-broker";
 import {
 	appendSubagentTranscriptFailure,
 	boundSubagentRunTranscripts,
 	renderSubagentTranscript,
+	type SubagentTranscriptRun,
 	type SubagentTranscriptSnapshot,
 } from "./transcript";
 
@@ -77,22 +78,12 @@ const SubagentParams = Type.Object({
 	})),
 });
 
-export interface StatefulSubagentRunDetails {
+export interface StatefulSubagentRunDetails extends SubagentTranscriptRun {
 	agentId?: string;
-	alias: string;
-	model?: string;
 	sessionId?: string;
 	task: string;
-	status: "running" | "completed" | "accepted" | "failed";
-	output: string;
-	transcript?: SubagentTranscriptSnapshot;
 	usage: SubagentUsage;
 	durationMs: number;
-	stopReason?: string;
-	errorMessage?: string;
-	step?: number;
-	persistent: boolean;
-	outputTruncated?: boolean;
 }
 
 export interface StatefulSubagentDetails {
@@ -224,10 +215,6 @@ function boundDetailOutputs(results: StatefulSubagentRunDetails[]): StatefulSuba
 	});
 }
 
-function failedRun(run: WorkerRunResult): boolean {
-	return run.stopReason === "error" || run.stopReason === "aborted" || Boolean(run.errorMessage);
-}
-
 function compactPersistentResult(result: DispatchResult, task: string, durationMs: number, step?: number): StatefulSubagentRunDetails {
 	return {
 		agentId: result.instance.agentId,
@@ -235,7 +222,7 @@ function compactPersistentResult(result: DispatchResult, task: string, durationM
 		model: railModelReference(result.instance.model),
 		sessionId: result.instance.sessionId,
 		task,
-		status: failedRun(result.run) ? "failed" : "completed",
+		status: runErrorMessage(result.run) ? "failed" : "completed",
 		output: result.run.output,
 		...(result.run.transcript ? { transcript: result.run.transcript } : {}),
 		usage: result.run.usage,
@@ -253,7 +240,7 @@ function compactStatelessResult(alias: string, model: RailModelRef, task: string
 		alias,
 		model: reference,
 		task,
-		status: run.exitCode !== 0 || failedRun(run) ? "failed" : "completed",
+		status: run.exitCode !== 0 || runErrorMessage(run) ? "failed" : "completed",
 		output: run.output,
 		...(run.transcript ? { transcript: run.transcript } : {}),
 		usage: run.usage,
@@ -489,7 +476,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				liveResults.set(slot, result);
 				const results = [...liveResults.entries()]
 					.sort(([left], [right]) => left - right)
-					.map(([, item]) => item);
+					.map(([slot, item]) => ({ ...item, slot }));
 				const details = resultDetails(results);
 				latestDetails.set(toolCallId, details);
 				onUpdate?.({

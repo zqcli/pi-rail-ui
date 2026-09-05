@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { isValidAgentAlias } from "./identity";
@@ -155,9 +156,13 @@ export class FileAgentInstanceStore implements AgentInstanceStore {
 		if (!AGENT_ID_RE.test(instance.agentId)) throw new Error(`Invalid subagent id: ${instance.agentId}`);
 		await mkdir(this.instancesDir, { recursive: true, mode: 0o700 });
 		const target = this.instancePath(instance.agentId);
-		const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-		await writeFile(temporary, `${JSON.stringify(instance, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-		await rename(temporary, target);
+		const temporary = `${target}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(temporary, `${JSON.stringify(instance, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+			await rename(temporary, target);
+		} finally {
+			await rm(temporary, { force: true });
+		}
 	}
 
 	async delete(agentId: string): Promise<void> {

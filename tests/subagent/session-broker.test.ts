@@ -259,6 +259,52 @@ describe("SessionBroker", () => {
 		assert.equal(starts.at(-1)?.sessionPath, first.instance.sessionFile);
 	});
 
+	for (const action of ["delete", "stop", "shutdown", "changeModel"] as const) {
+		test(`${action} waits for the complete dispatch metadata write`, async () => {
+			const dir = await mkdtemp(join(tmpdir(), "pi-subagent-finalize-"));
+			const store = new MemoryInstanceStore();
+			const worker = new FakeWorker("child", join(dir, "child.jsonl"));
+			const broker = new SessionBroker({ store, roster: new MemoryRoster(), workerFactory: async () => worker });
+			const agent = await broker.attach({ model: reviewerModel(), alias: "review" });
+			let release!: () => void;
+			let started!: () => void;
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const writing = new Promise<void>((resolve) => { started = resolve; });
+			const put = store.put.bind(store);
+			let held = false;
+			store.put = async (instance) => {
+				if (instance.lastTask === "finish" && !held) {
+					held = true;
+					started();
+					await gate;
+				}
+				await put(instance);
+			};
+			const run = broker.dispatch({ target: agent.agentId, task: "finish" });
+			await writing;
+			let finished = false;
+			const replacement = { provider: "test", modelId: "replacement" };
+			const operation = (action === "shutdown" ? broker.shutdown()
+				: action === "changeModel" ? broker.changeModel(agent.agentId, replacement)
+					: broker[action](agent.agentId)).then(() => { finished = true; });
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 30));
+				assert.equal(finished, false, "lifecycle operation must not overtake dispatch persistence");
+			} finally {
+				release();
+				await Promise.all([run, operation]);
+				await broker.shutdown();
+				await rm(dir, { recursive: true, force: true });
+			}
+			const stored = await store.get(agent.agentId);
+			if (action === "delete") assert.equal(stored, undefined);
+			else {
+				assert.equal(stored?.lastTask, "finish");
+				if (action === "changeModel") assert.deepEqual(stored?.model, replacement);
+			}
+		});
+	}
+
 	test("lazily assigns a stable subagent session name to legacy descriptors on open", async () => {
 		const { broker, store, roster, workerFactory, starts } = setup();
 		const first = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
@@ -374,6 +420,29 @@ describe("SessionBroker", () => {
 		rejectPrompt();
 		await assert.rejects(pending, /prompt rejected/);
 		assert.deepEqual(workers[0]!.controls, []);
+	});
+
+	test("controls close when the child finishes, before metadata persistence completes", async () => {
+		const { broker, store } = setup();
+		const agent = await broker.attach({ model: reviewerModel(), alias: "review" });
+		const writing = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const put = store.put.bind(store);
+		store.put = async (instance) => {
+			writing.resolve();
+			await release.promise;
+			await put(instance);
+		};
+		const pending = broker.dispatch({ target: agent.agentId, task: "finish" });
+		await writing.promise;
+		try {
+			await assert.rejects(broker.control({ target: agent.agentId, delivery: "steer", message: "too late" }), /not currently running/);
+			assert.notEqual(broker.runtimeStatus(agent.agentId).phase, "running");
+		} finally {
+			release.resolve();
+			await pending;
+			await broker.shutdown();
+		}
 	});
 
 	test("a failed control does not link a stopped global instance into the parent roster", async () => {
@@ -637,6 +706,35 @@ describe("SessionBroker", () => {
 		assert.equal(starts, 2);
 		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "idle", queued: 0 });
 	});
+
+	for (const rollbackFails of [false, true]) {
+		test(`a partial model change ${rollbackFails ? "retires the worker when rollback fails" : "rolls back before reuse"}`, async () => {
+			const { broker, workers, store, starts } = setup();
+			const agent = await broker.attach({ model: reviewerModel(), alias: "review" });
+			const worker = workers[0]!;
+			worker.setModel = async (model) => {
+				if (model.modelId === "replacement") {
+					worker.model = model;
+					throw new Error("thinking update failed");
+				}
+				if (rollbackFails) throw new Error("rollback failed");
+				worker.model = model;
+				return model;
+			};
+			await assert.rejects(
+				broker.changeModel(agent.agentId, { provider: "test", modelId: "replacement" }),
+				rollbackFails ? /rollback failed/ : /thinking update failed/,
+			);
+			assert.deepEqual((await store.get(agent.agentId))?.model, reviewerModel());
+			assert.equal(worker.stopped, rollbackFails);
+			assert.equal(broker.runtimeStatus(agent.agentId).phase, rollbackFails ? "error" : "idle");
+			if (!rollbackFails) assert.deepEqual(worker.model, reviewerModel());
+			await broker.dispatch({ target: agent.agentId, task: "continue with original model" });
+			assert.equal(workers.length, rollbackFails ? 2 : 1);
+			assert.deepEqual(starts.at(-1)?.model, reviewerModel());
+			await broker.shutdown();
+		});
+	}
 
 	test("single-flights worker startup before serializing concurrent messages after restart", async () => {
 		const { broker, store, roster, workerFactory, starts, workers } = setup();

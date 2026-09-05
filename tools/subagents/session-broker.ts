@@ -24,6 +24,11 @@ export interface WorkerRunResult {
 	errorMessage?: string;
 }
 
+export function runErrorMessage(run: Pick<WorkerRunResult, "stopReason" | "errorMessage">): string | undefined {
+	return run.errorMessage || (run.stopReason === "aborted" ? "Subagent request was aborted"
+		: run.stopReason === "error" ? "Subagent run failed" : undefined);
+}
+
 export type WorkerStartMode = "new" | "open" | "fork" | "exclusive";
 
 export interface WorkerStartSpec {
@@ -250,21 +255,34 @@ export class SessionBroker {
 		}
 		if (request.target && !this.roster.resolve(request.target)) this.roster.link(instance.alias, instance.agentId);
 		request.onUpdate?.({ instance, run: { output: "(starting...)", usage: emptyUsage() } });
-		let run: WorkerRunResult;
 		try {
 			const state = await this.workerState(instance, expectedEpoch);
-			run = await this.enqueue(state, () => state.worker.send(request.task, {
-				...(request.signal ? { signal: request.signal } : {}),
-				...(request.onUpdate ? { onUpdate: (partial) => request.onUpdate!({ instance, run: partial }) } : {}),
-				onAccepted: () => {
-					if (state.activeRunId !== undefined && !state.stopping) {
-						state.activeRunAccepted = true;
-						this.emitRuntimeChange();
-					}
-				},
-			}), "run");
-			this.runtimeErrors.delete(instance.agentId);
-			this.emitRuntimeChange();
+			return await this.enqueue(state, async () => {
+				const run = await state.worker.send(request.task, {
+					...(request.signal ? { signal: request.signal } : {}),
+					...(request.onUpdate ? { onUpdate: (partial) => request.onUpdate!({ instance, run: partial }) } : {}),
+					onAccepted: () => {
+						if (state.activeRunId !== undefined && !state.stopping) {
+							state.activeRunAccepted = true;
+							this.emitRuntimeChange();
+						}
+					},
+				});
+				state.activeRunId = undefined;
+				state.activeRunAccepted = false;
+				this.emitRuntimeChange();
+				const stored = await this.store.get(instance.agentId) ?? instance;
+				const persisted: AgentInstance = {
+					...stored,
+					updatedAt: new Date().toISOString(),
+					lastTask: compactMetadata(request.task, 2000),
+					lastOutput: compactMetadata(run.output, 16 * 1024),
+				};
+				await this.store.put(persisted);
+				state.instance = persisted;
+				this.runtimeErrors.delete(instance.agentId);
+				return { instance: { ...persisted, alias: instance.alias }, run };
+			}, "run");
 		} catch (error) {
 			if (this.stoppingAgents.has(instance.agentId) || request.signal?.aborted) this.runtimeErrors.delete(instance.agentId);
 			else {
@@ -274,17 +292,6 @@ export class SessionBroker {
 			this.emitRuntimeChange();
 			throw error;
 		}
-		const stored = await this.store.get(instance.agentId) ?? instance;
-		const persisted: AgentInstance = {
-			...stored,
-			updatedAt: new Date().toISOString(),
-			lastTask: compactMetadata(request.task, 2000),
-			lastOutput: compactMetadata(run.output, 16 * 1024),
-		};
-		await this.store.put(persisted);
-		const liveState = this.workers.get(instance.agentId);
-		if (liveState) liveState.instance = persisted;
-		return { instance: { ...persisted, alias: instance.alias }, run };
 	}
 
 	async control(request: ControlRequest): Promise<ControlResult> {
@@ -406,16 +413,16 @@ export class SessionBroker {
 					return updated;
 				}
 				if (!state.worker.setModel) throw new Error("Subagent worker does not support model changes");
-				const effective = await state.worker.setModel(model);
-				const updated = { ...latest, model: structuredClone(effective), updatedAt: new Date().toISOString() };
 				try {
+					const effective = await state.worker.setModel(model);
+					const updated = { ...latest, model: structuredClone(effective), updatedAt: new Date().toISOString() };
 					await this.store.put(updated);
 					return updated;
 				} catch (error) {
 					try {
 						await state.worker.setModel(latest.model);
 					} catch (rollbackError) {
-						const message = `Model metadata update failed and worker rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+						const message = `Subagent model change failed and worker rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
 						this.runtimeErrors.set(instance.agentId, message);
 						await this.retireFailedWorker(instance.agentId);
 						this.emitRuntimeChange();

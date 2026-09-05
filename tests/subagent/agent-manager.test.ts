@@ -24,6 +24,20 @@ function instance(agentId: string, alias: string, sessionFile: string) {
 	};
 }
 
+test("manager create and continue propagate failed or aborted run outcomes", async () => {
+	for (const run of [
+		{ stopReason: "error", errorMessage: "HTTP 401" },
+		{ stopReason: "error" },
+		{ stopReason: "aborted" },
+	]) {
+		const agent = instance("agt_test", "test", "/tmp/test.jsonl");
+		const manager = new RailAgentManager({ dispatch: async () => ({ instance: agent, run }) } as any, {} as any, {} as any, "/tmp");
+		const message = run.errorMessage ?? (run.stopReason === "aborted" ? "Subagent request was aborted" : "Subagent run failed");
+		await assert.rejects(manager.create({ model: agent.model, alias: agent.alias, cwd: agent.cwd, task: "first" }), { message });
+		await assert.rejects(manager.continue(agent.agentId, "next"), { message });
+	}
+});
+
 test("RailAgentManager combines current links, local runtime state, and foreign leases", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-"));
 	const foreignOwner = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });

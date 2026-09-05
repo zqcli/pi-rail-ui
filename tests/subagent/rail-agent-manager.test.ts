@@ -103,7 +103,7 @@ test("safe session linking selects a Pi model and defaults to fork", async () =>
 			},
 		},
 		roster: { link: () => undefined },
-		store: { list: async () => [] },
+		store: { list: async () => [{ alias: "existing", agentId: "agt_existing", sessionFile: "/tmp/saved.jsonl" }] },
 	};
 
 	await runRailAgentManager(ctx as any, runtime as any, {

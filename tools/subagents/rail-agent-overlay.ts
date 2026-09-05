@@ -637,7 +637,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			this.renderSoon();
 			return;
 		}
-		if (this.form.adoptMode === "exclusive") {
+		if (this.form.mode === "adopt" && this.form.adoptMode === "exclusive") {
 			const approved = await this.ctx.ui.confirm(
 				"Use saved session in place?",
 				"Only continue if no other Pi process has this session open. Safe copy is recommended.",
@@ -647,12 +647,11 @@ export class RailAgentOverlayComponent implements Focusable {
 		const model = { ...this.form.model, thinkingLevel: this.form.thinkingLevel };
 		await this.runOperation(this.form.mode === "new" ? "Creating and running agent..." : "Adopting saved session...", async (signal) => {
 			if (this.form.mode === "adopt") {
-				const managed = this.snapshot.agents.find((agent) => path.resolve(agent.instance.sessionFile) === path.resolve(this.form.session!.path));
+				const managed = this.form.adoptMode === "exclusive" && this.snapshot.agents.find((agent) => path.resolve(agent.instance.sessionFile) === path.resolve(this.form.session!.path));
 				if (managed && managed.phase !== "in-use-elsewhere" && managed.phase !== "unknown") {
 					const linked = await this.options.manager.link(managed.instance.agentId);
 					if (this.form.task.trim()) {
-						const result = await this.options.manager.continue(linked.agentId, this.form.task, signal);
-						if (result.run.stopReason === "aborted") throw new Error("Subagent run was aborted");
+						await this.options.manager.continue(linked.agentId, this.form.task, signal);
 					}
 					this.notice = this.form.task.trim()
 						? `Linked and continued existing Rail agent ${managed.instance.alias}`
@@ -662,15 +661,13 @@ export class RailAgentOverlayComponent implements Focusable {
 				}
 				const session = { mode: this.form.adoptMode, path: this.form.session!.path } as const;
 				if (this.form.task.trim()) {
-					const result = await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, session, signal });
-					if (result.run.stopReason === "aborted") throw new Error("Subagent run was aborted");
+					await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, session, signal });
 				} else {
 					await this.options.manager.adopt({ model, alias: this.form.alias, cwd: this.form.cwd, session });
 				}
 				this.notice = `Adopted ${this.form.alias} as ${this.form.adoptMode === "fork" ? "a safe copy" : "an exclusive session"}`;
 			} else {
-				const result = await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, signal });
-				if (result.run.stopReason === "aborted") throw new Error("Subagent run was aborted");
+				await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, signal });
 				this.notice = `Created ${this.form.alias}`;
 			}
 			this.tab = "current";

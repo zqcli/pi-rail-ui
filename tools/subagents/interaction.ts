@@ -1,6 +1,8 @@
+import type { ExtensionContext, InputEvent, InputEventResult } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, AutocompleteSuggestions } from "@earendil-works/pi-tui";
+import { isValidAgentAlias } from "./identity";
 import { railModelReference } from "./models";
-import type { AgentInstance } from "./session-broker";
+import type { AgentInstance, WorkerControlDelivery, WorkerControlRequest } from "./session-broker";
 
 export interface SubagentMentions {
 	targets: string[];
@@ -13,6 +15,59 @@ export interface MentionAgentItem {
 }
 
 export type MentionModelItem = string | { reference: string; description: string };
+
+export interface DirectSubagentControl {
+	target: string;
+	delivery: WorkerControlDelivery;
+	message: string;
+}
+
+export interface DirectSubagentControlResult {
+	instance: Pick<AgentInstance, "alias">;
+	delivery: WorkerControlDelivery;
+}
+
+export type DirectSubagentController = (
+	target: string,
+	request: WorkerControlRequest,
+	signal?: AbortSignal,
+) => Promise<DirectSubagentControlResult>;
+
+const DIRECT_CONTROL_PATTERN = /^@agent\/([^\s]+)[ \t]+(steer|followup)(?:[ \t]+([\s\S]*))?$/u;
+
+export function parseDirectSubagentControl(text: string): DirectSubagentControl | undefined {
+	const match = text.match(DIRECT_CONTROL_PATTERN);
+	if (!match || !isValidAgentAlias(match[1]!)) return undefined;
+	return {
+		target: match[1]!,
+		delivery: match[2] === "followup" ? "followUp" : "steer",
+		message: match[3]?.trim() ?? "",
+	};
+}
+
+export async function handleDirectSubagentControlInput(
+	event: Pick<InputEvent, "text" | "source">,
+	ctx: {
+		hasUI: ExtensionContext["hasUI"];
+		ui: Pick<ExtensionContext["ui"], "notify">;
+		signal?: AbortSignal | undefined;
+	},
+	control: DirectSubagentController | undefined,
+): Promise<InputEventResult> {
+	const request = parseDirectSubagentControl(event.text);
+	if (!request || event.source === "extension" || !ctx.hasUI) return { action: "continue" };
+
+	try {
+		if (!request.message) throw new Error("Subagent control message cannot be empty");
+		if (!control) throw new Error("Persistent subagent runtime is not ready");
+		const controlled = await control(request.target, { delivery: request.delivery, message: request.message }, ctx.signal);
+		const label = controlled.delivery === "steer" ? "Steer" : "Follow-up";
+		ctx.ui.notify(`${label} accepted by ${controlled.instance.alias}`, "info");
+	} catch (error) {
+		ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+	}
+	return { action: "handled" };
+}
 
 function uniqueMatches(text: string, pattern: RegExp): string[] {
 	const values: string[] = [];

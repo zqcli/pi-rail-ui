@@ -38,6 +38,39 @@ test("Rail subagent installer exposes only the Rail-namespaced slash command", (
 	assert.deepEqual(commands, ["rail-agent"]);
 });
 
+test("Rail subagent registers an input hook and consumes direct controls before session start", async () => {
+	let inputHandler: ((event: any, ctx: any) => Promise<unknown>) | undefined;
+	const notifications: Array<{ message: string; type: string | undefined }> = [];
+	const previousDepth = process.env["PI_SUBAGENT_DEPTH"];
+	process.env["PI_SUBAGENT_DEPTH"] = "0";
+	try {
+		installRailSubagent({
+			registerTool: () => undefined,
+			registerCommand: () => undefined,
+			on: (event: string, handler: (value: any, ctx: any) => Promise<unknown>) => {
+				if (event === "input") inputHandler = handler;
+			},
+			appendEntry: () => undefined,
+		} as any);
+	} finally {
+		if (previousDepth === undefined) delete process.env["PI_SUBAGENT_DEPTH"];
+		else process.env["PI_SUBAGENT_DEPTH"] = previousDepth;
+	}
+
+	assert.ok(inputHandler);
+	const result = await inputHandler!({
+		type: "input",
+		text: "@agent/auth-review steer Focus on tests",
+		source: "interactive",
+	}, {
+		hasUI: true,
+		ui: { notify: (message: string, type?: string) => notifications.push({ message, type }) },
+	});
+
+	assert.deepEqual(result, { action: "handled" });
+	assert.deepEqual(notifications, [{ message: "Persistent subagent runtime is not ready", type: "error" }]);
+});
+
 test("safe session linking selects a Pi model and defaults to fork", async () => {
 	const selectTitles: string[] = [];
 	let editorText = "";

@@ -11,6 +11,7 @@ import {
 	applySubagentMentionCompletion,
 	buildSubagentRosterPrompt,
 	extractSubagentMentions,
+	handleDirectSubagentControlInput,
 	subagentMentionSuggestions,
 } from "./interaction";
 import { availableRailModels, railModelReference } from "./models";
@@ -170,6 +171,15 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		if (!runtime) return;
 		runtime.ctx = ctx;
 		runtime.roster.restore(ctx.sessionManager.getBranch());
+	});
+
+	pi.on("input", async (event, ctx) => {
+		const active = runtime;
+		return handleDirectSubagentControlInput(
+			event,
+			ctx,
+			active ? (target, request, signal) => active.manager.control(target, request, signal) : undefined,
+		);
 	});
 
 	pi.on("before_agent_start", async (event) => {

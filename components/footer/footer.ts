@@ -19,8 +19,6 @@ import {
 } from "./footer-session-presenter";
 
 type FooterStore = {
-	selectionNoticeUntil: number;
-	selectionNoticeTimer?: ReturnType<typeof setTimeout> | undefined;
 	turnStartTime?: number | undefined;
 	turnDuration?: number | undefined;
 	footerData?: ReadonlyFooterDataProvider | undefined;
@@ -31,31 +29,11 @@ const MODAL_MIN_WIDTH = 56;
 const MODAL_MAX_WIDTH = 92;
 
 function footerStore(): FooterStore {
-	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { selectionNoticeUntil: 0, turnStartTime: undefined, turnDuration: undefined } satisfies FooterStore);
+	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { turnStartTime: undefined, turnDuration: undefined } satisfies FooterStore);
 }
 
 function requestFooterRender(tui?: any): void {
 	tui?.requestRender?.();
-}
-
-export function showFooterSelectionNotice(tui?: any, durationMs = 1800): void {
-	const store = footerStore();
-	store.selectionNoticeUntil = Date.now() + durationMs;
-	if (store.selectionNoticeTimer) clearTimeout(store.selectionNoticeTimer);
-	store.selectionNoticeTimer = setTimeout(() => {
-		store.selectionNoticeTimer = undefined;
-		store.selectionNoticeUntil = 0;
-		requestFooterRender(tui);
-	}, durationMs);
-	store.selectionNoticeTimer.unref?.();
-	requestFooterRender(tui);
-}
-
-export function clearFooterSelectionNotice(): void {
-	const store = footerStore();
-	if (store.selectionNoticeTimer) clearTimeout(store.selectionNoticeTimer);
-	store.selectionNoticeTimer = undefined;
-	store.selectionNoticeUntil = 0;
 }
 
 export function setTurnStartTime(time: number): void {
@@ -81,10 +59,6 @@ function turnDurationText(state: FooterLiveState, style: FooterStyle): string | 
 	if (!state.idle && store.turnStartTime !== undefined) return formatDuration(Date.now() - store.turnStartTime, style);
 	if (store.turnDuration !== undefined) return formatDuration(store.turnDuration, style);
 	return undefined;
-}
-
-function selectionNoticeText(style: FooterStyle): string | undefined {
-	return footerStore().selectionNoticeUntil > Date.now() ? `${style.mint}selection copied` : undefined;
 }
 
 function footerLine(content: string, width: number): string {
@@ -128,10 +102,6 @@ function fitPrioritizedFooterLeft(
 	return footerLine(visibleJoin([fitted, suffixWidth > 0 ? fitToWidth(suffix, suffixWidth) : undefined], separator), width);
 }
 
-function stateText(state: FooterLiveState, style: FooterStyle): string {
-	return state.idle ? `${style.mint}● ready` : `${style.amber}● working`;
-}
-
 function contextText(state: FooterLiveState, style: FooterStyle): string {
 	const hasPercent = typeof state.contextPercent === "number" && Number.isFinite(state.contextPercent);
 	const percent = hasPercent ? `${state.contextPercent!.toFixed(2)}%` : "?";
@@ -172,10 +142,8 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 		searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
 	];
 	const suffixParts = [
-		stateText(state, style),
 		turnDurationText(state, style),
 		state.pending ? `${style.amber}queued` : undefined,
-		selectionNoticeText(style),
 	];
 	const right = visibleJoin([
 		usageText(stats, style),

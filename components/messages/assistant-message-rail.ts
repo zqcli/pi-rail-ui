@@ -1,7 +1,6 @@
 import { type Theme } from "@earendil-works/pi-coding-agent";
-import { Spacer, type Component } from "@earendil-works/pi-tui";
+import { Spacer, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { railSectionConfig } from "../../config";
-import { markRailClickRows } from "../executions/rail-click";
 import {
 	EditorSurfaceRenderer,
 	SurfaceContentInsetBlock,
@@ -10,12 +9,13 @@ import {
 import {
 	collapseHint,
 	defineRailSection,
+	handleRailSectionClickToggle,
 	isRailUiActive,
 	markRailSectionManuallyToggled,
 	resolveRailSection,
 	wasRailSectionManuallyToggled,
 } from "../../rail/rail-section";
-import { ASSISTANT_RENDER_CACHE_KEY, HostedSearchRailBlock, hostedSearchBlockForAssistant } from "./hosted-search-rail";
+import { HostedSearchRailBlock, hostedSearchBlockForAssistant, ASSISTANT_RENDER_CACHE_KEY } from "./hosted-search-rail";
 
 export { ASSISTANT_RENDER_CACHE_KEY };
 
@@ -203,7 +203,15 @@ class AssistantThinkingRailBlock implements Component {
 			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.setExpandedAutomatically(false);
 			rows = this.expanded ? this.fullRows(width) : this.collapsedRows(width, limit);
 		}
-		return markRailClickRows(this, rows);
+		return rows;
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (!isRailUiActive()) return this.inner.handleMouse?.(event);
+		// Always consume clicks on a Rail thinking block: letting the native
+		// thinking MouseRegion toggle visibility would rebuild the message
+		// content and drop the Rail collapse preview.
+		return handleRailSectionClickToggle(this, event, true);
 	}
 }
 

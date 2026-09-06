@@ -21,6 +21,8 @@ import {
 	collapsedSimpleRows,
 	executionHiddenLineCount,
 	fg,
+	RAIL_RENDER_CONTENT_OFFSET_KEY,
+	RAIL_RENDER_PRESENTATION_KEY,
 	renderedChildLines,
 	TOOL_RAIL_CACHE_KEY,
 	type ExecutionRailPatchStore,
@@ -104,10 +106,16 @@ function renderBashExecutionRail(
 	store: ExecutionRailPatchStore,
 ): string[] {
 	const surface = bashExecutionSurfaceForTheme(store.theme);
-	if (width < surface.minRenderableWidth()) return renderBashWithoutSurface(component, width, originalRender);
+	if (width < surface.minRenderableWidth()) {
+		component[RAIL_RENDER_PRESENTATION_KEY] = "native";
+		component[RAIL_RENDER_CONTENT_OFFSET_KEY] = 0;
+		return renderBashWithoutSurface(component, width, originalRender);
+	}
 	const contentWidth = surface.contentWidth(width);
 	const simpleMode = railSectionConfig("bashExecution").collapsedRenderMode === "simple";
 	applyDefaultAutoCollapse(component, "bashExecution", () => renderedChildLines(component.contentContainer, contentWidth), { avoidExpandedRender: simpleMode });
+	component[RAIL_RENDER_PRESENTATION_KEY] = simpleMode && !component.expanded ? "simple" : "native";
+	component[RAIL_RENDER_CONTENT_OFFSET_KEY] = surface.contentStartCol();
 	const signature = bashRenderSignature(component, width, contentWidth);
 
 	if (simpleMode && !component.expanded) {
@@ -225,10 +233,16 @@ function renderToolExecutionRail(
 	const kind = "toolExecution";
 	const config = railSectionConfig(kind);
 	const surface = toolExecutionSurfaceForState(toolExecutionState(component));
-	if (width < surface.minRenderableWidth()) return originalRender.call(component, width);
+	if (width < surface.minRenderableWidth()) {
+		component[RAIL_RENDER_PRESENTATION_KEY] = "native";
+		component[RAIL_RENDER_CONTENT_OFFSET_KEY] = 0;
+		return originalRender.call(component, width);
+	}
 	const contentWidth = surface.contentWidth(width);
 	const simpleMode = config.collapsedRenderMode === "simple";
 	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, contentWidth), { avoidExpandedRender: simpleMode });
+	component[RAIL_RENDER_PRESENTATION_KEY] = simpleMode && !component.expanded ? "simple" : "native";
+	component[RAIL_RENDER_CONTENT_OFFSET_KEY] = surface.contentStartCol();
 	const cacheable = Boolean(component.result && component.isPartial === false && (!Array.isArray(component.imageComponents) || component.imageComponents.length === 0));
 	if (cacheable) {
 		const signature = [width, toolExecutionState(component), component.expanded ? 1 : 0, simpleMode ? 1 : 0].join("\u001f");

@@ -65,6 +65,9 @@ test("renders the active native search mode in the Rail footer", async () => {
 		assert.match(rendered, /FAST/);
 		assert.match(rendered, /xhigh.*FAST.*SEARCH LIVE/);
 		assert.match(rendered, /ctx 0\.00%/);
+		// Native status line covers ready/working; Rail routes nothing for copies.
+		assert.doesNotMatch(rendered, /selection copied/);
+		assert.doesNotMatch(rendered, /● ready|● working/);
 		assert.match(stripAnsi(component.render(40).join("\n")), /SEARCH LIVE/);
 	} finally {
 		component.dispose();

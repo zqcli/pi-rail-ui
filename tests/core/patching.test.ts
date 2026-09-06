@@ -8,7 +8,7 @@ import {
 	getTuiAltScreenConstructor,
 } from "../../core/patching";
 
-describe("Pi 0.84.4 constructor targeting", () => {
+describe("Pi 0.85.1 constructor targeting", () => {
 	it("resolves the same constructors exported to the extension", async () => {
 		assert.equal(await getTuiAltScreenConstructor(), TuiAltScreen);
 		assert.equal(await getInteractiveModeConstructor(), InteractiveMode);

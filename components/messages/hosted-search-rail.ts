@@ -1,5 +1,5 @@
 import { getMarkdownTheme, keyHint, type Theme } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, type Component } from "@earendil-works/pi-tui";
+import { Markdown, Text, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import {
 	HostedSearchActivity,
 	hostedSearchActivityForMessage,
@@ -11,11 +11,11 @@ import {
 import { RailSectionBlock } from "../../rail/rail-section-block";
 import {
 	defineRailSection,
+	handleRailSectionClickToggle,
 	isRailUiActive,
 	markRailSectionManuallyToggled,
 	wasRailSectionManuallyToggled,
 } from "../../rail/rail-section";
-import { markRailClickRows, unregisterRailClickComponent } from "../executions/rail-click";
 
 const HOSTED_SEARCH_BLOCK_KEY = Symbol.for("pi-rail-ui.hosted-search-block");
 export const ASSISTANT_RENDER_CACHE_KEY = Symbol.for("pi-rail-ui.assistant-render-cache");
@@ -177,12 +177,16 @@ export class HostedSearchRailBlock implements Component {
 
 	dispose(): void {
 		this.content.dispose();
-		unregisterRailClickComponent(this);
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (!isRailUiActive()) return this.surface.handleMouse?.(event);
+		return handleRailSectionClickToggle(this, event, true);
 	}
 
 	render(width: number): string[] {
 		if (!this.visible) return [];
-		return markRailClickRows(this, this.surface.render(width));
+		return this.surface.render(width);
 	}
 }
 

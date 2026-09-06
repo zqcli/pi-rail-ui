@@ -4,7 +4,7 @@ import { AssistantMessageComponent, initTheme } from "@earendil-works/pi-coding-
 import { installAssistantMessageRail, uninstallAssistantMessageRail } from "../../../components/messages/assistant-message";
 import { renderAssistantMessageRail, updateNativeAssistantContent } from "../../../components/messages/assistant-message-rail";
 import { stripAnsi } from "../../../core/utils";
-import { resolveRailSection } from "../../../rail/rail-section";
+import { resolveRailSection, setRailUiActive } from "../../../rail/rail-section";
 import { railThinkingSurface } from "../../../rail/rail-surface";
 import {
 	HostedSearchActivity,
@@ -300,7 +300,7 @@ test("keeps a manually expanded thinking block expanded across streaming updates
 	assert.equal(rows.some((row: string) => /more lines/.test(row)), false);
 });
 
-test("marks thinking rows so a plain click can expand them", () => {
+test("toggles the thinking collapse on a component click, ignoring press and release", () => {
 	const thinking = new MultiLineMarkdown("line1\nline2\nline3\nline4");
 	const children: any[] = [new Spacer(), thinking];
 	const component: any = {
@@ -321,10 +321,80 @@ test("marks thinking rows so a plain click can expand them", () => {
 		railThinkingSurface,
 	);
 	const block = component.contentContainer.children[1] as any;
-	const rows = block.render(80);
+	const event = (type: string) => ({
+		type,
+		button: "left",
+		x: 2,
+		y: 0,
+		screenX: 2,
+		screenY: 0,
+		width: 80,
+		height: 4,
+		shift: false,
+		alt: false,
+		ctrl: false,
+	});
 
-	assert.equal(rows[0]!.includes("\x1b_pi-rail-click:start:"), true);
-	assert.equal(rows[rows.length - 1]!.includes("\x1b_pi-rail-click:end:"), true);
+	block.render(80); // auto-collapse is applied lazily during render
+	assert.equal(block.expanded, false);
+	const collapsed = stripAnsi(block.render(80).join("\n"));
+	assert.match(collapsed, /earlier lines/);
+	assert.doesNotMatch(collapsed, /line4/);
+
+	assert.equal(block.handleMouse(event("press") as any), undefined);
+	assert.equal(block.handleMouse(event("release") as any), undefined);
+	assert.equal(block.expanded, false);
+
+	assert.deepEqual(block.handleMouse(event("click") as any), { handled: true });
+	assert.equal(block.expanded, true);
+	assert.equal(stripAnsi(block.render(80).join("\n")).includes("line4"), true);
+});
+
+test("hands thinking clicks back to the native inner region when rail UI is off", () => {
+	let nativeClicks = 0;
+	const thinking: any = new MultiLineMarkdown("line1\nline2\nline3\nline4");
+	thinking.handleMouse = () => {
+		nativeClicks++;
+		return { handled: true };
+	};
+	const component: any = {
+		contentContainer: {
+			children: [new Spacer(), thinking],
+			clear() { this.children = []; },
+			addChild(child: unknown) { this.children.push(child); },
+		},
+		hideThinkingBlock: false,
+		hiddenThinkingLabel: "Thinking...",
+		hasToolCalls: false,
+	};
+	renderAssistantMessageRail(
+		component,
+		{ content: [{ type: "thinking", thinking: "line1\nline2\nline3\nline4" }] },
+		theme() as any,
+		railThinkingSurface,
+	);
+	const block = component.contentContainer.children[1] as any;
+	const click = {
+		type: "click",
+		button: "left",
+		x: 2,
+		y: 0,
+		screenX: 2,
+		screenY: 0,
+		width: 80,
+		height: 4,
+		shift: false,
+		alt: false,
+		ctrl: false,
+	};
+
+	setRailUiActive(false);
+	try {
+		assert.deepEqual(block.handleMouse(click), { handled: true });
+		assert.equal(nativeClicks, 1);
+	} finally {
+		setRailUiActive(true);
+	}
 });
 
 test("preserves native outputPad, transformers, streaming context, and length status", async () => {

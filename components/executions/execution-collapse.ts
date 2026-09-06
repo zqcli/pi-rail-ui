@@ -23,6 +23,10 @@ export type ExecutionRailPatcher = {
 
 export const EXECUTION_RENDERED_KEY = Symbol.for("pi-rail-ui.execution-rendered");
 export const TOOL_RAIL_CACHE_KEY = Symbol.for("pi-rail-ui.tool-rail-cache");
+/** Rail presentation recorded at render time: "simple" (Rail preview rows) or "native". */
+export const RAIL_RENDER_PRESENTATION_KEY = Symbol.for("pi-rail-ui.execution-presentation");
+/** Rail surface content start column recorded at render time (for native hit translation). */
+export const RAIL_RENDER_CONTENT_OFFSET_KEY = Symbol.for("pi-rail-ui.execution-content-offset");
 export {
 	AUTO_COLLAPSE_RENDERING_KEY,
 	BASH_PREVIEW_LINES,

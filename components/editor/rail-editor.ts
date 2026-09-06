@@ -1,17 +1,22 @@
 import { CustomEditor, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, type EditorTheme, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, type EditorTheme, type TUI, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { completeSlashCommandWithoutSubmit } from "./rail-editor-autocomplete";
 import { EDITOR_PASTE_MARKER_STYLE, SLASH_COMMAND_LAYOUT, applyTextColor } from "../../config";
-import { stripAnsi } from "../../core/utils";
 import { railEditorSurface, type EditorSurfaceRenderer } from "../../rail/rail-surface";
 
 const PASTE_MARKER_RE = /\[paste #\d+(?: (?:\+\d+ lines|\d+ chars))?\]/g;
-const NATIVE_EDITOR_BORDER_RE = /^(?:─+|─── [↑↓].*|─{0,3}\.{1,3})$/u;
-const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+// Controlled bottom-border marker separates body rows from the completion rows
+// below it (native rows: blank top, body, sentinel bottom, completion). The
+// marker is stripped before the final render; the top border is "" at index 0.
+const BOTTOM_BORDER_SENTINEL = "\x1b]rail-editor-bottom\x07";
 
-type NativeVisualLine = { logicalLine: number; startCol: number; length: number };
-type EditorMouseRow = NativeVisualLine & { text: string };
-type EditorMouseLayout = { contentStartCol: number; rows: Array<EditorMouseRow | undefined> };
+/**
+ * Per-screen-row native editor row index (built during render) for mouse
+ * translation: body rows resolve into the native 1-based body offset, padded
+ * blank rows are `undefined`. Wrap/grapheme/scroll/autocomplete resolution is
+ * left to the native Editor via `super.handleMouse`.
+ */
+type RailMouseGeometry = { nativeWidth: number; nativeHeight: number };
 
 function selectListThemeForRailSlashMenu(theme: EditorTheme, appTheme: Theme): EditorTheme {
 	return {
@@ -29,26 +34,6 @@ function highlightPasteMarkers(text: string, appTheme: Theme): string {
 		const coloredMarker = applyTextColor(appTheme, EDITOR_PASTE_MARKER_STYLE.foreground, marker);
 		return `${EDITOR_PASTE_MARKER_STYLE.background}${EDITOR_PASTE_MARKER_STYLE.bold}${coloredMarker}${EDITOR_PASTE_MARKER_STYLE.reset}`;
 	});
-}
-
-function isNativeEditorBorder(row: string | undefined): boolean {
-	return row !== undefined && NATIVE_EDITOR_BORDER_RE.test(stripAnsi(row));
-}
-
-function splitNativeEditorRows(rows: string[]): { body: string[]; completion: string[] } {
-	if (!isNativeEditorBorder(rows[0])) return { body: rows, completion: [] };
-	let bottomBorder = -1;
-	for (let index = rows.length - 1; index > 0; index--) {
-		if (isNativeEditorBorder(rows[index])) {
-			bottomBorder = index;
-			break;
-		}
-	}
-	if (bottomBorder < 0) return { body: rows.slice(1), completion: [] };
-	return {
-		body: rows.slice(1, bottomBorder),
-		completion: rows.slice(bottomBorder + 1),
-	};
 }
 
 function terminalRowsForNativeEditor(visibleLines: number): number {
@@ -86,21 +71,10 @@ function fitEditorBodyRows(rows: string[], targetRows: number): { rows: string[]
 	};
 }
 
-function indexForVisibleColumn(text: string, targetColumn: number): number {
-	if (targetColumn <= 0) return 0;
-	let column = 0;
-	for (const segment of graphemeSegmenter.segment(text)) {
-		const nextColumn = column + visibleWidth(segment.segment);
-		if (targetColumn < nextColumn) return segment.index;
-		column = nextColumn;
-	}
-	return text.length;
-}
-
 export class RailEditor extends CustomEditor {
 	private readonly keybindingManager: KeybindingsManager;
-	private mouseLayout?: EditorMouseLayout | undefined;
-	private mouseVisualCache?: { width: number; rows: EditorMouseRow[] } | undefined;
+	private railMouseRows?: Array<number | undefined> | undefined;
+	private railMouseGeometry?: RailMouseGeometry | undefined;
 
 	constructor(
 		tui: TUI,
@@ -115,7 +89,6 @@ export class RailEditor extends CustomEditor {
 	}
 
 	override handleInput(data: string): void {
-		this.mouseVisualCache = undefined;
 		if (completeSlashCommandWithoutSubmit({
 			editor: this,
 			data,
@@ -125,41 +98,46 @@ export class RailEditor extends CustomEditor {
 		super.handleInput(data);
 	}
 
-	moveCursorToMousePosition(localRow: number, localCol: number): boolean {
-		const layout = this.mouseLayout;
-		const row = layout?.rows[localRow];
-		if (!layout || !row) return false;
-
-		const targetColumn = Math.max(0, localCol - layout.contentStartCol);
-		const cursorCol = row.startCol + indexForVisibleColumn(row.text, targetColumn);
-		const editor = this as any;
-		editor.cancelAutocomplete?.();
-		editor.lastAction = null;
-		editor.exitHistoryBrowsing?.();
-		editor.preferredVisualCol = null;
-		editor.snappedFromCursorCol = null;
-		editor.state.cursorLine = row.logicalLine;
-		if (typeof editor.setCursorCol === "function") editor.setCursorCol(cursorCol);
-		else editor.state.cursorCol = cursorCol;
-		this.tui.requestRender();
-		return true;
+	// Rail owns the editor chrome; Pi owns the native frame. Blank/deterministic
+	// border hooks make the body/completion boundary exact (no pattern matching).
+	override renderTopBorder(_width: number, _hiddenLineCount: number): string {
+		return "";
 	}
 
-	override setText(text: string): void {
-		this.mouseVisualCache = undefined;
-		super.setText(text);
+	override renderBottomBorder(_width: number, _hiddenLineCount: number): string {
+		return BOTTOM_BORDER_SENTINEL;
 	}
 
-	override insertTextAtCursor(text: string): void {
-		this.mouseVisualCache = undefined;
-		super.insertTextAtCursor(text);
+	override handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const rows = this.railMouseRows;
+		const geometry = this.railMouseGeometry;
+		if (!rows || !geometry) return super.handleMouse(event);
+
+		const nativeY = rows[event.y];
+		if (nativeY === undefined) {
+			// Padded blank rail row: mirror the native border-click contract
+			// (left-click focuses only; selection owns non-click events).
+			if (event.type !== "click" || event.button !== "left") return undefined;
+			return { handled: true, focus: true };
+		}
+
+		const railOffset = event.width < this.surface.minRenderableWidth() ? 0 : this.surface.contentStartCol();
+		const translated: TuiMouseEvent = {
+			...event,
+			x: event.x - railOffset,
+			y: nativeY,
+			width: geometry.nativeWidth,
+			height: geometry.nativeHeight,
+		};
+		return super.handleMouse(translated);
 	}
 
 	override render(width: number): string[] {
 		// Pi's editor remains the owner of wrapping, cursor placement, paste
 		// markers, autocomplete rows, and internal editor scrolling. Rail removes
-		// Pi's horizontal frame, applies the configured height window, and adds its
-		// own visual surface around the remaining native rows.
+		// Pi's horizontal frame (deterministic border markers above), applies the
+		// configured height window, and adds its own visual surface around the
+		// native rows.
 		const terminalRows = Math.max(1, Math.floor(this.tui.terminal.rows));
 		const maxInputHeight = this.surface.maxInputHeight(terminalRows);
 		const originalTui = this.tui;
@@ -183,8 +161,9 @@ export class RailEditor extends CustomEditor {
 		}
 
 		let nativeRows: string[];
+		let nativeWidth: number;
 		try {
-			const nativeWidth = width < this.surface.minRenderableWidth()
+			nativeWidth = width < this.surface.minRenderableWidth()
 				? Math.max(1, width)
 				: this.surface.contentWidth(width);
 			nativeRows = super.render(nativeWidth);
@@ -192,36 +171,21 @@ export class RailEditor extends CustomEditor {
 			this.tui = originalTui;
 		}
 
-		const native = splitNativeEditorRows(nativeRows);
-		const targetRows = this.surface.targetInputHeight(native.body.length, terminalRows);
-		const fitted = fitEditorBodyRows(native.body, targetRows);
-		const editor = this as any;
-		const cachedVisualRows = this.mouseVisualCache;
-		let visualRows: EditorMouseRow[] | undefined;
-		if (cachedVisualRows && cachedVisualRows.width === editor.lastWidth) visualRows = cachedVisualRows.rows;
-		if (!visualRows) {
-			const visualLines = editor.buildVisualLineMap(editor.lastWidth) as NativeVisualLine[];
-			const layoutLines = editor.layoutText(editor.lastWidth) as Array<{ text: string }>;
-			visualRows = visualLines.map((visual, index) => ({
-				...visual,
-				text: layoutLines[index]?.text ?? "",
-			}));
-			this.mouseVisualCache = { width: editor.lastWidth, rows: visualRows };
+		// bottomIdx is the sentinel border row: body is [1, bottomIdx),
+		// completion rows are [bottomIdx + 1, ...).
+		const bottomIdx = nativeRows.lastIndexOf(BOTTOM_BORDER_SENTINEL);
+		const body = bottomIdx > 1 ? nativeRows.slice(1, bottomIdx) : [];
+		const completion = bottomIdx >= 0 ? nativeRows.slice(bottomIdx + 1) : [];
+		const targetRows = this.surface.targetInputHeight(body.length, terminalRows);
+		const fitted = fitEditorBodyRows(body, targetRows);
+
+		this.railMouseRows = fitted.sourceRows.map((sourceRow) => sourceRow === undefined ? undefined : sourceRow + 1);
+		for (let index = 0; index < completion.length; index++) {
+			this.railMouseRows.push(bottomIdx + 1 + index);
 		}
-		const scrollOffset = Math.max(0, Number(editor.scrollOffset) || 0);
-		const visibleVisualLines = visualRows.slice(scrollOffset, scrollOffset + native.body.length);
-		this.mouseLayout = {
-			contentStartCol: (width < this.surface.minRenderableWidth() ? 0 : this.surface.contentStartCol()) + this.getPaddingX(),
-			rows: [
-				...fitted.sourceRows.map((sourceRow) => {
-					if (sourceRow === undefined) return undefined;
-					const visual = visibleVisualLines[sourceRow];
-					return visual ? { ...visual } : undefined;
-				}),
-				...native.completion.map(() => undefined),
-			],
-		};
-		const rows = [...fitted.rows, ...native.completion];
+		this.railMouseGeometry = { nativeWidth, nativeHeight: nativeRows.length };
+
+		const rows = [...fitted.rows, ...completion];
 		if (width < this.surface.minRenderableWidth()) return rows;
 		return rows.map((row) => this.surface.renderSurfaceRow(width, highlightPasteMarkers(row, this.appTheme)));
 	}

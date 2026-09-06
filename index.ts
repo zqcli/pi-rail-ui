@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { RailEditor } from "./components/editor";
-import { createRailFooter, installFooterCopyFeedback, openRailSessionModal, setTurnEndTime, setTurnStartTime, uninstallFooterCopyFeedback } from "./components/footer";
+import { createRailFooter, openRailSessionModal, setTurnEndTime, setTurnStartTime } from "./components/footer";
 import { handleDuplicateCommand } from "./commands/duplicate";
 import { installRailFast } from "./commands/rail-fast";
 import { installRailOaiSearch } from "./commands/rail-oai-search";
@@ -13,7 +13,6 @@ import { installExecutionRails, uninstallExecutionRails } from "./components/exe
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
 import { installGutter, uninstallGutter } from "./rail/gutter";
-import { installRailScrollbar, uninstallRailScrollbar } from "./rail/rail-scrollbar";
 import { installApplyPatchTool, installRailSubagent } from "./tools";
 
 export * from "./config";
@@ -50,8 +49,6 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		installEditor(ctx);
 		installFooter(ctx);
 		await installGutter();
-		await installRailScrollbar();
-		await installFooterCopyFeedback();
 		await installAssistantMessageRail(ctx.ui.theme);
 		await installUserMessageRail(ctx);
 		await installExecutionRails(ctx.ui.theme);
@@ -65,8 +62,6 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		ctx.ui.setEditorComponent(undefined);
 		ctx.ui.setFooter(undefined);
 		uninstallGutter();
-		uninstallRailScrollbar();
-		uninstallFooterCopyFeedback();
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();
 		uninstallExecutionRails();
@@ -143,8 +138,6 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		// Pi owns session replacement, terminal input, and renderer cleanup. Rail
 		// only tears down its style and narrow interaction patches.
 		uninstallGutter();
-		uninstallRailScrollbar();
-		uninstallFooterCopyFeedback();
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();
 		uninstallExecutionRails();

@@ -91,23 +91,6 @@ export type StyleFile = {
 		pasteMarker?: { background?: ColorReference; foreground?: ColorReference; bold?: boolean };
 		mouseTracking?: { enabled?: boolean };
 	};
-	conversationScroll?: {
-		mode?: "app" | "native";
-		enabled?: boolean;
-		alternateScreen?: boolean;
-		wheelStepRows?: number;
-		performance?: {
-			historyTailRenderWindow?: number;
-		};
-		scrollbar?: {
-			visible?: boolean;
-			dragEnabled?: boolean;
-			trackBackground?: ColorReference;
-			thumbBackground?: ColorReference;
-			widthMultiplier?: number;
-			dragAnimationMs?: number;
-		};
-	};
 	thinking: {
 		background: ColorReference;
 		rail: ColorReference;
@@ -248,26 +231,6 @@ export type EditorPasteMarkerStyle = {
 	background: string;
 	foreground: TextColorTarget;
 	bold: string;
-	reset: string;
-};
-
-export type ConversationScrollMode = "app" | "native";
-
-export type ConversationScrollLayout = {
-	mode: ConversationScrollMode;
-	enabled: boolean;
-	alternateScreen: boolean;
-	wheelStepRows: number;
-	historyTailRenderWindow: number;
-};
-
-export type ConversationScrollbarStyle = {
-	visible: boolean;
-	dragEnabled: boolean;
-	trackBackground: string;
-	thumbBackground: string;
-	width: number;
-	dragAnimationMs: number;
 	reset: string;
 };
 

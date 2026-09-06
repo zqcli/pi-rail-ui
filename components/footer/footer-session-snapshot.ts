@@ -75,25 +75,32 @@ export function footerUsageEntries(ctx: ExtensionContext): any[] {
 	return ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch();
 }
 
+function applyEntryUsage(totals: FooterUsageStats, usage: any): void {
+	if (!usage || typeof usage !== "object") return;
+	totals.inputTokens += usage.input ?? 0;
+	totals.outputTokens += usage.output ?? 0;
+	totals.cacheReadTokens += usage.cacheRead ?? 0;
+	totals.cacheWriteTokens += usage.cacheWrite ?? 0;
+	totals.cost += usage.cost?.total ?? 0;
+}
+
 export function usageStatsFromEntries(entries: any[]): FooterUsageStats {
-	let inputTokens = 0;
-	let outputTokens = 0;
-	let cacheReadTokens = 0;
-	let cacheWriteTokens = 0;
-	let cost = 0;
+	const totals: FooterUsageStats = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, cost: 0 };
 
 	for (const entry of entries) {
-		if (entry?.type !== "message") continue;
-		const usage = entry.message?.usage;
-		if (!usage) continue;
-		inputTokens += usage.input ?? 0;
-		outputTokens += usage.output ?? 0;
-		cacheReadTokens += usage.cacheRead ?? 0;
-		cacheWriteTokens += usage.cacheWrite ?? 0;
-		cost += usage.cost?.total ?? 0;
+		if (!entry || typeof entry !== "object") continue;
+		// Compaction and branch summaries are LLM work too: Pi stores their
+		// summary-generation usage on the entry itself (not on a message), and
+		// session docs include it in token and cost totals.
+		if (entry.type === "compaction" || entry.type === "branch_summary") {
+			applyEntryUsage(totals, entry.usage);
+			continue;
+		}
+		if (entry.type !== "message") continue;
+		applyEntryUsage(totals, entry.message?.usage);
 	}
 
-	return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, cost };
+	return totals;
 }
 
 function sessionStatsFromEntries(ctx: ExtensionContext, entries: any[], stats: FooterUsageStats): RailSessionStats {

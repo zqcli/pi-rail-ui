@@ -1,9 +1,10 @@
-import type { Component } from "@earendil-works/pi-tui";
+import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { RAIL_EDITOR_STYLE, type RailSectionKind } from "../config";
 import { padToWidth } from "../core/utils";
 import { cachedRailRows, type RailRowsCache } from "./surface-primitives";
 import {
 	defineRailSection,
+	handleRailSectionClickToggle,
 	isRailUiActive,
 	railSectionConfigWithOverrides,
 	type RailSectionOverrides,
@@ -25,6 +26,15 @@ export class RailSectionBlock implements Component {
 
 	unwrap(): Component {
 		return this.inner;
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (!isRailUiActive()) return this.inner.handleMouse?.(event);
+		const result = handleRailSectionClickToggle(this, event, false);
+		if (result) return result;
+		// Non-toggleable sections must not swallow clicks meant for interactive
+		// inner controls (links, selectors, ...) when Rail is active.
+		return this.inner.handleMouse?.(event);
 	}
 
 	invalidate(): void {

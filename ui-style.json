@@ -26,23 +26,6 @@
       "bold": true
     }
   },
-  "conversationScroll": {
-    "mode": "native",
-    "enabled": false,
-    "alternateScreen": false,
-    "wheelStepRows": 3,
-    "performance": {
-      "historyTailRenderWindow": 4
-    },
-    "scrollbar": {
-      "visible": true,
-      "dragEnabled": true,
-      "trackBackground": "transparent",
-      "thumbBackground": { "rgb": [137, 180, 250] },
-      "widthMultiplier": 1,
-      "dragAnimationMs": 90
-    }
-  },
   "thinking": {
     "background": "transparent",
     "rail": { "rgb": [203, 166, 247] }

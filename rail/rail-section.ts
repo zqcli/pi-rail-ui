@@ -1,4 +1,5 @@
 import { keyHint } from "@earendil-works/pi-coding-agent";
+import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import {
 	railSectionConfig,
 	type RailSectionKind,
@@ -141,6 +142,59 @@ export function collapseHint(theme: ThemeLike | undefined, hiddenLineCount: numb
 		const fallback = theme ? `${theme.fg("dim", "ctrl+o")}${theme.fg("muted", " to expand")}` : "ctrl+o to expand";
 		return `${prefix} ${fallback})`;
 	}
+}
+
+/**
+ * Run `dispatch` with a rail scroll anchor installed for its synchronous
+ * duration. Gutter document wrappers call this with the transcript ScrollView
+ * pin closure so a section toggle that happens anywhere in the dispatch pins
+ * the viewport (public `scrollTo(scrollTop, { disableFollow: true })`). Any
+ * currently installed anchor is preserved across nesting.
+ */
+export function withRailSectionScrollAnchor(anchor: (() => void) | undefined, dispatch: () => TuiMouseEventResult | undefined): TuiMouseEventResult | undefined {
+	const previous = currentRailSectionScrollAnchor;
+	currentRailSectionScrollAnchor = anchor;
+	try {
+		return dispatch();
+	} finally {
+		currentRailSectionScrollAnchor = previous;
+	}
+}
+
+let currentRailSectionScrollAnchor: (() => void) | undefined;
+
+/** Toggle a clickable section, pin the viewport first, then mark it manual. */
+export function toggleRailSectionFromClick(section: RailSectionDefinition): void {
+	if (!canToggleRailSection(section)) return;
+	const component = section.component;
+	currentRailSectionScrollAnchor?.();
+	setRailSectionExpanded(section, !Boolean(component.expanded));
+}
+
+/**
+ * Component-level click handler for collapsible Rail sections.
+ *
+ * Pi 0.85.1 synthesizes a `click` after an un-dragged selection release and
+ * dispatches it through the component tree, so a section only answers clicks;
+ * presses and drags stay in the native selection/copy pipeline.
+ *
+ * With `suppressUntoggleable`, a click on a non-toggleable section is still
+ * consumed so Pi's own regions (e.g. the native thinking visibility toggle)
+ * cannot rebuild content under the Rail collapse presentation.
+ */
+export function handleRailSectionClickToggle(
+	component: any,
+	event: TuiMouseEvent,
+	suppressUntoggleable = false,
+): TuiMouseEventResult | undefined {
+	if (event.type !== "click" || event.button !== "left") return undefined;
+	const section = resolveRailSection(component);
+	if (!section) return undefined;
+	if (canToggleRailSection(section)) {
+		toggleRailSectionFromClick(section);
+		return { handled: true };
+	}
+	return suppressUntoggleable ? { handled: true } : undefined;
 }
 
 export { RailSectionBlock } from "./rail-section-block";

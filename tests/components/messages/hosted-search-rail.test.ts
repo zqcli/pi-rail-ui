@@ -11,7 +11,6 @@ import {
 	resetHostedSearchActivities,
 	setActiveHostedSearchActivity,
 } from "../../../openai/hosted-search-activity";
-import { railClickComponentAtRow } from "../../../components/executions/rail-click";
 import { resolveRailSection, setRailSectionExpanded } from "../../../rail/rail-section";
 import { setRailUiActive } from "../../../rail/rail-section";
 
@@ -34,9 +33,38 @@ test("stays invisible until a real hosted call is observed, then expands while r
 	const running = stripAnsi(block.render(100).join("\n"));
 	assert.match(running, /WEB SEARCH · searching/);
 	assert.match(running, /Search: latest codex commit/);
-	const markedRows = block.render(100);
-	assert.equal(markedRows[0]?.includes("\x1b_pi-rail-click:start:"), true);
-	assert.equal(railClickComponentAtRow(markedRows, 0), block);
+	assert.equal(block.render(100)[0]?.includes("\x1b_pi-rail-click:start:"), false);
+});
+
+test("toggles hosted search expansion with a component click, ignoring press and release", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
+	activity.upsertCall("ws_1", "completed", { type: "open_page", url: "https://github.com/openai/codex/commits/main" });
+	activity.addSource("https://github.com/openai/codex", "OpenAI Codex");
+	activity.complete(3000);
+	const block = new HostedSearchRailBlock(activity, theme as any, {});
+	const click = (type: string) => ({
+		type,
+		button: "left",
+		x: 2,
+		y: 0,
+		screenX: 2,
+		screenY: 0,
+		width: 100,
+		height: 2,
+		shift: false,
+		alt: false,
+		ctrl: false,
+	});
+
+	assert.equal(block.handleMouse(click("press") as any), undefined);
+	assert.equal(block.handleMouse(click("release") as any), undefined);
+	assert.doesNotMatch(stripAnsi(block.render(100).join("\n")), /Opened:/);
+
+	assert.deepEqual(block.handleMouse(click("click") as any), { handled: true });
+	assert.match(stripAnsi(block.render(100).join("\n")), /Opened:/);
+
+	assert.deepEqual(block.handleMouse(click("click") as any), { handled: true });
+	assert.doesNotMatch(stripAnsi(block.render(100).join("\n")), /Opened:/);
 });
 
 test("auto-collapses completed searches and supports Rail expansion", () => {

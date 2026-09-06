@@ -1,201 +1,145 @@
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
-import { Container, ScrollView, TuiAltScreen, VStack } from "@earendil-works/pi-tui";
-import { getScrollbarGeometry } from "@earendil-works/pi-tui/dist/layout.js";
-import { drawRailScrollbar, isRailScrollbarView, markRailScrollbarView } from "../../rail/rail-scrollbar";
+import { test } from "node:test";
+import { Container, ScrollView, TuiAltScreen, VStack, type TuiAltScreenOptions } from "@earendil-works/pi-tui";
 
-const THUMB_CELL = "\x1b[38;2;137;180;250m█\x1b[0m";
+// Rail fully delegates the transcript scrollbar to Pi. These tests drive the
+// real fullscreen TUI with SGR mouse input through the same public Terminal
+// seam a real terminal uses, locking the native viewport contract Rail now
+// relies on: track press jump, thumb drag before release, Jump-to-latest
+// follow-end restore, Alt+wheel acceleration, and drag selection.
+const COLUMNS = 100;
+const ROWS = 30;
+const LINE_COUNT = 200;
+const MAX_SCROLL_TOP = LINE_COUNT - ROWS; // 170
 
-function fakeScrollView(over: { currentScrollTop?: number; currentScrollbar?: string } = {}) {
-	const view: any = {
-		primary: true,
-		currentScrollbar: over.currentScrollbar ?? "always",
-		currentScrollTop: over.currentScrollTop ?? 10,
-		transientScrollbarVisible: false,
-		get scrollTop() {
-			return this.currentScrollTop;
-		},
-		setScrollbar(value: string) {
-			this.currentScrollbar = value;
-		},
-		hideTransientScrollbar() {
-			this.transientScrollbarVisible = false;
-		},
+class Line {
+	constructor(readonly text: string) {}
+	render(): string[] { return [this.text]; }
+	invalidate(): void {}
+}
+
+const press = (button: number, x: number, y: number) => `\x1b[<${button};${x + 1};${y + 1}M`;
+const release = (button: number, x: number, y: number) => `\x1b[<${button};${x + 1};${y + 1}m`;
+
+function setup(options: { copySelection?: (text: string) => Promise<boolean> } = {}) {
+	const writes: string[] = [];
+	let onInput: ((data: string) => void) | undefined;
+	const terminal: any = {
+		columns: COLUMNS,
+		rows: ROWS,
+		write: (data: string) => writes.push(data),
+		start: (handler: (data: string) => void) => { onInput = handler; },
+		stop: () => undefined,
+		drainInput: async () => undefined,
+		hideCursor: () => undefined,
+		showCursor: () => undefined,
+		clearLine: () => undefined,
+		clearFromCursor: () => undefined,
+		clearScreen: () => undefined,
+		moveBy: () => undefined,
+		setTitle: () => undefined,
+		setProgress: () => undefined,
+		get kittyProtocolActive() { return false; },
 	};
-	return view;
-}
-
-function fakeLayout(scrollView: any, totalRows: number, viewportHeight = 20): any {
-	const box = {
-		scrollView,
-		rect: { x: 0, y: 0, width: 80, height: viewportHeight },
-		clip: { x: 0, y: 0, width: 80, height: viewportHeight },
-		children: [],
-		scrollContentLines: Array.from({ length: totalRows }, () => " ".repeat(80)),
+	const content = new Container();
+	for (let index = 0; index < LINE_COUNT; index++) content.addChild(new Line(`line ${index}`));
+	const scrollView = new ScrollView(content, { follow: "end", primary: true, scrollbar: "always" });
+	const altOptions: TuiAltScreenOptions = {
+		scrollToEndIndicator: () => "Jump to latest message",
+		...(options.copySelection ? { copySelection: options.copySelection } : {}),
 	};
-	return { primaryScrollView: scrollView, root: { children: [box] } };
+	const tui = new TuiAltScreen(terminal, false, undefined, altOptions);
+	tui.setLayoutRoot(new VStack([{ component: scrollView, basis: 0, grow: 1, shrink: 1, minSize: 1 }]));
+	tui.start();
+	tui.renderNow(true);
+	return { tui, scrollView, writes, send: (data: string) => onInput?.(data) };
 }
 
-function screen(rows: number): string[] {
-	return Array.from({ length: rows }, () => " ".repeat(80));
-}
+test("native scrollbar track press jumps scrollTop before release and disengages follow-end", (t) => {
+	const { tui, scrollView, send } = setup();
+	t.after(() => tui.stop());
 
-describe("rail scrollbar", () => {
-	test("hides the native paint path and draws the legacy blue thumb", () => {
-		const scrollView = fakeScrollView();
-		markRailScrollbarView(scrollView);
-		const layout = fakeLayout(scrollView, 100);
+	assert.equal(scrollView.scrollTop, MAX_SCROLL_TOP);
+	assert.equal(scrollView.isFollowingEnd, true);
 
-		const out = drawRailScrollbar(screen(24), layout, 80);
+	// Press in the last column on the track above the thumb (row 10). Pi jumps
+	// immediately on the press: thumbHeight = round(30*30/200) = 5,
+	// grabOffset = floor(5/2) = 2, scrollTop = round((10-2)/(30-5)*170) = 54.
+	send(press(0, COLUMNS - 1, 10));
+	assert.equal(scrollView.scrollTop, 54);
+	assert.equal(scrollView.isFollowingEnd, false);
 
-		assert.equal(scrollView.currentScrollbar, "hidden");
-		// thumbSize = max(2, min(20, round(20^2/100))) = 4; thumbTop = round(10/80*16) = 2
-		assert.equal(out[2]!.includes(THUMB_CELL), true);
-		assert.equal(out[5]!.includes(THUMB_CELL), true);
-		assert.equal(out[1]!.includes(THUMB_CELL), false);
-	});
+	send(release(0, COLUMNS - 1, 10));
+	assert.equal(scrollView.scrollTop, 54);
+});
 
-	test("draws the thumb on the same rows the native drag geometry targets", () => {
-		const scrollView = fakeScrollView();
-		markRailScrollbarView(scrollView);
-		const layout = fakeLayout(scrollView, 100);
-		Object.defineProperty(scrollView, "isScrollbarVisible", { get: () => true });
+test("jump-to-latest indicator restores follow-end after a track jump", (t) => {
+	const { tui, scrollView, writes, send } = setup();
+	t.after(() => tui.stop());
 
-		const out = drawRailScrollbar(screen(24), layout, 80);
-		const box = layout.root.children[0];
-		const geometry = getScrollbarGeometry(box)!;
+	send(press(0, COLUMNS - 1, 10));
+	send(release(0, COLUMNS - 1, 10));
+	writes.length = 0;
+	tui.renderNow(true);
+	// The label is centered on the last clip row, left of the scrollbar column:
+	// column = floor((99 - 20) / 2) = 39, spanning columns 39..58 at row 29.
+	assert.match(writes.join(""), /Jump to latest message/);
 
-		for (let row = 0; row < 24; row++) {
-			const expected = row >= geometry.thumbTop && row < geometry.thumbTop + geometry.thumbHeight;
-			assert.equal(out[row]!.includes(THUMB_CELL), expected, `row ${row}`);
-		}
-	});
+	send(press(0, 40, ROWS - 1));
+	assert.equal(scrollView.scrollTop, MAX_SCROLL_TOP);
+	assert.equal(scrollView.isFollowingEnd, true);
+	send(release(0, 40, ROWS - 1));
+});
 
-	test("keeps marking idempotent and restores the original scrollbar mode", () => {
-		const scrollView = fakeScrollView({ currentScrollbar: "auto" });
-		markRailScrollbarView(scrollView);
-		markRailScrollbarView(scrollView);
+test("native scrollbar thumb drag moves scrollTop before release", (t) => {
+	const { tui, scrollView, send } = setup();
+	t.after(() => tui.stop());
 
-		assert.equal(isRailScrollbarView(scrollView), true);
-		assert.equal(scrollView.currentScrollbar, "hidden");
-	});
+	// Jump to a mid-track position, then grab the thumb where it now sits.
+	send(press(0, COLUMNS - 1, 5));
+	// scrollTop = round((5-2)/25*170) = 20.
+	send(release(0, COLUMNS - 1, 5));
+	assert.equal(scrollView.scrollTop, 20);
 
-	test("draws nothing when content fits the viewport", () => {
-		const scrollView = fakeScrollView();
-		markRailScrollbarView(scrollView);
-		const layout = fakeLayout(scrollView, 10, 20);
+	// Thumb for scrollTop 20: thumbTop = round(20/170*25) = 3, rows 3..7.
+	// Pressing the thumb must not move yet; grabOffset = 4 - 3 = 1.
+	send(press(0, COLUMNS - 1, 4));
+	assert.equal(scrollView.scrollTop, 20);
 
-		const out = drawRailScrollbar(screen(24), layout, 80);
+	// Drag to row 15: scrollTop = round((15-1)/25*170) = 95, before release.
+	send(press(32, COLUMNS - 1, 15));
+	assert.equal(scrollView.scrollTop, 95);
+	send(release(0, COLUMNS - 1, 15));
+	assert.equal(scrollView.scrollTop, 95);
+	assert.equal(scrollView.isFollowingEnd, false);
+});
 
-		assert.equal(out[0]!.includes(THUMB_CELL), false);
-	});
+test("native alt+wheel scrolls five wheel steps", (t) => {
+	const { tui, scrollView, send } = setup();
+	t.after(() => tui.stop());
 
-	test("keeps content frozen during drag, previews the thumb, and commits on release", async () => {
-		class Line {
-			constructor(readonly text: string) {}
-			render(): string[] { return [this.text]; }
-			invalidate(): void {}
-		}
+	// Starts at the end (170). Normal wheel up moves one step (wheelScrollLines
+	// defaults to 1); Alt+wheel up (button 64|8) multiplies it by 5.
+	send("\x1b[<64;51;11M");
+	assert.equal(scrollView.scrollTop, MAX_SCROLL_TOP - 1);
 
-		const writes: string[] = [];
-		const terminal: any = {
-			columns: 100,
-			rows: 40,
-			write(data: string) { writes.push(data); },
-			onData() {},
-			hideCursor() {},
-			showCursor() {},
-		};
-		const altScreen: any = new TuiAltScreen(terminal, false, undefined, {});
-		const documentContainer = new Container();
-		for (let index = 0; index < 200; index++) documentContainer.addChild(new Line(`line ${index}`));
-		const scrollView: any = new ScrollView(documentContainer, { follow: "end", primary: true, scrollbar: "auto" });
-		altScreen.setLayoutRoot(new VStack([{ component: scrollView, basis: 0, grow: 1, shrink: 1, minSize: 1 }]));
-		altScreen.altScreenActive = true;
+	send("\x1b[<72;51;11M");
+	assert.equal(scrollView.scrollTop, MAX_SCROLL_TOP - 6);
+});
 
-		let renders = 0;
-		const originalDoRender = altScreen.doRender.bind(altScreen);
-		altScreen.doRender = () => {
-			renders++;
-			return originalDoRender();
-		};
+test("native transcript drag selects and copies text on release", async (t) => {
+	let copied = "";
+	const { tui, send } = setup({ copySelection: async (text) => { copied = text; return true; } });
+	t.after(() => tui.stop());
 
-		const originalScrollbarStyle = scrollView.scrollbarStyle;
-		const { installRailScrollbar, uninstallRailScrollbar } = await import("../../rail/rail-scrollbar");
-		await installRailScrollbar();
-		try {
-			altScreen.doRender();
-			scrollView.scrollToEnd();
-			altScreen.cancelRenderTimer?.();
-			altScreen.renderRequested = false;
-			altScreen.doRender();
-			writes.length = 0;
-			renders = 0;
+	// Pi's native line selection, as pinned from 0.85.1: a drag from local
+	// cell (10,5) to (40,8) maps to content rows 175..178 and copies as a
+	// line range. The partial anchor row contributes only its leading
+	// newline, and the remaining complete lines are newline-terminated.
+	send(press(0, 10, 5));
+	send(press(32, 40, 8));
+	send(release(0, 40, 8));
 
-			const layout = altScreen.currentLayout;
-			const scrollBox = layout.root.children.find((child: any) => child.scrollView === layout.primaryScrollView);
-			const totalRows = scrollBox.scrollContentLines.length;
-			const trackHeight = scrollBox.rect.height;
-			const thumbHeight = Math.max(2, Math.min(trackHeight, Math.round((trackHeight * trackHeight) / totalRows)));
-			const thumbTop = scrollBox.rect.y + Math.round((scrollView.scrollTop / (totalRows - trackHeight)) * (trackHeight - thumbHeight));
-			const column = scrollBox.rect.x + scrollBox.rect.width - 1;
-			const initialScrollTop = scrollView.scrollTop;
-			const mouse = (button: number, x: number, y: number, release = false) =>
-				`\x1b[<${button};${x + 1};${y + 1}${release ? "m" : "M"}`;
-			let scrollCalls = 0;
-			const originalScrollTo = scrollView.scrollTo.bind(scrollView);
-			scrollView.scrollTo = (value: number) => {
-				scrollCalls++;
-				originalScrollTo(value);
-			};
-
-			altScreen.handleViewportInput(mouse(0, column, thumbTop + 1));
-			altScreen.handleViewportInput(mouse(32, column, thumbTop - 8));
-			await new Promise<void>((resolve) => setImmediate(resolve));
-
-			assert.equal(scrollView.scrollTop, initialScrollTop);
-			assert.equal(scrollCalls, 0);
-			assert.equal(renders, 0);
-			assert.ok(writes.some((write) => write.includes(THUMB_CELL)));
-
-			altScreen.handleViewportInput(mouse(0, column, thumbTop - 8, true));
-			await new Promise<void>((resolve) => setImmediate(resolve));
-			await new Promise<void>((resolve) => setImmediate(resolve));
-			assert.notEqual(scrollView.scrollTop, initialScrollTop);
-			assert.equal(renders, 1);
-
-			// Native search can leave the viewport at the end while explicitly
-			// suppressing follow. A scrollbar commit at the end must use the same
-			// state transition as native ScrollView.scrollTo(end).
-			scrollView.scrollToEnd();
-			altScreen.cancelRenderTimer?.();
-			altScreen.renderRequested = false;
-			altScreen.doRender();
-			scrollView.followingEnd = false;
-			scrollView.followSuppressedAtEnd = true;
-			renders = 0;
-
-			altScreen.handleViewportInput(mouse(0, column, thumbTop + 1));
-			altScreen.handleViewportInput(mouse(0, column, thumbTop + 1, true));
-			await new Promise<void>((resolve) => setImmediate(resolve));
-			await new Promise<void>((resolve) => setImmediate(resolve));
-			assert.equal(scrollView.followingEnd, true);
-			assert.equal(scrollView.followSuppressedAtEnd, false);
-			assert.equal(renders, 1);
-		} finally {
-			uninstallRailScrollbar();
-		}
-		assert.equal(scrollView.currentScrollbar, "auto");
-		assert.equal(scrollView.scrollbarStyle, originalScrollbarStyle);
-	});
-
-	test("ignores unmarked scroll views", () => {
-		const scrollView = fakeScrollView();
-		const layout = fakeLayout(scrollView, 100);
-
-		const out = drawRailScrollbar(screen(24), layout, 80);
-
-		assert.equal(scrollView.currentScrollbar, "always");
-		assert.equal(out[0]!.includes(THUMB_CELL), false);
-	});
+	assert.equal(tui.hasActiveSelection(), true);
+	assert.equal(copied, "\nline 176\nline 177\nline 178");
 });

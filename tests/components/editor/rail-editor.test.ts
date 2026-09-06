@@ -25,7 +25,7 @@ const appTheme = {
 	},
 };
 
-function assertAutocompleteStaysInEditor(prefix: string, value: string): void {
+function assertAutocompleteStaysInEditor(prefix: string, value: string, data = "enter"): void {
 	let renderRequests = 0;
 	const tui = {
 		terminal: { rows: 24, columns: 80 },
@@ -50,17 +50,16 @@ function assertAutocompleteStaysInEditor(prefix: string, value: string): void {
 		autocompleteList: { getSelectedItem: () => ({ value, label: value }) },
 	});
 
-	editor.handleInput("enter");
+	editor.handleInput(data);
 
 	assert.equal(submitted, undefined);
 	assert.equal(editor.getText(), `/${value} `);
 	assert.equal(changed, `/${value} `);
 	assert.equal((editor as any).autocompleteState, null);
-	assert.ok(renderRequests > 0);
+	if (data === "enter") assert.ok(renderRequests > 0);
 }
 
-describe("RailEditor", () => {
-	test("replaces Pi's horizontal editor borders with the Rail surface", () => {
+describe("RailEditor", () => {	test("replaces Pi's horizontal editor borders with the Rail surface", () => {
 		const tui = {
 			terminal: { rows: 24, columns: 80 },
 			requestRender() {},
@@ -117,5 +116,9 @@ describe("RailEditor", () => {
 
 	test("keeps parameterized Rail command autocomplete in the editor", () => {
 		assertAutocompleteStaysInEditor("/rail-oai-s", "rail-oai-search");
+	});
+
+	test("Tab applies the selected autocomplete without submitting", () => {
+		assertAutocompleteStaysInEditor("/ski", "skill:web-access", "\t");
 	});
 });

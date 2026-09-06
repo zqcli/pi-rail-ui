@@ -8,7 +8,6 @@ export type { TextColorTarget, ThemeLike, RailSectionKind, RailSectionSelectionM
 export type { AppLayout, UserMessageLayout, SlashCommandLayout, FooterStyle, BashExecutionLayout } from "./types";
 export type { RailSectionSelectionConfig, RailSectionStyleConfig, RailSectionSpacingConfig } from "./types";
 export type { RailSectionLayoutConfig, RailSectionResolvedConfig, EditorPasteMarkerStyle } from "./types";
-export type { ConversationScrollMode, ConversationScrollLayout, ConversationScrollbarStyle } from "./types";
 export type { FooterLayout } from "./types";
 export { applyTextColor, railAnsiForTheme } from "./colors";
 export { resolveStyleConfig, type ResolvedStyleConfig } from "./resolved-style";
@@ -32,8 +31,6 @@ export const RAIL_EDITOR_SURFACE_STYLE = resolved.RAIL_EDITOR_SURFACE_STYLE;
 export const RAIL_EDITOR_HEIGHT = resolved.RAIL_EDITOR_HEIGHT;
 export const EDITOR_MOUSE_TRACKING_ENABLED = resolved.EDITOR_MOUSE_TRACKING_ENABLED;
 export const EDITOR_PASTE_MARKER_STYLE = resolved.EDITOR_PASTE_MARKER_STYLE;
-export const CONVERSATION_SCROLL_LAYOUT = resolved.CONVERSATION_SCROLL_LAYOUT;
-export const CONVERSATION_SCROLLBAR_STYLE = resolved.CONVERSATION_SCROLLBAR_STYLE;
 export const RAIL_EDITOR_STYLE = resolved.RAIL_EDITOR_STYLE;
 export const TOOL_EXECUTION_STATE_STYLES = resolved.TOOL_EXECUTION_STATE_STYLES;
 export const TOOL_EXECUTION_TEXT_STYLE = resolved.TOOL_EXECUTION_TEXT_STYLE;

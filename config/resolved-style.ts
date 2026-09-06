@@ -4,8 +4,6 @@ import type {
 	AppLayout,
 	BashExecutionLayout,
 	ColorReference,
-	ConversationScrollLayout,
-	ConversationScrollbarStyle,
 	EditorHeightPolicy,
 	EditorPasteMarkerStyle,
 	EditorSurfaceStyle,
@@ -32,8 +30,6 @@ export type ResolvedStyleConfig = {
 	RAIL_EDITOR_HEIGHT: EditorHeightPolicy;
 	EDITOR_MOUSE_TRACKING_ENABLED: boolean;
 	EDITOR_PASTE_MARKER_STYLE: EditorPasteMarkerStyle;
-	CONVERSATION_SCROLL_LAYOUT: ConversationScrollLayout;
-	CONVERSATION_SCROLLBAR_STYLE: ConversationScrollbarStyle;
 	RAIL_EDITOR_STYLE: EditorSurfaceStyle;
 	TOOL_EXECUTION_STATE_STYLES: ToolExecutionStateStyles;
 	TOOL_EXECUTION_TEXT_STYLE: ToolExecutionTextStyle;
@@ -93,27 +89,6 @@ export function resolveStyleConfig(style: StyleFile): ResolvedStyleConfig {
 		background: resolveBackground(style.editor.pasteMarker?.background ?? "transparent", editorBackground),
 		foreground: resolveTextColor(style.editor.pasteMarker?.foreground ?? "editor.rail", { editorRail }),
 		bold: style.editor.pasteMarker?.bold === true ? "\x1b[1m" : "",
-		reset: style.surfaceLayout.reset,
-	};
-	const CONVERSATION_SCROLL_LAYOUT: ConversationScrollLayout = {
-		// Pi 0.84 owns the active transcript viewport and alternate screen.
-		// Legacy style values remain readable for compatibility, but cannot
-		// reactivate Rail's retired renderer/input patches.
-		mode: "native",
-		enabled: false,
-		alternateScreen: false,
-		wheelStepRows: Math.max(1, Math.round(style.conversationScroll?.wheelStepRows ?? 3)),
-		historyTailRenderWindow: Math.max(1, Math.round(style.conversationScroll?.performance?.historyTailRenderWindow ?? 8)),
-	};
-	const CONVERSATION_SCROLLBAR_STYLE: ConversationScrollbarStyle = {
-		visible: style.conversationScroll?.scrollbar?.visible !== false,
-		dragEnabled: style.conversationScroll?.scrollbar?.dragEnabled !== false,
-		trackBackground: resolveBackground(style.conversationScroll?.scrollbar?.trackBackground ?? "editor.background", editorBackground),
-		thumbBackground: style.conversationScroll?.scrollbar?.thumbBackground
-			? resolveBackground(style.conversationScroll.scrollbar.thumbBackground, editorBackground)
-			: bg(style.editor.rail, "conversationScroll.scrollbar.thumbBackground"),
-		width: Math.max(1, Math.round(style.surfaceLayout.leftBorderWidth * (style.conversationScroll?.scrollbar?.widthMultiplier ?? 1))),
-		dragAnimationMs: Math.max(0, Math.round(style.conversationScroll?.scrollbar?.dragAnimationMs ?? 90)),
 		reset: style.surfaceLayout.reset,
 	};
 	const RAIL_EDITOR_STYLE: EditorSurfaceStyle = {
@@ -211,8 +186,6 @@ export function resolveStyleConfig(style: StyleFile): ResolvedStyleConfig {
 		RAIL_EDITOR_HEIGHT,
 		EDITOR_MOUSE_TRACKING_ENABLED: style.editor.mouseTracking?.enabled === true,
 		EDITOR_PASTE_MARKER_STYLE,
-		CONVERSATION_SCROLL_LAYOUT,
-		CONVERSATION_SCROLLBAR_STYLE,
 		RAIL_EDITOR_STYLE,
 		TOOL_EXECUTION_STATE_STYLES,
 		TOOL_EXECUTION_TEXT_STYLE,

@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
+import { installRailSubagent } from "../../tools/subagents";
 import {
 	applySubagentMentionCompletion,
 	buildSubagentRosterPrompt,
@@ -178,4 +182,93 @@ test("buildSubagentRosterPrompt binds new model mentions to the canonical model"
 	const prompt = buildSubagentRosterPrompt([], { targets: [], models: ["cus-resp/gpt-5.6-terra"] });
 
 	assert.match(prompt, /model="cus-resp\/gpt-5\.6-terra"/);
+});
+
+test("autocomplete reads the agent store and enumerates models only inside a Rail mention", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-autocomplete-"));
+	const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+	const previousDepth = process.env["PI_SUBAGENT_DEPTH"];
+	process.env["PI_CODING_AGENT_DIR"] = dir;
+	process.env["PI_SUBAGENT_DEPTH"] = "0";
+	let sessionStart: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
+	let providerFactory: ((current: unknown) => any) | undefined;
+	let modelEnumerations = 0;
+	try {
+		installRailSubagent({
+			registerTool: () => undefined,
+			registerCommand: () => undefined,
+			appendEntry: () => undefined,
+			on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+				if (event === "session_start") sessionStart = handler;
+			},
+		} as any);
+		const instancesDir = join(dir, "stateful-subagents", "instances");
+		await mkdir(join(dir, "stateful-subagents"), { recursive: true });
+		// A file where the instances directory is expected makes any agent store read fail.
+		await writeFile(instancesDir, "not a directory");
+		const linkEntry = {
+			type: "custom", id: "link-1", parentId: null, timestamp: "",
+			customType: "rail-subagent-link",
+			data: { action: "link", alias: "auth-review", agentId: "agt_probe" },
+		};
+		const ctx = {
+			mode: "tui", cwd: "/tmp/project", hasUI: true,
+			model: { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" },
+			thinkingLevel: "xhigh",
+			scopedModels: [{ model: { provider: "cus-resp", id: "gpt-5.6-sol" }, thinkingLevel: "xhigh" }],
+			modelRegistry: {
+				getAvailable: () => { modelEnumerations++; return []; },
+				find: () => undefined,
+			},
+			sessionManager: {
+				getBranch: () => [linkEntry],
+				getSessionName: () => "root",
+				getSessionId: () => "parent-session",
+			},
+			ui: { addAutocompleteProvider: (factory: (current: unknown) => any) => { providerFactory = factory; } },
+		};
+		await sessionStart!({} as any, ctx as any);
+		assert.ok(providerFactory, "tui mode must register the autocomplete provider");
+
+		const delegated = {
+			calls: 0,
+			fileChecks: 0,
+			getSuggestions: async () => { delegated.calls++; return { prefix: "", items: [{ value: "src/index.ts" }] }; },
+			shouldTriggerFileCompletion: () => { delegated.fileChecks++; return true; },
+		};
+		const provider = providerFactory!(delegated);
+
+		// Ordinary file/command completion must not read the agent store or enumerate models,
+		// even though the roster links an agent whose store read would fail here.
+		assert.deepEqual(
+			await provider.getSuggestions(["open ./"], 0, 8, {}),
+			{ prefix: "", items: [{ value: "src/index.ts" }] },
+		);
+		assert.equal(delegated.calls, 1);
+		assert.equal(modelEnumerations, 0);
+		assert.equal(provider.shouldTriggerFileCompletion(["open ./"], 0, 8), true);
+		assert.equal(delegated.fileChecks, 1);
+
+		// Inside a mention context the store and model enumeration still run and win over the delegate.
+		await rm(instancesDir, { recursive: true, force: true });
+		await mkdir(instancesDir, { recursive: true });
+		await writeFile(join(instancesDir, "agt_probe.json"), JSON.stringify({
+			version: 2, agentId: "agt_probe", alias: "auth-review",
+			model: { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" },
+			sessionId: "session-probe", sessionFile: "/tmp/probe.jsonl", cwd: "/tmp/project",
+			createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-02T00:00:00.000Z", lastTask: "review auth",
+		}));
+		const mention = await provider.getSuggestions(["Ask @agent/auth now"], 0, 15, {}) as { items: Array<{ value: string }> } | null;
+		assert.deepEqual(mention?.items.map((item) => item.value), ["@agent/auth-review"]);
+		assert.equal(delegated.calls, 1);
+		assert.equal(modelEnumerations, 1);
+		assert.equal(provider.shouldTriggerFileCompletion(["Ask @agent/auth now"], 0, 15), false);
+		assert.equal(delegated.fileChecks, 1);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+		if (previousDepth === undefined) delete process.env["PI_SUBAGENT_DEPTH"];
+		else process.env["PI_SUBAGENT_DEPTH"] = previousDepth;
+		await rm(dir, { recursive: true, force: true });
+	}
 });

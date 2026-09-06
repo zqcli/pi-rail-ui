@@ -422,6 +422,55 @@ test("usage elapsed time changes only at minute boundaries", () => {
 	assert.match(renderDuration(120_000), /Usage · .*2m/);
 });
 
+test("empty runs render only a zero-summary header within the row cap", () => {
+	const header = "0 model sessions · 0 persistent · 0 stateless · 0 complete · 0 running · 0 failed";
+	const collapsed = renderSubagentTranscript([], false, theme as any).render(header.length + 10);
+	const expanded = renderSubagentTranscript([], true, theme as any).render(header.length + 10);
+
+	assert.deepEqual(collapsed.map((line) => line.trim()), [header]);
+	assert.deepEqual(expanded.map((line) => line.trim()), [header]);
+	assert.ok(renderSubagentTranscript([], false, theme as any).render(1).every((line) => visibleWidth(line) <= 1));
+});
+
+test("single running run without a transcript falls back to its output line", () => {
+	const run = {
+		alias: "timer",
+		status: "running" as const,
+		output: "",
+		persistent: false,
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+		durationMs: 1000,
+	};
+	const collapsed = renderSubagentTranscript([run], false, theme as any).render(80);
+	const expanded = renderSubagentTranscript([run], true, theme as any).render(80);
+
+	assert.match(collapsed[0]?.trim() ?? "", /^… timer · stateless · model unavailable$/);
+	assert.ok(collapsed.join("\n").indexOf("Usage ·") < collapsed.join("\n").indexOf("(running...)"));
+	assert.ok(collapsed.length <= 10);
+	assert.ok(expanded.length <= 16);
+	assert.match(expanded.join("\n"), /\(running\.\.\.\)/);
+});
+
+test("single running fallback hides the usage line when nothing is reportable", () => {
+	const plain = { alias: "a", status: "running" as const, output: "working", persistent: false };
+	const withZeroUsage = {
+		...plain,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+	};
+	const noUsageRows = renderSubagentTranscript([plain], false, theme as any).render(80);
+	const zeroUsageRows = renderSubagentTranscript([withZeroUsage], false, theme as any).render(80);
+
+	assert.deepEqual(noUsageRows.map((line) => line.trim()), [
+		"… a · stateless · model unavailable",
+		"● assistant  working",
+	]);
+	assert.deepEqual(zeroUsageRows.map((line) => line.trim()), [
+		"… a · stateless · model unavailable",
+		"Usage · 0 in · 0 out",
+		"● assistant  working",
+	]);
+});
+
 test("parallel transcript ordering follows global activity rather than child creation time", () => {
 	const alpha = new SubagentTranscript("alpha");
 	const beta = new SubagentTranscript("beta");

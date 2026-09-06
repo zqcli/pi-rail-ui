@@ -5,6 +5,7 @@ import type { RailModelRef } from "./models";
 import { buildSubagentSessionName } from "./session-name";
 import type { SessionLease } from "./session-lease";
 import type { SubagentTranscriptSnapshot } from "./transcript";
+import { emptySubagentUsage } from "./usage";
 
 export interface SubagentUsage {
 	input: number;
@@ -199,8 +200,22 @@ function compactMetadata(value: string, maxLength: number): string {
 	return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }
 
-function emptyUsage(): SubagentUsage {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+function freshWorkerState(instance: AgentInstance, worker: SessionWorker): WorkerState {
+	return {
+		instance,
+		worker,
+		tail: Promise.resolve(),
+		controlTail: Promise.resolve(),
+		active: false,
+		activeRunId: undefined,
+		activeRunAccepted: false,
+		nextRunId: 0,
+		stopping: false,
+		unknownControlRunId: undefined,
+		controlPoisoned: false,
+		controlErrorMessage: undefined,
+		queued: 0,
+	};
 }
 
 export class SessionBroker {
@@ -254,7 +269,7 @@ export class SessionBroker {
 			throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 		}
 		if (request.target && !this.roster.resolve(request.target)) this.roster.link(instance.alias, instance.agentId);
-		request.onUpdate?.({ instance, run: { output: "(starting...)", usage: emptyUsage() } });
+		request.onUpdate?.({ instance, run: { output: "(starting...)", usage: emptySubagentUsage() } });
 		try {
 			const state = await this.workerState(instance, expectedEpoch);
 			return await this.enqueue(state, async () => {
@@ -346,7 +361,7 @@ export class SessionBroker {
 
 	async attach(request: AttachRequest): Promise<AgentInstance> {
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
-		const creation = this.createInstance(request, "(attached; no task yet)");
+		const creation = this.createInstance(request);
 		this.instanceCreations.add(creation);
 		try {
 			return await creation;
@@ -481,7 +496,7 @@ export class SessionBroker {
 		return instance;
 	}
 
-	private async createInstance(request: AttachRequest, lastTask: string): Promise<AgentInstance> {
+	private async createInstance(request: AttachRequest): Promise<AgentInstance> {
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		const agentId = createAgentId();
 		const alias = request.alias?.trim() || generatedAlias(request.model.modelId, agentId);
@@ -521,7 +536,7 @@ export class SessionBroker {
 				cwd,
 				createdAt: now,
 				updatedAt: now,
-				lastTask,
+				lastTask: "(attached; no task yet)",
 			};
 			await this.store.put(instance);
 			if (this.shuttingDown) {
@@ -529,21 +544,7 @@ export class SessionBroker {
 				throw new Error("Subagent broker is shutting down");
 			}
 			this.roster.link(alias, agentId);
-			this.workers.set(agentId, {
-				instance,
-				worker,
-				tail: Promise.resolve(),
-				controlTail: Promise.resolve(),
-				active: false,
-				activeRunId: undefined,
-				activeRunAccepted: false,
-				nextRunId: 0,
-				stopping: false,
-				unknownControlRunId: undefined,
-				controlPoisoned: false,
-				controlErrorMessage: undefined,
-				queued: 0,
-			});
+			this.workers.set(agentId, freshWorkerState(instance, worker));
 			this.emitRuntimeChange();
 			return instance;
 		} catch (error) {
@@ -555,12 +556,11 @@ export class SessionBroker {
 		}
 	}
 
-	private async resolveInstance(target: string, linkByAgentId = false): Promise<AgentInstance> {
+	private async resolveInstance(target: string): Promise<AgentInstance> {
 		const linkedAgentId = this.roster.resolve(target);
 		const agentId = linkedAgentId ?? target;
 		const instance = await this.store.get(agentId);
 		if (!instance) throw new Error(`Unknown persistent subagent: ${target}`);
-		if (!linkedAgentId && linkByAgentId) this.roster.link(instance.alias, instance.agentId);
 		return linkedAgentId && target !== agentId ? { ...instance, alias: target } : instance;
 	}
 
@@ -594,21 +594,7 @@ export class SessionBroker {
 				await worker.stop().catch(() => undefined);
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 			}
-			const state: WorkerState = {
-				instance: { ...instance, sessionName },
-				worker,
-				tail: Promise.resolve(),
-				controlTail: Promise.resolve(),
-				active: false,
-				activeRunId: undefined,
-				activeRunAccepted: false,
-				nextRunId: 0,
-				stopping: false,
-				unknownControlRunId: undefined,
-				controlPoisoned: false,
-				controlErrorMessage: undefined,
-				queued: 0,
-			};
+			const state = freshWorkerState({ ...instance, sessionName }, worker);
 			this.workers.set(instance.agentId, state);
 			this.emitRuntimeChange();
 			return state;

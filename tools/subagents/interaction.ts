@@ -91,7 +91,7 @@ export function extractSubagentMentions(text: string): SubagentMentions {
 	};
 }
 
-function mentionPrefix(beforeCursor: string): { namespace: "agent" | "new"; prefix: string; query: string } | undefined {
+export function subagentMentionContext(beforeCursor: string): { namespace: "agent" | "new"; prefix: string; query: string } | undefined {
 	const match = beforeCursor.match(/(?:^|\s)(@(agent|new)\/([^\s@]*))$/u);
 	if (!match) return undefined;
 	return {
@@ -106,7 +106,7 @@ export function subagentMentionSuggestions(
 	agents: MentionAgentItem[],
 	models: MentionModelItem[],
 ): AutocompleteSuggestions | null {
-	const mention = mentionPrefix(beforeCursor);
+	const mention = subagentMentionContext(beforeCursor);
 	if (!mention) return null;
 	let items: AutocompleteItem[];
 	if (mention.namespace === "agent") {

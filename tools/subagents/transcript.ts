@@ -512,13 +512,8 @@ export class SubagentTranscript {
 	}
 }
 
-interface RenderEntry {
-	entry: SubagentTranscriptEntry;
-	scope?: string;
-}
-
 interface RenderGroup {
-	entries: RenderEntry[];
+	entries: SubagentTranscriptEntry[];
 	order: number;
 }
 
@@ -640,7 +635,7 @@ class BoundedTranscriptView implements Component {
 			: [];
 		const initialLines = this.renderInitial(width);
 		const rendered = this.groups
-			.map((group) => group.entries.filter((item) => !isInitialEntry(item.entry)).flatMap((item) => this.renderEntry(item, width)))
+			.map((group) => group.entries.filter((entry) => !isInitialEntry(entry)).flatMap((entry) => this.renderEntry(entry, width)))
 			.filter((lines) => lines.length > 0);
 		const budget = Math.max(0, this.maxRows - headerLines.length - statusLines.length);
 		let selected = this.selectLatest(rendered, budget);
@@ -657,13 +652,12 @@ class BoundedTranscriptView implements Component {
 	invalidate(): void {}
 
 	renderInitial(width: number): string[] {
-		const entries = this.groups.flatMap((group) => group.entries.filter((item) => isInitialEntry(item.entry)));
+		const entries = this.groups.flatMap((group) => group.entries.filter((entry) => isInitialEntry(entry)));
 		if (entries.length === 0) return [];
-		return entries.flatMap((item) => this.renderEntry(item, width, true));
+		return entries.flatMap((entry) => this.renderEntry(entry, width, true));
 	}
 
-	private renderEntry(item: RenderEntry, width: number, unbounded = false): string[] {
-		const entry = item.entry;
+	private renderEntry(entry: SubagentTranscriptEntry, width: number, unbounded = false): string[] {
 		const failed = entry.status === "failed";
 		const icon = entry.kind === "user" ? "›"
 			: entry.kind === "assistant" ? "●"
@@ -674,12 +668,11 @@ class BoundedTranscriptView implements Component {
 			: entry.kind === "tool" ? `tool ${entry.label ?? ""}`.trim()
 			: entry.kind === "toolResult" ? `result ${entry.label ?? ""}`.trim()
 				: entry.kind;
-		const scope = item.scope ? `${item.scope} · ` : "";
 		const titleColor = failed ? "error" : entry.kind === "thinking" ? "dim" : entry.kind === "user" ? "accent" : "toolTitle";
 		const bodyColor = failed ? "error" : entry.kind === "thinking" ? "dim" : "toolOutput";
 		const logical = entry.text.split("\n");
 		const first = logical.shift() ?? "";
-		const title = `${this.theme.fg(titleColor, `${icon} ${scope}${label}`)}${first ? this.theme.fg(bodyColor, `  ${first}`) : ""}`;
+		const title = `${this.theme.fg(titleColor, `${icon} ${label}`)}${first ? this.theme.fg(bodyColor, `  ${first}`) : ""}`;
 		const rest = logical.map((line) => this.theme.fg(bodyColor, `   ${line}`));
 		const lines = new Text([title, ...rest].join("\n"), 0, 0).render(width);
 		if (unbounded || lines.length <= MAX_ENTRY_ROWS) return lines;
@@ -760,7 +753,7 @@ function canRenderAnswerMarkdown(run: SubagentTranscriptRun): boolean {
 function runGroups(run: SubagentTranscriptRun): RenderGroup[] {
 	return collectTranscriptGroups([run]).map((group) => ({
 		order: group.order,
-		entries: group.entries.map(({ entry }) => ({ entry })),
+		entries: group.entries.map(({ entry }) => entry),
 	}));
 }
 
@@ -918,55 +911,32 @@ export function renderSubagentTranscript(
 	if (only && only.status !== "running") {
 		return new SubagentRunPanel(only, expanded, true, false, theme, options.markdownTheme);
 	}
-	const completed = boundedRuns.filter((run) => run.status === "completed").length;
-	const accepted = boundedRuns.filter((run) => run.status === "accepted").length;
-	const failed = boundedRuns.filter((run) => run.status === "failed").length;
-	const running = boundedRuns.length - completed - accepted - failed;
-	const persistent = boundedRuns.filter((run) => run.persistent).length;
-	const stateless = boundedRuns.length - persistent;
-	const identity = (run: SubagentTranscriptRun) => `${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}`;
-	const header = boundedRuns.length === 1
-		? `${boundedRuns[0]!.status === "failed" ? theme.fg("error", "✗") : boundedRuns[0]!.status === "running" ? theme.fg("warning", "…") : theme.fg("success", "✓")} ${theme.fg("toolTitle", theme.bold(boundedRuns[0]!.alias))}${theme.fg("dim", ` · ${boundedRuns[0]!.persistent ? "persistent" : "stateless"} · ${boundedRuns[0]!.model ?? "model unavailable"}`)}`
-		: `${theme.fg("toolTitle", theme.bold(`${boundedRuns.length} model sessions`))}${theme.fg("dim", ` · ${persistent} persistent · ${stateless} stateless · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running · ${failed} failed`)}`;
-	const multiple = boundedRuns.length > 1;
-	let omittedEntries = 0;
-	for (const run of boundedRuns) {
-		if (run.transcript) {
-			omittedEntries += run.transcript.omittedEntries;
-		}
+	if (!only) {
+		const header = `${theme.fg("toolTitle", theme.bold("0 model sessions"))}${theme.fg("dim", " · 0 persistent · 0 stateless · 0 complete · 0 running · 0 failed")}`;
+		return new BoundedTranscriptView(header, [], 0, expanded ? EXPANDED_ROWS : COLLAPSED_ROWS, theme);
 	}
-	const groups: RenderGroup[] = collectTranscriptGroups(boundedRuns).map((group) => ({
-		order: group.order,
-		entries: group.entries.map(({ runIndex, entry }) => ({
-			entry,
-			...(multiple ? { scope: identity(boundedRuns[runIndex]!) } : {}),
-		})),
-	}));
-	for (let runIndex = 0; runIndex < boundedRuns.length; runIndex++) {
-		const run = boundedRuns[runIndex]!;
-		if (run.transcript !== undefined) continue;
+	const groups: RenderGroup[] = [...runGroups(only)];
+	if (!only.transcript) {
 		groups.push({
 			order: 0,
 			entries: [{
-				entry: {
-					id: `fallback:${run.alias}`,
-					kind: "assistant",
-					text: cleanDisplayText(run.output, "(running...)"),
-					status: run.status,
-					order: 0,
-				},
-				...(multiple ? { scope: identity(run) } : {}),
+				id: `fallback:${only.alias}`,
+				kind: "assistant",
+				text: cleanDisplayText(only.output, "(running...)"),
+				status: only.status,
+				order: 0,
 			}],
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	const liveUsage = only?.status === "running" ? usageText(only) : "";
+	const header = `${theme.fg("warning", "…")} ${theme.fg("toolTitle", theme.bold(only.alias))}${theme.fg("dim", ` · ${only.persistent ? "persistent" : "stateless"} · ${only.model ?? "model unavailable"}`)}`;
+	const usage = usageText(only);
 	return new BoundedTranscriptView(
 		header,
 		groups,
-		omittedEntries,
+		only.transcript?.omittedEntries ?? 0,
 		expanded ? EXPANDED_ROWS : COLLAPSED_ROWS,
 		theme,
-		liveUsage ? `Usage · ${liveUsage}` : undefined,
+		usage ? `Usage · ${usage}` : undefined,
 	);
 }

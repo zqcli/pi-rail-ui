@@ -205,6 +205,57 @@ test("model and saved-session choices open as searchable inline pickers", () => 
 	}
 });
 
+test("saved-session search matches words across title, message, cwd, and id from the unified overlay", async () => {
+	const state = setup();
+	state.sessions.splice(0, state.sessions.length,
+		{
+			path: "/tmp/auth.jsonl", id: "session-auth", cwd: "/tmp/project", name: "Security review",
+			created: new Date("2026-01-01"), modified: new Date("2026-01-02"), messageCount: 2,
+			firstMessage: "Inspect login races", allMessagesText: "Inspect login races",
+		},
+		{
+			path: "/tmp/db.jsonl", id: "session-db", cwd: "/tmp/database", name: "Storage",
+			created: new Date("2026-01-01"), modified: new Date("2026-01-03"), messageCount: 1,
+			firstMessage: "Tune indexes", allMessagesText: "Tune indexes",
+		},
+	);
+	try {
+		const ui = state.component;
+		ui.handleInput("\u001b[C");
+		ui.handleInput("\u001b[C");
+		ui.handleInput("\r");
+		for (let index = 0; index < 4; index++) ui.handleInput("\u001b[B");
+		ui.handleInput("\r");
+		assert.match(ui.render(100).join("\n"), /Select saved session/);
+
+		// One multi-token query spanning title, first message, cwd, and id.
+		for (const char of "security login project session") ui.handleInput(char);
+		let text = ui.render(100).join("\n");
+		assert.match(text, /Security review/);
+		assert.doesNotMatch(text, /Storage|Tune indexes/);
+
+		ui.handleInput("\r");
+		text = ui.render(100).join("\n");
+		assert.doesNotMatch(text, /Select saved session/);
+		assert.match(text, /Security review/);
+
+		// A second search across cwd and message finds the other session.
+		ui.handleInput("\r");
+		for (const char of "database indexes") ui.handleInput(char);
+		text = ui.render(100).join("\n");
+		assert.match(text, /database · Storage/);
+		assert.doesNotMatch(text, /Security review/);
+
+		// Cancelling the search keeps the earlier selection.
+		ui.handleInput("\u001b");
+		text = ui.render(100).join("\n");
+		assert.doesNotMatch(text, /Select saved session/);
+		assert.match(text, /Security review/);
+	} finally {
+		state.component.dispose();
+	}
+});
+
 test("running agents accept inline steer and follow-up controls", async () => {
 	const state = setup("running");
 	try {

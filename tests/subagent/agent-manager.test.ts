@@ -89,3 +89,47 @@ test("RailAgentManager combines current links, local runtime state, and foreign 
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+test("manager resolves agentId, canonical alias, and linked aliases to the same target while unknown ownership stays guarded", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-resolve-"));
+	try {
+		const local = instance("agt_alpha", "alpha-review", join(dir, "alpha.jsonl"));
+		const selfOwned = instance("agt_own", "own-review", join(dir, "own.jsonl"));
+		const instances = new Map([[local.agentId, local], [selfOwned.agentId, selfOwned]]);
+		const links = [
+			{ alias: "alpha-review", agentId: local.agentId },
+			{ alias: "linked-alias", agentId: local.agentId },
+		];
+		const selfLock = join(dir, "leases", sessionLeaseDirectoryName(sessionLeaseKey(selfOwned.sessionFile)));
+		await mkdir(selfLock, { recursive: true });
+		await writeFile(join(selfLock, "owner.json"), JSON.stringify({ pid: process.pid, token: "self", createdAt: new Date().toISOString() }));
+		const controls: unknown[] = [];
+		const broker = {
+			runtimeStatus: (agentId: string) => agentId === local.agentId ? { phase: "running", queued: 0 } : { phase: "stopped", queued: 0 },
+			subscribeRuntime: () => () => undefined,
+			control: async (request: unknown) => { controls.push(request); return { instance: local, delivery: "steer" }; },
+		};
+		const manager = new RailAgentManager(
+			broker as any,
+			{ get: async (id: string) => instances.get(id), put: async () => undefined, list: async () => [...instances.values()] } as any,
+			{ list: () => links, link: () => undefined, unlink: () => undefined, resolve: () => undefined } as any,
+			dir,
+		);
+
+		for (const target of [local.agentId, "alpha-review", "linked-alias"]) {
+			await manager.control(target, { delivery: "steer", message: "Focus on tests" });
+		}
+		assert.deepEqual(controls, [local.agentId, local.agentId, local.agentId]
+			.map((target) => ({ target, delivery: "steer", message: "Focus on tests" })));
+		await assert.rejects(
+			() => manager.control(selfOwned.agentId, { delivery: "steer", message: "Focus" }),
+			/ownership is not yet known/,
+		);
+		await assert.rejects(
+			() => manager.control("missing", { delivery: "steer", message: "Focus" }),
+			/Unknown persistent subagent/,
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});

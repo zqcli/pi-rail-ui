@@ -6,6 +6,11 @@ import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runn
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
+function inlineScript(events: unknown[]): string {
+	const body = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+	return `process.stdout.write(${JSON.stringify(body)});`;
+}
+
 test("stateless runner uses Pi JSON mode without creating a session", async () => {
 	let capturedArgs: string[] = [];
 	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
@@ -81,4 +86,117 @@ test("stateless abort clears queued transcript updates before rejecting", async 
 	assert.equal(updates.at(-1).transcript.entries.at(-1).text, "partial");
 	assert.equal(updates.at(-1).stopReason, "aborted");
 	assert.equal(updates.at(-1).errorMessage, "Subagent request was aborted");
+});
+
+test("drops throttle-only updates when the process ends before an assistant message_end", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript([
+			{ type: "message_start", message: { role: "assistant", content: [] } },
+			{ type: "message_end", message: { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "source" }], isError: false } },
+		])] }),
+	});
+	const updates: any[] = [];
+
+	const result = await runner({
+		model,
+		task: "result only",
+		cwd: process.cwd(),
+		onUpdate: (update) => updates.push(update),
+	});
+	t.mock.timers.tick(100);
+
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.output, "(no output)");
+	assert.equal(updates.length, 0);
+});
+
+test("flushes exactly once on the final assistant message_end", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript([
+			{ type: "message_start", message: { role: "assistant", content: [] } },
+			{ type: "message_update", usage: { input: 12, output: 3, cacheRead: 2, cacheWrite: 0, totalTokens: 17, cost: { total: 0.04 } } },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], usage: { input: 12, output: 3, cacheRead: 2, cacheWrite: 0, totalTokens: 17, cost: { total: 0.04 } }, stopReason: "stop" } },
+		])] }),
+	});
+	const updates: any[] = [];
+
+	const result = await runner({
+		model,
+		task: "short run",
+		cwd: process.cwd(),
+		onUpdate: (update) => updates.push(update),
+	});
+	t.mock.timers.tick(100);
+
+	assert.equal(updates.length, 1);
+	assert.equal(updates.at(-1).output, "done");
+	assert.equal(updates.at(-1).stopReason, "stop");
+	assert.equal(result.output, "done");
+	assert.equal(result.stopReason, "stop");
+	assert.deepEqual(result.usage, {
+		input: 12,
+		output: 3,
+		cacheRead: 2,
+		cacheWrite: 0,
+		cost: 0.04,
+		contextTokens: 17,
+		turns: 1,
+	});
+});
+
+test("ignores the tail of a malformed assistant message_end but keeps its transcript", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript([
+			{ type: "message_start", message: { role: "assistant", content: [] } },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first done" }], usage: { input: 10, output: 1 }, stopReason: "stop" } },
+			{ type: "message_start", message: { role: "assistant", content: [] } },
+			{ type: "message_end", message: { role: "assistant", content: [null, { type: "text", text: "second text" }], usage: { input: 999, output: 9 }, stopReason: "stop" } },
+			{ type: "message_start", message: { role: "assistant", content: [] } },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "third done" }], usage: { input: 5, output: 1 }, stopReason: "stop" } },
+		])] }),
+	});
+	const updates: any[] = [];
+
+	const result = await runner({
+		model,
+		task: "malformed tail",
+		cwd: process.cwd(),
+		onUpdate: (update) => updates.push(update),
+	});
+	t.mock.timers.tick(100);
+
+	assert.equal(updates.length, 2);
+	assert.equal(updates[0]?.output, "first done");
+	assert.equal(updates[1]?.output, "third done");
+	assert.equal(result.output, "third done");
+	assert.equal(result.errorMessage, undefined);
+	assert.deepEqual(result.usage, { input: 15, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 2 });
+	assert.deepEqual(result.transcript?.entries.map((entry) => entry.text), [
+		"malformed tail",
+		"first done",
+		"second text",
+		"third done",
+	]);
+});
+
+test("surfaces a spawn failure through the run's shared error slot", async () => {
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: "/nonexistent/rail-pi", args: [] }),
+	});
+	const updates: any[] = [];
+
+	const result = await runner({
+		model,
+		task: "boom",
+		cwd: process.cwd(),
+		onUpdate: (update) => updates.push(update),
+	});
+
+	assert.equal(result.exitCode, 1);
+	assert.match(result.errorMessage ?? "", /ENOENT/);
+	assert.equal(result.output, result.errorMessage);
+	assert.equal(updates.length, 0);
 });

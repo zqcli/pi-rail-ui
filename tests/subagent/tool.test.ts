@@ -709,3 +709,247 @@ test("a later parallel slot keeps its own initial task while an earlier worker s
 		await pending;
 	}
 });
+
+test("normalization trims placeholders for single, parallel, and chain and keeps task text intact", async () => {
+	let tool: any;
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+	});
+
+	assert.deepEqual(tool.prepareArguments({
+		model: " cus-resp/gpt-5.6-sol:xhigh ",
+		target: "",
+		alias: "   ",
+		task: "  keep my spaces  ",
+		cwd: " /tmp/x ",
+		session: { mode: "fork", path: " " },
+		control: { delivery: "steer", message: "" },
+		tasks: [],
+		chain: [],
+	}), {
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		task: "  keep my spaces  ",
+		cwd: "/tmp/x",
+	});
+	assert.deepEqual(tool.prepareArguments({
+		model: null,
+		target: null,
+		alias: null,
+		task: "null placeholders stay gone",
+		cwd: null,
+		session: null,
+		control: null,
+		tasks: [],
+		chain: [],
+	}), {
+		task: "null placeholders stay gone",
+	});
+	assert.deepEqual(tool.prepareArguments({
+		tasks: [
+			{ model: "", target: " keep-target ", alias: " ", task: "alpha", cwd: " ", session: { mode: "fork", path: "  " } },
+		],
+	}), {
+		tasks: [{ target: "keep-target", task: "alpha" }],
+	});
+	assert.deepEqual(tool.prepareArguments({
+		chain: [{ model: " m ", alias: " a ", task: "chain task", cwd: "" }],
+	}), {
+		chain: [{ model: "m", alias: "a", task: "chain task" }],
+	});
+});
+
+test("an aborted single call throws before dispatch and restores aborted details", async () => {
+	let tool: any;
+	let toolResultHandler: ((event: any) => any) | undefined;
+	const broker = new FakeBroker();
+	installStatefulSubagentTool({
+		registerTool: (definition: any) => { tool = definition; },
+		on: (event: string, handler: (value: any) => any) => {
+			if (event === "tool_result") toolResultHandler = handler;
+		},
+	} as any, { broker: broker as unknown as SessionBroker });
+	const controller = new AbortController();
+	controller.abort();
+
+	await assert.rejects(() => tool.execute("call-aborted-single", {
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		task: "never runs",
+	}, controller.signal, undefined, context()), /aborted before dispatch/);
+	assert.equal(broker.requests.length, 0);
+	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-aborted-single", isError: true });
+	assert.equal(restored.details.mode, "single");
+	assert.equal(restored.details.results[0].status, "failed");
+	assert.equal(restored.details.results[0].stopReason, "aborted");
+	assert.match(restored.details.results[0].errorMessage, /aborted before dispatch/);
+});
+
+test("an aborted chain stops immediately and dispatches no persistent sessions", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+	});
+	const controller = new AbortController();
+	controller.abort();
+
+	const result = await tool.execute("call-aborted-chain", {
+		chain: [
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "step-one", task: "first" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "step-two", task: "second" },
+		],
+	}, controller.signal, undefined, context());
+
+	assert.equal(broker.requests.length, 0);
+	assert.equal(result.details.mode, "chain");
+	assert.equal(result.details.results.length, 1);
+	assert.equal(result.details.results[0].status, "failed");
+	assert.equal(result.details.results[0].stopReason, "aborted");
+	assert.equal(result.details.results[0].step, 1);
+	assert.match(result.content[0].text, /Chain: 0\/1 succeeded/);
+});
+
+test("a single persistent failure throws and restores failed details with error status", async () => {
+	let tool: any;
+	let toolResultHandler: ((event: any) => any) | undefined;
+	const broker = new FakeBroker();
+	installStatefulSubagentTool({
+		registerTool: (definition: any) => { tool = definition; },
+		on: (event: string, handler: (value: any) => any) => {
+			if (event === "tool_result") toolResultHandler = handler;
+		},
+	} as any, { broker: broker as unknown as SessionBroker });
+	broker.dispatch = async () => { throw new Error("persistent broke"); };
+
+	await assert.rejects(() => tool.execute("call-fail-single", {
+		model: "cus-resp/gpt-5.6-sol:xhigh",
+		alias: "fragile",
+		task: "do work",
+	}, undefined, undefined, context()), /persistent broke/);
+
+	assert.equal(broker.requests.length, 0);
+	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-fail-single", isError: true });
+	assert.equal(restored.details.mode, "single");
+	assert.equal(restored.details.results[0].status, "failed");
+	assert.equal(restored.details.results[0].stopReason, "error");
+	assert.equal(restored.details.results[0].persistent, true);
+	assert.match(restored.details.results[0].errorMessage, /persistent broke/);
+	assert.deepEqual(restored.details.results[0].usage, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
+});
+
+test("parallel aggregates failed and completed results without throwing", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	broker.dispatch = async (request) => {
+		if (request.task === "broken") throw new Error("persistent broke");
+		const instance = {
+			version: 2,
+			agentId: "agt_parallel",
+			alias: request.alias ?? "item",
+			model: railModel,
+			sessionId: "session-parallel",
+			sessionFile: "/tmp/parallel.jsonl",
+			cwd: "/tmp/project",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			lastTask: request.task,
+		} as const;
+		return { instance, run: { output: `done: ${request.task}`, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 } } };
+	};
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+		runStateless: async () => ({ exitCode: 0, output: "stateless done", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 } }),
+	});
+
+	const result = await tool.execute("call-mixed-fail", {
+		tasks: [
+			{ task: "quick" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "fragile", task: "broken" },
+		],
+	}, undefined, undefined, context());
+
+	assert.equal(result.details.mode, "parallel");
+	assert.equal(result.details.results.length, 2);
+	assert.deepEqual(result.details.results.map((item: any) => item.status).sort(), ["completed", "failed"]);
+	assert.equal(result.details.results[1].status, "failed");
+	assert.equal(result.details.results[1].stopReason, "error");
+	assert.equal(result.details.results[1].persistent, true);
+	assert.match(result.details.results[1].errorMessage, /persistent broke/);
+	assert.match(result.content[0].text, /Parallel: 1\/2 succeeded/);
+});
+
+test("chain stops at the first failed step after substituting {previous}", async () => {
+	let tool: any;
+	const broker = new FakeBroker();
+	broker.dispatch = async (request) => {
+		broker.requests.push(request);
+		if (request.task.includes("STEP TWO")) throw new Error("step two broke");
+		const instance = {
+			version: 2,
+			agentId: "agt_chain",
+			alias: request.alias ?? "chain",
+			model: railModel,
+			sessionId: "session-chain",
+			sessionFile: "/tmp/chain.jsonl",
+			cwd: "/tmp/project",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			lastTask: request.task,
+		} as const;
+		return { instance, run: { output: `done: ${request.task}`, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 } } };
+	};
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: broker as unknown as SessionBroker,
+	});
+
+	const result = await tool.execute("call-chain-fail", {
+		chain: [
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "one", task: "STEP ONE" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "two", task: "STEP TWO {previous}" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "three", task: "STEP THREE" },
+		],
+	}, undefined, undefined, context());
+
+	assert.deepEqual(broker.requests.map((request) => request.task), [
+		"STEP ONE",
+		"STEP TWO done: STEP ONE",
+	]);
+	assert.deepEqual(result.details.results.map((item: any) => item.status), ["completed", "failed"]);
+	assert.deepEqual(result.details.results.map((item: any) => item.step), [1, 2]);
+	assert.match(result.details.results[1].errorMessage, /step two broke/);
+	assert.match(result.content[0].text, /Chain: 1\/2 succeeded/);
+});
+
+test("single, parallel, and chain keep equivalent details for the same stateless run", async () => {
+	let tool: any;
+	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
+		broker: new FakeBroker() as unknown as SessionBroker,
+		runStateless: async () => ({ exitCode: 0, output: "shared output", usage: { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0.2, contextTokens: 7, turns: 1 } }),
+	});
+
+	const single = await tool.execute("call-equiv-single", { model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }, undefined, undefined, context());
+	const parallel = await tool.execute("call-equiv-parallel", { tasks: [{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }] }, undefined, undefined, context());
+	const chain = await tool.execute("call-equiv-chain", { chain: [{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }] }, undefined, undefined, context());
+
+	const pick = (result: any) => {
+		const run = result.details.results[0];
+		return {
+			model: run.model,
+			task: run.task,
+			status: run.status,
+			output: run.output,
+			usage: run.usage,
+			persistent: run.persistent,
+			stopReason: run.stopReason ?? null,
+			errorMessage: run.errorMessage ?? null,
+		};
+	};
+	assert.deepEqual(pick(single), pick(parallel));
+	assert.deepEqual(pick(parallel), pick(chain));
+	assert.equal(single.details.results[0].alias, "cus-resp/gpt-5.6-sol");
+	assert.equal(parallel.details.results[0].alias, "cus-resp/gpt-5.6-sol #1");
+	assert.equal(chain.details.results[0].alias, "cus-resp/gpt-5.6-sol #1");
+	assert.equal(chain.details.results[0].step, 1);
+	assert.equal("step" in single.details.results[0], false);
+	assert.equal("step" in parallel.details.results[0], false);
+	assert.equal(typeof single.details.results[0].durationMs, "number");
+});

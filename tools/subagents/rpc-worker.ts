@@ -1,20 +1,18 @@
 import { railModelKey, type RailModelRef } from "./models";
 import { RpcCommandError } from "./rpc-transport";
 import { WorkerControlError } from "./session-broker";
-import { SubagentTranscript } from "./transcript";
 import type {
 	SessionWorker,
-	SubagentUsage,
 	WorkerRunResult,
 	WorkerSendOptions,
 	WorkerControlRequest,
 	WorkerStartSpec,
 } from "./session-broker";
-import { addCompletedAssistantUsage, emptySubagentUsage, providerReportedUsage, usageWithActiveTurn } from "./usage";
+import { RunResultCollector, assistantText } from "./run-result";
 
 export interface RpcEvent {
 	type: string;
-	message?: any;
+	message?: unknown;
 	error?: string;
 	[key: string]: unknown;
 }
@@ -44,14 +42,6 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	return args;
 }
 
-function assistantText(message: any): string {
-	if (message?.role !== "assistant" || !Array.isArray(message.content)) return "";
-	return message.content
-		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
-		.map((part: any) => part.text)
-		.join("\n");
-}
-
 export class RpcSessionWorker implements SessionWorker {
 	private constructor(
 		readonly sessionId: string,
@@ -78,28 +68,17 @@ export class RpcSessionWorker implements SessionWorker {
 
 	async send(task: string, options: WorkerSendOptions = {}): Promise<WorkerRunResult> {
 		if (options.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
-		const usage = emptySubagentUsage();
-		let activeUsage: SubagentUsage | undefined;
-		let output = "";
-		let stopReason: string | undefined;
-		let errorMessage: string | undefined;
+		const collector = new RunResultCollector(task, assistantText);
 		let settled = false;
 		let started = false;
 		let aborted = false;
 		let resolveSettled!: () => void;
 		let transportError: Error | undefined;
 		let abortRequest: Promise<void> | undefined;
-		const transcript = new SubagentTranscript(task);
 		let updateTimer: NodeJS.Timeout | undefined;
 		const publishUpdate = () => {
 			updateTimer = undefined;
-			options.onUpdate?.({
-				output: output || "(running...)",
-				usage: usageWithActiveTurn(usage, activeUsage),
-				transcript: transcript.snapshot(),
-				...(stopReason ? { stopReason } : {}),
-				...(errorMessage ? { errorMessage } : {}),
-			});
+			options.onUpdate?.(collector.result("(running...)"));
 		};
 		const queueUpdate = (immediate = false) => {
 			if (!options.onUpdate) return;
@@ -115,23 +94,10 @@ export class RpcSessionWorker implements SessionWorker {
 		});
 		const unsubscribe = this.transport.onEvent((event) => {
 			if (event.type === "agent_start") started = true;
-			const transcriptChanged = transcript.ingest(event);
-			if (event.type === "message_update") {
-				const reported = providerReportedUsage(event["usage"]);
-				if (reported) activeUsage = reported;
-			}
+			const changed = collector.ingest(event);
 			if (event.type === "message_end") {
-				const text = assistantText(event.message);
-				if (text) output = text;
-				addCompletedAssistantUsage(usage, event.message);
-				if (event.message?.role === "assistant") activeUsage = undefined;
-				if (event.message?.role === "assistant") {
-					stopReason = event.message.stopReason;
-					errorMessage = event.message.errorMessage;
-				}
 				queueUpdate(true);
-			}
-			if ((transcriptChanged || (event.type === "message_update" && activeUsage !== undefined)) && event.type !== "message_end") {
+			} else if (changed) {
 				queueUpdate(event.type === "tool_execution_start" || event.type === "tool_execution_end");
 			}
 			if (event.type === "agent_settled" && !settled) {
@@ -170,17 +136,8 @@ export class RpcSessionWorker implements SessionWorker {
 			if (!settled) options.onAccepted?.();
 			await settledPromise;
 			if (transportError) throw transportError;
-			if (aborted) {
-				stopReason = "aborted";
-				errorMessage = "Subagent request was aborted";
-			}
-			return {
-				output: output || "(no output)",
-				usage: usageWithActiveTurn(usage, activeUsage),
-				transcript: transcript.snapshot(),
-				...(stopReason ? { stopReason } : {}),
-				...(errorMessage ? { errorMessage } : {}),
-			};
+			if (aborted) collector.markAborted();
+			return collector.result("(no output)");
 		} finally {
 			await abortRequest;
 			if (updateTimer) clearTimeout(updateTimer);

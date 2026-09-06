@@ -23,6 +23,7 @@ import {
 	type SubagentTranscriptRun,
 	type SubagentTranscriptSnapshot,
 } from "./transcript";
+import { emptySubagentUsage } from "./usage";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CHAIN_TASKS = 8;
@@ -151,10 +152,6 @@ function normalizeTask(item: TaskParams): TaskParams {
 	};
 }
 
-function emptyUsage(): SubagentUsage {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
-}
-
 function utf8Prefix(value: string, maxBytes: number): string {
 	let low = 0;
 	let high = value.length;
@@ -269,7 +266,7 @@ function errorResult(
 		status: "failed",
 		output: truncateParentContent(message),
 		transcript: appendSubagentTranscriptFailure(previous?.transcript, item.task, message),
-		usage: previous?.usage ?? emptyUsage(),
+		usage: previous?.usage ?? emptySubagentUsage(),
 		durationMs,
 		stopReason: aborted ? "aborted" : "error",
 		errorMessage: truncateParentContent(message),
@@ -310,20 +307,8 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 			...(params.control && message ? { control: { delivery: params.control.delivery, message } } : {}),
 		};
 	}
-	const model = nonEmpty(params.model);
-	const target = nonEmpty(params.target);
-	const alias = nonEmpty(params.alias);
-	const cwd = nonEmpty(params.cwd);
-	const sessionPath = nonEmpty(params.session?.path);
-	return {
-		...(model ? { model } : {}),
-		...(target ? { target } : {}),
-		...(alias ? { alias } : {}),
-		task: params.task!,
-		...(cwd ? { cwd } : {}),
-		...(params.session && sessionPath ? { session: { mode: params.session.mode, path: sessionPath } } : {}),
-		...confirmSessionAttach,
-	};
+	const normalized = normalizeTask({ ...params, task: params.task! });
+	return { ...normalized, ...confirmSessionAttach };
 }
 
 function initialTasksForRender(args: SubagentParamsValue | undefined): string[] {
@@ -453,7 +438,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						task: message,
 						status: "accepted",
 						output,
-						usage: emptyUsage(),
+						usage: emptySubagentUsage(),
 						durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
 						stopReason: "accepted",
 						persistent: true,
@@ -484,17 +469,9 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					details,
 				});
 			};
-			const rawItems: TaskParams[] = mode === "single"
-				? [{
-					...(params.model ? { model: params.model } : {}),
-					...(params.target ? { target: params.target } : {}),
-					...(params.alias ? { alias: params.alias } : {}),
-					task: params.task!,
-					...(params.cwd ? { cwd: params.cwd } : {}),
-					...(params.session ? { session: params.session } : {}),
-				}]
+			const requestedItems: TaskParams[] = mode === "single"
+				? [{ ...params, task: params.task! } as TaskParams]
 				: (mode === "parallel" ? params.tasks! : params.chain!) as TaskParams[];
-			const requestedItems = rawItems.map(normalizeTask);
 			if (mode === "parallel" && requestedItems.length > MAX_PARALLEL_TASKS) {
 				throw new Error(`Too many parallel tasks (${requestedItems.length}); max is ${MAX_PARALLEL_TASKS}`);
 			}
@@ -530,7 +507,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						task: item.task,
 						status: "running",
 						output: "(starting...)",
-						usage: emptyUsage(),
+						usage: emptySubagentUsage(),
 						durationMs: duration(),
 						...(step !== undefined ? { step } : {}),
 						persistent: false,
@@ -587,29 +564,25 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				return result;
 			};
 
-			if (mode === "single") {
-				let result: StatefulSubagentRunDetails;
+			const runTask = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
 				try {
-					result = await dispatch(requestedItems[0]!, 0);
+					return await dispatch(item, slot, step);
 				} catch (error) {
-					result = errorResult(requestedItems[0]!, error, runDuration(0), signal?.aborted ?? false, undefined, liveResults.get(0));
-					publishLive(0, result);
+					const result = errorResult(item, error, runDuration(slot), signal?.aborted ?? false, step, liveResults.get(slot));
+					publishLive(slot, result);
+					return result;
 				}
+			};
+
+			if (mode === "single") {
+				const result = await runTask(requestedItems[0]!, 0);
 				if (result.status === "failed") throw new Error(finalText(result));
 				const details = resultDetails([result]);
 				latestDetails.set(toolCallId, details);
 				return { content: [{ type: "text", text: finalText(result) }], details };
 			}
 			if (mode === "parallel") {
-				const results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, async (item, index) => {
-					try {
-						return await dispatch(item, index);
-					} catch (error) {
-						const result = errorResult(item, error, runDuration(index), signal?.aborted ?? false, undefined, liveResults.get(index));
-						publishLive(index, result);
-						return result;
-					}
-				});
+				const results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
 				const details = resultDetails(results);
 				latestDetails.set(toolCallId, details);
 				return { content: [{ type: "text", text: aggregateText(mode, results) }], details };
@@ -619,17 +592,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			for (let index = 0; index < requestedItems.length; index++) {
 				const raw = requestedItems[index]!;
 				const item = { ...raw, task: raw.task.replaceAll("{previous}", previous) };
-				try {
-					const result = await dispatch(item, index, index + 1);
-					results.push(result);
-					if (result.status === "failed") break;
-					previous = result.output;
-				} catch (error) {
-					const result = errorResult(item, error, runDuration(index), signal?.aborted ?? false, index + 1, liveResults.get(index));
-					publishLive(index, result);
-					results.push(result);
-					break;
-				}
+				const result = await runTask(item, index, index + 1);
+				results.push(result);
+				if (result.status === "failed") break;
+				previous = result.output;
 			}
 			const details = resultDetails(results);
 			latestDetails.set(toolCallId, details);

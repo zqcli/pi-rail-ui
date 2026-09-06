@@ -8,7 +8,6 @@ import { availableRailModels, railModelReference, type RailModelRef } from "./mo
 import { showRailAgentOverlay } from "./rail-agent-overlay";
 import type { SessionBroker } from "./session-broker";
 import type { SessionAgentRoster } from "./session-links";
-import { pickSessionOverlay } from "./session-picker";
 
 const ACTION_CREATE = "Start persistent model session";
 const ACTION_LINK = "Link saved session (safe copy)";
@@ -79,7 +78,6 @@ async function chooseSession(ctx: ExtensionCommandContext, sessions: SessionInfo
 		ctx.ui.notify("No saved Pi sessions are available", "warning");
 		return undefined;
 	}
-	if (ctx.mode === "tui") return pickSessionOverlay(ctx, available);
 	const labels = available.map((info, index) => sessionLabel(info, index, ctx.cwd));
 	const selected = await ctx.ui.select("Saved Pi session", labels);
 	return selected ? available[labels.indexOf(selected)] : undefined;

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installRailSubagent } from "../../tools/subagents";
 import { runRailAgentManager } from "../../tools/subagents/rail-agent-manager";
-import { filterSessions } from "../../tools/subagents/session-picker";
 
 const model = {
 	provider: "cus-resp",
@@ -159,22 +158,163 @@ test("starting a persistent session selects a model and defers creation until ta
 	assert.equal(editorText, "@new/cus-resp/gpt-5.6-sol:xhigh ");
 });
 
-test("session popup search matches words across title, message, project, and id", () => {
+test("RPC cancel at the session menu aborts safe-copy linking", async () => {
+	let editorText = "";
+	const attached: any[] = [];
+	const ctx = {
+		...modelContext(),
+		cwd: "/tmp/project", hasUI: true,
+		sessionManager: { getSessionFile: () => "/tmp/current.jsonl" },
+		ui: {
+			select: async (title: string, options: string[]) => {
+				if (title === "Rail agents") return options.find((option) => option.startsWith("Link saved session"));
+				return undefined;
+			},
+			notify: () => undefined,
+			getEditorText: () => editorText,
+			setEditorText: (value: string) => { editorText = value; },
+		},
+	};
+	await runRailAgentManager(ctx as any, {
+		broker: {
+			listLinked: async () => [],
+			attach: async (request: any) => { attached.push(request); return { alias: request.alias, agentId: "agt_1" }; },
+		},
+		roster: { link: () => undefined },
+		store: { list: async () => [] },
+	} as any, {
+		listSessions: async () => [{
+			path: "/tmp/saved.jsonl", id: "saved-session", cwd: "/tmp/project",
+			created: new Date("2026-01-01"), modified: new Date("2026-01-02"), messageCount: 1,
+			firstMessage: "Review auth", allMessagesText: "Review auth",
+		}],
+	});
+
+	assert.equal(attached.length, 0);
+	assert.equal(editorText, "");
+});
+
+test("RPC cancel at the model menu aborts safe-copy linking", async () => {
+	let editorText = "";
+	const attached: any[] = [];
+	const ctx = {
+		...modelContext(),
+		cwd: "/tmp/project", hasUI: true,
+		sessionManager: { getSessionFile: () => "/tmp/current.jsonl" },
+		ui: {
+			select: async (title: string, options: string[]) => {
+				if (title === "Rail agents") return options.find((option) => option.startsWith("Link saved session"));
+				if (title === "Saved Pi session") return options[0];
+				return undefined;
+			},
+			notify: () => undefined,
+			getEditorText: () => editorText,
+			setEditorText: (value: string) => { editorText = value; },
+		},
+	};
+	await runRailAgentManager(ctx as any, {
+		broker: {
+			listLinked: async () => [],
+			attach: async (request: any) => { attached.push(request); return { alias: request.alias, agentId: "agt_1" }; },
+		},
+		roster: { link: () => undefined },
+		store: { list: async () => [] },
+	} as any, {
+		listSessions: async () => [{
+			path: "/tmp/saved.jsonl", id: "saved-session", cwd: "/tmp/project",
+			created: new Date("2026-01-01"), modified: new Date("2026-01-02"), messageCount: 1,
+			firstMessage: "Review auth", allMessagesText: "Review auth",
+		}],
+	});
+
+	assert.equal(attached.length, 0);
+	assert.equal(editorText, "");
+});
+
+test("RPC session menu resolves the chosen saved session by label", async () => {
 	const sessions = [
 		{
-			path: "/tmp/auth.jsonl", id: "session-auth", cwd: "/tmp/project", name: "Security review",
-			created: new Date(), modified: new Date(), messageCount: 1,
-			firstMessage: "Inspect login races", allMessagesText: "Inspect login races",
+			path: "/tmp/first.jsonl", id: "first", cwd: "/tmp/project", name: "First",
+			created: new Date("2026-01-01"), modified: new Date("2026-01-02"), messageCount: 1,
+			firstMessage: "Alpha", allMessagesText: "Alpha",
 		},
 		{
-			path: "/tmp/db.jsonl", id: "session-db", cwd: "/tmp/database", name: "Storage",
-			created: new Date(), modified: new Date(), messageCount: 1,
-			firstMessage: "Tune indexes", allMessagesText: "Tune indexes",
+			path: "/tmp/second.jsonl", id: "second", cwd: "/tmp/other", name: "Second",
+			created: new Date("2026-01-01"), modified: new Date("2026-01-03"), messageCount: 2,
+			firstMessage: "Beta", allMessagesText: "Beta",
 		},
 	];
+	const selectOptions: string[][] = [];
+	let editorText = "";
+	const attached: any[] = [];
+	const ctx = {
+		...modelContext(),
+		cwd: "/tmp/project", hasUI: true,
+		sessionManager: { getSessionFile: () => "/tmp/current.jsonl" },
+		ui: {
+			select: async (title: string, options: string[]) => {
+				selectOptions.push(options);
+				if (title === "Rail agents") return options.find((option) => option.startsWith("Link saved session"));
+				if (title === "Saved Pi session") return options[1];
+				return options[0];
+			},
+			notify: () => undefined,
+			setStatus: () => undefined,
+			getEditorText: () => editorText,
+			setEditorText: (value: string) => { editorText = value; },
+		},
+	};
+	await runRailAgentManager(ctx as any, {
+		broker: {
+			listLinked: async () => [],
+			attach: async (request: any) => { attached.push(request); return { alias: request.alias, agentId: "agt_1" }; },
+		},
+		roster: { link: () => undefined },
+		store: { list: async () => [] },
+	} as any, { listSessions: async () => sessions });
 
-	assert.deepEqual(filterSessions(sessions, "security login").map((item) => item.id), ["session-auth"]);
-	assert.deepEqual(filterSessions(sessions, "database indexes").map((item) => item.id), ["session-db"]);
+	assert.equal(selectOptions.length, 3);
+	assert.match(selectOptions[1]![0]!, /^1\. Current/);
+	assert.equal(attached.length, 1);
+	assert.deepEqual(attached[0].session, { mode: "fork", path: "/tmp/second.jsonl" });
+	assert.match(editorText, /^@agent\//);
+});
+
+test("RPC model menu preserves model reference labels and resolution", async () => {
+	const first = { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol", thinkingLevel: "xhigh" };
+	const second = { provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", thinkingLevel: "high" };
+	let editorText = "";
+	const attached: any[] = [];
+	const ctx = {
+		model: first,
+		thinkingLevel: "xhigh",
+		scopedModels: [{ model: first, thinkingLevel: "xhigh" }, { model: second, thinkingLevel: "high" }],
+		modelRegistry: { getAvailable: () => [first, second] },
+		cwd: "/tmp/project", hasUI: true,
+		ui: {
+			select: async (title: string, options: string[]) => {
+				if (title === "Rail agents") return options.find((option) => option.startsWith("Start persistent"));
+				assert.deepEqual(title, "Pi model");
+				assert.equal(options[0], "cus-resp/gpt-5.6-sol:xhigh — GPT 5.6 Sol");
+				assert.equal(options[1], "deepseek/deepseek-v4-flash:high — DeepSeek V4 Flash");
+				return options[1];
+			},
+			notify: () => undefined,
+			getEditorText: () => editorText,
+			setEditorText: (value: string) => { editorText = value; },
+		},
+	};
+	await runRailAgentManager(ctx as any, {
+		broker: {
+			listLinked: async () => [],
+			attach: async (request: any) => { attached.push(request); return { alias: request.alias, agentId: "agt_1" }; },
+		},
+		roster: { link: () => undefined },
+		store: { list: async () => [] },
+	} as any);
+
+	assert.deepEqual(editorText, "@new/deepseek/deepseek-v4-flash:high ");
+	assert.equal(attached.length, 0);
 });
 
 test("TUI management uses one centered unified overlay", async () => {

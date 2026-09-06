@@ -12,6 +12,7 @@ import {
 	buildSubagentRosterPrompt,
 	extractSubagentMentions,
 	handleDirectSubagentControlInput,
+	subagentMentionContext,
 	subagentMentionSuggestions,
 } from "./interaction";
 import { availableRailModels, railModelReference } from "./models";
@@ -112,7 +113,8 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 				const line = lines[cursorLine] ?? "";
 				const beforeCursor = line.slice(0, cursorCol);
 				const active = runtime;
-				if (active) {
+				// Ordinary file/command completion must not read the agent store or enumerate models.
+				if (active && subagentMentionContext(beforeCursor)) {
 					const instances = await active.broker.listLinked();
 					const models = availableRailModels(ctx);
 					const suggestions = subagentMentionSuggestions(
@@ -134,7 +136,7 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 			},
 			shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
 				const beforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
-				if (/(?:^|\s)@(agent|new)\/[^\s@]*$/u.test(beforeCursor)) return false;
+				if (subagentMentionContext(beforeCursor)) return false;
 				return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
 			},
 		}));
@@ -208,12 +210,10 @@ export * from "./rpc-transport";
 export * from "./rpc-worker";
 export * from "./rail-agent-manager";
 export * from "./rail-agent-overlay";
-export * from "./searchable-picker";
 export * from "./session-broker";
 export * from "./session-lease";
 export * from "./session-links";
 export * from "./session-name";
-export * from "./session-picker";
 export * from "./stateless-runner";
 export * from "./tool";
 export * from "./transcript";

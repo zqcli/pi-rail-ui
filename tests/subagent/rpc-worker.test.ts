@@ -371,4 +371,62 @@ describe("RpcSessionWorker", () => {
 		});
 		await worker.stop();
 	});
+
+	test("flushes a live update on every message_end, including tool results", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
+		transport.request = async (command) => command["type"] === "get_state" ? { isStreaming: true } : undefined;
+		const pending = worker.send("review auth", { onUpdate: (update) => updates.push(update) });
+
+		transport.emit({ type: "agent_start" });
+		transport.emit({
+			type: "message_end",
+			message: { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "auth source" }], isError: false },
+		});
+		assert.equal(updates.length, 1);
+		assert.equal(updates.at(-1)?.output, "(running...)");
+		assert.equal(updates.at(-1)?.transcript.entries.at(-1).kind, "toolResult");
+
+		transport.emit({ type: "agent_settled" });
+		const result = await pending;
+		assert.equal(result.output, "(no output)");
+	});
+
+	test("publishes no updates after the run settles", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
+		await worker.send("review auth", { onUpdate: (update) => updates.push(update) });
+		const settledCount = updates.length;
+
+		transport.emit({ type: "agent_start" });
+		transport.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "late" }], stopReason: "stop" } });
+		transport.emit({ type: "agent_settled" });
+
+		assert.equal(updates.length, settledCount);
+		assert.equal(transport.listeners.size, 0);
+	});
+
+	test("tolerates malformed content parts in RPC message_end events", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
+		transport.request = async (command) => command["type"] === "get_state" ? { isStreaming: true } : undefined;
+		const pending = worker.send("review auth", { onUpdate: (update) => updates.push(update) });
+
+		transport.emit({ type: "agent_start" });
+		transport.emit({
+			type: "message_end",
+			message: { role: "assistant", content: [null, { type: "text", text: "done" }], usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { total: 0.02 } }, stopReason: "stop" },
+		});
+		assert.equal(updates.length, 1);
+		assert.equal(updates.at(-1)?.output, "done");
+
+		transport.emit({ type: "agent_settled" });
+		const result = await pending;
+		assert.equal(result.output, "done");
+		assert.equal(result.stopReason, "stop");
+		assert.deepEqual(result.usage, { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.02, contextTokens: 11, turns: 1 });
+	});
 });

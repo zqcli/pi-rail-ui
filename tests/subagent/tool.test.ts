@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { installStatefulSubagentTool } from "../../tools/subagents/tool";
+import { installStatefulSubagentTool, type StatefulSubagentToolOptions } from "../../tools/subagents/tool";
 import { WorkerControlError, type ControlRequest, type ControlResult, type DispatchRequest, type DispatchResult, type SessionBroker } from "../../tools/subagents/session-broker";
 import { SubagentTranscript } from "../../tools/subagents/transcript";
 
@@ -90,11 +90,25 @@ class FakeBroker {
 	}
 }
 
-test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestration rules", () => {
+function setupTool(options: { runStateless?: StatefulSubagentToolOptions["runStateless"] } = {}) {
+	const broker = new FakeBroker();
 	let tool: any;
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	let hook: ((event: any) => any) | undefined;
+	const pi: any = {
+		registerTool: (definition: any) => { tool = definition; },
+		on: (event: string, handler: (value: any) => any) => {
+			if (event === "tool_result") hook = handler;
+		},
+	};
+	installStatefulSubagentTool(pi, {
+		broker: broker as unknown as SessionBroker,
+		...(options.runStateless ? { runStateless: options.runStateless } : {}),
 	});
+	return { tool, broker, hook };
+}
+
+test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestration rules", () => {
+	const { tool } = setupTool();
 
 	assert.match(tool.description, /model\+task with no alias\/target\/session for one-off stateless work/);
 	assert.match(tool.description, /model\+alias\+concrete task/);
@@ -126,11 +140,7 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 });
 
 test("control mode steers and queues follow-ups for an active persistent target", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
-	});
+	const { tool, broker } = setupTool();
 
 	const rawSteer = {
 		model: "ignored/model",
@@ -192,37 +202,21 @@ test("control mode steers and queues follow-ups for an active persistent target"
 });
 
 test("control failures retain an explicit unknown-delivery result for the panel", async () => {
-	let tool: any;
-	let toolResultHandler: ((event: any) => any) | undefined;
-	const broker = new FakeBroker();
+	const { tool, broker, hook } = setupTool();
 	broker.controlError = new WorkerControlError("Subagent control delivery outcome is unknown", "unknown");
-	installStatefulSubagentTool({
-		registerTool: (definition: any) => { tool = definition; },
-		on: (event: string, handler: (value: any) => any) => {
-			if (event === "tool_result") toolResultHandler = handler;
-		},
-	} as any, { broker: broker as unknown as SessionBroker });
 
 	await assert.rejects(() => tool.execute("call-unknown-control", {
 		target: "auth-review",
 		control: { delivery: "steer", message: "Focus on tests" },
 	}, undefined, undefined, context()), /outcome is unknown/);
-	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-unknown-control", isError: true });
+	const restored = hook?.({ toolName: "subagent", toolCallId: "call-unknown-control", isError: true });
 	assert.equal(restored.details.mode, "control");
 	assert.equal(restored.details.results[0].status, "failed");
 	assert.match(restored.details.results[0].errorMessage, /outcome is unknown/);
 });
 
 test("failed tool results restore the last streamed transcript through Pi's tool_result hook", async () => {
-	let tool: any;
-	let toolResultHandler: ((event: any) => any) | undefined;
-	installStatefulSubagentTool({
-		registerTool: (definition: any) => { tool = definition; },
-		on: (event: string, handler: (value: any) => any) => {
-			if (event === "tool_result") toolResultHandler = handler;
-		},
-	} as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	const { tool, hook } = setupTool({
 		runStateless: async (request) => {
 			const transcript = new SubagentTranscript(request.task);
 			transcript.ingest({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "before failure" } });
@@ -243,18 +237,14 @@ test("failed tool results restore the last streamed transcript through Pi's tool
 		() => {},
 		context(),
 	), /child crashed/);
-	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-failed", isError: true });
+	const restored = hook?.({ toolName: "subagent", toolCallId: "call-failed", isError: true });
 	assert.equal(restored.details.results[0].status, "failed");
 	assert.deepEqual(restored.details.results[0].transcript.entries.map((entry: any) => entry.kind), ["user", "thinking", "assistant"]);
 });
 
 test("model plus alias creates a persistent session and target continues it", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
+	const { tool, broker } = setupTool();
 	const continueUpdates: any[] = [];
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
-	});
 
 	const created = await tool.execute("call-1", {
 		model: "cus-resp/gpt-5.6-sol:xhigh",
@@ -299,10 +289,8 @@ test("model plus alias creates a persistent session and target continues it", as
 });
 
 test("parallel parent content is fair and details keep a bounded retained answer", async () => {
-	let tool: any;
 	const output = "界".repeat(100_000);
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	const { tool } = setupTool({
 		runStateless: async () => ({
 			output,
 			exitCode: 0,
@@ -328,14 +316,12 @@ test("parallel parent content is fair and details keep a bounded retained answer
 });
 
 test("full initial task rendering stays out of bounded parent details", async () => {
-	let tool: any;
 	const initialTask = [
 		"FULL INITIAL TASK START",
 		...Array.from({ length: 80 }, (_, index) => `initial detail ${index} ${"x".repeat(220)}`),
 		"FULL INITIAL TASK END",
 	].join("\n");
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	const { tool } = setupTool({
 		runStateless: async (request) => ({
 			output: "done",
 			exitCode: 0,
@@ -375,14 +361,12 @@ test("full initial task rendering stays out of bounded parent details", async ()
 });
 
 test("legacy restored details keep a follow-up user entry separate when the initial was evicted", async () => {
-	let tool: any;
 	const initialTask = [
 		"EVICTED INITIAL START",
 		...Array.from({ length: 80 }, (_, index) => `initial detail ${index} ${"q".repeat(220)}`),
 		"EVICTED INITIAL END",
 	].join("\n");
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	const { tool } = setupTool({
 		runStateless: async (request) => ({
 			output: "done",
 			exitCode: 0,
@@ -410,7 +394,6 @@ test("legacy restored details keep a follow-up user entry separate when the init
 });
 
 test("restored grouped panels recover parallel and chain initial tasks from render args", async () => {
-	let tool: any;
 	const makeTask = (label: string) => [
 		`${label} START`,
 		...Array.from({ length: 50 }, (_, index) => `${label} detail ${index} ${"y".repeat(220)}`),
@@ -418,8 +401,7 @@ test("restored grouped panels recover parallel and chain initial tasks from rend
 	].join("\n");
 	const parallelTasks = [makeTask("PARALLEL ALPHA"), makeTask("PARALLEL BETA")];
 	const chainTasks = [makeTask("CHAIN FIRST"), makeTask("CHAIN SECOND")];
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	const { tool } = setupTool({
 		runStateless: async (request) => ({
 			output: `done ${request.task.slice(0, 24)}`,
 			exitCode: 0,
@@ -455,11 +437,8 @@ test("restored grouped panels recover parallel and chain initial tasks from rend
 });
 
 test("restored control panels keep control messages bounded and out of initial-task rendering", async () => {
-	let tool: any;
 	const message = ["CONTROL TASK START", ...Array.from({ length: 50 }, (_, index) => `control detail ${index} ${"z".repeat(220)}`), "CONTROL TASK END"].join("\n");
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
-	});
+	const { tool } = setupTool();
 	const result = await tool.execute("call-restored-control", {
 		target: "auth-review",
 		control: { delivery: "steer", message },
@@ -476,11 +455,7 @@ test("restored control panels keep control messages bounded and out of initial-t
 });
 
 test("an aborted parallel call does not create not-yet-dispatched persistent sessions", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
-	});
+	const { tool, broker } = setupTool();
 	const controller = new AbortController();
 	controller.abort();
 
@@ -497,12 +472,9 @@ test("an aborted parallel call does not create not-yet-dispatched persistent ses
 });
 
 test("model without alias or session runs stateless and creates no broker instance", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
 	const statelessModels: unknown[] = [];
 	const statelessUpdates: any[] = [];
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
+	const { tool, broker } = setupTool({
 		runStateless: async (request) => {
 			statelessModels.push(request.model);
 			return {
@@ -555,10 +527,8 @@ test("model without alias or session runs stateless and creates no broker instan
 });
 
 test("omitting model uses the current Pi model for stateless work", async () => {
-	let tool: any;
 	let selected: unknown;
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	const { tool } = setupTool({
 		runStateless: async (request) => {
 			selected = request.model;
 			return { output: "done", exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } };
@@ -571,11 +541,8 @@ test("omitting model uses the current Pi model for stateless work", async () => 
 });
 
 test("parallel mode allows one model to back stateless and persistent sessions", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
 	const statelessTasks: string[] = [];
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
+	const { tool, broker } = setupTool({
 		runStateless: async (request) => {
 			statelessTasks.push(request.task);
 			return {
@@ -599,11 +566,7 @@ test("parallel mode allows one model to back stateless and persistent sessions",
 });
 
 test("chain mode preserves ordering and substitutes the previous final output", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
-	});
+	const { tool, broker } = setupTool();
 
 	const result = await tool.execute("call-chain", {
 		chain: [
@@ -622,10 +585,8 @@ test("chain mode preserves ordering and substitutes the previous final output", 
 });
 
 test("parallel streaming updates retain the recent transcript from every active child", async () => {
-	let tool: any;
 	const updates: any[] = [];
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
+	const { tool } = setupTool({
 		runStateless: async (request) => {
 			const transcript = new SubagentTranscript(request.task);
 			transcript.ingest({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: `thinking ${request.task}` } });
@@ -661,12 +622,8 @@ test("parallel streaming updates retain the recent transcript from every active 
 });
 
 test("session attachment confirms before forking an ordinary session", async () => {
-	let tool: any;
 	let confirmations = 0;
-	const broker = new FakeBroker();
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
-	});
+	const { tool, broker } = setupTool();
 	const ctx = context();
 	ctx.ui.confirm = async () => { confirmations++; return true; };
 
@@ -682,16 +639,13 @@ test("session attachment confirms before forking an ordinary session", async () 
 });
 
 test("a later parallel slot keeps its own initial task while an earlier worker starts", async () => {
-	const broker = new FakeBroker();
+	const { tool, broker } = setupTool({
+		runStateless: async () => ({ exitCode: 0, output: "done", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } }),
+	});
 	const dispatch = broker.dispatch.bind(broker);
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => { release = resolve; });
 	broker.dispatch = async (request) => { await gate; return dispatch(request); };
-	let tool: any;
-	installStatefulSubagentTool({ registerTool: (value: any) => { tool = value; } } as any, {
-		broker: broker as unknown as SessionBroker,
-		runStateless: async () => ({ exitCode: 0, output: "done", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } }),
-	});
 	const args = { tasks: [{ alias: "slow", task: "SLOW PERSISTENT TASK" }, { task: "FAST STATELESS TASK" }] };
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 	let fastPanel = "";
@@ -711,10 +665,7 @@ test("a later parallel slot keeps its own initial task while an earlier worker s
 });
 
 test("normalization trims placeholders for single, parallel, and chain and keeps task text intact", async () => {
-	let tool: any;
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
-	});
+	const { tool } = setupTool();
 
 	assert.deepEqual(tool.prepareArguments({
 		model: " cus-resp/gpt-5.6-sol:xhigh ",
@@ -759,15 +710,7 @@ test("normalization trims placeholders for single, parallel, and chain and keeps
 });
 
 test("an aborted single call throws before dispatch and restores aborted details", async () => {
-	let tool: any;
-	let toolResultHandler: ((event: any) => any) | undefined;
-	const broker = new FakeBroker();
-	installStatefulSubagentTool({
-		registerTool: (definition: any) => { tool = definition; },
-		on: (event: string, handler: (value: any) => any) => {
-			if (event === "tool_result") toolResultHandler = handler;
-		},
-	} as any, { broker: broker as unknown as SessionBroker });
+	const { tool, broker, hook } = setupTool();
 	const controller = new AbortController();
 	controller.abort();
 
@@ -776,7 +719,7 @@ test("an aborted single call throws before dispatch and restores aborted details
 		task: "never runs",
 	}, controller.signal, undefined, context()), /aborted before dispatch/);
 	assert.equal(broker.requests.length, 0);
-	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-aborted-single", isError: true });
+	const restored = hook?.({ toolName: "subagent", toolCallId: "call-aborted-single", isError: true });
 	assert.equal(restored.details.mode, "single");
 	assert.equal(restored.details.results[0].status, "failed");
 	assert.equal(restored.details.results[0].stopReason, "aborted");
@@ -784,11 +727,7 @@ test("an aborted single call throws before dispatch and restores aborted details
 });
 
 test("an aborted chain stops immediately and dispatches no persistent sessions", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
-	});
+	const { tool, broker } = setupTool();
 	const controller = new AbortController();
 	controller.abort();
 
@@ -809,16 +748,11 @@ test("an aborted chain stops immediately and dispatches no persistent sessions",
 });
 
 test("a single persistent failure throws and restores failed details with error status", async () => {
-	let tool: any;
-	let toolResultHandler: ((event: any) => any) | undefined;
-	const broker = new FakeBroker();
-	installStatefulSubagentTool({
-		registerTool: (definition: any) => { tool = definition; },
-		on: (event: string, handler: (value: any) => any) => {
-			if (event === "tool_result") toolResultHandler = handler;
-		},
-	} as any, { broker: broker as unknown as SessionBroker });
-	broker.dispatch = async () => { throw new Error("persistent broke"); };
+	const { tool, broker, hook } = setupTool();
+	broker.dispatch = async (request) => {
+		broker.requests.push(request);
+		throw new Error("persistent broke");
+	};
 
 	await assert.rejects(() => tool.execute("call-fail-single", {
 		model: "cus-resp/gpt-5.6-sol:xhigh",
@@ -826,8 +760,10 @@ test("a single persistent failure throws and restores failed details with error 
 		task: "do work",
 	}, undefined, undefined, context()), /persistent broke/);
 
-	assert.equal(broker.requests.length, 0);
-	const restored = toolResultHandler?.({ toolName: "subagent", toolCallId: "call-fail-single", isError: true });
+	assert.equal(broker.requests.length, 1);
+	assert.equal(broker.requests[0]?.alias, "fragile");
+	assert.equal(broker.requests[0]?.task, "do work");
+	const restored = hook?.({ toolName: "subagent", toolCallId: "call-fail-single", isError: true });
 	assert.equal(restored.details.mode, "single");
 	assert.equal(restored.details.results[0].status, "failed");
 	assert.equal(restored.details.results[0].stopReason, "error");
@@ -837,28 +773,13 @@ test("a single persistent failure throws and restores failed details with error 
 });
 
 test("parallel aggregates failed and completed results without throwing", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
-	broker.dispatch = async (request) => {
-		if (request.task === "broken") throw new Error("persistent broke");
-		const instance = {
-			version: 2,
-			agentId: "agt_parallel",
-			alias: request.alias ?? "item",
-			model: railModel,
-			sessionId: "session-parallel",
-			sessionFile: "/tmp/parallel.jsonl",
-			cwd: "/tmp/project",
-			createdAt: "2026-01-01T00:00:00.000Z",
-			updatedAt: "2026-01-01T00:00:00.000Z",
-			lastTask: request.task,
-		} as const;
-		return { instance, run: { output: `done: ${request.task}`, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 } } };
-	};
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
+	const { tool, broker } = setupTool({
 		runStateless: async () => ({ exitCode: 0, output: "stateless done", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 } }),
 	});
+	broker.dispatch = async (request) => {
+		broker.requests.push(request);
+		throw new Error("persistent broke");
+	};
 
 	const result = await tool.execute("call-mixed-fail", {
 		tasks: [
@@ -869,6 +790,7 @@ test("parallel aggregates failed and completed results without throwing", async 
 
 	assert.equal(result.details.mode, "parallel");
 	assert.equal(result.details.results.length, 2);
+	assert.deepEqual(broker.requests.map((request) => request.task), ["broken"]);
 	assert.deepEqual(result.details.results.map((item: any) => item.status).sort(), ["completed", "failed"]);
 	assert.equal(result.details.results[1].status, "failed");
 	assert.equal(result.details.results[1].stopReason, "error");
@@ -878,28 +800,15 @@ test("parallel aggregates failed and completed results without throwing", async 
 });
 
 test("chain stops at the first failed step after substituting {previous}", async () => {
-	let tool: any;
-	const broker = new FakeBroker();
+	const { tool, broker } = setupTool();
+	const dispatch = broker.dispatch.bind(broker);
 	broker.dispatch = async (request) => {
-		broker.requests.push(request);
-		if (request.task.includes("STEP TWO")) throw new Error("step two broke");
-		const instance = {
-			version: 2,
-			agentId: "agt_chain",
-			alias: request.alias ?? "chain",
-			model: railModel,
-			sessionId: "session-chain",
-			sessionFile: "/tmp/chain.jsonl",
-			cwd: "/tmp/project",
-			createdAt: "2026-01-01T00:00:00.000Z",
-			updatedAt: "2026-01-01T00:00:00.000Z",
-			lastTask: request.task,
-		} as const;
-		return { instance, run: { output: `done: ${request.task}`, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 } } };
+		if (request.task.includes("STEP TWO")) {
+			broker.requests.push(request);
+			throw new Error("step two broke");
+		}
+		return dispatch(request);
 	};
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: broker as unknown as SessionBroker,
-	});
 
 	const result = await tool.execute("call-chain-fail", {
 		chain: [
@@ -919,37 +828,31 @@ test("chain stops at the first failed step after substituting {previous}", async
 	assert.match(result.content[0].text, /Chain: 1\/2 succeeded/);
 });
 
-test("single, parallel, and chain keep equivalent details for the same stateless run", async () => {
-	let tool: any;
-	installStatefulSubagentTool({ registerTool: (definition: any) => { tool = definition; } } as any, {
-		broker: new FakeBroker() as unknown as SessionBroker,
-		runStateless: async () => ({ exitCode: 0, output: "shared output", usage: { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0.2, contextTokens: 7, turns: 1 } }),
+test("single, parallel, and chain carry per-mode alias and step for the same stateless run", async () => {
+	const expectedUsage = { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0.2, contextTokens: 7, turns: 1 };
+	const { tool } = setupTool({
+		runStateless: async () => ({ exitCode: 0, output: "shared output", usage: { ...expectedUsage } }),
 	});
-
-	const single = await tool.execute("call-equiv-single", { model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }, undefined, undefined, context());
-	const parallel = await tool.execute("call-equiv-parallel", { tasks: [{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }] }, undefined, undefined, context());
-	const chain = await tool.execute("call-equiv-chain", { chain: [{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }] }, undefined, undefined, context());
-
-	const pick = (result: any) => {
-		const run = result.details.results[0];
-		return {
-			model: run.model,
-			task: run.task,
-			status: run.status,
-			output: run.output,
-			usage: run.usage,
-			persistent: run.persistent,
-			stopReason: run.stopReason ?? null,
-			errorMessage: run.errorMessage ?? null,
-		};
-	};
-	assert.deepEqual(pick(single), pick(parallel));
-	assert.deepEqual(pick(parallel), pick(chain));
-	assert.equal(single.details.results[0].alias, "cus-resp/gpt-5.6-sol");
-	assert.equal(parallel.details.results[0].alias, "cus-resp/gpt-5.6-sol #1");
-	assert.equal(chain.details.results[0].alias, "cus-resp/gpt-5.6-sol #1");
-	assert.equal(chain.details.results[0].step, 1);
-	assert.equal("step" in single.details.results[0], false);
-	assert.equal("step" in parallel.details.results[0], false);
-	assert.equal(typeof single.details.results[0].durationMs, "number");
+	const cases = [
+		{ mode: "single", args: { model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }, alias: "cus-resp/gpt-5.6-sol", step: undefined as number | undefined },
+		{ mode: "parallel", args: { tasks: [{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }] }, alias: "cus-resp/gpt-5.6-sol #1", step: undefined as number | undefined },
+		{ mode: "chain", args: { chain: [{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "equiv task" }] }, alias: "cus-resp/gpt-5.6-sol #1", step: 1 },
+	];
+	for (const { mode, args, alias, step } of cases) {
+		const result = await tool.execute(`call-equiv-${mode}`, args, undefined, undefined, context());
+		assert.equal(result.details.mode, mode);
+		const run = result.details.results[0]!;
+		assert.equal(run.alias, alias);
+		assert.equal(run.model, "cus-resp/gpt-5.6-sol:xhigh");
+		assert.equal(run.task, "equiv task");
+		assert.equal(run.status, "completed");
+		assert.equal(run.output, "shared output");
+		assert.deepEqual(run.usage, expectedUsage);
+		assert.equal(run.persistent, false);
+		assert.equal(run.stopReason, undefined);
+		assert.equal(run.errorMessage, undefined);
+		assert.equal(typeof run.durationMs, "number");
+		assert.equal(Object.hasOwn(run, "step"), mode === "chain");
+		assert.equal(run.step, step);
+	}
 });

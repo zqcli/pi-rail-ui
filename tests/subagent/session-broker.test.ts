@@ -149,7 +149,7 @@ describe("SessionBroker", () => {
 		assert.deepEqual(workers[0]?.tasks, ["review auth", "check tests"]);
 	});
 
-	test("publishes persistent identity and model before the child produces output", async () => {
+	test("publishes persistent identity, model, and initial zero usage before the child produces output", async () => {
 		const { broker } = setup();
 		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
 		const progress: DispatchProgress[] = [];
@@ -160,15 +160,6 @@ describe("SessionBroker", () => {
 		assert.equal(progress[0]?.instance.sessionId, created.instance.sessionId);
 		assert.deepEqual(progress[0]?.instance.model, reviewerModel());
 		assert.equal(progress[0]?.run.output, "(starting...)");
-	});
-
-	test("starting progress publishes a zeroed usage snapshot", async () => {
-		const { broker } = setup();
-		await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });
-		const progress: DispatchProgress[] = [];
-
-		await broker.dispatch({ target: "auth-review", task: "continue", onUpdate: (update) => progress.push(update) });
-
 		assert.deepEqual(progress[0]?.run.usage, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
 	});
 

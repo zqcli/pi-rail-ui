@@ -6,6 +6,7 @@ import {
 	boundSubagentRunTranscripts,
 	SubagentTranscript,
 	renderSubagentTranscript,
+	type SubagentTranscriptRun,
 	type SubagentTranscriptSnapshot,
 } from "../../tools/subagents/transcript";
 
@@ -253,7 +254,7 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 	assert.match(wideText, /\$0\.012/);
 	assert.match(wideText, /<1m/);
 	assert.match(text, /earlier activity hidden/);
-	assert.ok(text.indexOf("1.2k in") < text.indexOf("earlier activity hidden"));
+	assert.match(text, /1\.2k in[\s\S]*earlier activity hidden/);
 	assert.ok(view.render(10).every((line) => visibleWidth(line) <= 10));
 });
 
@@ -282,9 +283,9 @@ test("completed expanded panels show the full final answer and usage metrics", (
 	assert.match(expanded, /18\.2k cache read/);
 	assert.match(expanded, /1m/);
 	assert.match(expanded, /stop/);
-	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("Recent activity"));
-	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("Final answer"));
-	assert.ok(expanded.indexOf("Usage ·") < expanded.indexOf("final answer line 0"));
+	assert.match(expanded, /Usage ·[\s\S]*Recent activity/);
+	assert.match(expanded, /Usage ·[\s\S]*Final answer/);
+	assert.match(expanded, /Usage ·[\s\S]*final answer line 0/);
 	assert.ok(expanded.split("\n").length > 16);
 });
 
@@ -396,8 +397,8 @@ test("parallel runs render as independent panels with aggregate wall usage", () 
 	assert.match(text, /beta final/);
 	const alphaPanel = text.slice(text.indexOf("alpha · stateless"), text.indexOf("beta · persistent"));
 	const betaPanel = text.slice(text.indexOf("beta · persistent"));
-	assert.ok(alphaPanel.indexOf("Usage ·") < alphaPanel.indexOf("alpha final"));
-	assert.ok(betaPanel.indexOf("Usage ·") < betaPanel.indexOf("beta final"));
+	assert.match(alphaPanel, /Usage ·[\s\S]*alpha final/);
+	assert.match(betaPanel, /Usage ·[\s\S]*beta final/);
 	assert.equal((text.match(/╭/gu) ?? []).length, 2);
 	for (const width of [1, 2]) {
 		assert.ok(renderSubagentTranscript(runs, false, theme as any).render(width).every((line) => visibleWidth(line) <= width));
@@ -445,7 +446,7 @@ test("single running run without a transcript falls back to its output line", ()
 	const expanded = renderSubagentTranscript([run], true, theme as any).render(80);
 
 	assert.match(collapsed[0]?.trim() ?? "", /^… timer · stateless · model unavailable$/);
-	assert.ok(collapsed.join("\n").indexOf("Usage ·") < collapsed.join("\n").indexOf("(running...)"));
+	assert.match(collapsed.join("\n"), /Usage ·[\s\S]*\(running\.\.\.\)/);
 	assert.ok(collapsed.length <= 10);
 	assert.ok(expanded.length <= 16);
 	assert.match(expanded.join("\n"), /\(running\.\.\.\)/);
@@ -471,22 +472,29 @@ test("single running fallback hides the usage line when nothing is reportable", 
 	]);
 });
 
-test("parallel transcript ordering follows global activity rather than child creation time", () => {
+test("global retention keeps the newest events across parallel runs, independent of run order", () => {
 	const alpha = new SubagentTranscript("alpha");
 	const beta = new SubagentTranscript("beta");
-	for (let index = 0; index < 6; index++) {
-		beta.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `beta ${index}` }] } });
+	// Global activity order, oldest first: beta 0, beta 1, alpha 0, beta 2, beta 3, alpha 1.
+	beta.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "beta 0" }] } });
+	beta.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "beta 1" }] } });
+	alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha 0" }] } });
+	beta.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "beta 2" }] } });
+	beta.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "beta 3" }] } });
+	alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha 1" }] } });
+	const runs: SubagentTranscriptRun[] = [
+		{ alias: "alpha", status: "running", output: "", persistent: true, transcript: alpha.snapshot() },
+		{ alias: "beta", status: "running", output: "", persistent: false, transcript: beta.snapshot() },
+	];
+	for (const ordered of [runs, [...runs].reverse()]) {
+		const bounded = boundSubagentRunTranscripts(ordered, 3);
+		const byAlias = new Map(bounded.map((run) => [run.alias, run]));
+		const retained = (alias: string) => byAlias.get(alias)!.transcript!.entries.filter((entry) => !entry.initial).map((entry) => entry.text);
+		assert.deepEqual(retained("alpha"), ["alpha 1"]);
+		assert.deepEqual(retained("beta"), ["beta 2", "beta 3"]);
+		assert.equal(byAlias.get("alpha")!.transcript!.entries.find((entry) => entry.initial)?.text, "alpha");
+		assert.equal(byAlias.get("beta")!.transcript!.entries.find((entry) => entry.initial)?.text, "beta");
 	}
-	alpha.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "alpha newest" }] } });
-
-	const view = renderSubagentTranscript([
-		{ alias: "alpha", model: "provider/model-a:high", status: "running", output: "", persistent: true, transcript: alpha.snapshot() },
-		{ alias: "beta", model: "provider/model-b", status: "running", output: "", persistent: false, transcript: beta.snapshot() },
-	], false, theme as any);
-	const text = view.render(160).join("\n");
-	assert.match(text, /alpha newest/);
-	assert.match(text, /alpha · persistent · provider\/model-a:high/);
-	assert.match(text, /beta · stateless · provider\/model-b/);
 });
 
 test("grouped child panels keep each run's initial task complete and associated", () => {
@@ -536,8 +544,8 @@ test("running parallel child panels show live usage before activity", () => {
 
 	const alphaPanel = text.slice(text.indexOf("alpha · stateless"), text.indexOf("beta · persistent"));
 	const betaPanel = text.slice(text.indexOf("beta · persistent"));
-	assert.ok(alphaPanel.indexOf("Usage · 101 in") < alphaPanel.indexOf("Activity"));
-	assert.ok(betaPanel.indexOf("Usage · 202 in") < betaPanel.indexOf("Activity"));
+	assert.match(alphaPanel, /Usage · 101 in[\s\S]*Activity/);
+	assert.match(betaPanel, /Usage · 202 in[\s\S]*Activity/);
 });
 
 test("tool calls stay paired with their results when parallel completions and result messages use different orders", () => {
@@ -557,9 +565,9 @@ test("tool calls stay paired with their results when parallel completions and re
 		transcript: transcript.snapshot(),
 	}], true, theme as any);
 	const text = view.render(100).join("\n");
-	assert.ok(text.indexOf('"path": "one"') < text.indexOf("result one"));
-	assert.ok(text.indexOf("result one") < text.indexOf('"path": "two"'));
-	assert.ok(text.indexOf('"path": "two"') < text.indexOf("result two"));
+	assert.match(text, /"path": "one"[\s\S]*result one/);
+	assert.match(text, /result one[\s\S]*"path": "two"/);
+	assert.match(text, /"path": "two"[\s\S]*result two/);
 });
 
 test("collector pressure evicts complete tool groups instead of orphaning results", () => {
@@ -584,7 +592,9 @@ test("collector pressure evicts complete tool groups instead of orphaning result
 	}
 
 	const entries = transcript.snapshot().entries;
-	for (const result of entries.filter((entry) => entry.kind === "toolResult")) {
+	const results = entries.filter((entry) => entry.kind === "toolResult");
+	assert.ok(results.length > 0);
+	for (const result of results) {
 		assert.equal(entries.some((entry) => entry.kind === "tool" && entry.groupId === result.groupId), true);
 	}
 });
@@ -610,10 +620,13 @@ test("appending a failure to a full snapshot evicts complete groups", () => {
 	}
 	const failed = appendSubagentTranscriptFailure(transcript.snapshot(), "task", "crashed");
 
+	const failedResults = failed.entries.filter((entry) => entry.kind === "toolResult");
+	assert.ok(failedResults.length > 0);
 	assert.ok(failed.entries.filter((entry) => !entry.initial).length <= 18);
-	for (const result of failed.entries.filter((entry) => entry.kind === "toolResult")) {
+	for (const result of failedResults) {
 		assert.equal(failed.entries.some((entry) => entry.kind === "tool" && entry.groupId === result.groupId), true);
 	}
+	assert.equal(failed.entries.some((entry) => entry.kind === "assistant" && entry.status === "failed" && entry.text === "crashed"), true);
 });
 
 test("parallel Tool Call details retain at most 18 transcript events across all children", () => {

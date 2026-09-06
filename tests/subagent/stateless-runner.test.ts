@@ -29,12 +29,13 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		onUpdate: (update) => updates.push(update),
 	});
 
-	assert.deepEqual(capturedArgs.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--model"]);
-	assert.equal(capturedArgs.includes("--thinking"), true);
-	assert.equal(capturedArgs.includes("--exclude-tools"), true);
-	assert.equal(capturedArgs.includes("--tools"), false);
-	assert.equal(capturedArgs.includes("--append-system-prompt"), false);
-	assert.equal(capturedArgs.includes("--name"), false);
+	assert.deepEqual(capturedArgs, [
+		"--mode", "json", "-p", "--no-session",
+		"--model", "cus-resp/gpt-5.6-luna",
+		"--thinking", "xhigh",
+		"--exclude-tools", "subagent",
+		"Task: inspect auth",
+	]);
 	assert.equal(result.output, "stateless done");
 	assert.equal(result.exitCode, 0);
 	assert.deepEqual(result.transcript?.entries.map((entry) => entry.kind), [
@@ -148,38 +149,61 @@ test("flushes exactly once on the final assistant message_end", async (t) => {
 
 test("ignores the tail of a malformed assistant message_end but keeps its transcript", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
-	const runner = createStatelessAgentRunner({
-		resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript([
-			{ type: "message_start", message: { role: "assistant", content: [] } },
-			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "first done" }], usage: { input: 10, output: 1 }, stopReason: "stop" } },
-			{ type: "message_start", message: { role: "assistant", content: [] } },
-			{ type: "message_end", message: { role: "assistant", content: [null, { type: "text", text: "second text" }], usage: { input: 999, output: 9 }, stopReason: "stop" } },
-			{ type: "message_start", message: { role: "assistant", content: [] } },
-			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "third done" }], usage: { input: 5, output: 1 }, stopReason: "stop" } },
-		])] }),
-	});
-	const updates: any[] = [];
+	const start = { type: "message_start", message: { role: "assistant", content: [] } };
+	const first = {
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "first done" }], usage: { input: 10, output: 1 }, stopReason: "stop" },
+	};
+	const malformed = {
+		type: "message_end",
+		message: { role: "assistant", content: [null, { type: "text", text: "second text" }], usage: { input: 999, output: 9 }, stopReason: "error", errorMessage: "boom" },
+	};
+	const third = {
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "third done" }], usage: { input: 5, output: 1 }, stopReason: "stop" },
+	};
+	const cases = [
+		{
+			events: [start, first, start, malformed, start, third],
+			updates: ["first done", "third done"],
+			output: "third done",
+			stopReason: "stop",
+			errorMessage: undefined,
+			usage: { input: 15, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 2 },
+			transcript: ["malformed tail", "first done", "second text", "boom", "third done"],
+		},
+		{
+			events: [start, first, start, malformed],
+			updates: ["first done"],
+			output: "first done",
+			stopReason: "stop",
+			errorMessage: undefined,
+			usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+			transcript: ["malformed tail", "first done", "second text", "boom"],
+		},
+	];
 
-	const result = await runner({
-		model,
-		task: "malformed tail",
-		cwd: process.cwd(),
-		onUpdate: (update) => updates.push(update),
-	});
-	t.mock.timers.tick(100);
+	for (const c of cases) {
+		const runner = createStatelessAgentRunner({
+			resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript(c.events)] }),
+		});
+		const updates: any[] = [];
 
-	assert.equal(updates.length, 2);
-	assert.equal(updates[0]?.output, "first done");
-	assert.equal(updates[1]?.output, "third done");
-	assert.equal(result.output, "third done");
-	assert.equal(result.errorMessage, undefined);
-	assert.deepEqual(result.usage, { input: 15, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 2 });
-	assert.deepEqual(result.transcript?.entries.map((entry) => entry.text), [
-		"malformed tail",
-		"first done",
-		"second text",
-		"third done",
-	]);
+		const result = await runner({
+			model,
+			task: "malformed tail",
+			cwd: process.cwd(),
+			onUpdate: (update) => updates.push(update),
+		});
+		t.mock.timers.tick(100);
+
+		assert.deepEqual(updates.map((update) => update.output), c.updates);
+		assert.equal(result.output, c.output);
+		assert.equal(result.stopReason, c.stopReason);
+		assert.equal(result.errorMessage, c.errorMessage);
+		assert.deepEqual(result.usage, c.usage);
+		assert.deepEqual(result.transcript?.entries.map((entry) => entry.text), c.transcript);
+	}
 });
 
 test("surfaces a spawn failure through the run's shared error slot", async () => {

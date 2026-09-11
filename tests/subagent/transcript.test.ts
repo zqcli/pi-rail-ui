@@ -452,6 +452,20 @@ test("single running run without a transcript falls back to its output line", ()
 	assert.match(expanded.join("\n"), /\(running\.\.\.\)/);
 });
 
+test("running Tool Call panels show an explicit compacting subphase", () => {
+	const text = renderSubagentTranscript([{
+		alias: "compacting",
+		model: "cus-resp/gpt-5.6-luna:xhigh",
+		status: "running",
+		output: "",
+		persistent: true,
+		isCompacting: true,
+	}], false, theme as any).render(100).join("\n");
+
+	assert.match(text, /Compacting/);
+	assert.doesNotMatch(text, /PRIVATE MODEL SUMMARY/);
+});
+
 test("single running fallback hides the usage line when nothing is reportable", () => {
 	const plain = { alias: "a", status: "running" as const, output: "working", persistent: false };
 	const withZeroUsage = {

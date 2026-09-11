@@ -112,6 +112,42 @@ test("drops throttle-only updates when the process ends before an assistant mess
 	assert.equal(updates.length, 0);
 });
 
+test("stateless JSON events expose native compaction while it is active and clear it at compaction_end", async () => {
+	const secret = "PRIVATE MODEL SUMMARY";
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript([
+			{ type: "compaction_start", reason: "threshold" },
+			{ type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 2, delayMs: 5, errorMessage: "temporary" },
+			{ type: "compaction_end", reason: "threshold", result: { summary: secret }, aborted: false, willRetry: true },
+			{ type: "message_start", message: { role: "assistant", content: [] } },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done after compaction" }], stopReason: "stop" } },
+		])] }),
+	});
+	const updates: any[] = [];
+	const result = await runner({ model, task: "compact task", cwd: process.cwd(), onUpdate: (update) => updates.push(update) });
+
+	assert.equal(updates.some((update) => update.isCompacting === true), true);
+	assert.equal(updates.at(-1)?.isCompacting, undefined);
+	assert.equal(result.output, "done after compaction");
+	assert.equal(result.isCompacting, undefined);
+	assert.doesNotMatch(JSON.stringify(updates), new RegExp(secret));
+	assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+});
+
+test("clears compaction state when the JSON process exits before compaction_end", async () => {
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript([
+			{ type: "compaction_start", reason: "threshold" },
+		])] }),
+	});
+	const updates: any[] = [];
+	const result = await runner({ model, task: "process exit during compaction", cwd: process.cwd(), onUpdate: (update) => updates.push(update) });
+
+	assert.equal(updates.some((update) => update.isCompacting === true), true);
+	assert.equal(result.isCompacting, undefined);
+	assert.equal(result.output, "(no output)");
+});
+
 test("flushes exactly once on the final assistant message_end", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const runner = createStatelessAgentRunner({

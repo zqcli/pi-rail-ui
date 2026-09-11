@@ -20,6 +20,7 @@ export interface SubagentUsage {
 export interface WorkerRunResult {
 	output: string;
 	usage: SubagentUsage;
+	isCompacting?: boolean;
 	transcript?: SubagentTranscriptSnapshot;
 	stopReason?: string;
 	errorMessage?: string;
@@ -168,6 +169,7 @@ interface WorkerState {
 	controlPoisoned: boolean;
 	controlErrorMessage: string | undefined;
 	queued: number;
+	isCompacting: boolean;
 }
 
 export type AgentRuntimePhase = "starting" | "running" | "queued" | "idle" | "stopped" | "error";
@@ -175,6 +177,7 @@ export type AgentRuntimePhase = "starting" | "running" | "queued" | "idle" | "st
 export interface AgentRuntimeStatus {
 	phase: AgentRuntimePhase;
 	queued: number;
+	isCompacting?: boolean;
 	errorMessage?: string;
 }
 
@@ -215,6 +218,7 @@ function freshWorkerState(instance: AgentInstance, worker: SessionWorker): Worke
 		controlPoisoned: false,
 		controlErrorMessage: undefined,
 		queued: 0,
+		isCompacting: false,
 	};
 }
 
@@ -275,7 +279,14 @@ export class SessionBroker {
 			return await this.enqueue(state, async () => {
 				const run = await state.worker.send(request.task, {
 					...(request.signal ? { signal: request.signal } : {}),
-					...(request.onUpdate ? { onUpdate: (partial) => request.onUpdate!({ instance, run: partial }) } : {}),
+					onUpdate: (partial) => {
+						const isCompacting = partial.isCompacting === true;
+						if (state.isCompacting !== isCompacting) {
+							state.isCompacting = isCompacting;
+							this.emitRuntimeChange();
+						}
+						request.onUpdate?.({ instance, run: partial });
+					},
 					onAccepted: () => {
 						if (state.activeRunId !== undefined && !state.stopping) {
 							state.activeRunAccepted = true;
@@ -285,6 +296,10 @@ export class SessionBroker {
 				});
 				state.activeRunId = undefined;
 				state.activeRunAccepted = false;
+				if (state.isCompacting) {
+					state.isCompacting = false;
+					this.emitRuntimeChange();
+				}
 				this.emitRuntimeChange();
 				const stored = await this.store.get(instance.agentId) ?? instance;
 				const persisted: AgentInstance = {
@@ -382,11 +397,12 @@ export class SessionBroker {
 		if (this.workerStarts.has(agentId)) return { phase: "starting", queued: 0 };
 		const state = this.workers.get(agentId);
 		if (state) {
-			if (state.activeRunId !== undefined) return { phase: state.activeRunAccepted ? "running" : "starting", queued: state.queued };
-			if (state.controlPoisoned) return { phase: "error", queued: state.queued, errorMessage: state.controlErrorMessage ?? "Subagent control delivery outcome is unknown" };
-			if (state.active || state.queued > 0) return { phase: "queued", queued: Math.max(1, state.queued) };
+			const activity = state.isCompacting ? { isCompacting: true as const } : {};
+			if (state.activeRunId !== undefined) return { phase: state.activeRunAccepted ? "running" : "starting", queued: state.queued, ...activity };
+			if (state.controlPoisoned) return { phase: "error", queued: state.queued, ...activity, errorMessage: state.controlErrorMessage ?? "Subagent control delivery outcome is unknown" };
+			if (state.active || state.queued > 0) return { phase: "queued", queued: Math.max(1, state.queued), ...activity };
 			const stateError = this.runtimeErrors.get(agentId);
-			return stateError ? { phase: "error", queued: 0, errorMessage: stateError } : { phase: "idle", queued: 0 };
+			return stateError ? { phase: "error", queued: 0, ...activity, errorMessage: stateError } : { phase: "idle", queued: 0, ...activity };
 		}
 		const errorMessage = this.runtimeErrors.get(agentId);
 		if (errorMessage) return { phase: "error", queued: 0, errorMessage };
@@ -636,6 +652,7 @@ export class SessionBroker {
 				state.active = false;
 				state.activeRunId = undefined;
 				state.activeRunAccepted = false;
+				state.isCompacting = false;
 				this.emitRuntimeChange();
 			}
 		};

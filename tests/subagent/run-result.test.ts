@@ -88,3 +88,59 @@ test("ingest returns a boolean update-change signal", () => {
 	assert.equal(collector.ingest({ type: "tool_execution_start", toolCallId: "c1", toolName: "read" }), true);
 	assert.equal(collector.ingest({ type: "message_end", message: { role: "assistant", content: [] } }), false);
 });
+
+test("does not classify branch-summary retries as compaction", () => {
+	const collector = new RunResultCollector("branch summary", assistantText);
+	assert.equal(collector.ingest({
+		type: "summarization_retry_scheduled",
+		attempt: 1,
+		maxAttempts: 2,
+		delayMs: 10,
+		errorMessage: "temporary branch summary failure",
+	}), false);
+	assert.equal(collector.ingest({ type: "summarization_retry_attempt_start", source: "branchSummary" }), false);
+	assert.equal(collector.ingest({ type: "summarization_retry_finished" }), false);
+	assert.equal(collector.result("(running...)").isCompacting, undefined);
+});
+
+test("tracks native compaction progress without leaking the summary or settling the child run", () => {
+	const collector = new RunResultCollector("compaction", assistantText);
+	assert.equal(collector.ingest({ type: "compaction_start", reason: "threshold" }), true);
+	assert.equal(collector.result("(running...)").isCompacting, true);
+
+	assert.equal(collector.ingest({
+		type: "summarization_retry_scheduled",
+		attempt: 1,
+		maxAttempts: 3,
+		delayMs: 10,
+		errorMessage: "temporary provider failure",
+	}), true);
+	assert.equal(collector.result("(running...)").isCompacting, true);
+	assert.equal(collector.ingest({ type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" }), true);
+	assert.equal(collector.ingest({ type: "summarization_retry_finished" }), true);
+
+	assert.equal(collector.ingest({
+		type: "compaction_end",
+		reason: "threshold",
+		result: { summary: "PRIVATE MODEL SUMMARY" },
+		aborted: false,
+		willRetry: true,
+	}), true);
+	const resumed = collector.result("(running...)");
+	assert.equal(resumed.isCompacting, undefined);
+	assert.equal(resumed.stopReason, undefined);
+	assert.doesNotMatch(JSON.stringify(resumed), /PRIVATE MODEL SUMMARY/);
+
+	for (const end of [
+		{ aborted: true, willRetry: false },
+		{ aborted: false, willRetry: false, errorMessage: "summary provider failed" },
+	]) {
+		const failed = new RunResultCollector("compaction", assistantText);
+		failed.ingest({ type: "compaction_start", reason: "threshold" });
+		failed.ingest({ type: "compaction_end", reason: "threshold", result: undefined, ...end });
+		const result = failed.result("(no output)");
+		assert.equal(result.isCompacting, undefined);
+		assert.equal(result.errorMessage, end.aborted ? undefined : end.errorMessage);
+		assert.doesNotMatch(JSON.stringify(result), /PRIVATE MODEL SUMMARY/);
+	}
+});

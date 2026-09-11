@@ -258,8 +258,9 @@ function errorResult(
 	previous?: StatefulSubagentRunDetails,
 ): StatefulSubagentRunDetails {
 	const message = error instanceof Error ? error.message : String(error);
+	const { isCompacting: _isCompacting, ...previousRun } = previous ?? {};
 	return {
-		...(previous ?? {}),
+		...previousRun,
 		alias: previous?.alias ?? item.target ?? item.alias ?? item.model ?? "current-model",
 		...(previous?.model ? { model: previous.model } : item.model ? { model: item.model } : {}),
 		task: item.task,
@@ -524,6 +525,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 							status: "running",
 							output: partial.output,
 							...(partial.transcript ? { transcript: partial.transcript } : {}),
+							...(partial.isCompacting ? { isCompacting: true } : {}),
 							usage: partial.usage,
 							durationMs: duration(),
 							...(step !== undefined ? { step } : {}),
@@ -552,6 +554,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						status: "running",
 						output: partial.output,
 						...(partial.transcript ? { transcript: partial.transcript } : {}),
+						...(partial.isCompacting ? { isCompacting: true } : {}),
 						usage: partial.usage,
 						durationMs: duration(),
 						...(step !== undefined ? { step } : {}),

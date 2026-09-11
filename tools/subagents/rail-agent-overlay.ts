@@ -65,13 +65,15 @@ function modelSearchText(model: RailModelRef): string {
 }
 
 function phaseLabel(agent: RailAgentView): string {
+	if (agent.isCompacting) return agent.queued > 0 ? `COMPACTING +${agent.queued}` : "COMPACTING";
 	if (agent.phase === "running" && agent.queued > 0) return `RUNNING +${agent.queued}`;
 	if (agent.phase === "in-use-elsewhere") return "IN USE ELSEWHERE";
 	if (agent.phase === "stopped") return "NOT CONNECTED";
 	return agent.phase.toUpperCase();
 }
 
-function phaseColor(phase: RailAgentPhase): "success" | "warning" | "error" | "muted" | "dim" {
+function phaseColor(phase: RailAgentPhase, isCompacting = false): "success" | "warning" | "error" | "muted" | "dim" {
+	if (isCompacting) return "warning";
 	if (phase === "running") return "success";
 	if (phase === "starting" || phase === "queued") return "warning";
 	if (phase === "error") return "error";
@@ -244,7 +246,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			const agent = agents[index]!;
 			const selected = index === this.selectedIndex;
 			const prefix = selected ? this.theme.fg("accent", " → ") : "   ";
-			const phase = this.theme.fg(phaseColor(agent.phase), phaseLabel(agent));
+			const phase = this.theme.fg(phaseColor(agent.phase, agent.isCompacting), phaseLabel(agent));
 			const alias = agent.linkedAliases[0] ?? agent.instance.alias;
 			const row = `${alias}  ${phase}  ${railModelReference(agent.instance.model)}`;
 			lines.push(`${prefix}${selected ? this.theme.fg("accent", row) : row}`);

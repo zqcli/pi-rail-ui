@@ -95,17 +95,27 @@ export class RpcSessionWorker implements SessionWorker {
 		const unsubscribe = this.transport.onEvent((event) => {
 			if (event.type === "agent_start") started = true;
 			const changed = collector.ingest(event);
-			if (event.type === "message_end") {
+			const immediate = event.type === "message_end"
+				|| event.type === "tool_execution_start"
+				|| event.type === "tool_execution_end"
+				|| event.type === "compaction_start"
+				|| event.type === "compaction_end"
+				|| event.type === "summarization_retry_scheduled"
+				|| event.type === "summarization_retry_attempt_start"
+				|| event.type === "summarization_retry_finished";
+			if (immediate) {
 				queueUpdate(true);
 			} else if (changed) {
-				queueUpdate(event.type === "tool_execution_start" || event.type === "tool_execution_end");
+				queueUpdate(false);
 			}
 			if (event.type === "agent_settled" && !settled) {
+				collector.markSettled();
 				queueUpdate(true);
 				settled = true;
 				resolveSettled();
 			}
 			if (event.type === "transport_error" && !settled) {
+				collector.noteError(event.error ?? "Subagent RPC transport failed");
 				queueUpdate(true);
 				settled = true;
 				transportError = new Error(event.error ?? "Subagent RPC transport failed");

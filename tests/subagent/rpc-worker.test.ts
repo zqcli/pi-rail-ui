@@ -241,6 +241,90 @@ describe("RpcSessionWorker", () => {
 		assert.equal(transport.listeners.size, 0);
 	});
 
+	test("rejects a handled compaction-only prompt without admitting a run", async () => {
+		const transport = new FakeTransport();
+		const request = transport.request.bind(transport);
+		let connected = false;
+		transport.request = async (command) => {
+			if (command["type"] === "prompt") return undefined;
+			if (command["type"] === "get_state") return connected
+				? { isStreaming: false, isCompacting: true }
+				: request(command);
+			return request(command);
+		};
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		connected = true;
+		let accepted = false;
+		const pending = worker.send("/manual-compaction-only", { onAccepted: () => { accepted = true; } });
+		const outcomePromise = pending.then(() => "settled", (error: Error) => error.message);
+		await new Promise((resolve) => setImmediate(resolve));
+		transport.emit({ type: "compaction_start", reason: "manual" });
+		transport.emit({ type: "compaction_end", reason: "manual", result: undefined, aborted: false, willRetry: false, errorMessage: "Compaction failed" });
+		const outcome = await Promise.race([
+			outcomePromise,
+			new Promise<string>((resolve) => setTimeout(() => resolve("still-pending"), 40)),
+		]);
+		if (outcome === "still-pending") {
+			transport.emit({ type: "transport_error", error: "test cleanup" });
+			await pending.catch(() => undefined);
+		}
+		assert.match(outcome, /handled without starting/);
+		assert.equal(accepted, false);
+		assert.equal(transport.listeners.size, 0);
+	});
+
+	test("publishes compaction as a running subphase without settling the child run", async () => {
+		const transport = new FakeTransport(false, undefined, true);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
+		const pending = worker.send("compact child", { onUpdate: (update) => updates.push(update) });
+		await new Promise((resolve) => setImmediate(resolve));
+
+		transport.emit({ type: "compaction_start", reason: "threshold" });
+		assert.equal(updates.at(-1)?.isCompacting, true);
+		transport.emit({ type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 2, delayMs: 5, errorMessage: "temporary" });
+		assert.equal(updates.at(-1)?.isCompacting, true);
+		transport.emit({ type: "compaction_end", reason: "threshold", result: { summary: "PRIVATE MODEL SUMMARY" }, aborted: false, willRetry: true });
+		assert.equal(updates.at(-1)?.isCompacting, undefined);
+		assert.equal(updates.at(-1)?.output, "(running...)");
+		let finished = false;
+		void pending.then(() => { finished = true; });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(finished, false);
+		transport.emit({ type: "agent_settled" });
+		const result = await pending;
+		assert.equal(result.isCompacting, undefined);
+		assert.doesNotMatch(JSON.stringify(updates), /PRIVATE MODEL SUMMARY/);
+	});
+
+	test("clears compaction on transport failure and local abort", async () => {
+		const transport = new FakeTransport(false, undefined, true);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
+		const pending = worker.send("transport failure", { onUpdate: (update) => updates.push(update) });
+		await new Promise((resolve) => setImmediate(resolve));
+		transport.emit({ type: "compaction_start", reason: "threshold" });
+		transport.emit({ type: "transport_error", error: "child transport failed" });
+		await assert.rejects(pending, /child transport failed/);
+		assert.equal(updates.at(-1)?.isCompacting, undefined);
+
+		const abortedTransport = new FakeTransport(false, undefined, true);
+		const abortedWorker = await RpcSessionWorker.connect(spec("new"), abortedTransport);
+		const controller = new AbortController();
+		const abortedUpdates: any[] = [];
+		const aborted = abortedWorker.send("abort during compaction", {
+			signal: controller.signal,
+			onUpdate: (update) => abortedUpdates.push(update),
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		abortedTransport.emit({ type: "compaction_start", reason: "threshold" });
+		controller.abort();
+		const result = await aborted;
+		assert.equal(result.stopReason, "aborted");
+		assert.equal(result.isCompacting, undefined);
+		assert.equal(abortedUpdates.at(-1)?.isCompacting, undefined);
+	});
+
 	test("classifies a lost control acknowledgement as unknown delivery", async () => {
 		const transport = new FakeTransport(false, undefined, false, true);
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);

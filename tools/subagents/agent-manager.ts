@@ -24,6 +24,7 @@ export interface RailAgentView {
 	linkedToCurrentSession: boolean;
 	phase: RailAgentPhase;
 	queued: number;
+	isCompacting?: boolean;
 	ownerPid?: number;
 	errorMessage?: string;
 }
@@ -90,6 +91,7 @@ export class RailAgentManager {
 					linkedToCurrentSession: linkedAliases.length > 0,
 					phase: local.phase,
 					queued: local.queued,
+					...(local.isCompacting ? { isCompacting: true } : {}),
 					...(local.errorMessage ? { errorMessage: local.errorMessage } : {}),
 				};
 			}

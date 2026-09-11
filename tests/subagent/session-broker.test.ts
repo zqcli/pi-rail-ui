@@ -377,6 +377,30 @@ describe("SessionBroker", () => {
 		assert.deepEqual(broker.runtimeStatus(created.instance.agentId), { phase: "stopped", queued: 0 });
 	});
 
+	test("keeps compaction as a running subphase and leaves control admission open", async () => {
+		const { broker, workers } = setup();
+		const created = await broker.attach({ model: reviewerModel(), alias: "auth-review" });
+		const worker = workers[0]!;
+		const release = Promise.withResolvers<void>();
+		worker.send = async (_task, options) => {
+			options?.onAccepted?.();
+			options?.onUpdate?.({ output: "(running...)", usage: emptyUsage(), isCompacting: true });
+			assert.deepEqual(broker.runtimeStatus(created.agentId), { phase: "running", queued: 0, isCompacting: true });
+			await release.promise;
+			options?.onUpdate?.({ output: "done", usage: emptyUsage() });
+			return { output: "done", usage: emptyUsage() };
+		};
+
+		const pending = broker.dispatch({ target: created.agentId, task: "compact" });
+		while (broker.runtimeStatus(created.agentId).isCompacting !== true) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(broker.runtimeStatus(created.agentId).phase, "running");
+		await broker.control({ target: created.agentId, delivery: "steer", message: "keep going" });
+		assert.deepEqual(worker.controls, [{ delivery: "steer", message: "keep going" }]);
+		release.resolve();
+		await pending;
+		assert.deepEqual(broker.runtimeStatus(created.agentId), { phase: "idle", queued: 0 });
+	});
+
 	test("delivers steer and follow-up controls to an actively running persistent worker", async () => {
 		const { broker, workers } = setup();
 		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });

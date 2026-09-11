@@ -38,6 +38,27 @@ test("manager create and continue propagate failed or aborted run outcomes", asy
 	}
 });
 
+test("manager exposes compaction activity without changing the running phase or count", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-compacting-"));
+	try {
+		const agent = instance("agt_compacting", "compacting-review", join(dir, "compacting.jsonl"));
+		const manager = new RailAgentManager(
+			{ runtimeStatus: () => ({ phase: "running", queued: 0, isCompacting: true }), subscribeRuntime: () => () => undefined } as any,
+			{ list: async () => [agent] } as any,
+			{ list: () => [{ alias: agent.alias, agentId: agent.agentId }] } as any,
+			dir,
+		);
+		const snapshot = await manager.snapshot();
+
+		assert.equal(snapshot.agents[0]?.phase, "running");
+		assert.equal(snapshot.agents[0]?.isCompacting, true);
+		assert.equal(snapshot.counts.running, 1);
+		assert.equal(snapshot.counts.idle, 0);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("RailAgentManager combines current links, local runtime state, and foreign leases", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-"));
 	const foreignOwner = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });

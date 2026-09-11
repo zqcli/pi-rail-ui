@@ -36,6 +36,7 @@ export interface SubagentTranscriptRun {
 	alias: string;
 	model?: string;
 	status: SubagentTranscriptStatus;
+	isCompacting?: boolean;
 	output: string;
 	persistent: boolean;
 	transcript?: SubagentTranscriptSnapshot;
@@ -738,6 +739,7 @@ function identityText(run: SubagentTranscriptRun): string {
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
 	if (run.status === "failed") return theme.fg("error", "✗");
+	if (run.status === "running" && run.isCompacting) return theme.fg("warning", "Compacting");
 	if (run.status === "running") return theme.fg("warning", "…");
 	if (run.status === "accepted") return theme.fg("accent", "↪");
 	return theme.fg("success", "✓");
@@ -929,7 +931,7 @@ export function renderSubagentTranscript(
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	const header = `${theme.fg("warning", "…")} ${theme.fg("toolTitle", theme.bold(only.alias))}${theme.fg("dim", ` · ${only.persistent ? "persistent" : "stateless"} · ${only.model ?? "model unavailable"}`)}`;
+	const header = `${theme.fg("warning", only.isCompacting ? "Compacting" : "…")} ${theme.fg("toolTitle", theme.bold(only.alias))}${theme.fg("dim", ` · ${only.persistent ? "persistent" : "stateless"} · ${only.model ?? "model unavailable"}`)}`;
 	const usage = usageText(only);
 	return new BoundedTranscriptView(
 		header,

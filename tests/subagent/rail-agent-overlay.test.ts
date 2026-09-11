@@ -42,11 +42,12 @@ const snapshot = {
 	counts: { linked: 1, global: 1, running: 0, queued: 0, idle: 1, stopped: 0, inUseElsewhere: 0, errors: 0 },
 };
 
-function setup(phase: "idle" | "running" = "idle", terminalRows = 30) {
+function setup(phase: "idle" | "running" = "idle", terminalRows = 30, compacting = false) {
 	let renders = 0;
 	let closed = false;
 	const currentSnapshot: any = structuredClone(snapshot);
 	currentSnapshot.agents[0]!.phase = phase;
+	currentSnapshot.agents[0]!.isCompacting = compacting;
 	currentSnapshot.counts.running = phase === "running" ? 1 : 0;
 	currentSnapshot.counts.idle = phase === "idle" ? 1 : 0;
 	const controls: unknown[] = [];
@@ -251,6 +252,17 @@ test("saved-session search matches words across title, message, cwd, and id from
 		text = ui.render(100).join("\n");
 		assert.doesNotMatch(text, /Select saved session/);
 		assert.match(text, /Security review/);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("running agents show compacting as an activity status while remaining controllable", () => {
+	const state = setup("running", 30, true);
+	try {
+		const text = state.component.render(100).join("\n");
+		assert.match(text, /COMPACTING/);
+		assert.match(text, /1 running · 0 queued/);
 	} finally {
 		state.component.dispose();
 	}

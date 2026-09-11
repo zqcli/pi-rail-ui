@@ -53,6 +53,7 @@ export class RunResultCollector {
 	private output = "";
 	private stopReasonValue: string | undefined;
 	private errorMessageValue: string | undefined;
+	private isCompactingValue = false;
 
 	constructor(task: string, extractAssistantText: AssistantTextExtractor) {
 		this.transcript = new SubagentTranscript(task);
@@ -67,6 +68,7 @@ export class RunResultCollector {
 	// adapters' call based on event type. Strict extraction may throw here after
 	// the transcript was ingested, restoring the stateless malformed-tail behavior.
 	ingest(event: SubagentRunEvent): boolean {
+		const activityChanged = this.ingestActivity(event);
 		const transcriptChanged = this.transcript.ingest(event);
 		if (event.type === "message_update") {
 			const reported = providerReportedUsage(event.usage);
@@ -83,18 +85,56 @@ export class RunResultCollector {
 				this.errorMessageValue = message.errorMessage;
 			}
 		}
-		return transcriptChanged || (event.type === "message_update" && this.activeUsage !== undefined);
+		return activityChanged || transcriptChanged || (event.type === "message_update" && this.activeUsage !== undefined);
 	}
 
 	// Host-side failures share the same error message slot as message_end folding,
 	// matching the stateless process-error behavior.
 	noteError(message: string): void {
+		this.isCompactingValue = false;
 		this.errorMessageValue = message;
 	}
 
 	markAborted(): void {
+		this.isCompactingValue = false;
 		this.stopReasonValue = "aborted";
 		this.errorMessageValue = "Subagent request was aborted";
+	}
+
+	markSettled(): void {
+		this.isCompactingValue = false;
+	}
+
+	private ingestActivity(event: SubagentRunEvent): boolean {
+		switch (event.type) {
+			case "compaction_start":
+				return this.setCompacting(true);
+			case "compaction_end":
+				this.setCompacting(false);
+				if (event["aborted"] !== true && event["willRetry"] !== true
+					&& typeof event["errorMessage"] === "string" && event["errorMessage"].trim()) {
+					this.errorMessageValue = event["errorMessage"];
+				}
+				return true;
+			case "summarization_retry_scheduled":
+				return this.isCompactingValue;
+			case "summarization_retry_attempt_start":
+				if (event["source"] === "compaction") this.setCompacting(true);
+				return event["source"] === "compaction";
+			case "summarization_retry_finished":
+				return this.isCompactingValue;
+			case "agent_settled":
+			case "transport_error":
+				return this.setCompacting(false);
+			default:
+				return false;
+		}
+	}
+
+	private setCompacting(value: boolean): boolean {
+		if (this.isCompactingValue === value) return false;
+		this.isCompactingValue = value;
+		return true;
 	}
 
 	result(outputFallback: string): WorkerRunResult {
@@ -102,6 +142,7 @@ export class RunResultCollector {
 			output: this.output || outputFallback,
 			usage: usageWithActiveTurn(this.usage, this.activeUsage),
 			transcript: this.transcript.snapshot(),
+			...(this.isCompactingValue ? { isCompacting: true } : {}),
 			...(this.stopReasonValue ? { stopReason: this.stopReasonValue } : {}),
 			...(this.errorMessageValue ? { errorMessage: this.errorMessageValue } : {}),
 		};

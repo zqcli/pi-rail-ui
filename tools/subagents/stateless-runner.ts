@@ -75,10 +75,18 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 						try {
 							const event = JSON.parse(line) as SubagentRunEvent;
 							const changed = collector.ingest(event);
-							if (event.type === "message_end" && isAssistantMessage(event.message)) {
+							const immediate = (event.type === "message_end" && isAssistantMessage(event.message))
+								|| event.type === "tool_execution_start"
+								|| event.type === "tool_execution_end"
+								|| event.type === "compaction_start"
+								|| event.type === "compaction_end"
+								|| event.type === "summarization_retry_scheduled"
+								|| event.type === "summarization_retry_attempt_start"
+								|| event.type === "summarization_retry_finished";
+							if (immediate) {
 								queueUpdate(true);
 							} else if (changed) {
-								queueUpdate(event.type === "tool_execution_start" || event.type === "tool_execution_end");
+								queueUpdate(false);
 							}
 						} catch {
 							// Ignore non-JSON diagnostic output, and skip the malformed message tail.
@@ -116,6 +124,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 				});
 		});
 		if (updateTimer) clearTimeout(updateTimer);
+		collector.markSettled();
 		if (aborted) {
 			collector.markAborted();
 			publishUpdate();

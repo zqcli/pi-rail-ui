@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installStatefulSubagentTool, type StatefulSubagentToolOptions } from "../../tools/subagents/tool";
 import { WorkerControlError, type ControlRequest, type ControlResult, type DispatchRequest, type DispatchResult, type SessionBroker } from "../../tools/subagents/session-broker";
+import { RunResultCollector, assistantText } from "../../tools/subagents/run-result";
 import { SubagentTranscript } from "../../tools/subagents/transcript";
 
 const model = {
@@ -286,6 +287,34 @@ test("model plus alias creates a persistent session and target continues it", as
 	assert.match(call.render(100).join("\n"), /persistent continue auth-review/);
 	const progressPanel = tool.renderResult(continueUpdates[0], { expanded: false }, theme);
 	assert.match(progressPanel.render(120)[0], /auth-review · persistent · cus-resp\/gpt-5\.6-sol:xhigh/);
+});
+
+test("native compaction progress reaches the Tool Call panel through the runner seam", async () => {
+	const { tool } = setupTool({
+		runStateless: async (request) => {
+			const collector = new RunResultCollector(request.task, assistantText);
+			collector.ingest({ type: "compaction_start", reason: "threshold" });
+			request.onUpdate?.({ ...collector.result("(running...)"), exitCode: 0 });
+			collector.ingest({ type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 2, delayMs: 5, errorMessage: "temporary" });
+			collector.ingest({ type: "compaction_end", reason: "threshold", result: { summary: "PRIVATE MODEL SUMMARY" }, aborted: false, willRetry: true });
+			collector.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } });
+			return { ...collector.result("(no output)"), exitCode: 0 };
+		},
+	});
+	const updates: any[] = [];
+	const result = await tool.execute(
+		"call-compacting",
+		{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "compact this child" },
+		undefined,
+		(update: any) => updates.push(update),
+		context(),
+	);
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const compacting = updates.find((update) => update.details.results[0].isCompacting === true);
+	assert.ok(compacting);
+	assert.match(tool.renderResult(compacting, { expanded: false, isPartial: true }, theme).render(100).join("\n"), /Compacting/);
+	assert.equal(result.details.results[0].isCompacting, undefined);
+	assert.doesNotMatch(JSON.stringify(result), /PRIVATE MODEL SUMMARY/);
 });
 
 test("parallel parent content is fair and details keep a bounded retained answer", async () => {

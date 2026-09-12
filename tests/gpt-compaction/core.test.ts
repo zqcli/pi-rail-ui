@@ -181,12 +181,21 @@ test("payload replay replaces only the display anchor and never duplicates an al
 	const u2 = message("u2", "c1", "latest");
 	const branch = [u1, a1, c1, u2];
 	const marker = `The conversation history before this point was compacted into the following summary:\n\n<summary>\n${gptCompactionSummary(cp.checkpointId)}\n</summary>`;
-	const payload = { model: model.id, input: [{ role: "user", content: [{ type: "input_text", text: marker }] }, { role: "user", content: [{ type: "input_text", text: "latest" }] }] };
+	const payload = {
+		model: model.id,
+		input: [{ role: "user", content: [{ type: "input_text", text: marker }] }, { role: "user", content: [{ type: "input_text", text: "latest" }] }],
+		tools: [{ type: "web_search_preview", search_context_size: "high" }],
+		include: ["web_search_call.action.sources"],
+		previous_response_id: "codex-response-1",
+	};
 	const rewritten = planPayloadRewrite({ ctx: context(branch), branchEntries: branch, payload, remoteEnabled: true, identity });
 	assert.equal(rewritten.action, "rewrite");
 	if (rewritten.action === "rewrite") {
 		assert.equal(JSON.stringify(rewritten.payload).includes(gptCompactionSummary(cp.checkpointId)), false);
 		assert.equal((rewritten.payload as any).input.filter((item: any) => item.type === "compaction").length, 1);
+		assert.deepEqual((rewritten.payload as any).tools, payload.tools);
+		assert.deepEqual((rewritten.payload as any).include, payload.include);
+		assert.equal((rewritten.payload as any).previous_response_id, payload.previous_response_id);
 	}
 
 	const alreadyRewritten = planPayloadRewrite({

@@ -5,7 +5,7 @@ import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_
 import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
 import type { WorkerRunResult } from "./session-broker";
-import { isAssistantMessage, RunResultCollector, strictAssistantText, type SubagentRunEvent } from "./run-result";
+import { isAssistantMessage, isSharedImmediateEvent, RunResultCollector, strictAssistantText, type SubagentRunEvent } from "./run-result";
 
 const STDERR_CAP = 50 * 1024;
 
@@ -95,14 +95,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 								if (detail !== undefined) protocolErrorEvent = detail;
 							}
 							const changed = collector.ingest(event);
-							const immediate = (event.type === "message_end" && isAssistantMessage(event.message))
-								|| event.type === "tool_execution_start"
-								|| event.type === "tool_execution_end"
-								|| event.type === "compaction_start"
-								|| event.type === "compaction_end"
-								|| event.type === "summarization_retry_scheduled"
-								|| event.type === "summarization_retry_attempt_start"
-								|| event.type === "summarization_retry_finished";
+							const immediate = (event.type === "message_end" && isAssistantMessage(event.message)) || isSharedImmediateEvent(event.type);
 							if (immediate) {
 								queueUpdate(true);
 							} else if (changed) {

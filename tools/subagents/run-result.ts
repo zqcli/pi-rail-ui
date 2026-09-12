@@ -45,6 +45,16 @@ export function strictAssistantText(message: unknown): string {
 		.join("\n");
 }
 
+export function isSharedImmediateEvent(type: string | undefined): boolean {
+	return type === "tool_execution_start"
+		|| type === "tool_execution_end"
+		|| type === "compaction_start"
+		|| type === "compaction_end"
+		|| type === "summarization_retry_scheduled"
+		|| type === "summarization_retry_attempt_start"
+		|| type === "summarization_retry_finished";
+}
+
 export class RunResultCollector {
 	private readonly usage = emptySubagentUsage();
 	private readonly transcript: SubagentTranscript;

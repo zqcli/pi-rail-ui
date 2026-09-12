@@ -20,7 +20,7 @@ import type {
 	WorkerControlRequest,
 	WorkerStartSpec,
 } from "./session-broker";
-import { RunResultCollector, assistantText } from "./run-result";
+import { isSharedImmediateEvent, RunResultCollector, assistantText } from "./run-result";
 
 export interface RpcEvent {
 	type: string;
@@ -186,15 +186,6 @@ export class RpcSessionWorker implements SessionWorker {
 		}
 	}
 
-	private async restoreAfterFailedRun(expectedWindow?: number): Promise<void> {
-		try {
-			await this.resetContext(expectedWindow);
-		} catch (error) {
-			this.unusable = true;
-			throw error;
-		}
-	}
-
 	private async prepareContext(contextWindow: number | undefined): Promise<number | undefined> {
 		const value = this.validateBudget(contextWindow);
 		if (value === undefined) return undefined;
@@ -240,7 +231,7 @@ export class RpcSessionWorker implements SessionWorker {
 		const prepared = restoreWindow !== undefined;
 		if (options.signal?.aborted) {
 			try {
-				if (prepared) await this.restoreAfterFailedRun(restoreWindow);
+				if (prepared) await this.resetContext(restoreWindow);
 			} finally {
 				this.runInFlight = false;
 			}
@@ -281,14 +272,7 @@ export class RpcSessionWorker implements SessionWorker {
 			}
 			if (event.type === "agent_start") started = true;
 			const changed = collector.ingest(event);
-			const immediate = event.type === "message_end"
-				|| event.type === "tool_execution_start"
-				|| event.type === "tool_execution_end"
-				|| event.type === "compaction_start"
-				|| event.type === "compaction_end"
-				|| event.type === "summarization_retry_scheduled"
-				|| event.type === "summarization_retry_attempt_start"
-				|| event.type === "summarization_retry_finished";
+			const immediate = event.type === "message_end" || isSharedImmediateEvent(event.type);
 			if (immediate) {
 				queueUpdate(true);
 			} else if (changed) {
@@ -350,7 +334,7 @@ export class RpcSessionWorker implements SessionWorker {
 			}
 			return collector.result("(no output)");
 		} catch (error) {
-			if (!settled && prepared && !this.unusable) await this.restoreAfterFailedRun(restoreWindow).catch((cleanupError) => { throw cleanupError; });
+			if (!settled && prepared && !this.unusable) await this.resetContext(restoreWindow);
 			throw error;
 		} finally {
 			this.runInFlight = false;

@@ -45,7 +45,7 @@ async function runJson(agentDir: string, logPath: string, budget: number | undef
 	let stderr = "";
 	child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
 	child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-	const code = await new Promise<number | null>((resolve) => child.once("exit", (exitCode) => resolve(exitCode)));
+	const code = await new Promise<number | null>((resolve) => child.once("close", (exitCode) => resolve(exitCode)));
 	return { code, stdout, stderr };
 }
 
@@ -66,7 +66,7 @@ async function runModelSelectJson(agentDir: string, logPath: string): Promise<{ 
 	let stderr = "";
 	child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
 	child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-	const code = await new Promise<number | null>((resolve) => child.once("exit", (exitCode) => resolve(exitCode)));
+	const code = await new Promise<number | null>((resolve) => child.once("close", (exitCode) => resolve(exitCode)));
 	return { code, stdout, stderr };
 }
 
@@ -188,9 +188,9 @@ test("real Pi stateless and persistent children observe per-dispatch contextWind
 	try {
 		worker = await RpcSessionWorker.connect(spec, transport);
 		await worker.send("persistent 64000", { contextWindow: 64_000 });
-		await worker.send("persistent 128000", { contextWindow: 128_000 });
+		await worker.send("persistent 96000", { contextWindow: 96_000 });
 		await worker.send("persistent omitted");
-		assert.deepEqual(await readProviderWindows(persistentLog), [64_000, 128_000, 128_000]);
+		assert.deepEqual(await readProviderWindows(persistentLog), [64_000, 96_000, 128_000]);
 		const state = await transport.request({ type: "get_state" }) as { model?: { contextWindow?: number }; isStreaming?: boolean; isCompacting?: boolean };
 		assert.equal(state.model?.contextWindow, 128_000);
 		assert.equal(state.isStreaming, false);

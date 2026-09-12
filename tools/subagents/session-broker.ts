@@ -315,10 +315,7 @@ export class SessionBroker {
 				});
 				currentState.activeRunId = undefined;
 				currentState.activeRunAccepted = false;
-				if (currentState.isCompacting) {
-					currentState.isCompacting = false;
-					this.emitRuntimeChange();
-				}
+				currentState.isCompacting = false;
 				this.emitRuntimeChange();
 				const stored = await this.store.get(resolvedInstance.agentId) ?? resolvedInstance;
 				const persisted: AgentInstance = {

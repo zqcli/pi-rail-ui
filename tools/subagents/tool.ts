@@ -122,15 +122,7 @@ function markdownThemeFromTheme(theme: Theme): MarkdownTheme {
 	};
 }
 
-type TaskParams = {
-	model?: string;
-	target?: string;
-	alias?: string;
-	task: string;
-	cwd?: string;
-	session?: { mode: "fork" | "exclusive"; path: string };
-	contextWindow?: number;
-};
+type TaskParams = Static<typeof TaskItem>;
 
 function isPersistentTask(item: Pick<TaskParams, "target" | "alias" | "session">): boolean {
 	return Boolean(item.target || item.alias || item.session?.path);

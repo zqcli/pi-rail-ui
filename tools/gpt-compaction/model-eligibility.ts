@@ -8,7 +8,6 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 export const RESPONSES_COMPACTION_APIS = [
 	"openai-responses",
 	"openai-codex-responses",
-	"azure-openai-responses",
 ] as const;
 export type ResponsesCompactionApi = (typeof RESPONSES_COMPACTION_APIS)[number];
 

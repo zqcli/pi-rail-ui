@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import {
 	compactionIdentity,
@@ -83,10 +84,49 @@ function markBlocked(signal: AbortSignal | undefined, reason: string, blocked: M
 export function installGptCompaction(pi: ExtensionAPI): void {
 	let mode: GptCompactionMode = readGptCompactionSettings().mode;
 	const blockedRequests = new Map<AbortSignal, string>();
+	let forceNativeRepair = false;
+	const syncMode = (): GptCompactionMode => {
+		mode = readGptCompactionSettings().mode;
+		return mode;
+	};
+	const repairBeforeDisabling = async (ctx: ExtensionContext): Promise<{ ok: true } | { ok: false; detail: string }> => {
+		const branch = ctx.sessionManager.getBranch();
+		const checkpoint = resolveSessionCheckpoint(branch);
+		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return { ok: true };
+		const index = branch.findIndex((entry) => entry.id === checkpoint.entry.id);
+		if (index < 0 || !branch.slice(index + 1).some((entry) => entry.type !== "compaction")) return { ok: true };
+		forceNativeRepair = true;
+		return await new Promise((resolve) => {
+			try {
+				ctx.compact({
+					onComplete: () => {
+						forceNativeRepair = false;
+						resolve({ ok: true });
+					},
+					onError: (error) => {
+						forceNativeRepair = false;
+						resolve({ ok: false, detail: error.message });
+					},
+				});
+			} catch (error) {
+				forceNativeRepair = false;
+				resolve({ ok: false, detail: error instanceof Error ? error.message : String(error) });
+			}
+		});
+	};
 
 	pi.registerCommand("rail-gpt-compaction", {
 		description: "Set GPT Remote Compaction v2 on or off",
+		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+			const items: AutocompleteItem[] = [
+				{ value: "on", label: "on — enable GPT Remote Compaction v2" },
+				{ value: "off", label: "off — use Pi native compaction" },
+			];
+			const filtered = items.filter((item) => item.value.startsWith(prefix.trim()));
+			return filtered.length > 0 ? filtered : null;
+		},
 		handler: async (args, ctx) => {
+			mode = readGptCompactionSettings().mode;
 			const command = (() => {
 				try {
 					return parseGptCompactionCommand(args);
@@ -106,7 +146,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 					updateStatus(mode, ctx);
 					return;
 				}
-				const selected = await ctx.ui.select("GPT Remote Compaction v2", ["on", "off"]);
+				const selected = await ctx.ui.select(`GPT Remote Compaction v2 — currently ${mode}`, ["on", "off"]);
 				if (selected !== "on" && selected !== "off") return;
 				selectedMode = selected;
 			} else {
@@ -114,6 +154,13 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 			}
 
 			await ctx.waitForIdle();
+			if (selectedMode === "off" && mode === "on") {
+				const repaired = await repairBeforeDisabling(ctx);
+				if (!repaired.ok) {
+					ctx.ui.notify(`GPT Remote Compaction v2 remains on; native repair failed: ${redactSensitiveText(repaired.detail)}`, "error");
+					return;
+				}
+			}
 			try {
 				const saved = writeGptCompactionMode(selectedMode);
 				mode = saved.mode;
@@ -140,9 +187,21 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 	pi.on("session_compact_failed", async (_event, ctx) => updateStatus(mode, ctx));
 
 	pi.on("session_before_compact", async (event, ctx) => {
+		syncMode();
 		const model = ctx.model;
 		const support = modelSupportsRemoteCompaction(model);
 		const checkpoint = resolveSessionCheckpoint(event.branchEntries);
+
+		const mustRepairNative = forceNativeRepair
+			|| checkpoint.status === "invalid"
+			|| (checkpoint.status === "remote" && (mode !== "on" || !support.supported));
+		if (mustRepairNative) {
+			const outcome = await runNativeRepairCompaction({ event, ctx });
+			if (outcome.outcome === "success") return { compaction: outcome.compaction };
+			if (outcome.outcome === "aborted") return { cancel: true };
+			notifyFailure(ctx, "while repairing native history", outcome.reason, outcome.detail);
+			return { cancel: true };
+		}
 
 		if (mode === "on" && support.supported) {
 			const outcome = await runRemoteCompaction({ event, ctx });
@@ -155,19 +214,14 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 			return { cancel: true };
 		}
 
-		if (checkpoint.status === "remote" || checkpoint.status === "invalid") {
-			const outcome = await runNativeRepairCompaction({ event, ctx });
-			if (outcome.outcome === "success") return { compaction: outcome.compaction };
-			if (outcome.outcome === "aborted") return { cancel: true };
-			notifyFailure(ctx, "while repairing native history", outcome.reason, outcome.detail);
-			return { cancel: true };
-		}
 		return undefined;
 	});
 
 	pi.on("context", async (event, ctx) => {
+		syncMode();
 		const branchEntries = ctx.sessionManager.getBranch();
-		if (resolveSessionCheckpoint(branchEntries).status !== "remote") return undefined;
+		const checkpoint = resolveSessionCheckpoint(branchEntries);
+		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return undefined;
 		const support = modelSupportsRemoteCompaction(ctx.model);
 		const identity = support.supported ? await resolveRuntimeIdentity(ctx) : safeIdentity(ctx);
 		const storedMessages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
@@ -189,10 +243,11 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 
 	pi.on("before_provider_request", async (event, ctx) => {
 		try {
+			syncMode();
 			const branchEntries = ctx.sessionManager.getBranch();
 			const checkpoint = resolveSessionCheckpoint(branchEntries);
 			const model = ctx.model;
-			if (checkpoint.status !== "remote" || !model) {
+			if ((checkpoint.status !== "remote" && checkpoint.status !== "invalid") || !model) {
 				rememberLiveRequestContext(ctx, event.payload);
 				return undefined;
 			}

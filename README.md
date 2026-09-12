@@ -95,6 +95,18 @@ Pi Rail UI registers the following slash commands:
 
 Toggles the extension on or off for the current UI session.
 
+### `/rail-gpt-compaction`
+
+Controls the global GPT Remote Compaction v2 switch:
+
+```text
+/rail-gpt-compaction
+/rail-gpt-compaction on
+/rail-gpt-compaction off
+```
+
+With no argument, the command shows the current state and, in TUI mode, a menu titled with that state. The `on`/`off` choices are also available through slash-command completion. The setting is stored under `getAgentDir()/rail-gpt-compaction/settings.json`, defaults to `off`, and is shared by TUI, RPC, JSON, and Rail child processes. Remote compaction is enabled only for GPT-named `openai-responses` and `openai-codex-responses` models; Azure OpenAI Responses is deliberately not in the v2 support scope until its endpoint, query, and authentication behavior are covered by a matching implementation. Unsupported models keep Pi's native compaction.
+
 ### `/rail-duplicate`
 
 Duplicates the current session as a sibling session (sharing the same parent).

@@ -109,13 +109,24 @@ export async function resolveCompactionAuth(
  */
 export function buildResponsesUrl(baseUrl: string, api: string): string {
 	const normalized = normalizeBaseUrl(baseUrl);
-	if (api === "openai-codex-responses") {
-		if (normalized.endsWith("/codex/responses")) return normalized;
-		if (normalized.endsWith("/codex")) return `${normalized}/responses`;
-		return `${normalized}/codex/responses`;
+	try {
+		const url = new URL(normalized);
+		const path = url.pathname.replace(/\/+$/u, "");
+		if (api === "openai-codex-responses") {
+			if (!path.endsWith("/codex/responses")) url.pathname = path.endsWith("/codex") ? `${path}/responses` : `${path}/codex/responses`;
+		} else if (!path.endsWith("/responses")) {
+			url.pathname = `${path}/responses`;
+		}
+		return url.toString();
+	} catch {
+		if (api === "openai-codex-responses") {
+			if (normalized.endsWith("/codex/responses")) return normalized;
+			if (normalized.endsWith("/codex")) return `${normalized}/responses`;
+			return `${normalized}/codex/responses`;
+		}
+		if (normalized.endsWith("/responses")) return normalized;
+		return `${normalized}/responses`;
 	}
-	if (normalized.endsWith("/responses")) return normalized;
-	return `${normalized}/responses`;
 }
 
 export function buildCompactionHeaders(args: {

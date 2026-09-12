@@ -3,6 +3,7 @@ import { calculateCost, createAssistantMessageEventStream, type Api, type ImageC
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	convertToLlm,
+	estimateTokens,
 	generateSummaryWithUsage,
 	type CompactionEntry,
 	type CompactionResult,
@@ -11,7 +12,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth, resolveSessionId } from "./auth";
-import { collectMessages, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
+import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
 import { compactionIdentity, identitiesMatch, type CompactionIdentity } from "./model-eligibility";
 import { getCompactionRequestExtras, rememberRequestContext } from "./request-context";
 import {
@@ -50,14 +51,28 @@ function isAbortError(error: unknown): boolean {
 
 function usageFromResponse(usage: RemoteCompactionUsage | undefined, model: Model<Api>): Usage | undefined {
 	if (!usage) return undefined;
-	const input = typeof usage.input === "number" ? usage.input : 0;
-	const output = typeof usage.output === "number" ? usage.output : 0;
-	const total = typeof usage.totalTokens === "number" ? usage.totalTokens : input + output;
+	const nestedInputDetails = usage["input_tokens_details"] && typeof usage["input_tokens_details"] === "object"
+		? usage["input_tokens_details"] as Record<string, unknown>
+		: undefined;
+	const rawInput = typeof usage["input"] === "number" ? usage["input"] : typeof usage["input_tokens"] === "number" ? usage["input_tokens"] : 0;
+	const cacheRead = typeof usage["cacheRead"] === "number"
+		? usage["cacheRead"]
+		: typeof usage["cached_tokens"] === "number"
+			? usage["cached_tokens"]
+			: typeof nestedInputDetails?.["cached_tokens"] === "number" ? nestedInputDetails["cached_tokens"] : 0;
+	const cacheWrite = typeof usage["cacheWrite"] === "number"
+		? usage["cacheWrite"]
+		: typeof usage["cache_write_tokens"] === "number"
+			? usage["cache_write_tokens"]
+			: typeof nestedInputDetails?.["cache_write_tokens"] === "number" ? nestedInputDetails["cache_write_tokens"] : 0;
+	const input = Math.max(0, rawInput - cacheRead - cacheWrite);
+	const output = typeof usage["output"] === "number" ? usage["output"] : typeof usage["output_tokens"] === "number" ? usage["output_tokens"] : 0;
+	const total = typeof usage["totalTokens"] === "number" ? usage["totalTokens"] : typeof usage["total_tokens"] === "number" ? usage["total_tokens"] : input + output + cacheRead + cacheWrite;
 	const resolved: Usage = {
 		input,
 		output,
-		cacheRead: 0,
-		cacheWrite: 0,
+		cacheRead,
+		cacheWrite,
 		totalTokens: total,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
@@ -73,7 +88,7 @@ function usageFromResponse(usage: RemoteCompactionUsage | undefined, model: Mode
  * entries are skipped because their ciphertext is bound to one provider.
  */
 export function rebuiltBranchMessages(branchEntries: readonly SessionEntry[]): AgentMessage[] {
-	return collectMessages(branchEntries.filter((entry) => entry.type !== "compaction"));
+	return rebuildNativeHistory(branchEntries).messages;
 }
 
 /** Responses-format text for the rebuilt history, used when no checkpoint applies. */
@@ -83,6 +98,11 @@ export function rebuiltBranchInput(model: Model<Api>, branchEntries: readonly Se
 
 function serializeEntries(model: Model<Api>, entries: readonly SessionEntry[]): unknown[] {
 	return serializeMessagesToResponsesInput(model, convertToLlm(collectMessages(entries)));
+}
+
+function safeHistoryPrefixInput(model: Model<Api>, branchEntries: readonly SessionEntry[], endIndex: number): unknown[] | undefined {
+	const rebuilt = rebuildNativeHistoryPrefix(branchEntries, endIndex);
+	return rebuilt ? serializeMessagesToResponsesInput(model, convertToLlm(rebuilt.messages)) : undefined;
 }
 
 function cloneCheckpointItems(items: readonly unknown[]): unknown[] {
@@ -102,25 +122,50 @@ export function buildRemoteCompactionRequest(args: {
 	model: Model<Api>;
 	branchEntries: readonly SessionEntry[];
 	identity?: CompactionIdentity;
+	/** First entry Pi will retain after this compaction cut. */
+	firstKeptEntryId?: string;
 }): { ok: true; input: unknown[] } | { ok: false; reason: string } {
+	const cutIndex = args.firstKeptEntryId === undefined
+		? undefined
+		: findEntryIndex(args.branchEntries, args.firstKeptEntryId);
+	if (args.firstKeptEntryId !== undefined && (cutIndex === undefined || cutIndex < 0)) {
+		return { ok: false, reason: "checkpoint-boundary-not-found" };
+	}
 	const checkpoint = resolveSessionCheckpoint(args.branchEntries);
 	if (checkpoint.status === "native") {
-		return { ok: true, input: rebuiltBranchInput(args.model, args.branchEntries) };
+		const input = cutIndex === undefined ? rebuiltBranchInput(args.model, args.branchEntries) : safeHistoryPrefixInput(args.model, args.branchEntries, cutIndex);
+		return input ? { ok: true, input } : { ok: false, reason: "checkpoint-boundary-not-found" };
 	}
 	if (checkpoint.status === "invalid") {
-		return { ok: false, reason: "checkpoint-invalid" };
+		const input = cutIndex === undefined ? undefined : safeHistoryPrefixInput(args.model, args.branchEntries, cutIndex);
+		return input ? { ok: true, input } : { ok: false, reason: "checkpoint-invalid" };
 	}
 	if (checkpoint.status === "none") {
-		return { ok: true, input: rebuiltBranchInput(args.model, args.branchEntries) };
+		const input = cutIndex === undefined ? rebuiltBranchInput(args.model, args.branchEntries) : safeHistoryPrefixInput(args.model, args.branchEntries, cutIndex);
+		return input ? { ok: true, input } : { ok: false, reason: "checkpoint-boundary-not-found" };
 	}
 
 	const identity = args.identity ?? compactionIdentity(args.model);
 	if (!identitiesMatch(checkpoint.details.consumer, identity)) {
 		// Opaque ciphertext never crosses identities; restart from real records.
-		return { ok: true, input: rebuiltBranchInput(args.model, args.branchEntries) };
+		const input = cutIndex === undefined ? rebuiltBranchInput(args.model, args.branchEntries) : safeHistoryPrefixInput(args.model, args.branchEntries, cutIndex);
+		return input ? { ok: true, input } : { ok: false, reason: "checkpoint-boundary-not-found" };
 	}
 	const boundary = resolveCheckpointBoundary(args.branchEntries, checkpoint.entry, checkpoint.details);
 	if (!boundary) return { ok: false, reason: "checkpoint-boundary-not-found" };
+	if (cutIndex !== undefined) {
+		if (cutIndex <= boundary.boundaryIndex) return { ok: false, reason: "checkpoint-boundary-not-found" };
+		const compactedEntries = args.branchEntries
+			.slice(boundary.firstKeptIndex, cutIndex)
+			.filter((entry) => entry.type !== "compaction");
+		return {
+			ok: true,
+			input: [
+				...cloneCheckpointItems(checkpoint.details.replacement),
+				...serializeEntries(args.model, compactedEntries),
+			],
+		};
+	}
 	return {
 		ok: true,
 		input: [
@@ -147,16 +192,24 @@ export async function runRemoteCompaction(args: {
 	if (!auth.ok) return { outcome: "failed", reason: auth.reason, detail: auth.detail };
 	const identity = auth.identity;
 
-	const request = buildRemoteCompactionRequest({ model, branchEntries: event.branchEntries, identity: auth.identity });
+	const request = buildRemoteCompactionRequest({
+		model,
+		branchEntries: event.branchEntries,
+		identity: auth.identity,
+		firstKeptEntryId: event.preparation.firstKeptEntryId,
+	});
 	if (!request.ok) return { outcome: "failed", reason: request.reason };
 
 	const instructions = ctx.getSystemPrompt();
 	const body: Record<string, unknown> = { model: model.id, input: request.input, instructions };
 	const extras = getCompactionRequestExtras(auth.identity, sessionId);
 	if (extras) {
+		if (extras.tools) body["tools"] = extras.tools;
+		if (extras.parallel_tool_calls !== undefined) body["parallel_tool_calls"] = extras.parallel_tool_calls;
 		if (extras.reasoning) body["reasoning"] = extras.reasoning;
 		if (extras.service_tier !== undefined) body["service_tier"] = extras.service_tier;
 		if (extras.text) body["text"] = extras.text;
+		if (extras.max_output_tokens !== undefined) body["max_output_tokens"] = extras.max_output_tokens;
 		if (extras.prompt_cache_key !== undefined) body["prompt_cache_key"] = extras.prompt_cache_key;
 	}
 
@@ -236,32 +289,41 @@ export async function runNativeRepairCompaction(args: {
 	const auth = await resolveCompactionAuth(ctx, model);
 	if (!auth.ok) return { outcome: "failed", reason: auth.reason, detail: auth.detail };
 	const summarize = args.deps?.nativeSummary ?? generateSummaryWithUsage;
+	const chunks = chunkNativeRepairMessages(preparation.messagesToSummarize, model, preparation.settings.reserveTokens);
+	if (!chunks) return { outcome: "failed", reason: "native-repair-budget-exhausted" };
 	try {
-		const result = await summarize(
-			preparation.messagesToSummarize,
-			model,
-			preparation.settings.reserveTokens,
-			auth.apiKey,
-			auth.headers,
-			event.signal,
-			event.customInstructions,
-			undefined,
-			ctx.thinkingLevel,
-			providerStreamFn(ctx),
-			undefined,
-			undefined,
-			undefined,
-			resolveSessionId(ctx),
-		);
-		if (event.signal.aborted) return { outcome: "aborted" };
-		if (!result.text.trim()) return { outcome: "failed", reason: "empty-summary" };
+		let summary: string | undefined;
+		let usage: Usage | undefined;
+		for (const chunk of chunks) {
+			const result = await summarize(
+				chunk,
+				model,
+				preparation.settings.reserveTokens,
+				auth.apiKey,
+				auth.headers,
+				event.signal,
+				event.customInstructions,
+				summary,
+				ctx.thinkingLevel,
+				providerStreamFn(ctx),
+				undefined,
+				undefined,
+				undefined,
+				resolveSessionId(ctx),
+			);
+			if (event.signal.aborted) return { outcome: "aborted" };
+			if (!result.text.trim()) return { outcome: "failed", reason: "empty-summary" };
+			summary = result.text;
+			usage = addUsage(usage, result.usage);
+		}
+		if (!summary) return { outcome: "failed", reason: "empty-summary" };
 		return {
 			outcome: "success",
 			compaction: {
-				summary: result.text,
+				summary,
 				firstKeptEntryId: preparation.firstKeptEntryId,
 				tokensBefore: preparation.tokensBefore,
-				usage: result.usage,
+				...(usage ? { usage } : {}),
 				details: { readFiles: [], modifiedFiles: [] },
 			},
 		};
@@ -288,6 +350,81 @@ function providerStreamFn(ctx: ExtensionContext): StreamFn {
 		});
 		return pending;
 	}) as StreamFn;
+}
+
+function addUsage(left: Usage | undefined, right: Usage): Usage {
+	if (!left) return structuredClone(right);
+	return {
+		input: left.input + right.input,
+		output: left.output + right.output,
+		cacheRead: left.cacheRead + right.cacheRead,
+		cacheWrite: left.cacheWrite + right.cacheWrite,
+		totalTokens: left.totalTokens + right.totalTokens,
+		cost: {
+			input: left.cost.input + right.cost.input,
+			output: left.cost.output + right.cost.output,
+			cacheRead: left.cost.cacheRead + right.cost.cacheRead,
+			cacheWrite: left.cost.cacheWrite + right.cost.cacheWrite,
+			total: left.cost.total + right.cost.total,
+		},
+	};
+}
+
+function splitText(text: string, maxChars: number): string[] {
+	const chunks: string[] = [];
+	for (let start = 0; start < text.length; start += maxChars) chunks.push(text.slice(start, start + maxChars));
+	return chunks.length > 0 ? chunks : [""];
+}
+
+function splitOversizedSummaryMessage(message: AgentMessage, budget: number): AgentMessage[] | undefined {
+	if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return undefined;
+	const content = message.content;
+	if (typeof content === "string") {
+		return splitText(content, Math.max(64, budget * 3)).map((text) => ({ ...message, content: text } as AgentMessage));
+	}
+	if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== "text") return undefined;
+	const block = content[0];
+	return splitText(block.text, Math.max(64, budget * 3)).map((text) => ({
+		...message,
+		content: [{ ...block, text }],
+	} as AgentMessage));
+}
+
+/**
+ * Bound each native repair request. A single native summary call is allowed
+ * when it fits; otherwise summaries are folded in order through the same
+ * provider, never by sending the entire recovered branch over the context
+ * window. Oversized plain-text messages are split only for this summary input;
+ * tool calls and rich messages fail closed rather than being truncated.
+ */
+function chunkNativeRepairMessages(messages: readonly AgentMessage[], model: Model<Api>, reserveTokens: number): AgentMessage[][] | undefined {
+	const outputBudget = Math.max(16, Math.min(Math.floor(reserveTokens * 0.8), model.maxTokens));
+	const available = model.contextWindow - outputBudget - 512;
+	if (available < 128) return undefined;
+	// Leave room for the previous folded summary on every call after the first.
+	const budget = Math.max(64, Math.floor((available - outputBudget) * 0.5));
+	if (budget < 64) return undefined;
+	const chunks: AgentMessage[][] = [];
+	let current: AgentMessage[] = [];
+	let currentTokens = 0;
+	for (const message of messages) {
+		const pieces = estimateTokens(message) > budget
+			? splitOversizedSummaryMessage(message, budget)
+			: [message];
+		if (!pieces || pieces.some((piece) => estimateTokens(piece) > budget)) return undefined;
+		for (const piece of pieces) {
+			const tokens = estimateTokens(piece);
+			if (current.length > 0 && currentTokens + tokens > budget) {
+				chunks.push(current);
+				current = [];
+				currentTokens = 0;
+			}
+			current.push(piece);
+			currentTokens += tokens;
+		}
+	}
+	if (current.length > 0) chunks.push(current);
+	return chunks.length > 0 ? chunks : undefined;
 }
 
 /**
@@ -371,14 +508,21 @@ export function planContextReplay(args: {
 	storedMessages?: readonly AgentMessage[];
 }): ContextReplayDecision {
 	const checkpoint = resolveSessionCheckpoint(args.branchEntries);
-	if (checkpoint.status !== "remote") return { action: "none" };
 	const model = args.ctx.model;
 	if (!model) return { action: "abort", reason: "missing-model" };
-	if (args.remoteEnabled && identitiesMatch(checkpoint.details.consumer, args.identity ?? compactionIdentity(model))) {
+	if (checkpoint.status === "remote"
+		&& args.remoteEnabled
+		&& identitiesMatch(checkpoint.details.consumer, args.identity ?? compactionIdentity(model))) {
 		return { action: "none" };
 	}
+	if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return { action: "none" };
 	const messages = rebuiltContextMessages(args);
-	return messages ? { action: "replace", messages } : { action: "abort", reason: "live-context-prefix-mismatch" };
+	if (!messages) return { action: "abort", reason: "live-context-prefix-mismatch" };
+	const estimatedTokens = messages.reduce((total, message) => total + estimateTokens(message), 0);
+	if (estimatedTokens > model.contextWindow) {
+		return { action: "abort", reason: "rebuilt-history-exceeds-context-window" };
+	}
+	return { action: "replace", messages };
 }
 
 export type PayloadRewriteDecision =
@@ -400,10 +544,16 @@ export function planPayloadRewrite(args: {
 	identity?: CompactionIdentity;
 }): PayloadRewriteDecision {
 	const checkpoint = resolveSessionCheckpoint(args.branchEntries);
-	if (checkpoint.status !== "remote") return { action: "none" };
 	const model = args.ctx.model;
 	if (!model) return { action: "fail", reason: "missing-model" };
 	const input = readResponsesInput(args.payload);
+	if (checkpoint.status === "invalid") {
+		if (!input) return { action: "fail", reason: "responses-input-missing" };
+		return containsGptCompactionMarker(input)
+			? { action: "fail", reason: "checkpoint-details-invalid" }
+			: { action: "none" };
+	}
+	if (checkpoint.status !== "remote") return { action: "none" };
 	const identity = args.identity ?? compactionIdentity(model);
 	const markerPresent = input ? findSummaryIndex(input, gptCompactionSummary(checkpoint.details.checkpointId)) >= 0 : false;
 	const matchingCheckpointCount = input?.filter((item) => isMatchingCheckpointItem(item, checkpoint.details.checkpoint)).length ?? 0;
@@ -465,6 +615,19 @@ function findSummaryIndex(input: readonly unknown[], marker: string): number {
 			const text = (part as Record<string, unknown>)["text"];
 			return typeof text === "string" && text.includes(marker);
 		});
+	});
+}
+
+function containsGptCompactionMarker(input: readonly unknown[]): boolean {
+	return input.some((item) => {
+		if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+		const record = item as Record<string, unknown>;
+		const content = record["content"];
+		if (typeof content === "string") return content.includes("[GPT remote compaction checkpoint ");
+		if (!Array.isArray(content)) return false;
+		return content.some((part) => part && typeof part === "object" && !Array.isArray(part)
+			&& typeof (part as Record<string, unknown>)["text"] === "string"
+			&& ((part as Record<string, unknown>)["text"] as string).includes("[GPT remote compaction checkpoint "));
 	});
 }
 

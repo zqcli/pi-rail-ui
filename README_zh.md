@@ -95,6 +95,18 @@ Pi Rail UI 注册了以下 slash 命令：
 
 用于在当前 UI 会话中启用或禁用该扩展。
 
+### `/rail-gpt-compaction`
+
+控制全局 GPT Remote Compaction v2 开关：
+
+```text
+/rail-gpt-compaction
+/rail-gpt-compaction on
+/rail-gpt-compaction off
+```
+
+不带参数时显示当前状态；在 TUI 中会打开带当前状态标题的菜单。`on`/`off` 也会通过 slash command completion 提供补全。设置保存在 `getAgentDir()/rail-gpt-compaction/settings.json`，默认是 `off`，并由 TUI、RPC、JSON 以及 Rail 子进程共享。远程压缩目前只对名称包含 GPT 的 `openai-responses` 和 `openai-codex-responses` 生效；Azure OpenAI Responses 暂不属于 v2 支持范围，待 endpoint、query 和认证行为有对应实现与测试后再启用。不符合条件的模型继续使用 Pi 原生压缩。
+
 ### `/rail-duplicate`
 
 将当前 session 复制为同级 session（共享相同的 parent）。

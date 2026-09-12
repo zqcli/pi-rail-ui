@@ -4,7 +4,11 @@ import {
 	type CompactionEntry,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import type { GptCompactionDetails } from "./types";
+import {
+	getGptCompactionDetails,
+	isGptCompactionSummaryText,
+	type GptCompactionDetails,
+} from "./types";
 
 export interface CheckpointBoundary {
 	/** Index of the compaction entry on the current branch. */
@@ -67,6 +71,38 @@ export interface HistoryRebuildResult {
 	messages: AgentMessage[];
 	/** Compaction markers skipped while flattening the branch. */
 	skippedCompactions: number;
+	/** The native boundary whose summary was retained, when one was usable. */
+	nativeBoundary?: NativeHistoryBoundary;
+}
+
+export interface NativeHistoryBoundary {
+	compactionIndex: number;
+	firstKeptIndex: number;
+	entry: CompactionEntry;
+}
+
+function isNativeCompactionEntry(entry: SessionEntry | undefined): entry is CompactionEntry {
+	if (!entry || entry.type !== "compaction") return false;
+	if (getGptCompactionDetails(entry)) return false;
+	return !isGptCompactionSummaryText(entry.summary);
+}
+
+/**
+ * Find the newest native compaction that still has a usable retained-history
+ * anchor. A newer opaque/invalid checkpoint is deliberately not revived here;
+ * the scan only considers native entries at or before the latest unsafe marker
+ * when the caller passes a branch prefix.
+ */
+export function findLatestNativeHistoryBoundary(entries: readonly SessionEntry[]): NativeHistoryBoundary | undefined {
+	for (let compactionIndex = entries.length - 1; compactionIndex >= 0; compactionIndex -= 1) {
+		const entry = entries[compactionIndex];
+		if (!isNativeCompactionEntry(entry)) continue;
+		const firstKeptIndex = findEntryIndex(entries, entry.firstKeptEntryId);
+		if (firstKeptIndex >= 0 && firstKeptIndex < compactionIndex) {
+			return { compactionIndex, firstKeptIndex, entry };
+		}
+	}
+	return undefined;
 }
 
 /**
@@ -82,12 +118,26 @@ export interface HistoryRebuildResult {
 export function rebuildNativeHistory(branchEntries: readonly SessionEntry[]): HistoryRebuildResult {
 	const messages: AgentMessage[] = [];
 	let skippedCompactions = 0;
-	for (const entry of branchEntries) {
+	const nativeBoundary = findLatestNativeHistoryBoundary(branchEntries);
+	const startIndex = nativeBoundary?.firstKeptIndex ?? 0;
+	if (nativeBoundary) messages.push(...sessionEntryToContextMessages(nativeBoundary.entry));
+	for (let index = startIndex; index < branchEntries.length; index += 1) {
+		const entry = branchEntries[index];
+		if (!entry) continue;
 		if (entry.type === "compaction") {
 			skippedCompactions += 1;
 			continue;
 		}
 		messages.push(...sessionEntryToContextMessages(entry));
 	}
-	return { messages, skippedCompactions };
+	return { messages, skippedCompactions, ...(nativeBoundary ? { nativeBoundary } : {}) };
+}
+
+/** Rebuild a branch prefix using the same native-boundary rules as full replay. */
+export function rebuildNativeHistoryPrefix(
+	branchEntries: readonly SessionEntry[],
+	endIndex: number,
+): HistoryRebuildResult | undefined {
+	if (endIndex < 0 || endIndex > branchEntries.length) return undefined;
+	return rebuildNativeHistory(branchEntries.slice(0, endIndex));
 }

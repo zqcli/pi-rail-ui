@@ -21,6 +21,7 @@ const RETRY_MAX_DELAY_MS = 2_000;
 /** Bounds on retained evidence; exceeding them is a protocol failure. */
 const MAX_SSE_EVENTS = 4_096;
 const MAX_SSE_BYTES = 8 * 1024 * 1024;
+const COMPACTION_ITEM_KEYS = new Set(["type", "encrypted_content", "id", "response_id", "output_index"]);
 
 export type RemoteCompactionFailureReason =
 	| "aborted"
@@ -304,6 +305,9 @@ function readCandidate(
 	if (!isRecord(item) || item["type"] !== "compaction" || !isNonEmptyString(item["encrypted_content"])) {
 		return { ok: false, reason: "malformed-compaction-item" };
 	}
+	if (Object.keys(item).some((key) => !COMPACTION_ITEM_KEYS.has(key))) {
+		return { ok: false, reason: "malformed-compaction-item" };
+	}
 	const itemId = optionalNonEmptyString(item, "id");
 	const itemResponseId = readResponseId(item);
 	const itemOutputIndex = optionalOutputIndex(item);
@@ -323,10 +327,15 @@ function readCandidate(
 		return { ok: false, reason: "invalid-compaction-metadata" };
 	}
 	const resolvedResponseId = sourceResponseId.value ?? itemResponseId.value;
+	const canonicalItem: CompactionItem = {
+		type: "compaction",
+		encrypted_content: item["encrypted_content"],
+		...(itemId.value !== undefined ? { id: itemId.value } : {}),
+	};
 	return {
 		ok: true,
 		candidate: {
-			item: structuredClone(item) as CompactionItem,
+			item: canonicalItem,
 			...(resolvedResponseId !== undefined ? { responseId: resolvedResponseId } : {}),
 			...(outputIndex !== undefined ? { outputIndex } : {}),
 			...(outputPosition !== undefined ? { outputPosition } : {}),

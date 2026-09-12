@@ -68,6 +68,20 @@ function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
 }
 
+const COMPACTION_ITEM_KEYS = new Set(["type", "encrypted_content", "id"]);
+
+function hasOnlyCompactionItemKeys(value: Record<string, unknown>): boolean {
+	return Object.keys(value).every((key) => COMPACTION_ITEM_KEYS.has(key));
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+	try {
+		return JSON.stringify(left) === JSON.stringify(right);
+	} catch {
+		return false;
+	}
+}
+
 function isIdentity(value: unknown): value is CompactionIdentity {
 	if (!isRecord(value)) return false;
 	return isNonEmptyString(value["provider"])
@@ -87,7 +101,11 @@ function isBoundary(value: unknown): value is GptCompactionBoundary {
 }
 
 export function isCompactionItem(value: unknown): value is CompactionItem {
-	return isRecord(value) && value["type"] === "compaction" && isNonEmptyString(value["encrypted_content"]);
+	return isRecord(value)
+		&& hasOnlyCompactionItemKeys(value)
+		&& value["type"] === "compaction"
+		&& isNonEmptyString(value["encrypted_content"])
+		&& (value["id"] === undefined || isNonEmptyString(value["id"]));
 }
 
 export function isGptCompactionDetails(value: unknown): value is GptCompactionDetails {
@@ -106,8 +124,9 @@ export function isGptCompactionDetails(value: unknown): value is GptCompactionDe
 		&& isCompactionItem(value["checkpoint"])
 		&& isBoundary(value["boundary"])
 		&& Array.isArray(replacement)
-		&& replacement.length > 0
-		&& replacement.some(isCompactionItem)
+		&& replacement.length === 1
+		&& isCompactionItem(replacement[0])
+		&& sameJson(replacement[0], value["checkpoint"])
 		&& (value["compactResponseId"] === undefined || isNonEmptyString(value["compactResponseId"]))
 		&& isNonEmptyString(value["createdAt"])
 		&& requestMetaValid;
@@ -120,7 +139,10 @@ export function gptCompactionSummary(checkpointId: string): string {
 
 /** True for the summary text this extension writes, including unreadable details. */
 export function isGptCompactionSummaryText(summary: string): boolean {
-	return summary.startsWith(GPT_SUMMARY_PREFIX) && summary.endsWith("]");
+	const start = summary.indexOf(GPT_SUMMARY_PREFIX);
+	if (start < 0) return false;
+	const end = summary.indexOf("]", start + GPT_SUMMARY_PREFIX.length);
+	return end > start + GPT_SUMMARY_PREFIX.length;
 }
 
 export function getGptCompactionDetails(entry: SessionEntry | CompactionEntry | undefined): GptCompactionDetails | undefined {

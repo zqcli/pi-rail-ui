@@ -121,9 +121,33 @@ export function transformMessagesForResponses(messages: readonly Message[], mode
 		if (message.role === "assistant") {
 			flushPending();
 			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+			const isSameModel = message.provider === model.provider
+				&& message.api === model.api
+				&& message.model === model.id;
 			const content: AssistantMessage["content"] = [];
 			for (const block of message.content) {
-				if (block.type !== "thinking" || block.thinkingSignature) content.push(block);
+				if (block.type === "thinking") {
+					// Redacted reasoning and signed reasoning are provider-bound. Pi's
+					// own transformer drops them across model identities; preserve only
+					// ordinary thinking text as plain text so foreign signatures/IDs do
+					// not cross an account or model boundary.
+					if (isSameModel && block.thinkingSignature) {
+						content.push(block);
+					} else if (!block.redacted && block.thinking?.trim()) {
+						content.push({ type: "text", text: block.thinking });
+					}
+					continue;
+				}
+				if (block.type === "text" && !isSameModel) {
+					content.push({ type: "text", text: block.text });
+					continue;
+				}
+				if (block.type === "toolCall" && !isSameModel && block.thoughtSignature) {
+					const { thoughtSignature: _thoughtSignature, ...withoutSignature } = block;
+					content.push(withoutSignature);
+					continue;
+				}
+				content.push(block);
 			}
 			transformed.push({ ...message, content });
 			const toolCalls = content.filter(isToolCall);

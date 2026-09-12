@@ -150,12 +150,13 @@ test("remote cut inside an older retained interval preserves the latest native p
 		model,
 		branchEntries: branch,
 		identity,
-		firstKeptEntryId: "new-user",
+		firstKeptEntryId: "kept-assistant",
 	});
 	assert.equal(request.ok, true);
 	if (!request.ok) return;
 	const serialized = JSON.stringify(request.input);
 	assert.match(serialized, /latest native prefix summary/);
+	assert.match(serialized, /retained user/);
 	assert.equal(serialized.match(/latest native prefix summary/gu)?.length, 1);
 	assert.doesNotMatch(serialized, /history covered by native summary|old answer/);
 });
@@ -624,6 +625,46 @@ test("native repair summarizes rebuilt records after remote mode is disabled", a
 		assert.equal(result.compaction.firstKeptEntryId, "u2");
 		assert.equal(result.compaction.summary, "native repair summary");
 	}
+});
+
+test("native repair keeps a native summary that is physically after an older cut", async () => {
+	const oldUser = message("prefix-old-user", null, "old history");
+	const oldAssistant = message("prefix-old-assistant", "prefix-old-user", "old answer", "assistant");
+	const keptUser = message("prefix-kept-user", "prefix-old-assistant", "kept user");
+	const keptAssistant = message("prefix-kept-assistant", "prefix-kept-user", "kept answer", "assistant");
+	const native = {
+		type: "compaction",
+		id: "prefix-native",
+		parentId: "prefix-kept-assistant",
+		timestamp: "2025-01-01T00:00:03.000Z",
+		summary: "native prefix summary",
+		firstKeptEntryId: "prefix-kept-user",
+		tokensBefore: 100,
+		details: { readFiles: [], modifiedFiles: [] },
+	} as SessionEntry;
+	const newUser = message("prefix-new-user", "prefix-native", "new user");
+	const calls: any[][] = [];
+	const result = await runNativeRepairCompaction({
+		event: {
+			branchEntries: [oldUser, oldAssistant, keptUser, keptAssistant, native, newUser],
+			preparation: { firstKeptEntryId: "prefix-kept-assistant", messagesToSummarize: [], turnPrefixMessages: [], isSplitTurn: false, tokensBefore: 100, fileOps: { read: new Set(), edited: new Set() }, settings: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
+			signal: new AbortController().signal,
+			customInstructions: undefined,
+			reason: "manual",
+			willRetry: false,
+		} as any,
+		ctx: { model, thinkingLevel: "off", getSystemPrompt: () => "system", sessionManager: { getSessionId: () => "prefix-repair" }, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "repair-key", baseUrl: model.baseUrl }) } } as any,
+		deps: {
+			nativeSummary: async (messages: any[]) => {
+				calls.push(messages);
+				return { text: "repaired prefix", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+			},
+		},
+	});
+	assert.equal(result.outcome, "success");
+	assert.equal(calls.length, 1);
+	assert.match(JSON.stringify(calls[0]), /native prefix summary|kept user/);
+	assert.doesNotMatch(JSON.stringify(calls[0]), /old history|old answer/);
 });
 
 test("native repair folds an oversized recovered history in bounded summary calls", async () => {

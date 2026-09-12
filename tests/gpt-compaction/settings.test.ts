@@ -51,6 +51,10 @@ test("the real extension registration exposes stateful menu, completion, and per
 			commandRegistrations += 1;
 			commands.set(name, command);
 		},
+		events: {
+			emit: () => {},
+			on: () => () => {},
+		},
 		on: (event: string, handler: unknown) => handlers.set(event, handler),
 	} as any;
 	installGptCompaction(pi);

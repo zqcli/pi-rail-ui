@@ -202,6 +202,40 @@ test("real Pi blocks an invalid Rail marker before the provider sees it", { time
 	assert.match(JSON.stringify(provider["payload"]), /original history/);
 });
 
+test("real CLI root and standalone extensions deduplicate in either load order", { timeout: 60_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-dedup-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const extensionOrders: Array<[string, string]> = [[railExtension, gptCompactionExtension], [gptCompactionExtension, railExtension]];
+	for (const [index, extensions] of extensionOrders.entries()) {
+		const agentDir = join(sandbox, `agent-${index}`);
+		const sessionPath = join(sandbox, `session-${index}.jsonl`);
+		await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+		await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+		await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 1 }, retry: { enabled: false } }));
+		await writePlainSeedSession(sessionPath);
+		const transport = new PiRpcProcessTransport({
+			command: process.execPath,
+			args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", extensions[0], "-e", extensions[1], "--model", "cus-resp/gpt-5.6-sol"],
+			cwd: process.cwd(),
+			env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir, RAIL_GPT_COMPACTION_GATEWAY: gateway },
+		});
+		await transport.start();
+		try {
+			const commandResult = await transport.request({ type: "get_commands" }) as { commands?: Array<{ name?: string }> };
+			assert.equal(commandResult.commands?.filter((command) => command.name === "rail-gpt-compaction").length, 1);
+			assert.equal(commandResult.commands?.some((command) => command.name?.startsWith("rail-gpt-compaction:")), false);
+			await transport.request({ type: "compact" });
+		} finally {
+			await transport.stop();
+		}
+	}
+	assert.equal(requests.length, 2, "both load orders must perform exactly one remote request");
+});
+
 test("real RPC manual compaction uses the mocked Responses v2 handshake and persists the opaque checkpoint", { timeout: 30_000 }, async (t) => {
 	const { server, gateway, requests } = await startMockCompactionServer();
 	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-rpc-"));
@@ -373,6 +407,124 @@ test("slash off repairs an oversized remote leaf before the next prompt", { time
 	}
 });
 
+test("a live worker preflights global off before a multi-turn tool run", { timeout: 60_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-off-tool-worker-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	const logPath = join(sandbox, "tool-loop.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath, 20_000);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", toolLoopFixture, "-e", gptCompactionExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir, RAIL_GPT_COMPACTION_GATEWAY: gateway, RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000", RAIL_GPT_COMPACTION_TOOL_LOG: logPath },
+	});
+	const events: Array<Record<string, any>> = [];
+	const unsubscribe = transport.onEvent((event) => events.push(event as Record<string, any>));
+	const waitFor = (type: string) => new Promise<void>((resolve) => {
+		const listener = (event: Record<string, any>) => {
+			if (event["type"] !== type) return;
+			unsubscribeEvent();
+			resolve();
+		};
+		const unsubscribeEvent = transport.onEvent(listener);
+	});
+	await transport.start();
+	try {
+		const remoteCompaction = waitFor("compaction_end");
+		await transport.request({ type: "compact" });
+		await remoteCompaction;
+		await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "off" }));
+		const settled = waitFor("agent_settled");
+		await transport.request({ type: "prompt", message: "run tool loop after global off" });
+		await settled;
+	} finally {
+		unsubscribe();
+		await transport.stop();
+	}
+	assert.equal(requests.length, 1, "the live worker must not send a second Remote v2 request after off");
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	const compactions = saved.filter((entry) => entry["type"] === "compaction");
+	assert.equal(compactions.filter((entry) => entry["details"]?.["strategy"] === "gpt-remote-compaction-v2").length, 1);
+	const nativeCompactions = compactions.filter((entry) => entry["details"]?.["strategy"] === undefined);
+	assert.equal(nativeCompactions.length, 1);
+	assert.ok(nativeCompactions[0]?.["usage"], "native repair usage must be persisted");
+	assert.equal(events.filter((event) => event["type"] === "compaction_start").length, 2);
+	const nativeEnds = events.filter((event) => event["type"] === "compaction_end" && event["result"]?.["details"]?.["strategy"] === undefined);
+	assert.equal(nativeEnds.length, 1);
+	assert.ok(nativeEnds[0]?.["result"]?.["usage"], "native repair must publish usage once");
+	const records = (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
+	const providerRecords = records.filter((record) => record["kind"] === "provider");
+	assert.ok(providerRecords.length >= 4, "the same run must include multiple tool/provider turns");
+	assert.ok(records.some((record) => record["kind"] === "tool"));
+	for (const record of providerRecords) {
+		assert.doesNotMatch(JSON.stringify(record), /opaque-server-checkpoint|GPT remote compaction checkpoint/);
+		const promptCount = JSON.stringify(record).split("run tool loop after global off").length - 1;
+		if (promptCount > 0) assert.equal(promptCount, 1, "the live prompt must occur exactly once in every later payload");
+	}
+});
+
+test("cancelling native repair restores the original opaque leaf", { timeout: 60_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-cancel-repair-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath, 20_000);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", gptCompactionExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir, RAIL_GPT_COMPACTION_GATEWAY: gateway, RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000", RAIL_GPT_COMPACTION_PROBE_DELAY_MS: "1000" },
+	});
+	const events: Array<Record<string, any>> = [];
+	const unsubscribe = transport.onEvent((event) => events.push(event as Record<string, any>));
+	const waitForCompactionStart = (count: number) => new Promise<void>((resolve) => {
+		const listener = (event: Record<string, any>) => {
+			if (event["type"] !== "compaction_start" || events.filter((item) => item["type"] === "compaction_start").length < count) return;
+			unsubscribeEvent();
+			resolve();
+		};
+		const unsubscribeEvent = transport.onEvent(listener);
+	});
+	await transport.start();
+	try {
+		const firstStart = waitForCompactionStart(1);
+		await transport.request({ type: "compact" });
+		await firstStart;
+		await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "off" }));
+		const secondStart = waitForCompactionStart(2);
+		const prompt = transport.request({ type: "prompt", message: "cancel repair" }).catch(() => undefined);
+		await secondStart;
+		await transport.request({ type: "abort" });
+		await prompt;
+	} finally {
+		unsubscribe();
+		await transport.stop();
+	}
+	assert.equal(requests.length, 1, "cancelled repair must not make a Remote v2 request");
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	const compactions = saved.filter((entry) => entry["type"] === "compaction");
+	assert.equal(compactions.length, 1, "cancelled repair must not install a native replacement");
+	assert.equal(compactions[0]?.["details"]?.["strategy"], "gpt-remote-compaction-v2");
+	const ends = events.filter((event) => event["type"] === "compaction_end");
+	assert.equal(ends.filter((event) => event["aborted"] === true).length, 1);
+});
+
 test("resume with global off repairs an oversized opaque history before provider I/O", { timeout: 60_000 }, async (t) => {
 	const { server, gateway, requests } = await startMockCompactionServer();
 	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-resume-off-"));
@@ -426,6 +578,63 @@ test("resume with global off repairs an oversized opaque history before provider
 	assert.equal(compactions.at(-1)?.["details"]?.strategy, undefined);
 	const records = (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
 	assert.ok(records.some((record) => JSON.stringify(record).includes("resumed after global off")));
+	assert.doesNotMatch(JSON.stringify(records), /opaque-server-checkpoint|GPT remote compaction checkpoint/);
+});
+
+test("resume with a changed account repairs an oversized remote branch while mode stays on", { timeout: 60_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-account-resume-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	const logPath = join(sandbox, "provider.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath, 20_000);
+	const makeTransport = () => new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", gptCompactionExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir, RAIL_GPT_COMPACTION_GATEWAY: gateway, RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000", RAIL_GPT_COMPACTION_PROBE_LOG: logPath },
+	});
+	const first = makeTransport();
+	await first.start();
+	try {
+		await first.request({ type: "compact" });
+	} finally {
+		await first.stop();
+	}
+	const entries = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	const remote = entries.find((entry) => entry["type"] === "compaction");
+	if (!remote) throw new Error("remote checkpoint missing");
+	remote["details"]["producer"]["authFingerprint"] = "foreign-account";
+	remote["details"]["consumer"]["authFingerprint"] = "foreign-account";
+	await writeFile(sessionPath, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+	const resumed = makeTransport();
+	await resumed.start();
+	try {
+		const settled = new Promise<void>((resolve) => {
+			const listener = resumed.onEvent((event) => {
+				if (event.type !== "agent_settled") return;
+				listener();
+				resolve();
+			});
+		});
+		await resumed.request({ type: "prompt", message: "resume after account change" });
+		await settled;
+	} finally {
+		await resumed.stop();
+	}
+	assert.equal(requests.length, 1, "account repair must not reuse opaque Remote v2 state");
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	const compactions = saved.filter((entry) => entry["type"] === "compaction");
+	assert.equal(compactions.at(-1)?.["details"]?.["strategy"], undefined);
+	const records = (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
+	assert.ok(records.some((record) => JSON.stringify(record).includes("resume after account change")));
 	assert.doesNotMatch(JSON.stringify(records), /opaque-server-checkpoint|GPT remote compaction checkpoint/);
 });
 

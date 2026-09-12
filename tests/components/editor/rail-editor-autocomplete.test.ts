@@ -77,6 +77,34 @@ describe("rail editor autocomplete seam", () => {
 		assert.equal(editor.autocompleteState, null);
 	});
 
+	test("keeps GPT compaction command arguments in the editor", () => {
+		const provider = new CombinedAutocompleteProvider([{ name: "rail-gpt-compaction" }], process.cwd());
+		const editor = {
+			state: { lines: ["/rail-gpt-compaction o"], cursorLine: 0, cursorCol: 22 },
+			autocompleteState: {} as unknown,
+			autocompleteProvider: provider,
+			autocompletePrefix: "/rail-gpt-compaction o",
+			autocompleteList: { getSelectedItem: () => ({ value: "rail-gpt-compaction", label: "rail-gpt-compaction" }) },
+			cancelAutocomplete() {
+				this.autocompleteState = null;
+			},
+			getText() {
+				return this.state.lines.join("\\n");
+			},
+		};
+
+		const handled = completeSlashCommandWithoutSubmit({
+			editor,
+			data: "enter",
+			keybindings: { matches: () => true },
+			requestRender: () => {},
+		});
+
+		assert.equal(handled, true);
+		assert.equal(editor.getText(), "/rail-gpt-compaction ");
+		assert.equal(editor.autocompleteState, null);
+	});
+
 	test("leaves slash commands without parameters to the editor implementation", () => {
 		const editor = {
 			state: { lines: ["/set"], cursorLine: 0, cursorCol: 4 },

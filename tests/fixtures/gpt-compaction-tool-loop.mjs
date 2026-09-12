@@ -15,11 +15,12 @@ function streamLoop(model, context, options) {
 		providerCalls += 1;
 		const assistantTurns = context.messages.filter((message) => message.role === "assistant").length;
 		log({ kind: "provider", call: providerCalls, assistantTurns, messages: context.messages });
-		const shouldFinish = assistantTurns >= 3;
+		const summarizing = context.systemPrompt?.includes("context summarization assistant") === true;
+		const shouldFinish = summarizing || assistantTurns >= 3;
 		const message = {
 			role: "assistant",
 			content: shouldFinish
-				? [{ type: "text", text: "tool loop complete" }]
+				? [{ type: "text", text: summarizing ? "native repair summary" : "tool loop complete" }]
 				: [{ type: "toolCall", id: `loop-call-${providerCalls}`, name: "gpt_compaction_loop_tool", arguments: { call: providerCalls } }],
 			api: model.api,
 			provider: model.provider,

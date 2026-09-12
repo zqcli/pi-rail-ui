@@ -22,6 +22,8 @@ function streamProbe(model, context, options) {
 	const stream = createAssistantMessageEventStream();
 	(async () => {
 		try {
+			const delayMs = Number(process.env.RAIL_GPT_COMPACTION_PROBE_DELAY_MS ?? 0);
+			if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
 			providerCalls += 1;
 			let payload = {
 				model: model.id,

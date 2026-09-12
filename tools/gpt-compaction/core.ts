@@ -472,7 +472,7 @@ function currentBranchMessagesBeforeCut(
 ): AgentMessage[] | undefined {
 	const cutIndex = branchEntries.findIndex((entry) => entry.id === firstKeptEntryId);
 	if (cutIndex < 0) return undefined;
-	return rebuiltBranchMessages(branchEntries.slice(0, cutIndex));
+	return rebuildNativeHistoryPrefix(branchEntries, cutIndex)?.messages;
 }
 
 export function rememberLiveRequestContext(ctx: ExtensionContext, payload: unknown): void {

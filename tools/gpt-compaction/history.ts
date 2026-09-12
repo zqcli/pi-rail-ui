@@ -88,10 +88,10 @@ function isNativeCompactionEntry(entry: SessionEntry | undefined): entry is Comp
 }
 
 /**
- * Find the newest native compaction that still has a usable retained-history
- * anchor. A newer opaque/invalid checkpoint is deliberately not revived here;
- * the scan only considers native entries at or before the latest unsafe marker
- * when the caller passes a branch prefix.
+ * Find the newest native compaction whose logical retained-history anchor is
+ * inside the requested prefix. The compaction entry may be physically after the
+ * cut: its summary still covers the history before firstKeptEntryId, and using
+ * the complete branch avoids losing that summary at an older retained cut.
  */
 export function findLatestNativeHistoryBoundary(entries: readonly SessionEntry[]): NativeHistoryBoundary | undefined {
 	return findLatestNativeHistoryBoundaryInRange(entries, 0, entries.length);
@@ -106,7 +106,7 @@ export function findLatestNativeHistoryBoundaryInRange(
 		const entry = entries[compactionIndex];
 		if (!isNativeCompactionEntry(entry)) continue;
 		const firstKeptIndex = findEntryIndex(entries, entry.firstKeptEntryId);
-		if (compactionIndex >= startIndex && compactionIndex < endIndex && firstKeptIndex >= startIndex && firstKeptIndex < endIndex && firstKeptIndex < compactionIndex) {
+		if (firstKeptIndex >= startIndex && firstKeptIndex < endIndex && firstKeptIndex < compactionIndex) {
 			return { compactionIndex, firstKeptIndex, entry };
 		}
 	}

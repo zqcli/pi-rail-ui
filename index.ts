@@ -13,6 +13,7 @@ import { installExecutionRails, uninstallExecutionRails } from "./components/exe
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
 import { installGutter, uninstallGutter } from "./rail/gutter";
+import { installGptCompaction } from "./tools/gpt-compaction/extension";
 import { installApplyPatchTool, installRailSubagent } from "./tools";
 
 export * from "./config";
@@ -31,6 +32,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	installApplyPatchTool(pi);
 	installRailFast(pi);
 	installRailOaiSearch(pi);
+	installGptCompaction(pi);
 
 	function installEditor(ctx: ExtensionContext) {
 		ctx.ui.setEditorComponent((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => {

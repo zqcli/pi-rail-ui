@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { resolve, join } from "node:path";
+import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
@@ -59,11 +61,20 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 	});
 });
 
-test("stateless runner can opt into an ephemeral session for real compaction lifecycle tests", async () => {
+test("production stateless runner enables an ephemeral session from the persisted GPT setting", async (t) => {
+	const agentDir = await mkdtemp(join(tmpdir(), "rail-stateless-gpt-setting-"));
+	t.after(() => rm(agentDir, { recursive: true, force: true }));
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+	process.env["PI_CODING_AGENT_DIR"] = agentDir;
+	t.after(() => {
+		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+	});
 	let capturedArgs: string[] = [];
 	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
 	const runner = createStatelessAgentRunner({
-		useSessionForCompaction: true,
 		resolveInvocation: (args) => {
 			capturedArgs = args;
 			return { command: process.execPath, args: [fixture] };
@@ -72,6 +83,50 @@ test("stateless runner can opt into an ephemeral session for real compaction lif
 	await runner({ model, task: "ephemeral compaction", cwd: process.cwd() });
 	assert.equal(capturedArgs.includes("--no-session"), false);
 	assert.equal(capturedArgs.includes("--session"), true);
+	assert.equal(capturedArgs.some((arg) => arg.endsWith("standalone-extension.ts")), true);
+	const sessionIndex = capturedArgs.indexOf("--session");
+	const sessionPath = capturedArgs[sessionIndex + 1];
+	assert.ok(sessionPath);
+	await assert.rejects(access(sessionPath), /ENOENT/);
+	let failedSessionPath: string | undefined;
+	const failingRunner = createStatelessAgentRunner({
+		resolveInvocation: (args) => {
+			const index = args.indexOf("--session");
+			failedSessionPath = args[index + 1];
+			throw new Error("invocation construction failed");
+		},
+	});
+	await assert.rejects(failingRunner({ model, task: "setup failure", cwd: process.cwd() }), /invocation construction failed/);
+	assert.ok(failedSessionPath);
+	await assert.rejects(access(failedSessionPath), /ENOENT/);
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "off" }));
+	capturedArgs = [];
+	await runner({ model, task: "setting changed between dispatches", cwd: process.cwd() });
+	assert.equal(capturedArgs.includes("--no-session"), true);
+	assert.equal(capturedArgs.some((arg) => arg.endsWith("standalone-extension.ts")), false);
+});
+
+test("GPT setting does not change native stateless semantics for a non-GPT model", async (t) => {
+	const agentDir = await mkdtemp(join(tmpdir(), "rail-stateless-non-gpt-setting-"));
+	t.after(() => rm(agentDir, { recursive: true, force: true }));
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+	process.env["PI_CODING_AGENT_DIR"] = agentDir;
+	t.after(() => {
+		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+	});
+	let capturedArgs: string[] = [];
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: (args) => {
+			capturedArgs = args;
+			return { command: process.execPath, args: [resolve("tests/fixtures/fake-pi-json.mjs")] };
+		},
+	});
+	await runner({ model: { provider: "cus-resp", modelId: "deepseek-v4" }, task: "native only", cwd: process.cwd() });
+	assert.equal(capturedArgs.includes("--no-session"), true);
+	assert.equal(capturedArgs.some((arg) => arg.endsWith("standalone-extension.ts")), false);
 });
 
 test("stateless runner adds the explicit context helper only for an explicit budget", async () => {

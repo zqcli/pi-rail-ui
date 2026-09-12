@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, formatContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
+import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
+import { isGptModelName } from "../gpt-compaction/model-eligibility";
+import { readGptCompactionSettings } from "../gpt-compaction/settings";
 import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
 import type { WorkerRunResult } from "./session-broker";
@@ -29,8 +32,6 @@ export type StatelessAgentRunner = (request: StatelessRunRequest) => Promise<Sta
 
 export interface StatelessAgentRunnerOptions {
 	resolveInvocation?: (args: string[]) => PiInvocation;
-	/** Run JSON through an ephemeral session so Pi's real compaction lifecycle is available. */
-	useSessionForCompaction?: boolean;
 }
 
 export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions = {}): StatelessAgentRunner {
@@ -42,9 +43,12 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		const contextWindow = settings
 			? validateContextWindowReserve(requestedContextWindow, settings.reserveTokens, settings.enabled)
 			: undefined;
-		const ephemeralSessionDir = options.useSessionForCompaction ? await mkdtemp(join(tmpdir(), "pi-rail-stateless-compaction-")) : undefined;
+		const gptCompactionEnabled = readGptCompactionSettings().mode === "on"
+			&& (isGptModelName(request.model.modelId) || isGptModelName(request.model.name));
+		const ephemeralSessionDir = gptCompactionEnabled ? await mkdtemp(join(tmpdir(), "pi-rail-stateless-compaction-")) : undefined;
 		const ephemeralSessionPath = ephemeralSessionDir ? join(ephemeralSessionDir, "session.jsonl") : undefined;
 		const args = ["--mode", "json", "-p", ...(ephemeralSessionPath ? ["--session", ephemeralSessionPath] : ["--no-session"]), "--model", railModelKey(request.model)];
+		if (gptCompactionEnabled) args.push("-e", gptCompactionExtensionPath());
 		if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
 		args.push("--exclude-tools", "subagent");
 		if (contextWindow !== undefined) {

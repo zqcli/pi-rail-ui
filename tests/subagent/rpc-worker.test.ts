@@ -7,6 +7,7 @@ import {
 	type RpcTransport,
 } from "../../tools/subagents/rpc-worker";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools/subagents/context-window";
+import { gptCompactionExtensionPath } from "../../tools/gpt-compaction/extension";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
 
@@ -210,6 +211,7 @@ describe("RPC worker arguments", () => {
 			"--model", "cus-resp/gpt-5.6-sol",
 			"--thinking", "xhigh",
 			"--exclude-tools", "subagent",
+			"-e", gptCompactionExtensionPath(),
 			"-e", contextExtensionPath(), "--rail-context-protocol", "1",
 		]);
 	});

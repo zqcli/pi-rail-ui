@@ -96,6 +96,35 @@ async function runProbe(agentDir: string, sessionPath: string, logPath: string, 
 	return { code, stdout, stderr };
 }
 
+async function runStatelessProbe(agentDir: string, gateway: string, logPath: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+	const child = spawn(process.execPath, [
+		bundleCli,
+		"--mode", "json", "-p", "--no-session", "--no-extensions", "--offline",
+		"-e", providerFixture,
+		"-e", railExtension,
+		"--model", "cus-resp/gpt-5.6-sol",
+		"stateless compaction ".repeat(30_000),
+	], {
+		cwd: process.cwd(),
+		env: {
+			...process.env,
+			PI_OFFLINE: "1",
+			PI_SKIP_VERSION_CHECK: "1",
+			PI_CODING_AGENT_DIR: agentDir,
+			RAIL_GPT_COMPACTION_GATEWAY: gateway,
+			RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000",
+			RAIL_GPT_COMPACTION_PROBE_LOG: logPath,
+		},
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+	child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+	const code = await new Promise<number | null>((resolve) => child.once("close", (exitCode) => resolve(exitCode)));
+	return { code, stdout, stderr };
+}
+
 async function readProbe(logPath: string): Promise<Record<string, any>> {
 	const content = await readFile(logPath, "utf8");
 	const record = content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>).find((entry) => entry["kind"] === "provider");
@@ -170,6 +199,26 @@ test("real RPC manual compaction uses the mocked Responses v2 handshake and pers
 	if (!compaction) throw new Error(`remote compaction entry missing: ${JSON.stringify(saved)}`);
 	assert.equal(compaction["details"]?.checkpoint?.encrypted_content, "opaque-server-checkpoint");
 	assert.match(compaction["summary"], /GPT remote compaction checkpoint/);
+});
+
+test("real Pi stateless JSON mode loads the root extension without a session", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-stateless-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const logPath = join(sandbox, "provider.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	const result = await runStatelessProbe(agentDir, gateway, logPath);
+	assert.equal(result.code, 0, result.stderr);
+	assert.match(result.stdout, /gpt-compaction-probe/);
+	assert.equal(requests.length, 0, "--no-session must not attempt to persist or remotely compact a session");
+	const providerCalls = (await readFile(logPath, "utf8")).split("\n").filter((line) => line.includes('"kind":"provider"'));
+	assert.equal(providerCalls.length, 1);
 });
 
 test("real RPC threshold compaction invokes Remote v2 before the next provider turn", { timeout: 30_000 }, async (t) => {

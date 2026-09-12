@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, formatContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
 import { railModelKey, type RailModelRef } from "./models";
@@ -26,6 +29,8 @@ export type StatelessAgentRunner = (request: StatelessRunRequest) => Promise<Sta
 
 export interface StatelessAgentRunnerOptions {
 	resolveInvocation?: (args: string[]) => PiInvocation;
+	/** Run JSON through an ephemeral session so Pi's real compaction lifecycle is available. */
+	useSessionForCompaction?: boolean;
 }
 
 export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions = {}): StatelessAgentRunner {
@@ -37,7 +42,9 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		const contextWindow = settings
 			? validateContextWindowReserve(requestedContextWindow, settings.reserveTokens, settings.enabled)
 			: undefined;
-		const args = ["--mode", "json", "-p", "--no-session", "--model", railModelKey(request.model)];
+		const ephemeralSessionDir = options.useSessionForCompaction ? await mkdtemp(join(tmpdir(), "pi-rail-stateless-compaction-")) : undefined;
+		const ephemeralSessionPath = ephemeralSessionDir ? join(ephemeralSessionDir, "session.jsonl") : undefined;
+		const args = ["--mode", "json", "-p", ...(ephemeralSessionPath ? ["--session", ephemeralSessionPath] : ["--no-session"]), "--model", railModelKey(request.model)];
 		if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
 		args.push("--exclude-tools", "subagent");
 		if (contextWindow !== undefined) {
@@ -49,7 +56,13 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		}
 		args.push(`Task: ${request.task}`);
 
-		const invocation = (options.resolveInvocation ?? resolvePiInvocation)(args);
+		let invocation: PiInvocation;
+		try {
+			invocation = (options.resolveInvocation ?? resolvePiInvocation)(args);
+		} catch (error) {
+			if (ephemeralSessionDir) await rm(ephemeralSessionDir, { recursive: true, force: true });
+			throw error;
+		}
 		const collector = new RunResultCollector(request.task, strictAssistantText);
 		let stderr = "";
 		let protocolErrorEvent: string | undefined;
@@ -69,7 +82,9 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 			}
 			if (!updateTimer) updateTimer = setTimeout(publishUpdate, 80);
 		};
-		const exitCode = await new Promise<number>((resolve) => {
+		let exitCode: number;
+		try {
+			exitCode = await new Promise<number>((resolve) => {
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: request.cwd,
 					env: {
@@ -135,7 +150,10 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 					request.signal?.removeEventListener("abort", abort);
 					if (killTimer) clearTimeout(killTimer);
 				});
-		});
+			});
+		} finally {
+			if (ephemeralSessionDir) await rm(ephemeralSessionDir, { recursive: true, force: true });
+		}
 		if (updateTimer) clearTimeout(updateTimer);
 		collector.markSettled();
 		if (aborted) {

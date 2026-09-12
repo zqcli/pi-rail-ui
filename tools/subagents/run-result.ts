@@ -1,6 +1,6 @@
 import { SubagentTranscript } from "./transcript";
 import type { SubagentUsage, WorkerRunResult } from "./session-broker";
-import { addCompletedAssistantUsage, emptySubagentUsage, providerReportedUsage, usageWithActiveTurn } from "./usage";
+import { addCompactionUsage, addCompletedAssistantUsage, emptySubagentUsage, providerReportedUsage, usageWithActiveTurn } from "./usage";
 
 interface JsonAssistantMessage {
 	role?: string;
@@ -64,6 +64,7 @@ export class RunResultCollector {
 	private stopReasonValue: string | undefined;
 	private errorMessageValue: string | undefined;
 	private isCompactingValue = false;
+	private compactionUsageAdded = false;
 
 	constructor(task: string, extractAssistantText: AssistantTextExtractor) {
 		this.transcript = new SubagentTranscript(task);
@@ -94,6 +95,10 @@ export class RunResultCollector {
 				this.stopReasonValue = message.stopReason;
 				this.errorMessageValue = message.errorMessage;
 			}
+		}
+		if (event.type === "compaction_start") this.compactionUsageAdded = false;
+		if (event.type === "compaction_end" && !this.compactionUsageAdded) {
+			this.compactionUsageAdded = addCompactionUsage(this.usage, event["result"]);
 		}
 		return activityChanged || transcriptChanged || (event.type === "message_update" && this.activeUsage !== undefined);
 	}

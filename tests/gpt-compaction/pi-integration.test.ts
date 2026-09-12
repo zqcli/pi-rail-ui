@@ -1,0 +1,278 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { test } from "node:test";
+import { gptCompactionSummary } from "../../tools/gpt-compaction/types";
+import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
+
+const bundleCli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
+const railExtension = fileURLToPath(new URL("../../index.ts", import.meta.url));
+const providerFixture = fileURLToPath(new URL("../fixtures/gpt-compaction-probe.mjs", import.meta.url));
+
+async function writeSeedSession(path: string): Promise<void> {
+	const authFingerprint = createHash("sha256").update("api-key:probe-key").digest("hex");
+	const checkpoint = { type: "compaction", encrypted_content: "opaque-checkpoint-for-probe" };
+	const details = {
+		version: 2,
+		strategy: "gpt-remote-compaction-v2",
+		checkpointId: "probe-checkpoint",
+		producer: { provider: "cus-resp", api: "openai-responses", model: "gpt-5.6-sol", baseUrl: "https://gateway.example/v1", authFingerprint },
+		consumer: { provider: "cus-resp", api: "openai-responses", model: "gpt-5.6-sol", baseUrl: "https://gateway.example/v1", authFingerprint },
+		checkpoint,
+		replacement: [checkpoint],
+		boundary: { parentEntryId: "seed-assistant", firstKeptEntryId: "seed-user", tokensBefore: 100 },
+		createdAt: "2025-01-01T00:00:03.000Z",
+	};
+	const entries = [
+		{ type: "session", version: 3, id: "probe-session", timestamp: "2025-01-01T00:00:00.000Z", cwd: process.cwd() },
+		{ type: "message", id: "seed-user", parentId: null, timestamp: "2025-01-01T00:00:01.000Z", message: { role: "user", content: [{ type: "text", text: "original history" }], timestamp: 1735689601000 } },
+		{ type: "message", id: "seed-assistant", parentId: "seed-user", timestamp: "2025-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "original answer" }], api: "openai-responses", provider: "cus-resp", model: "gpt-5.6-sol", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 1735689602000 } },
+		{ type: "compaction", id: "seed-compaction", parentId: "seed-assistant", timestamp: "2025-01-01T00:00:03.000Z", summary: `The conversation history before this point was compacted into the following summary:\n\n<summary>\n${gptCompactionSummary("probe-checkpoint")}\n</summary>`, firstKeptEntryId: "seed-user", tokensBefore: 100, details, fromHook: true },
+	].map((entry) => JSON.stringify(entry)).join("\n");
+	await writeFile(path, `${entries}\n`);
+}
+
+async function writePlainSeedSession(path: string): Promise<void> {
+	const history = "history before manual compaction ".repeat(2_000);
+	const entries = [
+		{ type: "session", version: 3, id: "plain-probe-session", timestamp: "2025-01-01T00:00:00.000Z", cwd: process.cwd() },
+		{ type: "message", id: "plain-user", parentId: null, timestamp: "2025-01-01T00:00:01.000Z", message: { role: "user", content: [{ type: "text", text: history }], timestamp: 1735689601000 } },
+		{ type: "message", id: "plain-assistant", parentId: "plain-user", timestamp: "2025-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "previous answer" }], api: "openai-responses", provider: "cus-resp", model: "gpt-5.6-sol", usage: { input: 10_000, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 10_001, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 1735689602000 } },
+	].map((entry) => JSON.stringify(entry)).join("\n");
+	await writeFile(path, `${entries}\n`);
+}
+
+async function startMockCompactionServer(): Promise<{
+	server: ReturnType<typeof createServer>;
+	gateway: string;
+	requests: Array<{ url: string | undefined; body: Record<string, any> }>;
+}> {
+	const requests: Array<{ url: string | undefined; body: Record<string, any> }> = [];
+	const server = createServer((request, response) => {
+		let raw = "";
+		request.setEncoding("utf8");
+		request.on("data", (chunk) => { raw += chunk; });
+		request.on("end", () => {
+			requests.push({ url: request.url, body: JSON.parse(raw) as Record<string, any> });
+			const checkpoint = { type: "compaction", id: "mock-item", encrypted_content: "opaque-server-checkpoint" };
+			const events = [
+				`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "mock-response" } })}\n\n`,
+				`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "mock-response", status: "completed", output: [checkpoint], usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12, input_tokens_details: { cached_tokens: 0 } }, created_at: 1_735_689_600 } })}\n\n`,
+			].join("");
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(events);
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("mock server did not bind");
+	return { server, gateway: `http://127.0.0.1:${address.port}/v1`, requests };
+}
+
+async function runProbe(agentDir: string, sessionPath: string, logPath: string, mode: "on" | "off"): Promise<{ code: number | null; stdout: string; stderr: string }> {
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: mode }));
+	const child = spawn(process.execPath, [
+		bundleCli,
+		"--mode", "json", "--session", sessionPath, "--no-extensions", "--offline",
+		"-e", providerFixture,
+		"-e", railExtension,
+		"--model", "cus-resp/gpt-5.6-sol",
+		"-p", "latest live instruction",
+	], {
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir, RAIL_GPT_COMPACTION_PROBE_LOG: logPath },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+	child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+	const code = await new Promise<number | null>((resolve) => child.once("close", (exitCode) => resolve(exitCode)));
+	return { code, stdout, stderr };
+}
+
+async function readProbe(logPath: string): Promise<Record<string, any>> {
+	const content = await readFile(logPath, "utf8");
+	const record = content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>).find((entry) => entry["kind"] === "provider");
+	if (!record) throw new Error(`provider record missing: ${content}`);
+	return record;
+}
+
+test("real Pi 0.85.1 loads the root extension and preserves live input in off/on replay", { timeout: 30_000 }, async (t) => {
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-"));
+	t.after(() => rm(sandbox, { recursive: true, force: true }));
+
+	for (const mode of ["off", "on"] as const) {
+		const agentDir = join(sandbox, `${mode}-agent`);
+		const sessionPath = join(sandbox, `${mode}-session.jsonl`);
+		const logPath = join(sandbox, `${mode}-provider.jsonl`);
+		await mkdir(agentDir, { recursive: true });
+		await writeSeedSession(sessionPath);
+		const header = (await readFile(sessionPath, "utf8")).split("\n")[0];
+		if (!header) throw new Error("seed session header missing");
+		assert.equal(JSON.parse(header).id, "probe-session");
+		const result = await runProbe(agentDir, sessionPath, logPath, mode);
+		assert.equal(result.code, 0, `${mode}: ${result.stderr}`);
+		assert.match(result.stdout, /gpt-compaction-probe/);
+		const provider = await readProbe(logPath);
+		assert.match(JSON.stringify(provider["payload"]), /latest live instruction/);
+		if (mode === "off") {
+			assert.doesNotMatch(JSON.stringify(provider["payload"]), /opaque-checkpoint-for-probe/);
+			assert.doesNotMatch(JSON.stringify(provider["payload"]), /rail-gpt-compaction:probe-checkpoint/);
+			assert.match(JSON.stringify(provider["context"]), /original history/);
+		} else {
+			assert.equal(provider["payload"].input.filter((item: any) => item.type === "compaction").length, 1);
+			assert.match(JSON.stringify(provider["payload"]), /opaque-checkpoint-for-probe/);
+			assert.doesNotMatch(JSON.stringify(provider["payload"]), /rail-gpt-compaction:probe-checkpoint/);
+		}
+	}
+});
+
+test("real RPC manual compaction uses the mocked Responses v2 handshake and persists the opaque checkpoint", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-rpc-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	await mkdir(agentDir, { recursive: true });
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", railExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir, RAIL_GPT_COMPACTION_GATEWAY: gateway },
+	});
+	await transport.start();
+	try {
+		await transport.request({ type: "compact" });
+	} finally {
+		await transport.stop();
+	}
+	assert.equal(requests.length, 1);
+	assert.equal(requests[0]?.url, "/v1/responses");
+	assert.equal(requests[0]?.body["store"], false);
+	assert.equal(requests[0]?.body["stream"], true);
+	assert.deepEqual(requests[0]?.body["input"].at(-1), { type: "compaction_trigger" });
+	assert.equal(requests[0]?.body["input"].filter((item: any) => item["type"] === "compaction_trigger").length, 1);
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	const compaction = saved.find((entry) => entry["type"] === "compaction");
+	if (!compaction) throw new Error(`remote compaction entry missing: ${JSON.stringify(saved)}`);
+	assert.equal(compaction["details"]?.checkpoint?.encrypted_content, "opaque-server-checkpoint");
+	assert.match(compaction["summary"], /GPT remote compaction checkpoint/);
+});
+
+test("real RPC threshold compaction invokes Remote v2 before the next provider turn", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-threshold-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", railExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: {
+			...process.env,
+			PI_OFFLINE: "1",
+			PI_SKIP_VERSION_CHECK: "1",
+			PI_CODING_AGENT_DIR: agentDir,
+			RAIL_GPT_COMPACTION_GATEWAY: gateway,
+			RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000",
+		},
+	});
+	await transport.start();
+	const events: Array<Record<string, any>> = [];
+	const unsubscribe = transport.onEvent((event) => events.push(event as Record<string, any>));
+	const settled = new Promise<void>((resolve) => {
+		const settleListener = transport.onEvent((event) => {
+			if (event.type !== "agent_settled") return;
+			settleListener();
+			resolve();
+		});
+	});
+	try {
+		await transport.request({ type: "prompt", message: "trigger threshold compaction" });
+		await settled;
+	} finally {
+		unsubscribe();
+		await transport.stop();
+	}
+	const starts = events.filter((event) => event["type"] === "compaction_start");
+	assert.equal(starts.length, 1);
+	assert.equal(starts[0]?.["reason"], "threshold");
+	assert.equal(requests.length, 1);
+	assert.equal(requests[0]?.url, "/v1/responses");
+	assert.deepEqual(requests[0]?.body["input"].at(-1), { type: "compaction_trigger" });
+});
+
+test("real RPC overflow recovery compacts once and retries the interrupted turn", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-overflow-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	const providerLogPath = join(sandbox, "provider.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", railExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: {
+			...process.env,
+			PI_OFFLINE: "1",
+			PI_SKIP_VERSION_CHECK: "1",
+			PI_CODING_AGENT_DIR: agentDir,
+			RAIL_GPT_COMPACTION_GATEWAY: gateway,
+			RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000",
+			RAIL_GPT_COMPACTION_OVERFLOW_ONCE: "1",
+			RAIL_GPT_COMPACTION_PROBE_LOG: providerLogPath,
+		},
+	});
+	await transport.start();
+	const events: Array<Record<string, any>> = [];
+	const unsubscribe = transport.onEvent((event) => events.push(event as Record<string, any>));
+	const settled = new Promise<void>((resolve) => {
+		const settleListener = transport.onEvent((event) => {
+			if (event.type !== "agent_settled") return;
+			settleListener();
+			resolve();
+		});
+	});
+	try {
+		await transport.request({ type: "prompt", message: "recover after overflow" });
+		await settled;
+	} finally {
+		unsubscribe();
+		await transport.stop();
+	}
+	const starts = events.filter((event) => event["type"] === "compaction_start");
+	assert.equal(starts.length, 1);
+	assert.equal(starts[0]?.["reason"], "overflow");
+	assert.equal(requests.length, 1);
+	const providerCalls = (await readFile(providerLogPath, "utf8")).split("\n").filter((line) => line.includes('"kind":"provider"'));
+	assert.equal(providerCalls.length, 2, "the overflow response must be followed by one retried provider call");
+});

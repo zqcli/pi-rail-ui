@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
+import { contextExtensionPath } from "../../tools/subagents/context-window";
 import { RpcSessionWorker, type RpcEvent } from "../../tools/subagents/rpc-worker";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
@@ -90,6 +91,8 @@ async function startWorker(agentDir: string, sessionPath: string, alias: string)
 			"--no-context-files",
 			"--offline",
 			"-e", fixture,
+			"-e", contextExtensionPath(),
+			"--rail-context-protocol", "1",
 		],
 		cwd: process.cwd(),
 		env: {

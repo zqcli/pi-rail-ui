@@ -1,7 +1,8 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SettingsManager, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import { type MarkdownTheme, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { normalizeContextWindow, validateContextWindowReserve } from "./context-window";
 import {
 	railModelKey,
 	railModelReference,
@@ -52,6 +53,7 @@ const TaskItem = Type.Object({
 	task: Type.String({ description: "Self-contained one-off task for stateless work, concrete initial task for a new persistent helper, or follow-up message for target" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; when adopting a cross-project saved session, use its original project directory when known" })),
 	session: Type.Optional(SessionSourceSchema),
+	contextWindow: Type.Optional(Type.Number({ description: "Optional positive safe-integer child-local context/compaction budget; omit to use the child model default" })),
 });
 
 const ChainItem = Type.Object({
@@ -61,6 +63,7 @@ const ChainItem = Type.Object({
 	task: Type.String({ description: "Self-contained task, persistent initial/follow-up task, and optional {previous} placeholder" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session" })),
 	session: Type.Optional(SessionSourceSchema),
+	contextWindow: Type.Optional(Type.Number({ description: "Optional positive safe-integer child-local context/compaction budget; omit to use the child model default" })),
 });
 
 const SubagentParams = Type.Object({
@@ -70,6 +73,7 @@ const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Self-contained stateless task, concrete initial task for a new persistent helper, or persistent follow-up message" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
 	session: Type.Optional(SessionSourceSchema),
+	contextWindow: Type.Optional(Type.Number({ description: "Optional positive safe-integer child-local context/compaction budget; omit to use the child model default" })),
 	control: Type.Optional(ControlSchema),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Group independent model-session tasks inside one subagent Tool Call; each item may be stateless or persistent. Use only when one grouped parent Tool Call with child panels is desired." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
@@ -125,6 +129,7 @@ type TaskParams = {
 	task: string;
 	cwd?: string;
 	session?: { mode: "fork" | "exclusive"; path: string };
+	contextWindow?: number;
 };
 
 function isPersistentTask(item: Pick<TaskParams, "target" | "alias" | "session">): boolean {
@@ -142,6 +147,7 @@ function normalizeTask(item: TaskParams): TaskParams {
 	const alias = nonEmpty(item.alias);
 	const cwd = nonEmpty(item.cwd);
 	const sessionPath = nonEmpty(item.session?.path);
+	const contextWindow = normalizeContextWindow(item.contextWindow);
 	return {
 		...(model ? { model } : {}),
 		...(target ? { target } : {}),
@@ -149,6 +155,7 @@ function normalizeTask(item: TaskParams): TaskParams {
 		task: item.task,
 		...(cwd ? { cwd } : {}),
 		...(item.session && sessionPath ? { session: { mode: item.session.mode, path: sessionPath } } : {}),
+		...(contextWindow !== undefined ? { contextWindow } : {}),
 	};
 }
 
@@ -291,6 +298,9 @@ function modeFor(params: SubagentParamsValue): SubagentMode {
 }
 
 function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
+	if (mode !== "single" && params.contextWindow !== undefined) {
+		throw new Error("contextWindow is only supported on the single task or on each parallel/chain item");
+	}
 	const confirmSessionAttach = typeof params.confirmSessionAttach === "boolean"
 		? { confirmSessionAttach: params.confirmSessionAttach }
 		: {};
@@ -317,6 +327,20 @@ function initialTasksForRender(args: SubagentParamsValue | undefined): string[] 
 	if (args?.tasks?.length) return args.tasks.map((item) => item.task);
 	const task = nonEmpty(args?.task);
 	return task ? [task] : [];
+}
+
+async function validateTaskContextWindows(items: TaskParams[], broker: SessionBroker | undefined, defaultCwd: string): Promise<void> {
+	for (const item of items) {
+		const contextWindow = normalizeContextWindow(item.contextWindow);
+		if (contextWindow === undefined) continue;
+		if (item.target) {
+			if (!broker) throw new Error("A broker is required to validate a targeted contextWindow");
+			await broker.validateContextWindowForTarget(item.target, contextWindow);
+			continue;
+		}
+		const settings = SettingsManager.create(item.cwd ?? defaultCwd, getAgentDir()).getCompactionSettings();
+		validateContextWindowReserve(contextWindow, settings.reserveTokens, settings.enabled);
+	}
 }
 
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -479,6 +503,11 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 			}
+			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow !== undefined);
+			const broker = contextTargetItems.length > 0
+				? (typeof options.broker === "function" ? options.broker() : options.broker)
+				: undefined;
+			await validateTaskContextWindows(requestedItems, broker, ctx.cwd);
 			const sessionAttachments = requestedItems.filter((item) => item.session !== undefined);
 			if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
 				if (!ctx.hasUI) throw new Error("Attaching an existing session requires UI confirmation or confirmSessionAttach=false");
@@ -517,6 +546,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						model,
 						task: item.task,
 						cwd: item.cwd ?? ctx.cwd,
+						...(item.contextWindow !== undefined ? { contextWindow: item.contextWindow } : {}),
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => publishLive(slot, {
 							alias,
@@ -544,6 +574,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					task: item.task,
 					...(item.cwd ? { cwd: item.cwd } : {}),
 					...(item.session ? { session: item.session } : {}),
+					...(item.contextWindow !== undefined ? { contextWindow: item.contextWindow } : {}),
 					...(signal ? { signal } : {}),
 					onUpdate: ({ instance, run: partial }) => publishLive(slot, {
 						agentId: instance.agentId,

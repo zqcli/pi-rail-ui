@@ -38,6 +38,10 @@ class FakeBroker {
 	readonly controls: ControlRequest[] = [];
 	controlError: Error | undefined;
 
+	async validateContextWindowForTarget(_target: string, contextWindow: number): Promise<void> {
+		if (contextWindow <= 16_384) throw new Error("contextWindow must be greater than the child reserveTokens (16384)");
+	}
+
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		this.requests.push(request);
 		const selectedModel = request.model ?? railModel;
@@ -594,6 +598,27 @@ test("parallel mode allows one model to back stateless and persistent sessions",
 	assert.deepEqual(result.details.results.map((item: any) => item.persistent), [false, true]);
 });
 
+test("forwards contextWindow only as per-task execution metadata", async () => {
+	const statelessWindows: Array<number | undefined> = [];
+	const { tool, broker } = setupTool({
+		runStateless: async (request) => {
+			statelessWindows.push(request.contextWindow);
+			return { output: "stateless", exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } };
+		},
+	});
+	const result = await tool.execute("context-window-forwarding", {
+		tasks: [
+			{ task: "stateless budget", contextWindow: 64_000 },
+			{ alias: "persistent-budget", task: "persistent budget", contextWindow: 128_000 },
+		],
+	}, undefined, undefined, context());
+
+	assert.deepEqual(statelessWindows, [64_000]);
+	assert.equal(broker.requests[0]?.contextWindow, 128_000);
+	assert.equal("contextWindow" in result.details.results[0], false);
+	assert.equal("contextWindow" in result.details.results[1], false);
+});
+
 test("chain mode preserves ordering and substitutes the previous final output", async () => {
 	const { tool, broker } = setupTool();
 
@@ -736,6 +761,41 @@ test("normalization trims placeholders for single, parallel, and chain and keeps
 	}), {
 		chain: [{ model: "m", alias: "a", task: "chain task" }],
 	});
+});
+
+test("validates every contextWindow before any parallel or chain dispatch", async () => {
+	const { tool, broker } = setupTool({
+		runStateless: async () => ({
+			output: "unexpected",
+			exitCode: 0,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+
+	await assert.rejects(() => tool.execute("invalid-parallel-window", {
+		tasks: [
+			{ task: "first", contextWindow: 64_000 },
+			{ task: "invalid", contextWindow: 1.5 as any },
+			{ task: "third", alias: "persistent", contextWindow: 128_000 },
+		],
+	}, undefined, undefined, context()), /contextWindow/);
+	assert.equal(broker.requests.length, 0);
+
+	await assert.rejects(() => tool.execute("invalid-chain-window", {
+		chain: [
+			{ task: "first", contextWindow: 64_000 },
+			{ task: "invalid", contextWindow: "128000" as any },
+		],
+	}, undefined, undefined, context()), /contextWindow/);
+	assert.equal(broker.requests.length, 0);
+
+	await assert.rejects(() => tool.execute("invalid-target-parallel-window", {
+		tasks: [
+			{ target: "existing", task: "invalid target budget", contextWindow: 1 },
+			{ task: "must not start", contextWindow: 64_000 },
+		],
+	}, undefined, undefined, context()), /reserveTokens/);
+	assert.equal(broker.requests.length, 0);
 });
 
 test("an aborted single call throws before dispatch and restores aborted details", async () => {

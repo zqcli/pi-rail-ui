@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
+import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { ContextProtocolError, ContextWindowValidationError, normalizeContextWindow, validateContextWindowReserve } from "./context-window";
 import { assertValidAgentAlias } from "./identity";
 import type { RailModelRef } from "./models";
 import { buildSubagentSessionName } from "./session-name";
@@ -44,9 +46,11 @@ export interface WorkerStartSpec {
 }
 
 export interface WorkerSendOptions {
+	contextWindow?: number;
 	signal?: AbortSignal;
 	onUpdate?: (result: WorkerRunResult) => void;
 	onAccepted?: () => void;
+	onSettled?: () => void;
 }
 
 export type WorkerControlDelivery = "steer" | "followUp";
@@ -73,6 +77,7 @@ export interface SessionWorker {
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult>;
 	control?(request: WorkerControlRequest): Promise<void>;
 	setModel?(model: RailModelRef): Promise<RailModelRef>;
+	isReusable?(): boolean;
 	stop(): Promise<void>;
 }
 
@@ -124,6 +129,7 @@ export interface DispatchRequest {
 	task: string;
 	cwd?: string;
 	session?: SessionSource;
+	contextWindow?: number;
 	signal?: AbortSignal;
 	onUpdate?: (progress: DispatchProgress) => void;
 }
@@ -252,56 +258,69 @@ export class SessionBroker {
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
+		const contextWindow = normalizeContextWindow(request.contextWindow);
 		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
 		if (Boolean(request.model) === Boolean(request.target)) {
 			throw new Error("Provide exactly one of model (new instance) or target (existing instance)");
 		}
-
+		if (contextWindow !== undefined && request.model) this.validateContextWindow(contextWindow, request.cwd ?? this.defaultCwd);
 		const requestedAgentId = request.target ? (this.roster.resolve(request.target) ?? request.target) : undefined;
 		const expectedEpoch = requestedAgentId ? this.lifecycleEpoch(requestedAgentId) : undefined;
 		if (requestedAgentId && this.stoppingAgents.has(requestedAgentId)) throw new Error("Subagent worker is stopping");
-		const instance = request.model
-			? await this.attach({
-				model: request.model,
-				...(request.alias ? { alias: request.alias } : {}),
-				...(request.cwd ? { cwd: request.cwd } : {}),
-				...(request.session ? { session: request.session } : {}),
-			})
-			: await this.resolveInstance(request.target!);
-		if (this.shuttingDown || this.stoppingAgents.has(instance.agentId)
-			|| (expectedEpoch !== undefined && this.lifecycleEpoch(instance.agentId) !== expectedEpoch)) {
-			throw new Error("Subagent dispatch was interrupted by stop or shutdown");
-		}
-		if (request.target && !this.roster.resolve(request.target)) this.roster.link(instance.alias, instance.agentId);
-		request.onUpdate?.({ instance, run: { output: "(starting...)", usage: emptySubagentUsage() } });
+		let instance: AgentInstance | undefined;
+		const createdInstance = Boolean(request.model);
+		let state: WorkerState | undefined;
 		try {
-			const state = await this.workerState(instance, expectedEpoch);
-			return await this.enqueue(state, async () => {
-				const run = await state.worker.send(request.task, {
+			instance = request.model
+				? await this.attach({
+					model: request.model,
+					...(request.alias ? { alias: request.alias } : {}),
+					...(request.cwd ? { cwd: request.cwd } : {}),
+					...(request.session ? { session: request.session } : {}),
+				})
+				: await this.resolveInstance(request.target!);
+			const resolvedInstance = instance;
+			if (this.shuttingDown || this.stoppingAgents.has(resolvedInstance.agentId)
+				|| (expectedEpoch !== undefined && this.lifecycleEpoch(resolvedInstance.agentId) !== expectedEpoch)) {
+				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
+			}
+			if (contextWindow !== undefined) this.validateContextWindow(contextWindow, resolvedInstance.cwd);
+			if (request.target && !this.roster.resolve(request.target)) this.roster.link(resolvedInstance.alias, resolvedInstance.agentId);
+			request.onUpdate?.({ instance: resolvedInstance, run: { output: "(starting...)", usage: emptySubagentUsage() } });
+			const currentState = await this.workerState(resolvedInstance, expectedEpoch);
+			state = currentState;
+			return await this.enqueue(currentState, async () => {
+				const run = await currentState.worker.send(request.task, {
+					...(request.contextWindow !== undefined ? { contextWindow: request.contextWindow } : {}),
 					...(request.signal ? { signal: request.signal } : {}),
 					onUpdate: (partial) => {
 						const isCompacting = partial.isCompacting === true;
-						if (state.isCompacting !== isCompacting) {
-							state.isCompacting = isCompacting;
+						if (currentState.isCompacting !== isCompacting) {
+							currentState.isCompacting = isCompacting;
 							this.emitRuntimeChange();
 						}
-						request.onUpdate?.({ instance, run: partial });
+						request.onUpdate?.({ instance: resolvedInstance, run: partial });
 					},
 					onAccepted: () => {
-						if (state.activeRunId !== undefined && !state.stopping) {
-							state.activeRunAccepted = true;
+						if (currentState.activeRunId !== undefined && !currentState.stopping) {
+							currentState.activeRunAccepted = true;
 							this.emitRuntimeChange();
 						}
 					},
+					onSettled: () => {
+						currentState.activeRunId = undefined;
+						currentState.activeRunAccepted = false;
+						this.emitRuntimeChange();
+					},
 				});
-				state.activeRunId = undefined;
-				state.activeRunAccepted = false;
-				if (state.isCompacting) {
-					state.isCompacting = false;
+				currentState.activeRunId = undefined;
+				currentState.activeRunAccepted = false;
+				if (currentState.isCompacting) {
+					currentState.isCompacting = false;
 					this.emitRuntimeChange();
 				}
 				this.emitRuntimeChange();
-				const stored = await this.store.get(instance.agentId) ?? instance;
+				const stored = await this.store.get(resolvedInstance.agentId) ?? resolvedInstance;
 				const persisted: AgentInstance = {
 					...stored,
 					updatedAt: new Date().toISOString(),
@@ -309,15 +328,29 @@ export class SessionBroker {
 					lastOutput: compactMetadata(run.output, 16 * 1024),
 				};
 				await this.store.put(persisted);
-				state.instance = persisted;
-				this.runtimeErrors.delete(instance.agentId);
-				return { instance: { ...persisted, alias: instance.alias }, run };
+				currentState.instance = persisted;
+				this.runtimeErrors.delete(resolvedInstance.agentId);
+				return { instance: { ...persisted, alias: resolvedInstance.alias }, run };
 			}, "run");
 		} catch (error) {
-			if (this.stoppingAgents.has(instance.agentId) || request.signal?.aborted) this.runtimeErrors.delete(instance.agentId);
+			const failedAgentId = instance?.agentId;
+			if (!failedAgentId) {
+				this.emitRuntimeChange();
+				throw error;
+			}
+			const mustRetire = error instanceof ContextProtocolError || state?.worker.isReusable?.() === false;
+			if (error instanceof ContextWindowValidationError) {
+				if (createdInstance && instance) {
+					await this.cleanupCreatedInstance(instance, request.session?.mode !== "exclusive");
+				}
+				this.runtimeErrors.delete(failedAgentId);
+			} else if (mustRetire) {
+				this.runtimeErrors.set(failedAgentId, error instanceof Error ? error.message : String(error));
+				await this.retireFailedWorker(failedAgentId);
+			} else if (this.stoppingAgents.has(failedAgentId) || request.signal?.aborted) this.runtimeErrors.delete(failedAgentId);
 			else {
-				this.runtimeErrors.set(instance.agentId, error instanceof Error ? error.message : String(error));
-				await this.retireFailedWorker(instance.agentId);
+				this.runtimeErrors.set(failedAgentId, error instanceof Error ? error.message : String(error));
+				await this.retireFailedWorker(failedAgentId);
 			}
 			this.emitRuntimeChange();
 			throw error;
@@ -353,7 +386,7 @@ export class SessionBroker {
 			}
 			try {
 				await state.worker.control!({ delivery: request.delivery, message });
-				if (state.stopping || state.activeRunId !== runId) {
+				if (state.stopping || state.activeRunId !== runId || !state.activeRunAccepted) {
 					state.unknownControlRunId = runId;
 					state.controlPoisoned = true;
 					state.controlErrorMessage = `Subagent ${instance.alias} acknowledged a control after the target run ended`;
@@ -383,6 +416,12 @@ export class SessionBroker {
 		} finally {
 			this.instanceCreations.delete(creation);
 		}
+	}
+
+	async validateContextWindowForTarget(target: string, contextWindow: number): Promise<void> {
+		const instance = await this.resolveInstance(target);
+		const settings = SettingsManager.create(instance.cwd, getAgentDir()).getCompactionSettings();
+		validateContextWindowReserve(contextWindow, settings.reserveTokens, settings.enabled);
 	}
 
 	async listLinked(): Promise<AgentInstance[]> {
@@ -686,11 +725,23 @@ export class SessionBroker {
 		await state.worker.stop().catch(() => undefined);
 	}
 
+	private async cleanupCreatedInstance(agent: AgentInstance, removeSessionFile: boolean): Promise<void> {
+		await this.stopWorker(agent.agentId).catch(() => undefined);
+		for (const link of this.roster.list().filter((item) => item.agentId === agent.agentId)) this.roster.unlink(link.alias);
+		await this.store.delete(agent.agentId).catch(() => undefined);
+		if (removeSessionFile) await rm(agent.sessionFile, { force: true }).catch(() => undefined);
+	}
+
 	private emitRuntimeChange(): void {
 		for (const listener of this.runtimeListeners) listener();
 	}
 
 	private lifecycleEpoch(agentId: string): number {
 		return this.lifecycleEpochs.get(agentId) ?? 0;
+	}
+
+	private validateContextWindow(contextWindow: number, cwd: string): void {
+		const settings = SettingsManager.create(cwd, getAgentDir()).getCompactionSettings();
+		validateContextWindowReserve(contextWindow, settings.reserveTokens, settings.enabled);
 	}
 }

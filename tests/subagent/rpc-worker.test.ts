@@ -6,6 +6,7 @@ import {
 	type RpcEvent,
 	type RpcTransport,
 } from "../../tools/subagents/rpc-worker";
+import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools/subagents/context-window";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
 
@@ -14,6 +15,10 @@ class FakeTransport implements RpcTransport {
 	readonly listeners = new Set<(event: RpcEvent) => void>();
 	stopped = false;
 	failClearQueue = false;
+	failContextCommand = false;
+	failResetCommand = false;
+	includeContextCommand = true;
+	contextWindowAfterReset: number | undefined;
 	clearQueueGate: Promise<void> | undefined;
 
 	constructor(
@@ -22,7 +27,10 @@ class FakeTransport implements RpcTransport {
 		private readonly waitForAbort = false,
 		private readonly failControl = false,
 	) {}
-	private selectedModel = { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
+	private selectedModel = { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol", contextWindow: 128000 };
+	private contextWindow = 128000;
+	private restoreContextWindow = 128000;
+	setContextWindow(value: number): void { this.contextWindow = value; this.restoreContextWindow = value; }
 	private thinkingLevel = "xhigh";
 
 	onEvent(listener: (event: RpcEvent) => void): () => void {
@@ -33,14 +41,19 @@ class FakeTransport implements RpcTransport {
 	async request(command: Record<string, unknown>): Promise<unknown> {
 		this.commands.push(command);
 		if (command["type"] === "get_state") {
-			return { sessionId: "child-session", sessionFile: "/tmp/child.jsonl", sessionName: this.sessionName, isStreaming: false, model: this.selectedModel, thinkingLevel: this.thinkingLevel };
+			return { sessionId: "child-session", sessionFile: "/tmp/child.jsonl", sessionName: this.sessionName, isStreaming: false, isCompacting: false, model: { ...this.selectedModel, contextWindow: this.contextWindow }, thinkingLevel: this.thinkingLevel };
+		}
+		if (command["type"] === "get_commands") {
+			return { commands: this.includeContextCommand ? [{ name: "rail-context-internal-v1", source: "extension", description: "Rail private context protocol v1" }] : [] };
 		}
 		if (command["type"] === "set_session_name") {
 			this.sessionName = command["name"] as string;
 			return undefined;
 		}
 		if (command["type"] === "set_model") {
-			this.selectedModel = { provider: String(command["provider"]), id: String(command["modelId"]), name: String(command["modelId"]) };
+			this.selectedModel = { provider: String(command["provider"]), id: String(command["modelId"]), name: String(command["modelId"]), contextWindow: 128000 };
+			this.contextWindow = 128000;
+			this.restoreContextWindow = 128000;
 			return this.selectedModel;
 		}
 		if (command["type"] === "set_thinking_level") {
@@ -61,6 +74,27 @@ class FakeTransport implements RpcTransport {
 			return undefined;
 		}
 		if (command["type"] === "prompt") {
+			if (String(command["message"]).startsWith("/rail-context-internal-v1 ")) {
+				if (this.failContextCommand) {
+					this.emit({ type: "extension_error", error: `${CONTEXT_PROTOCOL_ERROR_PREFIX}context command failed` });
+					return undefined;
+				}
+				const parts = String(command["message"]).trim().split(/\s+/u);
+				if (parts[1] === "prepare" && parts[2] !== "omit") {
+					this.restoreContextWindow = this.contextWindow;
+					this.contextWindow = Number(parts[2]);
+				} else if (parts[1] === "reset") {
+					this.contextWindow = this.contextWindowAfterReset ?? this.restoreContextWindow;
+				} else {
+					this.contextWindow = this.restoreContextWindow;
+				}
+				if (parts[1] === "reset" && this.failResetCommand) {
+					this.contextWindow = 999;
+					return undefined;
+				}
+				if (parts[1] === "reset" && this.contextWindowAfterReset !== undefined) this.contextWindow = this.contextWindowAfterReset;
+				return undefined;
+			}
 			this.emit({ type: "agent_start" });
 			if (this.waitForAbort) return undefined;
 			queueMicrotask(() => {
@@ -131,6 +165,7 @@ class FakeTransport implements RpcTransport {
 						stopReason: "stop",
 					},
 				});
+				this.contextWindow = this.restoreContextWindow;
 				this.emit({ type: "agent_settled" });
 			});
 		}
@@ -144,6 +179,10 @@ class FakeTransport implements RpcTransport {
 	emit(event: RpcEvent): void {
 		for (const listener of this.listeners) listener(event);
 	}
+}
+
+function isContextPrompt(command: Record<string, unknown>): boolean {
+	return command["type"] === "prompt" && String(command["message"] ?? "").startsWith("/rail-context-internal-v1 ");
 }
 
 function model(): RailModelRef {
@@ -171,6 +210,7 @@ describe("RPC worker arguments", () => {
 			"--model", "cus-resp/gpt-5.6-sol",
 			"--thinking", "xhigh",
 			"--exclude-tools", "subagent",
+			"-e", contextExtensionPath(), "--rail-context-protocol", "1",
 		]);
 	});
 
@@ -196,8 +236,8 @@ describe("RpcSessionWorker", () => {
 		const transport = new FakeTransport(false, "auth-review");
 		const worker = await RpcSessionWorker.connect(spec("open", "/tmp/child.jsonl"), transport);
 
-		assert.deepEqual(transport.commands.map((command) => command["type"]), ["get_state", "set_session_name"]);
-		assert.equal(transport.commands[1]?.["name"], "subagent · Main Auth Work · auth-review");
+		assert.deepEqual(transport.commands.map((command) => command["type"]), ["get_state", "get_commands", "set_session_name"]);
+		assert.equal(transport.commands[2]?.["name"], "subagent · Main Auth Work · auth-review");
 		await worker.stop();
 	});
 
@@ -207,7 +247,7 @@ describe("RpcSessionWorker", () => {
 		const selected = await worker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash", thinkingLevel: "high" });
 
 		assert.deepEqual(selected, { provider: "deepseek", modelId: "deepseek-v4-flash", name: "deepseek-v4-flash", thinkingLevel: "high" });
-		assert.deepEqual(transport.commands.slice(1).map((command) => command["type"]), ["set_model", "set_thinking_level", "get_state"]);
+		assert.deepEqual(transport.commands.slice(2).map((command) => command["type"]), ["get_state", "set_model", "set_thinking_level", "get_state"]);
 	});
 
 	test("maps child controls to Pi steer and follow_up RPC commands", async () => {
@@ -217,16 +257,84 @@ describe("RpcSessionWorker", () => {
 		await worker.control({ delivery: "steer", message: "Focus on tests" });
 		await worker.control({ delivery: "followUp", message: "Then summarize risks" });
 
-		assert.deepEqual(transport.commands.slice(1), [
+		assert.deepEqual(transport.commands.slice(2), [
 			{ type: "steer", message: "Focus on tests" },
 			{ type: "follow_up", message: "Then summarize risks" },
 		]);
 	});
 
+	test("prepares explicit and omitted budgets through private handled commands", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		await worker.send("explicit budget", { contextWindow: 64000 });
+		const beforeOmitted = transport.commands.length;
+		await worker.send("omitted budget");
+
+		const privatePrompts = transport.commands
+			.filter((command) => command["type"] === "prompt" && isContextPrompt(command))
+			.map((command) => command["message"]);
+		assert.deepEqual(privatePrompts, [
+			"/rail-context-internal-v1 prepare 64000",
+			"/rail-context-internal-v1 reset",
+		]);
+		assert.deepEqual(transport.commands.slice(beforeOmitted).map((command) => command["type"]), ["prompt"]);
+		assert.equal(worker.isReusable(), true);
+	});
+
+	test("rejects overlapping runs while the first budget is being prepared", async () => {
+		const transport = new FakeTransport();
+		const request = transport.request.bind(transport);
+		const gate = Promise.withResolvers<void>();
+		transport.request = async (command) => {
+			if (isContextPrompt(command) && String(command["message"]).includes(" prepare ")) await gate.promise;
+			return request(command);
+		};
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const first = worker.send("first", { contextWindow: 64000 });
+		await new Promise((resolve) => setImmediate(resolve));
+		await assert.rejects(() => worker.send("second", { contextWindow: 64000 }), /overlapping/);
+		gate.resolve();
+		await first;
+	});
+
+	test("rejects a budget at or below the effective reserve before sending a private command", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		await assert.rejects(() => worker.send("too small", { contextWindow: 1 }), /reserveTokens/);
+		assert.equal(transport.commands.some((command) => command["type"] === "prompt"), false);
+		assert.equal(worker.isReusable(), true);
+	});
+
+	test("retires a worker when reset confirmation fails", async () => {
+		const transport = new FakeTransport();
+		transport.failResetCommand = true;
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+
+		await assert.rejects(() => worker.send("cleanup failure", { contextWindow: 64000 }), /confirmation failed/);
+		assert.equal(worker.isReusable(), false);
+	});
+
+	test("keeps an observed current-model refresh as the native omitted default", async () => {
+		const transport = new FakeTransport();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		await worker.send("before refresh");
+		transport.setContextWindow(1_050_000);
+
+		await worker.send("after refresh");
+		assert.equal(worker.isReusable(), true);
+	});
+
+	test("requires the versioned private context command at startup", async () => {
+		const transport = new FakeTransport();
+		transport.includeContextCommand = false;
+		await assert.rejects(() => RpcSessionWorker.connect(spec("new"), transport), /missing.*context adapter/);
+		assert.equal(transport.stopped, true);
+	});
+
 	test("a handled prompt without a run fails without opening control admission", async () => {
 		const transport = new FakeTransport();
 		const request = transport.request.bind(transport);
-		transport.request = async (command) => command["type"] === "prompt" ? undefined : request(command);
+		transport.request = async (command) => command["type"] === "prompt" && !isContextPrompt(command) ? undefined : request(command);
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
 		let accepted = false;
 		const pending = worker.send("/handled-command", { onAccepted: () => { accepted = true; } });
@@ -245,11 +353,16 @@ describe("RpcSessionWorker", () => {
 		const transport = new FakeTransport();
 		const request = transport.request.bind(transport);
 		let connected = false;
+		let handled = false;
 		transport.request = async (command) => {
-			if (command["type"] === "prompt") return undefined;
-			if (command["type"] === "get_state") return connected
-				? { isStreaming: false, isCompacting: true }
-				: request(command);
+			if (isContextPrompt(command) && String(command["message"]).endsWith(" reset")) handled = false;
+			if (command["type"] === "prompt" && !isContextPrompt(command)) {
+				handled = true;
+				return undefined;
+			}
+			if (command["type"] === "get_state" && connected && handled) {
+				return { ...(await request(command) as any), isStreaming: false, isCompacting: true };
+			}
 			return request(command);
 		};
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
@@ -339,7 +452,20 @@ describe("RpcSessionWorker", () => {
 		const transport = new FakeTransport();
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
 		const accepted = Promise.withResolvers<void>();
-		transport.request = async (command) => command["type"] === "get_state" ? { isStreaming: true } : undefined;
+		let taskStarted = false;
+		let taskSettled = false;
+		const request = transport.request.bind(transport);
+		transport.request = async (command) => {
+			if (command["type"] === "prompt" && !isContextPrompt(command)) {
+				taskStarted = true;
+				return undefined;
+			}
+			if (command["type"] === "get_state") return taskStarted && !taskSettled
+				? { isStreaming: true, model: { provider: "cus-resp", id: "gpt-5.6-sol", contextWindow: 128000 } }
+				: request(command);
+			return request(command);
+		};
+		const phaseUnsubscribe = transport.onEvent((event) => { if (event.type === "agent_settled") taskSettled = true; });
 		let finished = false;
 		const pending = worker.send("normal task", { onAccepted: () => accepted.resolve() }).then((result) => {
 			finished = true;
@@ -351,6 +477,7 @@ describe("RpcSessionWorker", () => {
 		transport.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } });
 		transport.emit({ type: "agent_settled" });
 		assert.equal((await pending).output, "done");
+		phaseUnsubscribe();
 		assert.equal(transport.listeners.size, 0);
 	});
 
@@ -365,7 +492,7 @@ describe("RpcSessionWorker", () => {
 		const result = await pending;
 		assert.equal(result.stopReason, "aborted");
 		assert.equal(result.errorMessage, "Subagent request was aborted");
-		assert.deepEqual(transport.commands.slice(2).map((command) => command["type"]), ["clear_queue", "abort"]);
+		assert.deepEqual(transport.commands.filter((command) => command["type"] === "clear_queue" || command["type"] === "abort").map((command) => command["type"]), ["clear_queue", "abort"]);
 	});
 
 	test("still aborts when clearing the child queue fails", async () => {
@@ -379,7 +506,7 @@ describe("RpcSessionWorker", () => {
 
 		const result = await pending;
 		assert.equal(result.stopReason, "aborted");
-		assert.deepEqual(transport.commands.slice(2).map((command) => command["type"]), ["clear_queue", "abort"]);
+		assert.deepEqual(transport.commands.filter((command) => command["type"] === "clear_queue" || command["type"] === "abort").map((command) => command["type"]), ["clear_queue", "abort"]);
 	});
 
 	test("waits for the abort command chain after the child settles", async () => {
@@ -402,7 +529,7 @@ describe("RpcSessionWorker", () => {
 		releaseClearQueue();
 		const result = await pending;
 		assert.equal(result.stopReason, "aborted");
-		assert.deepEqual(transport.commands.slice(2).map((command) => command["type"]), ["clear_queue", "abort"]);
+		assert.deepEqual(transport.commands.filter((command) => command["type"] === "clear_queue" || command["type"] === "abort").map((command) => command["type"]), ["clear_queue", "abort"]);
 	});
 
 	test("keeps the child session and returns the settled assistant output", async () => {
@@ -414,7 +541,7 @@ describe("RpcSessionWorker", () => {
 
 		assert.equal(worker.sessionId, "child-session");
 		assert.equal(worker.sessionFile, "/tmp/child.jsonl");
-		assert.deepEqual(transport.commands.map((command) => command["type"]), ["get_state", "prompt"]);
+		assert.deepEqual(transport.commands.map((command) => command["type"]), ["get_state", "get_commands", "prompt"]);
 		assert.equal(result.output, "review complete");
 		assert.deepEqual(result.transcript?.entries.map((entry) => entry.kind), [
 			"user",
@@ -460,8 +587,22 @@ describe("RpcSessionWorker", () => {
 		const transport = new FakeTransport();
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
 		const updates: any[] = [];
-		transport.request = async (command) => command["type"] === "get_state" ? { isStreaming: true } : undefined;
+		let taskStarted = false;
+		let taskSettled = false;
+		const request = transport.request.bind(transport);
+		transport.request = async (command) => {
+			if (command["type"] === "prompt" && !isContextPrompt(command)) {
+				taskStarted = true;
+				return undefined;
+			}
+			if (command["type"] === "get_state") return taskStarted && !taskSettled
+				? { isStreaming: true, model: { provider: "cus-resp", id: "gpt-5.6-sol", contextWindow: 128000 } }
+				: request(command);
+			return request(command);
+		};
+		const phaseUnsubscribe = transport.onEvent((event) => { if (event.type === "agent_settled") taskSettled = true; });
 		const pending = worker.send("review auth", { onUpdate: (update) => updates.push(update) });
+		await new Promise((resolve) => setImmediate(resolve));
 
 		transport.emit({ type: "agent_start" });
 		transport.emit({
@@ -475,6 +616,7 @@ describe("RpcSessionWorker", () => {
 		transport.emit({ type: "agent_settled" });
 		const result = await pending;
 		assert.equal(result.output, "(no output)");
+		phaseUnsubscribe();
 	});
 
 	test("publishes no updates after the run settles", async () => {
@@ -496,8 +638,22 @@ describe("RpcSessionWorker", () => {
 		const transport = new FakeTransport();
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
 		const updates: any[] = [];
-		transport.request = async (command) => command["type"] === "get_state" ? { isStreaming: true } : undefined;
+		let taskStarted = false;
+		let taskSettled = false;
+		const request = transport.request.bind(transport);
+		transport.request = async (command) => {
+			if (command["type"] === "prompt" && !isContextPrompt(command)) {
+				taskStarted = true;
+				return undefined;
+			}
+			if (command["type"] === "get_state") return taskStarted && !taskSettled
+				? { isStreaming: true, model: { provider: "cus-resp", id: "gpt-5.6-sol", contextWindow: 128000 } }
+				: request(command);
+			return request(command);
+		};
+		const phaseUnsubscribe = transport.onEvent((event) => { if (event.type === "agent_settled") taskSettled = true; });
 		const pending = worker.send("review auth", { onUpdate: (update) => updates.push(update) });
+		await new Promise((resolve) => setImmediate(resolve));
 
 		transport.emit({ type: "agent_start" });
 		transport.emit({
@@ -512,5 +668,6 @@ describe("RpcSessionWorker", () => {
 		assert.equal(result.output, "done");
 		assert.equal(result.stopReason, "stop");
 		assert.deepEqual(result.usage, { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.02, contextTokens: 11, turns: 1 });
+		phaseUnsubscribe();
 	});
 });

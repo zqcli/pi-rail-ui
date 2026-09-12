@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { test } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
+import { CONTEXT_PROTOCOL_ERROR_PREFIX } from "../../tools/subagents/context-window";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
@@ -56,6 +57,49 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		contextTokens: 17,
 		turns: 1,
 	});
+});
+
+test("stateless runner adds the explicit context helper only for an explicit budget", async () => {
+	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
+	let explicitArgs: string[] = [];
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: (args) => {
+			explicitArgs = args;
+			return { command: process.execPath, args: [fixture] };
+		},
+	});
+
+	await runner({ model, task: "explicit budget", cwd: process.cwd(), contextWindow: 64_000 });
+	assert.equal(explicitArgs.includes("-e"), true);
+	assert.equal(explicitArgs.at(explicitArgs.indexOf("-e") + 1)?.endsWith("context-extension.ts"), true);
+	assert.deepEqual(explicitArgs.slice(-5), ["--rail-context-protocol", "1", "--rail-context-window", "64000", "Task: explicit budget"]);
+
+	let omittedArgs: string[] = [];
+	const omittedRunner = createStatelessAgentRunner({
+		resolveInvocation: (args) => {
+			omittedArgs = args;
+			return { command: process.execPath, args: [fixture] };
+		},
+	});
+	await omittedRunner({ model, task: "omitted budget", cwd: process.cwd() });
+	assert.equal(omittedArgs.includes("-e"), false);
+	assert.equal(omittedArgs.includes("--rail-context-window"), false);
+});
+
+test("explicit context startup errors fail closed and discard child output", async () => {
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: ["-e", inlineScript([
+			{ type: "extension_error", error: `${CONTEXT_PROTOCOL_ERROR_PREFIX}context helper failed` },
+			{ type: "agent_start" },
+			{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "must be discarded" }], stopReason: "stop" } },
+		]) ] }),
+	});
+
+	const result = await runner({ model, task: "startup error", cwd: process.cwd(), contextWindow: 64_000 });
+	assert.match(result.errorMessage ?? "", /context helper failed/);
+	assert.match(result.output, /context protocol failed/);
+	assert.doesNotMatch(result.output, /must be discarded/);
+	assert.equal(result.transcript, undefined);
 });
 
 test("stateless abort clears queued transcript updates before rejecting", async () => {

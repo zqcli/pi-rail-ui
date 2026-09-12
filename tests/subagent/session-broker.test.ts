@@ -74,6 +74,10 @@ class FakeWorker implements SessionWorker {
 	controlDelayMs = 0;
 	modelDelayMs = 0;
 	unknownControlMessage: string | undefined;
+	settleBeforeReturn = false;
+	settled = false;
+	controlAckGate: Promise<void> | undefined;
+	private settledCallback: (() => void) | undefined;
 
 	constructor(
 		readonly sessionId: string,
@@ -85,6 +89,13 @@ class FakeWorker implements SessionWorker {
 		this.maxActive = Math.max(this.maxActive, this.active);
 		_options?.onAccepted?.();
 		this.tasks.push(task);
+		this.settledCallback = () => {
+			this.settled = true;
+			_options?.onSettled?.();
+		};
+		if (this.settleBeforeReturn) {
+			this.settledCallback();
+		}
 		await new Promise((resolve) => setTimeout(resolve, this.delayMs));
 		this.active--;
 		return { output: `done: ${task}`, usage: emptyUsage() };
@@ -102,9 +113,14 @@ class FakeWorker implements SessionWorker {
 
 	async control(request: { delivery: "steer" | "followUp"; message: string }): Promise<void> {
 		this.controlStarts.push(request.message);
+		await this.controlAckGate;
 		if (this.controlDelayMs) await new Promise((resolve) => setTimeout(resolve, this.controlDelayMs));
 		if (request.message === this.unknownControlMessage) throw new WorkerControlError("ack lost", "unknown");
 		this.controls.push(request);
+	}
+
+	settleRun(): void {
+		this.settledCallback?.();
 	}
 }
 
@@ -133,6 +149,17 @@ function setup() {
 }
 
 describe("SessionBroker", () => {
+	test("rejects an invalid new-instance budget before creating a worker", async () => {
+		const { broker, store, workers } = setup();
+
+		await assert.rejects(
+			() => broker.dispatch({ model: reviewerModel(), alias: "invalid-window", task: "must not start", contextWindow: 1 }),
+			/reserveTokens/,
+		);
+		assert.equal(workers.length, 0);
+		assert.deepEqual(await store.list(), []);
+	});
+
 	test("creates a persistent instance and reuses it by alias", async () => {
 		const { broker, store, roster, starts, workers } = setup();
 
@@ -445,6 +472,46 @@ describe("SessionBroker", () => {
 		rejectPrompt();
 		await assert.rejects(pending, /prompt rejected/);
 		assert.deepEqual(workers[0]!.controls, []);
+	});
+
+	test("closes control admission at native settlement before worker cleanup returns", async () => {
+		const { broker, workers } = setup();
+		const agent = await broker.attach({ model: reviewerModel(), alias: "settled" });
+		const worker = workers[0]!;
+		worker.delayMs = 40;
+		worker.settleBeforeReturn = true;
+		const pending = broker.dispatch({ target: agent.agentId, task: "settle before reset" });
+		while (!worker.settled) await new Promise((resolve) => setImmediate(resolve));
+
+		assert.notEqual(broker.runtimeStatus(agent.agentId).phase, "running");
+		await assert.rejects(
+			() => broker.control({ target: agent.agentId, delivery: "steer", message: "must wait for cleanup" }),
+			/not currently running/,
+		);
+		await pending;
+	});
+
+	test("poisons a control whose acknowledgement crosses native settlement", async () => {
+		const { broker, workers } = setup();
+		const agent = await broker.attach({ model: reviewerModel(), alias: "settled-ack" });
+		const worker = workers[0]!;
+		let releaseAck!: () => void;
+		worker.controlAckGate = new Promise<void>((resolve) => { releaseAck = resolve; });
+		const pending = broker.dispatch({ target: agent.agentId, task: "settle with delayed control ack" });
+		while (!worker.tasks.length) await new Promise((resolve) => setImmediate(resolve));
+		const control = broker.control({ target: agent.agentId, delivery: "steer", message: "crosses settlement" });
+		while (!worker.controlStarts.length) await new Promise((resolve) => setImmediate(resolve));
+		worker.settleRun();
+
+		await assert.rejects(
+			() => broker.control({ target: agent.agentId, delivery: "steer", message: "new control after settlement" }),
+			/not currently running/,
+		);
+		releaseAck();
+		await assert.rejects(control, (error: unknown) => error instanceof WorkerControlError && error.outcome === "unknown");
+		await pending;
+		assert.deepEqual(worker.controlStarts, ["crosses settlement"]);
+		assert.deepEqual(worker.controls.map((entry) => entry.message), ["crosses settlement"]);
 	});
 
 	test("controls close when the child finishes, before metadata persistence completes", async () => {

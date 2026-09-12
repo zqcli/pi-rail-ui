@@ -1,5 +1,6 @@
 let buffer = "";
 let sessionName;
+let contextWindow = 128000;
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -17,6 +18,13 @@ process.stdin.on("data", (chunk) => {
 				sessionFile: "/tmp/fixture.jsonl",
 				sessionName,
 				isStreaming: false,
+				model: { provider: "cus-resp", id: "gpt-5.6-luna", contextWindow },
+			} });
+			continue;
+		}
+		if (command.type === "get_commands") {
+			write({ type: "response", id: command.id, command: "get_commands", success: true, data: {
+				commands: [{ name: "rail-context-internal-v1", source: "extension", description: "Rail private context protocol v1" }],
 			} });
 			continue;
 		}
@@ -26,6 +34,13 @@ process.stdin.on("data", (chunk) => {
 			continue;
 		}
 		if (command.type === "prompt") {
+			if (command.message.startsWith("/rail-context-internal-v1 ")) {
+				const parts = command.message.trim().split(/\s+/u);
+				if (parts[1] === "prepare" && parts[2] !== "omit") contextWindow = Number(parts[2]);
+				if (parts[1] === "reset" || (parts[1] === "prepare" && parts[2] === "omit")) contextWindow = 128000;
+				write({ type: "response", id: command.id, command: "prompt", success: true });
+				continue;
+			}
 			write({ type: "response", id: command.id, command: "prompt", success: true });
 			write({ type: "agent_start" });
 			write({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fixture done" }] } });

@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, formatContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
 import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
 import type { WorkerRunResult } from "./session-broker";
@@ -11,6 +13,7 @@ export interface StatelessRunRequest {
 	model: RailModelRef;
 	task: string;
 	cwd: string;
+	contextWindow?: number;
 	signal?: AbortSignal;
 	onUpdate?: (result: StatelessRunResult) => void;
 }
@@ -29,14 +32,27 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 	return async (request) => {
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
+		const requestedContextWindow = request.contextWindow;
+		const settings = requestedContextWindow === undefined ? undefined : SettingsManager.create(request.cwd, getAgentDir()).getCompactionSettings();
+		const contextWindow = settings
+			? validateContextWindowReserve(requestedContextWindow, settings.reserveTokens, settings.enabled)
+			: undefined;
 		const args = ["--mode", "json", "-p", "--no-session", "--model", railModelKey(request.model)];
 		if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
 		args.push("--exclude-tools", "subagent");
+		if (contextWindow !== undefined) {
+			args.push(
+				"-e", contextExtensionPath(),
+				`--${CONTEXT_PROTOCOL_FLAG}`, CONTEXT_PROTOCOL_VERSION,
+				`--${CONTEXT_WINDOW_FLAG}`, formatContextWindow(contextWindow),
+			);
+		}
 		args.push(`Task: ${request.task}`);
 
 		const invocation = (options.resolveInvocation ?? resolvePiInvocation)(args);
 		const collector = new RunResultCollector(request.task, strictAssistantText);
 		let stderr = "";
+		let protocolErrorEvent: string | undefined;
 		let aborted = false;
 		let killTimer: NodeJS.Timeout | undefined;
 		let updateTimer: NodeJS.Timeout | undefined;
@@ -74,6 +90,10 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 						if (!line.trim()) continue;
 						try {
 							const event = JSON.parse(line) as SubagentRunEvent;
+							if (event.type === "extension_error") {
+								const detail = readContextProtocolError(event["error"]);
+								if (detail !== undefined) protocolErrorEvent = detail;
+							}
 							const changed = collector.ingest(event);
 							const immediate = (event.type === "message_end" && isAssistantMessage(event.message))
 								|| event.type === "tool_execution_start"
@@ -130,9 +150,25 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 			publishUpdate();
 			throw new Error("Subagent request was aborted");
 		}
-		const failure = collector.errorMessage ?? (exitCode === 0 ? undefined : stderr.trim() || `Subagent process exited with code ${exitCode}`);
+		const protocolError = protocolErrorEvent ?? stderr.split(/\r?\n/u)
+			.map((line) => line.trim())
+			.find((line) => line.startsWith(CONTEXT_PROTOCOL_ERROR_PREFIX))
+			?.slice(CONTEXT_PROTOCOL_ERROR_PREFIX.length).trim();
+		const failure = protocolError
+			? `Subagent context protocol failed before the run started: ${protocolError}`
+			: collector.errorMessage ?? (exitCode === 0 ? undefined : stderr.trim() || `Subagent process exited with code ${exitCode}`);
+		const collected = collector.result(failure || "(no output)");
+		if (protocolError) {
+			const { transcript: _transcript, ...withoutTranscript } = collected;
+			return {
+				...withoutTranscript,
+				output: failure!,
+				exitCode,
+				errorMessage: failure!,
+			};
+		}
 		return {
-			...collector.result(failure || "(no output)"),
+			...collected,
 			exitCode,
 			...(failure ? { errorMessage: failure } : {}),
 		};

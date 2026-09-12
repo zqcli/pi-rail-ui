@@ -28,6 +28,7 @@ test("PiRpcProcessTransport correlates responses and emits independent events", 
 		sessionId: "fixture-session",
 		sessionFile: "/tmp/fixture.jsonl",
 		isStreaming: false,
+		model: { provider: "cus-resp", id: "gpt-5.6-luna", contextWindow: 128000 },
 	});
 	assert.deepEqual(eventTypes, ["agent_start", "message_end", "agent_settled"]);
 	await transport.stop();

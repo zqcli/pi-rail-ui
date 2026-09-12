@@ -66,6 +66,10 @@ class LeasedSessionWorker implements SessionWorker {
 		return this.worker.setModel(model);
 	}
 
+	isReusable(): boolean {
+		return this.worker.isReusable?.() ?? true;
+	}
+
 	async stop(): Promise<void> {
 		if (this.stopped) return;
 		this.stopped = true;

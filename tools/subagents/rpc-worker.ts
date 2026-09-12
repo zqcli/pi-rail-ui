@@ -1,3 +1,15 @@
+import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import {
+	CONTEXT_COMMAND,
+	CONTEXT_PROTOCOL_FLAG,
+	CONTEXT_PROTOCOL_VERSION,
+	ContextProtocolError,
+	ContextWindowValidationError,
+	contextExtensionPath,
+	formatContextWindow,
+	readContextProtocolError,
+	validateContextWindowReserve,
+} from "./context-window";
 import { railModelKey, type RailModelRef } from "./models";
 import { RpcCommandError } from "./rpc-transport";
 import { WorkerControlError } from "./session-broker";
@@ -27,8 +39,9 @@ interface RpcState {
 	sessionFile?: string;
 	sessionName?: string;
 	isStreaming?: boolean;
-	model?: { provider?: string; id?: string; name?: string };
+	model?: { provider?: string; id?: string; name?: string; contextWindow?: number };
 	thinkingLevel?: RailModelRef["thinkingLevel"];
+	isCompacting?: boolean;
 }
 
 export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
@@ -39,6 +52,7 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	args.push("--model", railModelKey(spec.model));
 	if (spec.model.thinkingLevel) args.push("--thinking", spec.model.thinkingLevel);
 	args.push("--exclude-tools", "subagent");
+	args.push("-e", contextExtensionPath(), `--${CONTEXT_PROTOCOL_FLAG}`, CONTEXT_PROTOCOL_VERSION);
 	return args;
 }
 
@@ -47,7 +61,12 @@ export class RpcSessionWorker implements SessionWorker {
 		readonly sessionId: string,
 		readonly sessionFile: string,
 		private readonly transport: RpcTransport,
+		private readonly cwd: string,
+		private modelProvider: string,
+		private modelId: string,
 	) {}
+	private unusable = false;
+	private runInFlight = false;
 
 	static async connect(spec: WorkerStartSpec, transport: RpcTransport): Promise<RpcSessionWorker> {
 		const state = await transport.request({ type: "get_state" }) as RpcState;
@@ -59,19 +78,180 @@ export class RpcSessionWorker implements SessionWorker {
 			await transport.stop();
 			throw new Error("Subagent session is already streaming; live attach is not supported");
 		}
+		const commands = await transport.request({ type: "get_commands" }) as { commands?: Array<{ name?: string; source?: string; description?: string }> } | undefined;
+		if (!commands?.commands?.some((command) => command.name === CONTEXT_COMMAND
+			&& command.source === "extension"
+			&& command.description?.includes(`protocol v${CONTEXT_PROTOCOL_VERSION}`))) {
+			await transport.stop();
+			throw new ContextProtocolError(`Subagent RPC worker is missing the ${CONTEXT_COMMAND} context adapter`);
+		}
+		const stateModel = state.model;
+		if (!stateModel?.provider || !stateModel.id || typeof stateModel.contextWindow !== "number"
+			|| !Number.isSafeInteger(stateModel.contextWindow) || stateModel.contextWindow <= 0) {
+			await transport.stop();
+			throw new ContextProtocolError("Subagent RPC worker did not expose a verifiable model contextWindow");
+		}
+		if (stateModel.provider !== spec.model.provider || stateModel.id !== spec.model.modelId) {
+			await transport.stop();
+			throw new ContextProtocolError(`Subagent RPC worker opened ${stateModel.provider}/${stateModel.id}, expected ${railModelKey(spec.model)}`);
+		}
 		if (spec.mode === "open" && spec.sessionName && state.sessionName !== spec.sessionName) {
 			await transport.request({ type: "set_session_name", name: spec.sessionName });
 		}
-		const worker = new RpcSessionWorker(state.sessionId, state.sessionFile, transport);
+		const worker = new RpcSessionWorker(
+			state.sessionId,
+			state.sessionFile,
+			transport,
+			spec.cwd,
+			stateModel.provider,
+			stateModel.id,
+		);
 		return worker;
 	}
 
+	isReusable(): boolean {
+		return !this.unusable;
+	}
+
+	private protocolFailure(message: string, cause?: unknown): ContextProtocolError {
+		this.unusable = true;
+		return new ContextProtocolError(message, cause instanceof Error ? { cause } : undefined);
+	}
+
+	private validateBudget(value: number | undefined): number | undefined {
+		if (value === undefined) return undefined;
+		const settings = SettingsManager.create(this.cwd, getAgentDir()).getCompactionSettings();
+		return validateContextWindowReserve(value, settings.reserveTokens, settings.enabled);
+	}
+
+	private assertModelState(state: RpcState, expectedWindow?: number): void {
+		const model = state.model;
+		if (!model?.provider || !model.id) {
+			throw this.protocolFailure("Subagent state did not expose its current provider/model identity");
+		}
+		if (model.provider !== this.modelProvider || model.id !== this.modelId) {
+			throw this.protocolFailure(`Subagent model changed during context protocol: ${model.provider}/${model.id}`);
+		}
+		if (typeof model.contextWindow !== "number" || !Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0) {
+			throw this.protocolFailure("Subagent state did not expose a verifiable current contextWindow");
+		}
+		if (expectedWindow !== undefined && model?.contextWindow !== expectedWindow) {
+			throw this.protocolFailure(`Subagent contextWindow confirmation failed: expected ${expectedWindow}, received ${String(model?.contextWindow)}`);
+		}
+	}
+
+	private async state(): Promise<RpcState> {
+		return await this.transport.request({ type: "get_state" }) as RpcState;
+	}
+
+	private async issueContextCommand(message: string): Promise<void> {
+		const errors: string[] = [];
+		const unsubscribe = this.transport.onEvent((event) => {
+			if (event.type === "extension_error") {
+				const error = readContextProtocolError(event.error);
+				if (error !== undefined) errors.push(error);
+			}
+		});
+		try {
+			await this.transport.request({ type: "prompt", message });
+		} catch (error) {
+			this.unusable = true;
+			throw new ContextProtocolError(`Rail context command failed: ${error instanceof Error ? error.message : String(error)}`, error instanceof Error ? { cause: error } : undefined);
+		} finally {
+			unsubscribe();
+		}
+		if (errors.length > 0) {
+			this.unusable = true;
+			throw new ContextProtocolError(`Rail context command reported an extension error: ${errors.join("; ")}`);
+		}
+	}
+
+	private async confirmContextWindow(expectedWindow?: number, requireIdle = true): Promise<RpcState> {
+		const state = await this.state();
+		this.assertModelState(state, expectedWindow);
+		if (requireIdle && (state.isStreaming === true || state.isCompacting === true)) {
+			throw this.protocolFailure("Rail context protocol expected an idle child after its private command");
+		}
+		return state;
+	}
+
+	private async resetContext(expectedWindow?: number): Promise<void> {
+		try {
+			await this.issueContextCommand(`/${CONTEXT_COMMAND} reset`);
+			await this.confirmContextWindow(expectedWindow);
+		} catch (error) {
+			this.unusable = true;
+			if (error instanceof ContextProtocolError) throw error;
+			throw this.protocolFailure(`Rail context cleanup could not be confirmed: ${error instanceof Error ? error.message : String(error)}`, error);
+		}
+	}
+
+	private async restoreAfterFailedRun(expectedWindow?: number): Promise<void> {
+		try {
+			await this.resetContext(expectedWindow);
+		} catch (error) {
+			this.unusable = true;
+			throw error;
+		}
+	}
+
+	private async prepareContext(contextWindow: number | undefined): Promise<number | undefined> {
+		const value = this.validateBudget(contextWindow);
+		if (value === undefined) return undefined;
+		let commandSent = false;
+		let restoreWindow: number | undefined;
+		try {
+			const before = await this.state();
+			this.assertModelState(before);
+			if (before.isStreaming === true || before.isCompacting === true) {
+				throw this.protocolFailure("Rail context protocol expected an idle child before its private command");
+			}
+			restoreWindow = before.model!.contextWindow;
+			commandSent = true;
+			await this.issueContextCommand(`/${CONTEXT_COMMAND} prepare ${formatContextWindow(value)}`);
+			await this.confirmContextWindow(value);
+			return restoreWindow;
+		} catch (error) {
+			if (error instanceof ContextWindowValidationError) throw error;
+			if (commandSent && !this.unusable) {
+				try {
+					await this.resetContext(restoreWindow);
+				} catch (cleanupError) {
+					throw cleanupError;
+				}
+			}
+			if (error instanceof ContextProtocolError) throw error;
+			throw this.protocolFailure(`Rail context preparation failed: ${error instanceof Error ? error.message : String(error)}`, error);
+		}
+	}
+
 	async send(task: string, options: WorkerSendOptions = {}): Promise<WorkerRunResult> {
+		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
+		if (this.runInFlight) throw new ContextProtocolError("Subagent RPC worker received an overlapping run");
 		if (options.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
+		this.runInFlight = true;
+		let restoreWindow: number | undefined;
+		try {
+			restoreWindow = await this.prepareContext(options.contextWindow);
+		} catch (error) {
+			this.runInFlight = false;
+			throw error;
+		}
+		const prepared = restoreWindow !== undefined;
+		if (options.signal?.aborted) {
+			try {
+				if (prepared) await this.restoreAfterFailedRun(restoreWindow);
+			} finally {
+				this.runInFlight = false;
+			}
+			throw new Error("Subagent request was aborted before dispatch");
+		}
 		const collector = new RunResultCollector(task, assistantText);
 		let settled = false;
+		let settledNotified = false;
 		let started = false;
 		let aborted = false;
+		let protocolError: ContextProtocolError | undefined;
 		let resolveSettled!: () => void;
 		let transportError: Error | undefined;
 		let abortRequest: Promise<void> | undefined;
@@ -93,6 +273,12 @@ export class RpcSessionWorker implements SessionWorker {
 			resolveSettled = resolve;
 		});
 		const unsubscribe = this.transport.onEvent((event) => {
+			if (event.type === "extension_error") {
+				const error = readContextProtocolError(event.error);
+				if (error !== undefined && !protocolError) {
+					protocolError = this.protocolFailure(`Rail context helper failed during the child run: ${error}`);
+				}
+			}
 			if (event.type === "agent_start") started = true;
 			const changed = collector.ingest(event);
 			const immediate = event.type === "message_end"
@@ -112,13 +298,22 @@ export class RpcSessionWorker implements SessionWorker {
 				collector.markSettled();
 				queueUpdate(true);
 				settled = true;
+				if (!settledNotified) {
+					settledNotified = true;
+					options.onSettled?.();
+				}
 				resolveSettled();
 			}
 			if (event.type === "transport_error" && !settled) {
 				collector.noteError(event.error ?? "Subagent RPC transport failed");
+				this.unusable = true;
 				queueUpdate(true);
 				settled = true;
-				transportError = new Error(event.error ?? "Subagent RPC transport failed");
+				if (!settledNotified) {
+					settledNotified = true;
+					options.onSettled?.();
+				}
+				transportError = this.protocolFailure(event.error ?? "Subagent RPC transport failed");
 				resolveSettled();
 			}
 		});
@@ -145,10 +340,20 @@ export class RpcSessionWorker implements SessionWorker {
 			}
 			if (!settled) options.onAccepted?.();
 			await settledPromise;
+			await abortRequest;
 			if (transportError) throw transportError;
+			if (protocolError) throw protocolError;
 			if (aborted) collector.markAborted();
+			if (prepared) {
+				const settledState = await this.confirmContextWindow();
+				await this.resetContext(settledState.model!.contextWindow);
+			}
 			return collector.result("(no output)");
+		} catch (error) {
+			if (!settled && prepared && !this.unusable) await this.restoreAfterFailedRun(restoreWindow).catch((cleanupError) => { throw cleanupError; });
+			throw error;
 		} finally {
+			this.runInFlight = false;
 			await abortRequest;
 			if (updateTimer) clearTimeout(updateTimer);
 			options.signal?.removeEventListener("abort", abort);
@@ -173,6 +378,14 @@ export class RpcSessionWorker implements SessionWorker {
 	}
 
 	async setModel(model: RailModelRef): Promise<RailModelRef> {
+		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
+		const before = await this.state();
+		this.assertModelState(before);
+		const observed = before.model?.contextWindow;
+		if (typeof observed !== "number" || !Number.isSafeInteger(observed) || observed <= 0) {
+			throw this.protocolFailure("Subagent model change has no verifiable current contextWindow");
+		}
+		if (before.isStreaming === true || before.isCompacting === true) throw this.protocolFailure("Subagent model change requires an idle child");
 		const selected = await this.transport.request({
 			type: "set_model",
 			provider: model.provider,
@@ -183,6 +396,12 @@ export class RpcSessionWorker implements SessionWorker {
 		}
 		const state = await this.transport.request({ type: "get_state" }) as RpcState;
 		const effective = state.model ?? selected;
+		if (!effective?.provider || !effective.id || typeof state.model?.contextWindow !== "number"
+			|| !Number.isSafeInteger(state.model.contextWindow) || state.model.contextWindow <= 0) {
+			throw this.protocolFailure("Subagent model change did not return a verifiable model contextWindow");
+		}
+		this.modelProvider = effective.provider;
+		this.modelId = effective.id;
 		return {
 			provider: effective?.provider ?? model.provider,
 			modelId: effective?.id ?? model.modelId,

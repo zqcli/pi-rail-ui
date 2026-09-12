@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	buildRemoteCompactionRequest,
+	rebuiltBranchInput,
 	planContextReplay,
 	planPayloadRewrite,
 	runNativeRepairCompaction,
@@ -125,6 +126,58 @@ test("remote checkpoint replay follows the branch boundary and supports continuo
 	assert.equal(second.ok, true);
 	if (second.ok) assert.deepEqual(second.input[0], first.checkpoint, "the next request continues from the latest installed checkpoint");
 	assert.equal(resolveSessionCheckpoint([u1, a1, u2, a2, c1, u3, a3, c2]).status, "remote");
+});
+
+test("remote cut inside an older retained interval preserves the latest native prefix", () => {
+	const oldUser = message("old-user", null, "history covered by native summary");
+	const oldAssistant = message("old-assistant", "old-user", "old answer", "assistant");
+	const kept = message("kept", "old-assistant", "retained user");
+	const keptAssistant = message("kept-assistant", "kept", "retained answer", "assistant");
+	const native = {
+		type: "compaction",
+		id: "native-prefix",
+		parentId: "kept-assistant",
+		timestamp: "2025-01-01T00:00:03.000Z",
+		summary: "latest native prefix summary",
+		firstKeptEntryId: "kept",
+		tokensBefore: 100,
+		details: { readFiles: [], modifiedFiles: [] },
+	} as SessionEntry;
+	const newUser = message("new-user", "native-prefix", "new request");
+	const newAssistant = message("new-assistant", "new-user", "new answer", "assistant");
+	const branch = [oldUser, oldAssistant, kept, keptAssistant, native, newUser, newAssistant];
+	const request = buildRemoteCompactionRequest({
+		model,
+		branchEntries: branch,
+		identity,
+		firstKeptEntryId: "new-user",
+	});
+	assert.equal(request.ok, true);
+	if (!request.ok) return;
+	const serialized = JSON.stringify(request.input);
+	assert.match(serialized, /latest native prefix summary/);
+	assert.equal(serialized.match(/latest native prefix summary/gu)?.length, 1);
+	assert.doesNotMatch(serialized, /history covered by native summary|old answer/);
+});
+
+test("a later remote cut can compact inside the previous checkpoint retained interval", () => {
+	const oldUser = message("remote-old-user", null, "old history");
+	const oldAssistant = message("remote-old-assistant", "remote-old-user", "old answer", "assistant");
+	const kept = message("remote-kept", "remote-old-assistant", "retained request");
+	const keptAssistant = message("remote-kept-assistant", "remote-kept", "retained answer", "assistant");
+	const firstDetails = details("remote-first", "remote-kept-assistant", "remote-kept");
+	const firstRemote = remoteEntry("remote-first-entry", "remote-kept-assistant", firstDetails);
+	const request = buildRemoteCompactionRequest({
+		model,
+		branchEntries: [oldUser, oldAssistant, kept, keptAssistant, firstRemote],
+		identity,
+		firstKeptEntryId: "remote-kept-assistant",
+	});
+	assert.equal(request.ok, true);
+	if (!request.ok) return;
+	assert.deepEqual(request.input[0], firstDetails.checkpoint);
+	assert.match(JSON.stringify(request.input), /retained request/);
+	assert.doesNotMatch(JSON.stringify(request.input), /old history|old answer/);
 });
 
 test("remote compaction sends each compacted interval once across two checkpoints", async () => {
@@ -274,6 +327,50 @@ test("remote compaction reuses the active Responses request extras", async () =>
 	});
 });
 
+test("manual compaction instructions are merged into the remote request only", async () => {
+	const bodies: Record<string, unknown>[] = [];
+	let systemPromptReads = 0;
+	const user = message("instruction-user", null, "history");
+	const cut = message("instruction-cut", "instruction-user", "retained");
+	const result = await runRemoteCompaction({
+		event: {
+			branchEntries: [user, cut],
+			preparation: {
+				firstKeptEntryId: "instruction-cut",
+				messagesToSummarize: [],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 20,
+				settings: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 },
+				fileOps: { read: new Set(), edited: new Set() },
+			},
+			customInstructions: "focus on risks only",
+			signal: new AbortController().signal,
+			reason: "manual",
+			willRetry: false,
+		} as any,
+		ctx: {
+			model,
+			getSystemPrompt: () => {
+				systemPromptReads += 1;
+				return "ordinary system prompt";
+			},
+			sessionManager: { getSessionId: () => "instruction-session" },
+			modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "instruction-key", baseUrl: model.baseUrl }) },
+		} as any,
+		deps: {
+			executeRemote: async ({ body }: { body: Record<string, unknown> }) => {
+				bodies.push(body);
+				return { ok: true as const, status: 200, checkpoint: { type: "compaction" as const, encrypted_content: "instruction-checkpoint" } };
+			},
+		},
+	});
+	assert.equal(result.outcome, "success");
+	assert.equal(systemPromptReads, 1);
+	assert.match(String(bodies[0]?.["instructions"]), /ordinary system prompt/);
+	assert.match(String(bodies[0]?.["instructions"]), /focus on risks only/);
+});
+
 test("opaque checkpoints are rebuilt for off mode and a different provider identity", () => {
 	const u1 = message("u1", null, "original user");
 	const a1 = message("a1", "u1", "original answer", "assistant");
@@ -323,6 +420,23 @@ test("opaque checkpoints are rebuilt for off mode and a different provider ident
 	}
 });
 
+test("a model switch away and back accepts an already rebuilt native payload", () => {
+	const u1 = message("switch-user", null, "original history");
+	const a1 = message("switch-assistant", "switch-user", "original answer", "assistant");
+	const cp = details("switch-cp", "switch-assistant", "switch-user");
+	const compacted = remoteEntry("switch-compaction", "switch-assistant", cp);
+	const branch = [u1, a1, compacted, message("switch-live", "switch-compaction", "live after switch")];
+	const rebuiltInput = rebuiltBranchInput(model, branch);
+	const decision = planPayloadRewrite({
+		ctx: context(branch),
+		branchEntries: branch,
+		payload: { model: model.id, input: rebuiltInput },
+		remoteEnabled: true,
+		identity,
+	});
+	assert.deepEqual(decision, { action: "none" });
+});
+
 test("payload replay replaces only the display anchor and never duplicates an already rewritten checkpoint", () => {
 	const u1 = message("u1", null, "original");
 	const a1 = message("a1", "u1", "answer", "assistant");
@@ -356,6 +470,14 @@ test("payload replay replaces only the display anchor and never duplicates an al
 		identity,
 	});
 	assert.deepEqual(alreadyRewritten, { action: "none" });
+	const missingAnchor = planPayloadRewrite({
+		ctx: context(branch),
+		branchEntries: branch,
+		payload: { model: model.id, input: [{ role: "user", content: "unrelated payload" }] },
+		remoteEnabled: true,
+		identity,
+	});
+	assert.deepEqual(missingAnchor, { action: "fail", reason: "payload-summary-anchor-missing" });
 	const ambiguous = planPayloadRewrite({
 		ctx: context(branch),
 		branchEntries: branch,

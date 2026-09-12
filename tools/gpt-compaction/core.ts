@@ -4,6 +4,7 @@ import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	convertToLlm,
 	estimateTokens,
+	sessionEntryToContextMessages,
 	generateSummaryWithUsage,
 	type CompactionEntry,
 	type CompactionResult,
@@ -12,7 +13,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth, resolveSessionId } from "./auth";
-import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
+import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, findLatestNativeHistoryBoundaryInRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
 import { compactionIdentity, identitiesMatch, type CompactionIdentity } from "./model-eligibility";
 import { getCompactionRequestExtras, rememberRequestContext } from "./request-context";
 import {
@@ -100,6 +101,23 @@ function serializeEntries(model: Model<Api>, entries: readonly SessionEntry[]): 
 	return serializeMessagesToResponsesInput(model, convertToLlm(collectMessages(entries)));
 }
 
+function serializeLogicalCompactionInterval(
+	model: Model<Api>,
+	branchEntries: readonly SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+): unknown[] {
+	const nativeBoundary = findLatestNativeHistoryBoundaryInRange(branchEntries, startIndex, endIndex);
+	if (!nativeBoundary) {
+		return serializeEntries(model, branchEntries.slice(startIndex, endIndex).filter((entry) => entry.type !== "compaction"));
+	}
+	const messages = [
+		...sessionEntryToContextMessages(nativeBoundary.entry),
+		...collectMessages(branchEntries.slice(nativeBoundary.firstKeptIndex, endIndex).filter((entry) => entry.type !== "compaction")),
+	];
+	return serializeMessagesToResponsesInput(model, convertToLlm(messages));
+}
+
 function safeHistoryPrefixInput(model: Model<Api>, branchEntries: readonly SessionEntry[], endIndex: number): unknown[] | undefined {
 	const rebuilt = rebuildNativeHistoryPrefix(branchEntries, endIndex);
 	return rebuilt ? serializeMessagesToResponsesInput(model, convertToLlm(rebuilt.messages)) : undefined;
@@ -154,15 +172,12 @@ export function buildRemoteCompactionRequest(args: {
 	const boundary = resolveCheckpointBoundary(args.branchEntries, checkpoint.entry, checkpoint.details);
 	if (!boundary) return { ok: false, reason: "checkpoint-boundary-not-found" };
 	if (cutIndex !== undefined) {
-		if (cutIndex <= boundary.boundaryIndex) return { ok: false, reason: "checkpoint-boundary-not-found" };
-		const compactedEntries = args.branchEntries
-			.slice(boundary.firstKeptIndex, cutIndex)
-			.filter((entry) => entry.type !== "compaction");
+		if (cutIndex <= boundary.firstKeptIndex) return { ok: false, reason: "checkpoint-boundary-not-found" };
 		return {
 			ok: true,
 			input: [
 				...cloneCheckpointItems(checkpoint.details.replacement),
-				...serializeEntries(args.model, compactedEntries),
+				...serializeLogicalCompactionInterval(args.model, args.branchEntries, boundary.firstKeptIndex, cutIndex),
 			],
 		};
 	}
@@ -170,10 +185,17 @@ export function buildRemoteCompactionRequest(args: {
 		ok: true,
 		input: [
 			...cloneCheckpointItems(checkpoint.details.replacement),
-			...serializeEntries(args.model, boundary.retained),
+			...serializeLogicalCompactionInterval(args.model, args.branchEntries, boundary.firstKeptIndex, boundary.boundaryIndex),
 			...serializeEntries(args.model, boundary.liveTail),
 		],
 	};
+}
+
+function mergeCompactionInstructions(systemPrompt: string, customInstructions: string | undefined): string {
+	const custom = customInstructions?.trim();
+	if (!custom) return systemPrompt;
+	if (!systemPrompt.trim()) return custom;
+	return `${systemPrompt}\n\nAdditional instructions for this compaction only:\n${custom}`;
 }
 
 /** Run remote v2 compaction for one `session_before_compact` event. */
@@ -200,7 +222,7 @@ export async function runRemoteCompaction(args: {
 	});
 	if (!request.ok) return { outcome: "failed", reason: request.reason };
 
-	const instructions = ctx.getSystemPrompt();
+	const instructions = mergeCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
 	const body: Record<string, unknown> = { model: model.id, input: request.input, instructions };
 	const extras = getCompactionRequestExtras(auth.identity, sessionId);
 	if (extras) {
@@ -564,6 +586,10 @@ export function planPayloadRewrite(args: {
 		return markerPresent ? { action: "fail", reason: "checkpoint-anchor-not-replayed" } : { action: "none" };
 	}
 	if (!input) return { action: "fail", reason: "responses-input-missing" };
+	if (matchingCheckpointCount === 0 && !markerPresent) {
+		const rebuiltInput = rebuiltBranchInput(model, args.branchEntries);
+		if (inputStartsWith(input, rebuiltInput)) return { action: "none" };
+	}
 	if (matchingCheckpointCount === 1 && !markerPresent) {
 		const boundary = resolveCheckpointBoundary(args.branchEntries, checkpoint.entry, checkpoint.details);
 		return boundary ? { action: "none" } : { action: "fail", reason: "checkpoint-boundary-not-found" };
@@ -600,6 +626,18 @@ function readResponsesInput(payload: unknown): unknown[] | undefined {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
 	const input = (payload as Record<string, unknown>)["input"];
 	return Array.isArray(input) ? input : undefined;
+}
+
+function inputStartsWith(input: readonly unknown[], prefix: readonly unknown[]): boolean {
+	if (input.length < prefix.length) return false;
+	for (let index = 0; index < prefix.length; index += 1) {
+		try {
+			if (JSON.stringify(input[index]) !== JSON.stringify(prefix[index])) return false;
+		} catch {
+			return false;
+		}
+	}
+	return true;
 }
 
 function findSummaryIndex(input: readonly unknown[], marker: string): number {

@@ -1,14 +1,17 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { buildSessionContext, estimateTokens, findCutPoint, getAgentDir, sessionEntryToContextMessages, SettingsManager, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import {
 	compactionIdentity,
+	identitiesMatch,
 	modelSupportsRemoteCompaction,
 	type CompactionIdentity,
 } from "./model-eligibility";
 import {
 	planContextReplay,
 	planPayloadRewrite,
+	rebuiltBranchMessages,
 	rememberLiveRequestContext,
 	runNativeRepairCompaction,
 	runRemoteCompaction,
@@ -26,6 +29,11 @@ import {
 
 const STATUS_KEY = "rail-gpt-compaction";
 const MISSING_AUTH_FINGERPRINT = "missing-auth";
+const installedApis = new WeakSet<object>();
+
+export function gptCompactionExtensionPath(): string {
+	return fileURLToPath(new URL("./standalone-extension.ts", import.meta.url));
+}
 
 function safeIdentity(ctx: ExtensionContext): CompactionIdentity | undefined {
 	const model = ctx.model;
@@ -43,7 +51,7 @@ async function resolveRuntimeIdentity(ctx: ExtensionContext): Promise<Compaction
 function statusText(mode: GptCompactionMode, ctx: ExtensionContext): string {
 	if (mode === "off") return "GPT compact: native";
 	const support = modelSupportsRemoteCompaction(ctx.model);
-	return support.supported ? "GPT compact: remote v2" : "GPT compact: native (inactive)";
+	return support.supported ? "GPT compact: remote v2" : `GPT compact: native (inactive — ${support.detail})`;
 }
 
 function updateStatus(mode: GptCompactionMode, ctx: ExtensionContext): void {
@@ -61,6 +69,57 @@ function redactSensitiveText(text: string): string {
 		.replace(/("?(?:encrypted_content|authorization|api[_-]?key|access[_-]?token)"?\s*:\s*")([^"\\]*)(")/giu, "$1[redacted]$3")
 		.replace(/((?:encrypted[_ ]content|api\s*key|access\s*token|authorization)\s*[:=]\s*)[^\s,;]+/giu, "$1[redacted]")
 		.slice(0, 500);
+}
+
+type MutableSessionManager = {
+	branch(branchFromId: string): void;
+	resetLeaf(): void;
+	appendCompaction(summary: string, firstKeptEntryId: string, tokensBefore: number, details?: unknown, fromHook?: boolean, usage?: unknown): string;
+	appendMessage(message: unknown): string;
+	appendModelChange(provider: string, modelId: string): string;
+	appendThinkingLevelChange(thinkingLevel: string): string;
+	appendCustomEntry(customType: string, data?: unknown): string;
+	appendCustomMessageEntry(customType: string, content: unknown, display: boolean, details?: unknown): string;
+	appendSessionInfo(name: string): string;
+	appendLabelChange(targetId: string, label: string | undefined): string;
+};
+
+function isReplayableTailEntry(entry: SessionEntry): boolean {
+	return entry.type === "message"
+		|| entry.type === "model_change"
+		|| entry.type === "thinking_level_change"
+		|| entry.type === "custom"
+		|| entry.type === "custom_message"
+		|| entry.type === "session_info"
+		|| entry.type === "label";
+}
+
+function appendTailEntry(manager: MutableSessionManager, entry: SessionEntry): void {
+	switch (entry.type) {
+		case "message":
+			manager.appendMessage(entry.message);
+			return;
+		case "model_change":
+			manager.appendModelChange(entry.provider, entry.modelId);
+			return;
+		case "thinking_level_change":
+			manager.appendThinkingLevelChange(entry.thinkingLevel);
+			return;
+		case "custom":
+			manager.appendCustomEntry(entry.customType, entry.data);
+			return;
+		case "custom_message":
+			manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
+			return;
+		case "session_info":
+			if (entry.name !== undefined) manager.appendSessionInfo(entry.name);
+			return;
+		case "label":
+			manager.appendLabelChange(entry.targetId, entry.label);
+			return;
+		default:
+			throw new Error(`unsupported-live-tail-entry:${entry.type}`);
+	}
 }
 
 function blockedProviderPayload(payload: unknown, reason: string): unknown {
@@ -82,9 +141,11 @@ function markBlocked(signal: AbortSignal | undefined, reason: string, blocked: M
 
 /** Install Rail's GPT-only remote compaction seam in every Pi run mode. */
 export function installGptCompaction(pi: ExtensionAPI): void {
+	if (installedApis.has(pi as object)) return;
+	installedApis.add(pi as object);
 	let mode: GptCompactionMode = readGptCompactionSettings().mode;
 	const blockedRequests = new Map<AbortSignal, string>();
-	let forceNativeRepair = false;
+	let pendingContextRefresh: { previousMessages: AgentMessage[] } | undefined;
 	const syncMode = (): GptCompactionMode => {
 		mode = readGptCompactionSettings().mode;
 		return mode;
@@ -93,26 +154,82 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		const branch = ctx.sessionManager.getBranch();
 		const checkpoint = resolveSessionCheckpoint(branch);
 		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return { ok: true };
-		const index = branch.findIndex((entry) => entry.id === checkpoint.entry.id);
-		if (index < 0 || !branch.slice(index + 1).some((entry) => entry.type !== "compaction")) return { ok: true };
-		forceNativeRepair = true;
-		return await new Promise((resolve) => {
-			try {
-				ctx.compact({
-					onComplete: () => {
-						forceNativeRepair = false;
-						resolve({ ok: true });
-					},
-					onError: (error) => {
-						forceNativeRepair = false;
-						resolve({ ok: false, detail: error.message });
-					},
-				});
-			} catch (error) {
-				forceNativeRepair = false;
-				resolve({ ok: false, detail: error instanceof Error ? error.message : String(error) });
-			}
+		const checkpointIndex = branch.findIndex((entry) => entry.id === checkpoint.entry.id);
+		if (checkpointIndex < 0) return { ok: false, detail: "checkpoint-boundary-not-found" };
+		const originalBranch = branch.slice(0, checkpointIndex);
+		const settings = SettingsManager.create(ctx.cwd, getAgentDir()).getCompactionSettings();
+		const checkpointFirstKeptIndex = originalBranch.findIndex((entry) => entry.id === checkpoint.entry.firstKeptEntryId);
+		const cutPoint = checkpointFirstKeptIndex > 0
+			? undefined
+			: findCutPoint(originalBranch, 0, originalBranch.length, settings.keepRecentTokens);
+		const firstKeptIndex = checkpointFirstKeptIndex > 0 ? checkpointFirstKeptIndex : cutPoint?.firstKeptEntryIndex ?? -1;
+		const firstKeptEntry = originalBranch[firstKeptIndex];
+		if (!firstKeptEntry?.id) return { ok: false, detail: "no-repair-source" };
+		const historyEnd = firstKeptIndex;
+		const preparation = {
+			firstKeptEntryId: firstKeptEntry.id,
+			messagesToSummarize: originalBranch.slice(0, historyEnd).flatMap(sessionEntryToContextMessages),
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: buildSessionContext(originalBranch).messages.reduce((total, message) => total + estimateTokens(message), 0),
+			fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+			settings,
+		};
+		if (preparation.messagesToSummarize.length === 0) return { ok: false, detail: "no-repair-source" };
+		const tail = branch.slice(checkpointIndex + 1);
+		if (tail.some((entry) => !isReplayableTailEntry(entry))) return { ok: false, detail: "unsupported-live-tail-entry" };
+		const previousMessages = ctx.sessionManager.buildContextEntries().flatMap((entry) => sessionEntryToContextMessages(entry));
+		const signal = new AbortController();
+		const outcome = await runNativeRepairCompaction({
+			event: {
+				type: "session_before_compact",
+				preparation,
+				branchEntries: originalBranch,
+				reason: "manual",
+				willRetry: false,
+				signal: signal.signal,
+			},
+			ctx,
 		});
+		if (outcome.outcome !== "success") {
+			return outcome.outcome === "aborted"
+				? { ok: false, detail: "native-repair-aborted" }
+				: { ok: false, detail: outcome.detail ?? outcome.reason };
+		}
+		try {
+			const manager = ctx.sessionManager as typeof ctx.sessionManager & MutableSessionManager;
+			if (checkpoint.entry.parentId) manager.branch(checkpoint.entry.parentId);
+			else manager.resetLeaf();
+			manager.appendCompaction(
+				outcome.compaction.summary,
+				outcome.compaction.firstKeptEntryId,
+				outcome.compaction.tokensBefore,
+				outcome.compaction.details,
+				false,
+				outcome.compaction.usage,
+			);
+			for (const entry of tail) appendTailEntry(manager, entry);
+			pendingContextRefresh = { previousMessages };
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+		}
+	};
+	const repairIfUnsafeResume = async (ctx: ExtensionContext): Promise<void> => {
+		const branch = ctx.sessionManager.getBranch();
+		const checkpoint = resolveSessionCheckpoint(branch);
+		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return;
+		const model = ctx.model;
+		if (!model) return;
+		const support = modelSupportsRemoteCompaction(model);
+		if (mode === "on" && support.supported && checkpoint.status === "remote") {
+			const identity = await resolveRuntimeIdentity(ctx);
+			if (identity && identitiesMatch(checkpoint.details.consumer, identity)) return;
+		}
+		const rebuilt = rebuiltBranchMessages(branch);
+		if (rebuilt.reduce((total, message) => total + estimateTokens(message), 0) <= model.contextWindow) return;
+		const repaired = await repairBeforeDisabling(ctx);
+		if (!repaired.ok) ctx.ui.notify(`GPT compaction resume remains fail-closed; native repair failed: ${redactSensitiveText(repaired.detail)}`, "error");
 	};
 
 	pi.registerCommand("rail-gpt-compaction", {
@@ -166,6 +283,10 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 				mode = saved.mode;
 				updateStatus(mode, ctx);
 				ctx.ui.notify(`GPT Remote Compaction v2 ${mode} (${gptCompactionSettingsScope(saved.path)}).`, "info");
+				if (mode === "on") {
+					const support = modelSupportsRemoteCompaction(ctx.model);
+					if (!support.supported) ctx.ui.notify(`Remote v2 is inactive for the current model: ${support.detail}. Pi will use native compaction.`, "warning");
+				}
 			} catch (error) {
 				ctx.ui.notify(`Could not save GPT compaction settings: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`, "error");
 			}
@@ -175,13 +296,19 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		const settings = readGptCompactionSettings();
 		mode = settings.mode;
+		pendingContextRefresh = undefined;
 		clearRequestContextCache(ctx.sessionManager.getSessionId());
 		blockedRequests.clear();
 		if (settings.warning) ctx.ui.notify(settings.warning, "warning");
+		if (mode === "off") await repairIfUnsafeResume(ctx);
 		updateStatus(mode, ctx);
 	});
 
-	pi.on("model_select", async (_event, ctx) => updateStatus(mode, ctx));
+	pi.on("model_select", async (_event, ctx) => {
+		syncMode();
+		await repairIfUnsafeResume(ctx);
+		updateStatus(mode, ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => updateStatus(mode, ctx));
 	pi.on("session_compact", async (_event, ctx) => updateStatus(mode, ctx));
 	pi.on("session_compact_failed", async (_event, ctx) => updateStatus(mode, ctx));
@@ -192,8 +319,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		const support = modelSupportsRemoteCompaction(model);
 		const checkpoint = resolveSessionCheckpoint(event.branchEntries);
 
-		const mustRepairNative = forceNativeRepair
-			|| checkpoint.status === "invalid"
+		const mustRepairNative = checkpoint.status === "invalid"
 			|| (checkpoint.status === "remote" && (mode !== "on" || !support.supported));
 		if (mustRepairNative) {
 			const outcome = await runNativeRepairCompaction({ event, ctx });
@@ -221,6 +347,31 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		syncMode();
 		const branchEntries = ctx.sessionManager.getBranch();
 		const checkpoint = resolveSessionCheckpoint(branchEntries);
+		if (pendingContextRefresh) {
+			const previousMessages = pendingContextRefresh.previousMessages;
+			const startsWith = (messages: readonly AgentMessage[], prefix: readonly AgentMessage[]): boolean => {
+				if (messages.length < prefix.length) return false;
+				for (let index = 0; index < prefix.length; index += 1) {
+					try {
+						if (JSON.stringify(messages[index]) !== JSON.stringify(prefix[index])) return false;
+					} catch {
+						return false;
+					}
+				}
+				return true;
+			};
+			const rebuilt = rebuiltBranchMessages(branchEntries);
+			if (startsWith(event.messages, previousMessages)) {
+				pendingContextRefresh = undefined;
+				return { messages: [...rebuilt, ...event.messages.slice(previousMessages.length).map((message) => structuredClone(message))] };
+			}
+			if (startsWith(event.messages, rebuilt)) pendingContextRefresh = undefined;
+			else {
+				markBlocked(ctx.signal, "native-repair-context-refresh-failed", blockedRequests);
+				ctx.abort();
+				return { messages: event.messages };
+			}
+		}
 		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return undefined;
 		const support = modelSupportsRemoteCompaction(ctx.model);
 		const identity = support.supported ? await resolveRuntimeIdentity(ctx) : safeIdentity(ctx);
@@ -288,5 +439,6 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		clearRequestContextCache(ctx.sessionManager.getSessionId());
 		blockedRequests.clear();
+		pendingContextRefresh = undefined;
 	});
 }

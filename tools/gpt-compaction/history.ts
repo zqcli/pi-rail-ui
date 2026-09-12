@@ -94,11 +94,19 @@ function isNativeCompactionEntry(entry: SessionEntry | undefined): entry is Comp
  * when the caller passes a branch prefix.
  */
 export function findLatestNativeHistoryBoundary(entries: readonly SessionEntry[]): NativeHistoryBoundary | undefined {
+	return findLatestNativeHistoryBoundaryInRange(entries, 0, entries.length);
+}
+
+export function findLatestNativeHistoryBoundaryInRange(
+	entries: readonly SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+): NativeHistoryBoundary | undefined {
 	for (let compactionIndex = entries.length - 1; compactionIndex >= 0; compactionIndex -= 1) {
 		const entry = entries[compactionIndex];
 		if (!isNativeCompactionEntry(entry)) continue;
 		const firstKeptIndex = findEntryIndex(entries, entry.firstKeptEntryId);
-		if (firstKeptIndex >= 0 && firstKeptIndex < compactionIndex) {
+		if (compactionIndex >= startIndex && compactionIndex < endIndex && firstKeptIndex >= startIndex && firstKeptIndex < endIndex && firstKeptIndex < compactionIndex) {
 			return { compactionIndex, firstKeptIndex, entry };
 		}
 	}
@@ -139,5 +147,11 @@ export function rebuildNativeHistoryPrefix(
 	endIndex: number,
 ): HistoryRebuildResult | undefined {
 	if (endIndex < 0 || endIndex > branchEntries.length) return undefined;
-	return rebuildNativeHistory(branchEntries.slice(0, endIndex));
+	const nativeBoundary = findLatestNativeHistoryBoundaryInRange(branchEntries, 0, endIndex);
+	if (!nativeBoundary) return rebuildNativeHistory(branchEntries.slice(0, endIndex));
+	const messages = [
+		...sessionEntryToContextMessages(nativeBoundary.entry),
+		...collectMessages(branchEntries.slice(nativeBoundary.firstKeptIndex, endIndex).filter((entry) => entry.type !== "compaction")),
+	];
+	return { messages, skippedCompactions: 1, nativeBoundary };
 }

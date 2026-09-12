@@ -11,6 +11,7 @@ import {
 	writeGptCompactionMode,
 } from "../../tools/gpt-compaction/settings";
 import { installGptCompaction } from "../../tools/gpt-compaction/extension";
+import installGptCompactionExtension from "../../tools/gpt-compaction/standalone-extension";
 
 test("GPT compaction settings default to off and persist outside session files", async (t) => {
 	const agentDir = await mkdtemp(join(tmpdir(), "rail-gpt-settings-"));
@@ -41,22 +42,30 @@ test("the real extension registration exposes stateful menu, completion, and per
 		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
 	});
 	const commands = new Map<string, any>();
+	let commandRegistrations = 0;
 	const handlers = new Map<string, any>();
 	const notices: string[] = [];
 	const selections: Array<{ title: string; options: string[] }> = [];
 	const pi = {
-		registerCommand: (name: string, command: unknown) => commands.set(name, command),
+		registerCommand: (name: string, command: unknown) => {
+			commandRegistrations += 1;
+			commands.set(name, command);
+		},
 		on: (event: string, handler: unknown) => handlers.set(event, handler),
 	} as any;
 	installGptCompaction(pi);
+	installGptCompactionExtension(pi);
+	assert.equal(commandRegistrations, 1);
 	assert.equal(commands.has("rail-gpt-compaction"), true);
 	const command = commands.get("rail-gpt-compaction");
+	assert.deepEqual(command.getArgumentCompletions("")?.map((item: any) => item.value), ["on", "off"]);
 	assert.deepEqual(command.getArgumentCompletions("on")?.map((item: any) => item.value), ["on"]);
+	assert.deepEqual(command.getArgumentCompletions("off")?.map((item: any) => item.value), ["off"]);
 	assert.deepEqual(command.getArgumentCompletions("x"), null);
 	const ctx = {
 		mode: "tui",
 		hasUI: true,
-		model: undefined,
+		model: { provider: "azure", api: "azure-openai-responses", id: "gpt-4.1", name: "GPT-4.1", baseUrl: "https://azure.example/v1" },
 		ui: {
 			select: async (title: string, options: string[]) => {
 				selections.push({ title, options });
@@ -72,6 +81,7 @@ test("the real extension registration exposes stateful menu, completion, and per
 	assert.equal(readGptCompactionSettings(agentDir).mode, "on");
 	assert.deepEqual(selections, [{ title: "GPT Remote Compaction v2 — currently off", options: ["on", "off"] }]);
 	assert.match(notices.join("\n"), /global agent setting/);
+	assert.match(notices.join("\n"), /azure\/gpt-4\.1 uses azure-openai-responses/);
 	await command.handler("off", ctx);
 	assert.equal(readGptCompactionSettings(agentDir).mode, "off");
 });

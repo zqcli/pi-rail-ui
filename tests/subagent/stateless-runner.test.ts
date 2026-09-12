@@ -59,6 +59,21 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 	});
 });
 
+test("stateless runner can opt into an ephemeral session for real compaction lifecycle tests", async () => {
+	let capturedArgs: string[] = [];
+	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
+	const runner = createStatelessAgentRunner({
+		useSessionForCompaction: true,
+		resolveInvocation: (args) => {
+			capturedArgs = args;
+			return { command: process.execPath, args: [fixture] };
+		},
+	});
+	await runner({ model, task: "ephemeral compaction", cwd: process.cwd() });
+	assert.equal(capturedArgs.includes("--no-session"), false);
+	assert.equal(capturedArgs.includes("--session"), true);
+});
+
 test("stateless runner adds the explicit context helper only for an explicit budget", async () => {
 	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
 	let explicitArgs: string[] = [];

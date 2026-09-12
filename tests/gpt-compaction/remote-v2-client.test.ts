@@ -95,6 +95,7 @@ test("reconciliation fails closed on every incomplete or ambiguous stream", () =
 		{ name: "no compaction item", events: sse([{ event: "response.completed", data: completedResponse({ output: [{ type: "message", role: "assistant" }] }) }]), reason: "invalid-compaction-count" },
 		{ name: "two compaction items", events: sse([{ event: "response.completed", data: completedResponse({ output: [{ ...checkpointItem }, { ...checkpointItem, id: "item_2" }] }) }]), reason: "invalid-compaction-count" },
 		{ name: "malformed checkpoint", events: sse([{ event: "response.completed", data: completedResponse({ output: [{ type: "compaction", id: "x" }] }) }]), reason: "malformed-compaction-item" },
+		{ name: "checkpoint with unrelated fields", events: sse([{ event: "response.completed", data: completedResponse({ output: [{ ...checkpointItem, trigger: true }] }) }]), reason: "malformed-compaction-item" },
 		{ name: "failed response", events: sse([{ event: "response.failed", data: { type: "response.failed", response: { id: "r", status: "failed" } } }]), reason: "error-event" },
 		{ name: "incomplete status", events: sse([{ event: "response.completed", data: completedResponse({ status: "incomplete" }) }]), reason: "incomplete-response" },
 		{ name: "event after completed", events: sse([{ event: "response.completed", data: completedResponse() }, { event: "response.output_text.delta", data: { type: "response.output_text.delta", delta: "x" } }]), reason: "invalid-event-order" },

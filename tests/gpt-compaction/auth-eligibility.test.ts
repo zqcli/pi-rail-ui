@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildCompactionHeaders, resolveCompactionAuth } from "../../tools/gpt-compaction/auth";
+import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth } from "../../tools/gpt-compaction/auth";
 import { isGptModelName, modelSupportsRemoteCompaction } from "../../tools/gpt-compaction/model-eligibility";
 
 const model = {
@@ -16,6 +16,12 @@ test("GPT Responses eligibility is provider-independent but not model-independen
 	assert.equal(modelSupportsRemoteCompaction(model).supported, true);
 	assert.equal(modelSupportsRemoteCompaction({ ...model, id: "claude-3", name: "Claude 3" }).supported, false);
 	assert.equal(modelSupportsRemoteCompaction({ ...model, api: "openai-completions" }).supported, false);
+	assert.equal(modelSupportsRemoteCompaction({ ...model, api: "azure-openai-responses" }).supported, false);
+});
+
+test("Responses URLs append paths without swallowing endpoint query parameters", () => {
+	assert.equal(buildResponsesUrl("https://proxy.example/v1?api-version=2025-01-01", "openai-responses"), "https://proxy.example/v1/responses?api-version=2025-01-01");
+	assert.equal(buildResponsesUrl("https://proxy.example/codex?tenant=local", "openai-codex-responses"), "https://proxy.example/codex/responses?tenant=local");
 });
 
 test("compaction auth reuses header-only credentials and stores only a non-secret fingerprint", async () => {

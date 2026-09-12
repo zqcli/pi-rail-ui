@@ -8,15 +8,21 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { gptCompactionSummary } from "../../tools/gpt-compaction/types";
 import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
+import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
 
 const bundleCli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const railExtension = fileURLToPath(new URL("../../index.ts", import.meta.url));
 const providerFixture = fileURLToPath(new URL("../fixtures/gpt-compaction-probe.mjs", import.meta.url));
+const toolLoopFixture = fileURLToPath(new URL("../fixtures/gpt-compaction-tool-loop.mjs", import.meta.url));
 
-async function writeSeedSession(path: string): Promise<void> {
+async function writeSeedSession(path: string, invalidDetails = false): Promise<void> {
 	const authFingerprint = createHash("sha256").update("api-key:probe-key").digest("hex");
 	const checkpoint = { type: "compaction", encrypted_content: "opaque-checkpoint-for-probe" };
-	const details = {
+	const details = invalidDetails ? {
+		version: 2,
+		strategy: "gpt-remote-compaction-v2",
+		checkpointId: "probe-checkpoint",
+	} : {
 		version: 2,
 		strategy: "gpt-remote-compaction-v2",
 		checkpointId: "probe-checkpoint",
@@ -162,6 +168,21 @@ test("real Pi 0.85.1 loads the root extension and preserves live input in off/on
 	}
 });
 
+test("real Pi blocks an invalid Rail marker before the provider sees it", { timeout: 30_000 }, async (t) => {
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-invalid-"));
+	t.after(() => rm(sandbox, { recursive: true, force: true }));
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	const logPath = join(sandbox, "provider.jsonl");
+	await mkdir(agentDir, { recursive: true });
+	await writeSeedSession(sessionPath, true);
+	const result = await runProbe(agentDir, sessionPath, logPath, "on");
+	assert.equal(result.code, 0, result.stderr);
+	const provider = await readProbe(logPath);
+	assert.doesNotMatch(JSON.stringify(provider["payload"]), /opaque-checkpoint-for-probe|probe-checkpoint|GPT remote compaction checkpoint/);
+	assert.match(JSON.stringify(provider["payload"]), /original history/);
+});
+
 test("real RPC manual compaction uses the mocked Responses v2 handshake and persists the opaque checkpoint", { timeout: 30_000 }, async (t) => {
 	const { server, gateway, requests } = await startMockCompactionServer();
 	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-rpc-"));
@@ -201,6 +222,50 @@ test("real RPC manual compaction uses the mocked Responses v2 handshake and pers
 	assert.match(compaction["summary"], /GPT remote compaction checkpoint/);
 });
 
+test("a persistent RPC worker observes a global compaction switch without restarting", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-worker-settings-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 16_384, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", railExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir, RAIL_GPT_COMPACTION_GATEWAY: gateway },
+	});
+	await transport.start();
+	try {
+		await transport.request({ type: "compact" });
+		assert.equal(requests.length, 1);
+		await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "off" }));
+		const settled = new Promise<void>((resolve) => {
+			const unsubscribe = transport.onEvent((event) => {
+				if (event.type !== "agent_settled") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		await transport.request({ type: "prompt", message: "live after global switch" });
+		await settled;
+		await transport.request({ type: "compact" });
+	} finally {
+		await transport.stop();
+	}
+	assert.equal(requests.length, 1, "turns after the global off switch must not call Remote v2");
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	const compactions = saved.filter((entry) => entry["type"] === "compaction");
+	assert.ok(compactions.length >= 2);
+	assert.equal(compactions.at(-1)?.["details"]?.strategy, undefined, "the persistent worker must repair with native compaction after the switch");
+});
+
 test("real Pi stateless JSON mode loads the root extension without a session", { timeout: 30_000 }, async (t) => {
 	const { server, gateway, requests } = await startMockCompactionServer();
 	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-stateless-"));
@@ -219,6 +284,58 @@ test("real Pi stateless JSON mode loads the root extension without a session", {
 	assert.equal(requests.length, 0, "--no-session must not attempt to persist or remotely compact a session");
 	const providerCalls = (await readFile(logPath, "utf8")).split("\n").filter((line) => line.includes('"kind":"provider"'));
 	assert.equal(providerCalls.length, 1);
+});
+
+test("real stateless runner can use an ephemeral session for a multi-turn tool compaction", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-stateless-runner-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const nestedCwd = join(sandbox, "nested", "cwd");
+	const logPath = join(sandbox, "tool-loop.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await mkdir(nestedCwd, { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	const runner = createStatelessAgentRunner({
+		useSessionForCompaction: true,
+		resolveInvocation: (args) => {
+			const task = args.at(-1)!;
+			return {
+				command: process.execPath,
+				args: [bundleCli, ...args.slice(0, -1), "-e", toolLoopFixture, "-e", railExtension, task],
+			};
+		},
+	});
+	const previousGateway = process.env["RAIL_GPT_COMPACTION_GATEWAY"];
+	const previousLog = process.env["RAIL_GPT_COMPACTION_TOOL_LOG"];
+	const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+	process.env["RAIL_GPT_COMPACTION_GATEWAY"] = gateway;
+	process.env["RAIL_GPT_COMPACTION_TOOL_LOG"] = logPath;
+	process.env["PI_CODING_AGENT_DIR"] = agentDir;
+	t.after(() => {
+		if (previousGateway === undefined) delete process.env["RAIL_GPT_COMPACTION_GATEWAY"];
+		else process.env["RAIL_GPT_COMPACTION_GATEWAY"] = previousGateway;
+		if (previousLog === undefined) delete process.env["RAIL_GPT_COMPACTION_TOOL_LOG"];
+		else process.env["RAIL_GPT_COMPACTION_TOOL_LOG"] = previousLog;
+		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+	});
+	const result = await runner({
+		model: { provider: "cus-resp", modelId: "gpt-5.6-sol" },
+		cwd: nestedCwd,
+		contextWindow: 16_000,
+		task: `run the tool loop ${"history ".repeat(5_000)}`,
+	});
+	assert.equal(result.exitCode, 0, result.errorMessage);
+	assert.equal(result.output, "tool loop complete");
+	assert.ok(requests.length >= 1, "the ephemeral stateless session must enter the real Remote v2 handshake");
+	const records = (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
+	assert.ok(records.some((record) => record["kind"] === "tool"), "the runner must execute real tool turns");
+	assert.ok(records.filter((record) => record["kind"] === "provider").length >= 3, "the runner must make multiple provider turns");
 });
 
 test("real RPC threshold compaction invokes Remote v2 before the next provider turn", { timeout: 30_000 }, async (t) => {

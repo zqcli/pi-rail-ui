@@ -144,3 +144,31 @@ test("tracks native compaction progress without leaking the summary or settling 
 		assert.doesNotMatch(JSON.stringify(result), /PRIVATE MODEL SUMMARY/);
 	}
 });
+
+test("folds one compaction usage result without turning it into an assistant turn", () => {
+	const collector = new RunResultCollector("compaction usage", assistantText);
+	collector.ingest({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "before" }], usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.1 } }, stopReason: "stop" },
+	});
+	collector.ingest({ type: "compaction_start", reason: "threshold" });
+	const compactionEnd = {
+		type: "compaction_end",
+		reason: "threshold",
+		result: { summary: "private", usage: { input_tokens: 100, output_tokens: 5, total_tokens: 125, input_tokens_details: { cached_tokens: 20 }, cost: { total: 0.5 } } },
+		aborted: false,
+		willRetry: false,
+	} as const;
+	collector.ingest(compactionEnd);
+	collector.ingest(compactionEnd);
+
+	assert.deepEqual(collector.result("fallback").usage, {
+		input: 90,
+		output: 7,
+		cacheRead: 20,
+		cacheWrite: 0,
+		cost: 0.6,
+		contextTokens: 12,
+		turns: 1,
+	});
+});

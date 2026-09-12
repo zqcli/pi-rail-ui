@@ -120,7 +120,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 				updateStatus(mode, ctx);
 				ctx.ui.notify(`GPT Remote Compaction v2 ${mode} (${gptCompactionSettingsScope(saved.path)}).`, "info");
 			} catch (error) {
-				ctx.ui.notify(`Could not save GPT compaction settings: ${error instanceof Error ? error.message : String(error)}`, "error");
+				ctx.ui.notify(`Could not save GPT compaction settings: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`, "error");
 			}
 		},
 	});

@@ -32,12 +32,10 @@ import {
 const STATUS_KEY = "rail-gpt-compaction";
 const MISSING_AUTH_FINGERPRINT = "missing-auth";
 const INSTALL_EVENT = "rail-gpt-compaction:install";
-const installedApis = new WeakSet<object>();
 
 type InstallClaim = { claimed: boolean };
 
 function claimSharedInstall(pi: ExtensionAPI): boolean {
-	if (!pi.events) return true;
 	const claim: InstallClaim = { claimed: false };
 	pi.events.emit(INSTALL_EVENT, claim);
 	if (claim.claimed) return false;
@@ -152,9 +150,7 @@ function markBlocked(signal: AbortSignal | undefined, reason: string, blocked: M
 
 /** Install Rail's GPT-only remote compaction seam in every Pi run mode. */
 export function installGptCompaction(pi: ExtensionAPI): void {
-	if (installedApis.has(pi as object)) return;
 	if (!claimSharedInstall(pi)) return;
-	installedApis.add(pi as object);
 	let mode: GptCompactionMode = readGptCompactionSettings().mode;
 	const blockedRequests = new Map<AbortSignal, string>();
 	let pendingNativeRepair: PendingNativeRepair | undefined;

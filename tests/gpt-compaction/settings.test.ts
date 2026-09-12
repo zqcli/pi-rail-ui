@@ -46,14 +46,20 @@ test("the real extension registration exposes stateful menu, completion, and per
 	const handlers = new Map<string, any>();
 	const notices: string[] = [];
 	const selections: Array<{ title: string; options: string[] }> = [];
+	const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
 	const pi = {
 		registerCommand: (name: string, command: unknown) => {
 			commandRegistrations += 1;
 			commands.set(name, command);
 		},
 		events: {
-			emit: () => {},
-			on: () => () => {},
+			emit: (channel: string, data: unknown) => { for (const handler of eventHandlers.get(channel) ?? []) handler(data); },
+			on: (channel: string, handler: (data: unknown) => void) => {
+				const handlers = eventHandlers.get(channel) ?? new Set<(data: unknown) => void>();
+				handlers.add(handler);
+				eventHandlers.set(channel, handlers);
+				return () => handlers.delete(handler);
+			},
 		},
 		on: (event: string, handler: unknown) => handlers.set(event, handler),
 	} as any;

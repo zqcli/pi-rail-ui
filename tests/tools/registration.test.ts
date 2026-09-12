@@ -7,11 +7,21 @@ async function collectRegistrations(depth: number): Promise<{ tools: string[]; c
 	process.env["PI_SUBAGENT_DEPTH"] = String(depth);
 	const tools: string[] = [];
 	const commands: string[] = [];
+	const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
 	try {
 		await installRailUi({
 			registerTool: (definition: { name: string }) => { tools.push(definition.name); },
 			registerCommand: (name: string) => { commands.push(name); },
 			on: () => undefined,
+			events: {
+				emit: (channel: string, data: unknown) => { for (const handler of eventHandlers.get(channel) ?? []) handler(data); },
+				on: (channel: string, handler: (data: unknown) => void) => {
+					const handlers = eventHandlers.get(channel) ?? new Set<(data: unknown) => void>();
+					handlers.add(handler);
+					eventHandlers.set(channel, handlers);
+					return () => handlers.delete(handler);
+				},
+			},
 		} as any);
 		return { tools, commands };
 	} finally {

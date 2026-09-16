@@ -115,13 +115,17 @@ function setupTool(options: { runStateless?: StatefulSubagentToolOptions["runSta
 test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestration rules", () => {
 	const { tool } = setupTool();
 
-	assert.match(tool.description, /model\+task with no alias\/target\/session for one-off stateless work/);
-	assert.match(tool.description, /model\+alias\+concrete task/);
-	assert.match(tool.description, /target\+task/);
+	assert.match(tool.description, /Use exactly one mode: single, parallel, chain, or control/);
+	assert.match(tool.description, /\{"model":"provider\/model:thinking","task":"one-off work","contextWindow":64000\}/);
+	assert.match(tool.description, /\{"model":"provider\/model:thinking","alias":"worker","task":"initial work","contextWindow":96000\}/);
+	assert.match(tool.description, /\{"target":"worker","task":"follow-up","contextWindow":96000\}/);
+	assert.match(tool.description, /\{"tasks":\[\{"task":"A"\},\{"model":"provider\/model","alias":"worker","task":"B","contextWindow":128000\}\]\}/);
+	assert.match(tool.description, /\{"chain":\[\{"task":"plan"\},\{"target":"worker","task":"implement \{previous\}"\}\]\}/);
+	assert.match(tool.description, /\{"target":"worker","control":\{"delivery":"steer","message":"redirect now"\}\}/);
+	assert.match(tool.description, /Top-level contextWindow is only for single mode/);
+	assert.match(tool.description, /each tasks or chain item owns its own contextWindow/);
 	assert.match(tool.description, /multiple sibling subagent calls in the same assistant turn/);
-	assert.match(tool.description, /do not use the tasks array/);
-	assert.match(tool.description, /one grouped parent Tool Call/);
-	assert.match(tool.description, /control.*steer.*followUp/);
+	assert.match(tool.description, /do not use tasks/);
 	assert.equal(tool.executionMode, "parallel");
 	const guidance = tool.promptGuidelines.join("\n");
 	assert.match(guidance, /lifecycle by continuity/);
@@ -556,6 +560,7 @@ test("model without alias or session runs stateless and creates no broker instan
 		chain: [],
 	}, theme).render(100).join("\n");
 	assert.match(rendered, /stateless cus-resp\/gpt-5\.6-sol:xhigh/);
+	assert.match(rendered, /contextWindow default/);
 	assert.doesNotMatch(rendered, /control|persistent new/);
 });
 
@@ -617,6 +622,45 @@ test("forwards contextWindow only as per-task execution metadata", async () => {
 	assert.equal(broker.requests[0]?.contextWindow, 128_000);
 	assert.equal("contextWindow" in result.details.results[0], false);
 	assert.equal("contextWindow" in result.details.results[1], false);
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const args = {
+		tasks: [
+			{ task: "stateless budget", contextWindow: 64_000 },
+			{ alias: "persistent-budget", task: "persistent budget", contextWindow: 128_000 },
+		],
+	};
+	const call = tool.renderCall(args, theme).render(140).join("\n");
+	assert.match(call, /contextWindow \[64000, 128000\]/);
+	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(160).join("\n");
+	assert.match(panel, /cus-resp\/gpt-5\.6-sol #1 · stateless · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 64000/);
+	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 128000/);
+});
+
+test("context window display uses default for omitted single and grouped budgets", async () => {
+	const { tool } = setupTool({
+		runStateless: async () => ({
+			output: "done",
+			exitCode: 0,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+	const singleArgs = { task: "default single" };
+	const single = await tool.execute("default-single-window", singleArgs, undefined, undefined, context());
+	assert.match(tool.renderCall(singleArgs, theme).render(100).join("\n"), /contextWindow default/);
+	assert.match(
+		tool.renderResult(single, { expanded: false }, theme, { args: singleArgs }).render(140).join("\n"),
+		/contextWindow default/,
+	);
+
+	const groupedArgs = { tasks: [{ task: "default child" }, { task: "explicit child", contextWindow: 96_000 }] };
+	const grouped = await tool.execute("mixed-context-window-display", groupedArgs, undefined, undefined, context());
+	assert.match(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /contextWindow \[default, 96000\]/);
+	const groupedPanel = tool.renderResult(grouped, { expanded: false }, theme, { args: groupedArgs }).render(160).join("\n");
+	assert.equal((groupedPanel.match(/contextWindow default/gu) ?? []).length, 1);
+	assert.equal((groupedPanel.match(/contextWindow 96000/gu) ?? []).length, 1);
 });
 
 test("chain mode preserves ordering and substitutes the previous final output", async () => {

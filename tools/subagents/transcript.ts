@@ -54,12 +54,14 @@ export interface SubagentTranscriptRun {
 	errorMessage?: string;
 	step?: number;
 	outputTruncated?: boolean;
+	contextWindowText?: string;
 }
 
 export interface SubagentTranscriptRenderOptions {
 	isPartial?: boolean;
 	durationMs?: number;
 	initialTasks?: readonly string[];
+	contextWindows?: readonly (string | undefined)[] | undefined;
 	markdownTheme?: MarkdownTheme;
 }
 
@@ -732,9 +734,22 @@ function usageText(run: SubagentTranscriptRun): string {
 	return parts.join(" · ");
 }
 
+function runsWithContextWindows(
+	runs: SubagentTranscriptRun[],
+	contextWindows: readonly (string | undefined)[] | undefined,
+): SubagentTranscriptRun[] {
+	if (!contextWindows) return runs;
+	return runs.map((run, runIndex) => {
+		const targetSlot = run.slot ?? runIndex;
+		const contextWindowText = contextWindows[targetSlot] ?? "default";
+		return { ...run, contextWindowText };
+	});
+}
+
 function identityText(run: SubagentTranscriptRun): string {
 	const step = run.step !== undefined ? `step ${run.step} · ` : "";
-	return `${step}${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}`;
+	const contextWindow = run.contextWindowText ? ` · contextWindow ${run.contextWindowText}` : "";
+	return `${step}${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}${contextWindow}`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
@@ -905,7 +920,11 @@ export function renderSubagentTranscript(
 	theme: Theme,
 	options: SubagentTranscriptRenderOptions = {},
 ): Component {
-	const boundedRuns = boundSubagentRunTranscripts(runsWithInitialTasks(runs, options.initialTasks));
+	const runsWithContext = runsWithContextWindows(
+		runsWithInitialTasks(runs, options.initialTasks),
+		options.contextWindows,
+	);
+	const boundedRuns = boundSubagentRunTranscripts(runsWithContext);
 	if (boundedRuns.length > 1) {
 		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme, options.markdownTheme);
 	}
@@ -931,7 +950,8 @@ export function renderSubagentTranscript(
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	const header = `${theme.fg("warning", only.isCompacting ? "Compacting" : "…")} ${theme.fg("toolTitle", theme.bold(only.alias))}${theme.fg("dim", ` · ${only.persistent ? "persistent" : "stateless"} · ${only.model ?? "model unavailable"}`)}`;
+	const contextWindow = only.contextWindowText ? ` · contextWindow ${only.contextWindowText}` : "";
+	const header = `${theme.fg("warning", only.isCompacting ? "Compacting" : "…")} ${theme.fg("toolTitle", theme.bold(only.alias))}${theme.fg("dim", ` · ${only.persistent ? "persistent" : "stateless"} · ${only.model ?? "model unavailable"}${contextWindow}`)}`;
 	const usage = usageText(only);
 	return new BoundedTranscriptView(
 		header,

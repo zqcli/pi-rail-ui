@@ -321,6 +321,19 @@ function initialTasksForRender(args: SubagentParamsValue | undefined): string[] 
 	return task ? [task] : [];
 }
 
+function contextWindowsForRender(args: SubagentParamsValue | undefined, count: number): string[] {
+	if (args?.chain?.length) {
+		return args.chain.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default");
+	}
+	if (args?.tasks?.length) {
+		return args.tasks.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default");
+	}
+	if (args?.contextWindow !== undefined) {
+		return [String(args.contextWindow)];
+	}
+	return Array.from({ length: Math.max(1, count) }, () => "default");
+}
+
 async function validateTaskContextWindows(items: TaskParams[], broker: SessionBroker | undefined, defaultCwd: string): Promise<void> {
 	for (const item of items) {
 		const contextWindow = normalizeContextWindow(item.contextWindow);
@@ -390,7 +403,17 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate work to Pi model sessions using the lifecycle that matches expected continuity. Continue an already linked persistent helper with target+task. Adopt an existing saved Pi session with session (fork by default) when its conversation history or project context matters, especially for cross-project work. Create a new persistent long-term helper with model+alias+concrete task only when future follow-ups are expected. Use model+task with no alias/target/session for one-off stateless work; stateless runs create no saved JSONL and do not appear in /resume. Use target+control to send steer or followUp to an already-running local persistent helper: steer is delivered before its next model call, while followUp runs after its current work finishes. Controls do not start stopped or idle sessions and must not be issued as a sibling of the dispatch they intend to control. This mode is mainly for host-side or external orchestration because a parent LLM normally cannot issue another Tool Call while its own dispatch is still pending. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn, give each call one single-mode task, and do not use the tasks array; Pi executes those sibling calls concurrently. Use tasks only when one grouped parent Tool Call containing multiple child panels is desired. Use chain for sequential handoff. Persistent agents can be permanently deleted from /rail-agent; deletion removes only the Rail descriptor and child JSONL, intentionally does not rewrite other parent sessions, and their later calls will fail as unknown. Child sessions can use normal Pi tools but cannot recursively call subagent.",
+		description: "Delegate work to Pi model sessions. Use exactly one mode: single, parallel, chain, or control.\n"
+			+ "1. single: dispatch one task. Lifecycle options:\n"
+			+ "   - stateless (one-off, no saved JSONL): {\"model\":\"provider/model:thinking\",\"task\":\"one-off work\",\"contextWindow\":64000} (omit model to use current model)\n"
+			+ "   - new persistent (expected follow-ups): {\"model\":\"provider/model:thinking\",\"alias\":\"worker\",\"task\":\"initial work\",\"contextWindow\":96000}\n"
+			+ "   - continue linked helper: {\"target\":\"worker\",\"task\":\"follow-up\",\"contextWindow\":96000} (do not provide model)\n"
+			+ "   - adopt existing saved session: {\"session\":{\"mode\":\"fork\",\"path\":\"/path/to/session.jsonl\"},\"task\":\"continue work\"} (defaults to fork)\n"
+			+ "   Top-level contextWindow is only for single mode; each tasks or chain item owns its own contextWindow.\n"
+			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\"},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\",\"contextWindow\":128000}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
+			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\"},{\"target\":\"worker\",\"task\":\"implement {previous}\"}]}.\n"
+			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, chain, or contextWindow, and never issue control as a sibling of the dispatch it intends to control.\n"
+			+ "Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
 		promptGuidelines: [
@@ -641,8 +664,15 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						: nonEmpty(args.alias) || nonEmpty(args.session?.path)
 							? `persistent new ${args.model || "current model"}`
 							: `stateless ${args.model || "current model"}`;
+			const windowText = controlMessage
+				? ""
+				: args.chain?.length
+					? ` · contextWindow [${args.chain.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default").join(", ")}]`
+					: args.tasks?.length
+						? ` · contextWindow [${args.tasks.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default").join(", ")}]`
+						: ` · contextWindow ${args.contextWindow !== undefined ? String(args.contextWindow) : "default"}`;
 			const task = controlMessage ?? args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
-			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}${theme.fg("dim", windowText)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},
 
 		renderResult(result, { expanded, isPartial }, theme, context) {
@@ -651,10 +681,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const content = result.content[0];
 				return new Text(content?.type === "text" ? content.text : "(no output)", 0, 0);
 			}
+			const isControl = details.mode === "control" || Boolean(context?.args?.control?.message);
+			const contextWindows = isControl ? undefined : contextWindowsForRender(context?.args, details.results.length);
 			return renderSubagentTranscript(details.results, expanded, theme, {
 				isPartial,
 				durationMs: details.durationMs,
 				initialTasks: initialTasksForRender(context?.args),
+				...(contextWindows ? { contextWindows } : {}),
 				markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),
 			});
 		},

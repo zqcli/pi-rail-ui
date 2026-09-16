@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { ExtensionCommandContext, KeybindingsManager, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
 import { Input, Key, matchesKey, stripTerminalSequences, truncateToWidth, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import type { RailAgentManager, RailAgentManagerSnapshot, RailAgentPhase, RailAgentView } from "./agent-manager";
+import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { assertValidAgentAlias } from "./identity";
 import {
 	availableThinkingLevels,
@@ -43,6 +44,7 @@ interface CreateForm {
 	adoptMode: "fork" | "exclusive";
 	cwd: string;
 	task: string;
+	fastMode: boolean;
 }
 
 function compact(value: string, maxLength = 80): string {
@@ -140,6 +142,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			adoptMode: "fork",
 			cwd: options.currentCwd,
 			task: "",
+			fastMode: false,
 		};
 		this.unsubscribe = options.manager.subscribe(() => { void this.refresh(); });
 		this.interval = setInterval(() => { void this.refresh(); }, 1500);
@@ -248,7 +251,10 @@ export class RailAgentOverlayComponent implements Focusable {
 			const prefix = selected ? this.theme.fg("accent", " → ") : "   ";
 			const phase = this.theme.fg(phaseColor(agent.phase, agent.isCompacting), phaseLabel(agent));
 			const alias = agent.linkedAliases[0] ?? agent.instance.alias;
-			const row = `${alias}  ${phase}  ${railModelReference(agent.instance.model)}`;
+			const fast = agent.instance.fastMode === true
+				? `  ${this.theme.fg(this.fastModeEligible(agent.instance.model) ? "success" : "warning", this.fastModeEligible(agent.instance.model) ? "FAST" : "FAST inactive")}`
+				: "";
+			const row = `${alias}  ${phase}${fast}  ${railModelReference(agent.instance.model)}`;
 			lines.push(`${prefix}${selected ? this.theme.fg("accent", row) : row}`);
 		}
 		const selected = agents[this.selectedIndex];
@@ -258,6 +264,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			lines.push(` ${this.theme.fg("muted", compact(selected.instance.cwd, innerWidth - 2))}`);
 			lines.push(` ${this.theme.fg("dim", `Last task: ${compact(selected.instance.lastTask, innerWidth - 13)}`)}`);
 			if (selected.instance.lastOutput) lines.push(` ${this.theme.fg("dim", `Last answer: ${compact(selected.instance.lastOutput, innerWidth - 15)}`)}`);
+			if (selected.instance.fastMode === true) lines.push(` ${this.theme.fg(this.fastModeEligible(selected.instance.model) ? "success" : "warning", this.fastModeEligible(selected.instance.model) ? "Fast mode: active" : "Fast mode: inactive for current model")}`);
 			if (selected.errorMessage) lines.push(` ${this.theme.fg("error", compact(selected.errorMessage, innerWidth - 2))}`);
 		}
 		if (this.control) {
@@ -310,8 +317,8 @@ export class RailAgentOverlayComponent implements Focusable {
 		return lines;
 	}
 
-	private formFields(): Array<{ id: EditField | "mode" | "model" | "thinking" | "session" | "adoptMode" | "submit"; label: string; value: string }> {
-		const fields: Array<{ id: EditField | "mode" | "model" | "thinking" | "session" | "adoptMode" | "submit"; label: string; value: string }> = [
+	private formFields(): Array<{ id: EditField | "mode" | "model" | "thinking" | "session" | "adoptMode" | "fastMode" | "submit"; label: string; value: string }> {
+		const fields: Array<{ id: EditField | "mode" | "model" | "thinking" | "session" | "adoptMode" | "fastMode" | "submit"; label: string; value: string }> = [
 			{ id: "mode", label: "Mode", value: this.form.mode === "new" ? "New persistent session ▾" : "Adopt saved session ▾" },
 			{ id: "alias", label: "Alias", value: this.form.alias || "(required)" },
 			{ id: "model", label: "Model", value: `${railModelKey(this.form.model)} ▾` },
@@ -326,6 +333,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		fields.push(
 			{ id: "cwd", label: "Cwd", value: this.form.cwd },
 			{ id: "task", label: this.form.mode === "new" ? "First task" : "First task", value: this.form.task || (this.form.mode === "new" ? "(required)" : "(optional)") },
+			{ id: "fastMode", label: "Fast", value: this.form.fastMode ? "On" : "Off" },
 			{ id: "submit", label: "Action", value: this.form.mode === "new" || this.form.task.trim() ? "Create & Run" : "Adopt & Link" },
 		);
 		return fields;
@@ -335,8 +343,8 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.picker) return "type to filter · ↑↓ navigate · enter select · esc back";
 		if (this.edit) return "enter apply · esc cancel";
 		if (this.control) return "type message · enter send · esc cancel";
-		if (this.tab === "create") return "↑↓ fields · enter edit/open · ←→ or tab switch tabs · esc close";
-		return "/ search · ↑↓ select · enter continue/link · g steer · f follow-up · m model · t thinking · s stop · d detach · x delete · n new";
+		if (this.tab === "create") return "↑↓ fields · enter edit/open · shift+f fast · ←→ or tab switch tabs · esc close";
+		return "/ search · ↑↓ select · enter continue/link · g steer · f follow-up · shift+f fast · m model · t thinking · s stop · d detach · x delete · n new";
 	}
 
 	private handleAgentInput(data: string): void {
@@ -359,6 +367,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			const selected = agents[this.selectedIndex];
 			if (!selected) return;
 			if (this.keybindings.matches(data, "tui.select.confirm")) void this.continueAgent(selected);
+			else if (data === "F") void this.toggleFastMode(selected);
 			else if (matchesKey(data, "m")) {
 				if (this.options.models.length === 0) {
 					this.notice = "No authenticated Pi models are available";
@@ -381,7 +390,11 @@ export class RailAgentOverlayComponent implements Focusable {
 
 	private handleFormInput(data: string): void {
 		const fields = this.formFields();
-		if (this.keybindings.matches(data, "tui.select.up")) this.formIndex = Math.max(0, this.formIndex - 1);
+		if (data === "F") {
+			if (!this.fastModeEligible(this.form.model)) this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
+			else this.form.fastMode = !this.form.fastMode;
+		}
+		else if (this.keybindings.matches(data, "tui.select.up")) this.formIndex = Math.max(0, this.formIndex - 1);
 		else if (this.keybindings.matches(data, "tui.select.down")) this.formIndex = Math.min(fields.length - 1, this.formIndex + 1);
 		else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.space)) this.activateFormField(fields[this.formIndex]!.id);
 		this.renderSoon();
@@ -398,6 +411,11 @@ export class RailAgentOverlayComponent implements Focusable {
 		}
 		if (field === "model") return this.openModelPicker();
 		if (field === "thinking") return this.cycleFormThinking();
+		if (field === "fastMode") {
+			if (!this.fastModeEligible(this.form.model)) this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
+			else this.form.fastMode = !this.form.fastMode;
+			return;
+		}
 		if (field === "session") {
 			void this.openSessionPicker();
 			return;
@@ -514,6 +532,8 @@ export class RailAgentOverlayComponent implements Focusable {
 			if (!session) return;
 			this.form.session = session;
 			this.form.cwd = session.cwd || path.dirname(session.path);
+			const managed = this.snapshot.agents.find((agent) => path.resolve(agent.instance.sessionFile) === path.resolve(session.path));
+			if (managed) this.form.fastMode = managed.instance.fastMode === true;
 			if (!this.aliasEdited) this.form.alias = defaultAlias(this.form.model.modelId, session.id);
 		}
 		this.picker = undefined;
@@ -551,6 +571,29 @@ export class RailAgentOverlayComponent implements Focusable {
 		this.notice = "";
 		this.syncInputFocus();
 		this.renderSoon();
+	}
+
+	private async toggleFastMode(agent: RailAgentView): Promise<void> {
+		if (agent.phase === "in-use-elsewhere" || agent.phase === "unknown") {
+			this.notice = "Fast mode cannot change a session owned by another process";
+			this.renderSoon();
+			return;
+		}
+		if (agent.phase === "running" || agent.phase === "starting" || agent.phase === "queued" || agent.isCompacting) {
+			this.notice = "Fast mode can change only while the agent is idle, stopped, or in error";
+			this.renderSoon();
+			return;
+		}
+		const next = agent.instance.fastMode !== true;
+		if (next && !this.fastModeEligible(agent.instance.model)) {
+			this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
+			this.renderSoon();
+			return;
+		}
+		await this.runOperation(next ? "Enabling fast mode..." : "Disabling fast mode...", async () => {
+			await this.options.manager.setFastMode(agent.instance.agentId, next);
+			this.notice = `${agent.instance.alias} fast mode: ${next ? "on" : "off"}`;
+		});
 	}
 
 	private async stopAgent(agent: RailAgentView): Promise<void> {
@@ -639,6 +682,19 @@ export class RailAgentOverlayComponent implements Focusable {
 			this.renderSoon();
 			return;
 		}
+		const managed = this.form.mode === "adopt" && this.form.adoptMode === "exclusive" && this.form.session
+			? this.snapshot.agents.find((agent) => path.resolve(agent.instance.sessionFile) === path.resolve(this.form.session!.path))
+			: undefined;
+		if (managed && this.form.fastMode !== (managed.instance.fastMode === true)) {
+			this.notice = "This session is already a Rail agent; change Fast from Current or All Persistent with Shift+F";
+			this.renderSoon();
+			return;
+		}
+		if (!managed && this.form.fastMode && !this.fastModeEligible(this.form.model)) {
+			this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
+			this.renderSoon();
+			return;
+		}
 		if (this.form.mode === "adopt" && this.form.adoptMode === "exclusive") {
 			const approved = await this.ctx.ui.confirm(
 				"Use saved session in place?",
@@ -649,7 +705,6 @@ export class RailAgentOverlayComponent implements Focusable {
 		const model = { ...this.form.model, thinkingLevel: this.form.thinkingLevel };
 		await this.runOperation(this.form.mode === "new" ? "Creating and running agent..." : "Adopting saved session...", async (signal) => {
 			if (this.form.mode === "adopt") {
-				const managed = this.form.adoptMode === "exclusive" && this.snapshot.agents.find((agent) => path.resolve(agent.instance.sessionFile) === path.resolve(this.form.session!.path));
 				if (managed && managed.phase !== "in-use-elsewhere" && managed.phase !== "unknown") {
 					const linked = await this.options.manager.link(managed.instance.agentId);
 					if (this.form.task.trim()) {
@@ -663,13 +718,13 @@ export class RailAgentOverlayComponent implements Focusable {
 				}
 				const session = { mode: this.form.adoptMode, path: this.form.session!.path } as const;
 				if (this.form.task.trim()) {
-					await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, session, signal });
+					await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, session, fastMode: this.form.fastMode, signal });
 				} else {
-					await this.options.manager.adopt({ model, alias: this.form.alias, cwd: this.form.cwd, session });
+					await this.options.manager.adopt({ model, alias: this.form.alias, cwd: this.form.cwd, session, fastMode: this.form.fastMode });
 				}
 				this.notice = `Adopted ${this.form.alias} as ${this.form.adoptMode === "fork" ? "a safe copy" : "an exclusive session"}`;
 			} else {
-				await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, signal });
+				await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, fastMode: this.form.fastMode, signal });
 				this.notice = `Created ${this.form.alias}`;
 			}
 			this.tab = "current";
@@ -705,6 +760,13 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (!this.aliasEdited) {
 			this.form.alias = defaultAlias(model.modelId, this.form.session?.id ?? this.ctx.sessionManager.getSessionId());
 		}
+		if (!this.fastModeEligible(model)) this.form.fastMode = false;
+	}
+
+	private fastModeEligible(model: RailModelRef): boolean {
+		const resolved = this.ctx.modelRegistry.find(model.provider, model.modelId)
+			?? (this.ctx.model?.provider === model.provider && this.ctx.model.id === model.modelId ? this.ctx.model : undefined);
+		return supportsNativeGptFastMode(resolved as NativeFastModel | undefined);
 	}
 
 	private cycleFormThinking(): void {

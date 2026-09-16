@@ -28,6 +28,20 @@ function instance(agentId: string, alias: string): AgentInstance {
 }
 
 describe("FileAgentInstanceStore", () => {
+	test("defaults a legacy v2 descriptor without fastMode to off and preserves explicit policy", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-fast-policy-"));
+		try {
+			const store = new FileAgentInstanceStore(dir);
+			const legacy = instance("agt_legacy_fast", "legacy-fast");
+			await store.put(legacy);
+			assert.equal((await store.get(legacy.agentId) as any)?.fastMode, false);
+			await store.put({ ...legacy, agentId: "agt_enabled_fast", alias: "enabled-fast", fastMode: true } as any);
+			assert.equal((await store.get("agt_enabled_fast") as any)?.fastMode, true);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("persists independent agent files and lists them by recency", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "pi-subagent-store-"));
 		try {
@@ -38,7 +52,7 @@ describe("FileAgentInstanceStore", () => {
 			await store.put(older);
 			await store.put(newer);
 
-			assert.deepEqual(await store.get("agt_old"), older);
+			assert.deepEqual(await store.get("agt_old"), { ...older, fastMode: false });
 			assert.deepEqual((await store.list()).map((item) => item.agentId), ["agt_new", "agt_old"]);
 			assert.equal((await readFile(join(dir, "instances", "agt_old.json"), "utf8")).endsWith("\n"), true);
 			await store.delete("agt_old");

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
+import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { test } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
@@ -59,6 +60,28 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		contextTokens: 17,
 		turns: 1,
 	});
+});
+
+test("stateless runner forwards fastMode only for an explicit true dispatch", async () => {
+	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
+	let capturedArgs: string[] = [];
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: (args) => {
+			capturedArgs = args;
+			return { command: process.execPath, args: [fixture] };
+		},
+	});
+
+	await runner({ model, task: "fast", cwd: process.cwd(), fastMode: true as any });
+	assert.deepEqual(capturedArgs.includes(`--${RAIL_FAST_MODE_FLAG}`), true);
+	assert.deepEqual(capturedArgs.includes(railFastExtensionPath()), true);
+
+	await runner({ model, task: "slow", cwd: process.cwd(), fastMode: false as any });
+	assert.deepEqual(capturedArgs.includes(`--${RAIL_FAST_MODE_FLAG}`), false);
+	assert.deepEqual(capturedArgs.includes(railFastExtensionPath()), false);
+
+	await runner({ model, task: "default", cwd: process.cwd() });
+	assert.deepEqual(capturedArgs.includes(`--${RAIL_FAST_MODE_FLAG}`), false);
 });
 
 test("production stateless runner enables an ephemeral session from the persisted GPT setting", async (t) => {

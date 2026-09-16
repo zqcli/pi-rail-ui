@@ -20,6 +20,7 @@ interface LegacyAgentInstance {
 	updatedAt: string;
 	lastTask: string;
 	lastOutput?: string;
+	fastMode?: boolean;
 }
 
 interface SessionEntryCandidate {
@@ -45,7 +46,8 @@ function validIdentity(item: Partial<AgentInstance>): boolean {
 		&& typeof item.createdAt === "string"
 		&& typeof item.updatedAt === "string"
 		&& typeof item.lastTask === "string"
-		&& (item.sessionName === undefined || typeof item.sessionName === "string");
+		&& (item.sessionName === undefined || typeof item.sessionName === "string")
+		&& (item.fastMode === undefined || typeof item.fastMode === "boolean");
 }
 
 function isAgentInstance(value: unknown): value is AgentInstance {
@@ -128,6 +130,7 @@ async function migrateLegacy(value: unknown): Promise<AgentInstance | undefined>
 		updatedAt: legacy.updatedAt,
 		lastTask: legacy.lastTask,
 		...(legacy.lastOutput ? { lastOutput: legacy.lastOutput } : {}),
+		fastMode: false,
 	};
 }
 
@@ -142,7 +145,7 @@ export class FileAgentInstanceStore implements AgentInstanceStore {
 		if (!AGENT_ID_RE.test(agentId)) return undefined;
 		try {
 			const value = JSON.parse(await readFile(this.instancePath(agentId), "utf8")) as unknown;
-			if (isAgentInstance(value)) return value;
+			if (isAgentInstance(value)) return { ...value, fastMode: value.fastMode === true };
 			const migrated = await migrateLegacy(value);
 			if (migrated) await this.put(migrated);
 			return migrated;

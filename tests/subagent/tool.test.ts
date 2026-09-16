@@ -7,6 +7,7 @@ import { SubagentTranscript } from "../../tools/subagents/transcript";
 
 const model = {
 	provider: "cus-resp",
+	api: "openai-responses",
 	id: "gpt-5.6-sol",
 	name: "GPT 5.6 Sol",
 };
@@ -125,6 +126,9 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(tool.description, /\{"chain":\[\{"task":"plan","contextWindow":null\},\{"target":"worker","task":"implement \{previous\}","contextWindow":null\}\]\}/);
 	assert.match(tool.description, /\{"target":"worker","control":\{"delivery":"steer","message":"redirect now"\}\}/);
 	assert.match(tool.description, /Set contextWindow to null by default/);
+	assert.match(tool.description, /fastMode/);
+	assert.match(tool.description, /existing target.*descriptor|descriptor.*existing target/iu);
+	assert.match(tool.description, /through \/rail-agent/);
 	assert.match(tool.description, /Null or omission uses the selected child model's native default/);
 	assert.match(tool.description, /Only use a positive safe integer when the user explicitly requests a specific child context or compaction budget/);
 	assert.match(tool.description, /Top-level numeric contextWindow is only for single mode/);
@@ -141,6 +145,15 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 		assert.equal(schema.default, null);
 		assert.deepEqual(schema.anyOf.map((variant: any) => variant.type), ["number", "null"]);
 	}
+	const fastModeSchemas = [
+		tool.parameters.properties.fastMode,
+		tool.parameters.properties.tasks.items.properties.fastMode,
+		tool.parameters.properties.chain.items.properties.fastMode,
+	];
+	for (const schema of fastModeSchemas) {
+		assert.equal(schema.default, null);
+		assert.deepEqual(schema.anyOf.map((variant: any) => variant.type), ["boolean", "null"]);
+	}
 	const guidance = tool.promptGuidelines.join("\n");
 	assert.match(guidance, /lifecycle by continuity/);
 	assert.match(guidance, /existing saved Pi session/);
@@ -152,6 +165,8 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /stateless one-off work/);
 	assert.match(guidance, /make the task self-contained/);
 	assert.match(guidance, /Use contextWindow:null by default/);
+	assert.match(guidance, /fastMode/);
+	assert.match(guidance, /existing.*rail-agent|rail-agent.*existing/iu);
 	assert.match(guidance, /Only use a positive integer when the user explicitly requests/);
 	assert.match(guidance, /Null or omission uses the selected child model's native default/);
 	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
@@ -234,6 +249,85 @@ test("control mode steers and queues follow-ups for an active persistent target"
 		/aborted before delivery/,
 	);
 	assert.equal(broker.controls.length, 2);
+});
+
+test("fastMode null is the default, while explicit target/grouped/control values are rejected", async () => {
+	const { tool, broker } = setupTool({
+		runStateless: async () => ({
+			exitCode: 0,
+			output: "done",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+
+	await tool.execute("call-null-fast", { task: "one-off", fastMode: null }, undefined, undefined, context());
+	assert.equal(broker.requests.length, 0);
+
+	await assert.rejects(
+		() => tool.execute("call-target-fast", { target: "auth-review", task: "continue", fastMode: true }, undefined, undefined, context()),
+		/existing target.*rail-agent|rail-agent.*existing target/iu,
+	);
+	await assert.rejects(
+		() => tool.execute("call-group-fast", { tasks: [{ task: "one" }], fastMode: true }, undefined, undefined, context()),
+		/fastMode.*grouped|grouped.*fastMode/iu,
+	);
+	await assert.rejects(
+		() => tool.execute("call-control-fast", { target: "auth-review", fastMode: true, control: { delivery: "steer", message: "Focus" } }, undefined, undefined, context()),
+		/fastMode.*control|control.*fastMode/iu,
+	);
+	const unsupported = {
+		...context(),
+		model: { ...model, id: "deepseek-v4", name: "DeepSeek V4" },
+		modelRegistry: {
+			getAvailable: () => [{ ...model, id: "deepseek-v4", name: "DeepSeek V4" }],
+			find: (provider: string, id: string) => provider === "cus-resp" && id === "deepseek-v4" ? { ...model, id, name: "DeepSeek V4" } : undefined,
+		},
+		scopedModels: [{ model: { ...model, id: "deepseek-v4", name: "DeepSeek V4" }, thinkingLevel: "xhigh" }],
+	};
+	await assert.rejects(
+		() => tool.execute("call-unsupported-fast", { model: "cus-resp/deepseek-v4", task: "native only", fastMode: true }, undefined, undefined, unsupported as any),
+		/GPT.*supported|supported.*GPT/iu,
+	);
+});
+
+test("fastMode is forwarded to stateless and initial persistent dispatches without entering result details", async () => {
+	const { tool, broker } = setupTool({
+		runStateless: async (request) => ({
+			exitCode: 0,
+			output: request.fastMode ? "fast done" : "done",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+	await tool.execute("call-fast-stateless", { task: "fast", fastMode: true }, undefined, undefined, context());
+	const persistent = await tool.execute("call-fast-persistent", { model: "cus-resp/gpt-5.6-sol", alias: "fast-review", task: "fast initial", fastMode: true }, undefined, undefined, context());
+	assert.equal(broker.requests.length, 1);
+	assert.equal(broker.requests[0]?.fastMode, true);
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const createdArgs = { model: "cus-resp/gpt-5.6-sol", alias: "fast-review", task: "fast initial", fastMode: true };
+	assert.match(tool.renderCall(createdArgs, theme).render(120).join("\n"), /fast on/);
+	assert.match(tool.renderResult(persistent, { expanded: false }, theme, { args: createdArgs }).render(120).join("\n"), /fast on/);
+
+	const groupedArgs = { tasks: [{ task: "one", fastMode: null }, { target: "fast-review", task: "two", fastMode: null }] };
+	const grouped = tool.renderResult({
+		content: [{ type: "text", text: "done" }],
+		details: {
+			mode: "parallel",
+			results: [
+				{ alias: "one", model: "cus-resp/gpt-5.6-sol", status: "completed", output: "one", persistent: false },
+				{ alias: "two", model: "cus-resp/gpt-5.6-sol", status: "completed", output: "two", persistent: true },
+			],
+			durationMs: 1,
+		},
+	}, { expanded: false, isPartial: false }, theme, { args: groupedArgs }).render(120).join("\n");
+	assert.match(tool.renderCall(groupedArgs, theme).render(120).join("\n"), /fast \[off, agent default\]/);
+	assert.match(grouped, /fast off/);
+	assert.match(grouped, /fast agent default/);
+
+	const targetArgs = { target: "fast-review", task: "continue", fastMode: null };
+	assert.match(tool.renderCall(targetArgs, theme).render(120).join("\n"), /fast agent default/);
+	assert.match(tool.renderResult(persistent, { expanded: false }, theme, { args: targetArgs }).render(120).join("\n"), /fast agent default/);
+	assert.doesNotMatch(JSON.stringify(persistent.details), /fastMode/);
 });
 
 test("control failures retain an explicit unknown-delivery result for the panel", async () => {

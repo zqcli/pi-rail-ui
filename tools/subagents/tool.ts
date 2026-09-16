@@ -1,8 +1,9 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import { getAgentDir, SettingsManager, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type MarkdownTheme, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { normalizeContextWindow, validateContextWindowReserve } from "./context-window";
+import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import {
 	railModelKey,
 	railModelReference,
@@ -56,6 +57,16 @@ function contextWindowSchema() {
 	}));
 }
 
+function fastModeSchema() {
+	return Type.Optional(Type.Union([
+		Type.Boolean(),
+		Type.Null(),
+	], {
+		default: null,
+		description: "Use native OpenAI priority fast mode for a stateless call or a new persistent agent; null or omission means off. Existing targets are managed in /rail-agent.",
+	}));
+}
+
 const TaskItem = Type.Object({
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. Use with no alias/session for stateless work or with alias to create a persistent session." })),
 	target: Type.Optional(Type.String({ description: "Exact linked persistent alias or agentId whose existing conversation memory should continue; omit model when target is set" })),
@@ -64,6 +75,7 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; when adopting a cross-project saved session, use its original project directory when known" })),
 	session: Type.Optional(SessionSourceSchema),
 	contextWindow: contextWindowSchema(),
+	fastMode: fastModeSchema(),
 });
 
 const ChainItem = Type.Object({
@@ -74,6 +86,7 @@ const ChainItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session" })),
 	session: Type.Optional(SessionSourceSchema),
 	contextWindow: contextWindowSchema(),
+	fastMode: fastModeSchema(),
 });
 
 const SubagentParams = Type.Object({
@@ -84,6 +97,7 @@ const SubagentParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
 	session: Type.Optional(SessionSourceSchema),
 	contextWindow: contextWindowSchema(),
+	fastMode: fastModeSchema(),
 	control: Type.Optional(ControlSchema),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Group independent model-session tasks inside one subagent Tool Call; each item may be stateless or persistent. Use only when one grouped parent Tool Call with child panels is desired." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
@@ -158,6 +172,7 @@ function normalizeTask(item: TaskParams): TaskParams {
 		...(cwd ? { cwd } : {}),
 		...(item.session && sessionPath ? { session: { mode: item.session.mode, path: sessionPath } } : {}),
 		...(contextWindow !== undefined ? { contextWindow } : {}),
+		...(item.fastMode !== undefined ? { fastMode: item.fastMode } : {}),
 	};
 }
 
@@ -307,12 +322,19 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 		? { confirmSessionAttach: params.confirmSessionAttach }
 		: {};
 	if (mode === "parallel") {
+		if ((params.fastMode !== undefined && params.fastMode !== null) || params.tasks!.some((item) => item.fastMode !== undefined && item.fastMode !== null)) {
+			throw new Error("fastMode is not supported on grouped dispatch; use separate stateless calls or /rail-agent");
+		}
 		return { tasks: params.tasks!.map(normalizeTask), ...confirmSessionAttach };
 	}
 	if (mode === "chain") {
+		if ((params.fastMode !== undefined && params.fastMode !== null) || params.chain!.some((item) => item.fastMode !== undefined && item.fastMode !== null)) {
+			throw new Error("fastMode is not supported on grouped dispatch; use separate stateless calls or /rail-agent");
+		}
 		return { chain: params.chain!.map(normalizeTask), ...confirmSessionAttach };
 	}
 	if (mode === "control") {
+		if (params.fastMode !== undefined && params.fastMode !== null) throw new Error("fastMode is not supported on control; manage persistent policy through /rail-agent");
 		const target = nonEmpty(params.target);
 		const message = nonEmpty(params.control?.message);
 		return {
@@ -321,7 +343,49 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 		};
 	}
 	const normalized = normalizeTask({ ...params, task: params.task! });
+	if (normalized.target && normalized.fastMode !== undefined && normalized.fastMode !== null) {
+		throw new Error("fastMode for an existing target is managed through /rail-agent");
+	}
 	return { ...normalized, ...confirmSessionAttach };
+}
+
+function modelForFastMode(
+	item: TaskParams,
+	ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">,
+): NativeFastModel | undefined {
+	if (!item.model) return ctx.model;
+	const model = resolveRailModel(item.model, ctx);
+	return ctx.modelRegistry.find(model.provider, model.modelId)
+		?? ctx.modelRegistry.getAvailable().find((candidate) => candidate.provider === model.provider && candidate.id === model.modelId);
+}
+
+function validateFastMode(
+	item: TaskParams,
+	ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">,
+): void {
+	if (item.fastMode !== true) return;
+	const model = modelForFastMode(item, ctx);
+	if (!supportsNativeGptFastMode(model)) {
+		throw new Error("fastMode requires a GPT model using a supported native OpenAI API");
+	}
+}
+
+type FastModeDisplay = "on" | "off" | "agent default";
+
+function fastModeForDisplay(item: Pick<TaskParams, "target" | "fastMode">): FastModeDisplay {
+	if (nonEmpty(item.target)) return "agent default";
+	return item.fastMode === true ? "on" : "off";
+}
+
+function fastModesForRender(args: SubagentParamsValue | undefined): FastModeDisplay[] | undefined {
+	if (!args) return undefined;
+	if (args.chain?.length) {
+		return args.chain.map(fastModeForDisplay);
+	}
+	if (args.tasks?.length) {
+		return args.tasks.map(fastModeForDisplay);
+	}
+	return [fastModeForDisplay(args as TaskParams)];
 }
 
 function initialTasksForRender(args: SubagentParamsValue | undefined): string[] {
@@ -433,6 +497,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":null},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\",\"contextWindow\":null}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
+			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent when the selected model is a GPT model on a supported native OpenAI API. fastMode:false explicitly keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent, and grouped or control calls cannot set fastMode.\n"
 			+ "Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
@@ -444,6 +509,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"For stateless subagent work, call subagent with task, optional model, and contextWindow:null by default. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists. Stateless runs create no child JSONL and never appear in /resume.",
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
 			"Use contextWindow:null by default. Null or omission uses the selected child model's native default. Only use a positive integer when the user explicitly requests a specific child context or compaction budget; for parallel and chain calls, put an explicit numeric value on the individual item that owns it.",
+			"Use fastMode:true only for a stateless call or a new persistent agent on a GPT model with a supported native OpenAI API. Keep fastMode null or omitted by default. Existing persistent target policy is managed through /rail-agent; do not put fastMode on target, grouped, or control calls.",
 			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
 			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
 			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call; contextWindow must be null or omitted, never numeric. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
@@ -539,6 +605,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 			}
+			for (const item of requestedItems) validateFastMode(item, ctx);
 			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
 			const broker = contextTargetItems.length > 0
 				? (typeof options.broker === "function" ? options.broker() : options.broker)
@@ -583,6 +650,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						task: item.task,
 						cwd: item.cwd ?? ctx.cwd,
 						...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
+						...(item.fastMode !== undefined && item.fastMode !== null ? { fastMode: item.fastMode } : {}),
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => publishLive(slot, {
 							alias,
@@ -611,6 +679,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					...(item.cwd ? { cwd: item.cwd } : {}),
 					...(item.session ? { session: item.session } : {}),
 					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
+					...(item.fastMode !== undefined && item.fastMode !== null ? { fastMode: item.fastMode } : {}),
 					...(signal ? { signal } : {}),
 					onUpdate: ({ instance, run: partial }) => publishLive(slot, {
 						agentId: instance.agentId,
@@ -692,8 +761,14 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					: args.tasks?.length
 						? ` · contextWindow [${args.tasks.map((item) => formatContextWindowForDisplay(item.contextWindow)).join(", ")}]`
 						: ` · contextWindow ${formatContextWindowForDisplay(args.contextWindow)}`;
+			const fastModes = controlMessage ? undefined : fastModesForRender(args);
+			const fastText = !fastModes
+				? ""
+				: fastModes.length > 1
+					? `fast [${fastModes.join(", ")}]`
+					: `fast ${fastModes[0]}`;
 			const task = controlMessage ?? args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
-			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}${theme.fg("dim", windowText)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}${theme.fg("dim", `${windowText}${fastText ? ` · ${fastText}` : ""}`)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},
 
 		renderResult(result, { expanded, isPartial }, theme, context) {
@@ -704,11 +779,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			}
 			const isControl = details.mode === "control" || Boolean(context?.args?.control?.message);
 			const contextWindows = isControl ? undefined : contextWindowsForRender(context?.args, details.results.length);
+			const fastModes = isControl ? undefined : fastModesForRender(context?.args);
 			return renderSubagentTranscript(details.results, expanded, theme, {
 				isPartial,
 				durationMs: details.durationMs,
 				initialTasks: initialTasksForRender(context?.args),
 				...(contextWindows ? { contextWindows } : {}),
+				...(fastModes ? { fastModes } : {}),
 				markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),
 			});
 		},

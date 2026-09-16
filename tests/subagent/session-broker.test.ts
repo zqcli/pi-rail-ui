@@ -388,6 +388,101 @@ describe("SessionBroker", () => {
 		assert.deepEqual(workers[0]?.tasks, ["initial", "one", "two"]);
 	});
 
+	test("propagates persistent fastMode into creation and descriptor reloads", async () => {
+		const { broker, store, roster, workerFactory, starts } = setup();
+		const first = await broker.dispatch({ model: reviewerModel(), alias: "fast-review", task: "review quickly", fastMode: true });
+
+		assert.equal(first.instance.fastMode, true);
+		assert.equal(starts[0]?.fastMode, true);
+		assert.equal((await store.get(first.instance.agentId))?.fastMode, true);
+
+		await broker.shutdown();
+		const restarted = new SessionBroker({ store, roster, workerFactory, parentSessionLabel: "Main Auth Work" });
+		await restarted.dispatch({ target: "fast-review", task: "continue quickly" });
+		assert.equal(starts.at(-1)?.mode, "open");
+		assert.equal(starts.at(-1)?.fastMode, true);
+		await restarted.shutdown();
+	});
+
+	test("setFastMode updates an idle or stopped agent and reopens it with the saved policy", async () => {
+		const { broker, store, workers, starts } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "fast-review", task: "initial" });
+		let workerStoppedAtPolicyWrite: boolean | undefined;
+		const put = store.put.bind(store);
+		store.put = async (instance) => {
+			if (instance.agentId === created.instance.agentId && instance.fastMode === true) {
+				workerStoppedAtPolicyWrite = workers[0]?.stopped;
+			}
+			await put(instance);
+		};
+
+		const enabled = await broker.setFastMode(created.instance.agentId, true);
+		assert.equal(enabled.fastMode, true);
+		assert.equal(workerStoppedAtPolicyWrite, false, "the local worker lease must still be held while the descriptor changes");
+		assert.equal((await store.get(created.instance.agentId))?.fastMode, true);
+		assert.equal(workers[0]?.stopped, true);
+
+		await broker.dispatch({ target: created.instance.agentId, task: "after toggle" });
+		assert.equal(starts.at(-1)?.fastMode, true);
+		await broker.stop(created.instance.agentId);
+		await assert.rejects(
+			() => broker.setFastMode(created.instance.agentId, false),
+			/held session lease/,
+		);
+		const disabled = await broker.setFastMode(created.instance.agentId, false, { sessionLeaseHeld: true });
+		assert.equal(disabled.fastMode, false);
+		assert.equal((await store.get(created.instance.agentId))?.fastMode, false);
+	});
+
+	test("setFastMode blocks a dispatch race and clears its barrier after persistence failure", async () => {
+		const { broker, workers } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "fast-review", task: "initial" });
+		const setting = broker.setFastMode(created.instance.agentId, true);
+		await assert.rejects(() => broker.dispatch({ target: created.instance.agentId, task: "racing dispatch" }), /stopping|interrupted|changing/);
+		await setting;
+		assert.equal(workers[0]?.stopped, true);
+
+		const next = setup();
+		const nextCreated = await next.broker.dispatch({ model: reviewerModel(), alias: "persist-failure", task: "initial" });
+		const put = next.store.put.bind(next.store);
+		next.store.put = async (instance) => {
+			if (instance.fastMode === true) throw new Error("descriptor write failed");
+			await put(instance);
+		};
+		await assert.rejects(() => next.broker.setFastMode(nextCreated.instance.agentId, true), /descriptor write failed/);
+		assert.deepEqual(next.broker.runtimeStatus(nextCreated.instance.agentId), { phase: "idle", queued: 0 });
+		next.store.put = put;
+		await next.broker.dispatch({ target: nextCreated.instance.agentId, task: "after failed toggle" });
+		await next.broker.shutdown();
+	});
+
+	test("delete waits for an in-flight fast-mode update and cannot leave a resurrected descriptor", async () => {
+		const { broker, store, roster } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "fast-delete", task: "initial" });
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		const put = store.put.bind(store);
+		store.put = async (instance) => {
+			if (instance.agentId === created.instance.agentId && instance.fastMode === true) {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+			}
+			await put(instance);
+		};
+
+		const setting = broker.setFastMode(created.instance.agentId, true);
+		await writeStarted.promise;
+		let deleted = false;
+		const deleting = broker.delete(created.instance.agentId).then(() => { deleted = true; });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(deleted, false);
+		releaseWrite.resolve();
+		await Promise.all([setting, deleting]);
+
+		assert.equal(await store.get(created.instance.agentId), undefined);
+		assert.equal(roster.resolve("fast-delete"), undefined);
+	});
+
 	test("reports running, queued, idle, and stopped runtime phases truthfully", async () => {
 		const { broker } = setup();
 		const created = await broker.dispatch({ model: reviewerModel(), alias: "auth-review", task: "initial" });

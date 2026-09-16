@@ -154,3 +154,79 @@ test("manager resolves agentId, canonical alias, and linked aliases to the same 
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+test("manager permits fast policy changes only for idle, stopped, or error agents", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-fast-"));
+	try {
+		const agent = instance("agt_fast", "fast-review", join(dir, "fast.jsonl"));
+		const stored = { ...agent, fastMode: false };
+		let phase: "idle" | "running" | "stopped" | "error" = "idle";
+		const calls: Array<{ target: string; enabled: boolean }> = [];
+		const broker = {
+			runtimeStatus: () => ({ phase, queued: 0 }),
+			subscribeRuntime: () => () => undefined,
+			hasLocalWorker: () => phase !== "stopped",
+			setFastMode: async (target: string, enabled: boolean) => {
+				calls.push({ target, enabled });
+				stored.fastMode = enabled;
+				return stored;
+			},
+		};
+		const manager = new RailAgentManager(
+			broker as any,
+			{ get: async () => stored, put: async () => undefined, list: async () => [stored] } as any,
+			{ list: () => [{ alias: stored.alias, agentId: stored.agentId }] } as any,
+			dir,
+		);
+
+		await manager.setFastMode(agent.agentId, true);
+		assert.deepEqual(calls, [{ target: agent.agentId, enabled: true }]);
+		phase = "running";
+		await assert.rejects(() => manager.setFastMode(agent.agentId, false), /only change.*idle|idle.*fast/iu);
+		phase = "stopped";
+		await manager.setFastMode(agent.agentId, false);
+		phase = "error";
+		await manager.setFastMode(agent.agentId, true);
+		assert.deepEqual(calls, [
+			{ target: agent.agentId, enabled: true },
+			{ target: agent.agentId, enabled: false },
+			{ target: agent.agentId, enabled: true },
+		]);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("manager refuses an error-state Fast change when another process owns the stopped session", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-fast-foreign-"));
+	const foreignOwner = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });
+	try {
+		await once(foreignOwner, "spawn");
+		const agent = instance("agt_fast_foreign", "fast-foreign", join(dir, "foreign.jsonl"));
+		const lock = join(dir, "leases", sessionLeaseDirectoryName(sessionLeaseKey(agent.sessionFile)));
+		await mkdir(lock, { recursive: true });
+		await writeFile(join(lock, "owner.json"), JSON.stringify({ pid: foreignOwner.pid, token: "foreign-fast", createdAt: new Date().toISOString() }));
+		let calls = 0;
+		const manager = new RailAgentManager(
+			{
+				runtimeStatus: () => ({ phase: "error", queued: 0, errorMessage: "previous worker failed" }),
+				subscribeRuntime: () => () => undefined,
+				hasLocalWorker: () => false,
+				setFastMode: async () => { calls += 1; return agent; },
+			} as any,
+			{ get: async () => agent, list: async () => [agent] } as any,
+			{ list: () => [{ alias: agent.alias, agentId: agent.agentId }] } as any,
+			dir,
+		);
+
+		await assert.rejects(() => manager.setFastMode(agent.agentId, true), /owned by process/);
+		assert.equal(calls, 0);
+	} finally {
+		if (foreignOwner.exitCode === null && foreignOwner.signalCode === null) {
+			const exited = once(foreignOwner, "exit");
+			foreignOwner.kill();
+			await exited;
+		}
+		await rm(dir, { recursive: true, force: true });
+	}
+});

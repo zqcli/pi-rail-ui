@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
+import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import {
 	RpcSessionWorker,
 	buildRpcWorkerArgs,
@@ -214,6 +215,18 @@ describe("RPC worker arguments", () => {
 			"-e", gptCompactionExtensionPath(),
 			"-e", contextExtensionPath(), "--rail-context-protocol", "1",
 		]);
+	});
+
+	test("adds the private fast flag to new and resumed workers when enabled", () => {
+		const created = buildRpcWorkerArgs({ ...spec("new"), fastMode: true } as any);
+		const resumed = buildRpcWorkerArgs({ ...spec("open", "/tmp/child.jsonl"), fastMode: true } as any);
+		const ordinary = buildRpcWorkerArgs({ ...spec("new"), fastMode: false } as any);
+		assert.equal(created.includes(`--${RAIL_FAST_MODE_FLAG}`), true);
+		assert.equal(created.includes(railFastExtensionPath()), true);
+		assert.equal(resumed.includes(`--${RAIL_FAST_MODE_FLAG}`), true);
+		assert.equal(resumed.includes(railFastExtensionPath()), true);
+		assert.equal(ordinary.includes(`--${RAIL_FAST_MODE_FLAG}`), false);
+		assert.equal(ordinary.includes(railFastExtensionPath()), false);
 	});
 
 	test("opens a managed child session instead of forking it again", () => {

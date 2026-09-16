@@ -55,6 +55,7 @@ export interface SubagentTranscriptRun {
 	step?: number;
 	outputTruncated?: boolean;
 	contextWindowText?: string;
+	fastModeText?: "on" | "off" | "agent default";
 }
 
 export interface SubagentTranscriptRenderOptions {
@@ -62,6 +63,7 @@ export interface SubagentTranscriptRenderOptions {
 	durationMs?: number;
 	initialTasks?: readonly string[];
 	contextWindows?: readonly (string | undefined)[] | undefined;
+	fastModes?: readonly ("on" | "off" | "agent default" | undefined)[] | undefined;
 	markdownTheme?: MarkdownTheme;
 }
 
@@ -746,10 +748,23 @@ function runsWithContextWindows(
 	});
 }
 
+function runsWithFastModes(
+	runs: SubagentTranscriptRun[],
+	fastModes: readonly ("on" | "off" | "agent default" | undefined)[] | undefined,
+): SubagentTranscriptRun[] {
+	if (!fastModes) return runs;
+	return runs.map((run, runIndex) => {
+		const targetSlot = run.slot ?? runIndex;
+		const fastModeText = fastModes[targetSlot];
+		return fastModeText === undefined ? run : { ...run, fastModeText };
+	});
+}
+
 function identityText(run: SubagentTranscriptRun): string {
 	const step = run.step !== undefined ? `step ${run.step} · ` : "";
 	const contextWindow = run.contextWindowText ? ` · contextWindow ${run.contextWindowText}` : "";
-	return `${step}${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}${contextWindow}`;
+	const fast = run.fastModeText === undefined ? "" : ` · fast ${run.fastModeText}`;
+	return `${step}${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
@@ -924,7 +939,8 @@ export function renderSubagentTranscript(
 		runsWithInitialTasks(runs, options.initialTasks),
 		options.contextWindows,
 	);
-	const boundedRuns = boundSubagentRunTranscripts(runsWithContext);
+	const runsWithFast = runsWithFastModes(runsWithContext, options.fastModes);
+	const boundedRuns = boundSubagentRunTranscripts(runsWithFast);
 	if (boundedRuns.length > 1) {
 		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme, options.markdownTheme);
 	}

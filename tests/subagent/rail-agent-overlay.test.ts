@@ -7,6 +7,7 @@ import type { RailModelRef } from "../../tools/subagents/models";
 
 const piModel = {
 	provider: "cus-resp",
+	api: "openai-responses",
 	id: "gpt-5.6-sol",
 	name: "GPT 5.6 Sol",
 	reasoning: true,
@@ -33,6 +34,7 @@ const snapshot = {
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			lastTask: "Review authentication",
+			fastMode: false,
 		},
 		linkedAliases: ["auth-review"],
 		linkedToCurrentSession: true,
@@ -42,7 +44,7 @@ const snapshot = {
 	counts: { linked: 1, global: 1, running: 0, queued: 0, idle: 1, stopped: 0, inUseElsewhere: 0, errors: 0 },
 };
 
-function setup(phase: "idle" | "running" = "idle", terminalRows = 30, compacting = false) {
+function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "error" | "in-use-elsewhere" | "unknown" = "idle", terminalRows = 30, compacting = false) {
 	let renders = 0;
 	let closed = false;
 	const currentSnapshot: any = structuredClone(snapshot);
@@ -65,6 +67,10 @@ function setup(phase: "idle" | "running" = "idle", terminalRows = 30, compacting
 		detach: async () => snapshot.agents[0]!.instance,
 		create: async () => ({ instance: snapshot.agents[0]!.instance, run: { output: "done", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } } }),
 		adopt: async () => snapshot.agents[0]!.instance,
+		setFastMode: async (_target: string, enabled: boolean) => {
+			currentSnapshot.agents[0]!.instance.fastMode = enabled;
+			return currentSnapshot.agents[0]!.instance;
+		},
 		control: async (target: string, request: unknown) => { controls.push({ target, request }); return { instance: currentSnapshot.agents[0]!.instance, delivery: "steer" }; },
 	};
 	const ctx = {
@@ -104,7 +110,7 @@ function setup(phase: "idle" | "running" = "idle", terminalRows = 30, compacting
 		},
 		currentSnapshot,
 	);
-	return { component, controls, manager, sessions, get renders() { return renders; }, get closed() { return closed; } };
+	return { component, controls, manager, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; } };
 }
 
 for (const mode of ["fork", "exclusive"] as const) test(`${mode} ${mode === "fork" ? "copies" : "links"} an already managed session`, async () => {
@@ -126,7 +132,7 @@ for (const mode of ["fork", "exclusive"] as const) test(`${mode} ${mode === "for
 		ui.handleInput("\r");
 		ui.handleInput("\u001b[B");
 		if (mode === "exclusive") ui.handleInput("\r");
-		for (let index = 0; index < 3; index++) ui.handleInput("\u001b[B");
+		for (let index = 0; index < 4; index++) ui.handleInput("\u001b[B");
 		ui.handleInput("\r");
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(adopted.length, mode === "fork" ? 1 : 0);
@@ -154,6 +160,7 @@ test("Create & Run displays a provider failure instead of reporting success", as
 		ui.handleInput("\r");
 		ui.handleInput("review");
 		ui.handleInput("\r");
+		ui.handleInput("\u001b[B");
 		ui.handleInput("\u001b[B");
 		ui.handleInput("\r");
 		await new Promise((resolve) => setImmediate(resolve));
@@ -289,6 +296,110 @@ test("running agents accept inline steer and follow-up controls", async () => {
 		]);
 	} finally {
 		state.component.dispose();
+	}
+});
+
+test("create form exposes Fast and turns it off for an ineligible model", () => {
+	const state = setup();
+	try {
+		state.component.handleInput("n");
+		assert.match(state.component.render(100).join("\n"), /Fast/);
+		state.component.handleInput("\u001b[B");
+		state.component.handleInput("\u001b[B");
+		state.component.handleInput("\r");
+		for (const char of "deepseek") state.component.handleInput(char);
+		state.component.handleInput("\r");
+		assert.match(state.component.render(100).join("\n"), /Fast\s+Off/);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("Shift+F toggles an eligible idle agent and shows unsupported saved policy as inactive", async () => {
+	const state = setup();
+	try {
+		state.component.handleInput("F");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(state.component.render(100).join("\n"), /FAST/);
+
+		const unsupported = structuredClone(snapshot.agents[0]!.instance) as any;
+		unsupported.model = models[1];
+		unsupported.fastMode = true;
+		state.snapshot.agents[0]!.instance = unsupported;
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(state.component.render(100).join("\n"), /FAST inactive/);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("Shift+F permits stopped and error agents but rejects unknown ownership", async () => {
+	for (const phase of ["stopped", "error"] as const) {
+		const state = setup(phase);
+		try {
+			state.component.handleInput("F");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.match(state.component.render(100).join("\n"), /FAST/);
+		} finally {
+			state.component.dispose();
+		}
+	}
+	const unknown = setup("unknown");
+	try {
+		unknown.component.handleInput("F");
+		assert.match(unknown.component.render(100).join("\n"), /another process|ownership/iu);
+	} finally {
+		unknown.component.dispose();
+	}
+});
+
+test("fast toggle rejects busy and foreign-owned agents", () => {
+	for (const phase of ["running", "starting", "queued"] as const) {
+		const state = setup(phase);
+		try {
+			state.component.handleInput("F");
+			assert.match(state.component.render(100).join("\n"), /fast|running|pending/iu);
+		} finally {
+			state.component.dispose();
+		}
+	}
+	const compacting = setup("running", 30, true);
+	try {
+		compacting.component.handleInput("F");
+		assert.match(compacting.component.render(100).join("\n"), /idle or stopped|compacting|fast/iu);
+	} finally {
+		compacting.component.dispose();
+	}
+	const foreign = setup("in-use-elsewhere");
+	foreign.snapshot.agents[0]!.ownerPid = 1234;
+	try {
+		foreign.component.handleInput("F");
+		assert.match(foreign.component.render(100).join("\n"), /another process|elsewhere/iu);
+	} finally {
+		foreign.component.dispose();
+	}
+});
+
+test("exclusive adopt never silently ignores a different Fast selection for an existing agent", async () => {
+	const state = setup();
+	let linked = 0;
+	state.manager.link = async () => { linked += 1; return snapshot.agents[0]!.instance; };
+	const component = state.component as any;
+	component.form.mode = "adopt";
+	component.form.session = {
+		path: snapshot.agents[0]!.instance.sessionFile,
+		id: "managed",
+		cwd: snapshot.agents[0]!.instance.cwd,
+		name: "Managed",
+	};
+	component.form.adoptMode = "exclusive";
+	component.form.fastMode = true;
+	try {
+		await component.submitForm();
+		assert.equal(linked, 0);
+		assert.match(component.render(100).join("\n"), /already a Rail agent.*Shift\+F/iu);
+	} finally {
+		component.dispose();
 	}
 });
 

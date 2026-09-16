@@ -1,4 +1,5 @@
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
 import {
 	CONTEXT_COMMAND,
@@ -53,6 +54,7 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	args.push("--model", railModelKey(spec.model));
 	if (spec.model.thinkingLevel) args.push("--thinking", spec.model.thinkingLevel);
 	args.push("--exclude-tools", "subagent");
+	if (spec.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
 	args.push("-e", gptCompactionExtensionPath());
 	args.push("-e", contextExtensionPath(), `--${CONTEXT_PROTOCOL_FLAG}`, CONTEXT_PROTOCOL_VERSION);
 	return args;

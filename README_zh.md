@@ -58,9 +58,10 @@ fi
 - 使用 `@agent/auth-review` 把后续任务强制派发给该 instance，同时不和 Pi 原生 `@path` 文件补全冲突。
 - 在 TUI/RPC 中，使用 `@agent/auth-review steer <message>` 或 `@agent/auth-review followup <message>` 可直接控制已经运行的本地 persistent child；Rail 会消费这条输入并调用本地 control path，不会再把它排队给 parent。`followup` 映射为 `followUp`，消息不能为空。无 UI 的 print/JSON 输入和 extension 注入的消息保持普通 routing。
 - 在 CLI、print、JSON 和 RPC prompt 中使用等价的 `new://cus-resp/gpt-5.6-sol` 与 `agent://auth-review`。Pi 会在 extension 收到输入前，把位于 CLI 参数开头的 `@...` 当作文件展开。
-- 使用 `/rail-agent` 打开统一 TUI overlay，其中包含 **Current**、**All Persistent**、**Create / Adopt** 三个 tab。面板准确区分 `starting`、`running`、`queued`、`idle`、`not connected` 和 `error`；其他进程持有的 live lease 显示为 **In use elsewhere**，不会猜测它是否正在生成。Native Pi 压缩期间，local child 仍保持 `running` phase 以维持 control admission，同时显式显示 **COMPACTING**。Model 与 saved session 都在同一面板中通过可搜索 inline picker 选择；创建表单把选中的 model/thinking level 映射到一个独立 session，新 persistent agent 必须提供具体首个任务，adopt saved session 时保留原 cwd。对于当前进程内正在运行的 agent，按 `g` 打开 inline **Steer** 输入，按 `f` 排队 inline **Follow-up**。
+- 使用 `/rail-agent` 打开统一 TUI overlay，其中包含 **Current**、**All Persistent**、**Create / Adopt** 三个 tab。面板准确区分 `starting`、`running`、`queued`、`idle`、`not connected` 和 `error`；其他进程持有的 live lease 显示为 **In use elsewhere**，不会猜测它是否正在生成。Native Pi 压缩期间，local child 仍保持 `running` phase 以维持 control admission，同时显式显示 **COMPACTING**。Model 与 saved session 都在同一面板中通过可搜索 inline picker 选择；创建表单把选中的 model/thinking level 与 Fast policy 映射到一个独立 session，新 persistent agent 必须提供具体首个任务，adopt saved session 时保留原 cwd。`Shift+F` 可切换创建表单或 idle/stopped/error persistent agent 的 Fast；active、queued、compacting、foreign-owned 与 ownership unknown 状态会拒绝修改。对于当前进程内正在运行的 agent，按 `g` 打开 inline **Steer** 输入，按 `f` 排队 inline **Follow-up**。
 - Tool 提供 `model` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 model session，不创建 persistent instance 或 child session；省略 `model` 时使用 Pi 当前模型。
 - `contextWindow` 是每次 dispatch 的可选、本地 Pi budget。single 模式放在顶层；`tasks` 和 `chain` 中必须放在各自 item 上，不存在数组级默认值或继承。它必须是正的 safe integer；省略时使用 Rail 临时 override 前当前选中的 child model 值。只有 catalog/registry 刷新不会迫使 Rail 把 registry 对象同步到当前 selected object。启用 compaction 时，值小于等于 child 实际 `reserveTokens` 会被拒绝；高于模型 metadata 的值可以使用，但它只改变本地 budgeting metadata，不提高 provider 服务端容量，也不修改 `maxTokens`。
+- `fastMode: true` 为一次 stateless GPT dispatch 启用 Pi 原生 priority service tier，或在创建/adopt persistent GPT agent 时保存该 policy。默认关闭，也不会隐式继承 parent Pi session 当前的 Fast 状态。已有 persistent target 使用 descriptor 中保存的 policy，只能通过 `/rail-agent` 修改。不支持的模型会保留 policy 并显示 **FAST inactive**，但不会收到 `service_tier`。Grouped 与 control 调用不能修改 Fast policy。
 - stateless 只有 explicit budget 才会通过 `-e` 加载 child-local helper；omit 会保持现有的 `--mode json -p --no-session` 调用。persistent worker 通过私有 handled command prepare 并确认 budget，在 retry、compaction 和 queued follow-up 期间保持它；helper 会在 `agent_settled` 时恢复自己拥有的 model 对象，然后由父进程确认 cleanup。省略 budget 的 persistent dispatch 不发送 private prepare/reset prompt。helper 缺失、model/window 不一致、transport 状态不确定或 reset 无法确认时会 fail closed，并 retire worker，不复用不确定状态。
 - 使用 `model` 加 `alias` 创建 persistent session；后续使用 `target` 复用该 session。同一个 model 换一个 alias 即可创建另一个独立 session。
 - 生命周期按连续性选择：已有 linked helper 使用 `target` 继续；已有 session 的历史或项目 cwd 有价值时用安全 `fork` 接入（常用于跨仓库工作）；只有具体首个任务预计需要后续追问时才创建新的 persistent alias，禁止创建空占位 session；其余使用 stateless 一次性派发。
@@ -134,6 +135,8 @@ Pi Rail UI 注册了以下 slash 命令：
 ```
 
 该命令临时覆盖 `model.samplingParams.service_tier`；关闭、切换模型或 session shutdown 时会恢复原值。不维护模型白名单，也不重写 provider payload。
+
+Rail Subagent 通过 `fastMode: true` 使用同一套原生机制。Subagent Fast 刻意只对 GPT 生效，会在 child 模型第一次 provider request 之前应用；它属于 dispatch/persistent-agent policy，不会隐式继承 parent 当前命令状态。
 
 生效范围是 Pi 文档明确透传 `samplingParams` 的 `openai-completions`、`openai-responses` 和 `azure-openai-responses`。`openai-codex-responses` 会显示为 inactive，因为 Pi 0.85.1 的 Codex builder 使用独立 `serviceTier` option，并不会转发模型 `samplingParams`。
 

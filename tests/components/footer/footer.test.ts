@@ -12,6 +12,7 @@ test("renders the active native search mode in the Rail footer", async () => {
 	let renders = 0;
 	const tui = { requestRender: () => { renders += 1; } };
 	const pi: any = {
+		events: { emit: () => undefined, on: () => () => undefined },
 		registerCommand: (name: string, definition: any) => commands.set(name, definition),
 		on: (event: string, handler: any) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		getThinkingLevel: () => "xhigh",

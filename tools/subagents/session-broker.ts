@@ -43,6 +43,7 @@ export interface WorkerStartSpec {
 	sessionName?: string;
 	cwd: string;
 	sessionPath?: string;
+	fastMode?: boolean;
 }
 
 export interface WorkerSendOptions {
@@ -96,6 +97,7 @@ export interface AgentInstance {
 	updatedAt: string;
 	lastTask: string;
 	lastOutput?: string;
+	fastMode?: boolean;
 }
 
 export interface AgentInstanceStore {
@@ -130,6 +132,7 @@ export interface DispatchRequest {
 	cwd?: string;
 	session?: SessionSource;
 	contextWindow?: number;
+	fastMode?: boolean | null;
 	signal?: AbortSignal;
 	onUpdate?: (progress: DispatchProgress) => void;
 }
@@ -159,6 +162,7 @@ export interface AttachRequest {
 	alias?: string;
 	cwd?: string;
 	session?: SessionSource;
+	fastMode?: boolean | null;
 }
 
 interface WorkerState {
@@ -244,7 +248,9 @@ export class SessionBroker {
 	private readonly lifecycleEpochs = new Map<string, number>();
 	private readonly runtimeErrors = new Map<string, string>();
 	private readonly stoppingAgents = new Set<string>();
+	private readonly deletingAgents = new Set<string>();
 	private readonly modelChanges = new Map<string, Promise<AgentInstance>>();
+	private readonly fastModeChanges = new Map<string, Promise<AgentInstance>>();
 
 	constructor(options: SessionBrokerOptions) {
 		this.store = options.store;
@@ -266,7 +272,11 @@ export class SessionBroker {
 		if (contextWindow !== undefined && request.model) this.validateContextWindow(contextWindow, request.cwd ?? this.defaultCwd);
 		const requestedAgentId = request.target ? (this.roster.resolve(request.target) ?? request.target) : undefined;
 		const expectedEpoch = requestedAgentId ? this.lifecycleEpoch(requestedAgentId) : undefined;
-		if (requestedAgentId && this.stoppingAgents.has(requestedAgentId)) throw new Error("Subagent worker is stopping");
+		if (request.target && request.fastMode !== undefined && request.fastMode !== null) {
+			throw new Error("fastMode for an existing target is managed through /rail-agent");
+		}
+		if (requestedAgentId && (this.stoppingAgents.has(requestedAgentId) || this.deletingAgents.has(requestedAgentId))) throw new Error("Subagent worker is stopping");
+		if (requestedAgentId && this.fastModeChanges.has(requestedAgentId)) throw new Error("Subagent fast mode is changing");
 		let instance: AgentInstance | undefined;
 		const createdInstance = Boolean(request.model);
 		let state: WorkerState | undefined;
@@ -277,10 +287,11 @@ export class SessionBroker {
 					...(request.alias ? { alias: request.alias } : {}),
 					...(request.cwd ? { cwd: request.cwd } : {}),
 					...(request.session ? { session: request.session } : {}),
+					...(request.fastMode !== undefined && request.fastMode !== null ? { fastMode: request.fastMode === true } : {}),
 				})
 				: await this.resolveInstance(request.target!);
 			const resolvedInstance = instance;
-			if (this.shuttingDown || this.stoppingAgents.has(resolvedInstance.agentId)
+			if (this.shuttingDown || this.stoppingAgents.has(resolvedInstance.agentId) || this.deletingAgents.has(resolvedInstance.agentId)
 				|| (expectedEpoch !== undefined && this.lifecycleEpoch(resolvedInstance.agentId) !== expectedEpoch)) {
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 			}
@@ -359,7 +370,7 @@ export class SessionBroker {
 		if (!message) throw new Error("Subagent control message cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent control was aborted before delivery");
 		const agentId = this.roster.resolve(request.target) ?? request.target;
-		if (this.shuttingDown || this.stoppingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
+		if (this.shuttingDown || this.stoppingAgents.has(agentId) || this.deletingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
 		if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
 		const state = this.workers.get(agentId);
 		if (!state) {
@@ -424,7 +435,7 @@ export class SessionBroker {
 	async listLinked(): Promise<AgentInstance[]> {
 		const values = await Promise.all(this.roster.list().map(async (link) => {
 			const instance = await this.store.get(link.agentId);
-			return instance ? { ...instance, alias: link.alias } : undefined;
+			return instance ? { ...instance, alias: link.alias, fastMode: instance.fastMode === true } as AgentInstance : undefined;
 		}));
 		return values.filter((value): value is AgentInstance => value !== undefined);
 	}
@@ -450,8 +461,15 @@ export class SessionBroker {
 		return () => this.runtimeListeners.delete(listener);
 	}
 
+	hasLocalWorker(agentId: string): boolean {
+		return this.workers.has(agentId) || this.workerStarts.has(agentId);
+	}
+
 	async stop(target: string): Promise<AgentInstance | undefined> {
 		const agentId = this.roster.resolve(target) ?? target;
+		if (this.fastModeChanges.has(agentId) || this.modelChanges.has(agentId)) {
+			throw new Error("Subagent maintenance operation is already pending");
+		}
 		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
 		this.stoppingAgents.add(agentId);
 		const state = this.workers.get(agentId);
@@ -466,10 +484,56 @@ export class SessionBroker {
 		}
 	}
 
+	async setFastMode(target: string, enabled: boolean, options: { sessionLeaseHeld?: boolean } = {}): Promise<AgentInstance> {
+		const requestedAgentId = this.roster.resolve(target) ?? target;
+		if (this.deletingAgents.has(requestedAgentId)) throw new Error("Subagent is being deleted");
+		if (this.fastModeChanges.has(requestedAgentId)) throw new Error("Subagent fast mode is already changing");
+		const change = (async () => {
+			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
+			const instance = await this.resolveInstance(target);
+			const agentId = instance.agentId;
+			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
+			if (this.deletingAgents.has(agentId)) throw new Error("Subagent is being deleted");
+			if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
+			if (this.modelChanges.has(agentId)) throw new Error("Subagent maintenance operation is already pending");
+			if (this.stoppingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
+			const state = this.workers.get(agentId);
+			if (state && (state.active || state.queued > 0 || state.activeRunId !== undefined || state.isCompacting)) {
+				throw new Error("Fast mode can only change while the subagent is idle or stopped");
+			}
+			if (!state && options.sessionLeaseHeld !== true) {
+				throw new Error("Fast mode changes for a stopped subagent require a held session lease");
+			}
+			this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
+			this.stoppingAgents.add(agentId);
+			if (state) state.stopping = true;
+			try {
+				const latest = await this.store.get(agentId) ?? instance;
+				const updated = { ...latest, fastMode: enabled, updatedAt: new Date().toISOString() };
+				await this.store.put(updated);
+				if (state) await this.stopWorker(agentId);
+				this.emitRuntimeChange();
+				return updated;
+			} finally {
+				this.stoppingAgents.delete(agentId);
+				if (state && this.workers.get(agentId) === state) state.stopping = false;
+				this.emitRuntimeChange();
+			}
+		})();
+		this.fastModeChanges.set(requestedAgentId, change);
+		try {
+			return await change;
+		} finally {
+			this.fastModeChanges.delete(requestedAgentId);
+		}
+	}
+
 	async changeModel(target: string, model: RailModelRef): Promise<AgentInstance> {
 		const instance = await this.resolveInstance(target);
+		if (this.deletingAgents.has(instance.agentId)) throw new Error("Subagent is being deleted");
 		if (this.workerStarts.has(instance.agentId)) throw new Error("Subagent worker is still starting");
 		if (this.modelChanges.has(instance.agentId)) throw new Error("Subagent model change is already pending");
+		if (this.fastModeChanges.has(instance.agentId)) throw new Error("Subagent fast mode is changing");
 		const change = (async () => {
 			const state = this.workers.get(instance.agentId);
 			const apply = async () => {
@@ -515,7 +579,7 @@ export class SessionBroker {
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true;
 		for (const state of this.workers.values()) state.stopping = true;
-		await Promise.allSettled([...this.workerStarts.values(), ...this.instanceCreations]);
+		await Promise.allSettled([...this.workerStarts.values(), ...this.instanceCreations, ...this.fastModeChanges.values(), ...this.modelChanges.values()]);
 		const states = Array.from(this.workers.values());
 		this.workers.clear();
 		for (const state of states) state.stopping = true;
@@ -537,15 +601,30 @@ export class SessionBroker {
 	}
 
 	async delete(target: string): Promise<AgentInstance | undefined> {
-		const instance = await this.resolveInstance(target).catch(() => undefined);
-		if (!instance) return undefined;
-		await this.stopWorker(instance.agentId);
-		await rm(instance.sessionFile, { force: true });
-		await this.store.delete(instance.agentId);
-		for (const link of this.roster.list().filter((item) => item.agentId === instance.agentId)) this.roster.unlink(link.alias);
-		this.runtimeErrors.delete(instance.agentId);
+		const agentId = this.roster.resolve(target) ?? target;
+		if (this.deletingAgents.has(agentId)) throw new Error("Subagent is already being deleted");
+		this.deletingAgents.add(agentId);
+		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
+		const state = this.workers.get(agentId);
+		if (state) state.stopping = true;
 		this.emitRuntimeChange();
-		return instance;
+		try {
+			const pending = [this.fastModeChanges.get(agentId), this.modelChanges.get(agentId)]
+				.filter((operation): operation is Promise<AgentInstance> => operation !== undefined);
+			if (pending.length > 0) await Promise.allSettled(pending);
+			const instance = await this.resolveInstance(target).catch(() => undefined);
+			if (!instance) return undefined;
+			await this.stopWorker(instance.agentId);
+			await rm(instance.sessionFile, { force: true });
+			await this.store.delete(instance.agentId);
+			for (const link of this.roster.list().filter((item) => item.agentId === instance.agentId)) this.roster.unlink(link.alias);
+			this.runtimeErrors.delete(instance.agentId);
+			this.emitRuntimeChange();
+			return instance;
+		} finally {
+			this.deletingAgents.delete(agentId);
+			this.emitRuntimeChange();
+		}
 	}
 
 	private async createInstance(request: AttachRequest): Promise<AgentInstance> {
@@ -574,6 +653,7 @@ export class SessionBroker {
 				sessionName,
 				cwd,
 				...(session.path ? { sessionPath: session.path } : {}),
+				fastMode: request.fastMode === true,
 			});
 			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 			const now = new Date().toISOString();
@@ -589,6 +669,7 @@ export class SessionBroker {
 				createdAt: now,
 				updatedAt: now,
 				lastTask: "(attached; no task yet)",
+				fastMode: request.fastMode === true,
 			};
 			await this.store.put(instance);
 			if (this.shuttingDown) {
@@ -613,14 +694,15 @@ export class SessionBroker {
 		const agentId = linkedAgentId ?? target;
 		const instance = await this.store.get(agentId);
 		if (!instance) throw new Error(`Unknown persistent subagent: ${target}`);
-		return linkedAgentId && target !== agentId ? { ...instance, alias: target } : instance;
+		const normalized: AgentInstance = { ...instance, fastMode: instance.fastMode === true };
+		return linkedAgentId && target !== agentId ? { ...normalized, alias: target } : normalized;
 	}
 
 	private async workerState(instance: AgentInstance, expectedEpoch = this.lifecycleEpoch(instance.agentId)): Promise<WorkerState> {
-		if (this.shuttingDown || this.stoppingAgents.has(instance.agentId) || this.lifecycleEpoch(instance.agentId) !== expectedEpoch) {
+		if (this.shuttingDown || this.stoppingAgents.has(instance.agentId) || this.deletingAgents.has(instance.agentId) || this.lifecycleEpoch(instance.agentId) !== expectedEpoch) {
 			throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 		}
-		const changing = this.modelChanges.get(instance.agentId);
+		const changing = this.modelChanges.get(instance.agentId) ?? this.fastModeChanges.get(instance.agentId);
 		if (changing) {
 			await changing;
 			instance = await this.store.get(instance.agentId) ?? instance;
@@ -641,8 +723,9 @@ export class SessionBroker {
 				sessionName,
 				cwd: instance.cwd,
 				sessionPath: instance.sessionFile,
+				fastMode: instance.fastMode === true,
 			});
-			if (this.shuttingDown || this.stoppingAgents.has(instance.agentId) || this.lifecycleEpoch(instance.agentId) !== expectedEpoch) {
+			if (this.shuttingDown || this.stoppingAgents.has(instance.agentId) || this.deletingAgents.has(instance.agentId) || this.lifecycleEpoch(instance.agentId) !== expectedEpoch) {
 				await worker.stop().catch(() => undefined);
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 			}

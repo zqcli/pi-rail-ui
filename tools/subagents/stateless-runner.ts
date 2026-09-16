@@ -4,6 +4,7 @@ import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, formatContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
 import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
 import { isGptModelName } from "../gpt-compaction/model-eligibility";
@@ -20,6 +21,7 @@ export interface StatelessRunRequest {
 	task: string;
 	cwd: string;
 	contextWindow?: number;
+	fastMode?: boolean;
 	signal?: AbortSignal;
 	onUpdate?: (result: StatelessRunResult) => void;
 }
@@ -50,6 +52,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		const args = ["--mode", "json", "-p", ...(ephemeralSessionPath ? ["--session", ephemeralSessionPath] : ["--no-session"]), "--model", railModelKey(request.model)];
 		if (gptCompactionEnabled) args.push("-e", gptCompactionExtensionPath());
 		if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
+		if (request.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
 		args.push("--exclude-tools", "subagent");
 		if (contextWindow !== undefined) {
 			args.push(

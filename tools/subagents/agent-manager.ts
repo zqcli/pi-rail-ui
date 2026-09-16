@@ -49,6 +49,7 @@ export interface CreateRailAgentRequest {
 	task: string;
 	cwd: string;
 	session?: SessionSource;
+	fastMode?: boolean;
 	onUpdate?: (progress: DispatchProgress) => void;
 	signal?: AbortSignal;
 }
@@ -58,6 +59,7 @@ export interface AdoptRailAgentRequest {
 	alias: string;
 	cwd: string;
 	session: SessionSource;
+	fastMode?: boolean;
 }
 
 export class RailAgentManager {
@@ -73,7 +75,7 @@ export class RailAgentManager {
 	}
 
 	async snapshot(): Promise<RailAgentManagerSnapshot> {
-		const instances = await this.store.list();
+		const instances = (await this.store.list()).map((instance) => ({ ...instance, fastMode: instance.fastMode === true } as AgentInstance));
 		const links = this.roster.list();
 		const aliasesByAgent = new Map<string, string[]>();
 		for (const link of links) {
@@ -156,6 +158,22 @@ export class RailAgentManager {
 
 	adopt(request: AdoptRailAgentRequest): Promise<AgentInstance> {
 		return this.broker.attach(request);
+	}
+
+	async setFastMode(target: string, enabled: boolean): Promise<AgentInstance> {
+		const agent = await this.assertLocallyControllable(target);
+		if (agent.phase !== "idle" && agent.phase !== "stopped" && agent.phase !== "error") {
+			throw new Error("Fast mode can only change while the subagent is idle, stopped, or in error");
+		}
+		if (!this.broker.hasLocalWorker(agent.instance.agentId)) {
+			const lease = await this.leases.acquire(sessionLeaseKey(agent.instance.sessionFile));
+			try {
+				return await this.broker.setFastMode(agent.instance.agentId, enabled, { sessionLeaseHeld: true });
+			} finally {
+				await lease.release();
+			}
+		}
+		return this.broker.setFastMode(agent.instance.agentId, enabled);
 	}
 
 	async link(agentId: string): Promise<AgentInstance> {

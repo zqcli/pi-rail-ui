@@ -116,12 +116,17 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	const { tool } = setupTool();
 
 	assert.match(tool.description, /Use exactly one mode: single, parallel, chain, or control/);
-	assert.match(tool.description, /\{"model":"provider\/model:thinking","task":"one-off work","contextWindow":64000\}/);
-	assert.match(tool.description, /\{"model":"provider\/model:thinking","alias":"worker","task":"initial work","contextWindow":96000\}/);
-	assert.match(tool.description, /\{"target":"worker","task":"follow-up","contextWindow":96000\}/);
-	assert.match(tool.description, /\{"tasks":\[\{"task":"A"\},\{"model":"provider\/model","alias":"worker","task":"B","contextWindow":128000\}\]\}/);
+	assert.match(tool.description, /\{"model":"provider\/model:thinking","task":"one-off work"\}/);
+	assert.match(tool.description, /\{"model":"provider\/model:thinking","alias":"worker","task":"initial work"\}/);
+	assert.match(tool.description, /\{"target":"worker","task":"follow-up"\}/);
+	assert.match(tool.description, /\{"tasks":\[\{"task":"A"\},\{"model":"provider\/model","alias":"worker","task":"B"\}\]\}/);
+	assert.match(tool.description, /Explicit single example: \{"task":"work","contextWindow":64000\}/);
+	assert.match(tool.description, /Explicit grouped example: \{"tasks":\[\{"task":"A","contextWindow":64000\},\{"task":"B","contextWindow":128000\}\]\}/);
 	assert.match(tool.description, /\{"chain":\[\{"task":"plan"\},\{"target":"worker","task":"implement \{previous\}"\}\]\}/);
 	assert.match(tool.description, /\{"target":"worker","control":\{"delivery":"steer","message":"redirect now"\}\}/);
+	assert.match(tool.description, /By default, omit contextWindow/);
+	assert.match(tool.description, /Only send contextWindow when the user explicitly requests a specific child context or compaction budget/);
+	assert.match(tool.description, /Omitting it uses the selected child model's native default/);
 	assert.match(tool.description, /Top-level contextWindow is only for single mode/);
 	assert.match(tool.description, /each tasks or chain item owns its own contextWindow/);
 	assert.match(tool.description, /multiple sibling subagent calls in the same assistant turn/);
@@ -137,6 +142,9 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /do not create an empty, idle, or placeholder persistent session/);
 	assert.match(guidance, /stateless one-off work/);
 	assert.match(guidance, /make the task self-contained/);
+	assert.match(guidance, /Omit contextWindow by default/);
+	assert.match(guidance, /Only include it when the user explicitly requests/);
+	assert.match(guidance, /selected child model's native default/);
 	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
 	assert.match(guidance, /separate top-level Tool Call panels/);
 	assert.match(guidance, /Pi preflights sibling calls in order and executes them concurrently/);
@@ -631,10 +639,10 @@ test("forwards contextWindow only as per-task execution metadata", async () => {
 		],
 	};
 	const call = tool.renderCall(args, theme).render(140).join("\n");
-	assert.match(call, /contextWindow \[64000, 128000\]/);
+	assert.match(call, /contextWindow \[64K, 128K\]/);
 	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(160).join("\n");
-	assert.match(panel, /cus-resp\/gpt-5\.6-sol #1 · stateless · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 64000/);
-	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 128000/);
+	assert.match(panel, /cus-resp\/gpt-5\.6-sol #1 · stateless · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 64K/);
+	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 128K/);
 });
 
 test("context window display uses default for omitted single and grouped budgets", async () => {
@@ -655,12 +663,12 @@ test("context window display uses default for omitted single and grouped budgets
 		/contextWindow default/,
 	);
 
-	const groupedArgs = { tasks: [{ task: "default child" }, { task: "explicit child", contextWindow: 96_000 }] };
+	const groupedArgs = { tasks: [{ task: "default child" }, { task: "explicit child", contextWindow: 65_536 }] };
 	const grouped = await tool.execute("mixed-context-window-display", groupedArgs, undefined, undefined, context());
-	assert.match(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /contextWindow \[default, 96000\]/);
+	assert.match(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /contextWindow \[default, 65\.536K\]/);
 	const groupedPanel = tool.renderResult(grouped, { expanded: false }, theme, { args: groupedArgs }).render(160).join("\n");
 	assert.equal((groupedPanel.match(/contextWindow default/gu) ?? []).length, 1);
-	assert.equal((groupedPanel.match(/contextWindow 96000/gu) ?? []).length, 1);
+	assert.equal((groupedPanel.match(/contextWindow 65\.536K/gu) ?? []).length, 1);
 });
 
 test("chain mode preserves ordering and substitutes the previous final output", async () => {

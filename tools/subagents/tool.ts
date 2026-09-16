@@ -53,7 +53,7 @@ const TaskItem = Type.Object({
 	task: Type.String({ description: "Self-contained one-off task for stateless work, concrete initial task for a new persistent helper, or follow-up message for target" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; when adopting a cross-project saved session, use its original project directory when known" })),
 	session: Type.Optional(SessionSourceSchema),
-	contextWindow: Type.Optional(Type.Number({ description: "Optional positive safe-integer child-local context/compaction budget; omit to use the child model default" })),
+	contextWindow: Type.Optional(Type.Number({ description: "Positive safe-integer child-local context/compaction budget. Omit by default; include only when the user explicitly requests one." })),
 });
 
 const ChainItem = Type.Object({
@@ -63,7 +63,7 @@ const ChainItem = Type.Object({
 	task: Type.String({ description: "Self-contained task, persistent initial/follow-up task, and optional {previous} placeholder" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session" })),
 	session: Type.Optional(SessionSourceSchema),
-	contextWindow: Type.Optional(Type.Number({ description: "Optional positive safe-integer child-local context/compaction budget; omit to use the child model default" })),
+	contextWindow: Type.Optional(Type.Number({ description: "Positive safe-integer child-local context/compaction budget. Omit by default; include only when the user explicitly requests one." })),
 });
 
 const SubagentParams = Type.Object({
@@ -73,7 +73,7 @@ const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Self-contained stateless task, concrete initial task for a new persistent helper, or persistent follow-up message" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
 	session: Type.Optional(SessionSourceSchema),
-	contextWindow: Type.Optional(Type.Number({ description: "Optional positive safe-integer child-local context/compaction budget; omit to use the child model default" })),
+	contextWindow: Type.Optional(Type.Number({ description: "Positive safe-integer child-local context/compaction budget. Omit by default; include only when the user explicitly requests one." })),
 	control: Type.Optional(ControlSchema),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Group independent model-session tasks inside one subagent Tool Call; each item may be stateless or persistent. Use only when one grouped parent Tool Call with child panels is desired." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
@@ -321,15 +321,25 @@ function initialTasksForRender(args: SubagentParamsValue | undefined): string[] 
 	return task ? [task] : [];
 }
 
+function formatContextWindowForDisplay(value: number | undefined): string {
+	if (value === undefined) return "default";
+	if (!Number.isSafeInteger(value) || value <= 0) return String(value);
+	const thousands = Math.floor(value / 1000);
+	const remainder = value % 1000;
+	if (remainder === 0) return `${thousands}K`;
+	const fraction = String(remainder).padStart(3, "0").replace(/0+$/u, "");
+	return `${thousands}.${fraction}K`;
+}
+
 function contextWindowsForRender(args: SubagentParamsValue | undefined, count: number): string[] {
 	if (args?.chain?.length) {
-		return args.chain.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default");
+		return args.chain.map((item) => formatContextWindowForDisplay(item.contextWindow));
 	}
 	if (args?.tasks?.length) {
-		return args.tasks.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default");
+		return args.tasks.map((item) => formatContextWindowForDisplay(item.contextWindow));
 	}
 	if (args?.contextWindow !== undefined) {
-		return [String(args.contextWindow)];
+		return [formatContextWindowForDisplay(args.contextWindow)];
 	}
 	return Array.from({ length: Math.max(1, count) }, () => "default");
 }
@@ -404,13 +414,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		name: "subagent",
 		label: "Subagent",
 		description: "Delegate work to Pi model sessions. Use exactly one mode: single, parallel, chain, or control.\n"
+			+ "Context budget rule: By default, omit contextWindow. Only send contextWindow when the user explicitly requests a specific child context or compaction budget. Omitting it uses the selected child model's native default. Top-level contextWindow is only for single mode; each tasks or chain item owns its own contextWindow. Explicit single example: {\"task\":\"work\",\"contextWindow\":64000}. Explicit grouped example: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":64000},{\"task\":\"B\",\"contextWindow\":128000}]}.\n"
 			+ "1. single: dispatch one task. Lifecycle options:\n"
-			+ "   - stateless (one-off, no saved JSONL): {\"model\":\"provider/model:thinking\",\"task\":\"one-off work\",\"contextWindow\":64000} (omit model to use current model)\n"
-			+ "   - new persistent (expected follow-ups): {\"model\":\"provider/model:thinking\",\"alias\":\"worker\",\"task\":\"initial work\",\"contextWindow\":96000}\n"
-			+ "   - continue linked helper: {\"target\":\"worker\",\"task\":\"follow-up\",\"contextWindow\":96000} (do not provide model)\n"
-			+ "   - adopt existing saved session: {\"session\":{\"mode\":\"fork\",\"path\":\"/path/to/session.jsonl\"},\"task\":\"continue work\"} (defaults to fork)\n"
-			+ "   Top-level contextWindow is only for single mode; each tasks or chain item owns its own contextWindow.\n"
-			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\"},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\",\"contextWindow\":128000}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
+			+ "   - stateless (one-off, no saved JSONL): {\"model\":\"provider/model:thinking\",\"task\":\"one-off work\"} (omit model to use current model)\n"
+			+ "   - new persistent (expected follow-ups): {\"model\":\"provider/model:thinking\",\"alias\":\"worker\",\"task\":\"initial work\"}\n"
+			+ "   - continue linked helper: {\"target\":\"worker\",\"task\":\"follow-up\"} (do not provide model)\n"
+			+ "   - adopt existing saved session: {\"session\":{\"mode\":\"fork\",\"path\":\"/path/to/session.jsonl\"},\"task\":\"continue work\"} (use fork unless the user explicitly requests exclusive ownership)\n"
+			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\"},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\"}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\"},{\"target\":\"worker\",\"task\":\"implement {previous}\"}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, chain, or contextWindow, and never issue control as a sibling of the dispatch it intends to control.\n"
 			+ "Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
@@ -423,6 +433,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"Create a new persistent subagent only when future follow-ups need the same child context. The first model+alias call must include a concrete initial task; do not create an empty, idle, or placeholder persistent session. One model can back many aliases with independent histories.",
 			"For stateless subagent work, call subagent with task and optional model only. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists. Stateless runs create no child JSONL and never appear in /resume.",
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
+			"Omit contextWindow by default. Only include it when the user explicitly requests a specific child context or compaction budget. Omission uses the selected child model's native default; for parallel and chain calls, put an explicitly requested value on the individual item that owns it.",
 			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
 			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
 			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
@@ -667,10 +678,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const windowText = controlMessage
 				? ""
 				: args.chain?.length
-					? ` · contextWindow [${args.chain.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default").join(", ")}]`
+					? ` · contextWindow [${args.chain.map((item) => formatContextWindowForDisplay(item.contextWindow)).join(", ")}]`
 					: args.tasks?.length
-						? ` · contextWindow [${args.tasks.map((item) => item.contextWindow !== undefined ? String(item.contextWindow) : "default").join(", ")}]`
-						: ` · contextWindow ${args.contextWindow !== undefined ? String(args.contextWindow) : "default"}`;
+						? ` · contextWindow [${args.tasks.map((item) => formatContextWindowForDisplay(item.contextWindow)).join(", ")}]`
+						: ` · contextWindow ${formatContextWindowForDisplay(args.contextWindow)}`;
 			const task = controlMessage ?? args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}${theme.fg("dim", windowText)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
 		},

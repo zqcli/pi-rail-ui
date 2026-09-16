@@ -42,7 +42,7 @@ function describe(value: unknown): string {
 }
 
 export function normalizeContextWindow(value: unknown): number | undefined {
-	if (value === undefined) return undefined;
+	if (value === undefined || value === null) return undefined;
 	if (typeof value !== "number" || !Number.isFinite(value) || !Number.isSafeInteger(value) || value <= 0) {
 		throw new ContextWindowValidationError(`contextWindow must be a positive safe integer; received ${describe(value)}`);
 	}

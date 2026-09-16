@@ -4,9 +4,10 @@ import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import installRailContextExtension from "../../tools/subagents/context-extension";
 import { CONTEXT_COMMAND, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, normalizeContextWindow, parseContextWindowFlag, validateContextWindowReserve } from "../../tools/subagents/context-window";
 
-test("contextWindow accepts only positive safe integers and preserves omission", () => {
+test("contextWindow accepts positive safe integers and treats null or omission as default", () => {
 	assert.equal(normalizeContextWindow(undefined), undefined);
-	for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "64000", null, true]) {
+	assert.equal(normalizeContextWindow(null), undefined);
+	for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "64000", true]) {
 		assert.throws(() => normalizeContextWindow(value), /contextWindow/);
 	}
 	assert.equal(normalizeContextWindow(1), 1);

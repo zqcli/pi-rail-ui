@@ -46,6 +46,16 @@ const ControlSchema = Type.Object({
 	message: Type.String({ description: "Control message for an already-running local persistent subagent" }),
 });
 
+function contextWindowSchema() {
+	return Type.Optional(Type.Union([
+		Type.Number(),
+		Type.Null(),
+	], {
+		default: null,
+		description: "Child-local context/compaction budget. Use null by default; null or omission uses the selected child model's native default. Use a positive safe integer only when the user explicitly requests one.",
+	}));
+}
+
 const TaskItem = Type.Object({
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. Use with no alias/session for stateless work or with alias to create a persistent session." })),
 	target: Type.Optional(Type.String({ description: "Exact linked persistent alias or agentId whose existing conversation memory should continue; omit model when target is set" })),
@@ -53,7 +63,7 @@ const TaskItem = Type.Object({
 	task: Type.String({ description: "Self-contained one-off task for stateless work, concrete initial task for a new persistent helper, or follow-up message for target" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; when adopting a cross-project saved session, use its original project directory when known" })),
 	session: Type.Optional(SessionSourceSchema),
-	contextWindow: Type.Optional(Type.Number({ description: "Positive safe-integer child-local context/compaction budget. Omit by default; include only when the user explicitly requests one." })),
+	contextWindow: contextWindowSchema(),
 });
 
 const ChainItem = Type.Object({
@@ -63,7 +73,7 @@ const ChainItem = Type.Object({
 	task: Type.String({ description: "Self-contained task, persistent initial/follow-up task, and optional {previous} placeholder" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session" })),
 	session: Type.Optional(SessionSourceSchema),
-	contextWindow: Type.Optional(Type.Number({ description: "Positive safe-integer child-local context/compaction budget. Omit by default; include only when the user explicitly requests one." })),
+	contextWindow: contextWindowSchema(),
 });
 
 const SubagentParams = Type.Object({
@@ -73,7 +83,7 @@ const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Self-contained stateless task, concrete initial task for a new persistent helper, or persistent follow-up message" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
 	session: Type.Optional(SessionSourceSchema),
-	contextWindow: Type.Optional(Type.Number({ description: "Positive safe-integer child-local context/compaction budget. Omit by default; include only when the user explicitly requests one." })),
+	contextWindow: contextWindowSchema(),
 	control: Type.Optional(ControlSchema),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Group independent model-session tasks inside one subagent Tool Call; each item may be stateless or persistent. Use only when one grouped parent Tool Call with child panels is desired." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
@@ -290,7 +300,7 @@ function modeFor(params: SubagentParamsValue): SubagentMode {
 }
 
 function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
-	if (mode !== "single" && params.contextWindow !== undefined) {
+	if (mode !== "single" && normalizeContextWindow(params.contextWindow) !== undefined) {
 		throw new Error("contextWindow is only supported on the single task or on each parallel/chain item");
 	}
 	const confirmSessionAttach = typeof params.confirmSessionAttach === "boolean"
@@ -321,8 +331,8 @@ function initialTasksForRender(args: SubagentParamsValue | undefined): string[] 
 	return task ? [task] : [];
 }
 
-function formatContextWindowForDisplay(value: number | undefined): string {
-	if (value === undefined) return "default";
+function formatContextWindowForDisplay(value: number | null | undefined): string {
+	if (value === undefined || value === null) return "default";
 	if (!Number.isSafeInteger(value) || value <= 0) return String(value);
 	const thousands = Math.floor(value / 1000);
 	const remainder = value % 1000;
@@ -414,15 +424,15 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		name: "subagent",
 		label: "Subagent",
 		description: "Delegate work to Pi model sessions. Use exactly one mode: single, parallel, chain, or control.\n"
-			+ "Context budget rule: By default, omit contextWindow. Only send contextWindow when the user explicitly requests a specific child context or compaction budget. Omitting it uses the selected child model's native default. Top-level contextWindow is only for single mode; each tasks or chain item owns its own contextWindow. Explicit single example: {\"task\":\"work\",\"contextWindow\":64000}. Explicit grouped example: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":64000},{\"task\":\"B\",\"contextWindow\":128000}]}.\n"
+			+ "Context budget rule: Set contextWindow to null by default. Null or omission uses the selected child model's native default. Only use a positive safe integer when the user explicitly requests a specific child context or compaction budget. Top-level numeric contextWindow is only for single mode; each tasks or chain item owns its own numeric contextWindow. A top-level null is tolerated in grouped/control calls as the default sentinel. Explicit single example: {\"task\":\"work\",\"contextWindow\":64000}. Explicit grouped example: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":64000},{\"task\":\"B\",\"contextWindow\":128000}]}.\n"
 			+ "1. single: dispatch one task. Lifecycle options:\n"
-			+ "   - stateless (one-off, no saved JSONL): {\"model\":\"provider/model:thinking\",\"task\":\"one-off work\"} (omit model to use current model)\n"
-			+ "   - new persistent (expected follow-ups): {\"model\":\"provider/model:thinking\",\"alias\":\"worker\",\"task\":\"initial work\"}\n"
-			+ "   - continue linked helper: {\"target\":\"worker\",\"task\":\"follow-up\"} (do not provide model)\n"
-			+ "   - adopt existing saved session: {\"session\":{\"mode\":\"fork\",\"path\":\"/path/to/session.jsonl\"},\"task\":\"continue work\"} (use fork unless the user explicitly requests exclusive ownership)\n"
-			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\"},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\"}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
-			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\"},{\"target\":\"worker\",\"task\":\"implement {previous}\"}]}.\n"
-			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, chain, or contextWindow, and never issue control as a sibling of the dispatch it intends to control.\n"
+			+ "   - stateless (one-off, no saved JSONL): {\"model\":\"provider/model:thinking\",\"task\":\"one-off work\",\"contextWindow\":null} (omit model to use current model)\n"
+			+ "   - new persistent (expected follow-ups): {\"model\":\"provider/model:thinking\",\"alias\":\"worker\",\"task\":\"initial work\",\"contextWindow\":null}\n"
+			+ "   - continue linked helper: {\"target\":\"worker\",\"task\":\"follow-up\",\"contextWindow\":null} (do not provide model)\n"
+			+ "   - adopt existing saved session: {\"session\":{\"mode\":\"fork\",\"path\":\"/path/to/session.jsonl\"},\"task\":\"continue work\",\"contextWindow\":null} (use fork unless the user explicitly requests exclusive ownership)\n"
+			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":null},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\",\"contextWindow\":null}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
+			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
+			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
 			+ "Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
@@ -431,12 +441,12 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"For an existing linked subagent, continue with target+task and no model. Reuse the exact alias so the same child conversation memory, session, and working context continue.",
 			"When adopting an existing saved Pi session, use session mode fork by default so the original remains untouched. This is appropriate for continuing prior work or modifying another repository; preserve that session's project cwd when known. Use exclusive only with explicit user intent and no other writer.",
 			"Create a new persistent subagent only when future follow-ups need the same child context. The first model+alias call must include a concrete initial task; do not create an empty, idle, or placeholder persistent session. One model can back many aliases with independent histories.",
-			"For stateless subagent work, call subagent with task and optional model only. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists. Stateless runs create no child JSONL and never appear in /resume.",
+			"For stateless subagent work, call subagent with task, optional model, and contextWindow:null by default. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists. Stateless runs create no child JSONL and never appear in /resume.",
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
-			"Omit contextWindow by default. Only include it when the user explicitly requests a specific child context or compaction budget. Omission uses the selected child model's native default; for parallel and chain calls, put an explicitly requested value on the individual item that owns it.",
+			"Use contextWindow:null by default. Null or omission uses the selected child model's native default. Only use a positive integer when the user explicitly requests a specific child context or compaction budget; for parallel and chain calls, put an explicit numeric value on the individual item that owns it.",
 			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
 			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
-			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
+			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call; contextWindow must be null or omitted, never numeric. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
 			"When a child asks for input or another specialist in its ordinary final answer (for example by using the plain-language labels needs_input or specialist_request), keep orchestration in the parent: resolve the question or dispatch the specialist, then continue the original persistent child with target+task. These labels are guidance, not a structured wire protocol. Do not enable recursive child subagent calls.",
 			"When the user names @agent/<alias> or agent://<alias>, use subagent with target set to that exact alias.",
 			"When the user names @new/<provider>/<modelId> or new://<provider>/<modelId>, use subagent with model set to that canonical model reference and assign a concise alias.",
@@ -529,7 +539,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 			}
-			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow !== undefined);
+			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
 			const broker = contextTargetItems.length > 0
 				? (typeof options.broker === "function" ? options.broker() : options.broker)
 				: undefined;
@@ -572,7 +582,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						model,
 						task: item.task,
 						cwd: item.cwd ?? ctx.cwd,
-						...(item.contextWindow !== undefined ? { contextWindow: item.contextWindow } : {}),
+						...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => publishLive(slot, {
 							alias,
@@ -600,7 +610,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					task: item.task,
 					...(item.cwd ? { cwd: item.cwd } : {}),
 					...(item.session ? { session: item.session } : {}),
-					...(item.contextWindow !== undefined ? { contextWindow: item.contextWindow } : {}),
+					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
 					...(signal ? { signal } : {}),
 					onUpdate: ({ instance, run: partial }) => publishLive(slot, {
 						agentId: instance.agentId,

@@ -116,22 +116,31 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	const { tool } = setupTool();
 
 	assert.match(tool.description, /Use exactly one mode: single, parallel, chain, or control/);
-	assert.match(tool.description, /\{"model":"provider\/model:thinking","task":"one-off work"\}/);
-	assert.match(tool.description, /\{"model":"provider\/model:thinking","alias":"worker","task":"initial work"\}/);
-	assert.match(tool.description, /\{"target":"worker","task":"follow-up"\}/);
-	assert.match(tool.description, /\{"tasks":\[\{"task":"A"\},\{"model":"provider\/model","alias":"worker","task":"B"\}\]\}/);
+	assert.match(tool.description, /\{"model":"provider\/model:thinking","task":"one-off work","contextWindow":null\}/);
+	assert.match(tool.description, /\{"model":"provider\/model:thinking","alias":"worker","task":"initial work","contextWindow":null\}/);
+	assert.match(tool.description, /\{"target":"worker","task":"follow-up","contextWindow":null\}/);
+	assert.match(tool.description, /\{"tasks":\[\{"task":"A","contextWindow":null\},\{"model":"provider\/model","alias":"worker","task":"B","contextWindow":null\}\]\}/);
 	assert.match(tool.description, /Explicit single example: \{"task":"work","contextWindow":64000\}/);
 	assert.match(tool.description, /Explicit grouped example: \{"tasks":\[\{"task":"A","contextWindow":64000\},\{"task":"B","contextWindow":128000\}\]\}/);
-	assert.match(tool.description, /\{"chain":\[\{"task":"plan"\},\{"target":"worker","task":"implement \{previous\}"\}\]\}/);
+	assert.match(tool.description, /\{"chain":\[\{"task":"plan","contextWindow":null\},\{"target":"worker","task":"implement \{previous\}","contextWindow":null\}\]\}/);
 	assert.match(tool.description, /\{"target":"worker","control":\{"delivery":"steer","message":"redirect now"\}\}/);
-	assert.match(tool.description, /By default, omit contextWindow/);
-	assert.match(tool.description, /Only send contextWindow when the user explicitly requests a specific child context or compaction budget/);
-	assert.match(tool.description, /Omitting it uses the selected child model's native default/);
-	assert.match(tool.description, /Top-level contextWindow is only for single mode/);
-	assert.match(tool.description, /each tasks or chain item owns its own contextWindow/);
+	assert.match(tool.description, /Set contextWindow to null by default/);
+	assert.match(tool.description, /Null or omission uses the selected child model's native default/);
+	assert.match(tool.description, /Only use a positive safe integer when the user explicitly requests a specific child context or compaction budget/);
+	assert.match(tool.description, /Top-level numeric contextWindow is only for single mode/);
+	assert.match(tool.description, /each tasks or chain item owns its own numeric contextWindow/);
 	assert.match(tool.description, /multiple sibling subagent calls in the same assistant turn/);
 	assert.match(tool.description, /do not use tasks/);
 	assert.equal(tool.executionMode, "parallel");
+	const contextWindowSchemas = [
+		tool.parameters.properties.contextWindow,
+		tool.parameters.properties.tasks.items.properties.contextWindow,
+		tool.parameters.properties.chain.items.properties.contextWindow,
+	];
+	for (const schema of contextWindowSchemas) {
+		assert.equal(schema.default, null);
+		assert.deepEqual(schema.anyOf.map((variant: any) => variant.type), ["number", "null"]);
+	}
 	const guidance = tool.promptGuidelines.join("\n");
 	assert.match(guidance, /lifecycle by continuity/);
 	assert.match(guidance, /existing saved Pi session/);
@@ -142,9 +151,9 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /do not create an empty, idle, or placeholder persistent session/);
 	assert.match(guidance, /stateless one-off work/);
 	assert.match(guidance, /make the task self-contained/);
-	assert.match(guidance, /Omit contextWindow by default/);
-	assert.match(guidance, /Only include it when the user explicitly requests/);
-	assert.match(guidance, /selected child model's native default/);
+	assert.match(guidance, /Use contextWindow:null by default/);
+	assert.match(guidance, /Only use a positive integer when the user explicitly requests/);
+	assert.match(guidance, /Null or omission uses the selected child model's native default/);
 	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
 	assert.match(guidance, /separate top-level Tool Call panels/);
 	assert.match(guidance, /Pi preflights sibling calls in order and executes them concurrently/);
@@ -166,6 +175,7 @@ test("control mode steers and queues follow-ups for an active persistent target"
 		cwd: "/ignored/path",
 		session: { mode: "fork" as const, path: "/ignored/session.jsonl" },
 		control: { delivery: "steer" as const, message: "Focus on tests" },
+		contextWindow: null,
 		tasks: [],
 		chain: [],
 		unexpected: "ignored",
@@ -205,6 +215,14 @@ test("control mode steers and queues follow-ups for an active persistent target"
 			control: { delivery: "steer", message: "Focus" },
 		}, undefined, undefined, context()),
 		/exactly one mode/,
+	);
+	await assert.rejects(
+		() => tool.execute("call-numeric-control-window", {
+			target: "auth-review",
+			control: { delivery: "steer", message: "Focus" },
+			contextWindow: 64_000,
+		}, undefined, undefined, context()),
+		/only supported on the single task/,
 	);
 	const controller = new AbortController();
 	controller.abort();
@@ -645,6 +663,52 @@ test("forwards contextWindow only as per-task execution metadata", async () => {
 	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 128K/);
 });
 
+test("null contextWindow uses the native default without forwarding a temporary budget", async () => {
+	const statelessWindows: Array<{ hasValue: boolean; value: number | undefined }> = [];
+	const { tool, broker } = setupTool({
+		runStateless: async (request) => {
+			statelessWindows.push({ hasValue: Object.hasOwn(request, "contextWindow"), value: request.contextWindow });
+			return {
+				output: `done: ${request.task}`,
+				exitCode: 0,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+			};
+		},
+	});
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+	const singleArgs = { task: "single default", contextWindow: null };
+	const single = await tool.execute("null-single-window", singleArgs, undefined, undefined, context());
+	assert.match(tool.renderCall(singleArgs, theme).render(100).join("\n"), /contextWindow default/);
+	assert.match(tool.renderResult(single, { expanded: false }, theme, { args: singleArgs }).render(140).join("\n"), /contextWindow default/);
+
+	const groupedArgs = {
+		contextWindow: null,
+		tasks: [
+			{ task: "parallel default", contextWindow: null },
+			{ alias: "persistent-default", task: "persistent default", contextWindow: null },
+		],
+	};
+	await tool.execute("null-parallel-window", groupedArgs, undefined, undefined, context());
+	assert.match(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /contextWindow \[default, default\]/);
+	assert.equal(Object.hasOwn(broker.requests[0]!, "contextWindow"), false);
+
+	await tool.execute("null-chain-window", {
+		contextWindow: null,
+		chain: [
+			{ task: "chain first", contextWindow: null },
+			{ task: "chain second {previous}", contextWindow: null },
+		],
+	}, undefined, undefined, context());
+
+	assert.deepEqual(statelessWindows, [
+		{ hasValue: false, value: undefined },
+		{ hasValue: false, value: undefined },
+		{ hasValue: false, value: undefined },
+		{ hasValue: false, value: undefined },
+	]);
+});
+
 test("context window display uses default for omitted single and grouped budgets", async () => {
 	const { tool } = setupTool({
 		runStateless: async () => ({
@@ -802,14 +866,16 @@ test("normalization trims placeholders for single, parallel, and chain and keeps
 		task: "null placeholders stay gone",
 	});
 	assert.deepEqual(tool.prepareArguments({
+		contextWindow: null,
 		tasks: [
-			{ model: "", target: " keep-target ", alias: " ", task: "alpha", cwd: " ", session: { mode: "fork", path: "  " } },
+			{ model: "", target: " keep-target ", alias: " ", task: "alpha", cwd: " ", session: { mode: "fork", path: "  " }, contextWindow: null },
 		],
 	}), {
 		tasks: [{ target: "keep-target", task: "alpha" }],
 	});
 	assert.deepEqual(tool.prepareArguments({
-		chain: [{ model: " m ", alias: " a ", task: "chain task", cwd: "" }],
+		contextWindow: null,
+		chain: [{ model: " m ", alias: " a ", task: "chain task", cwd: "", contextWindow: null }],
 	}), {
 		chain: [{ model: "m", alias: "a", task: "chain task" }],
 	});

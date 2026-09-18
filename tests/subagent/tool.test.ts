@@ -216,9 +216,9 @@ test("control mode steers and queues follow-ups for an active persistent target"
 	assert.equal(steer.details.results[0].persistent, true);
 	assert.equal(steer.details.results[0].model, "cus-resp/gpt-5.6-sol:xhigh");
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-	assert.match(tool.renderCall({ target: "auth-review", control: { delivery: "steer", message: "Focus on tests" } }, theme).render(100).join("\n"), /control steer auth-review/);
+	assert.match(tool.renderCall({ target: "auth-review", control: { delivery: "steer", message: "Focus on tests" } }, theme).render(100).join("\n"), /steer · auth-review/);
 	const controlPanel = tool.renderResult(steer, { expanded: false }, theme).render(100).join("\n");
-	assert.match(controlPanel, /↪ auth-review/);
+	assert.match(controlPanel, /↪ accepted · auth-review/);
 	assert.match(controlPanel, /accepted/);
 	const expandedControlPanel = tool.renderResult(steer, { expanded: true }, theme).render(100).join("\n");
 	assert.match(expandedControlPanel, /Control acknowledgement/);
@@ -305,8 +305,8 @@ test("fastMode is forwarded to stateless and initial persistent dispatches witho
 
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 	const createdArgs = { model: "cus-resp/gpt-5.6-sol", alias: "fast-review", task: "fast initial", fastMode: true };
-	assert.match(tool.renderCall(createdArgs, theme).render(120).join("\n"), /fast on/);
-	assert.match(tool.renderResult(persistent, { expanded: false }, theme, { args: createdArgs }).render(120).join("\n"), /fast on/);
+	assert.match(tool.renderCall(createdArgs, theme).render(120).join("\n"), /FAST/);
+	assert.doesNotMatch(tool.renderResult(persistent, { expanded: false }, theme, { args: createdArgs }).render(120).join("\n"), /FAST/);
 
 	const groupedArgs = { tasks: [{ task: "one", fastMode: null }, { target: "fast-review", task: "two", fastMode: null }] };
 	const grouped = tool.renderResult({
@@ -320,14 +320,51 @@ test("fastMode is forwarded to stateless and initial persistent dispatches witho
 			durationMs: 1,
 		},
 	}, { expanded: false, isPartial: false }, theme, { args: groupedArgs }).render(120).join("\n");
-	assert.match(tool.renderCall(groupedArgs, theme).render(120).join("\n"), /fast \[off, agent default\]/);
-	assert.match(grouped, /fast off/);
-	assert.match(grouped, /fast agent default/);
+	assert.doesNotMatch(tool.renderCall(groupedArgs, theme).render(120).join("\n"), /fast|FAST/);
+	assert.doesNotMatch(grouped, /fast|FAST/);
 
 	const targetArgs = { target: "fast-review", task: "continue", fastMode: null };
-	assert.match(tool.renderCall(targetArgs, theme).render(120).join("\n"), /fast agent default/);
-	assert.match(tool.renderResult(persistent, { expanded: false }, theme, { args: targetArgs }).render(120).join("\n"), /fast agent default/);
+	assert.doesNotMatch(tool.renderCall(targetArgs, theme).render(120).join("\n"), /FAST|fast (?:on|off|agent)/u);
+	assert.doesNotMatch(tool.renderResult(persistent, { expanded: false }, theme, { args: targetArgs }).render(120).join("\n"), /FAST|fast (?:on|off|agent)/u);
 	assert.doesNotMatch(JSON.stringify(persistent.details), /fastMode/);
+});
+
+test("renderCall owns task-free dispatch metadata and single results do not repeat it", async () => {
+	const { tool } = setupTool({
+		runStateless: async () => ({
+			exitCode: 0,
+			output: "done",
+			usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 0, cost: 0.01, contextTokens: 120, turns: 1 },
+		}),
+	});
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const defaultArgs = { task: "PRIVATE TASK PREVIEW MUST NOT RENDER" };
+	const defaultCall = tool.renderCall(defaultArgs, theme).render(120).join("\n");
+	assert.doesNotMatch(defaultCall, /PRIVATE TASK PREVIEW/);
+	assert.doesNotMatch(defaultCall, /budget|FAST|fast off/);
+
+	const explicitArgs = { model: "cus-resp/gpt-5.6-sol", task: "PRIVATE TASK PREVIEW MUST NOT RENDER", contextWindow: 64_000, fastMode: true };
+	const offArgs = { model: "cus-resp/gpt-5.6-sol", task: "off", fastMode: false };
+	assert.doesNotMatch(tool.renderCall(offArgs, theme).render(120).join("\n"), /FAST/);
+	const offResult = await tool.execute("layout-off", offArgs, undefined, undefined, context());
+	assert.doesNotMatch(tool.renderResult(offResult, { expanded: false }, theme, { args: offArgs }).render(120).join("\n"), /FAST/);
+	const explicitResult = await tool.execute("layout-explicit", explicitArgs, undefined, undefined, context());
+	const explicitCall = tool.renderCall(explicitArgs, theme).render(120).join("\n");
+	const explicitPanel = tool.renderResult(explicitResult, { expanded: false }, theme, { args: explicitArgs }).render(120).join("\n");
+	assert.match(explicitCall, /budget 64K/);
+	assert.match(explicitCall, /FAST/);
+	assert.doesNotMatch(explicitCall, /PRIVATE TASK PREVIEW/);
+	assert.match(explicitPanel, /PRIVATE TASK PREVIEW/);
+	assert.doesNotMatch(explicitPanel, /budget 64K|FAST|Usage ·/);
+	assert.match(tool.renderCall({
+		model: "cus-resp/gpt-5.6-sol",
+		alias: "adopted-review",
+		task: "resume",
+		session: { mode: "fork", path: "/tmp/review.jsonl" },
+	}, theme).render(120).join("\n"), /adopt fork · adopted-review · cus-resp\/gpt-5\.6-sol/);
+	for (const width of [1, 2, 3, 40, 80, 120]) {
+		assert.equal(tool.renderCall(explicitArgs, theme).render(width).length, 1);
+	}
 });
 
 test("control failures retain an explicit unknown-delivery result for the panel", async () => {
@@ -342,6 +379,11 @@ test("control failures retain an explicit unknown-delivery result for the panel"
 	assert.equal(restored.details.mode, "control");
 	assert.equal(restored.details.results[0].status, "failed");
 	assert.match(restored.details.results[0].errorMessage, /outcome is unknown/);
+	assert.equal(restored.details.results[0].transcript.entries.some((entry: any) => entry.initial && entry.text === "Focus on tests"), true);
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const panel = tool.renderResult(restored, { expanded: true }, theme).render(100).join("\n");
+	assert.match(panel, /failed · auth-review/);
+	assert.doesNotMatch(panel, /Focus on tests|initial task|cus-resp\/gpt-5\.6-sol|persistent|0 in/);
 });
 
 test("failed tool results restore the last streamed transcript through Pi's tool_result hook", async () => {
@@ -412,9 +454,9 @@ test("model plus alias creates a persistent session and target continues it", as
 		bold: (text: string) => text,
 	};
 	const call = tool.renderCall({ target: "auth-review", task: "check tests" }, theme);
-	assert.match(call.render(100).join("\n"), /persistent continue auth-review/);
+	assert.match(call.render(100).join("\n"), /continue · auth-review/);
 	const progressPanel = tool.renderResult(continueUpdates[0], { expanded: false }, theme);
-	assert.match(progressPanel.render(120)[0], /auth-review · persistent · cus-resp\/gpt-5\.6-sol:xhigh/);
+	assert.match(progressPanel.render(120)[0], /Running · cus-resp\/gpt-5\.6-sol:xhigh/);
 });
 
 test("native compaction progress reaches the Tool Call panel through the runner seam", async () => {
@@ -679,8 +721,8 @@ test("model without alias or session runs stateless and creates no broker instan
 		tasks: [],
 		chain: [],
 	}, theme).render(100).join("\n");
-	assert.match(rendered, /stateless cus-resp\/gpt-5\.6-sol:xhigh/);
-	assert.match(rendered, /contextWindow default/);
+	assert.match(rendered, /stateless · cus-resp\/gpt-5\.6-sol:xhigh/);
+	assert.doesNotMatch(rendered, /contextWindow default|budget/);
 	assert.doesNotMatch(rendered, /control|persistent new/);
 });
 
@@ -751,10 +793,10 @@ test("forwards contextWindow only as per-task execution metadata", async () => {
 		],
 	};
 	const call = tool.renderCall(args, theme).render(140).join("\n");
-	assert.match(call, /contextWindow \[64K, 128K\]/);
+	assert.match(call, /budget 1=64K, 2=128K/);
 	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(160).join("\n");
-	assert.match(panel, /cus-resp\/gpt-5\.6-sol #1 · stateless · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 64K/);
-	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh · contextWindow 128K/);
+	assert.match(panel, /cus-resp\/gpt-5\.6-sol #1 · one-off · cus-resp\/gpt-5\.6-sol:xhigh · budget 64K/);
+	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh · budget 128K/);
 });
 
 test("null contextWindow uses the native default without forwarding a temporary budget", async () => {
@@ -773,8 +815,8 @@ test("null contextWindow uses the native default without forwarding a temporary 
 
 	const singleArgs = { task: "single default", contextWindow: null };
 	const single = await tool.execute("null-single-window", singleArgs, undefined, undefined, context());
-	assert.match(tool.renderCall(singleArgs, theme).render(100).join("\n"), /contextWindow default/);
-	assert.match(tool.renderResult(single, { expanded: false }, theme, { args: singleArgs }).render(140).join("\n"), /contextWindow default/);
+	assert.doesNotMatch(tool.renderCall(singleArgs, theme).render(100).join("\n"), /contextWindow default|budget/);
+	assert.doesNotMatch(tool.renderResult(single, { expanded: false }, theme, { args: singleArgs }).render(140).join("\n"), /contextWindow default|budget/);
 
 	const groupedArgs = {
 		contextWindow: null,
@@ -784,7 +826,7 @@ test("null contextWindow uses the native default without forwarding a temporary 
 		],
 	};
 	await tool.execute("null-parallel-window", groupedArgs, undefined, undefined, context());
-	assert.match(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /contextWindow \[default, default\]/);
+	assert.doesNotMatch(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /contextWindow default|budget/);
 	assert.equal(Object.hasOwn(broker.requests[0]!, "contextWindow"), false);
 
 	await tool.execute("null-chain-window", {
@@ -803,7 +845,7 @@ test("null contextWindow uses the native default without forwarding a temporary 
 	]);
 });
 
-test("context window display uses default for omitted single and grouped budgets", async () => {
+test("context window display omits omitted single and grouped budgets", async () => {
 	const { tool } = setupTool({
 		runStateless: async () => ({
 			output: "done",
@@ -815,18 +857,18 @@ test("context window display uses default for omitted single and grouped budgets
 
 	const singleArgs = { task: "default single" };
 	const single = await tool.execute("default-single-window", singleArgs, undefined, undefined, context());
-	assert.match(tool.renderCall(singleArgs, theme).render(100).join("\n"), /contextWindow default/);
-	assert.match(
+	assert.doesNotMatch(tool.renderCall(singleArgs, theme).render(100).join("\n"), /contextWindow default|budget/);
+	assert.doesNotMatch(
 		tool.renderResult(single, { expanded: false }, theme, { args: singleArgs }).render(140).join("\n"),
-		/contextWindow default/,
+		/contextWindow default|budget/,
 	);
 
 	const groupedArgs = { tasks: [{ task: "default child" }, { task: "explicit child", contextWindow: 65_536 }] };
 	const grouped = await tool.execute("mixed-context-window-display", groupedArgs, undefined, undefined, context());
-	assert.match(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /contextWindow \[default, 65\.536K\]/);
+	assert.match(tool.renderCall(groupedArgs, theme).render(140).join("\n"), /budget 2=65\.536K/);
 	const groupedPanel = tool.renderResult(grouped, { expanded: false }, theme, { args: groupedArgs }).render(160).join("\n");
-	assert.equal((groupedPanel.match(/contextWindow default/gu) ?? []).length, 1);
-	assert.equal((groupedPanel.match(/contextWindow 65\.536K/gu) ?? []).length, 1);
+	assert.equal((groupedPanel.match(/budget default/gu) ?? []).length, 0);
+	assert.equal((groupedPanel.match(/budget 65\.536K/gu) ?? []).length, 1);
 });
 
 test("chain mode preserves ordering and substitutes the previous final output", async () => {
@@ -846,6 +888,111 @@ test("chain mode preserves ordering and substitutes the previous final output", 
 	]);
 	assert.deepEqual(result.details.results.map((item: any) => item.step), [1, 2]);
 	assert.match(result.content[0].text, /Chain: 2\/2 succeeded/);
+});
+
+test("chain rendering uses the full substituted task cached by tool call and slot", async () => {
+	const updates: any[] = [];
+	const { tool, hook } = setupTool({
+		runStateless: async (request) => {
+			const transcript = new SubagentTranscript(request.task);
+			request.onUpdate?.({
+				output: `partial: ${request.task}`,
+				exitCode: 0,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				transcript: transcript.snapshot(),
+			});
+			return {
+				output: `done: ${request.task}`,
+				exitCode: 0,
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+				transcript: transcript.snapshot(),
+			};
+		},
+	});
+	const args = {
+		chain: [
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", task: "first result" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", task: `REPLACED TASK START\nreview {previous}\n${"r".repeat(10_000)}\nREPLACED TASK END` },
+		],
+	};
+	const result = await tool.execute("chain-render-cache", args, undefined, (update: any) => updates.push(update), context());
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	hook?.({ toolName: "subagent", toolCallId: "chain-render-cache", isError: false });
+	const panel = tool.renderResult(result, { expanded: false }, theme, {
+		args,
+		toolCallId: "chain-render-cache",
+	}).render(120).join("\n");
+	const restoredWithoutCache = tool.renderResult(structuredClone(result), { expanded: false }, theme, {
+		args,
+		toolCallId: "different-call",
+	}).render(120).join("\n");
+
+	assert.ok(updates.some((update) => update.details.results.some((run: any) => run.task.includes("REPLACED TASK START"))));
+	assert.ok(Buffer.byteLength(result.details.results[1].task, "utf8") <= 8 * 1024);
+	assert.match(panel, /REPLACED TASK START/);
+	assert.match(panel, /REPLACED TASK END/);
+	assert.doesNotMatch(panel, /review \{previous\}/);
+	assert.doesNotMatch(restoredWithoutCache, /REPLACED TASK END/);
+});
+
+test("restored results without Tool args preserve the transcript initial entry", () => {
+	const { tool } = setupTool();
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const transcript = new SubagentTranscript("TRANSCRIPT INITIAL TASK").snapshot();
+	const result = {
+		content: [{ type: "text", text: "done" }],
+		details: {
+			mode: "single",
+			durationMs: 10,
+			results: [{
+				alias: "restored",
+				model: "provider/model",
+				status: "completed",
+				output: "done",
+				persistent: false,
+				task: "DIFFERENT BOUNDED TASK FIELD",
+				transcript,
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+				durationMs: 10,
+			}],
+		},
+	};
+	const panel = tool.renderResult(result, { expanded: false }, theme).render(120).join("\n");
+
+	assert.match(panel, /TRANSCRIPT INITIAL TASK/);
+	assert.doesNotMatch(panel, /DIFFERENT BOUNDED TASK FIELD/);
+});
+
+test("details mode keeps one-result parallel and chain results in grouped panels", () => {
+	const { tool } = setupTool();
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const parallelArgs = { tasks: [{ task: "one parallel task" }] };
+	const parallel = {
+		content: [{ type: "text", text: "parallel" }],
+		details: {
+			mode: "parallel",
+			durationMs: 100,
+			results: [{ alias: "parallel-one", model: "provider/model", status: "completed", output: "parallel done", persistent: false, task: "one parallel task", usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 12, turns: 1 }, durationMs: 100, slot: 0 }],
+		},
+	};
+	const parallelPanel = tool.renderResult(parallel, { expanded: false }, theme, { args: parallelArgs }).render(120).join("\n");
+	assert.match(parallelPanel, /1 model session · 1 complete/);
+	assert.match(parallelPanel, /╭/);
+	assert.match(parallelPanel, /parallel-one/);
+
+	const chainArgs = { chain: [{ task: "first" }, { task: "second {previous}" }] };
+	const chain = {
+		content: [{ type: "text", text: "chain" }],
+		details: {
+			mode: "chain",
+			durationMs: 100,
+			results: [{ alias: "chain-one", model: "provider/model", status: "failed", output: "failed", persistent: false, task: "first", step: 1, usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 12, turns: 1 }, durationMs: 100, slot: 0, stopReason: "error", errorMessage: "failed" }],
+		},
+	};
+	const chainPanel = tool.renderResult(chain, { expanded: false }, theme, { args: chainArgs }).render(120).join("\n");
+	assert.match(chainPanel, /1 model session · 0 complete · 0 running · 1 failed/);
+	assert.match(chainPanel, /1\/2 · chain-one/);
+	assert.match(chainPanel, /╭/);
 });
 
 test("parallel streaming updates retain the recent transcript from every active child", async () => {

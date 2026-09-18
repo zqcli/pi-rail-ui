@@ -243,13 +243,13 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 
 	assert.ok(lines.length <= 10);
 	assert.ok(view.render(120).length <= 10);
-	assert.match(lines[0] ?? "", /persistent/);
+	assert.match(lines[0] ?? "", /Running ·/);
 	assert.match(view.render(120)[0] ?? "", /cus-resp\/gpt-5\.6-sol:xhigh/);
 	assert.match(text, /assistant message 9/);
 	assert.doesNotMatch(text, /assistant message 0/);
 	assert.match(text, /1\.2k in/);
-	assert.match(wideText, /107 cache read/);
-	assert.match(wideText, /1\.4k context/);
+	assert.match(wideText, /107 cached/);
+	assert.match(wideText, /ctx 1\.4k/);
 	assert.match(wideText, /2 turns/);
 	assert.match(wideText, /\$0\.012/);
 	assert.match(wideText, /<1m/);
@@ -280,13 +280,28 @@ test("completed expanded panels show the full final answer and usage metrics", (
 	assert.doesNotMatch(collapsed, /final answer line 29/);
 	assert.match(expanded, /final answer line 29/);
 	assert.match(expanded, /24\.8k in/);
-	assert.match(expanded, /18\.2k cache read/);
+	assert.match(expanded, /18\.2k cached/);
+	assert.match(expanded, /\$0\.083/);
+	assert.doesNotMatch(expanded, /\$0\.0831/);
 	assert.match(expanded, /1m/);
-	assert.match(expanded, /stop/);
-	assert.match(expanded, /Usage ·[\s\S]*Recent activity/);
-	assert.match(expanded, /Usage ·[\s\S]*Final answer/);
-	assert.match(expanded, /Usage ·[\s\S]*final answer line 0/);
+	assert.doesNotMatch(expanded, /· stop/);
+	assert.match(expanded, /Recent activity[\s\S]*Final answer/);
+	assert.match(expanded, /3 turns[\s\S]*final answer line 0/);
 	assert.ok(expanded.split("\n").length > 16);
+});
+
+test("cost formatting keeps four decimals below one cent and three otherwise", () => {
+	const renderCost = (cost: number): string => renderSubagentTranscript([{
+		alias: "cost",
+		model: "provider/gpt-cost",
+		status: "completed",
+		output: "done",
+		persistent: false,
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost, contextTokens: 1, turns: 1 },
+	}], false, theme as any).render(120).join("\n");
+
+	assert.match(renderCost(0.00123), /\$0\.0012/);
+	assert.match(renderCost(0.01234), /\$0\.012/);
 });
 
 test("expanded completed answers render markdown while collapsed and unsafe terminal output stay literal", () => {
@@ -391,14 +406,14 @@ test("parallel runs render as independent panels with aggregate wall usage", () 
 	assert.match(text, /2 model sessions · 2 complete/);
 	assert.match(text, /3k in/);
 	assert.match(text, /wall <1m/);
-	assert.match(text, /alpha · stateless · provider\/model-a:high/);
+	assert.match(text, /alpha · one-off · provider\/model-a:high/);
 	assert.match(text, /beta · persistent · provider\/model-b:xhigh/);
 	assert.match(text, /alpha final/);
 	assert.match(text, /beta final/);
-	const alphaPanel = text.slice(text.indexOf("alpha · stateless"), text.indexOf("beta · persistent"));
+	const alphaPanel = text.slice(text.indexOf("alpha · one-off"), text.indexOf("beta · persistent"));
 	const betaPanel = text.slice(text.indexOf("beta · persistent"));
-	assert.match(alphaPanel, /Usage ·[\s\S]*alpha final/);
-	assert.match(betaPanel, /Usage ·[\s\S]*beta final/);
+	assert.doesNotMatch(alphaPanel, /Usage/);
+	assert.doesNotMatch(betaPanel, /Usage/);
 	assert.equal((text.match(/╭/gu) ?? []).length, 2);
 	for (const width of [1, 2]) {
 		assert.ok(renderSubagentTranscript(runs, false, theme as any).render(width).every((line) => visibleWidth(line) <= width));
@@ -415,12 +430,12 @@ test("usage elapsed time changes only at minute boundaries", () => {
 		durationMs,
 	}], false, theme as any).render(100).join("\n");
 
-	assert.match(renderDuration(1_000), /Usage · .*<1m/);
-	assert.match(renderDuration(59_999), /Usage · .*<1m/);
-	assert.match(renderDuration(60_000), /Usage · .*1m/);
+	assert.match(renderDuration(1_000), /<1m/);
+	assert.match(renderDuration(59_999), /<1m/);
+	assert.match(renderDuration(60_000), /1m/);
 	assert.doesNotMatch(renderDuration(60_000), /<1m/);
-	assert.match(renderDuration(119_999), /Usage · .*1m/);
-	assert.match(renderDuration(120_000), /Usage · .*2m/);
+	assert.match(renderDuration(119_999), /1m/);
+	assert.match(renderDuration(120_000), /2m/);
 });
 
 test("empty runs render only a zero-summary header within the row cap", () => {
@@ -445,8 +460,8 @@ test("single running run without a transcript falls back to its output line", ()
 	const collapsed = renderSubagentTranscript([run], false, theme as any).render(80);
 	const expanded = renderSubagentTranscript([run], true, theme as any).render(80);
 
-	assert.match(collapsed[0]?.trim() ?? "", /^… timer · stateless · model unavailable$/);
-	assert.match(collapsed.join("\n"), /Usage ·[\s\S]*\(running\.\.\.\)/);
+	assert.match(collapsed[0]?.trim() ?? "", /^Running · model unavailable/);
+	assert.match(collapsed.join("\n"), /Running ·[\s\S]*\(running\.\.\.\)/);
 	assert.ok(collapsed.length <= 10);
 	assert.ok(expanded.length <= 16);
 	assert.match(expanded.join("\n"), /\(running\.\.\.\)/);
@@ -476,12 +491,12 @@ test("single running fallback hides the usage line when nothing is reportable", 
 	const zeroUsageRows = renderSubagentTranscript([withZeroUsage], false, theme as any).render(80);
 
 	assert.deepEqual(noUsageRows.map((line) => line.trim()), [
-		"… a · stateless · model unavailable",
+		"Running · model unavailable",
 		"● assistant  working",
 	]);
 	assert.deepEqual(zeroUsageRows.map((line) => line.trim()), [
-		"… a · stateless · model unavailable",
-		"Usage · 0 in · 0 out",
+		"Running · model unavailable",
+		"0 in · 0 out",
 		"● assistant  working",
 	]);
 });
@@ -529,9 +544,9 @@ test("grouped child panels keep each run's initial task complete and associated"
 	assert.equal(bounded[1]?.transcript?.entries.find((entry) => entry.initial)?.text, betaTask);
 	assert.ok(bounded.reduce((total, run) => total + (run.transcript?.entries.filter((entry) => !entry.initial).length ?? 0), 0) <= 18);
 
-	const rendered = renderSubagentTranscript(runs, true, theme as any).render(120).join("\n");
-	const plannerHeader = rendered.indexOf("step 1 · planner · stateless · provider/model-a");
-	const reviewerHeader = rendered.indexOf("step 2 · reviewer · persistent · provider/model-b");
+	const rendered = renderSubagentTranscript(runs, true, theme as any, { sequenceTotal: 2 }).render(120).join("\n");
+	const plannerHeader = rendered.indexOf("1/2 · planner · one-off · provider/model-a");
+	const reviewerHeader = rendered.indexOf("2/2 · reviewer · persistent · provider/model-b");
 	assert.ok(plannerHeader >= 0 && plannerHeader < rendered.indexOf("ALPHA INITIAL START"));
 	assert.ok(reviewerHeader >= 0 && reviewerHeader < rendered.indexOf("BETA INITIAL START"));
 	assert.match(rendered, /ALPHA INITIAL END/);
@@ -556,10 +571,11 @@ test("running parallel child panels show live usage before activity", () => {
 		},
 	], false, theme as any, { durationMs: 2500 }).render(100).join("\n");
 
-	const alphaPanel = text.slice(text.indexOf("alpha · stateless"), text.indexOf("beta · persistent"));
+	const alphaPanel = text.slice(text.indexOf("alpha · one-off"), text.indexOf("beta · persistent"));
 	const betaPanel = text.slice(text.indexOf("beta · persistent"));
-	assert.match(alphaPanel, /Usage · 101 in[\s\S]*Activity/);
-	assert.match(betaPanel, /Usage · 202 in[\s\S]*Activity/);
+	assert.match(text, /303 in[\s\S]*Activity/);
+	assert.match(alphaPanel, /Activity/);
+	assert.match(betaPanel, /Activity/);
 });
 
 test("tool calls stay paired with their results when parallel completions and result messages use different orders", () => {
@@ -656,4 +672,224 @@ test("parallel Tool Call details retain at most 18 transcript events across all 
 	assert.ok(bounded.reduce((total, run) => total + (run.transcript?.entries.filter((entry) => !entry.initial).length ?? 0), 0) <= 18);
 	assert.equal(bounded.reduce((total, run) => total + (run.transcript?.entries.filter((entry) => entry.initial).length ?? 0), 0), 8);
 	assert.ok(bounded.reduce((total, run) => total + (run.transcript?.omittedEntries ?? 0), 0) > 0);
+});
+
+test("single panels keep the initial task while separating runtime and usage lines", () => {
+	const initialTask = "INITIAL SINGLE TASK\nPreserve this complete task in the result panel.\nINITIAL SINGLE TASK END";
+	const transcript = new SubagentTranscript(initialTask);
+	transcript.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "recent activity" }] } });
+	const run: SubagentTranscriptRun = {
+		alias: "implement-luna",
+		model: "cus-resp/gpt-5.6-luna:max",
+		status: "running",
+		output: "working",
+		persistent: true,
+		isCompacting: true,
+		transcript: transcript.snapshot(),
+		usage: { input: 697700, output: 3400, cacheRead: 646100, cacheWrite: 0, cost: 0.42, contextTokens: 358500, turns: 4 },
+		durationMs: 60_000,
+	};
+	const text = renderSubagentTranscript([run], false, theme as any, {
+		contextWindows: ["64K"],
+		fastModes: ["on"],
+	}).render(120).join("\n");
+
+	assert.match(text, /Compacting · cus-resp\/gpt-5\.6-luna:max · ctx 358\.5k · 4 turns · 1m/);
+	assert.match(text, /697\.7k in · 3\.4k out · 646\.1k cached/);
+	assert.match(text, /INITIAL SINGLE TASK/);
+	assert.match(text, /INITIAL SINGLE TASK END/);
+	assert.doesNotMatch(text, /Usage|budget 64K|FAST|implement-luna ·/);
+	for (const width of [40, 80, 120]) {
+		assert.ok(renderSubagentTranscript([run], false, theme as any, { contextWindows: ["64K"], fastModes: ["on"] }).render(width).every((line) => visibleWidth(line) <= width));
+	}
+});
+
+test("completed and failed single panels share runtime hierarchy and hide normal stop", () => {
+	const transcript = new SubagentTranscript("completed initial task");
+	const base: SubagentTranscriptRun = {
+		alias: "reviewer",
+		model: "provider/gpt-review",
+		status: "completed",
+		output: "final answer",
+		persistent: false,
+		transcript: transcript.snapshot(),
+		usage: { input: 1000, output: 200, cacheRead: 500, cacheWrite: 0, cost: 0, contextTokens: 1500, turns: 2 },
+		durationMs: 1200,
+		stopReason: "stop",
+	};
+	const completed = renderSubagentTranscript([base], true, theme as any, {
+		contextWindows: ["64K"],
+	}).render(120).join("\n");
+	assert.match(completed, /Completed · provider\/gpt-review · ctx 1\.5k · 2 turns · <1m/);
+	assert.match(completed, /1k in · 200 out · 500 cached/);
+	assert.doesNotMatch(completed, /· stop|Usage|budget 64K|FAST/);
+	assert.match(completed, /completed initial task/);
+
+	const failed = renderSubagentTranscript([{ ...base, status: "failed", output: "provider failed", errorMessage: "provider failed", stopReason: "error" }], false, theme as any, {
+		contextWindows: ["64K"],
+	}).render(120).join("\n");
+	assert.match(failed, /Failed · provider\/gpt-review · ctx 1\.5k · 2 turns · <1m · error/);
+	assert.match(failed, /provider failed/);
+	assert.doesNotMatch(failed, /Usage|budget 64K|FAST/);
+});
+
+test("failed panels retain a distinct error message beside partial output without duplication", () => {
+	const run: SubagentTranscriptRun = {
+		alias: "provider-failure",
+		model: "provider/gpt-review",
+		status: "failed",
+		output: "partial answer before failure",
+		errorMessage: "provider disconnected after the partial answer",
+		persistent: false,
+		stopReason: "error",
+		usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 12, turns: 1 },
+	};
+	const collapsed = renderSubagentTranscript([run], false, theme as any).render(120).join("\n");
+	const expanded = renderSubagentTranscript([run], true, theme as any).render(120).join("\n");
+	assert.match(collapsed, /partial answer before failure/);
+	assert.match(collapsed, /provider disconnected after the partial answer/);
+	assert.match(expanded, /partial answer before failure/);
+	assert.match(expanded, /provider disconnected after the partial answer/);
+
+	const same = renderSubagentTranscript([{ ...run, output: "same failure", errorMessage: "same failure" }], true, theme as any).render(120).join("\n");
+	assert.equal((same.match(/same failure/gu) ?? []).length, 1);
+	const errorOnly = renderSubagentTranscript([{ ...run, output: "", errorMessage: "error only" }], true, theme as any).render(120).join("\n");
+	assert.equal((errorOnly.match(/error only/gu) ?? []).length, 1);
+});
+
+test("grouped panels retain child identity, explicit policy, and chain sequence without defaults", () => {
+	const firstTask = "GROUP FIRST INITIAL TASK";
+	const secondTask = "GROUP SECOND INITIAL TASK";
+	const first = new SubagentTranscript(firstTask);
+	const second = new SubagentTranscript(secondTask);
+	const runs: SubagentTranscriptRun[] = [
+		{ alias: "planner", model: "provider/gpt-plan", status: "completed", output: "plan", persistent: false, step: 1, transcript: first.snapshot(), usage: { input: 1000, output: 100, cacheRead: 200, cacheWrite: 0, cost: 0, contextTokens: 1100, turns: 1 }, durationMs: 1000 },
+		{ alias: "reviewer", model: "provider/gpt-review", status: "failed", output: "failed", persistent: true, step: 2, transcript: second.snapshot(), usage: { input: 2000, output: 300, cacheRead: 400, cacheWrite: 0, cost: 0.1, contextTokens: 2300, turns: 2 }, durationMs: 2000, stopReason: "error" },
+	];
+	const text = renderSubagentTranscript(runs, false, theme as any, {
+		durationMs: 3000,
+		contextWindows: [undefined, "64K"],
+		fastModes: [undefined, "on"],
+		sequenceTotal: 2,
+	}).render(120).join("\n");
+
+	assert.match(text, /2 model sessions · 1 complete · 0 running · 1 failed/);
+	assert.match(text, /3k in · 400 out · 600 cached · \$0\.100 · wall <1m/);
+	assert.match(text, /1\/2 · planner · one-off · provider\/gpt-plan/);
+	assert.match(text, /2\/2 · reviewer · persistent · provider\/gpt-review · budget 64K · FAST/);
+	assert.match(text, /GROUP FIRST INITIAL TASK/);
+	assert.match(text, /GROUP SECOND INITIAL TASK/);
+	assert.doesNotMatch(text, /budget default|fast off|agent default|Usage ·/);
+	const firstPanelStart = text.indexOf("╭");
+	const firstPanelEnd = text.indexOf("╰", firstPanelStart);
+	assert.ok(firstPanelStart >= 0 && firstPanelEnd > firstPanelStart);
+	const firstPanel = text.slice(firstPanelStart, firstPanelEnd);
+	assert.doesNotMatch(firstPanel, /\bin\b|\bout\b|cached|cache write|\$/);
+	assert.match(firstPanel, /ctx 1\.1k · 1 turn · <1m/);
+	for (const width of [40, 80, 120]) {
+		assert.ok(renderSubagentTranscript(runs, false, theme as any, {
+			contextWindows: [undefined, "64K"],
+			fastModes: [undefined, "on"],
+			sequenceTotal: 2,
+		}).render(width).every((line) => visibleWidth(line) <= width));
+	}
+});
+
+test("control panels show only delivery status and alias, never control message as initial task", () => {
+	const controlMessage = "CONTROL MESSAGE MUST NOT BE INITIAL TASK";
+	const run: SubagentTranscriptRun = {
+		alias: "auth-review",
+		model: "provider/gpt-auth",
+		status: "accepted",
+		output: "Steer accepted by auth-review",
+		persistent: true,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		transcript: new SubagentTranscript(controlMessage).snapshot(),
+	};
+	const text = renderSubagentTranscript([run], false, theme as any, { control: true }).render(120).join("\n");
+	assert.match(text, /accepted · auth-review/);
+	assert.match(text, /Steer accepted by auth-review/);
+	assert.doesNotMatch(text, /provider\/gpt-auth|persistent|0 in|initial task|CONTROL MESSAGE/);
+	for (const width of [1, 40, 80, 120]) assert.ok(renderSubagentTranscript([run], false, theme as any, { control: true }).render(width).every((line) => visibleWidth(line) <= width));
+});
+
+test("control panels isolate the acknowledgement or error body from all transcript activity", () => {
+	const transcript = new SubagentTranscript("CONTROL INITIAL MUST STAY HIDDEN");
+	transcript.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "NON-INITIAL ACTIVITY MUST STAY HIDDEN" }] } });
+	const success = renderSubagentTranscript([{
+		alias: "auth-review",
+		status: "accepted",
+		output: "Steer accepted by auth-review",
+		persistent: true,
+		transcript: transcript.snapshot(),
+	}], true, theme as any, { mode: "control" }).render(120).join("\n");
+	assert.match(success, /Control acknowledgement/);
+	assert.match(success, /Steer accepted by auth-review/);
+	assert.doesNotMatch(success, /CONTROL INITIAL|NON-INITIAL ACTIVITY|Recent activity|Activity/);
+
+	const failure = renderSubagentTranscript([{
+		alias: "auth-review",
+		status: "failed",
+		output: "partial control output",
+		errorMessage: "control delivery failed",
+		persistent: true,
+		transcript: transcript.snapshot(),
+	}], true, theme as any, { control: true }).render(120).join("\n");
+	assert.match(failure, /Control error/);
+	assert.match(failure, /control delivery failed/);
+	assert.match(failure, /partial control output/);
+	assert.doesNotMatch(failure, /CONTROL INITIAL|NON-INITIAL ACTIVITY|Recent activity|Activity/);
+});
+
+test("explicit grouped mode keeps one child boxed and shows the chain denominator", () => {
+	const run: SubagentTranscriptRun = {
+		alias: "only-step",
+		model: "provider/model",
+		status: "completed",
+		output: "done",
+		persistent: false,
+		step: 1,
+		transcript: new SubagentTranscript("task").snapshot(),
+		usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 12, turns: 1 },
+	};
+	const text = renderSubagentTranscript([run], false, theme as any, { mode: "chain", sequenceTotal: 3 }).render(120).join("\n");
+	assert.match(text, /1 model session · 1 complete/);
+	assert.match(text, /1\/3 · only-step/);
+	assert.match(text, /╭/);
+	assert.match(text, /╰/);
+});
+
+test("single and grouped headers stay one physical line while initial tasks may wrap", () => {
+	const singleTask = "SINGLE INITIAL TASK that must remain complete even when the terminal is narrow";
+	const single = {
+		alias: "single-alias",
+		model: "provider/gpt-single",
+		status: "failed" as const,
+		output: "failed",
+		persistent: true,
+		stopReason: "error",
+		transcript: new SubagentTranscript(singleTask).snapshot(),
+		usage: { input: 1000, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0.1, contextTokens: 1200, turns: 2 },
+		durationMs: 60_000,
+	};
+	const grouped = [
+		{ alias: "child-one-with-a-very-long-alias", model: "provider/gpt-one-with-a-very-long-model-name", status: "completed" as const, output: "x", persistent: false },
+		{ alias: "child-two-with-a-very-long-alias", model: "provider/gpt-two-with-a-very-long-model-name", status: "completed" as const, output: "x", persistent: true },
+	];
+
+	for (const width of [1, 2, 3, 40, 80, 120]) {
+		const singleLines = renderSubagentTranscript([single], false, theme as any).render(width);
+		const initialIndex = singleLines.findIndex((line) => line.includes("›"));
+		assert.equal(initialIndex, 2, `single header/usage unexpectedly wrapped at ${width}`);
+		assert.ok(singleLines.slice(0, initialIndex).every((line) => visibleWidth(line) <= width));
+		assert.match(singleLines.slice(initialIndex).join("").replaceAll(" ", ""), /SINGLEINITIALTASKthatmustremaincompleteevenwhentheterminalisnarrow/);
+
+		const groupedLines = renderSubagentTranscript(grouped, false, theme as any, {
+			contextWindows: ["64K", "128K"],
+			fastModes: ["on", "on"],
+		}).render(width);
+		const expectedRows = width >= 3 ? 10 : 6;
+		assert.equal(groupedLines.length, expectedRows, `grouped header unexpectedly wrapped at ${width}`);
+		assert.ok(groupedLines.every((line) => visibleWidth(line) <= width));
+	}
 });

@@ -55,15 +55,18 @@ export interface SubagentTranscriptRun {
 	step?: number;
 	outputTruncated?: boolean;
 	contextWindowText?: string;
-	fastModeText?: "on" | "off" | "agent default";
+	fastModeText?: "on";
 }
 
 export interface SubagentTranscriptRenderOptions {
 	isPartial?: boolean;
 	durationMs?: number;
-	initialTasks?: readonly string[];
+	initialTasks?: readonly (string | undefined)[];
 	contextWindows?: readonly (string | undefined)[] | undefined;
-	fastModes?: readonly ("on" | "off" | "agent default" | undefined)[] | undefined;
+	fastModes?: readonly ("on" | undefined)[] | undefined;
+	mode?: "single" | "parallel" | "chain" | "control";
+	sequenceTotal?: number;
+	control?: boolean;
 	markdownTheme?: MarkdownTheme;
 }
 
@@ -163,7 +166,7 @@ function toolCallText(toolCall: UnknownRecord): string {
 
 function runsWithInitialTasks(
 	runs: SubagentTranscriptRun[],
-	initialTasks: readonly string[] | undefined,
+	initialTasks: readonly (string | undefined)[] | undefined,
 ): SubagentTranscriptRun[] {
 	if (!initialTasks) return runs;
 	return runs.map((run, runIndex) => {
@@ -634,7 +637,7 @@ class BoundedTranscriptView implements Component {
 	) {}
 
 	render(width: number): string[] {
-		const headerLines = new Text(this.header, 0, 0).render(width).slice(0, 1);
+		const headerLines = [truncateToWidth(this.header, Math.max(1, width), "", true)];
 		const statusLines = this.statusLine
 			? [truncateToWidth(this.theme.fg("dim", this.statusLine), Math.max(1, width), "", true)]
 			: [];
@@ -724,16 +727,40 @@ function usageText(run: SubagentTranscriptRun): string {
 	const parts: string[] = [];
 	if (usage) {
 		parts.push(`${compactNumber(usage.input)} in`, `${compactNumber(usage.output)} out`);
-		if (usage.cacheRead > 0) parts.push(`${compactNumber(usage.cacheRead)} cache read`);
+		if (usage.cacheRead > 0) parts.push(`${compactNumber(usage.cacheRead)} cached`);
 		if (usage.cacheWrite > 0) parts.push(`${compactNumber(usage.cacheWrite)} cache write`);
-		if (usage.contextTokens > 0) parts.push(`${compactNumber(usage.contextTokens)} context`);
-		if (usage.turns > 0) parts.push(`${usage.turns} ${usage.turns === 1 ? "turn" : "turns"}`);
-		if (usage.cost > 0) parts.push(`$${usage.cost.toFixed(usage.cost < 0.01 ? 4 : 3)}`);
+		if (usage.cost > 0) parts.push(costText(usage.cost));
 	}
+	return parts.join(" · ");
+}
+
+function costText(value: number): string {
+	return `$${value.toFixed(value < 0.01 ? 4 : 3)}`;
+}
+
+function runtimeMetricsText(run: SubagentTranscriptRun): string {
+	const parts: string[] = [];
+	if (run.usage?.contextTokens && run.usage.contextTokens > 0) parts.push(`ctx ${compactNumber(run.usage.contextTokens)}`);
+	if (run.usage?.turns && run.usage.turns > 0) parts.push(`${run.usage.turns} ${run.usage.turns === 1 ? "turn" : "turns"}`);
 	const duration = compactDuration(run.durationMs);
 	if (duration) parts.push(duration);
-	if (run.stopReason) parts.push(run.stopReason);
+	if (run.stopReason && run.stopReason !== "stop" && run.stopReason !== "accepted") parts.push(run.stopReason);
 	return parts.join(" · ");
+}
+
+function runtimeText(run: SubagentTranscriptRun): string {
+	const runtime = runtimeMetricsText(run);
+	const parts = [run.model ?? "model unavailable"];
+	if (runtime) parts.push(runtime);
+	return parts.join(" · ");
+}
+
+function statusText(run: SubagentTranscriptRun): string {
+	if (run.status === "failed") return "Failed";
+	if (run.status === "running" && run.isCompacting) return "Compacting";
+	if (run.status === "running") return "Running";
+	if (run.status === "accepted") return "Accepted";
+	return "Completed";
 }
 
 function runsWithContextWindows(
@@ -743,14 +770,14 @@ function runsWithContextWindows(
 	if (!contextWindows) return runs;
 	return runs.map((run, runIndex) => {
 		const targetSlot = run.slot ?? runIndex;
-		const contextWindowText = contextWindows[targetSlot] ?? "default";
-		return { ...run, contextWindowText };
+		const contextWindowText = contextWindows[targetSlot];
+		return contextWindowText === undefined ? run : { ...run, contextWindowText };
 	});
 }
 
 function runsWithFastModes(
 	runs: SubagentTranscriptRun[],
-	fastModes: readonly ("on" | "off" | "agent default" | undefined)[] | undefined,
+	fastModes: readonly ("on" | undefined)[] | undefined,
 ): SubagentTranscriptRun[] {
 	if (!fastModes) return runs;
 	return runs.map((run, runIndex) => {
@@ -760,11 +787,14 @@ function runsWithFastModes(
 	});
 }
 
-function identityText(run: SubagentTranscriptRun): string {
-	const step = run.step !== undefined ? `step ${run.step} · ` : "";
-	const contextWindow = run.contextWindowText ? ` · contextWindow ${run.contextWindowText}` : "";
-	const fast = run.fastModeText === undefined ? "" : ` · fast ${run.fastModeText}`;
-	return `${step}${run.alias} · ${run.persistent ? "persistent" : "stateless"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}`;
+function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control", sequenceTotal?: number): string {
+	if (layout === "control") return `${run.status === "failed" ? "failed" : "accepted"} · ${run.alias}`;
+	const step = run.step !== undefined
+		? `${sequenceTotal !== undefined ? `${run.step}/${sequenceTotal}` : `step ${run.step}`} · `
+		: "";
+	const contextWindow = run.contextWindowText ? ` · budget ${run.contextWindowText}` : "";
+	const fast = run.fastModeText === undefined ? "" : " · FAST";
+	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
@@ -782,8 +812,8 @@ function canRenderAnswerMarkdown(run: SubagentTranscriptRun): boolean {
 		&& !run.output.includes("[Final answer truncated in the parent session details.");
 }
 
-function runGroups(run: SubagentTranscriptRun): RenderGroup[] {
-	return collectTranscriptGroups([run]).map((group) => ({
+function runGroups(run: SubagentTranscriptRun, includeInitial = true): RenderGroup[] {
+	return collectTranscriptGroups([run], includeInitial).map((group) => ({
 		order: group.order,
 		entries: group.entries.map(({ entry }) => entry),
 	}));
@@ -791,6 +821,7 @@ function runGroups(run: SubagentTranscriptRun): RenderGroup[] {
 
 class SubagentRunPanel implements Component {
 	private readonly answer: string;
+	private readonly errorMessage: string | undefined;
 	private readonly answerMarkdown: Markdown | undefined;
 
 	constructor(
@@ -800,8 +831,15 @@ class SubagentRunPanel implements Component {
 		private readonly boxed: boolean,
 		private readonly theme: Theme,
 		markdownTheme?: MarkdownTheme,
+		private readonly layout: "single" | "grouped" | "control" = "single",
+		private readonly sequenceTotal?: number,
 	) {
-		this.answer = cleanDisplayText(run.output || run.errorMessage || "", "(no output)");
+		const output = cleanDisplayText(run.output, "");
+		const errorMessage = cleanDisplayText(run.errorMessage ?? "", "");
+		this.answer = output || errorMessage || "(no output)";
+		this.errorMessage = run.status === "failed" && output !== "" && errorMessage !== "" && errorMessage !== output
+			? errorMessage
+			: undefined;
 		this.answerMarkdown = terminal && expanded && canRenderAnswerMarkdown(run) && markdownTheme
 			? new Markdown(this.answer, 0, 0, markdownTheme)
 			: undefined;
@@ -810,14 +848,21 @@ class SubagentRunPanel implements Component {
 	render(width: number): string[] {
 		const boxed = this.boxed && width >= 3;
 		const innerWidth = Math.max(1, width - (boxed ? 2 : 0));
-		const lines = [
-			`${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run)))}`,
-		];
-		const metrics = usageText(this.run);
-		if (metrics) lines.push(truncateToWidth(this.theme.fg("dim", `Usage · ${metrics}`), innerWidth, "", true));
+		const header = this.layout === "single"
+			? this.theme.fg("toolTitle", this.theme.bold(`${statusText(this.run)} · ${runtimeText(this.run)}`))
+			: `${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run, this.layout, this.sequenceTotal)))}`;
+		const lines = [truncateToWidth(header, innerWidth, "", true)];
+		const metrics = this.layout === "single"
+			? usageText(this.run)
+			: this.layout === "grouped"
+				? runtimeMetricsText(this.run)
+				: "";
+		if (metrics) lines.push(truncateToWidth(this.theme.fg("dim", metrics), innerWidth, "", true));
 		if (this.terminal) lines.push(...this.renderCompleted(innerWidth));
 		else lines.push(...this.renderActivity(innerWidth));
-		if (!boxed) return lines.flatMap((line) => new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
+		if (!boxed) return lines.flatMap((line, index) => index === 0
+			? [line]
+			: new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
 		const borderColor = this.run.status === "failed" ? "error" : this.run.status === "running" ? "warning" : "borderAccent";
 		const border = (value: string) => this.theme.fg(borderColor, value);
@@ -837,32 +882,44 @@ class SubagentRunPanel implements Component {
 
 	private renderCompleted(width: number): string[] {
 		const rendered = this.answerMarkdown?.render(width) ?? new Text(this.answer, 0, 0).render(width);
+		const error = this.errorMessage
+			? new Text(this.theme.fg("error", `Error · ${this.errorMessage}`), 0, 0).render(width)
+			: [];
 		if (this.expanded) {
-			const activity = this.run.transcript
+			const activity = this.layout !== "control" && this.run.transcript
 				? new BoundedTranscriptView(
 					this.theme.fg("dim", "Recent activity"),
-					runGroups(this.run),
+					runGroups(this.run, true),
 					this.run.transcript.omittedEntries,
 					EXPANDED_ROWS,
 					this.theme,
 				).render(width)
 				: [];
-			const label = this.run.status === "accepted" ? "Control acknowledgement" : "Final answer";
-			return [...activity, this.theme.fg("dim", label), ...rendered];
+			const label = this.layout === "control"
+				? this.run.status === "failed" ? "Control error" : "Control acknowledgement"
+				: "Final answer";
+			return [...activity, ...error, this.theme.fg("dim", label), ...rendered];
 		}
-		const initial = this.run.transcript
+		const initial = this.layout === "control" ? [] : this.run.transcript
 			? new BoundedTranscriptView("", runGroups(this.run), 0, 0, this.theme).renderInitial(width)
 			: [];
+		const collapsedError = error.slice(0, 1);
 		const preview = rendered.slice(0, 2);
 		if (rendered.length > preview.length) preview.push(this.theme.fg("dim", "… expand for full answer"));
-		return [...initial, ...preview];
+		const controlLabel = this.layout === "control"
+			? [this.theme.fg("dim", this.run.status === "failed" ? "Control error" : "Control acknowledgement")]
+			: [];
+		return [...initial, ...collapsedError, ...controlLabel, ...preview];
 	}
 
 	private renderActivity(width: number): string[] {
+		if (this.layout === "control") {
+			return new Text(cleanDisplayText(this.run.output, "(running...)"), 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
+		}
 		if (!this.run.transcript) return new Text(cleanDisplayText(this.run.output, "(running...)"), 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
 		const view = new BoundedTranscriptView(
 			this.theme.fg("dim", "Activity"),
-			runGroups(this.run),
+			runGroups(this.run, true),
 			this.run.transcript.omittedEntries,
 			this.expanded ? 7 : 4,
 			this.theme,
@@ -880,6 +937,7 @@ class MultiSubagentPanelView implements Component {
 		private readonly durationMs: number | undefined,
 		private readonly theme: Theme,
 		markdownTheme?: MarkdownTheme,
+		sequenceTotal?: number,
 	) {
 		this.panels = runs.map((run) => new SubagentRunPanel(
 			run,
@@ -888,6 +946,8 @@ class MultiSubagentPanelView implements Component {
 			true,
 			theme,
 			markdownTheme,
+			"grouped",
+			sequenceTotal,
 		));
 	}
 
@@ -905,13 +965,13 @@ class MultiSubagentPanelView implements Component {
 			usage.cost += run.usage.cost;
 			return usage;
 		}, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-		const summary = `${this.runs.length} model sessions · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running · ${failed} failed`;
+		const summary = `${this.runs.length} model ${this.runs.length === 1 ? "session" : "sessions"} · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running · ${failed} failed`;
 		const metrics = [
 			`${compactNumber(total.input)} in`,
 			`${compactNumber(total.output)} out`,
-			...(total.cacheRead > 0 ? [`${compactNumber(total.cacheRead)} cache read`] : []),
+			...(total.cacheRead > 0 ? [`${compactNumber(total.cacheRead)} cached`] : []),
 			...(total.cacheWrite > 0 ? [`${compactNumber(total.cacheWrite)} cache write`] : []),
-			...(total.cost > 0 ? [`$${total.cost.toFixed(total.cost < 0.01 ? 4 : 3)}`] : []),
+			...(total.cost > 0 ? [costText(total.cost)] : []),
 			...(this.durationMs !== undefined ? [`wall ${compactDuration(this.durationMs)}`] : []),
 		].join(" · ");
 		const lines = [
@@ -941,12 +1001,25 @@ export function renderSubagentTranscript(
 	);
 	const runsWithFast = runsWithFastModes(runsWithContext, options.fastModes);
 	const boundedRuns = boundSubagentRunTranscripts(runsWithFast);
-	if (boundedRuns.length > 1) {
-		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme, options.markdownTheme);
+	const grouped = options.mode === "parallel" || options.mode === "chain"
+		|| (options.mode === undefined && boundedRuns.length > 1);
+	if (grouped) {
+		const sequenceTotal = options.sequenceTotal ?? (options.mode === "chain"
+			? boundedRuns.length
+			: boundedRuns.some((run) => run.step !== undefined) ? boundedRuns.length : undefined);
+		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme, options.markdownTheme, sequenceTotal);
 	}
 	const only = boundedRuns[0];
-	if (only && only.status !== "running") {
-		return new SubagentRunPanel(only, expanded, true, false, theme, options.markdownTheme);
+	if (only && (only.status !== "running" || options.mode === "control" || options.control)) {
+		return new SubagentRunPanel(
+			only,
+			expanded,
+			true,
+			false,
+			theme,
+			options.markdownTheme,
+			options.mode === "control" || options.control ? "control" : "single",
+		);
 	}
 	if (!only) {
 		const header = `${theme.fg("toolTitle", theme.bold("0 model sessions"))}${theme.fg("dim", " · 0 persistent · 0 stateless · 0 complete · 0 running · 0 failed")}`;
@@ -966,8 +1039,7 @@ export function renderSubagentTranscript(
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	const contextWindow = only.contextWindowText ? ` · contextWindow ${only.contextWindowText}` : "";
-	const header = `${theme.fg("warning", only.isCompacting ? "Compacting" : "…")} ${theme.fg("toolTitle", theme.bold(only.alias))}${theme.fg("dim", ` · ${only.persistent ? "persistent" : "stateless"} · ${only.model ?? "model unavailable"}${contextWindow}`)}`;
+	const header = theme.fg("toolTitle", theme.bold(`${statusText(only)} · ${runtimeText(only)}`));
 	const usage = usageText(only);
 	return new BoundedTranscriptView(
 		header,
@@ -975,6 +1047,6 @@ export function renderSubagentTranscript(
 		only.transcript?.omittedEntries ?? 0,
 		expanded ? EXPANDED_ROWS : COLLAPSED_ROWS,
 		theme,
-		usage ? `Usage · ${usage}` : undefined,
+		usage || undefined,
 	);
 }

@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { type MarkdownTheme, Text } from "@earendil-works/pi-tui";
+import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { normalizeContextWindow, validateContextWindowReserve } from "./context-window";
 import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
@@ -370,29 +370,53 @@ function validateFastMode(
 	}
 }
 
-type FastModeDisplay = "on" | "off" | "agent default";
+type FastModeDisplay = "on";
 
-function fastModeForDisplay(item: Pick<TaskParams, "target" | "fastMode">): FastModeDisplay {
-	if (nonEmpty(item.target)) return "agent default";
-	return item.fastMode === true ? "on" : "off";
+function fastModeForDisplay(item: Pick<TaskParams, "fastMode">): FastModeDisplay | undefined {
+	if (item.fastMode === true) return "on";
+	return undefined;
 }
 
-function fastModesForRender(args: SubagentParamsValue | undefined): FastModeDisplay[] | undefined {
+function fastModesForRender(args: SubagentParamsValue | undefined): Array<FastModeDisplay | undefined> | undefined {
 	if (!args) return undefined;
 	if (args.chain?.length) {
-		return args.chain.map(fastModeForDisplay);
+		const modes = args.chain.map(fastModeForDisplay);
+		return modes.some((mode) => mode !== undefined) ? modes : undefined;
 	}
 	if (args.tasks?.length) {
-		return args.tasks.map(fastModeForDisplay);
+		const modes = args.tasks.map(fastModeForDisplay);
+		return modes.some((mode) => mode !== undefined) ? modes : undefined;
 	}
-	return [fastModeForDisplay(args as TaskParams)];
+	const mode = fastModeForDisplay(args as TaskParams);
+	return mode ? [mode] : undefined;
 }
 
-function initialTasksForRender(args: SubagentParamsValue | undefined): string[] {
-	if (args?.chain?.length) return args.chain.map((item) => item.task);
-	if (args?.tasks?.length) return args.tasks.map((item) => item.task);
-	const task = nonEmpty(args?.task);
-	return task ? [task] : [];
+function initialTasksForRender(
+	args: SubagentParamsValue | undefined,
+	mode: "single" | "parallel" | "chain" | "control" | undefined,
+	resultCount: number,
+	actualTasks?: ReadonlyMap<number, string>,
+	fallbackTasks?: readonly (string | undefined)[],
+): Array<string | undefined> {
+	const renderMode = mode
+		?? (args?.chain?.length ? "chain" : args?.tasks?.length ? "parallel" : args?.control?.message ? "control" : "single");
+	const rawItems: TaskParams[] = renderMode === "chain"
+		? (args?.chain ?? []) as TaskParams[]
+		: renderMode === "parallel"
+			? (args?.tasks ?? []) as TaskParams[]
+			: args?.task !== undefined ? [{ ...args, task: args.task } as TaskParams] : [];
+	if (renderMode === "control") return [];
+	const count = Math.max(resultCount, rawItems.length, actualTasks?.size ?? 0);
+	return Array.from({ length: count }, (_, index) => {
+		const actual = actualTasks?.get(index);
+		if (actual !== undefined) return actual;
+		const raw = rawItems[index]?.task;
+		const fallback = fallbackTasks?.[index];
+		if (renderMode === "chain" && raw?.includes("{previous}")) {
+			return fallback !== undefined && fallback !== raw ? fallback : undefined;
+		}
+		return raw ?? fallback;
+	});
 }
 
 function formatContextWindowForDisplay(value: number | null | undefined): string {
@@ -405,17 +429,27 @@ function formatContextWindowForDisplay(value: number | null | undefined): string
 	return `${thousands}.${fraction}K`;
 }
 
-function contextWindowsForRender(args: SubagentParamsValue | undefined, count: number): string[] {
+function contextWindowsForRender(args: SubagentParamsValue | undefined, count: number): Array<string | undefined> {
 	if (args?.chain?.length) {
-		return args.chain.map((item) => formatContextWindowForDisplay(item.contextWindow));
+		return args.chain.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow));
 	}
 	if (args?.tasks?.length) {
-		return args.tasks.map((item) => formatContextWindowForDisplay(item.contextWindow));
+		return args.tasks.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow));
 	}
-	if (args?.contextWindow !== undefined) {
+	if (args?.contextWindow != null) {
 		return [formatContextWindowForDisplay(args.contextWindow)];
 	}
-	return Array.from({ length: Math.max(1, count) }, () => "default");
+	return Array.from({ length: Math.max(1, count) }, () => undefined);
+}
+
+class SingleLineText implements Component {
+	constructor(private readonly value: string) {}
+
+	render(width: number): string[] {
+		return [truncateToWidth(this.value, Math.max(1, width), "", true)];
+	}
+
+	invalidate(): void {}
 }
 
 async function validateTaskContextWindows(items: TaskParams[], broker: SessionBroker | undefined, defaultCwd: string): Promise<void> {
@@ -476,11 +510,14 @@ function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunD
 
 export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulSubagentToolOptions): void {
 	const latestDetails = new Map<string, StatefulSubagentDetails>();
+	const actualTasksByCall = new Map<string, Map<number, string>>();
+	const actualTasksByDetails = new WeakMap<StatefulSubagentDetails, Map<number, string>>();
 	const eventApi = pi as Partial<Pick<ExtensionAPI, "on">>;
 	eventApi.on?.("tool_result", (event) => {
 		if (event.toolName !== "subagent") return;
 		const details = latestDetails.get(event.toolCallId);
 		latestDetails.delete(event.toolCallId);
+		actualTasksByCall.delete(event.toolCallId);
 		if (event.isError && details) return { details };
 		return undefined;
 	});
@@ -534,14 +571,20 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			let toolStartedAt = performance.now();
 			const mode = modeFor(params);
 			params = filterParamsForMode(params, mode);
+			const actualTasks = new Map<number, string>();
+			actualTasksByCall.set(toolCallId, actualTasks);
 			const liveResults = new Map<number, StatefulSubagentRunDetails>();
 			const runStartedAt = new Map<number, number>();
 			const runDuration = (slot: number) => Math.max(0, Math.round(performance.now() - (runStartedAt.get(slot) ?? performance.now())));
-			const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => ({
-				mode,
-				results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
-				durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
-			});
+			const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => {
+				const details: StatefulSubagentDetails = {
+					mode,
+					results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
+					durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
+				};
+				actualTasksByDetails.set(details, actualTasks);
+				return details;
+			};
 			if (mode === "control") {
 				if (!params.target?.trim()) throw new Error("Control mode requires target for an existing persistent subagent");
 				const message = params.control!.message.trim();
@@ -625,6 +668,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			toolStartedAt = performance.now();
 
 			const dispatch = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
+				actualTasks.set(slot, item.task);
 				runStartedAt.set(slot, performance.now());
 				const duration = () => runDuration(slot);
 				if (signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
@@ -743,32 +787,40 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 
 		renderCall(args, theme) {
 			const controlMessage = nonEmpty(args.control?.message);
+			const alias = nonEmpty(args.alias);
+			const model = nonEmpty(args.model);
+			const persistentIdentity = alias ?? model ?? "current model";
+			const persistentModel = alias && model ? ` · ${model}` : "";
 			const mode = controlMessage
-				? `control ${args.control!.delivery} ${args.target ?? "target required"}`
+				? `${args.control!.delivery === "followUp" ? "follow-up" : "steer"} · ${nonEmpty(args.target) ?? "target required"}`
 				: args.chain?.length
-				? `chain (${args.chain.length})`
+				? `chain · ${args.chain.length}`
 				: args.tasks?.length
-					? `parallel (${args.tasks.length})`
+					? `parallel · ${args.tasks.length}`
 					: nonEmpty(args.target)
-						? `persistent continue ${args.target!.trim()}`
-						: nonEmpty(args.alias) || nonEmpty(args.session?.path)
-							? `persistent new ${args.model || "current model"}`
-							: `stateless ${args.model || "current model"}`;
-			const windowText = controlMessage
-				? ""
+						? `continue · ${args.target!.trim()}`
+						: alias || nonEmpty(args.session?.path)
+							? `${args.session?.path ? `adopt ${args.session.mode}` : "new"} · ${persistentIdentity}${persistentModel}`
+							: `stateless · ${args.model || "current model"}`;
+			const budgetValues = controlMessage
+				? []
 				: args.chain?.length
-					? ` · contextWindow [${args.chain.map((item) => formatContextWindowForDisplay(item.contextWindow)).join(", ")}]`
+					? args.chain.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow))
 					: args.tasks?.length
-						? ` · contextWindow [${args.tasks.map((item) => formatContextWindowForDisplay(item.contextWindow)).join(", ")}]`
-						: ` · contextWindow ${formatContextWindowForDisplay(args.contextWindow)}`;
-			const fastModes = controlMessage ? undefined : fastModesForRender(args);
-			const fastText = !fastModes
+						? args.tasks.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow))
+						: args.contextWindow == null ? [] : [formatContextWindowForDisplay(args.contextWindow)];
+			const explicitBudgets = budgetValues.flatMap((value, index) => value === undefined ? [] : [{ index, value }]);
+			const budgetText = explicitBudgets.length === 0
 				? ""
-				: fastModes.length > 1
-					? `fast [${fastModes.join(", ")}]`
-					: `fast ${fastModes[0]}`;
-			const task = controlMessage ?? args.task ?? args.tasks?.[0]?.task ?? args.chain?.[0]?.task ?? "";
-			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}${theme.fg("dim", `${windowText}${fastText ? ` · ${fastText}` : ""}`)}\n${theme.fg("dim", task.slice(0, 100))}`, 0, 0);
+				: budgetValues.length > 1
+					? `budget ${explicitBudgets.map(({ index, value }) => `${index + 1}=${value}`).join(", ")}`
+					: `budget ${explicitBudgets[0]!.value}`;
+			const grouped = Boolean(args.chain?.length || args.tasks?.length);
+			const fastModes = controlMessage || grouped ? undefined : fastModesForRender(args);
+			const metadata = [budgetText, fastModes?.some((value) => value === "on") ? "FAST" : ""]
+				.filter(Boolean)
+				.join(" · ");
+			return new SingleLineText(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}${metadata ? theme.fg("dim", ` · ${metadata}`) : ""}`);
 		},
 
 		renderResult(result, { expanded, isPartial }, theme, context) {
@@ -780,10 +832,18 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const isControl = details.mode === "control" || Boolean(context?.args?.control?.message);
 			const contextWindows = isControl ? undefined : contextWindowsForRender(context?.args, details.results.length);
 			const fastModes = isControl ? undefined : fastModesForRender(context?.args);
+			const actualTasks = (context?.toolCallId ? actualTasksByCall.get(context.toolCallId) : undefined)
+				?? actualTasksByDetails.get(details);
+			const fallbackTasks = details.results.map((run) => run.transcript?.entries.some((entry) => entry.initial)
+				? undefined
+				: run.task);
 			return renderSubagentTranscript(details.results, expanded, theme, {
 				isPartial,
 				durationMs: details.durationMs,
-				initialTasks: initialTasksForRender(context?.args),
+				initialTasks: initialTasksForRender(context?.args, details.mode, details.results.length, actualTasks, fallbackTasks),
+				mode: details.mode,
+				...(isControl ? { control: true } : {}),
+				...(details.mode === "chain" ? { sequenceTotal: context?.args?.chain?.length ?? details.results.length } : {}),
 				...(contextWindows ? { contextWindows } : {}),
 				...(fastModes ? { fastModes } : {}),
 				markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),

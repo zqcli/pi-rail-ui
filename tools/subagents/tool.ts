@@ -123,6 +123,7 @@ export interface StatefulSubagentDetails {
 
 export interface StatefulSubagentToolOptions {
 	broker: SessionBroker | (() => SessionBroker);
+	readonly knownFastMode?: (target: string) => boolean | undefined;
 	runStateless?: StatelessAgentRunner;
 	getMarkdownTheme?: () => MarkdownTheme;
 }
@@ -370,25 +371,15 @@ function validateFastMode(
 	}
 }
 
-type FastModeDisplay = "on";
+type FastModeDisplay = "on" | "off";
 
-function fastModeForDisplay(item: Pick<TaskParams, "fastMode">): FastModeDisplay | undefined {
-	if (item.fastMode === true) return "on";
-	return undefined;
+interface DispatchDisplayMetadata {
+	contextWindowText: string;
+	fastModeText: FastModeDisplay;
 }
 
-function fastModesForRender(args: SubagentParamsValue | undefined): Array<FastModeDisplay | undefined> | undefined {
-	if (!args) return undefined;
-	if (args.chain?.length) {
-		const modes = args.chain.map(fastModeForDisplay);
-		return modes.some((mode) => mode !== undefined) ? modes : undefined;
-	}
-	if (args.tasks?.length) {
-		const modes = args.tasks.map(fastModeForDisplay);
-		return modes.some((mode) => mode !== undefined) ? modes : undefined;
-	}
-	const mode = fastModeForDisplay(args as TaskParams);
-	return mode ? [mode] : undefined;
+function fastModeForDisplay(item: Pick<TaskParams, "fastMode">): FastModeDisplay {
+	return item.fastMode === true ? "on" : "off";
 }
 
 function initialTasksForRender(
@@ -420,7 +411,7 @@ function initialTasksForRender(
 }
 
 function formatContextWindowForDisplay(value: number | null | undefined): string {
-	if (value === undefined || value === null) return "default";
+	if (value === undefined || value === null) return "Default";
 	if (!Number.isSafeInteger(value) || value <= 0) return String(value);
 	const thousands = Math.floor(value / 1000);
 	const remainder = value % 1000;
@@ -429,24 +420,68 @@ function formatContextWindowForDisplay(value: number | null | undefined): string
 	return `${thousands}.${fraction}K`;
 }
 
-function contextWindowsForRender(args: SubagentParamsValue | undefined, count: number): Array<string | undefined> {
-	if (args?.chain?.length) {
-		return args.chain.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow));
-	}
-	if (args?.tasks?.length) {
-		return args.tasks.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow));
-	}
-	if (args?.contextWindow != null) {
-		return [formatContextWindowForDisplay(args.contextWindow)];
-	}
-	return Array.from({ length: Math.max(1, count) }, () => undefined);
+function renderModeForArgs(args: SubagentParamsValue | undefined): "single" | "parallel" | "chain" | "control" {
+	if (args?.control?.message) return "control";
+	if (args?.chain?.length) return "chain";
+	if (args?.tasks?.length) return "parallel";
+	return "single";
+}
+
+function renderItemsForMode(
+	args: SubagentParamsValue | undefined,
+	mode: "single" | "parallel" | "chain" | "control",
+): TaskParams[] {
+	if (mode === "chain") return (args?.chain ?? []) as TaskParams[];
+	if (mode === "parallel") return (args?.tasks ?? []) as TaskParams[];
+	if (mode === "single" && args?.task !== undefined) return [{ ...args, task: args.task } as TaskParams];
+	return [];
+}
+
+function dispatchMetadataText(metadata: readonly DispatchDisplayMetadata[], grouped: boolean): string {
+	const firstContextWindow = metadata[0]?.contextWindowText ?? "Default";
+	const sameContextWindow = metadata.every((item) => item.contextWindowText === firstContextWindow);
+	const contextWindow = grouped && !sameContextWindow
+		? `ContextWindow ${metadata.map((item, index) => `${index + 1}=${item.contextWindowText}`).join(", ")}`
+		: `ContextWindow ${firstContextWindow}`;
+	const firstFastMode = metadata[0]?.fastModeText ?? "off";
+	const sameFastMode = metadata.every((item) => item.fastModeText === firstFastMode);
+	const fast = grouped && !sameFastMode
+		? metadata.map((item, index) => `${index + 1}=${item.fastModeText}`).join(", ")
+		: firstFastMode;
+	return `${contextWindow} · FAST ${fast}`;
+}
+
+function dispatchMetadataForRender(
+	args: SubagentParamsValue | undefined,
+	mode: "single" | "parallel" | "chain" | "control" | undefined,
+	count: number,
+	cached?: ReadonlyMap<number, DispatchDisplayMetadata>,
+	knownFastMode?: (target: string) => boolean | undefined,
+): DispatchDisplayMetadata[] {
+	const renderMode = mode ?? renderModeForArgs(args);
+	if (renderMode === "control") return [];
+	const items = renderItemsForMode(args, renderMode);
+	const total = Math.max(count, items.length, cached?.size ?? 0, 1);
+	return Array.from({ length: total }, (_, index) => {
+		const cachedMetadata = cached?.get(index);
+		if (cachedMetadata) return cachedMetadata;
+		const item = items[index];
+		const known = item?.target && knownFastMode ? knownFastMode(item.target) : undefined;
+		return {
+			contextWindowText: formatContextWindowForDisplay(item?.contextWindow),
+			fastModeText: item?.target
+				? known === true ? "on" : "off"
+				: renderMode === "parallel" || renderMode === "chain" ? "off" : fastModeForDisplay(item ?? {}),
+		};
+	});
 }
 
 class SingleLineText implements Component {
-	constructor(private readonly value: string) {}
+	constructor(private readonly value: string | (() => string)) {}
 
 	render(width: number): string[] {
-		return [truncateToWidth(this.value, Math.max(1, width), "", true)];
+		const value = typeof this.value === "function" ? this.value() : this.value;
+		return [truncateToWidth(value, Math.max(1, width), "", true)];
 	}
 
 	invalidate(): void {}
@@ -512,15 +547,23 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	const latestDetails = new Map<string, StatefulSubagentDetails>();
 	const actualTasksByCall = new Map<string, Map<number, string>>();
 	const actualTasksByDetails = new WeakMap<StatefulSubagentDetails, Map<number, string>>();
+	const dispatchMetadataByCall = new Map<string, Map<number, DispatchDisplayMetadata>>();
+	const dispatchMetadataByDetails = new WeakMap<StatefulSubagentDetails, Map<number, DispatchDisplayMetadata>>();
+	const callHeaderInvalidators = new Map<string, () => void>();
 	const eventApi = pi as Partial<Pick<ExtensionAPI, "on">>;
 	eventApi.on?.("tool_result", (event) => {
 		if (event.toolName !== "subagent") return;
 		const details = latestDetails.get(event.toolCallId);
 		latestDetails.delete(event.toolCallId);
 		actualTasksByCall.delete(event.toolCallId);
+		dispatchMetadataByCall.delete(event.toolCallId);
+		callHeaderInvalidators.delete(event.toolCallId);
 		if (event.isError && details) return { details };
 		return undefined;
 	});
+	const knownFastModeForRender = (target: string): boolean | undefined => {
+		return options.knownFastMode?.(target.trim());
+	};
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -573,9 +616,25 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			params = filterParamsForMode(params, mode);
 			const actualTasks = new Map<number, string>();
 			actualTasksByCall.set(toolCallId, actualTasks);
+			const dispatchMetadata = new Map<number, DispatchDisplayMetadata>();
+			dispatchMetadataByCall.set(toolCallId, dispatchMetadata);
 			const liveResults = new Map<number, StatefulSubagentRunDetails>();
 			const runStartedAt = new Map<number, number>();
 			const runDuration = (slot: number) => Math.max(0, Math.round(performance.now() - (runStartedAt.get(slot) ?? performance.now())));
+			const setDispatchMetadata = (item: TaskParams, slot: number, actualFastMode?: boolean) => {
+				const grouped = mode === "parallel" || mode === "chain";
+				const known = item.target && actualFastMode === undefined ? knownFastModeForRender(item.target) : undefined;
+				const metadata: DispatchDisplayMetadata = {
+					contextWindowText: formatContextWindowForDisplay(item.contextWindow),
+					fastModeText: actualFastMode !== undefined
+						? actualFastMode ? "on" : "off"
+						: item.target
+							? known === true ? "on" : "off"
+							: grouped ? "off" : fastModeForDisplay(item),
+				};
+				dispatchMetadata.set(slot, metadata);
+				callHeaderInvalidators.get(toolCallId)?.();
+			};
 			const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => {
 				const details: StatefulSubagentDetails = {
 					mode,
@@ -583,6 +642,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
 				};
 				actualTasksByDetails.set(details, actualTasks);
+				dispatchMetadataByDetails.set(details, dispatchMetadata);
 				return details;
 			};
 			if (mode === "control") {
@@ -642,6 +702,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const requestedItems: TaskParams[] = mode === "single"
 				? [{ ...params, task: params.task! } as TaskParams]
 				: (mode === "parallel" ? params.tasks! : params.chain!) as TaskParams[];
+			requestedItems.forEach((item, index) => setDispatchMetadata(item, index));
 			if (mode === "parallel" && requestedItems.length > MAX_PARALLEL_TASKS) {
 				throw new Error(`Too many parallel tasks (${requestedItems.length}); max is ${MAX_PARALLEL_TASKS}`);
 			}
@@ -725,24 +786,29 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
 					...(item.fastMode !== undefined && item.fastMode !== null ? { fastMode: item.fastMode } : {}),
 					...(signal ? { signal } : {}),
-					onUpdate: ({ instance, run: partial }) => publishLive(slot, {
-						agentId: instance.agentId,
-						alias: instance.alias,
-						model: railModelReference(instance.model),
-						sessionId: instance.sessionId,
-						task: item.task,
-						status: "running",
-						output: partial.output,
-						...(partial.transcript ? { transcript: partial.transcript } : {}),
-						...(partial.isCompacting ? { isCompacting: true } : {}),
-						usage: partial.usage,
-						durationMs: duration(),
-						...(step !== undefined ? { step } : {}),
-						persistent: true,
-					}),
+					onUpdate: ({ instance, run: partial }) => {
+						setDispatchMetadata(item, slot, instance.fastMode === true);
+						publishLive(slot, {
+							agentId: instance.agentId,
+							alias: instance.alias,
+							model: railModelReference(instance.model),
+							sessionId: instance.sessionId,
+							task: item.task,
+							status: "running",
+							output: partial.output,
+							...(partial.transcript ? { transcript: partial.transcript } : {}),
+							...(partial.isCompacting ? { isCompacting: true } : {}),
+							usage: partial.usage,
+							durationMs: duration(),
+							...(step !== undefined ? { step } : {}),
+							persistent: true,
+						});
+					},
 				};
 				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
-				const result = compactPersistentResult(await broker.dispatch(request), item.task, duration(), step);
+				const dispatched = await broker.dispatch(request);
+				setDispatchMetadata(item, slot, dispatched.instance.fastMode === true);
+				const result = compactPersistentResult(dispatched, item.task, duration(), step);
 				publishLive(slot, result);
 				return result;
 			};
@@ -785,13 +851,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			return { content: [{ type: "text", text: aggregateText(mode, results) }], details };
 		},
 
-		renderCall(args, theme) {
+		renderCall(args, theme, context) {
 			const controlMessage = nonEmpty(args.control?.message);
 			const alias = nonEmpty(args.alias);
 			const model = nonEmpty(args.model);
 			const persistentIdentity = alias ?? model ?? "current model";
 			const persistentModel = alias && model ? ` · ${model}` : "";
-			const mode = controlMessage
+			const modeText = controlMessage
 				? `${args.control!.delivery === "followUp" ? "follow-up" : "steer"} · ${nonEmpty(args.target) ?? "target required"}`
 				: args.chain?.length
 				? `chain · ${args.chain.length}`
@@ -802,38 +868,46 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						: alias || nonEmpty(args.session?.path)
 							? `${args.session?.path ? `adopt ${args.session.mode}` : "new"} · ${persistentIdentity}${persistentModel}`
 							: `stateless · ${args.model || "current model"}`;
-			const budgetValues = controlMessage
-				? []
-				: args.chain?.length
-					? args.chain.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow))
-					: args.tasks?.length
-						? args.tasks.map((item) => item.contextWindow == null ? undefined : formatContextWindowForDisplay(item.contextWindow))
-						: args.contextWindow == null ? [] : [formatContextWindowForDisplay(args.contextWindow)];
-			const explicitBudgets = budgetValues.flatMap((value, index) => value === undefined ? [] : [{ index, value }]);
-			const budgetText = explicitBudgets.length === 0
-				? ""
-				: budgetValues.length > 1
-					? `budget ${explicitBudgets.map(({ index, value }) => `${index + 1}=${value}`).join(", ")}`
-					: `budget ${explicitBudgets[0]!.value}`;
-			const grouped = Boolean(args.chain?.length || args.tasks?.length);
-			const fastModes = controlMessage || grouped ? undefined : fastModesForRender(args);
-			const metadata = [budgetText, fastModes?.some((value) => value === "on") ? "FAST" : ""]
-				.filter(Boolean)
-				.join(" · ");
-			return new SingleLineText(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", mode)}${metadata ? theme.fg("dim", ` · ${metadata}`) : ""}`);
+			const renderMode = renderModeForArgs(args);
+			const grouped = renderMode === "parallel" || renderMode === "chain";
+			if (context?.toolCallId) {
+				if (context.isPartial && context.executionStarted) callHeaderInvalidators.set(context.toolCallId, context.invalidate);
+				else callHeaderInvalidators.delete(context.toolCallId);
+			}
+			return new SingleLineText(() => {
+				const dispatchMetadata = controlMessage
+					? []
+					: dispatchMetadataForRender(
+						args,
+						renderMode,
+						grouped ? Math.max(args.tasks?.length ?? 0, args.chain?.length ?? 0) : 1,
+						context?.toolCallId ? dispatchMetadataByCall.get(context.toolCallId) : undefined,
+						knownFastModeForRender,
+					);
+				const metadata = dispatchMetadata.length > 0
+					? theme.fg("dim", ` · ${dispatchMetadataText(dispatchMetadata, grouped)}`)
+					: "";
+				return `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", modeText)}${metadata}`;
+			});
 		},
 
 		renderResult(result, { expanded, isPartial }, theme, context) {
+			if (context?.toolCallId && !isPartial) callHeaderInvalidators.delete(context.toolCallId);
 			const details = result.details as StatefulSubagentDetails | undefined;
 			if (!details?.results.length) {
 				const content = result.content[0];
 				return new Text(content?.type === "text" ? content.text : "(no output)", 0, 0);
 			}
 			const isControl = details.mode === "control" || Boolean(context?.args?.control?.message);
-			const contextWindows = isControl ? undefined : contextWindowsForRender(context?.args, details.results.length);
-			const fastModes = isControl ? undefined : fastModesForRender(context?.args);
 			const actualTasks = (context?.toolCallId ? actualTasksByCall.get(context.toolCallId) : undefined)
 				?? actualTasksByDetails.get(details);
+			const dispatchMetadata = isControl ? [] : dispatchMetadataForRender(
+				context?.args,
+				details.mode,
+				details.results.length,
+				(context?.toolCallId ? dispatchMetadataByCall.get(context.toolCallId) : undefined) ?? dispatchMetadataByDetails.get(details),
+				knownFastModeForRender,
+			);
 			const fallbackTasks = details.results.map((run) => run.transcript?.entries.some((entry) => entry.initial)
 				? undefined
 				: run.task);
@@ -844,8 +918,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				mode: details.mode,
 				...(isControl ? { control: true } : {}),
 				...(details.mode === "chain" ? { sequenceTotal: context?.args?.chain?.length ?? details.results.length } : {}),
-				...(contextWindows ? { contextWindows } : {}),
-				...(fastModes ? { fastModes } : {}),
+				...(dispatchMetadata.length > 0 ? {
+					contextWindows: dispatchMetadata.map((item) => item.contextWindowText),
+					fastModes: dispatchMetadata.map((item) => item.fastModeText),
+				} : {}),
 				markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),
 			});
 		},

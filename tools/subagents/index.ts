@@ -102,6 +102,7 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 
 	installStatefulSubagentTool(pi, {
 		broker: () => getRuntime().broker,
+		knownFastMode: (target) => runtime?.broker.knownFastMode(target),
 		runStateless: createStatelessAgentRunner(),
 		getMarkdownTheme,
 	});
@@ -148,7 +149,11 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (runtime) await runtime.broker.shutdown();
+		if (runtime) {
+			const previous = runtime;
+			runtime = undefined;
+			await previous.broker.shutdown();
+		}
 		const store = new FileAgentInstanceStore(stateDir);
 		const roster = new SessionAgentRoster((customType, data) => pi.appendEntry(customType, data));
 		roster.restore(ctx.sessionManager.getBranch());
@@ -164,6 +169,7 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 			),
 			aliasLeaseManager: new FileSessionLeaseManager(stateDir),
 		});
+		await broker.prewarmFastModes();
 		const manager = new RailAgentManager(broker, store, roster, stateDir);
 		runtime = { ctx, broker, roster, store, manager };
 		if (ctx.mode === "tui") installAutocomplete(ctx);
@@ -173,6 +179,7 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		if (!runtime) return;
 		runtime.ctx = ctx;
 		runtime.roster.restore(ctx.sessionManager.getBranch());
+		await runtime.broker.prewarmFastModes();
 	});
 
 	pi.on("input", async (event, ctx) => {

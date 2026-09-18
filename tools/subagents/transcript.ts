@@ -55,7 +55,7 @@ export interface SubagentTranscriptRun {
 	step?: number;
 	outputTruncated?: boolean;
 	contextWindowText?: string;
-	fastModeText?: "on";
+	fastModeText?: "on" | "off";
 }
 
 export interface SubagentTranscriptRenderOptions {
@@ -63,7 +63,7 @@ export interface SubagentTranscriptRenderOptions {
 	durationMs?: number;
 	initialTasks?: readonly (string | undefined)[];
 	contextWindows?: readonly (string | undefined)[] | undefined;
-	fastModes?: readonly ("on" | undefined)[] | undefined;
+	fastModes?: readonly ("on" | "off" | undefined)[] | undefined;
 	mode?: "single" | "parallel" | "chain" | "control";
 	sequenceTotal?: number;
 	control?: boolean;
@@ -777,7 +777,7 @@ function runsWithContextWindows(
 
 function runsWithFastModes(
 	runs: SubagentTranscriptRun[],
-	fastModes: readonly ("on" | undefined)[] | undefined,
+	fastModes: readonly ("on" | "off" | undefined)[] | undefined,
 ): SubagentTranscriptRun[] {
 	if (!fastModes) return runs;
 	return runs.map((run, runIndex) => {
@@ -792,8 +792,8 @@ function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control",
 	const step = run.step !== undefined
 		? `${sequenceTotal !== undefined ? `${run.step}/${sequenceTotal}` : `step ${run.step}`} · `
 		: "";
-	const contextWindow = run.contextWindowText ? ` · budget ${run.contextWindowText}` : "";
-	const fast = run.fastModeText === undefined ? "" : " · FAST";
+	const contextWindow = ` · ContextWindow ${run.contextWindowText ?? "Default"}`;
+	const fast = ` · FAST ${run.fastModeText ?? "off"}`;
 	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}`;
 }
 
@@ -1007,7 +1007,14 @@ export function renderSubagentTranscript(
 		const sequenceTotal = options.sequenceTotal ?? (options.mode === "chain"
 			? boundedRuns.length
 			: boundedRuns.some((run) => run.step !== undefined) ? boundedRuns.length : undefined);
-		return new MultiSubagentPanelView(boundedRuns, expanded, options.durationMs, theme, options.markdownTheme, sequenceTotal);
+		return new MultiSubagentPanelView(
+			boundedRuns,
+			expanded,
+			options.durationMs,
+			theme,
+			options.markdownTheme,
+			sequenceTotal,
+		);
 	}
 	const only = boundedRuns[0];
 	if (only && (only.status !== "running" || options.mode === "control" || options.control)) {

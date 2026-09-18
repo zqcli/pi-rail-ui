@@ -698,7 +698,7 @@ test("single panels keep the initial task while separating runtime and usage lin
 	assert.match(text, /697\.7k in · 3\.4k out · 646\.1k cached/);
 	assert.match(text, /INITIAL SINGLE TASK/);
 	assert.match(text, /INITIAL SINGLE TASK END/);
-	assert.doesNotMatch(text, /Usage|budget 64K|FAST|implement-luna ·/);
+	assert.doesNotMatch(text, /Usage|ContextWindow 64K|FAST|implement-luna ·/);
 	for (const width of [40, 80, 120]) {
 		assert.ok(renderSubagentTranscript([run], false, theme as any, { contextWindows: ["64K"], fastModes: ["on"] }).render(width).every((line) => visibleWidth(line) <= width));
 	}
@@ -722,7 +722,7 @@ test("completed and failed single panels share runtime hierarchy and hide normal
 	}).render(120).join("\n");
 	assert.match(completed, /Completed · provider\/gpt-review · ctx 1\.5k · 2 turns · <1m/);
 	assert.match(completed, /1k in · 200 out · 500 cached/);
-	assert.doesNotMatch(completed, /· stop|Usage|budget 64K|FAST/);
+	assert.doesNotMatch(completed, /· stop|Usage|ContextWindow 64K|FAST/);
 	assert.match(completed, /completed initial task/);
 
 	const failed = renderSubagentTranscript([{ ...base, status: "failed", output: "provider failed", errorMessage: "provider failed", stopReason: "error" }], false, theme as any, {
@@ -730,7 +730,7 @@ test("completed and failed single panels share runtime hierarchy and hide normal
 	}).render(120).join("\n");
 	assert.match(failed, /Failed · provider\/gpt-review · ctx 1\.5k · 2 turns · <1m · error/);
 	assert.match(failed, /provider failed/);
-	assert.doesNotMatch(failed, /Usage|budget 64K|FAST/);
+	assert.doesNotMatch(failed, /Usage|ContextWindow 64K|FAST/);
 });
 
 test("failed panels retain a distinct error message beside partial output without duplication", () => {
@@ -757,7 +757,7 @@ test("failed panels retain a distinct error message beside partial output withou
 	assert.equal((errorOnly.match(/error only/gu) ?? []).length, 1);
 });
 
-test("grouped panels retain child identity, explicit policy, and chain sequence without defaults", () => {
+test("grouped panels retain child identity, explicit dispatch policy, and chain sequence", () => {
 	const firstTask = "GROUP FIRST INITIAL TASK";
 	const secondTask = "GROUP SECOND INITIAL TASK";
 	const first = new SubagentTranscript(firstTask);
@@ -776,10 +776,11 @@ test("grouped panels retain child identity, explicit policy, and chain sequence 
 	assert.match(text, /2 model sessions · 1 complete · 0 running · 1 failed/);
 	assert.match(text, /3k in · 400 out · 600 cached · \$0\.100 · wall <1m/);
 	assert.match(text, /1\/2 · planner · one-off · provider\/gpt-plan/);
-	assert.match(text, /2\/2 · reviewer · persistent · provider\/gpt-review · budget 64K · FAST/);
+	assert.match(text, /2\/2 · reviewer · persistent · provider\/gpt-review · ContextWindow 64K · FAST on/);
 	assert.match(text, /GROUP FIRST INITIAL TASK/);
 	assert.match(text, /GROUP SECOND INITIAL TASK/);
-	assert.doesNotMatch(text, /budget default|fast off|agent default|Usage ·/);
+	assert.doesNotMatch(text.slice(0, text.indexOf("╭")), /ContextWindow|FAST/);
+	assert.doesNotMatch(text, /budget default|agent default|Usage ·/);
 	const firstPanelStart = text.indexOf("╭");
 	const firstPanelEnd = text.indexOf("╰", firstPanelStart);
 	assert.ok(firstPanelStart >= 0 && firstPanelEnd > firstPanelStart);

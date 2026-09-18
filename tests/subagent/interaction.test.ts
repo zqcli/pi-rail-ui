@@ -204,8 +204,6 @@ test("autocomplete reads the agent store and enumerates models only inside a Rai
 		} as any);
 		const instancesDir = join(dir, "stateful-subagents", "instances");
 		await mkdir(join(dir, "stateful-subagents"), { recursive: true });
-		// A file where the instances directory is expected makes any agent store read fail.
-		await writeFile(instancesDir, "not a directory");
 		const linkEntry = {
 			type: "custom", id: "link-1", parentId: null, timestamp: "",
 			customType: "rail-subagent-link",
@@ -229,6 +227,9 @@ test("autocomplete reads the agent store and enumerates models only inside a Rai
 		};
 		await sessionStart!({} as any, ctx as any);
 		assert.ok(providerFactory, "tui mode must register the autocomplete provider");
+		// After session_start's restore prewarm, a later file-store failure still surfaces
+		// through the autocomplete path instead of being swallowed.
+		await writeFile(instancesDir, "not a directory");
 
 		const delegated = {
 			calls: 0,
@@ -264,6 +265,88 @@ test("autocomplete reads the agent store and enumerates models only inside a Rai
 		assert.equal(modelEnumerations, 1);
 		assert.equal(provider.shouldTriggerFileCompletion(["Ask @agent/auth now"], 0, 15), false);
 		assert.equal(delegated.fileChecks, 1);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+		if (previousDepth === undefined) delete process.env["PI_SUBAGENT_DEPTH"];
+		else process.env["PI_SUBAGENT_DEPTH"] = previousDepth;
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("session restore prewarms saved Fast policy before the Tool Call renderer reads it", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-restore-fast-"));
+	const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+	const previousDepth = process.env["PI_SUBAGENT_DEPTH"];
+	process.env["PI_CODING_AGENT_DIR"] = dir;
+	process.env["PI_SUBAGENT_DEPTH"] = "0";
+	let tool: any;
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+	let branch: unknown[] = [];
+	try {
+		installRailSubagent({
+			registerTool: (definition: unknown) => { tool = definition; },
+			registerCommand: () => undefined,
+			appendEntry: () => undefined,
+			on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(event, handler); },
+		} as any);
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		assert.doesNotThrow(() => {
+			const beforeRuntime = tool.renderCall({ target: "restore-review", task: "continue" }, theme).render(120).join("\n");
+			assert.match(beforeRuntime, /ContextWindow Default · FAST off/);
+		});
+		const instancesDir = join(dir, "stateful-subagents", "instances");
+		await mkdir(instancesDir, { recursive: true });
+		await writeFile(join(instancesDir, "agt_restore.json"), JSON.stringify({
+			version: 2,
+			agentId: "agt_restore",
+			alias: "restore-review",
+			model: { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" },
+			sessionId: "session-restore",
+			sessionFile: "/tmp/restore-review.jsonl",
+			cwd: "/tmp/project",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-02T00:00:00.000Z",
+			lastTask: "restore",
+			fastMode: true,
+		}));
+		const linkEntry = {
+			type: "custom", id: "restore-link", parentId: null, timestamp: "",
+			customType: "rail-subagent-link",
+			data: { action: "link", alias: "restore-review", agentId: "agt_restore" },
+		};
+		const ctx = {
+			mode: "print", cwd: "/tmp/project", hasUI: false,
+			model: { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" },
+			thinkingLevel: "xhigh", scopedModels: [], modelRegistry: { getAvailable: () => [], find: () => undefined },
+			sessionManager: {
+				getBranch: () => branch,
+				getSessionName: () => "root",
+				getSessionId: () => "parent-session",
+			},
+		};
+		branch = [linkEntry];
+		await handlers.get("session_start")!({}, ctx);
+		const restored = tool.renderCall({ target: "restore-review", task: "continue" }, theme).render(120).join("\n");
+		assert.match(restored, /ContextWindow Default · FAST on/);
+
+		await writeFile(join(instancesDir, "agt_tree.json"), JSON.stringify({
+			version: 2,
+			agentId: "agt_tree",
+			alias: "tree-review",
+			model: { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" },
+			sessionId: "session-tree",
+			sessionFile: "/tmp/tree-review.jsonl",
+			cwd: "/tmp/project",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-02T00:00:00.000Z",
+			lastTask: "tree",
+			fastMode: true,
+		}));
+		branch = [{ ...linkEntry, id: "tree-link", data: { action: "link", alias: "tree-review", agentId: "agt_tree" } }];
+		await handlers.get("session_tree")!({}, ctx);
+		const treeRestored = tool.renderCall({ target: "tree-review", task: "continue" }, theme).render(120).join("\n");
+		assert.match(treeRestored, /ContextWindow Default · FAST on/);
 	} finally {
 		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
 		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;

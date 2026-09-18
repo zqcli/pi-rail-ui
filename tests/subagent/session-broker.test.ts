@@ -23,10 +23,17 @@ import type { RailModelRef } from "../../tools/subagents/models";
 class MemoryInstanceStore implements AgentInstanceStore {
 	readonly instances = new Map<string, AgentInstance>();
 	getDelayMs = 0;
+	readonly getBlockers: Promise<void>[] = [];
+	readonly listBlockers: Promise<void>[] = [];
+	getStarted?: (agentId: string) => void;
+	listStarted?: () => void;
 
 	async get(agentId: string): Promise<AgentInstance | undefined> {
+		const value = this.instances.get(agentId);
+		this.getStarted?.(agentId);
 		if (this.getDelayMs) await new Promise((resolve) => setTimeout(resolve, this.getDelayMs));
-		return this.instances.get(agentId);
+		await this.getBlockers.shift();
+		return value === undefined ? undefined : structuredClone(value);
 	}
 
 	async put(instance: AgentInstance): Promise<void> {
@@ -38,7 +45,10 @@ class MemoryInstanceStore implements AgentInstanceStore {
 	}
 
 	async list(): Promise<AgentInstance[]> {
-		return Array.from(this.instances.values());
+		const values = Array.from(this.instances.values()).map((instance) => structuredClone(instance));
+		this.listStarted?.();
+		await this.listBlockers.shift();
+		return values;
 	}
 }
 
@@ -130,6 +140,22 @@ function emptyUsage() {
 
 function reviewerModel(): RailModelRef {
 	return { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" };
+}
+
+function savedAgent(agentId: string, alias: string, fastMode = true): AgentInstance {
+	return {
+		version: 2,
+		agentId,
+		alias,
+		model: reviewerModel(),
+		sessionId: `session-${agentId}`,
+		sessionFile: `/tmp/${agentId}.jsonl`,
+		cwd: "/tmp/project",
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		lastTask: "saved",
+		fastMode,
+	};
 }
 
 function setup() {
@@ -259,15 +285,19 @@ describe("SessionBroker", () => {
 				createdAt: "2026-01-01T00:00:00.000Z",
 				updatedAt: "2026-01-01T00:00:00.000Z",
 				lastTask: "review",
+				fastMode: true,
 			};
 			await store.put(saved);
 			roster.link(saved.alias, saved.agentId);
 			const broker = new SessionBroker({ store, roster, workerFactory: async () => new FakeWorker(saved.sessionId, sessionFile) });
+			await broker.listLinked();
+			assert.equal(broker.knownFastMode(saved.alias), true);
 
 			await broker.delete(saved.agentId);
 
 			assert.equal(await store.get(saved.agentId), undefined);
 			assert.equal(roster.resolve(saved.alias), undefined);
+			assert.equal(broker.knownFastMode(saved.agentId), undefined);
 			await assert.rejects(() => access(sessionFile));
 		} finally {
 			await rm(dir, { recursive: true, force: true });
@@ -393,16 +423,70 @@ describe("SessionBroker", () => {
 		const first = await broker.dispatch({ model: reviewerModel(), alias: "fast-review", task: "review quickly", fastMode: true });
 
 		assert.equal(first.instance.fastMode, true);
+		assert.equal(broker.knownFastMode("fast-review"), true);
 		assert.equal(starts[0]?.fastMode, true);
 		assert.equal((await store.get(first.instance.agentId))?.fastMode, true);
 
 		await broker.shutdown();
 		const restarted = new SessionBroker({ store, roster, workerFactory, parentSessionLabel: "Main Auth Work" });
+		assert.equal(restarted.knownFastMode("fast-review"), undefined);
+		await restarted.listLinked();
+		assert.equal(restarted.knownFastMode("fast-review"), true);
 		await restarted.dispatch({ target: "fast-review", task: "continue quickly" });
 		assert.equal(starts.at(-1)?.mode, "open");
 		assert.equal(starts.at(-1)?.fastMode, true);
 		await restarted.shutdown();
 	});
+
+	test("prewarms saved Fast policy for unlinked descriptors", async () => {
+		const { broker, store } = setup();
+		const saved = savedAgent("agt_unlinked", "unlinked-review");
+		await store.put(saved);
+
+		assert.equal(broker.knownFastMode(saved.agentId), undefined);
+		await broker.prewarmFastModes();
+		assert.equal(broker.knownFastMode(saved.agentId), true);
+		assert.equal(broker.knownFastMode(saved.alias), undefined);
+	});
+
+	for (const readKind of ["listLinked", "prewarm"] as const) {
+		for (const mutation of ["setFastMode", "delete"] as const) {
+			test(`${readKind} ignores an old read after ${mutation}`, async () => {
+				const store = new MemoryInstanceStore();
+				const roster = new MemoryRoster();
+				const saved = savedAgent(`agt_${readKind}_${mutation}`, `${readKind}-${mutation}`);
+				await store.put(saved);
+				roster.link(saved.alias, saved.agentId);
+				const broker = new SessionBroker({ store, roster, workerFactory: async () => new FakeWorker(saved.sessionId, saved.sessionFile) });
+				await broker.prewarmFastModes();
+				assert.equal(broker.knownFastMode(saved.agentId), true);
+
+				const started = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				if (readKind === "listLinked") {
+					store.getStarted = () => started.resolve();
+					store.getBlockers.push(release.promise);
+				} else {
+					store.listStarted = () => started.resolve();
+					store.listBlockers.push(release.promise);
+				}
+				const oldRead = readKind === "listLinked" ? broker.listLinked() : broker.prewarmFastModes();
+				await started.promise;
+
+				if (mutation === "setFastMode") {
+					await broker.setFastMode(saved.agentId, false, { sessionLeaseHeld: true });
+					assert.equal(broker.knownFastMode(saved.agentId), false);
+				} else {
+					await broker.delete(saved.agentId);
+					assert.equal(broker.knownFastMode(saved.agentId), undefined);
+				}
+				release.resolve();
+				await oldRead;
+
+				assert.equal(broker.knownFastMode(saved.agentId), mutation === "setFastMode" ? false : undefined);
+			});
+		}
+	}
 
 	test("setFastMode updates an idle or stopped agent and reopens it with the saved policy", async () => {
 		const { broker, store, workers, starts } = setup();
@@ -418,6 +502,7 @@ describe("SessionBroker", () => {
 
 		const enabled = await broker.setFastMode(created.instance.agentId, true);
 		assert.equal(enabled.fastMode, true);
+		assert.equal(broker.knownFastMode(created.instance.agentId), true);
 		assert.equal(workerStoppedAtPolicyWrite, false, "the local worker lease must still be held while the descriptor changes");
 		assert.equal((await store.get(created.instance.agentId))?.fastMode, true);
 		assert.equal(workers[0]?.stopped, true);
@@ -431,6 +516,7 @@ describe("SessionBroker", () => {
 		);
 		const disabled = await broker.setFastMode(created.instance.agentId, false, { sessionLeaseHeld: true });
 		assert.equal(disabled.fastMode, false);
+		assert.equal(broker.knownFastMode(created.instance.agentId), false);
 		assert.equal((await store.get(created.instance.agentId))?.fastMode, false);
 	});
 

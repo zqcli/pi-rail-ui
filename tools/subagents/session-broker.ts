@@ -251,6 +251,8 @@ export class SessionBroker {
 	private readonly deletingAgents = new Set<string>();
 	private readonly modelChanges = new Map<string, Promise<AgentInstance>>();
 	private readonly fastModeChanges = new Map<string, Promise<AgentInstance>>();
+	private readonly fastModeSnapshots = new Map<string, boolean>();
+	private readonly fastModeSnapshotEpochs = new Map<string, number>();
 
 	constructor(options: SessionBrokerOptions) {
 		this.store = options.store;
@@ -336,6 +338,7 @@ export class SessionBroker {
 					lastOutput: compactMetadata(run.output, 16 * 1024),
 				};
 				await this.store.put(persisted);
+				this.commitInstanceSnapshot(persisted);
 				currentState.instance = persisted;
 				this.runtimeErrors.delete(resolvedInstance.agentId);
 				return { instance: { ...persisted, alias: resolvedInstance.alias }, run };
@@ -434,10 +437,37 @@ export class SessionBroker {
 
 	async listLinked(): Promise<AgentInstance[]> {
 		const values = await Promise.all(this.roster.list().map(async (link) => {
+			const snapshotEpoch = this.fastModeSnapshotEpoch(link.agentId);
 			const instance = await this.store.get(link.agentId);
-			return instance ? { ...instance, alias: link.alias, fastMode: instance.fastMode === true } as AgentInstance : undefined;
+			if (!instance) {
+				this.forgetInstanceAtEpoch(link.agentId, snapshotEpoch);
+				return undefined;
+			}
+			const normalized = { ...instance, fastMode: instance.fastMode === true } as AgentInstance;
+			this.rememberInstanceAtEpoch(normalized, snapshotEpoch);
+			return { ...normalized, alias: link.alias };
 		}));
 		return values.filter((value): value is AgentInstance => value !== undefined);
+	}
+
+	async prewarmFastModes(): Promise<void> {
+		const epochsAtStart = new Map(this.fastModeSnapshotEpochs);
+		const snapshotAgentIds = new Set(this.fastModeSnapshots.keys());
+		const instances = await this.store.list();
+		const listedAgentIds = new Set<string>();
+		for (const instance of instances) {
+			listedAgentIds.add(instance.agentId);
+			const normalized = { ...instance, fastMode: instance.fastMode === true } as AgentInstance;
+			this.rememberInstanceAtEpoch(normalized, epochsAtStart.get(instance.agentId) ?? 0);
+		}
+		for (const agentId of snapshotAgentIds) {
+			if (!listedAgentIds.has(agentId)) this.forgetInstanceAtEpoch(agentId, epochsAtStart.get(agentId) ?? 0);
+		}
+	}
+
+	knownFastMode(target: string): boolean | undefined {
+		const agentId = this.roster.resolve(target) ?? target;
+		return this.fastModeSnapshots.get(agentId);
 	}
 
 	runtimeStatus(agentId: string): AgentRuntimeStatus {
@@ -511,6 +541,7 @@ export class SessionBroker {
 				const latest = await this.store.get(agentId) ?? instance;
 				const updated = { ...latest, fastMode: enabled, updatedAt: new Date().toISOString() };
 				await this.store.put(updated);
+				this.commitInstanceSnapshot(updated);
 				if (state) await this.stopWorker(agentId);
 				this.emitRuntimeChange();
 				return updated;
@@ -541,6 +572,7 @@ export class SessionBroker {
 				if (!state) {
 					const updated = { ...latest, model: structuredClone(model), updatedAt: new Date().toISOString() };
 					await this.store.put(updated);
+					this.commitInstanceSnapshot(updated);
 					return updated;
 				}
 				if (!state.worker.setModel) throw new Error("Subagent worker does not support model changes");
@@ -548,6 +580,7 @@ export class SessionBroker {
 					const effective = await state.worker.setModel(model);
 					const updated = { ...latest, model: structuredClone(effective), updatedAt: new Date().toISOString() };
 					await this.store.put(updated);
+					this.commitInstanceSnapshot(updated);
 					return updated;
 				} catch (error) {
 					try {
@@ -617,6 +650,7 @@ export class SessionBroker {
 			await this.stopWorker(instance.agentId);
 			await rm(instance.sessionFile, { force: true });
 			await this.store.delete(instance.agentId);
+			this.commitDeletedSnapshot(instance.agentId);
 			for (const link of this.roster.list().filter((item) => item.agentId === instance.agentId)) this.roster.unlink(link.alias);
 			this.runtimeErrors.delete(instance.agentId);
 			this.emitRuntimeChange();
@@ -672,8 +706,14 @@ export class SessionBroker {
 				fastMode: request.fastMode === true,
 			};
 			await this.store.put(instance);
+			this.commitInstanceSnapshot(instance);
 			if (this.shuttingDown) {
-				await this.store.delete(agentId).catch(() => undefined);
+				try {
+					await this.store.delete(agentId);
+					this.commitDeletedSnapshot(agentId);
+				} catch {
+					// Preserve the descriptor snapshot when cleanup could not be persisted.
+				}
 				throw new Error("Subagent broker is shutting down");
 			}
 			this.roster.link(alias, agentId);
@@ -692,9 +732,14 @@ export class SessionBroker {
 	private async resolveInstance(target: string): Promise<AgentInstance> {
 		const linkedAgentId = this.roster.resolve(target);
 		const agentId = linkedAgentId ?? target;
+		const snapshotEpoch = this.fastModeSnapshotEpoch(agentId);
 		const instance = await this.store.get(agentId);
-		if (!instance) throw new Error(`Unknown persistent subagent: ${target}`);
+		if (!instance) {
+			this.forgetInstanceAtEpoch(agentId, snapshotEpoch);
+			throw new Error(`Unknown persistent subagent: ${target}`);
+		}
 		const normalized: AgentInstance = { ...instance, fastMode: instance.fastMode === true };
+		this.rememberInstanceAtEpoch(normalized, snapshotEpoch);
 		return linkedAgentId && target !== agentId ? { ...normalized, alias: target } : normalized;
 	}
 
@@ -714,7 +759,11 @@ export class SessionBroker {
 		if (starting) return starting;
 		const start = (async () => {
 			const sessionName = instance.sessionName ?? buildSubagentSessionName(this.parentSessionLabel, instance.alias);
-			if (!instance.sessionName) await this.store.put({ ...instance, sessionName });
+			if (!instance.sessionName) {
+				const updated = { ...instance, sessionName };
+				await this.store.put(updated);
+				this.commitInstanceSnapshot(updated);
+			}
 			const worker = await this.workerFactory({
 				agentId: instance.agentId,
 				mode: "open",
@@ -742,6 +791,38 @@ export class SessionBroker {
 			this.workerStarts.delete(instance.agentId);
 			this.emitRuntimeChange();
 		}
+	}
+
+	private fastModeSnapshotEpoch(agentId: string): number {
+		return this.fastModeSnapshotEpochs.get(agentId) ?? 0;
+	}
+
+	private bumpFastModeSnapshotEpoch(agentId: string): number {
+		const next = this.fastModeSnapshotEpoch(agentId) + 1;
+		this.fastModeSnapshotEpochs.set(agentId, next);
+		return next;
+	}
+
+	private commitInstanceSnapshot(instance: AgentInstance): void {
+		this.bumpFastModeSnapshotEpoch(instance.agentId);
+		this.fastModeSnapshots.set(instance.agentId, instance.fastMode === true);
+	}
+
+	private commitDeletedSnapshot(agentId: string): void {
+		this.bumpFastModeSnapshotEpoch(agentId);
+		this.fastModeSnapshots.delete(agentId);
+	}
+
+	private rememberInstanceAtEpoch(instance: AgentInstance, epoch: number): boolean {
+		if (this.fastModeSnapshotEpoch(instance.agentId) !== epoch) return false;
+		this.fastModeSnapshots.set(instance.agentId, instance.fastMode === true);
+		return true;
+	}
+
+	private forgetInstanceAtEpoch(agentId: string, epoch: number): boolean {
+		if (this.fastModeSnapshotEpoch(agentId) !== epoch) return false;
+		this.fastModeSnapshots.delete(agentId);
+		return true;
 	}
 
 	private async enqueue<T>(state: WorkerState, operation: () => Promise<T>, kind: "run" | "maintenance" = "maintenance"): Promise<T> {
@@ -808,7 +889,12 @@ export class SessionBroker {
 	private async cleanupCreatedInstance(agent: AgentInstance, removeSessionFile: boolean): Promise<void> {
 		await this.stopWorker(agent.agentId).catch(() => undefined);
 		for (const link of this.roster.list().filter((item) => item.agentId === agent.agentId)) this.roster.unlink(link.alias);
-		await this.store.delete(agent.agentId).catch(() => undefined);
+		try {
+			await this.store.delete(agent.agentId);
+			this.commitDeletedSnapshot(agent.agentId);
+		} catch {
+			// Keep the snapshot when descriptor cleanup did not succeed.
+		}
 		if (removeSessionFile) await rm(agent.sessionFile, { force: true }).catch(() => undefined);
 	}
 

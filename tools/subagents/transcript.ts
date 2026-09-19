@@ -772,39 +772,22 @@ function statusText(run: SubagentTranscriptRun): string {
 	return "Completed";
 }
 
-function runsWithContextWindows(
+function runsWithDispatchMetadata(
 	runs: SubagentTranscriptRun[],
-	contextWindows: readonly (string | undefined)[] | undefined,
+	{ contextWindows, fastModes, searchModes }: SubagentTranscriptRenderOptions,
 ): SubagentTranscriptRun[] {
-	if (!contextWindows) return runs;
+	if (!contextWindows && !fastModes && !searchModes) return runs;
 	return runs.map((run, runIndex) => {
-		const targetSlot = run.slot ?? runIndex;
-		const contextWindowText = contextWindows[targetSlot];
-		return contextWindowText === undefined ? run : { ...run, contextWindowText };
-	});
-}
-
-function runsWithFastModes(
-	runs: SubagentTranscriptRun[],
-	fastModes: readonly ("on" | "off" | undefined)[] | undefined,
-): SubagentTranscriptRun[] {
-	if (!fastModes) return runs;
-	return runs.map((run, runIndex) => {
-		const targetSlot = run.slot ?? runIndex;
-		const fastModeText = fastModes[targetSlot];
-		return fastModeText === undefined ? run : { ...run, fastModeText };
-	});
-}
-
-function runsWithSearchModes(
-	runs: SubagentTranscriptRun[],
-	searchModes: readonly ("on" | "off" | undefined)[] | undefined,
-): SubagentTranscriptRun[] {
-	if (!searchModes) return runs;
-	return runs.map((run, runIndex) => {
-		const targetSlot = run.slot ?? runIndex;
-		const searchModeText = searchModes[targetSlot];
-		return searchModeText === undefined ? run : { ...run, searchModeText };
+		const slot = run.slot ?? runIndex;
+		const contextWindowText = contextWindows?.[slot];
+		const fastModeText = fastModes?.[slot];
+		const searchModeText = searchModes?.[slot];
+		if (contextWindowText === undefined && fastModeText === undefined && searchModeText === undefined) return run;
+		const withMetadata = { ...run };
+		if (contextWindowText !== undefined) withMetadata.contextWindowText = contextWindowText;
+		if (fastModeText !== undefined) withMetadata.fastModeText = fastModeText;
+		if (searchModeText !== undefined) withMetadata.searchModeText = searchModeText;
+		return withMetadata;
 	});
 }
 
@@ -1019,13 +1002,8 @@ export function renderSubagentTranscript(
 	theme: Theme,
 	options: SubagentTranscriptRenderOptions = {},
 ): Component {
-	const runsWithContext = runsWithContextWindows(
-		runsWithInitialTasks(runs, options.initialTasks),
-		options.contextWindows,
-	);
-	const runsWithFast = runsWithFastModes(runsWithContext, options.fastModes);
-	const runsWithSearch = runsWithSearchModes(runsWithFast, options.searchModes);
-	const boundedRuns = boundSubagentRunTranscripts(runsWithSearch);
+	const runsWithMetadata = runsWithDispatchMetadata(runsWithInitialTasks(runs, options.initialTasks), options);
+	const boundedRuns = boundSubagentRunTranscripts(runsWithMetadata);
 	const grouped = options.mode === "parallel" || options.mode === "chain"
 		|| (options.mode === undefined && boundedRuns.length > 1);
 	if (grouped) {

@@ -36,18 +36,100 @@ function completedResponse(overrides: Record<string, unknown> = {}): Record<stri
 
 test("v2 request body forces the trigger, store:false, and stream:true without mutating the source", () => {
 	const source = { model: "gpt-5.6-sol", input: [{ role: "user", content: "hi" }], store: true, stream: false, tools: [{ type: "web_search" }] };
+	const original = structuredClone(source);
 	const body = buildRemoteV2RequestBody(source);
 	assert.equal(body["store"], false);
 	assert.equal(body["stream"], true);
 	assert.deepEqual(body["input"], [{ role: "user", content: "hi" }, { type: "compaction_trigger" }]);
 	assert.deepEqual(body["tools"], [{ type: "web_search" }]);
-	assert.equal(source.input.length, 1, "source input must not be mutated");
-	assert.equal(source.store, true, "source store must not be mutated");
+	assert.deepEqual(source, original, "the entire source body must remain unchanged");
 });
 
 test("v2 request body keeps exactly one terminal trigger", () => {
-	const body = buildRemoteV2RequestBody({ input: [{ type: "compaction_trigger" }, { role: "user", content: "hi" }, { type: "compaction_trigger" }] });
+	const source = { input: [{ type: "compaction_trigger", extra: { old: true } }, { role: "user", content: "hi" }, { type: "compaction_trigger" }] };
+	const original = structuredClone(source);
+	const body = buildRemoteV2RequestBody(source);
 	assert.deepEqual(body["input"], [{ role: "user", content: "hi" }, { type: "compaction_trigger" }]);
+	assert.deepEqual(buildRemoteV2RequestBody(body), body, "rebuilding must not accumulate triggers");
+	assert.deepEqual(source, original);
+});
+
+test("v2 request body isolates nested input, tools, and other fields in both directions", () => {
+	const source = {
+		input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+		tools: [{ type: "function", parameters: { properties: { query: { type: "string" } }, required: ["query"] } }],
+		text: { format: { type: "json_schema", schema: { required: ["answer"] } } },
+	};
+	const original = structuredClone(source);
+	const body = buildRemoteV2RequestBody(source);
+	const input = body["input"] as typeof source.input;
+	const tools = body["tools"] as typeof source.tools;
+	const text = body["text"] as typeof source.text;
+	input[0]!.content[0]!.text = "changed clone";
+	tools[0]!.parameters.properties.query.type = "number";
+	tools[0]!.parameters.required.push("extra");
+	text.format.schema.required.push("extra");
+	assert.deepEqual(source, original);
+
+	const changedBody = structuredClone(body);
+	source.input[0]!.content.push({ type: "input_text", text: "changed source" });
+	source.tools[0]!.parameters.required.push("source-only");
+	source.text.format.schema.required.push("source-only");
+	assert.deepEqual(body, changedBody);
+});
+
+test("v2 request body preserves independent input and body clones for shared references", () => {
+	const shared = { nested: { values: ["original"] } };
+	const input: [typeof shared, typeof shared, { type: string }] = [shared, shared, { type: "compaction_trigger" }];
+	const source = { input, tools: [shared], metadata: shared, inputAlias: input };
+	const original = structuredClone(source);
+	const body = buildRemoteV2RequestBody(source);
+	const clonedInput = body["input"] as typeof input;
+	const tools = body["tools"] as typeof source.tools;
+	const inputAlias = body["inputAlias"] as typeof input;
+	assert.equal(clonedInput[0], clonedInput[1], "aliases within input must survive");
+	assert.equal(tools[0], body["metadata"], "aliases within the remaining body must survive");
+	assert.equal(inputAlias[0], tools[0]);
+	assert.notEqual(clonedInput[0], tools[0], "input must be cloned independently from the rest of the body");
+	assert.notEqual(clonedInput, inputAlias);
+	assert.deepEqual(inputAlias, input, "filtering must not remove triggers from aliases in other fields");
+	clonedInput[0].nested.values.push("input-only");
+	assert.deepEqual(tools[0]!.nested.values, ["original"]);
+	tools[0]!.nested.values.push("tools-only");
+	assert.deepEqual(clonedInput[0].nested.values, ["original", "input-only"]);
+	assert.deepEqual(source, original);
+});
+
+test("v2 request body uses only a trigger for missing, empty, or cloneable non-array input", () => {
+	const sources: Record<string, unknown>[] = [
+		{},
+		...[undefined, null, false, 0, "hi", { nested: ["ignored"] }, []].map((input) => ({ input })),
+	];
+	for (const source of sources) {
+		const original = structuredClone(source);
+		assert.deepEqual(buildRemoteV2RequestBody(source), {
+			input: [{ type: "compaction_trigger" }], store: false, stream: true,
+		});
+		assert.deepEqual(source, original);
+	}
+});
+
+test("v2 request body still rejects uncloneable values even when their fields are replaced or filtered", () => {
+	const uncloneable = () => undefined;
+	const sources: Record<string, unknown>[] = [
+		{ input: uncloneable },
+		{ input: Symbol("input") },
+		{ input: { nested: uncloneable } },
+		{ input: [{ nested: uncloneable }] },
+		{ input: [{ type: "compaction_trigger", nested: uncloneable }] },
+		{ input: [], tools: [{ nested: uncloneable }] },
+		{ input: [], store: uncloneable },
+		{ input: [], stream: uncloneable },
+		{ tools: [{ nested: uncloneable }] },
+	];
+	for (const source of sources) {
+		assert.throws(() => buildRemoteV2RequestBody(source), { name: "DataCloneError" });
+	}
 });
 
 test("SSE parsing rejects malformed JSON and tolerates multi-line data", () => {

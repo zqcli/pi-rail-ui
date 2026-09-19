@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
 import { RailAgentOverlayComponent } from "../../tools/subagents/rail-agent-overlay";
-import { RailAgentManager } from "../../tools/subagents/agent-manager";
-import type { RailModelRef } from "../../tools/subagents/models";
+import { RailAgentManager, type RailAgentView } from "../../tools/subagents/agent-manager";
+import { railModelReference, type RailModelRef } from "../../tools/subagents/models";
 
 const piModel = {
 	provider: "cus-resp",
@@ -53,6 +53,8 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	currentSnapshot.counts.running = phase === "running" ? 1 : 0;
 	currentSnapshot.counts.idle = phase === "idle" ? 1 : 0;
 	const controls: unknown[] = [];
+	const availableModels = structuredClone(models);
+	const mentions: string[] = [];
 	const sessions = [{
 		path: "/tmp/saved.jsonl", id: "saved-session", cwd: "/tmp/other",
 		created: new Date("2026-01-01"), modified: new Date("2026-01-02"), messageCount: 2,
@@ -103,15 +105,199 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 		ctx as any,
 		{
 			manager: manager as any,
-			models,
+			models: availableModels,
 			sessions,
 			currentCwd: "/tmp/project",
-			insertMention: () => undefined,
+			insertMention: (alias) => { mentions.push(alias); },
 		},
 		currentSnapshot,
 	);
-	return { component, controls, manager, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; } };
+	return { component, controls, manager, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; } };
 }
+
+test("agent filtering preserves fields, input order, current-tab scope, selection, and fresh snapshots", async () => {
+	const state = setup();
+	const agents: RailAgentView[] = ["zulu", "alpha", "foreign", "unmatched"].map((alias) => ({
+		...structuredClone(snapshot.agents[0]!),
+		instance: {
+			...structuredClone(snapshot.agents[0]!.instance), alias: `original-${alias}`, agentId: `agt_${alias}`,
+			model: { ...models[0], name: "DisplayOnly" },
+		},
+		linkedAliases: [`linked-${alias}`],
+		linkedToCurrentSession: alias !== "foreign",
+	}));
+	agents[3]!.instance.lastTask = "Other work";
+	state.snapshot.agents = agents;
+	try {
+		const ui = state.component;
+		const filter = (query: string) => {
+			ui["searchInput"].setValue(query);
+			return ui["filteredAgents"]();
+		};
+		for (const query of ["", " \t\n\u2003 "]) assert.deepEqual(filter(query), [agents[0], agents[1], agents[3]]);
+		for (const query of ["CUS-RESP authentication PROJECT idle", "  IDLE\tproject\nAuthentication  cus-resp  "]) {
+			assert.deepEqual(filter(query), [agents[0], agents[1]]);
+		}
+		assert.deepEqual(filter("original-alpha linked-alpha gpt-5.6-sol xhigh"), [agents[1]]);
+		assert.deepEqual(filter("project missing"), []);
+		// Agent IDs and model display names are not searchable agent fields.
+		assert.deepEqual(filter("agt_zulu"), []);
+		assert.deepEqual(filter("DisplayOnly"), []);
+
+		filter("");
+		ui.handleInput("\u001b[B");
+		assert.match(ui.render(160).join("\n"), /→ linked-alpha/);
+		ui.handleInput("/");
+		ui.handleInput("AUTHENTICATION project");
+		assert.match(ui.render(160).join("\n"), /→ linked-zulu/);
+		ui.handleInput("\u001b");
+		ui.handleInput("\u001b[C");
+		assert.deepEqual(ui["filteredAgents"](), agents.slice(0, 3));
+		ui.handleInput("\u001b[B");
+		assert.match(ui.render(160).join("\n"), /→ linked-alpha/);
+
+		const refreshed = structuredClone(agents[2]!);
+		refreshed.linkedAliases = ["refreshed-foreign"];
+		state.manager.snapshot = async () => ({ ...state.snapshot, agents: [refreshed] });
+		await ui["refresh"]();
+		assert.deepEqual(ui["filteredAgents"](), [refreshed]);
+		assert.match(ui.render(160).join("\n"), /→ refreshed-foreign/);
+		ui.handleInput("\r");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(state.mentions, ["refreshed-foreign"]);
+		assert.equal(state.closed, true);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("model filtering preserves cross-field matching, whitespace, order, and picker selection without caching", () => {
+	const state = setup();
+	state.models.splice(0, state.models.length,
+		{ provider: "Vendor", modelId: "zulu", name: "Shared Display", thinkingLevel: "high" },
+		{ provider: "Vendor", modelId: "alpha", name: "Shared Display", thinkingLevel: "high" },
+		{ provider: "Other", modelId: "shared", name: "Unmatched", thinkingLevel: "off" },
+	);
+	try {
+		const ui = state.component;
+		for (const query of ["", " \t\n\u2003 "]) assert.equal(ui["filteredModels"](query), state.models);
+		for (const query of ["VENDOR shared HIGH", "  HiGh\tSHARED\nVendor  "]) {
+			assert.deepEqual(ui["filteredModels"](query), state.models.slice(0, 2));
+		}
+		assert.deepEqual(ui["filteredModels"]("vendor ALPHA display HIGH"), [state.models[1]]);
+		assert.deepEqual(ui["filteredModels"]("vendor missing"), []);
+
+		ui.handleInput("n");
+		ui.handleInput("\u001b[B");
+		ui.handleInput("\u001b[B");
+		ui.handleInput("\r");
+		ui.handleInput("\u001b[B");
+		assert.match(ui.render(160).join("\n"), /→ Vendor\/alpha:high/);
+		ui.handleInput("  VENDOR   shared HIGH  ");
+		assert.match(ui.render(160).join("\n"), /→ Vendor\/zulu:high/);
+		ui.handleInput("\u001b[A");
+		assert.match(ui.render(160).join("\n"), /→ Vendor\/alpha:high/);
+		ui.handleInput("\r");
+		assert.equal(ui["form"].model, state.models[1]);
+
+		state.models[0]!.name = "Changed";
+		assert.deepEqual(ui["filteredModels"]("vendor shared high"), [state.models[1]]);
+		ui.handleInput("\r");
+		ui.handleInput("missing");
+		ui.handleInput("\r");
+		assert.match(ui.render(160).join("\n"), /No matching options/);
+		ui.handleInput("\u001b");
+		assert.equal(ui["form"].model, state.models[1]);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("session filtering preserves cross-field matching, whitespace, order, and picker selection without caching", () => {
+	const state = setup();
+	const base = state.sessions[0]!;
+	state.sessions.splice(0, state.sessions.length,
+		{ ...base, id: "session-zulu", name: "Security Zulu", cwd: "/tmp/project", firstMessage: "Inspect login", modified: new Date("2026-01-01") },
+		{ ...base, id: "session-alpha", name: "Security Alpha", cwd: "/tmp/project", firstMessage: "Inspect login", modified: new Date("2026-01-03") },
+		{ ...base, id: "session-other", name: "Storage", allMessagesText: "hidden-history", path: "/tmp/hidden-path.jsonl" },
+	);
+	try {
+		const ui = state.component;
+		for (const query of ["", " \t\n\u2003 "]) assert.equal(ui["filteredSessions"](query), state.sessions);
+		for (const query of ["SECURITY login PROJECT SESSION", "  SESSION\tproject\nLOGIN  security  "]) {
+			assert.deepEqual(ui["filteredSessions"](query), state.sessions.slice(0, 2));
+		}
+		assert.deepEqual(ui["filteredSessions"]("alpha session-alpha"), [state.sessions[1]]);
+		for (const query of ["project missing", "hidden-history", "hidden-path"]) assert.deepEqual(ui["filteredSessions"](query), []);
+
+		ui.handleInput("n");
+		ui.handleInput("\r");
+		for (let index = 0; index < 4; index++) ui.handleInput("\u001b[B");
+		ui.handleInput("\r");
+		ui.handleInput("\u001b[B");
+		assert.match(ui.render(160).join("\n"), /→ Current · Security Alpha/);
+		ui.handleInput("  SECURITY  login PROJECT SESSION  ");
+		assert.match(ui.render(160).join("\n"), /→ Current · Security Zulu/);
+		ui.handleInput("\u001b[A");
+		assert.match(ui.render(160).join("\n"), /→ Current · Security Alpha/);
+		ui.handleInput("\r");
+		assert.equal(ui["form"].session, state.sessions[1]);
+		assert.equal(ui["form"].cwd, "/tmp/project");
+
+		state.sessions[0]!.firstMessage = "Changed";
+		assert.deepEqual(ui["filteredSessions"]("security login project session"), [state.sessions[1]]);
+		ui.handleInput("\r");
+		ui.handleInput("missing");
+		ui.handleInput("\r");
+		assert.match(ui.render(160).join("\n"), /No matching options/);
+		ui.handleInput("\u001b");
+		assert.equal(ui["form"].session, state.sessions[1]);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+for (const kind of ["model", "session"] as const) test(`${kind} filtering builds search text once per candidate and matches the legacy results`, (t) => {
+	const state = setup();
+	let reads = 0;
+	try {
+		const candidates = kind === "model"
+			? Array.from({ length: 1000 }, (_, index) => ({
+				provider: "Vendor", modelId: `model-${index}`, thinkingLevel: "high" as const,
+				get name() { reads++; return "Shared Display"; },
+			}))
+			: Array.from({ length: 1000 }, (_, index) => ({
+				...state.sessions[0]!, id: `session-${index}`, cwd: "/tmp/project",
+				get name() { reads++; return "Security review"; },
+			}));
+		if (kind === "model") state.models.splice(0, state.models.length, ...candidates as RailModelRef[]);
+		else state.sessions.splice(0, state.sessions.length, ...candidates as typeof state.sessions);
+		const filter = (query: string) => kind === "model" ? state.component["filteredModels"](query) : state.component["filteredSessions"](query);
+		const searchText = (candidate: typeof candidates[number]) => kind === "model"
+			? `${railModelReference(candidate as RailModelRef)} ${candidate.name ?? ""}`.toLowerCase()
+			: [candidate.name, (candidate as typeof state.sessions[number]).firstMessage, (candidate as typeof state.sessions[number]).cwd, (candidate as typeof state.sessions[number]).id].filter(Boolean).join(" ").toLowerCase();
+		const query = kind === "model" ? "VENDOR model SHARED HIGH" : "SECURITY auth PROJECT SESSION";
+		for (const value of [query, "", " \t\n ", `${query} missing`, `missing ${query}`, `${query} -19`]) {
+			const terms = value.toLowerCase().trim().split(/\s+/u).filter(Boolean);
+			reads = 0;
+			const legacy = terms.length === 0 ? candidates : candidates.filter((candidate) => terms.every((term) => searchText(candidate).includes(term)));
+			const legacyReads = reads;
+			reads = 0;
+			const actual = filter(value);
+			const optimizedReads = reads;
+			assert.equal(actual.length, legacy.length);
+			actual.forEach((candidate, index) => assert.equal(candidate, legacy[index]));
+			assert.equal(optimizedReads, terms.length === 0 ? 0 : 1000);
+			if (value === query) {
+				assert.equal(actual.length, 1000);
+				assert.equal(legacyReads, 4000);
+				t.diagnostic(`${kind}: 1000 candidates × 4 terms, search-text builds ${legacyReads} → ${optimizedReads}; identical ordered results`);
+			}
+		}
+	} finally {
+		state.component.dispose();
+	}
+});
 
 for (const mode of ["fork", "exclusive"] as const) test(`${mode} ${mode === "fork" ? "copies" : "links"} an already managed session`, async () => {
 	const state = setup();

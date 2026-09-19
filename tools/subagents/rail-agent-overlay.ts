@@ -807,23 +807,29 @@ export class RailAgentOverlayComponent implements Focusable {
 	}
 
 	private filteredAgents(): RailAgentView[] {
-		const query = this.searchInput.getValue().toLowerCase().trim();
+		const terms = this.searchInput.getValue().toLowerCase().trim().split(/\s+/u).filter(Boolean);
 		return this.snapshot.agents.filter((agent) => {
 			if (this.tab === "current" && !agent.linkedToCurrentSession) return false;
-			if (!query) return true;
+			if (terms.length === 0) return true;
 			const text = [agent.instance.alias, ...agent.linkedAliases, railModelReference(agent.instance.model), agent.instance.cwd, agent.instance.lastTask, agent.phase].join(" ").toLowerCase();
-			return query.split(/\s+/u).every((term) => text.includes(term));
+			return terms.every((term) => text.includes(term));
 		});
 	}
 
 	private filteredModels(query: string): RailModelRef[] {
 		const terms = query.toLowerCase().trim().split(/\s+/u).filter(Boolean);
-		return terms.length === 0 ? this.options.models : this.options.models.filter((model) => terms.every((term) => modelSearchText(model).includes(term)));
+		return terms.length === 0 ? this.options.models : this.options.models.filter((model) => {
+			const text = modelSearchText(model);
+			return terms.every((term) => text.includes(term));
+		});
 	}
 
 	private filteredSessions(query: string): SessionInfo[] {
 		const terms = query.toLowerCase().trim().split(/\s+/u).filter(Boolean);
-		return terms.length === 0 ? this.sessions : this.sessions.filter((session) => terms.every((term) => sessionSearchText(session).includes(term)));
+		return terms.length === 0 ? this.sessions : this.sessions.filter((session) => {
+			const text = sessionSearchText(session);
+			return terms.every((term) => text.includes(term));
+		});
 	}
 
 	private switchTab(direction: number): void {

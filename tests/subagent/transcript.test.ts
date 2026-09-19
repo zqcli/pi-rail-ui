@@ -909,6 +909,35 @@ test("grouped child panels map a sparse slot beyond the result count", () => {
 	assert.doesNotMatch(text, /ContextWindow 1K|ContextWindow 2K/u);
 });
 
+test("sparse dispatch metadata preserves existing fields without mutating runs or options", () => {
+	const runs: SubagentTranscriptRun[] = [
+		{ alias: "sparse", model: "provider/a", status: "completed", output: "a", persistent: false, slot: 3,
+			contextWindowText: "64K", fastModeText: "on", searchModeText: "on" },
+		{ alias: "positional", model: "provider/b", status: "completed", output: "b", persistent: true,
+			contextWindowText: "128K", fastModeText: "off", searchModeText: "off" },
+	];
+	const options = {
+		mode: "parallel" as const,
+		contextWindows: [undefined, "256K"],
+		fastModes: [undefined, undefined, undefined, "off"] as const,
+		searchModes: [] as const,
+	};
+	const before = structuredClone({ runs, options });
+	for (const run of runs) Object.freeze(run);
+	Object.freeze(runs);
+	Object.freeze(options.contextWindows);
+	Object.freeze(options);
+	for (const expanded of [false, true]) {
+		const panel = renderSubagentTranscript(runs, expanded, theme as any, options);
+		const text = panel.render(180).join("\n");
+		assert.match(text, /sparse · one-off · provider\/a · ContextWindow 64K · FAST off · SEARCH on/u);
+		assert.match(text, /positional · persistent · provider\/b · ContextWindow 256K · FAST off · SEARCH off/u);
+		panel.invalidate();
+		assert.equal(panel.render(180).join("\n"), text);
+	}
+	assert.deepEqual({ runs, options }, before);
+});
+
 test("control panels show only delivery status and alias, never control message as initial task", () => {
 	const controlMessage = "CONTROL MESSAGE MUST NOT BE INITIAL TASK";
 	const run: SubagentTranscriptRun = {

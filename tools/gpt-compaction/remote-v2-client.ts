@@ -536,10 +536,12 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 export function buildRemoteV2RequestBody(body: Record<string, unknown>): Record<string, unknown> {
-	const input = Array.isArray(body["input"]) ? body["input"] : [];
-	const clonedInput = (structuredClone(input) as unknown[]).filter((item) => !isRecord(item) || item["type"] !== "compaction_trigger");
+	const input = body["input"];
+	const clonedInput = (structuredClone(Array.isArray(input) ? input : []) as unknown[]).filter((item) => !isRecord(item) || item["type"] !== "compaction_trigger");
+	// Clone JSON-like body fields separately to preserve input/body alias isolation.
+	// Only omit array input: non-array values must still be cloned (and may throw).
 	return {
-		...structuredClone(body),
+		...structuredClone(Array.isArray(input) ? { ...body, input: undefined } : body),
 		input: [...clonedInput, { type: "compaction_trigger" }],
 		store: false,
 		stream: true,

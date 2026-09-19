@@ -6,6 +6,7 @@ import {
 	restoreHostedSearchActivities,
 } from "../openai/hosted-search-activity";
 import { isGptModel } from "../openai/model-eligibility";
+import { rejectRailOaiCommandForModel } from "./rail-oai-command";
 
 const STATUS_KEY = "rail-oai-search";
 const INSTALL_EVENT = "rail-oai-search:install";
@@ -34,6 +35,7 @@ type JsonObject = Record<string, unknown>;
 
 let mode: RailOaiSearchMode = "off";
 let activeForCurrentModel = false;
+let modelIsGpt = false;
 let turnActive = false;
 let searchRunning = false;
 let probeNextRequest = false;
@@ -152,10 +154,14 @@ export function transformNativeSearchPayload(
 export function railOaiSearchFooterLabel(): string | undefined {
 	if (searchRunning) return "SEARCHING";
 	if (mode === "off") return undefined;
+	// A non-GPT model cannot host the tool at all; hiding the stale mode is more
+	// truthful than showing an inactive policy the user cannot act on.
+	if (!modelIsGpt) return undefined;
 	return `SEARCH ${mode.toUpperCase()}${activeForCurrentModel ? "" : " (inactive)"}${probeNextRequest ? " · PROBE NEXT" : ""}`;
 }
 
 function updateStatus(ctx: ExtensionContext): void {
+	modelIsGpt = isGptModel(ctx.model);
 	activeForCurrentModel = mode !== "off" && supportsNativeGptSearch(ctx.model);
 	if (!ctx.hasUI) return;
 	ctx.ui.setStatus(STATUS_KEY, railOaiSearchFooterLabel());
@@ -195,7 +201,13 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 				return;
 			}
 
+			// `off` is always allowed; enabling/probing is GPT-only. Reject before
+			// idle so the current mode, probe flag, and capture stay untouched.
+			if (action !== "off" && rejectRailOaiCommandForModel(ctx)) return;
 			await ctx.waitForIdle();
+			// A model switch can land during the idle wait, so re-check the model that
+			// is actually active before writing mode/probe/capture state.
+			if (action !== "off" && rejectRailOaiCommandForModel(ctx)) return;
 			mode = action === "probe" ? "live" : action;
 			probeNextRequest = action === "probe";
 			searchRunning = false;
@@ -272,6 +284,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		mode = "off";
 		activeForCurrentModel = false;
+		modelIsGpt = false;
 		turnActive = false;
 		searchRunning = false;
 		probeNextRequest = false;

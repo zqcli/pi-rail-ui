@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isGptModel } from "../openai/model-eligibility";
+import { rejectRailOaiCommandForModel } from "./rail-oai-command";
 
 const STATUS_KEY = "rail-oai-fast";
 const INSTALL_EVENT = "rail-oai-fast:install";
@@ -20,6 +21,7 @@ export type NativeFastModel = {
 
 let enabled = false;
 let activeForCurrentModel = false;
+let modelIsGpt = false;
 
 type InstallClaim = { claimed: boolean };
 
@@ -62,14 +64,18 @@ function withNativeFastServiceTier(payload: unknown): unknown {
 
 export function railFastFooterLabel(): string | undefined {
 	if (!enabled) return undefined;
+	// A non-GPT model is not an inactive Fast state; the feature is simply not
+	// available, so the footer hides it instead of advertising a dead policy.
+	if (!modelIsGpt) return undefined;
 	return activeForCurrentModel ? "FAST" : "FAST inactive";
 }
 
 function updateStatus(ctx: ExtensionContext): void {
 	const model = ctx.model as NativeFastModel | undefined;
+	modelIsGpt = isGptModel(model);
 	activeForCurrentModel = enabled && supportsNativeGptFastMode(model);
 	if (!ctx.hasUI) return;
-	const status = enabled
+	const status = enabled && modelIsGpt
 		? activeForCurrentModel ? "FAST" : "FAST (inactive)"
 		: undefined;
 	ctx.ui.setStatus(STATUS_KEY, status);
@@ -96,15 +102,15 @@ export function installRailFast(pi: ExtensionAPI): void {
 		description: "Toggle Pi native OpenAI fast mode for the current model",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
-			if (action === "on") {
-				enabled = true;
-			} else if (action === "off") {
-				enabled = false;
-			}
-			else if (action !== "status") {
+			if (action !== "on" && action !== "off" && action !== "status") {
 				if (ctx.hasUI) ctx.ui.notify("Usage: /rail-oai-fast on|off|status", "warning");
 				return;
 			}
+			// `off` is always available so a stale policy can be cleared even on a
+			// non-GPT model. `on`/`status` cannot start or report a GPT-only policy.
+			if (action !== "off" && rejectRailOaiCommandForModel(ctx)) return;
+			if (action === "on") enabled = true;
+			else if (action === "off") enabled = false;
 
 			updateStatus(ctx);
 			notifyStatus(ctx);
@@ -128,5 +134,6 @@ export function installRailFast(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		enabled = false;
 		activeForCurrentModel = false;
+		modelIsGpt = false;
 	});
 }

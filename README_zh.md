@@ -109,6 +109,8 @@ Pi Rail UI 注册了以下 slash 命令：
 
 不带参数时显示当前状态；在 TUI 中会打开带当前状态标题的菜单。`on`/`off` 也会通过 slash command completion 提供补全。设置保存在 `getAgentDir()/rail-gpt-compaction/settings.json`，默认是 `off`，并由 TUI、RPC、JSON 以及 Rail 子进程共享。旧的 `/rail-gpt-compaction` 名称不再保留为别名；只有持久化设置目录仍沿用旧的 `rail-gpt-compaction` 名称。远程压缩目前只对名称包含 GPT 的 `openai-responses` 和 `openai-codex-responses` 生效；Azure OpenAI Responses 暂不属于 v2 支持范围，待 endpoint、query 和认证行为有对应实现与测试后再启用。不符合条件的模型继续使用 Pi 原生压缩。全局开关为 `on` 时，生产 stateless GPT dispatch 会加载独立压缩 helper，并只在本次调用期间使用临时 session；正常完成、初始化失败或子进程失败都会清理临时目录。开关为 `off` 或模型不是 GPT 时，stateless dispatch 仍保持 Pi 原本的 `--no-session` 路径。persistent RPC worker 始终加载 helper，但开关关闭时其压缩 hook 不会生效。
 
+在当前模型非 GPT 或缺失时，执行该命令（`on` 或无参数菜单）会在打开菜单前被拒绝：统一输出 GPT-only warning，且不写入任何全局设置。`off` 不受当前模型限制，仍保留既有的原生历史修复安全检查。GPT 模型但 API 不属于 v2 范围时保持原行为——命令成功、设置保存、状态显示 `GPT compact: native (inactive — …)`；非 GPT 模型则直接显示 `GPT compact: native`。
+
 ### `/rail-duplicate`
 
 将当前 session 复制为同级 session（共享相同的 parent）。
@@ -135,11 +137,13 @@ Pi Rail UI 注册了以下 slash 命令：
 /rail-oai-fast on|off|status
 ```
 
-该命令设置 session-local policy，Rail 通过 Pi 的 `before_provider_request` hook 在每次发出的 provider payload 上生效：命中资格的 payload 会以副本返回并附加 `service_tier: "priority"`。Rail 不修改 `model.samplingParams`，因此模型原有 sampling 参数完全保留，policy 也能跨模型切换、provider 重新注册和 retry 保持生效。Session shutdown 会清除该 policy，无需恢复模型参数。父会话和 Rail child 的资格判定统一为 GPT-only：模型必须是 `openai-completions`、`openai-responses` 或 `azure-openai-responses` 上的 GPT 模型；非 GPT 模型无论使用哪个受支持 API 都保持 inactive。`openai-codex-responses` 保持 inactive，因为 Rail 不重写 Codex 请求。不存在只针对父会话的 API 范围：切到非 GPT 模型或不支持的 API 时，已启用的 policy 会显示 `FAST inactive` 且不注入任何内容；切回受支持 API 上的 GPT 模型即自动恢复注入，无需重新执行命令。
+该命令设置 session-local policy，Rail 通过 Pi 的 `before_provider_request` hook 在每次发出的 provider payload 上生效：命中资格的 payload 会以副本返回并附加 `service_tier: "priority"`。Rail 不修改 `model.samplingParams`，因此模型原有 sampling 参数完全保留，policy 也能跨模型切换、provider 重新注册和 retry 保持生效。Session shutdown 会清除该 policy，无需恢复模型参数。父会话和 Rail child 的资格判定统一为 GPT-only：模型必须是 `openai-completions`、`openai-responses` 或 `azure-openai-responses` 上的 GPT 模型；非 GPT 模型无论使用哪个受支持 API 都保持 inactive。`openai-codex-responses` 保持 inactive，因为 Rail 不重写 Codex 请求。不存在只针对父会话的 API 范围：切到非 GPT 模型或不支持的 API 时停止注入；切回受支持 API 上的 GPT 模型即自动恢复注入，无需重新执行命令。
+
+`on` 和 `status` 仅适用于 GPT：当前模型非 GPT 或缺失时统一以 `Cannot enable Rail OpenAI features for the current model: GPT models only.` 拒绝，并保持原有 policy 不变。如果原本关闭，之后切到 GPT 也不会自动开启。`off` 在任何模型上始终允许，用于清除陈旧 policy。GPT 模型但 API 不受支持时保持原 inactive 行为（status/footer 显示 `FAST (inactive)` / `FAST inactive`）；非 GPT 模型则直接隐藏 footer 标签，不再展示一个永远无法生效的 policy。
 
 Rail Subagent 通过 `fastMode: true` 使用同一套原生机制。Subagent Fast 会在 child 模型第一次 provider request 之前应用；它属于 dispatch/persistent-agent policy，不会隐式继承 parent 当前命令状态。standalone `--rail-oai-fast-enabled` flag、parent 的 `/rail-oai-fast` 开关以及 child 原地切换模型都走同一个 GPT 资格判定，确保 status、footer 与 request hook 始终一致。
 
-`/rail-oai-fast`、`/rail-oai-search` 与远程压缩共享同一条 GPT 规则：当 model id 或显示名称中包含独立的、忽略大小写的 `gpt` token（如 `gpt-5.6-sol`、`GPT 5.6`）时视为 GPT 模型；`gptx` 这类 substring 不匹配，provider id 从不参与判断。各功能在这条共享判定之上仍各自应用自己的 supported API 范围。
+`/rail-oai-fast`、`/rail-oai-search` 与远程压缩共享同一条 GPT 规则：当 model id 或显示名称中包含独立的、忽略大小写的 `gpt` token（如 `gpt-5.6-sol`、`GPT 5.6`）时视为 GPT 模型；`gptx` 这类 substring 不匹配，provider id 从不参与判断。各功能在这条共享判定之上仍各自应用自己的 supported API 范围。三者同时复用同一个命令级 guard（`commands/rail-oai-command.ts`）与 `openai/model-eligibility.ts` 的 `isGptModel`，因此 Fast、Search 与 compaction 输出的是同一条 GPT-only 拒绝提示，而不是三份各自漂移的文案。
 
 ### `/rail-oai-search`
 
@@ -149,7 +153,7 @@ Rail Subagent 通过 `fastMode: true` 使用同一套原生机制。Subagent Fas
 /rail-oai-search live|cached|off|probe
 ```
 
-`live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。生效条件是非空 API 加上 GPT 名称，并且 API 检查是 blocklist 而非 allowlist：缺失或空白的 API id 保持 inactive，内置的非 Responses API（`openai-completions`、`anthropic-messages`、`mistral-conversations` 等）保持 inactive，但其他任何 API id——包括自定义的 `cus-resp` 与 Codex 的 `openai-codex-responses`——仍然 eligible。GPT 匹配要求 model ID 或显示名称中存在独立的 `gpt` token，而不是任意 substring。由于 Rail 只重写 Responses 形态的 payload，eligible 的自定义 API 仍需收到 Responses 形态的请求；Codex 可以注入 hosted tool，但其默认 WebSocket transport 不会被观测，因此不计入搜索次数。Rail 在该请求中替换冲突的本地或 hosted `web_search`，并保留已有 `include` 并请求 source metadata。切换到非 GPT 或 inactive 模型后，当前模式会保持为 inactive；切回 eligible 模型时自动恢复。
+`live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。开启（`live`、`cached` 或 `probe`）时若当前模型非 GPT 或缺失，会以 `Cannot enable Rail OpenAI features for the current model: GPT models only.` 统一拒绝；资格会在 idle wait 前后校验，拒绝时不改变 mode、probe 标志或 capture lease；`off` 始终允许。非 GPT 模型下 footer 直接隐藏该 mode，而不是显示 inactive policy。生效条件是非空 API 加上 GPT 名称，并且 API 检查是 blocklist 而非 allowlist：缺失或空白的 API id 保持 inactive，内置的非 Responses API（`openai-completions`、`anthropic-messages`、`mistral-conversations` 等）保持 inactive，但其他任何 API id——包括自定义的 `cus-resp` 与 Codex 的 `openai-codex-responses`——仍然 eligible。GPT 模型落在这些非 eligible API 上时保持原 inactive 行为。GPT 匹配要求 model ID 或显示名称中存在独立的 `gpt` token，而不是任意 substring。由于 Rail 只重写 Responses 形态的 payload，eligible 的自定义 API 仍需收到 Responses 形态的请求；Codex 可以注入 hosted tool，但其默认 WebSocket transport 不会被观测，因此不计入搜索次数。Rail 在该请求中替换冲突的本地或 hosted `web_search`，并保留已有 `include` 并请求 source metadata。切换到非 GPT 或 inactive 模型后，当前模式会保持为 inactive；切回 eligible 模型时自动恢复。
 
 `probe` 是一次性诊断模式：它会切换到 `live`，强制下一次 eligible Responses 请求调用 hosted `web_search`，随后立即恢复普通 `live`/`auto` 行为。它只用于验证 provider 注入和搜索活动面板，不改变正常搜索语义。
 

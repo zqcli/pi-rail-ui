@@ -207,7 +207,7 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 
 	ctx.model = { provider: "custom", api: "anthropic-messages", id: "claude-opus", name: "Claude" };
 	await handlers.get("model_select")({}, ctx);
-	assert.equal(statuses.at(-1), "SEARCH LIVE (inactive)");
+	assert.equal(statuses.at(-1), undefined, "a non-GPT footer hides the unavailable policy");
 	assert.equal(
 		await handlers.get("before_provider_request")(
 			{ payload: { model: "claude-opus", messages: [] } },
@@ -217,7 +217,7 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 	);
 	ctx.model = { provider: "custom", api: "openai-completions", id: "gpt-4.1", name: "GPT 4.1" };
 	await handlers.get("model_select")({}, ctx);
-	assert.equal(statuses.at(-1), "SEARCH LIVE (inactive)");
+	assert.equal(statuses.at(-1), "SEARCH LIVE (inactive)", "a GPT model on an unsupported API keeps the inactive label");
 
 	ctx.model = { provider: "another", api: "cus-resp", id: "custom-gpt", name: "Custom GPT" };
 	await handlers.get("model_select")({}, ctx);

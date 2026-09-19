@@ -106,40 +106,40 @@ test("/rail-oai-fast toggles request-time service_tier and status", async () => 
 
 test("parent slash eligibility is GPT-only on supported APIs and never injects for non-GPT models", async () => {
 	const statuses: Array<string | undefined> = [];
+	const notices: string[] = [];
 	const { command, handlers } = setupFast();
-	const ctx = context({ api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" }, statuses);
+	const ctx = context({ api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" }, statuses, notices);
 	const payload = { model: "probe", input: [] };
 
 	await handlers.get("session_start")({}, ctx);
 	assert.equal(statuses.at(-1), undefined, "a non-GPT model starts inactive");
 	await command.handler("on", ctx);
-	assert.equal(statuses.at(-1), "FAST (inactive)", "enabling the policy cannot widen a non-GPT model");
-	assert.equal(
-		await handlers.get("before_provider_request")({ payload }, ctx),
-		undefined,
-		"a normal parent session no longer gets the old API-only injection for non-GPT models",
-	);
-	assert.equal(railFastFooterLabel(), "FAST inactive");
+	assert.match(notices.at(-1) ?? "", /GPT models only/, "a non-GPT on is rejected with the shared warning");
+	assert.equal(statuses.at(-1), undefined, "a rejected on leaves no status");
+	assert.equal(railFastFooterLabel(), undefined, "a rejected on shows no footer label");
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
 
-	// A non-GPT model stays inactive across every API Fast supports, including
+	// A non-GPT model stays rejected across every API Fast supports, including
 	// the completions API that never had a GPT gate before.
 	ctx.model = { api: "openai-completions", id: "deepseek-chat", name: "DeepSeek Chat" };
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(statuses.at(-1), undefined);
 
 	ctx.model = { api: "anthropic-messages", id: "claude-opus", name: "Claude Opus" };
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload: { messages: [] } }, ctx), undefined);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(statuses.at(-1), undefined);
 
-	// Switching to a GPT model on a supported API activates the same policy.
+	// Switching to a GPT model lets the same command enable the policy.
 	ctx.model = { api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
 	await handlers.get("model_select")({}, ctx);
+	await command.handler("on", ctx);
 	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
 	assert.equal(statuses.at(-1), "FAST");
 	assert.equal(railFastFooterLabel(), "FAST");
 
+	// GPT on an unsupported API keeps the original inactive behavior.
 	ctx.model = { api: "openai-codex-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "codex stays outside the rewritten APIs");
@@ -167,12 +167,12 @@ test("parent and child share the same GPT-only injection across on/off and GPT â
 	await command.handler("on", ctx);
 	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
 
-	// GPT â†’ non-GPT: inactive, no injection, footer agrees with status.
+	// GPT â†’ non-GPT: no injection and the footer hides the unavailable policy.
 	ctx.model = nonGptModel;
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
-	assert.equal(railFastFooterLabel(), "FAST inactive");
+	assert.equal(statuses.at(-1), undefined);
+	assert.equal(railFastFooterLabel(), undefined);
 
 	// Non-GPT â†’ GPT restores injection without re-arming the command.
 	ctx.model = gptModel;
@@ -187,7 +187,7 @@ test("parent and child share the same GPT-only injection across on/off and GPT â
 	ctx.model = nonGptModel;
 	await handlers.get("session_start")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "a child non-GPT model must not inject");
-	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(statuses.at(-1), undefined);
 
 	ctx.model = gptModel;
 	await handlers.get("model_select")({}, ctx);
@@ -201,7 +201,7 @@ test("parent and child share the same GPT-only injection across on/off and GPT â
 	ctx.model = nonGptModel;
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(statuses.at(-1), undefined);
 
 	await handlers.get("session_shutdown")({}, ctx);
 });
@@ -221,18 +221,21 @@ test("child startup flag keeps fast GPT-only across a model switch and slash tog
 	ctx.model = { api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" };
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(statuses.at(-1), undefined);
 
-	// Slash toggles inside the child must not lift the GPT-only restriction.
+	// Slash toggles inside the child must not lift the GPT-only restriction, and
+	// a rejected `on` leaves the policy off rather than arming it for later.
 	await command.handler("off", ctx);
 	await command.handler("on", ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
-	assert.equal(railFastFooterLabel(), "FAST inactive");
+	assert.equal(statuses.at(-1), undefined);
+	assert.equal(railFastFooterLabel(), undefined);
 
-	// Switching back to GPT restores injection with the restrictive scope intact.
+	// Switching back to GPT restores injection only after a GPT-eligible `on`.
 	ctx.model = { api: "openai-completions", id: "gpt-4.1", name: "GPT 4.1" };
 	await handlers.get("model_select")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "the rejected on left the policy off");
+	await command.handler("on", ctx);
 	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
 	assert.equal(railFastFooterLabel(), "FAST");
 
@@ -247,11 +250,13 @@ test("child startup flag keeps fast GPT-only across a model switch and slash tog
 	assert.equal(
 		await handlers.get("before_provider_request")({ payload }, ctx),
 		undefined,
-		"a toggled-on parent must not inject for a non-GPT model",
+		"a non-GPT on is rejected and never arms the policy",
 	);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(statuses.at(-1), undefined);
 	ctx.model = { api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
 	await handlers.get("model_select")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "still off until a GPT-eligible on");
+	await command.handler("on", ctx);
 	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
 
 	await handlers.get("session_shutdown")({}, ctx);

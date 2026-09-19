@@ -9,6 +9,7 @@ import {
 	modelSupportsRemoteCompaction,
 	type CompactionIdentity,
 } from "./model-eligibility";
+import { isGptModel } from "../../openai/model-eligibility";
 import {
 	planContextReplay,
 	planPayloadRewrite,
@@ -20,6 +21,7 @@ import {
 import { resolveCompactionAuth } from "./auth";
 import { rebuildNativeHistoryPrefix } from "./history";
 import { clearRequestContextCache } from "./request-context";
+import { rejectRailOaiCommandForModel } from "../../commands/rail-oai-command";
 import { resolveSessionCheckpoint } from "./types";
 import {
 	gptCompactionSettingsScope,
@@ -64,6 +66,8 @@ async function resolveRuntimeIdentity(ctx: ExtensionContext): Promise<Compaction
 
 function statusText(mode: GptCompactionMode, ctx: ExtensionContext): string {
 	if (mode === "off") return "GPT compact: native";
+	// Non-GPT models use native compaction even while the global switch is on.
+	if (!isGptModel(ctx.model)) return "GPT compact: native";
 	const support = modelSupportsRemoteCompaction(ctx.model);
 	return support.supported ? "GPT compact: remote v2" : `GPT compact: native (inactive — ${support.detail})`;
 }
@@ -283,6 +287,11 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 				}
 			})();
 			if (!command) return;
+			// The no-arg menu and `on` are GPT-only. `off` stays available so the
+			// global switch and its repair safety can always be used. Reject before
+			// opening the menu so an ineligible model cannot reach the writer.
+			const enabling = command.operation === "menu" || command.mode === "on";
+			if (enabling && rejectRailOaiCommandForModel(ctx)) return;
 			let selectedMode: GptCompactionMode;
 
 			if (command.operation === "menu") {
@@ -301,6 +310,9 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 			}
 
 			await ctx.waitForIdle();
+			// Re-check after the menu and idle wait: a model switch during either
+			// window must not let an `on` write through on an ineligible model.
+			if (selectedMode === "on" && rejectRailOaiCommandForModel(ctx)) return;
 			if (selectedMode === "off" && mode === "on") {
 				const repaired = await repairBeforeDisabling(ctx);
 				if (!repaired.ok) {

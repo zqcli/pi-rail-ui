@@ -40,3 +40,33 @@ test("history restores latest journal snapshot per team as interrupted, rejectin
 		assert.throws(() => restored.complete(old!, { status: "completed", output: "stale" }), /binding/);
 	} finally { source.dispose(); restored.dispose(); }
 });
+
+test("status explains deadline and admission cancellation in model-visible text", async (t) => {
+	let now = 1000;
+	const hub = new TeamHub({ now: () => now, startupTimeoutMs: 30_000 });
+	t.after(() => hub.dispose());
+	let tool: any;
+	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
+	const expired = hub.prepare({ coordinator: "A", workers: ["B"], timeoutSeconds: 120 });
+	now += 120_000;
+	const deadline = await tool.execute("deadline", { action: "status", teamId: expired.id });
+	assert.match(deadline.content[0].text, /Reason: Team deadline exceeded/u);
+	const missingPeer = hub.prepare({ coordinator: "A2", workers: ["B2"] });
+	hub.join(missingPeer.id, ["A2"]);
+	now += 30_000;
+	const admission = await tool.execute("admission", { action: "status", teamId: missingPeer.id });
+	assert.match(admission.content[0].text, /Reason: Startup admission deadline exceeded/u);
+});
+
+test("cancel reason is visible but bounded and stripped of terminal control sequences", async (t) => {
+	const hub = new TeamHub(); t.after(() => hub.dispose());
+	let tool: any;
+	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
+	const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+	const cancelled = await tool.execute("cancel", { action: "cancel", teamId: team.id, reason: "\u001b[31mRequested stop\u001b[0m\n" + "more context ".repeat(80) });
+	const text = cancelled.content[0].text;
+	assert.match(text, /Reason: Requested stop more context/u);
+	assert.doesNotMatch(text, /\u001b/u);
+	assert.ok(text.length < 500);
+	assert.match(tool.renderResult(cancelled).render(120).join("\n"), /Reason: Requested stop/u);
+});

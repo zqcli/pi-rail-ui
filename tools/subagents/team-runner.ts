@@ -1,9 +1,17 @@
+import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 import type { TeamHub } from "./team-hub";
 import type { TeamBinding, TeamDispatchChannel, TeamSnapshot } from "./team-protocol";
 import { runErrorMessage, type WorkerRunResult } from "./session-broker";
 
 export function teamStatus(snapshot: TeamSnapshot): string {
-	return `Team ${snapshot.phase.toUpperCase()} · ${snapshot.members.map((member) => `${member.id}: ${member.state.toUpperCase().replaceAll("_", " ")}${member.waitingFor ? `(${member.waitingFor})` : ""}`).join(" · ")}`;
+	const status = `Team ${snapshot.phase.toUpperCase()} · ${snapshot.members.map((member) => `${member.id}: ${member.state.toUpperCase().replaceAll("_", " ")}${member.waitingFor ? `(${member.waitingFor})` : ""}`).join(" · ")}`;
+	const reason = snapshot.phase === "cancelled" || snapshot.phase === "failed"
+		? snapshot.events.findLast((event) => event.kind === "cancelled")?.message
+		: undefined;
+	if (!reason) return status;
+	const preview = truncateToWidth(stripTerminalSequences(reason).replace(/\s+/gu, " ").trim(), 300, "…");
+	// Native truncation may add ANSI resets; tool content must remain plain text.
+	return `${status}\nReason: ${stripTerminalSequences(preview)}`;
 }
 
 export class TeamRunManager {

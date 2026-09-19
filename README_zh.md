@@ -87,7 +87,7 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 {"action":"prepare","coordinator":"A","workers":["B1","B2"]}
 ```
 
-再用返回的 id 替换 `<teamId>`，在**同一 assistant turn 发出以下两个 sibling `subagent` tool call 并行执行**，不能串行等待，也不能合并为一个 `tasks` 数组。A 使用 single，所有预登记 B 放在一个 grouped call；两边的 `teamId` 都只放顶层。示例省略 `model`，使用当前 Pi 模型；每次建队请换用全新 alias。
+再用返回的 id 替换 `<teamId>`，在**同一 assistant turn 发出以下两个 sibling `subagent` tool call 并行执行**，不能串行等待，也不能合并为一个 `tasks` 数组。A 使用 single，所有预登记 B 放在一个 grouped call；两边的 `teamId` 都只放顶层。示例省略 `model`，使用当前 Pi 模型；每次建队请换用全新 alias。原生父会话会在启动成员前检查同一消息内是否齐备两侧调用；若因缺侧被拒绝，可沿用该 prepared teamId，在下一条消息中同时重发两侧，不要只补发另一侧。
 
 ```json
 {"teamId":"<teamId>","alias":"A","task":"协调 B1/B2 的只读审查。用 team finish 等待全部 worker 结果，再总结发现与失败。"}
@@ -111,7 +111,7 @@ Child 使用 `team` tool；发送者和所属 team 由运行时确定，不作�
 
 - 调度默认允许 **4 个 active worker permit，A 独立准入**。等待或暂停的 worker 释放 permit，但保留 session；cooperative wait/pause 都不会结束外层父 Tool Call。运行中的成员先显示 `PAUSE REQUESTED`，到安全点后才是 `PAUSED`；已在途的模型请求、工具或 compaction 可能继续完成，不是立即冻结进程，也不回滚操作。`redirect` 的方向在下一个原生 context gate 进入模型；恢复时不会重写已经生成的请求 payload 或工具参数。
 - A 必须等每个 worker 都有 native 终态结果（含失败）后才生成最终总结，不能把 `report` 或 `finish` 自述当作完成。A 提前结束时，父调用仍保持 pending，随后以全部 worker 结果快照执行最终总结续轮。单个 worker 失败通常不阻止其余 worker 完成；A 失败或取消会停止 team，不能保证成功总结。
-- Team deadline 默认**从 prepare 起 1 小时**（`timeoutSeconds` 为正数，最多 `86400`）；全员须在**首次 join 后 30 秒内**加入，因此串行派发可能启动超时。查看状态：`subagent_team` 参数 `{"action":"status","teamId":"<teamId>"}`，省略 id 列出所有 team；取消：`{"action":"cancel","teamId":"<teamId>","reason":"停止此次审查"}`。中止任一父 dispatch 会取消 team。Reload 后未完成历史标为 `interrupted`，不恢复旧 Promise，也不自动续跑。
+- Team deadline 默认**从 prepare 起 1 小时**（`timeoutSeconds` 为正数，最多 `86400`）。未指定时使用 `null`／省略，不要为代码审查或高思考级别模型自行设置 120／180 秒限制；它覆盖启动、思考、工具执行、等待及最终总结，不是单次工具超时。显式设置的短期限仍会被尊重。全员须在**首次 join 后 30 秒内**加入；批次检查不能覆盖的外部阻断或串行执行仍由此期限兜底。父调用失败结果及状态会保留真实取消原因，而不只显示 RPC 停止。查看状态：`subagent_team` 参数 `{"action":"status","teamId":"<teamId>"}`，省略 id 列出所有 team；取消：`{"action":"cancel","teamId":"<teamId>","reason":"停止此次审查"}`。中止任一父 dispatch 会取消 team。Reload 后未完成历史标为 `interrupted`，不恢复旧 Promise，也不自动续跑。
 - 状态显示在既有 Tool Call 输出/面板中，不是新的独立 GUI overlay。Inbox、历史与总结快照都有上限：每个父 session 最多保留 32 个 team，单条消息最多 8 KiB；容量溢出会报错，旧事件历史可能丢弃，总结快照内每个 worker 输出最多保留 16 KiB 并显式标记截断。大产物写入文件，消息中提供路径与简要结论，不把消息或 summary 当作完整 transcript。
 - 本地真实 Pi RPC + 合成 provider 测试用于验证协作和结束行为，**不等于真实外网模型的决策质量验证**。
 

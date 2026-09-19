@@ -20,14 +20,18 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {
 	pi.registerTool({
 		name: "subagent_team",
 		label: "Subagent Team",
-		description: "Prepare a fixed team, inspect status, or cancel. After prepare, launch two sibling subagent calls with teamId: single alias=coordinator and tasks with exactly all worker aliases. All members require new persistent sessions and concrete tasks. Do not launch serially: admission has a short timeout. Pause is cooperative at safe points. Reload interrupts unfinished teams.",
+		description: "Prepare a fixed team, inspect status, or cancel. After prepare, launch two sibling subagent calls with teamId: single alias=coordinator and tasks with exactly all worker aliases. All members require new persistent sessions and concrete tasks. Emit BOTH calls in the same assistant message; never wait for A before starting workers. Keep timeoutSeconds null (default 3600s) unless the user requests a deadline; it covers the whole team including reasoning, tools, waiting and the final summary. Pause is cooperative at safe points. Reload interrupts unfinished teams.",
+		promptGuidelines: [
+			"Team prepare: default timeoutSeconds to null. Do not invent short 120/180-second limits for code review or max-thinking models; explicit deadlines bound the entire workflow, not one tool call.",
+			"After Team prepare, emit coordinator single and workers grouped as two sibling subagent calls in ONE assistant message. If an unpaired call is rejected before joining, retry BOTH using the same prepared teamId rather than launching the missing side alone.",
+		],
 		executionMode: "parallel",
 		parameters: Type.Object({
 			action: StringEnum(["prepare", "status", "cancel"]),
 			teamId: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 			coordinator: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 			workers: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()])),
-			timeoutSeconds: Type.Optional(Type.Union([Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), Type.Null()])),
+			timeoutSeconds: Type.Optional(Type.Union([Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), Type.Null()], { description: "Default null = 3600 seconds. Set only for a user-requested deadline. Total team budget from prepare, including startup, all model/tool work, waits and final summary; not a per-call timeout." })),
 			reason: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 		}),
 		async execute(_id, params) {
@@ -41,7 +45,12 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {
 				hub.cancel(params.teamId, params.reason ?? undefined);
 				snapshots = [hub.get(params.teamId)];
 			} else snapshots = params.teamId ? [hub.get(params.teamId)] : hub.list();
-			return { content: [{ type: "text", text: snapshots.map((snapshot) => `${snapshot.id}\n${teamStatus(snapshot)}`).join("\n") || "No teams" }], details: { snapshots } };
+			const text = snapshots.map((snapshot) => {
+				const status = `${snapshot.id}\n${teamStatus(snapshot)}`;
+				if (params.action !== "prepare") return status;
+				return `${status}\nBudget: ${(snapshot.deadline - snapshot.createdAt) / 1000}s total from prepare, including reasoning, tools, waiting and final summary.\nNext: emit BOTH coordinator single and all workers grouped with this teamId in ONE assistant message; do not wait between them.`;
+			}).join("\n") || "No teams";
+			return { content: [{ type: "text", text }], details: { snapshots } };
 		},
 		renderResult(result) {
 			return new Text(result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n"), 0, 0);

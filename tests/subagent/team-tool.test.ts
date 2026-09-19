@@ -15,6 +15,8 @@ test("parent prepare/status/cancel handles null defaults and exposes no binding"
 		const prepared = await tool.execute("prepare", { action: "prepare", coordinator: "A", workers: ["B"], timeoutSeconds: null });
 		const snapshot = prepared.details.snapshots[0];
 		assert.equal(snapshot.deadline - snapshot.createdAt, 3600000);
+		assert.match(prepared.content[0].text, /Budget: 3600s total from prepare/u);
+		assert.match(prepared.content[0].text, /BOTH coordinator single and all workers grouped.*ONE assistant message/u);
 		const status = await tool.execute("status", { action: "status", teamId: snapshot.id });
 		assert.match(status.content[0].text, /REGISTERED/);
 		assert.equal(JSON.stringify(status).includes("epoch"), false);
@@ -22,6 +24,19 @@ test("parent prepare/status/cancel handles null defaults and exposes no binding"
 		assert.equal(cancelled.details.snapshots[0].phase, "cancelled");
 		assert.equal((await tool.execute("list", { action: "status", teamId: null })).details.snapshots.length, 1);
 	} finally { hub.dispose(); }
+});
+
+test("prepare explains an explicit short total deadline without silently extending it", async (t) => {
+	const hub = new TeamHub(); t.after(() => hub.dispose());
+	let tool: any;
+	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
+	assert.match(tool.parameters.properties.timeoutSeconds.description, /Default null = 3600 seconds/u);
+	assert.match(tool.promptGuidelines.join("\n"), /default timeoutSeconds to null/u);
+	const result = await tool.execute("short", { action: "prepare", coordinator: "A", workers: ["B"], timeoutSeconds: 120 });
+	const snapshot = result.details.snapshots[0];
+	assert.equal(snapshot.deadline - snapshot.createdAt, 120000);
+	assert.match(result.content[0].text, /Budget: 120s total from prepare, including reasoning, tools, waiting and final summary/u);
+	assert.equal(snapshot.phase, "prepared");
 });
 
 test("history restores latest journal snapshot per team as interrupted, rejecting old bindings", () => {

@@ -76,6 +76,44 @@ The `/rail-agent` safe path defaults to **Safe copy** (`fork`), including sessio
 
 Instance metadata and leases live under `~/.pi/agent/stateful-subagents/`; each instance stores a model reference rather than an agent profile. Session leases and short-lived alias reservations enforce one writer and globally unique persistent aliases across Rail processes. The full child transcript remains in the child Pi session. Parent tool content remains capped at 50KB; Tool Call details keep a bounded retained final answer plus the recent-event window rather than duplicating unbounded child history.
 
+#### Coordinated teams (opt-in)
+
+Ordinary subagent modes are unchanged. A team has a fixed roster of **one coordinator A and 1–8 workers B**, all with **new, unique persistent aliases** and concrete tasks. Team dispatch does not support stateless sessions, existing `target`, session adoption, `chain`, or parent `control` mode; children still cannot spawn subagents.
+
+First call `subagent_team` to prepare:
+
+```json
+{"action":"prepare","coordinator":"A","workers":["B1","B2"]}
+```
+
+Then replace `<teamId>` with the returned id and emit the following as **two sibling `subagent` tool calls in the same assistant turn**, not sequential calls and not one combined `tasks` array. A is single; all prepared Bs belong in the grouped call. `teamId` is top-level in both. These examples omit `model` to use the current Pi model; choose fresh aliases for each team.
+
+```json
+{"teamId":"<teamId>","alias":"A","task":"Coordinate B1/B2's read-only review. Await all worker outcomes with team finish, then summarize findings and failures."}
+```
+
+```json
+{"teamId":"<teamId>","tasks":[{"alias":"B1","task":"Review implementation correctness without edits. Report findings to A."},{"alias":"B2","task":"Review test coverage without edits. Report findings to A."}]}
+```
+
+Children use the `team` tool; sender and team are supplied by the runtime, not arguments:
+
+| Action | Example arguments / meaning |
+| --- | --- |
+| `send` | `{"action":"send","to":"B2","message":"Please check the error path."}` — message a teammate. |
+| `report` | `{"action":"report","message":"Blocked; need scope clarification.","wait":{"kind":"message"}}` — report to A and atomically wait for a reply; omit `wait` to report without waiting. |
+| `wait` | `{"action":"wait","wait":{"kind":"member","member":"B2"}}` — await a member's terminal outcome. Use `{"kind":"message"}` for inbox messages or, for A only, `{"kind":"workers"}` for all worker outcomes. |
+| `control` | A only: `{"action":"control","to":"B1","command":"pause"}`; `resume` clears the pause. `redirect` also requires `message` and replaces a pending wait with the new direction, but does not clear an explicit pause or undo work. |
+| `finish` | `{"action":"finish"}` — completion intent, not a terminal result. A waits for all workers; a worker must still produce its final answer. |
+
+**`wait`, `report` with `wait`, and `finish` must each be the sole tool call in their assistant batch**, never alongside another tool. Use event-driven waits, not polling. Self-waits, unknown members and dependency cycles are rejected.
+
+- Scheduling allows **four active worker permits plus independent A admission**. Waiting/paused workers release permits but retain their sessions; neither cooperative waiting nor pausing ends the enclosing parent Tool Call. A running member first shows `PAUSE REQUESTED`, then `PAUSED` at a safe point; in-flight model/tool/compaction work may finish. This is not an immediate process freeze or rollback. Redirected directions enter the model at its next native context gate; resuming does not rewrite already prepared provider payloads or tool arguments.
+- A's final summary is generated only after every worker has a native terminal outcome, including failures—not merely a `report` or `finish` claim. If A settles early, its parent call stays pending and a final-summary continuation receives the complete worker result snapshot. Worker failure normally allows others to finish; coordinator failure or cancellation stops the team and may prevent a successful summary.
+- The team deadline defaults to **one hour from prepare** (`timeoutSeconds`, positive, at most `86400`). All members must join within **30 seconds of the first join**; serial dispatch can therefore fail startup admission. Inspect with `subagent_team` arguments `{"action":"status","teamId":"<teamId>"}` (omit id to list), or cancel with `{"action":"cancel","teamId":"<teamId>","reason":"Stop this review"}`. Aborting either parent dispatch cancels the team. Reload marks unfinished history `interrupted`; it does not restore pending Promises or automatically resume work.
+- Status appears in existing Tool Call output/panels, not a new standalone GUI overlay. Inbox/history and summary snapshots are bounded: a parent session retains at most 32 teams, messages are limited to 8 KiB, capacity overflow is rejected, and old event history may be dropped. Summary snapshots retain at most 16 KiB of each worker's output with an explicit truncation marker. Put large artifacts in files and send paths plus concise findings rather than relying on messages or summaries as full transcripts.
+- Local real-Pi RPC tests with a synthetic provider exercise coordination and settlement; they do **not** establish real external-model decision quality.
+
 ## Testing
 
 The test suite is centralized under `tests/` and uses Node's built-in `node:test`

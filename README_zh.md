@@ -77,6 +77,44 @@ fi
 
 Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instance 保存的是 model reference，而不是 agent profile。Session lease 与短期 alias reservation 同时保证 single writer 和跨 Rail 进程的 persistent alias 唯一性。完整 child transcript 仍保留在 child Pi session 中。父 tool content 继续限制为 50KB；Tool Call details 只保留有界 final answer 与近期事件窗口，不复制无界 child 历史。
 
+#### 协作 Team（按需启用）
+
+普通 subagent 模式保持不变。Team 固定为 **1 个协调者 A + 1–8 个 worker B**，所有成员都必须使用**全新且唯一的 persistent alias**，并提供具体任务。Team dispatch 不支持 stateless、已有 `target`、session adopt、`chain` 或父级 `control` 模式；child 仍不能递归派发 subagent。
+
+先调用 `subagent_team` 准备名单：
+
+```json
+{"action":"prepare","coordinator":"A","workers":["B1","B2"]}
+```
+
+再用返回的 id 替换 `<teamId>`，在**同一 assistant turn 发出以下两个 sibling `subagent` tool call 并行执行**，不能串行等待，也不能合并为一个 `tasks` 数组。A 使用 single，所有预登记 B 放在一个 grouped call；两边的 `teamId` 都只放顶层。示例省略 `model`，使用当前 Pi 模型；每次建队请换用全新 alias。
+
+```json
+{"teamId":"<teamId>","alias":"A","task":"协调 B1/B2 的只读审查。用 team finish 等待全部 worker 结果，再总结发现与失败。"}
+```
+
+```json
+{"teamId":"<teamId>","tasks":[{"alias":"B1","task":"只读审查实现正确性，不修改文件，向 A 报告发现。"},{"alias":"B2","task":"只读审查测试覆盖，不修改文件，向 A 报告发现。"}]}
+```
+
+Child 使用 `team` tool；发送者和所属 team 由运行时确定，不作为参数传入：
+
+| Action | 参数示例 / 含义 |
+| --- | --- |
+| `send` | `{"action":"send","to":"B2","message":"请检查错误路径。"}`：向队友发消息。 |
+| `report` | `{"action":"report","message":"遇到阻碍，需要明确范围。","wait":{"kind":"message"}}`：向 A 报告并原子地等待回复；省略 `wait` 则只报告。 |
+| `wait` | `{"action":"wait","wait":{"kind":"member","member":"B2"}}`：等指定成员的终态结果。`{"kind":"message"}` 等 inbox 消息；仅 A 可用 `{"kind":"workers"}` 等全部 worker 结果。 |
+| `control` | 仅 A：`{"action":"control","to":"B1","command":"pause"}`；`resume` 解除暂停。`redirect` 还必须提供 `message`，用新指令替换 pending wait，但不会解除显式暂停或撤销已有操作。 |
+| `finish` | `{"action":"finish"}`：表达完成意图，不等于终态结果。A 会等全部 worker；worker 仍需输出最终答复。 |
+
+**`wait`、带 `wait` 的 `report`、`finish` 都必须是该 assistant 批次唯一的 tool call**，不能与其他工具并发发出。使用事件等待，不要轮询；自等待、未知成员和依赖环会被拒绝。
+
+- 调度默认允许 **4 个 active worker permit，A 独立准入**。等待或暂停的 worker 释放 permit，但保留 session；cooperative wait/pause 都不会结束外层父 Tool Call。运行中的成员先显示 `PAUSE REQUESTED`，到安全点后才是 `PAUSED`；已在途的模型请求、工具或 compaction 可能继续完成，不是立即冻结进程，也不回滚操作。`redirect` 的方向在下一个原生 context gate 进入模型；恢复时不会重写已经生成的请求 payload 或工具参数。
+- A 必须等每个 worker 都有 native 终态结果（含失败）后才生成最终总结，不能把 `report` 或 `finish` 自述当作完成。A 提前结束时，父调用仍保持 pending，随后以全部 worker 结果快照执行最终总结续轮。单个 worker 失败通常不阻止其余 worker 完成；A 失败或取消会停止 team，不能保证成功总结。
+- Team deadline 默认**从 prepare 起 1 小时**（`timeoutSeconds` 为正数，最多 `86400`）；全员须在**首次 join 后 30 秒内**加入，因此串行派发可能启动超时。查看状态：`subagent_team` 参数 `{"action":"status","teamId":"<teamId>"}`，省略 id 列出所有 team；取消：`{"action":"cancel","teamId":"<teamId>","reason":"停止此次审查"}`。中止任一父 dispatch 会取消 team。Reload 后未完成历史标为 `interrupted`，不恢复旧 Promise，也不自动续跑。
+- 状态显示在既有 Tool Call 输出/面板中，不是新的独立 GUI overlay。Inbox、历史与总结快照都有上限：每个父 session 最多保留 32 个 team，单条消息最多 8 KiB；容量溢出会报错，旧事件历史可能丢弃，总结快照内每个 worker 输出最多保留 16 KiB 并显式标记截断。大产物写入文件，消息中提供路径与简要结论，不把消息或 summary 当作完整 transcript。
+- 本地真实 Pi RPC + 合成 provider 测试用于验证协作和结束行为，**不等于真实外网模型的决策质量验证**。
+
 ## 测试
 
 测试用例统一放在 `tests/` 下，使用 Node 内置 `node:test`，并通过 `tsx` 加载 TypeScript。

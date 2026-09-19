@@ -16,9 +16,9 @@ A parent prepares one fixed team (one coordinator plus 1–8 workers), then laun
 
 Team v1 uses **new persistent RPC sessions only**. No target/adopt/chain/control team attachment, dynamic members, remote machines or seamless process-restart recovery. Team metadata does not enter model references or persistent agent descriptors. Existing plain RPC workers may load an inert team helper, but it exposes no active team capability until explicitly bound to a dispatch.
 
-## Proposed public surface
+## Public surface
 
-- Parent tool `subagent_team`: `prepare`, `status`, `cancel`. Prepare takes `coordinator` alias and `workers` aliases; returns a generated team id. Optional positive `timeoutSeconds` (default one hour, max one day) bounds the team; admission of both dispatches has a separate short startup deadline. Null/omitted optional arguments retain defaults.
+- Parent tool `subagent_team`: `prepare`, `status`, `cancel`. Prepare takes `coordinator` alias and `workers` aliases; returns a generated team id. Optional positive `timeoutSeconds` (default one hour, max one day) bounds the team; admission of both dispatches has a separate 30-second deadline starting at the first successful join. Null/omitted optional arguments retain defaults.
 - Existing `subagent` gains optional nullable `teamId` only at the top level. Single call alias must be the prepared coordinator; parallel call aliases must exactly match the prepared workers. Team mode requires concrete tasks and new persistent sessions, and both calls must execute as parallel siblings. Reject incompatible modes before side effects. Ordinary schemas and lifecycle behavior remain compatible.
 - Child-only tool `team`: actions `send`, `report`, `wait`, `control`, `finish`. The runtime binds sender/team/epoch/role; LLM cannot choose a sender. Control is coordinator-only and limited to `pause`, `resume`, `redirect` within this team. `report` may include a wait condition to atomically report and wait. Waiting conditions: next inbox message, named member terminal, all workers terminal. No periodic model polling.
 - A private versioned child extension command carries bind/reply/unbind frames over native RPC prompt. It returns immediately after applying the frame, never waits for agent idle. A custom entry ACK verifies application; RPC prompt success alone is insufficient.
@@ -45,7 +45,7 @@ Team v1 uses **new persistent RPC sessions only**. No target/adopt/chain/control
 - Existing non-team MAX_CONCURRENCY=4 remains unchanged. Team mode starts bounded member processes independently (max 8 workers + coordinator) and limits **active work**, not whole dispatch lifetime. Coordinator has independent admission; paused/waiting workers release an execution permit while retaining their session lease.
 - A safe-point checkpoint before a native model turn grants a permit only when joined, not manually paused and dependencies allow execution. At a wait-only team tool or settled turn, release the permit. No release while unrelated tools in the same child batch are still active: wait/report-and-wait must be sole tool calls in their batch or be rejected.
 - Pause request is `pause_requested` until a verified safe point. In-flight provider calls/tools/compaction may finish; do not claim immediate freeze or rollback. Once `paused`, no new work is admitted. Resume messages use the independent control path and can wake a paused waiter.
-- Dependency readiness does not override an explicit pause. Redirect can replace a specified wait and provides a new direction before new work; it does not undo filesystem effects.
+- Dependency readiness does not override an explicit pause. Redirect replaces the target's current pending wait and queues a new direction; it does not undo filesystem effects. Directions enter the model at its next native context gate. Already prepared provider payloads or tool arguments are not rewritten on resume; pause is not a transactional rollback/replan facility.
 - Detect self-wait, unknown members and explicit dependency cycles; dependency failure wakes waiters with a failure result rather than hanging.
 
 ## Completion and failure
@@ -133,3 +133,12 @@ git diff HEAD --check
 ```
 
 Commit verified logical slices locally only. Deliver worktree/branch, commits, actual tests and remaining limitations. No push.
+
+## Implemented validation and boundaries
+
+- Core coverage includes fixed admission, four execution permits, B1 waiting for initially queued B8, role checks, replay/old-epoch rejection, bounded inbox/results, atomic report-and-wait, explicit dependency cycles, deadlines, journal failure and interrupted history. The per-parent history capacity is 32 teams; overflow is an explicit error, not silent eviction of active work.
+- Native child probes use the installed Pi 0.85.1 RPC process. They cover an immediate private command while a tool is parked, application ACKs, live command conflicts, nullable arguments, same-batch rejection, native context/tool/provider gates, abort and late callbacks. A loopback HTTP provider confirms that a parked provider gate does not send a request. Checkpoints at tool/provider gates do not consume inbox messages; only the context gate does, preventing a pre-generated wait from losing its wakeup.
+- Registered parent-tool integration starts real child processes with a deterministic offline provider: 1A+8B message/dependency flow and finalization, coordinator pause-confirm/redirect/resume, cancellation and lease cleanup, no provider polling while parked, native automatic retry, and native threshold compaction under a temporary 64K window followed by reuse at 128K. The compaction fixture supplies a synthetic summary through the native extension hook; it does not validate an external summarization service or every overflow/retry interleaving.
+- Independent review found and regression-tested invalid unjoined calls cancelling an active team, fractional deadline wire mismatch, and startup-paused members missing from the panel. Forced RPC shutdown now waits for the child exit acknowledgement before releasing ownership.
+- Final gates in this worktree: `npm_config_offline=true npm run check` passed typecheck and **686/686 tests**; `PI_SUBAGENT_DEPTH=1 npm_config_offline=true npm test` passed **686/686 tests**; `git diff HEAD --check` passed. Local logs: `/tmp/rail-team-final-check.log` and `/tmp/rail-team-final-depth.log`.
+- This is automated handler/RPC/renderer coverage, not an interactive terminal or external live-model smoke. Model coordination quality, external gateways, and adversarial OS/tool side effects are not implied by these tests. No Pi package, global configuration, credential, original worktree or installed extension was modified as part of the feature implementation.

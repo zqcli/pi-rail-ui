@@ -107,10 +107,18 @@ test("real RPC team keeps two parent calls pending, wakes B1 from B8, and gives 
 	const instances = await store.list();
 	assert.equal(instances.length, 9);
 	for (const instance of instances) {
-		const modelTurns = (await journal(instance.alias)).filter((entry) => entry.customType === "team-e2e-turn");
+		const entries = await journal(instance.alias);
+		const modelTurns = entries.filter((entry) => entry.customType === "team-e2e-turn");
 		const result = instance.alias === "A" ? a.details.results[0] : b.details.results.find((r: any) => r.alias === instance.alias);
 		assert.equal(result.usage.turns, modelTurns.length, "all actual native turns are counted once");
-		assert.ok(modelTurns.length <= (instance.alias === "A" ? 6 : 3), "waiting must not poll the provider");
+		// Staggered worker events may legitimately wake A in separate turns.
+		// Verify actual event-driven wakeups, not a timing-dependent turn count.
+		const waits = new Set(entries.flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content.filter((part: any) => part.type === "toolCall" && part.name === "team" && part.arguments.action === "wait" && part.arguments.wait?.kind === "message").map((part: any) => part.id) : []));
+		for (const entry of entries) if (entry.message?.role === "toolResult" && waits.has(entry.message.toolCallId)) {
+			const reply = JSON.parse(entry.message.content.find((part: any) => part.type === "text").text);
+			assert.equal(reply.ok, true);
+			assert.ok(reply.events?.length > 0, "a message wait must wake from an actual event");
+		}
 	}
 });
 
@@ -131,13 +139,42 @@ test("real coordinator pauses a worker, receives safe-point confirmation, redire
 });
 
 test("real cancellation wakes both parked calls and awaits native lease cleanup without a final summary", { timeout: 90_000 }, async (t) => {
-	const { hub, teamId, dispatch, tools, ctx, store, leases } = await setup(t, 1, "cancel");
+	const { hub, teamId, dispatch, tools, ctx, store, leases, journal } = await setup(t, 1, "cancel");
 	const settled = Promise.allSettled(dispatch());
 	await waitForSnapshot(hub, teamId, (s) => s.members.every((m) => m.state === "waiting" && m.waitingFor === "message"));
+	const turns = async () => Promise.all(["A", "B1"].map(async (alias) => (await journal(alias)).filter((entry) => entry.customType === "team-e2e-turn").length));
+	const before = await turns();
+	await new Promise((resolve) => setTimeout(resolve, 120));
+	assert.deepEqual(await turns(), before, "parked members must not poll the provider");
 	await tools.get("subagent_team").execute("cancel", { action: "cancel", teamId, reason: "test cancellation" }, undefined, undefined, ctx);
 	const results = await settled;
 	assert.equal(hub.get(teamId).phase, "cancelled");
 	assert.ok(results.some((result) => result.status === "rejected"));
 	for (const result of results) if (result.status === "fulfilled") assert.ok(result.value.details.results.every((run: any) => run.status === "failed"));
 	for (const instance of await store.list()) assert.deepEqual(await leases.inspect(instance.sessionFile), { state: "free" });
+});
+
+test("team finalization waits through native automatic retry rather than the first agent_end", { timeout: 90_000 }, async (t) => {
+	const { hub, teamId, dispatch, journal, history } = await setup(t, 1, "retry");
+	const [a, b] = await Promise.all(dispatch());
+	assert.equal(hub.get(teamId).phase, "completed");
+	assert.match(a.details.results[0].output, /LIFECYCLE_FINAL/u);
+	assert.equal(b.details.results[0].status, "completed");
+	const turns = (await journal("B1")).filter((entry) => entry.customType === "team-e2e-turn");
+	assert.equal(turns.length, 2, "native retry must actually execute a second provider request");
+	assert.ok(history.filter((snapshot) => snapshot.phase === "finalizing").every((snapshot) => snapshot.members.find((member) => member.id === "B1")?.output === "B1 result"));
+});
+
+test("team preserves native threshold compaction and restores the temporary context window before reuse", { timeout: 90_000 }, async (t) => {
+	const { hub, teamId, dispatch, journal, broker, updates } = await setup(t, 1, "compaction");
+	const [a, b] = await Promise.all(dispatch());
+	assert.equal(hub.get(teamId).phase, "completed");
+	assert.match(a.details.results[0].output, /LIFECYCLE_FINAL/u);
+	assert.equal(b.details.results[0].status, "completed");
+	const entries = await journal("B1");
+	assert.ok(entries.some((entry) => entry.type === "compaction"), "native threshold compaction must write its real checkpoint");
+	assert.ok(entries.some((entry) => entry.customType === "team-e2e-compaction" && entry.data.contextWindow === 64000));
+	assert.ok(updates.some((update) => update.details.results.some((run: any) => run.alias === "B1" && run.isCompacting)));
+	const reused = await broker.dispatch({ target: "B1", task: "VERIFY_NATIVE_WINDOW" });
+	assert.equal(reused.run.output, "window=128000");
 });

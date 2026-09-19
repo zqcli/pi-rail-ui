@@ -7,7 +7,17 @@ export default function install(pi) {
 	let coordinatorStep = 0;
 	const call = (args) => [{ type: "toolCall", id: `team-${turns}`, name: "team", arguments: args }];
 	const answer = (text) => [{ type: "text", text }];
+	if (process.env.TEAM_E2E_SCENARIO === "compaction") pi.on("session_before_compact", (event, ctx) => {
+		pi.appendEntry("team-e2e-compaction", { contextWindow: ctx.model?.contextWindow });
+		return { compaction: { summary: "TEAM_MEMBER_B1 completed the assigned work.", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
+	});
 	function choose(member, text) {
+		if (["retry", "compaction"].includes(process.env.TEAM_E2E_SCENARIO)) {
+			if (member !== "A") return answer(`${member} result`);
+			if (!text.includes("All workers have settled.")) return answer("EARLY_COORDINATOR_OUTPUT");
+			if (!text.includes("B1 result")) throw new Error("Missing settled worker result");
+			return answer("LIFECYCLE_FINAL: B1 has settled");
+		}
 		if (process.env.TEAM_E2E_SCENARIO === "cancel") return call({ action: "wait", wait: { kind: "message" } });
 		if (process.env.TEAM_E2E_SCENARIO === "control") {
 			if (member !== "A") {
@@ -52,14 +62,17 @@ export default function install(pi) {
 			const text = JSON.stringify(context.messages);
 			const member = text.match(/TEAM_MEMBER_(A|B[1-8])/u)?.[1];
 			if (!member || ++turns > 12) throw new Error("Unexpected team model turn/polling");
-			const content = choose(member, text);
+			const retry = process.env.TEAM_E2E_SCENARIO === "retry" && member === "B1" && turns === 1;
+			const input = process.env.TEAM_E2E_SCENARIO === "compaction" && member === "B1" && turns === 1 ? 60000 : 1;
+			const content = retry ? [] : text.includes("VERIFY_NATIVE_WINDOW") ? answer(`window=${model.contextWindow}`) : choose(member, text);
 			const message = { role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
-				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-				stopReason: options?.signal?.aborted ? "aborted" : content[0].type === "toolCall" ? "toolUse" : "stop", timestamp: Date.now() };
+				usage: { input, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: input + 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				...(retry ? { errorMessage: "429 rate limit exceeded" } : {}),
+				stopReason: options?.signal?.aborted ? "aborted" : retry ? "error" : content[0].type === "toolCall" ? "toolUse" : "stop", timestamp: Date.now() };
 			pi.appendEntry("team-e2e-turn", { member, turn: turns });
 			const stream = createAssistantMessageEventStream();
 			stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
-			stream.push({ type: "done", reason: message.stopReason, message });
+			stream.push(retry ? { type: "error", reason: "error", error: message } : { type: "done", reason: message.stopReason, message });
 			stream.end(message);
 			return stream;
 		},

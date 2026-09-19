@@ -162,7 +162,15 @@ export class HostedSearchActivity {
 			if (this.callsById.size >= MAX_CALLS) {
 				// Keep counting distinct calls past the display cap; repeated
 				// in_progress/searching/completed events must still count once.
-				if (firstObservation) this.notify();
+				// A failed call beyond the cap is still a real failure, so it must
+				// update the phase and error even though it is not displayed.
+				if (cleanText(status, 64) === "failed") {
+					this.phaseValue = "failed";
+					this.errorValue ??= "Search call failed";
+					this.notify();
+				} else if (firstObservation) {
+					this.notify();
+				}
 				return;
 			}
 		}

@@ -321,6 +321,86 @@ test("tracks observed call ids beyond the bounded snapshot list", () => {
 	assert.equal(HostedSearchActivity.restore(snapshot).snapshot().callCount, 40);
 });
 
+test("keeps a failed call past the display cap from being overwritten by response completion", () => {
+	resetHostedSearchActivities();
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
+	setActiveHostedSearchActivity(activity);
+	const observer = new HostedSearchSseObserver(activity);
+	for (let index = 0; index < 24; index++) {
+		observer.push(sse("response.web_search_call.completed", {
+			type: "response.web_search_call.completed",
+			item_id: `ws_${index}`,
+		}));
+	}
+	observer.push(sse("response.web_search_call.in_progress", {
+		type: "response.web_search_call.in_progress",
+		item_id: "ws_beyond",
+	}));
+	observer.push(sse("response.output_item.done", {
+		type: "response.output_item.done",
+		item: {
+			id: "ws_beyond",
+			type: "web_search_call",
+			status: "failed",
+			action: { type: "search", query: "beyond cap" },
+		},
+	}));
+	observer.push(sse("response.completed", {
+		type: "response.completed",
+		response: { id: "resp_beyond", completed_at: 2, output: [] },
+	}));
+	observer.end();
+
+	const snapshot = activity.snapshot();
+	assert.equal(snapshot.callCount, 25);
+	assert.equal(snapshot.calls.length, 24);
+	assert.equal(snapshot.calls.some((call) => call.id === "ws_beyond"), false);
+	assert.equal(snapshot.phase, "failed");
+	assert.equal(snapshot.error, "Search call failed");
+	assert.equal(snapshot.endedAt, 2000);
+});
+
+test("counts repeated events for an ignored beyond-cap call id only once", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	for (let index = 0; index < 24; index++) activity.upsertCall(`ws_${index}`, "completed");
+	activity.upsertCall("ws_beyond", "in_progress");
+	activity.upsertCall("ws_beyond", "in_progress");
+	activity.upsertCall("ws_beyond", "completed");
+
+	const snapshot = activity.snapshot();
+	assert.equal(snapshot.callCount, 25);
+	assert.equal(snapshot.calls.length, 24);
+});
+
+test("records a beyond-cap failed call that arrives directly as failed", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	for (let index = 0; index < 24; index++) activity.upsertCall(`ws_${index}`, "completed");
+	activity.upsertCall("ws_beyond", "failed");
+
+	const snapshot = activity.snapshot();
+	assert.equal(snapshot.callCount, 25);
+	assert.equal(snapshot.calls.length, 24);
+	assert.equal(snapshot.phase, "failed");
+	assert.equal(snapshot.error, "Search call failed");
+});
+
+test("notifies listeners when an ignored beyond-cap call changes to failed", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
+	for (let index = 0; index < 24; index++) activity.upsertCall(`ws_${index}`, "completed");
+	activity.upsertCall("ws_beyond", "in_progress");
+	let notifications = 0;
+	activity.subscribe(() => { notifications += 1; });
+
+	activity.upsertCall("ws_beyond", "in_progress");
+	assert.equal(notifications, 0);
+	activity.upsertCall("ws_beyond", "failed");
+	assert.equal(notifications, 1);
+	activity.complete(9999);
+	const snapshot = activity.snapshot();
+	assert.equal(snapshot.phase, "failed");
+	assert.equal(snapshot.endedAt, 9999);
+});
+
 test("falls back to unique persisted call ids when a snapshot predates callCount", () => {
 	const legacySnapshot = (calls: HostedSearchSnapshot["calls"]): HostedSearchSnapshot => ({
 		version: 1,

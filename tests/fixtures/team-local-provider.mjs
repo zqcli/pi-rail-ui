@@ -3,11 +3,22 @@ import { Type } from "typebox";
 
 export default function install(pi) {
 	let turns = 0;
+	if (process.env.TEAM_PROBE_SCENARIO === "delivery") pi.on("session_before_compact", (event) => ({
+		compaction: {
+			summary: "Unrelated work only; deliberately omits collaboration facts.",
+			firstKeptEntryId: [...event.branchEntries].reverse().find((entry) => entry.type === "message").id,
+			tokensBefore: event.preparation.tokensBefore,
+		},
+	}));
 	pi.on("session_start", () => pi.appendEntry("team-probe-start", { pid: process.pid }));
 	pi.registerTool({
 		name: "team_probe_work", label: "Probe work", description: "Local native batch probe", parameters: Type.Object({}),
-		async execute() {
+		async execute(_id, _params, signal) {
 			pi.appendEntry("team-probe-work", { executed: true });
+			if (process.env.TEAM_PROBE_SCENARIO === "probe-abort") await new Promise((resolve) => {
+				if (signal.aborted) resolve();
+				else signal.addEventListener("abort", resolve, { once: true });
+			});
 			if (process.env.TEAM_PROBE_SCENARIO === "conflict") pi.registerCommand("rail-subagent-team-protocol", { description: "Runtime collision probe", handler: async () => {} });
 			return { content: [{ type: "text", text: "local-work-done" }], details: {} };
 		},
@@ -26,11 +37,11 @@ export default function install(pi) {
 			const scenario = process.env.TEAM_PROBE_SCENARIO;
 			pi.appendEntry("team-probe-provider", {
 				aborted: options?.signal?.aborted === true,
-				...(scenario?.startsWith("queued-") ? { messages: context.messages, systemPrompt: context.systemPrompt, teamParameters: context.tools?.find((tool) => tool.name === "team")?.parameters } : {}),
+				messages: context.messages, systemPrompt: context.systemPrompt, teamParameters: context.tools?.find((tool) => tool.name === "team")?.parameters,
 			});
-			if (++turns > 3) throw new Error("Unexpected provider polling");
+			if (++turns > (scenario === "delivery" ? 8 : 3)) throw new Error("Unexpected provider polling");
 			const wait = ["wait", "mixed", "wait-null", "wait-empty", "queued-wait", "queued-report-wait"].includes(scenario) && turns === 1;
-			const work = ["work", "mixed", "conflict"].includes(scenario) && turns === 1;
+			const work = (["work", "mixed", "conflict", "probe-abort"].includes(scenario) && turns === 1) || (scenario === "delivery" && turns <= 2);
 			const send = ["send-null", "send-empty", "send-denied"].includes(scenario) && turns === 1;
 			const placeholder = scenario?.endsWith("empty") ? "" : null;
 			const waitArgs = scenario === "queued-report-wait"

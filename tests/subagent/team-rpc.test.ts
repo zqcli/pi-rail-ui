@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -8,7 +8,7 @@ import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
 import { TeamRpcConnection } from "../../tools/subagents/team-rpc";
 import { TeamHub } from "../../tools/subagents/team-hub";
-import { TEAM_COMMAND_DESCRIPTION } from "../../tools/subagents/team-extension";
+import { TEAM_COMMAND_DESCRIPTION, TEAM_DELIVERY_TYPE } from "../../tools/subagents/team-extension";
 import { TEAM_COMMAND, TEAM_ENTRY_TYPE, teamExtensionPath, type TeamBinding, type TeamReply, type TeamRequest } from "../../tools/subagents/team-protocol";
 import type { RpcEvent, RpcTransport } from "../../tools/subagents/rpc-worker";
 import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
@@ -234,11 +234,12 @@ test("close while reply command discovery is pending never dispatches a late pri
 	assert.equal(transport.stopped, false);
 });
 
-async function local(t: { after(fn: () => Promise<void>): void }, scenario: string, url = "") {
+async function local(t: { after(fn: () => Promise<void>): void }, scenario: string, url = "", probe = false) {
 	const sandbox = await mkdtemp(join(tmpdir(), "rail-team-probe-"));
+	if (scenario === "delivery") await writeFile(join(sandbox, "settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 1 } }));
 	const transport = new PiRpcProcessTransport({
 		command: process.execPath,
-		args: [fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url)), "--mode", "rpc", "--offline", "--no-extensions", "--session-dir", sandbox, "-e", teamExtensionPath(), "-e", fileURLToPath(new URL("../fixtures/team-local-provider.mjs", import.meta.url)), "--model", "rail-team-local/probe"],
+		args: [fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url)), "--mode", "rpc", "--offline", "--no-extensions", "--session-dir", sandbox, "-e", teamExtensionPath(), "-e", fileURLToPath(new URL("../fixtures/team-local-provider.mjs", import.meta.url)), "--model", "rail-team-local/probe", ...(probe ? ["-e", fileURLToPath(new URL("../fixtures/team-delivery-probe.mjs", import.meta.url))] : [])],
 		cwd: sandbox,
 		env: { PATH: process.env["PATH"] ?? "", HOME: sandbox, PI_CODING_AGENT_DIR: sandbox, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", TEAM_PROBE_SCENARIO: scenario, TEAM_PROBE_URL: url },
 	});
@@ -252,6 +253,182 @@ function eventOnce(transport: RpcTransport, predicate: (event: RpcEvent) => bool
 		const off = transport.onEvent((event) => { if (predicate(event)) { clearTimeout(timer); off(); resolve(event); } });
 	});
 }
+
+test("native sendMessage context probe persists only after tool results, without extra turns, including abort", { timeout: 20000 }, async (t) => {
+	for (const abort of [false, true]) {
+		const transport = await local(t, abort ? "probe-abort" : "work", "", true);
+		const providers: any[] = [];
+		transport.onEvent((event) => {
+			if (event.type === "entry_appended" && (event["entry"] as any)?.customType === "team-probe-provider") providers.push((event["entry"] as any).data);
+		});
+		const waiting = eventOnce(transport, (event) => event.type === "entry_appended" && (event["entry"] as any)?.customType === "team-probe-work");
+		const settled = eventOnce(transport, (event) => event.type === "agent_settled");
+		await transport.request({ type: "prompt", message: "native persistence probe" });
+		if (abort) {
+			await waiting;
+			assert.match(JSON.stringify(providers[0].messages), /native-delivery-probe-fact/);
+			assert.doesNotMatch(JSON.stringify(await transport.request({ type: "get_messages" })), /native-delivery-probe-fact/, "not yet flushed during parked tool");
+			await transport.request({ type: "abort" });
+		}
+		await settled;
+		assert.equal(providers.length, abort ? 1 : 2, "context-only delivery never schedules a provider turn");
+		assert.equal(JSON.stringify(providers[0].messages).split("native-delivery-probe-fact").length - 1, 1);
+		if (!abort) assert.doesNotMatch(JSON.stringify(providers[1].messages), /native-delivery-probe-fact/, "Pi 0.85.1 continuation has a separate context array: native branch repair is required");
+		const state = await transport.request({ type: "get_state" }) as { sessionFile: string };
+		const entries = (await readFile(state.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+		const delivered = entries.findIndex((entry) => entry.type === "custom_message" && entry.customType === "team-delivery-api-probe");
+		const result = entries.findIndex((entry) => entry.type === "message" && entry.message.role === "toolResult");
+		assert.ok(result >= 0 && delivered > result, "native writer puts delivery after the tool result, also on abort");
+		assert.equal(entries.filter((entry) => entry.customType === "team-delivery-api-probe").length, 1);
+		assert.match(JSON.stringify(await transport.request({ type: "get_messages" })), /native-delivery-probe-fact/);
+	}
+});
+
+test("real Team delivery is visible before a parked tool and native abort flushes it after the result", { timeout: 15000 }, async (t) => {
+	const transport = await local(t, "probe-abort");
+	const providers: any[] = [];
+	transport.onEvent((event) => {
+		if (event.type === "entry_appended" && (event["entry"] as any)?.customType === "team-probe-provider") providers.push((event["entry"] as any).data);
+	});
+	let received = false;
+	const connection = new TeamRpcConnection(transport, { binding, onRequest: async (request) => {
+		if (!received && request.receive) {
+			received = true;
+			return { ok: true, events: [{ seq: 1, kind: "message", message: "READY-before-abort" }] };
+		}
+		return { ok: true };
+	} });
+	t.after(async () => { await connection.close().catch(() => undefined); });
+	await connection.bind();
+	const parked = eventOnce(transport, (event) => event.type === "entry_appended" && (event["entry"] as any)?.customType === "team-probe-work");
+	const settled = eventOnce(transport, (event) => event.type === "agent_settled" || event.type === "transport_error");
+	await transport.request({ type: "prompt", message: "park after receiving checkpoint" });
+	await parked;
+	assert.match(JSON.stringify(providers[0].messages), /READY-before-abort/);
+	assert.doesNotMatch(JSON.stringify(await transport.request({ type: "get_messages" })), /READY-before-abort/);
+	const state = await transport.request({ type: "get_state" }) as { sessionFile: string };
+	// Team's abort gate may retire the child before the abort RPC response; inspect
+	// only this probe's synthetic session to verify native flush before retirement.
+	await transport.request({ type: "abort" }).catch((error) => assert.match(String(error), /process stopped/));
+	await settled;
+	assert.equal(providers.length, 1);
+	const entries = (await readFile(state.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+	const result = entries.findIndex((entry) => entry.type === "message" && entry.message.role === "toolResult");
+	const delivery = entries.findIndex((entry) => entry.type === "custom_message" && entry.customType === TEAM_DELIVERY_TYPE);
+	assert.ok(result >= 0 && delivery > result);
+	assert.equal(entries.filter((entry) => entry.type === "custom_message" && entry.customType === TEAM_DELIVERY_TYPE).length, 1);
+	assert.match(entries[delivery].content, /READY-before-abort/);
+	await connection.close().catch((error) => assert.match(String(error), /Team extension failed/));
+});
+
+test("real Pi keeps checkpoint deliveries across unrelated tools and native compaction without polling or double writes", { timeout: 20000 }, async (t) => {
+	const transport = await local(t, "delivery");
+	const providers: any[] = [];
+	transport.onEvent((event) => {
+		if (event.type === "entry_appended" && (event["entry"] as any)?.customType === "team-probe-provider") providers.push((event["entry"] as any).data);
+	});
+	const hub = new TeamHub();
+	t.after(() => hub.dispose());
+	const team = hub.prepare({ coordinator: "a", workers: ["b"] });
+	const coordinator = hub.join(team.id, ["a"])[0]!;
+	const worker = hub.join(team.id, ["b"])[0]!;
+	await hub.request(coordinator, { action: "send", to: "b", message: "READY-fact", sequence: 1, requestId: "fact" });
+	const connection = new TeamRpcConnection(transport, { binding: worker, onRequest: (request, signal) => hub.request(worker, request, signal) });
+	t.after(async () => { await connection.close().catch(() => undefined); });
+	await connection.bind();
+	const prompt = async (message: string) => {
+		const settled = eventOnce(transport, (event) => event.type === "agent_settled");
+		await transport.request({ type: "prompt", message });
+		await settled;
+	};
+	await prompt("perform unrelated work twice");
+	assert.equal(providers.length, 3, "only two tool continuations, no delivery-triggered extra turns");
+	for (const provider of providers) {
+		assert.match(JSON.stringify(provider.messages), /READY-fact/);
+		assert.match(JSON.stringify(provider.messages), /coordinator/);
+		assert.doesNotMatch(JSON.stringify(provider.messages), new RegExp(worker.epoch));
+	}
+	const state = await transport.request({ type: "get_state" }) as { sessionFile: string };
+	const entries = (await readFile(state.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+	const deliveries = entries.filter((entry) => entry.type === "custom_message" && entry.customType === TEAM_DELIVERY_TYPE);
+	assert.equal(deliveries.length, 1, "continuation recovery does not write again");
+	assert.deepEqual(Object.keys(deliveries[0].details).sort(), ["deliveryId", "memberId", "teamId"]);
+	const deliveryIndex = entries.indexOf(deliveries[0]);
+	const resultIndex = entries.findIndex((entry) => entry.type === "message" && entry.message.role === "toolResult");
+	assert.ok(deliveryIndex > resultIndex, "delivery cannot split a toolCall/result pair");
+	await transport.request({ type: "compact" });
+	assert.doesNotMatch(JSON.stringify(await transport.request({ type: "get_messages" })), /READY-fact/, "real compaction removes the original delivery from native context");
+	await prompt("continue unrelated work after compaction");
+	assert.equal(providers.length, 4);
+	assert.match(JSON.stringify(providers[3].messages), /READY-fact/);
+	assert.match(JSON.stringify(providers[3].messages), /coordinator/);
+	const after = (await readFile(state.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+	assert.equal(after.filter((entry) => entry.type === "custom_message" && entry.customType === TEAM_DELIVERY_TYPE).length, 1);
+	await connection.close();
+	await transport.request({ type: "compact" });
+	await prompt("ordinary non-team dispatch");
+	assert.equal(providers.length, 5);
+	assert.doesNotMatch(JSON.stringify(providers[4].messages), /READY-fact/, "unbound contexts never recover team deliveries");
+	const rebound = new TeamRpcConnection(transport, { binding: worker, onRequest: async () => ({ ok: true }) });
+	t.after(async () => { await rebound.close().catch(() => undefined); });
+	await rebound.bind();
+	await prompt("same binding, another send after native compaction");
+	assert.equal(providers.length, 6);
+	assert.match(JSON.stringify(providers[5].messages), /READY-fact/, "same runtime binding keeps its original history boundary across sends");
+	assert.match(JSON.stringify(providers[5].messages), /coordinator/);
+	assert.doesNotMatch(JSON.stringify(providers[5].messages), new RegExp(worker.epoch));
+	await rebound.close();
+	const renewed = new TeamRpcConnection(transport, { binding: { ...worker, epoch: "new-probe-epoch" }, onRequest: async () => ({ ok: true }) });
+	t.after(async () => { await renewed.close().catch(() => undefined); });
+	await renewed.bind();
+	await prompt("same public identity, new epoch");
+	assert.equal(providers.length, 7);
+	assert.doesNotMatch(JSON.stringify(providers[6].messages), /READY-fact/, "new epoch never recovers the old lifetime");
+	await renewed.close();
+	const other = new TeamRpcConnection(transport, { binding: { ...binding, teamId: "other-team" }, onRequest: async () => ({ ok: true }) });
+	t.after(async () => { await other.close().catch(() => undefined); });
+	await other.bind();
+	await prompt("different team dispatch");
+	assert.equal(providers.length, 8);
+	assert.doesNotMatch(JSON.stringify(providers[7].messages), /READY-fact/, "a new binding cannot recover the previous team's deliveries");
+	await other.close();
+});
+
+test("real Pi new epoch filters old visible native deliveries without compaction or deleting history", { timeout: 15000 }, async (t) => {
+	const transport = await local(t, "work");
+	const providers: any[] = [];
+	transport.onEvent((event) => {
+		if (event.type === "entry_appended" && (event["entry"] as any)?.customType === "team-probe-provider") providers.push((event["entry"] as any).data);
+	});
+	let received = false;
+	const first = new TeamRpcConnection(transport, { binding, onRequest: async (request) => {
+		if (request.receive && !received) {
+			received = true;
+			return { ok: true, events: [{ seq: 1, kind: "message", message: "OLD-EPOCH-FACT" }] };
+		}
+		return { ok: true };
+	} });
+	t.after(async () => { await first.close().catch(() => undefined); });
+	const prompt = async () => {
+		const settled = eventOnce(transport, (event) => event.type === "agent_settled");
+		await transport.request({ type: "prompt", message: "unrelated work" });
+		await settled;
+	};
+	await first.bind();
+	await prompt();
+	assert.equal(providers.length, 2);
+	assert.match(JSON.stringify(providers[1].messages), /OLD-EPOCH-FACT/);
+	await first.close();
+	assert.match(JSON.stringify(await transport.request({ type: "get_messages" })), /OLD-EPOCH-FACT/, "old delivery remains visible in native history without compaction");
+	const next = new TeamRpcConnection(transport, { binding: { ...binding, epoch: "renewed-private-epoch" }, onRequest: async () => ({ ok: true }) });
+	t.after(async () => { await next.close().catch(() => undefined); });
+	await next.bind();
+	await prompt();
+	assert.equal(providers.length, 3);
+	assert.doesNotMatch(JSON.stringify(providers[2].messages), /OLD-EPOCH-FACT|private-epoch/);
+	assert.match(JSON.stringify(await transport.request({ type: "get_messages" })), /OLD-EPOCH-FACT/, "context projection must not delete native history");
+	await next.close();
+});
 
 test("real Pi private command replies while a team tool waits, with no idle wait or extra provider polls", { timeout: 15000 }, async (t) => {
 	const transport = await local(t, "wait");
@@ -326,11 +503,10 @@ test("real Pi + Hub preserve a message queued before tool preflight for the alre
 		assert.ok(waited?.reply.ok);
 		assert.ok(waited.reply.events?.some((event) => event.message === "queued-before-team-wait"), "wait must return the message without a second send/resume or model polling");
 		assert.equal(providers.length, 2);
-		const prefix = "Team checkpoint data: ";
-		const injected = providers[0].messages.flatMap((message: any) => Array.isArray(message.content) ? message.content : [])
-			.find((part: any) => part.type === "text" && part.text.startsWith(prefix));
+		const injected = providers[0].messages.flatMap((message: any) => Array.isArray(message.content) ? message.content : [{ type: "text", text: message.content }])
+			.find((part: any) => part.type === "text" && part.text.startsWith('{"ok":true') && part.text.includes('"snapshot"'));
 		assert.ok(injected, "the first provider call must actually receive the public roster");
-		const publicContext = JSON.parse(injected.text.slice(prefix.length)) as TeamReply;
+		const publicContext = JSON.parse(injected.text) as TeamReply;
 		assert.equal(publicContext.snapshot?.coordinator, "a");
 		assert.deepEqual(publicContext.snapshot?.workers, ["b"]);
 		assert.doesNotMatch(JSON.stringify(providers[0].messages), /queued-before-team-wait/);
@@ -600,7 +776,8 @@ test("real native HTTP provider gate pauses before network and fails closed when
 			await transport.request({ type: "prompt", message: "second turn without a direction" });
 			await again;
 			assert.equal(hits, before + 2);
-			assert.doesNotMatch(bodies.at(-1)!, /hub-direction-continue|private-epoch/, "the finite injection is not repeated or persisted");
+			assert.equal(bodies.at(-1)!.split("hub-direction-continue").length - 1, 1, "native history retains the consumed fact exactly once");
+			assert.doesNotMatch(bodies.at(-1)!, /private-epoch|requestId|rail-subagent-team-protocol/);
 			await connection.close();
 		}
 	}

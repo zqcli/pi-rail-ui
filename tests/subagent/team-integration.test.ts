@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
+import { runAgentLoop } from "@earendil-works/pi-agent-core";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
 import { SessionBroker } from "../../tools/subagents/session-broker";
 import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
@@ -136,6 +138,44 @@ test("real coordinator pauses a worker, receives safe-point confirmation, redire
 	const paused = events.find((e) => e.member === "B1" && e.kind === "state" && e.state === "paused");
 	const redirect = events.find((e) => e.kind === "control" && e.message === "redirect");
 	assert.ok(paused && redirect && paused.seq < redirect.seq);
+});
+
+test("native parent prepares full-property team calls before validation and runs both RPC siblings", { timeout: 90_000 }, async (t) => {
+	const { hub, teamId, tools, ctx, store } = await setup(t, 2, "control");
+	// Match the real smoke session's provider-filled optional fields, including
+	// empty session/control objects at the top level and inside grouped tasks.
+	const emptyTask = { model: "", target: "", alias: "", task: "", cwd: "", session: { mode: "fork", path: "" }, contextWindow: null, fastMode: null };
+	const emptyCall = { ...emptyTask, teamId, control: { delivery: "steer", message: "" }, tasks: [], chain: [], confirmSessionAttach: true };
+	const args = [
+		{ ...emptyCall, model: "rail-team-e2e/probe", alias: "A", task: "TEAM_MEMBER_A coordinate the workers", cwd: ctx.cwd },
+		{ ...emptyCall, tasks: ["B1", "B2"].map((alias) => ({ ...emptyTask, model: "rail-team-e2e/probe", alias, task: `TEAM_MEMBER_${alias} complete the assigned work`, cwd: ctx.cwd })) },
+	];
+	const before = structuredClone(args);
+	const tool = tools.get("subagent");
+	let requests = 0;
+	const messages = await runAgentLoop([{ role: "user", content: "Start both team siblings", timestamp: Date.now() }], {
+		systemPrompt: "Local parent integration probe", messages: [],
+		tools: [{ ...tool, execute: (id: string, params: any, signal: AbortSignal, onUpdate: any) => tool.execute(id, params, signal, onUpdate, ctx) }],
+	}, { model: nativeModel as any, convertToLlm: (items) => items as any, toolExecution: "parallel" }, () => undefined, t.signal, () => {
+		assert.ok(++requests <= 2, "the parent must not retry rejected tool calls");
+		const message: any = { role: "assistant", api: nativeModel.api, provider: nativeModel.provider, model: nativeModel.id,
+			content: requests === 1 ? args.map((arguments_, index) => ({ type: "toolCall", id: `native-team-${index}`, name: "subagent", arguments: arguments_ })) : [{ type: "text", text: "ROOT_DONE" }],
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: requests === 1 ? "toolUse" : "stop", timestamp: Date.now() };
+		const stream = createAssistantMessageEventStream();
+		stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
+		stream.push({ type: "done", reason: message.stopReason, message });
+		stream.end(message);
+		return stream;
+	});
+	const results = messages.filter((message) => message.role === "toolResult") as any[];
+	assert.equal(results.length, 2);
+	for (const result of results) assert.equal(result.isError, false, JSON.stringify(result.content));
+	assert.match(results.find((result) => result.toolCallId === "native-team-0").details.results[0].output, /CONTROL_FINAL/u);
+	assert.equal(results.find((result) => result.toolCallId === "native-team-1").details.results.length, 2);
+	assert.equal(hub.get(teamId).phase, "completed");
+	assert.equal((await store.list()).length, 3, "all three real child sessions must be created");
+	assert.deepEqual(args, before);
 });
 
 test("real cancellation wakes both parked calls and awaits native lease cleanup without a final summary", { timeout: 90_000 }, async (t) => {

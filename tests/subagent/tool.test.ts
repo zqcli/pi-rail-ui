@@ -232,6 +232,92 @@ test("two sibling tool calls share the hub and return a newly generated coordina
 	} finally { hub.dispose(); }
 });
 
+test("full-property provider A/B team args normalize no-op placeholders without mutating raw args", async () => {
+	for (const [preflight, placeholder] of [[false, ""], [true, ""], [false, "  "], [true, "  "]] as const) {
+		const hub = new TeamHub();
+		try {
+			const team = hub.prepare({ coordinator: "A", workers: ["B1", "B2"] });
+			const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+			const emptyTask = { model: placeholder, target: placeholder, alias: placeholder, task: placeholder, cwd: placeholder, session: { mode: "fork", path: placeholder }, contextWindow: null, fastMode: null };
+			const emptyCall = { ...emptyTask, teamId: team.id, control: { delivery: "steer", message: placeholder }, tasks: [], chain: [], confirmSessionAttach: true };
+			const a = { ...emptyCall, alias: "A", task: "  coordinate  " };
+			const b = { ...emptyCall, tasks: [{ ...emptyTask, alias: "B1", task: "one" }, { ...emptyTask, alias: "B2", task: "two" }] };
+			const before = structuredClone([a, b]);
+			const expectedA = { teamId: team.id, alias: "A", task: a.task, fastMode: null, confirmSessionAttach: true };
+			const expectedB = { teamId: team.id, tasks: [{ alias: "B1", task: "one", fastMode: null }, { alias: "B2", task: "two", fastMode: null }], confirmSessionAttach: true };
+			if (preflight) {
+				assert.deepEqual(tool.prepareArguments(a), expectedA);
+				assert.deepEqual(tool.prepareArguments(b), expectedB);
+				assert.deepEqual(tool.prepareArguments(expectedA), expectedA);
+				assert.deepEqual(tool.prepareArguments(expectedB), expectedB);
+			}
+			const ctx = context();
+			ctx.ui.confirm = async () => { assert.fail("empty session path must not prompt"); };
+			await Promise.all([
+				tool.execute("full-A", preflight ? tool.prepareArguments(a) : a, undefined, undefined, ctx),
+				tool.execute("full-B", preflight ? tool.prepareArguments(b) : b, undefined, undefined, ctx),
+			]);
+			assert.deepEqual(broker.requests.map((request) => request.alias).sort(), ["A", "B1", "B2"]);
+			assert.equal(broker.requests.find((request) => request.alias === "A")!.task, a.task);
+			assert.ok(broker.requests.every((request) => !request.target && !request.session && request.team?.binding.teamId === team.id));
+			assert.equal(broker.controls.length, 0);
+			assert.equal(hub.signal(team.id).aborted, false);
+			assert.deepEqual([a, b], before);
+		} finally { hub.dispose(); }
+	}
+});
+
+test("meaningful team-forbidden fields survive placeholder normalization and reject before side effects", async () => {
+	const hub = new TeamHub();
+	try {
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		hub.join(team.id, ["A"]);
+		hub.join(team.id, ["B"]);
+		const beforeTeam = hub.get(team.id);
+		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+		const item = { model: "", target: "  ", alias: "B", task: "work", cwd: "", session: { mode: "fork", path: "  " }, contextWindow: null, fastMode: null };
+		const base = { ...item, teamId: team.id, alias: "A", control: { delivery: "steer", message: "  " }, tasks: [], chain: [], confirmSessionAttach: true };
+		const grouped = { ...base, alias: "", task: "", tasks: [item] };
+		for (const raw of [
+			{ ...base, target: " existing " },
+			{ ...base, session: { mode: "fork", path: " /tmp/existing.jsonl " } },
+			{ ...base, control: { delivery: "steer", message: " real redirect " } },
+			{ ...base, chain: [{ ...item, task: "real chain task" }] },
+			{ ...grouped, target: " existing " },
+			{ ...grouped, session: { mode: "fork", path: " /tmp/existing.jsonl " } },
+			{ ...grouped, tasks: [{ ...item, target: " existing " }] },
+			{ ...grouped, tasks: [{ ...item, session: { mode: "fork", path: " /tmp/existing.jsonl " } }] },
+		]) {
+			const before = structuredClone(raw);
+			const ctx = context();
+			ctx.ui.confirm = async () => { assert.fail("forbidden team session must not prompt"); };
+			for (const args of [raw, tool.prepareArguments(raw)]) {
+				await assert.rejects(tool.execute("forbidden", args, undefined, undefined, ctx), /Team does not support|Provide exactly one mode/);
+			}
+			assert.deepEqual(raw, before);
+			assert.deepEqual(hub.get(team.id), beforeTeam);
+			assert.equal(hub.signal(team.id).aborted, false);
+		}
+		assert.equal(broker.requests.length, 0);
+		assert.equal(broker.controls.length, 0);
+	} finally { hub.dispose(); }
+});
+
+test("empty teamId placeholders use ordinary dispatch without looking up a team runtime", async () => {
+	for (const teamId of ["", "   ", null]) {
+		const { tool, broker } = setupTool({ team: () => { throw new Error("must not access team runtime"); } });
+		const raw = { teamId, alias: "ordinary", task: "work" };
+		const before = structuredClone(raw);
+		const prepared = tool.prepareArguments(raw);
+		assert.deepEqual(prepared, { alias: "ordinary", task: "work" });
+		await tool.execute("raw-ordinary", raw, undefined, undefined, context());
+		await tool.execute("prepared-ordinary", prepared, undefined, undefined, context());
+		assert.equal(broker.requests.length, 2);
+		assert.ok(broker.requests.every((request) => request.team === undefined));
+		assert.deepEqual(raw, before);
+	}
+});
+
 test("unjoined preflight failures and duplicate joins cannot cancel a running team", async () => {
 	for (const invalid of [
 		{ alias: "A", task: "work", target: "old" },

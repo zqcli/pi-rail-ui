@@ -323,14 +323,22 @@ function modeFor(params: SubagentParamsValue): SubagentMode {
 }
 
 function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
-	if (params.teamId != null && (mode === "chain" || mode === "control" || params.chain !== undefined || params.control !== undefined || params.target !== undefined || params.session !== undefined
-		|| params.tasks?.some((item) => item.target !== undefined || item.session !== undefined))) throw new Error("Team does not support target/session/chain/control");
+	const teamId = nonEmpty(params.teamId ?? undefined);
+	if (teamId) {
+		// Providers may fill optional fields with no-op placeholders. Apply the
+		// same task normalization used for dispatch before checking team lifecycle.
+		const items = [normalizeTask({ ...params, task: params.task! }), ...(params.tasks ?? []).map(normalizeTask)];
+		if (mode === "chain" || mode === "control" || params.chain?.length || nonEmpty(params.control?.message)
+			|| items.some((item) => item.target !== undefined || item.session !== undefined)) {
+			throw new Error("Team does not support target/session/chain/control");
+		}
+	}
 	if (mode !== "single" && normalizeContextWindow(params.contextWindow) !== undefined) {
 		throw new Error("contextWindow is only supported on the single task or on each parallel/chain item");
 	}
 	const confirmSessionAttach = {
 		...(typeof params.confirmSessionAttach === "boolean" ? { confirmSessionAttach: params.confirmSessionAttach } : {}),
-		...(params.teamId !== undefined ? { teamId: params.teamId } : {}),
+		...(teamId ? { teamId } : {}),
 	};
 	if (mode === "parallel") {
 		if ((params.fastMode !== undefined && params.fastMode !== null) || params.tasks!.some((item) => item.fastMode !== undefined && item.fastMode !== null)) {
@@ -698,7 +706,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			let toolStartedAt = performance.now();
-			const teamId = params.teamId ?? undefined;
+			const teamId = nonEmpty(params.teamId ?? undefined);
 			const team = teamId !== undefined ? options.team?.() : undefined;
 			let teamScope: ReturnType<typeof teamCallSignal> | undefined;
 			let unsubscribeTeam: (() => void) | undefined;

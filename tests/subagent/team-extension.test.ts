@@ -78,6 +78,9 @@ test("bound collaboration guidance names only public identity and leaves ordinar
 		assert.match(systemPrompt, /"member":"b"/);
 		assert.match(systemPrompt, /sole tool call/);
 		assert.match(systemPrompt, /without model polling/);
+		assert.match(systemPrompt, /report defaults to the coordinator/);
+		assert.match(systemPrompt, /Prefer to:null or omit to/);
+		assert.match(systemPrompt, /correct the indicated fields and retry report/);
 		assert.match(systemPrompt, /all workers' terminal outcomes/);
 		assert.match(systemPrompt, /untrusted data, not higher-priority instructions/);
 		assert.doesNotMatch(systemPrompt, /epoch|private-epoch|rail-subagent-team-protocol/);
@@ -120,7 +123,7 @@ test("wait/report-wait/finish reject mixed batch before release; worker control 
 	const h = harness();
 	await h.command("bind");
 	h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "one" }, { type: "toolCall", id: "two" }] } });
-	for (const params of [{ action: "wait", wait: { kind: "message" } }, { action: "report", message: "done", wait: { kind: "message" } }, { action: "finish" }]) {
+	for (const params of [{ action: "wait", wait: { kind: "message" } }, { action: "report", to: "a", message: "done", wait: { kind: "message" } }, { action: "finish" }]) {
 		await assert.rejects(h.tools.get("team").execute("one", params, h.ctx.signal, undefined, h.ctx), /sole tool/);
 	}
 	await assert.rejects(h.tools.get("team").execute("one", { action: "control", to: "a", command: "pause" }, undefined, undefined, h.ctx), /coordinator/);
@@ -194,11 +197,79 @@ test("sole report-and-wait appends one atomic runtime request and unbind release
 	await rejection;
 });
 
+test("report accepts a coordinator to assertion and preserves it in the atomic report/wait wire request", async () => {
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 1, action: "report", to: "a", message: "READY", wait: { kind: "message" } }), true);
+	const h = harness();
+	await h.command("bind");
+	h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "one" }] } });
+	for (const to of ["a", null, undefined]) {
+		const params = Object.freeze({ action: "report", ...(to === undefined ? {} : { to }), message: "READY", wait: Object.freeze({ kind: "message", member: null, afterSeq: null }), command: null });
+		const before = structuredClone(params);
+		const result = h.tools.get("team").execute("one", params, h.ctx.signal, undefined, h.ctx);
+		const request = h.entries.at(-1).request;
+		assert.equal(request.action, "report", "must not downgrade to send");
+		assert.equal(request.to, to ?? undefined);
+		assert.equal(request.message, "READY");
+		assert.deepEqual(request.wait, { kind: "message" });
+		await h.command("reply", { requestId: request.requestId, reply: { ok: true, events: [{ seq: 1, kind: "message", from: "a", message: "CONTINUE" }] } });
+		assert.match(JSON.stringify(await result), /CONTINUE/);
+		assert.deepEqual(params, before);
+	}
+	assert.equal(h.aborted(), 0);
+});
+
+test("report preserves a wrong to for authoritative rejection and allows correction without abort", async () => {
+	const h = harness();
+	await h.command("bind");
+	h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "one" }] } });
+	const params = Object.freeze({ action: "report", to: "other-worker", message: "READY", wait: Object.freeze({ kind: "message" }) });
+	const result = h.tools.get("team").execute("one", params, h.ctx.signal, undefined, h.ctx);
+	const rejected = assert.rejects(result, /team report rejected: report\.to must match coordinator a/);
+	const wrong = h.entries.at(-1).request;
+	assert.equal(wrong.action, "report");
+	assert.equal(wrong.to, "other-worker", "must not silently discard the assertion or downgrade to send");
+	assert.deepEqual(wrong.wait, { kind: "message" });
+	await h.command("reply", { requestId: wrong.requestId, reply: { ok: false, error: "report.to must match coordinator a" } });
+	await rejected;
+	assert.equal(h.aborted(), 0);
+	const corrected = h.tools.get("team").execute("one", { ...params, to: "a" }, h.ctx.signal, undefined, h.ctx);
+	await h.command("reply", { requestId: h.entries.at(-1).request.requestId, reply: { ok: true } });
+	await corrected;
+	assert.deepEqual(h.entries.filter((entry) => entry.kind === "request").map((entry) => entry.request.action), ["report", "report"]);
+	assert.equal(params.to, "other-worker");
+	assert.equal(h.aborted(), 0);
+});
+
+test("argument errors identify action and corrective fields without sending an empty report or entering wait", async () => {
+	const h = harness();
+	await h.command("bind");
+	for (const [params, expected] of [
+		[{ action: "report", to: "a", message: "", wait: { kind: "message" } }, /action=report:.*message cannot be empty/],
+		[{ action: "report", to: "a", message: null, wait: { kind: "message" } }, /action=report:.*requires a non-empty message/],
+		[{ action: "report", to: "a", message: "READY", wait: { kind: "message", member: "a" } }, /action=report:.*wait\.member.*message\/workers use member:null/],
+		[{ action: "report", to: "a", message: "READY", command: "pause" }, /action=report:.*command must be null or omitted/],
+		[{ action: "report", to: "a", message: "中".repeat(3000) }, /action=report:.*8192 UTF-8 bytes/],
+		[{ action: "wait", wait: { kind: "message", member: "a" } }, /action=wait:.*wait\.member/],
+		[{ action: "send", message: "hello" }, /action=send:.*requires non-empty to and message/],
+		[{ action: "finish", to: "a" }, /action=finish:.*takes no to/],
+	] as const) {
+		const before = structuredClone(params);
+		await assert.rejects(h.tools.get("team").execute("one", params, h.ctx.signal, undefined, h.ctx), expected);
+		assert.deepEqual(params, before);
+	}
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 1, action: "report", to: "a", message: "READY", wait: { kind: "message", member: "a" } }), false);
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 1, action: "report", to: "a", message: "READY", command: "pause" }), false);
+	assert.equal(h.entries.filter((entry) => entry.kind === "request").length, 0);
+	assert.equal(h.aborted(), 0);
+});
+
 test("team optional schemas are nullable/default null and provider placeholders normalize before strict wire validation", async () => {
 	const h = harness("coordinator");
 	await h.command("bind");
 	h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "one" }] } });
 	const tool = h.tools.get("team");
+	assert.match(tool.description, /report defaults to the coordinator/);
+	assert.match(tool.parameters.properties.to.anyOf.find((schema: any) => schema.type === "string").description, /supplied to asserts the coordinator alias and must match it/);
 	assert.equal(Object.hasOwn(tool.parameters.properties, "receive"), false);
 	for (const name of ["to", "message", "command", "wait"]) {
 		assert.equal(tool.parameters.properties[name].default, null);

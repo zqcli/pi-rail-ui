@@ -79,6 +79,101 @@ test("message before wait and atomic report+wait do not lose wakeups; sender is 
 	assert.equal((await hub.request({ ...b, role: "coordinator" }, forged)).ok, false);
 });
 
+for (const recipient of ["explicit", "omitted", "normalized-null"] as const) {
+	test(`report recipient ${recipient} delivers atomically to coordinator and waits for its reply`, async (t) => {
+		const { hub, a, b, request } = fixture(); t.after(() => hub.dispose());
+		// Child normalization removes null; the Hub wire contract remains optional string.
+		const to = recipient === "explicit" ? a.memberId : recipient === "normalized-null" ? null : undefined;
+		const report = { action: "report", message: "blocked", wait: { kind: "message" }, ...(to == null ? {} : { to }) } as const;
+		assert.equal(Object.hasOwn(report, "to"), recipient === "explicit");
+		let replied = false;
+		const off = hub.subscribe((snapshot) => {
+			if (!replied && snapshot.events.some((event) => event.kind === "report" && event.message === "blocked")) {
+				replied = true;
+				void request(a, { action: "send", to: b.memberId, message: "continue" });
+			}
+		});
+		const result = await request(b, report);
+		off();
+		assert.equal(result.ok, true);
+		assert.equal(result.events?.[0]?.message, "continue");
+		const inbox = await request(a, { action: "checkpoint", receive: true });
+		const delivered = inbox.events?.filter((event) => event.kind === "report");
+		assert.equal(delivered?.length, 1);
+		assert.equal(delivered?.[0]?.to, a.memberId);
+		assert.equal(delivered?.[0]?.from, b.memberId);
+	});
+}
+
+for (const recipient of ["peer", "self", "unknown", "foreign-coordinator", "foreign-team-id", "whitespace", "case", "empty"] as const) {
+	for (const withWait of [false, true]) {
+		test(`report recipient ${recipient}, wait=${withWait}: reject without delivery, state changes or permit release`, async (t) => {
+			const { hub, a, b, workers, request, id } = fixture(5); t.after(() => hub.dispose());
+			const other = hub.prepare({ coordinator: "OtherA", workers: ["OtherB"] });
+			const to = { peer: "B2", self: "B1", unknown: "missing", "foreign-coordinator": other.coordinator,
+				"foreign-team-id": other.id, whitespace: " A ", case: "a", empty: "" }[recipient];
+			for (const worker of workers.slice(0, 4)) await request(worker, { action: "checkpoint" });
+			let admitted = false;
+			const queue = request(workers[4]!, { action: "checkpoint" }).then((reply) => { admitted = true; return reply; });
+			let coordinatorReady = false;
+			const coordinatorWait = request(a, { action: "wait", wait: { kind: "message" } }).then((reply) => { coordinatorReady = true; return reply; });
+			const before = hub.get(id);
+			const otherBefore = hub.get(other.id);
+			let settled = false;
+			const invalid = request(b, { action: "report", to, message: "must not deliver", ...(withWait ? { wait: { kind: "message" as const } } : {}) })
+				.then((reply) => { settled = true; return reply; });
+			await tick();
+			assert.equal(settled, true, "invalid report+wait must return an error, not park");
+			const rejected = await invalid;
+			assert.equal(rejected.ok, false);
+			assert.match(rejected.error!, /report.*only.*coordinator.*A.*send/i);
+			assert.deepEqual(hub.get(id), before, "no report/state event or waitingFor mutation");
+			assert.deepEqual(hub.get(other.id), otherBefore);
+			assert.equal(coordinatorReady, false, "invalid report must not wake A");
+			assert.equal(admitted, false, "invalid report must retain B1's execution permit");
+			// A corrected fresh request remains usable and is the first operation to release B1's permit.
+			const corrected = request(b, { action: "report", to: a.memberId, message: "corrected", wait: { kind: "message" } });
+			assert.equal((await queue).ok, true);
+			assert.equal((await coordinatorWait).events?.find((event) => event.kind === "report")?.message, "corrected");
+			await request(a, { action: "send", to: b.memberId, message: "continue" });
+			assert.equal((await corrected).events?.[0]?.message, "continue");
+		});
+	}
+}
+
+test("report recipient errors retain request dedup and sequence rules while permitting correction", async (t) => {
+	const { hub, a, b, id } = fixture(); t.after(() => hub.dispose());
+	const invalid: TeamRequest = { requestId: "wrong-recipient", sequence: 1, action: "report", to: "B2", message: "report" };
+	const before = hub.get(id);
+	const rejected = await hub.request(b, invalid);
+	assert.equal(rejected.ok, false);
+	assert.deepEqual(await hub.request(b, invalid), rejected);
+	assert.match((await hub.request(b, { ...invalid, to: a.memberId })).error!, /Conflicting duplicate/);
+	assert.match((await hub.request(b, { ...invalid, requestId: "stale", to: a.memberId })).error!, /Stale/);
+	assert.deepEqual(hub.get(id), before);
+	assert.equal((await hub.request(b, { ...invalid, requestId: "corrected", sequence: 2, to: a.memberId })).ok, true);
+});
+
+test("explicit report recipient preserves manual pause and inbox overflow semantics", async (t) => {
+	const { hub, a, b, request, id } = fixture(); t.after(() => hub.dispose());
+	await request(b, { action: "checkpoint" });
+	await request(a, { action: "control", command: "pause", to: b.memberId });
+	const before = hub.get(id);
+	assert.equal((await request(b, { action: "report", to: "B2", message: "invalid" })).ok, false);
+	assert.deepEqual(hub.get(id), before);
+	let settled = false;
+	const pending = request(b, { action: "report", to: a.memberId, message: "blocked", wait: { kind: "message" } }).then((reply) => { settled = true; return reply; });
+	await request(a, { action: "send", to: b.memberId, message: "continue" });
+	await tick(); assert.equal(settled, false);
+	assert.equal(hub.get(id).members.find((member) => member.id === b.memberId)?.state, "paused");
+	await request(a, { action: "control", command: "resume", to: b.memberId });
+	assert.equal((await pending).ok, true);
+	for (let i = 1; i < TEAM_MAX_EVENTS; i++) assert.equal((await request(b, { action: "report", to: a.memberId, message: `report${i}` })).ok, true);
+	const full = hub.get(id);
+	assert.match((await request(b, { action: "report", to: a.memberId, message: "overflow", wait: { kind: "message" } })).error!, /overflow/);
+	assert.deepEqual(hub.get(id), full);
+});
+
 test("request id retries are idempotent, conflicting duplicates and stale sequences fail", async (t) => {
 	const { hub, a, b, request, id } = fixture(); t.after(() => hub.dispose());
 	const send: TeamRequest = { requestId: "send", sequence: 1, action: "send", to: "A", message: "once" };

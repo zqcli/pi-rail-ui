@@ -347,6 +347,64 @@ test("real Pi + Hub preserve a message queued before tool preflight for the alre
 	}
 });
 
+test("real Pi reports READY to an explicit coordinator alias through native RPC and Hub", { timeout: 20000 }, async (t) => {
+	for (const withWait of [false, true]) {
+		const hub = new TeamHub();
+		t.after(() => hub.dispose());
+		const team = hub.prepare({ coordinator: "lead", workers: ["worker"] });
+		const coordinator = hub.join(team.id, ["lead"])[0]!;
+		const worker = hub.join(team.id, ["worker"])[0]!;
+		let turns = 0;
+		const args = { action: "report", to: "lead", message: "READY", command: null, wait: withWait ? { kind: "message", member: null, afterSeq: null } : null };
+		const server = createServer((request, response) => {
+			request.resume();
+			const first = ++turns === 1;
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			const delta = first
+				? { role: "assistant", tool_calls: [{ index: 0, id: "report-one", type: "function", function: { name: "team", arguments: JSON.stringify(args) } }] }
+				: { role: "assistant", content: "report-complete" };
+			for (const chunk of [
+				{ id: "local-report", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] },
+				{ id: "local-report", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: first ? "tool_calls" : "stop" }] },
+			]) response.write(`data: ${JSON.stringify(chunk)}\n\n`);
+			response.end("data: [DONE]\n\n");
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		t.after(async () => { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); });
+		const transport = await local(t, "text", `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`);
+		const requests: TeamRequest[] = [];
+		let coordinatorSequence = 0;
+		const connection = new TeamRpcConnection(transport, { binding: worker, onRequest: async (request, signal) => {
+			requests.push(request);
+			if (request.action === "report" && withWait) {
+				const sent = await hub.request(coordinator, { requestId: "wake-worker", sequence: ++coordinatorSequence, action: "send", to: "worker", message: "CONTINUE" });
+				assert.equal(sent.ok, true);
+			}
+			return hub.request(worker, request, signal);
+		} });
+		t.after(async () => { await connection.close().catch(() => undefined); });
+		await connection.bind();
+		const settled = eventOnce(transport, (event) => event.type === "agent_settled");
+		await transport.request({ type: "prompt", message: "Report READY to the coordinator" });
+		await settled;
+		const reports = requests.filter((request) => request.action !== "checkpoint");
+		assert.equal(reports.length, 1, "READY must succeed on the first call, without report retries or an empty wait fallback");
+		assert.equal(reports[0]!.action, "report");
+		assert.equal(reports[0]!.to, "lead");
+		assert.equal(reports[0]!.message, "READY");
+		assert.deepEqual(reports[0]!.wait, withWait ? { kind: "message" } : undefined);
+		const inbox = await hub.request(coordinator, { requestId: "receive-ready", sequence: ++coordinatorSequence, action: "wait", wait: { kind: "message" } });
+		assert.ok(inbox.events?.some((event) => event.kind === "report" && event.from === "worker" && event.to === "lead" && event.message === "READY"));
+		const result = await transport.request({ type: "get_messages" }) as { messages: Array<{ role: string; toolName?: string; isError?: boolean }> };
+		assert.equal(result.messages.find((message) => message.role === "toolResult" && message.toolName === "team")?.isError, false);
+		assert.match(JSON.stringify(result), /report-complete/);
+		if (withWait) assert.match(JSON.stringify(result), /CONTINUE/);
+		assert.equal(turns, 2);
+		assert.equal(hub.signal(team.id).aborted, false);
+		await connection.close();
+	}
+});
+
 test("real Pi validates nullable/empty optional fields and marks business denials as non-aborting tool errors", { timeout: 20000 }, async (t) => {
 	for (const scenario of ["wait-null", "wait-empty", "send-null", "send-empty", "send-denied"]) {
 		const transport = await local(t, scenario);

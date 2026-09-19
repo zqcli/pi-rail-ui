@@ -12,6 +12,8 @@ export const TEAM_COMMAND_DESCRIPTION = "Rail private team protocol v1";
 // Includes the complete bounded worker result snapshot, not just one message.
 export const TEAM_FRAME_BYTES = 1024 * 1024;
 
+const REPORT_GUIDANCE = "report defaults to the coordinator (A role) identified in the public roster. Prefer to:null or omit to; a supplied to asserts the coordinator alias and must match it. Use send to address another member.";
+
 function object(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -28,7 +30,7 @@ export function strictTeamRequest(value: unknown): value is TeamRequest {
 	switch (action) {
 		case "checkpoint": case "finish": return to === undefined && message === undefined && wait === undefined && command === undefined;
 		case "send": return !!to && message !== undefined && wait === undefined && command === undefined;
-		case "report": return to === undefined && message !== undefined && command === undefined;
+		case "report": return message !== undefined && command === undefined;
 		case "wait": return !!wait && to === undefined && message === undefined && command === undefined;
 		case "control": return !!to && !!command && wait === undefined && (command !== "redirect" || message !== undefined);
 	}
@@ -38,9 +40,22 @@ function optionalNullable<T extends TSchema>(schema: T) {
 	return Type.Optional(Type.Union([schema, Type.Null()], { default: null }));
 }
 
+function toolArgumentsError(input: Record<string, unknown>, detail = ""): Error {
+	const hints: Record<string, string> = {
+		send: "send requires non-empty to and message; wait and command must be null or omitted.",
+		report: `report requires a non-empty message; wait is optional and command must be null or omitted. ${REPORT_GUIDANCE} Correct argument errors and retry report before waiting; an invalid report has not been sent.`,
+		wait: "wait requires wait.kind: message, member or workers; top-level to, message and command must be null or omitted.",
+		control: "control requires to and command: pause, resume or redirect; redirect also requires a non-empty message. wait must be null or omitted.",
+		finish: "finish takes no to, message, wait or command; set those fields to null or omit them.",
+	};
+	const action = typeof input["action"] === "string" && Object.hasOwn(hints, input["action"]) ? input["action"] : "unknown";
+	const hint = hints[action] ?? "action must be send, report, wait, control or finish; checkpoint and receive are internal only.";
+	return new Error(`Invalid team arguments for action=${action}: ${detail ? `${detail} ` : ""}${hint} wait.member is required only for wait.kind=member; for message/workers use member:null or omit it. wait.afterSeq must be a non-negative safe integer or null. Non-empty messages are limited to ${TEAM_MAX_MESSAGE_BYTES} UTF-8 bytes.`);
+}
+
 /** Only the tool surface accepts provider placeholders; the wire never accepts null. */
 function normalizeToolInput(params: Record<string, unknown>): Record<string, unknown> {
-	if (!keys(params, ["action", "to", "message", "wait", "command"])) throw new Error("Invalid team arguments");
+	if (!keys(params, ["action", "to", "message", "wait", "command"])) throw toolArgumentsError(params, "Only action, to, message, wait and command are public fields.");
 	const input = { ...params };
 	for (const key of ["to", "message", "command", "wait"]) if (input[key] === null) delete input[key];
 	for (const key of ["to", "command"]) {
@@ -50,7 +65,7 @@ function normalizeToolInput(params: Record<string, unknown>): Record<string, unk
 		}
 	}
 	if (typeof input["message"] === "string" && !input["message"].trim()) {
-		if (input["action"] === "send" || input["action"] === "report" || input["command"] === "redirect") throw new Error("Team message cannot be empty");
+		if (input["action"] === "send" || input["action"] === "report" || input["command"] === "redirect") throw toolArgumentsError(input, "message cannot be empty.");
 		delete input["message"];
 	}
 	if (object(input["wait"])) {
@@ -171,22 +186,22 @@ export default function installTeamExtension(pi: ExtensionAPI): void {
 		if (registered) return;
 		if (pi.getAllTools().some((tool) => tool.name === "team")) throw new Error("Conflicting team tool");
 		pi.registerTool({
-			name: "team", label: "Team", description: "Communicate with this team. send requires to/message; report requires message and optionally wait; wait requires a condition; control requires to/command (coordinator only). wait, report with wait, and finish MUST be the sole tool call in the assistant batch. finish is intent, not a terminal result. Messages are limited to 8192 UTF-8 bytes.",
+			name: "team", label: "Team", description: `Communicate with this team. send requires to/message; report requires message and optionally wait. ${REPORT_GUIDANCE} wait requires a condition; control requires to/command (coordinator only). wait, report with wait, and finish MUST be the sole tool call in the assistant batch. finish is intent, not a terminal result. Messages are limited to 8192 UTF-8 bytes.`,
 			parameters: Type.Object({
 				action: StringEnum(["send", "report", "wait", "control", "finish"]),
-				to: optionalNullable(Type.String({ maxLength: 64 })),
+				to: optionalNullable(Type.String({ maxLength: 64, description: `Recipient for send/control. ${REPORT_GUIDANCE}` })),
 				message: optionalNullable(Type.String({ maxLength: TEAM_MAX_MESSAGE_BYTES })),
 				command: optionalNullable(StringEnum(["pause", "resume", "redirect", ""])),
 				wait: optionalNullable(Type.Object({
 					kind: StringEnum(["message", "member", "workers"]),
-					member: optionalNullable(Type.String({ maxLength: 64 })),
+					member: optionalNullable(Type.String({ maxLength: 64, description: "Required only for kind=member. For kind=message or workers, use null or omit member." })),
 					afterSeq: optionalNullable(Type.Integer({ minimum: 0 })),
 				}, { additionalProperties: false })),
 			}, { additionalProperties: false }),
 			async execute(id, params, signal, _update, ctx) {
 				if (!binding) throw new Error("Team is not bound");
 				const validated = { ...normalizeToolInput(params), requestId: "validate", sequence: 1 };
-				if (!strictTeamRequest(validated) || validated.action === "checkpoint") throw new Error("Invalid team arguments");
+				if (!strictTeamRequest(validated) || validated.action === "checkpoint") throw toolArgumentsError(validated);
 				if (validated.action === "control" && binding.role !== "coordinator") throw new Error("Only coordinator may control members");
 				if ((validated.action === "wait" || validated.action === "finish" || validated.wait) && !sole(id, ctx)) throw new Error("Waiting/finish team call must be the sole tool in its batch");
 				let reply: TeamReply;
@@ -195,7 +210,7 @@ export default function installTeamExtension(pi: ExtensionAPI): void {
 					reply = await request(input, ctx, signal ?? ctx.signal);
 				} catch (error) { throw fail(ctx, error); }
 				// Business rejection is a native tool error, not a transport/gate failure.
-				if (!reply.ok) throw new Error(reply.error ?? "Team request rejected");
+				if (!reply.ok) throw new Error(`team ${validated.action} rejected: ${reply.error ?? "request rejected"}`);
 				return { content: [{ type: "text", text: JSON.stringify(reply) }], details: reply };
 			},
 		});
@@ -238,6 +253,8 @@ export default function installTeamExtension(pi: ExtensionAPI): void {
 		const guidance = [
 			`Team collaboration: ${JSON.stringify({ member: binding.memberId, role: binding.role })}.`,
 			"The first team context includes the public roster. Address only members in that roster; your sender identity is supplied by the runtime.",
+			REPORT_GUIDANCE,
+			"If report returns an argument error, correct the indicated fields and retry report; do not skip a required report by switching directly to wait.",
 			"Use the team tool to send/report/receive messages. team wait and report with wait park without model polling; do not repeatedly poll with model turns, shell commands or APIs.",
 			"team wait, report with wait, and finish must each be the sole tool call in the assistant batch, never in parallel with another tool.",
 			"finish is intent, not a terminal result. The coordinator must use team finish or wait(kind:workers) to await all workers' terminal outcomes, then write the final summary from the complete result snapshot. Workers cannot spawn subagents.",

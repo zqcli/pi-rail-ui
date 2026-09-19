@@ -382,6 +382,9 @@ export class TeamHub {
 				return;
 			case "send": this.deliver(team, member, request.to, request.message, "message"); break;
 			case "report":
+				if (request.to !== undefined && request.to !== team.view.coordinator) {
+					throw new Error(`report can only be sent to this team's coordinator "${team.view.coordinator}"; use send for other recipients`);
+				}
 				if (request.wait) this.validateWait(team, member, request.wait);
 				this.deliver(team, member, team.view.coordinator, request.message, "report");
 				if (request.wait) { this.park(team, member, "wait", done, request.wait, signal); return; }

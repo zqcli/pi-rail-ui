@@ -577,13 +577,21 @@ export function planPayloadRewrite(args: {
 	}
 	if (checkpoint.status !== "remote") return { action: "none" };
 	const identity = args.identity ?? compactionIdentity(model);
-	const markerPresent = input ? findSummaryIndex(input, gptCompactionSummary(checkpoint.details.checkpointId)) >= 0 : false;
+	const markerCount = input ? countSummaryMarkers(input, gptCompactionSummary(checkpoint.details.checkpointId)) : 0;
+	const markerPresent = markerCount > 0;
 	const matchingCheckpointCount = input?.filter((item) => isMatchingCheckpointItem(item, checkpoint.details.checkpoint)).length ?? 0;
-	if (matchingCheckpointCount > 1 || (markerPresent && matchingCheckpointCount > 0)) {
+	// Any second anchor (duplicate marker or an already-present checkpoint next
+	// to the marker) means one rewrite cannot account for every occurrence.
+	if (matchingCheckpointCount > 1 || markerCount > 1 || (markerPresent && matchingCheckpointCount > 0)) {
 		return { action: "fail", reason: "checkpoint-anchor-ambiguous" };
 	}
 	if (!args.remoteEnabled || !identitiesMatch(checkpoint.details.consumer, identity)) {
-		return markerPresent ? { action: "fail", reason: "checkpoint-anchor-not-replayed" } : { action: "none" };
+		// An already rewritten checkpoint carries opaque ciphertext bound to the
+		// producer identity. Forwarding it while replay is off or from another
+		// account/endpoint must fail closed instead of leaking it to the provider.
+		return markerPresent || matchingCheckpointCount > 0
+			? { action: "fail", reason: "checkpoint-anchor-not-replayed" }
+			: { action: "none" };
 	}
 	if (!input) return { action: "fail", reason: "responses-input-missing" };
 	if (matchingCheckpointCount === 0 && !markerPresent) {
@@ -640,20 +648,30 @@ function inputStartsWith(input: readonly unknown[], prefix: readonly unknown[]):
 	return true;
 }
 
-function findSummaryIndex(input: readonly unknown[], marker: string): number {
-	return input.findIndex((item) => {
-		if (!item || typeof item !== "object" || Array.isArray(item)) return false;
-		const record = item as Record<string, unknown>;
-		if (record["role"] !== "user") return false;
-		const content = record["content"];
-		if (typeof content === "string") return content.includes(marker);
-		if (!Array.isArray(content)) return false;
-		return content.some((part) => {
-			if (!part || typeof part !== "object" || Array.isArray(part)) return false;
-			const text = (part as Record<string, unknown>)["text"];
-			return typeof text === "string" && text.includes(marker);
-		});
+function isSummaryMarkerItem(item: unknown, marker: string): boolean {
+	if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+	const record = item as Record<string, unknown>;
+	if (record["role"] !== "user") return false;
+	const content = record["content"];
+	if (typeof content === "string") return content.includes(marker);
+	if (!Array.isArray(content)) return false;
+	return content.some((part) => {
+		if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+		const text = (part as Record<string, unknown>)["text"];
+		return typeof text === "string" && text.includes(marker);
 	});
+}
+
+function findSummaryIndex(input: readonly unknown[], marker: string): number {
+	return input.findIndex((item) => isSummaryMarkerItem(item, marker));
+}
+
+function countSummaryMarkers(input: readonly unknown[], marker: string): number {
+	let count = 0;
+	for (const item of input) {
+		if (isSummaryMarkerItem(item, marker)) count += 1;
+	}
+	return count;
 }
 
 function containsGptCompactionMarker(input: readonly unknown[]): boolean {

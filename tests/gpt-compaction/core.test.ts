@@ -489,6 +489,76 @@ test("payload replay replaces only the display anchor and never duplicates an al
 	assert.deepEqual(ambiguous, { action: "fail", reason: "checkpoint-anchor-ambiguous" });
 });
 
+test("an already rewritten checkpoint fails closed when replay is disabled or the consumer differs", () => {
+	const u1 = message("guard-u1", null, "original");
+	const a1 = message("guard-a1", "guard-u1", "answer", "assistant");
+	const cp = details("guard-cp", "guard-a1", "guard-u1");
+	const c1 = remoteEntry("guard-c1", "guard-a1", cp);
+	const branch = [u1, a1, c1, message("guard-u2", "guard-c1", "latest")];
+	const alreadyRewritten = { model: model.id, input: [cp.checkpoint, { role: "user", content: "latest" }] };
+
+	const off = planPayloadRewrite({ ctx: context(branch), branchEntries: branch, payload: alreadyRewritten, remoteEnabled: false, identity });
+	assert.deepEqual(off, { action: "fail", reason: "checkpoint-anchor-not-replayed" }, "off must never forward opaque ciphertext");
+
+	const crossAccount = planPayloadRewrite({
+		ctx: context(branch),
+		branchEntries: branch,
+		payload: alreadyRewritten,
+		remoteEnabled: true,
+		identity: { ...identity, authFingerprint: "account-b" },
+	});
+	assert.deepEqual(crossAccount, { action: "fail", reason: "checkpoint-anchor-not-replayed" }, "a different account must not receive another account's checkpoint");
+
+	const crossEndpoint = planPayloadRewrite({
+		ctx: context(branch),
+		branchEntries: branch,
+		payload: alreadyRewritten,
+		remoteEnabled: true,
+		identity: { ...identity, baseUrl: "https://other.example/v1" },
+	});
+	assert.deepEqual(crossEndpoint, { action: "fail", reason: "checkpoint-anchor-not-replayed" }, "a different gateway must not receive another endpoint's checkpoint");
+
+	const sameIdentity = planPayloadRewrite({ ctx: context(branch), branchEntries: branch, payload: alreadyRewritten, remoteEnabled: true, identity });
+	assert.deepEqual(sameIdentity, { action: "none" }, "a same-identity already rewritten checkpoint stays idempotent");
+});
+
+test("duplicate summary markers are rejected instead of rewriting only the first", () => {
+	const u1 = message("dup-u1", null, "original");
+	const a1 = message("dup-a1", "dup-u1", "answer", "assistant");
+	const cp = details("dup-cp", "dup-a1", "dup-u1");
+	const c1 = remoteEntry("dup-c1", "dup-a1", cp);
+	const branch = [u1, a1, c1, message("dup-u2", "dup-c1", "latest")];
+	const marker = `The conversation history before this point was compacted into the following summary:\n\n<summary>\n${gptCompactionSummary(cp.checkpointId)}\n</summary>`;
+	const duplicate = planPayloadRewrite({
+		ctx: context(branch),
+		branchEntries: branch,
+		payload: { model: model.id, input: [{ role: "user", content: marker }, { role: "user", content: marker }, { role: "user", content: "latest" }] },
+		remoteEnabled: true,
+		identity,
+	});
+	assert.deepEqual(duplicate, { action: "fail", reason: "checkpoint-anchor-ambiguous" }, "two identical anchors would leave one marker unreplayed");
+});
+
+test("ordinary text and unrelated markers are not mistaken for the exact checkpoint anchor", () => {
+	const u1 = message("text-u1", null, "original");
+	const a1 = message("text-a1", "text-u1", "answer", "assistant");
+	const cp = details("text-cp", "text-a1", "text-u1");
+	const c1 = remoteEntry("text-c1", "text-a1", cp);
+	const branch = [u1, a1, c1, message("text-u2", "text-c1", "latest")];
+	const rebuiltInput = rebuiltBranchInput(model, branch);
+	const nativePayload = planPayloadRewrite({ ctx: context(branch), branchEntries: branch, payload: { model: model.id, input: rebuiltInput }, remoteEnabled: false, identity });
+	assert.deepEqual(nativePayload, { action: "none" }, "a rebuilt native payload with no marker or ciphertext stays untouched");
+
+	const ordinary = planPayloadRewrite({
+		ctx: context(branch),
+		branchEntries: branch,
+		payload: { model: model.id, input: [{ role: "user", content: "[GPT remote compaction checkpoint not-the-active-id]" }] },
+		remoteEnabled: false,
+		identity,
+	});
+	assert.deepEqual(ordinary, { action: "none" }, "another checkpoint's marker is not this checkpoint's exact anchor");
+});
+
 test("compaction details accept exactly one matching replacement item", () => {
 	const valid = details("strict", "answer", "user");
 	assert.equal(isGptCompactionDetails(valid), true);

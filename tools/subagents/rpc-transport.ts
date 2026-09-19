@@ -116,8 +116,9 @@ export class PiRpcProcessTransport implements RpcTransport {
 				return;
 			}
 			const timeout = setTimeout(() => {
+				// Sending SIGKILL is not an exit acknowledgement. The session lease
+				// must stay held until Node has reaped the child below.
 				proc.kill("SIGKILL");
-				resolve();
 			}, 1500);
 			proc.once("exit", () => {
 				clearTimeout(timeout);

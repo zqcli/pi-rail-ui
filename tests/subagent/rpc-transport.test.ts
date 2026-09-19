@@ -41,6 +41,15 @@ test("PiRpcProcessTransport surfaces RPC failures", async () => {
 	await transport.stop();
 });
 
+test("PiRpcProcessTransport waits for exit after forced termination before releasing ownership", { timeout: 10_000 }, async () => {
+	const transport = new PiRpcProcessTransport({ command: process.execPath, cwd: process.cwd(), args: ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000); console.log(JSON.stringify({type:"ready", pid:process.pid}));'] });
+	const ready = new Promise<number>((resolve) => transport.onEvent((event) => { if (event.type === "ready") resolve(event["pid"] as number); }));
+	await transport.start();
+	const pid = await ready;
+	await Promise.all([transport.stop(), transport.stop()]);
+	assert.throws(() => process.kill(pid, 0), (error: any) => error.code === "ESRCH", "stop must wait until the child is reaped");
+});
+
 test("PiRpcProcessTransport rejects requests once shutdown starts", async () => {
 	const transport = new PiRpcProcessTransport({ command: process.execPath, args: [fixture], cwd: process.cwd() });
 	await transport.start();

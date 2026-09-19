@@ -340,7 +340,12 @@ test("team batch rejects missing or duplicate sides before join, dispatch or can
 		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
 		const a = { teamId: snapshot.id, alias: "A", task: "coordinate" };
 		const b = { teamId: snapshot.id, tasks: [{ alias: "B", task: "work" }] };
-		for (const sides of [[a], [b], [a, a], [b, b], [a, b, a], [a, b, b], [{ ...a, alias: " " }, b]]) {
+		for (const sides of [[a], [b], [a, a], [b, b], [a, b, a], [a, b, b], [{ ...a, alias: " " }, b],
+			[a, { ...b, tasks: [{ task: "work" }] }],
+			[a, { ...b, tasks: [{ alias: " ", task: "work" }] }],
+			[a, { ...b, tasks: [{ alias: "B", task: " " }] }],
+			[a, { ...b, tasks: [{ alias: "B", task: "one" }, { alias: " B ", task: "two" }] }],
+		]) {
 			const calls = sides.map((args, index) => ({ id: `side-${index}`, arguments: args }));
 			const ctx = contextWithBatch(calls);
 			// Native sequential batches may already have trailing tool results. The

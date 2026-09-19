@@ -387,7 +387,9 @@ function assertTeamDispatchBatch(toolCallId: string, teamId: string, ctx: Extens
 			const mode = modeFor(raw);
 			const normalized = filterParamsForMode(raw, mode);
 			if (mode === "single" && normalized.alias) singles++;
-			if (mode === "parallel" && normalized.tasks?.length) parallels++;
+			if (mode === "parallel" && normalized.tasks?.length
+				&& normalized.tasks.every((item) => item.alias && nonEmpty(item.task))
+				&& new Set(normalized.tasks.map((item) => item.alias)).size === normalized.tasks.length) parallels++;
 		}
 	} catch { throw error; }
 	if (singles !== 1 || parallels !== 1) throw error;

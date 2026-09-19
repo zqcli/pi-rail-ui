@@ -55,6 +55,41 @@ Team v1 uses **new persistent RPC sessions only**. No target/adopt/chain/control
 - Worker failures default to best-effort completion of remaining workers; coordinator sees failures and summarizes partial outcomes. Coordinator failure or user/team cancellation stops new work and aborts/cleans remaining participants. Exceptional cancellation cannot promise a successful coordinator summary.
 - Finalized members cannot be resumed; late messages from old epochs cannot resurrect work.
 
+## Frozen TypeScript seams for parallel implementation
+
+`team-protocol.ts` is parent-owned. Helpers import its wire types without changing it; report needed changes.
+
+Core exports `TeamHub` with constructor options `{ onSnapshot?: (snapshot: TeamSnapshot) => void; startupTimeoutMs?: number; now?: () => number }` and methods:
+
+```ts
+prepare(input: { coordinator: string; workers: string[]; timeoutSeconds?: number }): TeamSnapshot;
+join(teamId: string, memberIds: string[]): TeamBinding[]; // atomic fixed-roster claim; no waiting
+request(binding: TeamBinding, request: TeamRequest, signal?: AbortSignal): Promise<TeamReply>;
+complete(binding: TeamBinding, outcome: TeamOutcome): void;
+waitForWorkers(binding: TeamBinding, signal?: AbortSignal): Promise<TeamSnapshot>;
+get(teamId: string): TeamSnapshot;
+list(): TeamSnapshot[];
+signal(teamId: string): AbortSignal;
+subscribe(listener: (snapshot: TeamSnapshot) => void): () => void;
+cancel(teamId: string, reason?: string): void;
+restore(snapshots: readonly TeamSnapshot[]): void; // nonterminal becomes interrupted, no live bindings
+// request checkpoint waits for full roster admission and a permit; waits/finish release permit.
+// coordinator finish/waitForWorkers obtains finalizing state only after all workers terminal.
+dispose(): void;
+```
+
+Child adapter exports `TeamRpcConnection` from `team-rpc.ts`:
+
+```ts
+constructor(transport: RpcTransport, channel: TeamWorkerChannel, signal?: AbortSignal);
+bind(): Promise<void>; // subscribe before command, validate helper/version, app-level ACK
+close(): Promise<void>; // unbind, dispose listener, settle outstanding work; idempotent
+```
+
+Host adds optional `team?: TeamWorkerChannel` to WorkerSendOptions and optional `team?: TeamDispatchChannel` to DispatchRequest. `RpcSessionWorker.send` binds before native prompt and closes at settlement/failure. The broker keeps the entire optional afterRun/continuation loop inside its existing enqueue operation; normal requests remain a single send. `afterRun` may await workers and return one final-summary prompt without returning the outer dispatch. No other target run can enter the gap. Team command delivery uses the connection's transport directly, not worker.send/control.
+
+The host may use a small `TeamRunManager`/factory in team-runner.ts to wire Hub channels and afterRun callbacks. TeamRpcConnection.close must preserve the original send error if cleanup also fails; unknown bind/delivery must fail closed, not start an ordinary prompt with a private command as user text.
+
 ## Development slices / parallel ownership
 
 ### Slice 0 — specification and native probes (parent)

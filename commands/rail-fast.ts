@@ -18,15 +18,12 @@ export type NativeFastModel = {
 	samplingParams?: Record<string, unknown>;
 };
 
-type AppliedFastMode = {
-	model: NativeFastModel;
-	originalSamplingParams: Record<string, unknown> | undefined;
-};
-
 let enabled = false;
-let restrictStartupFastModeToGpt = false;
+// Child processes start with the standalone flag and stay GPT-only; a normal
+// parent session keeps Pi's API-only scope. A slash toggle must not widen a
+// child's restriction.
+let restrictToGptModels = false;
 let activeForCurrentModel = false;
-let appliedFastMode: AppliedFastMode | undefined;
 
 type InstallClaim = { claimed: boolean };
 
@@ -52,22 +49,30 @@ export function supportsNativeGptFastMode(model: NativeFastModel | undefined): m
 	return supportsNativeFastMode(model) && (isGptModelName(model.id) || isGptModelName(model.name));
 }
 
-export function applyNativeFastMode(model: NativeFastModel | undefined): boolean {
+/**
+ * Single eligibility decision shared by the status/footer and the request hook
+ * so a GPT-only child restriction and the parent's API-only scope can never
+ * disagree. Eligibility is evaluated against the model of the moment, so an
+ * in-place switch updates both without re-registering the extension.
+ */
+function fastModeEligible(model: NativeFastModel | undefined): model is NativeFastModel {
 	if (!supportsNativeFastMode(model)) return false;
-	if (appliedFastMode?.model === model && model.samplingParams?.["service_tier"] === "priority") return true;
-
-	restoreNativeFastMode();
-	appliedFastMode = { model, originalSamplingParams: model.samplingParams };
-	model.samplingParams = { ...model.samplingParams, service_tier: "priority" };
-	return true;
+	return !restrictToGptModels || supportsNativeGptFastMode(model);
 }
 
-export function restoreNativeFastMode(): void {
-	const applied = appliedFastMode;
-	if (!applied) return;
-	if (applied.originalSamplingParams === undefined) delete applied.model.samplingParams;
-	else applied.model.samplingParams = applied.originalSamplingParams;
-	appliedFastMode = undefined;
+/**
+ * Fast mode is injected into each provider payload instead of mutating the
+ * active model's samplingParams. Pi refreshes the active model object whenever
+ * an extension re-registers its provider (hosted search does this on model
+ * switches), which silently drops model mutations and would leave a switched
+ * back GPT request without service_tier. Injecting per payload also preserves
+ * the model's original sampling parameters untouched.
+ */
+function withNativeFastServiceTier(payload: unknown): unknown {
+	if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+	const record = payload as Record<string, unknown>;
+	if (record["service_tier"] === "priority") return undefined;
+	return { ...record, service_tier: "priority" };
 }
 
 export function railFastFooterLabel(): string | undefined {
@@ -77,14 +82,7 @@ export function railFastFooterLabel(): string | undefined {
 
 function updateStatus(ctx: ExtensionContext): void {
 	const model = ctx.model as NativeFastModel | undefined;
-	const eligible = supportsNativeFastMode(model)
-		&& (!restrictStartupFastModeToGpt || supportsNativeGptFastMode(model));
-	if (!enabled || !eligible) {
-		restoreNativeFastMode();
-		activeForCurrentModel = false;
-	} else {
-		activeForCurrentModel = applyNativeFastMode(model);
-	}
+	activeForCurrentModel = enabled && fastModeEligible(model);
 	if (!ctx.hasUI) return;
 	const status = enabled
 		? activeForCurrentModel ? "FAST" : "FAST (inactive)"
@@ -114,10 +112,8 @@ export function installRailFast(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
 			if (action === "on") {
-				restrictStartupFastModeToGpt = false;
 				enabled = true;
 			} else if (action === "off") {
-				restrictStartupFastModeToGpt = false;
 				enabled = false;
 			}
 			else if (action !== "status") {
@@ -131,8 +127,8 @@ export function installRailFast(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		restrictStartupFastModeToGpt = pi.getFlag?.(RAIL_FAST_MODE_FLAG) === true;
-		enabled = restrictStartupFastModeToGpt;
+		restrictToGptModels = pi.getFlag?.(RAIL_FAST_MODE_FLAG) === true;
+		enabled = restrictToGptModels;
 		updateStatus(ctx);
 	});
 
@@ -140,10 +136,14 @@ export function installRailFast(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 	});
 
+	pi.on("before_provider_request", async (event, ctx) => {
+		if (!enabled || !fastModeEligible(ctx.model as NativeFastModel | undefined)) return undefined;
+		return withNativeFastServiceTier(event.payload);
+	});
+
 	pi.on("session_shutdown", async () => {
-		restoreNativeFastMode();
 		enabled = false;
-		restrictStartupFastModeToGpt = false;
+		restrictToGptModels = false;
 		activeForCurrentModel = false;
 	});
 }

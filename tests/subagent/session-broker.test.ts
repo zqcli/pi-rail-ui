@@ -449,8 +449,86 @@ describe("SessionBroker", () => {
 		assert.equal(broker.knownFastMode(saved.alias), undefined);
 	});
 
+	test("descriptor snapshots expose model and fast policy together at creation", async () => {
+		const { broker } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "descriptor-review", task: "initial", fastMode: true });
+
+		assert.deepEqual(broker.knownModel("descriptor-review"), reviewerModel());
+		assert.deepEqual(broker.knownModel(created.instance.agentId), reviewerModel());
+		assert.equal(broker.knownFastMode("descriptor-review"), true);
+		assert.equal(broker.knownModel("missing-review"), undefined);
+		assert.equal(broker.knownFastMode("missing-review"), undefined);
+	});
+
+	test("listLinked and prewarm refresh model snapshots for linked and saved descriptors", async () => {
+		const { broker, store, roster } = setup();
+		const linked = savedAgent("agt_linked_snapshot", "linked-snapshot");
+		const saved = savedAgent("agt_saved_snapshot", "saved-snapshot");
+		await store.put(linked);
+		await store.put(saved);
+		roster.link(linked.alias, linked.agentId);
+
+		assert.equal(broker.knownModel(linked.agentId), undefined);
+		await broker.listLinked();
+		assert.deepEqual(broker.knownModel(linked.agentId), linked.model);
+		assert.equal(broker.knownFastMode(linked.alias), true);
+
+		assert.equal(broker.knownModel(saved.agentId), undefined);
+		await broker.prewarmFastModes();
+		assert.deepEqual(broker.knownModel(saved.agentId), saved.model);
+		assert.equal(broker.knownFastMode(saved.agentId), true);
+	});
+
+	test("descriptor snapshots isolate model clones from callers and live descriptors", async () => {
+		const instances = new Map<string, AgentInstance>();
+		const liveStore: AgentInstanceStore = {
+			get: async (agentId) => instances.get(agentId),
+			put: async (instance) => { instances.set(instance.agentId, instance); },
+			delete: async (agentId) => { instances.delete(agentId); },
+			list: async () => Array.from(instances.values()),
+		};
+		const saved = savedAgent("agt_clone", "clone-review");
+		instances.set(saved.agentId, saved);
+		const broker = new SessionBroker({ store: liveStore, roster: new MemoryRoster(), workerFactory: async () => new FakeWorker(saved.sessionId, saved.sessionFile) });
+		await broker.prewarmFastModes();
+
+		const returned = broker.knownModel(saved.agentId);
+		assert.deepEqual(returned, reviewerModel());
+		returned!.modelId = "tampered-read";
+		assert.deepEqual(broker.knownModel(saved.agentId), reviewerModel(), "callers must not mutate the cached descriptor");
+
+		saved.model.modelId = "tampered-live";
+		saved.fastMode = false;
+		assert.deepEqual(broker.knownModel(saved.agentId), reviewerModel(), "the snapshot must not alias the store's live descriptor");
+		assert.equal(broker.knownFastMode(saved.agentId), true);
+	});
+
+	test("changeModel and setFastMode keep the other half of the descriptor snapshot intact", async () => {
+		const { broker } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "descriptor-update", task: "initial", fastMode: true });
+		const replacement: RailModelRef = { provider: "deepseek", modelId: "deepseek-v4-flash", thinkingLevel: "high" };
+
+		await broker.changeModel(created.instance.agentId, replacement);
+		assert.deepEqual(broker.knownModel(created.instance.agentId), replacement);
+		assert.equal(broker.knownFastMode(created.instance.agentId), true, "a model change must preserve the fast policy");
+
+		await broker.setFastMode(created.instance.agentId, false);
+		assert.deepEqual(broker.knownModel(created.instance.agentId), replacement, "a fast-mode change must preserve the model");
+		assert.equal(broker.knownFastMode(created.instance.agentId), false);
+	});
+
+	test("delete clears both halves of the descriptor snapshot", async () => {
+		const { broker } = setup();
+		const created = await broker.dispatch({ model: reviewerModel(), alias: "descriptor-delete", task: "initial", fastMode: true });
+
+		assert.deepEqual(broker.knownModel(created.instance.agentId), reviewerModel());
+		await broker.delete(created.instance.agentId);
+		assert.equal(broker.knownModel(created.instance.agentId), undefined);
+		assert.equal(broker.knownFastMode(created.instance.agentId), undefined);
+	});
+
 	for (const readKind of ["listLinked", "prewarm"] as const) {
-		for (const mutation of ["setFastMode", "delete"] as const) {
+		for (const mutation of ["setFastMode", "changeModel", "delete"] as const) {
 			test(`${readKind} ignores an old read after ${mutation}`, async () => {
 				const store = new MemoryInstanceStore();
 				const roster = new MemoryRoster();
@@ -460,6 +538,7 @@ describe("SessionBroker", () => {
 				const broker = new SessionBroker({ store, roster, workerFactory: async () => new FakeWorker(saved.sessionId, saved.sessionFile) });
 				await broker.prewarmFastModes();
 				assert.equal(broker.knownFastMode(saved.agentId), true);
+				assert.deepEqual(broker.knownModel(saved.agentId), saved.model);
 
 				const started = Promise.withResolvers<void>();
 				const release = Promise.withResolvers<void>();
@@ -473,19 +552,66 @@ describe("SessionBroker", () => {
 				const oldRead = readKind === "listLinked" ? broker.listLinked() : broker.prewarmFastModes();
 				await started.promise;
 
+				const replacement: RailModelRef = { provider: "test", modelId: "replacement-model" };
 				if (mutation === "setFastMode") {
 					await broker.setFastMode(saved.agentId, false, { sessionLeaseHeld: true });
 					assert.equal(broker.knownFastMode(saved.agentId), false);
+					assert.deepEqual(broker.knownModel(saved.agentId), saved.model);
+				} else if (mutation === "changeModel") {
+					await broker.changeModel(saved.agentId, replacement);
+					assert.deepEqual(broker.knownModel(saved.agentId), replacement);
+					assert.equal(broker.knownFastMode(saved.agentId), true);
 				} else {
 					await broker.delete(saved.agentId);
 					assert.equal(broker.knownFastMode(saved.agentId), undefined);
+					assert.equal(broker.knownModel(saved.agentId), undefined);
 				}
 				release.resolve();
 				await oldRead;
 
-				assert.equal(broker.knownFastMode(saved.agentId), mutation === "setFastMode" ? false : undefined);
+				if (mutation === "setFastMode") {
+					assert.equal(broker.knownFastMode(saved.agentId), false);
+					assert.deepEqual(broker.knownModel(saved.agentId), saved.model);
+				} else if (mutation === "changeModel") {
+					assert.deepEqual(broker.knownModel(saved.agentId), replacement);
+					assert.equal(broker.knownFastMode(saved.agentId), true);
+				} else {
+					assert.equal(broker.knownFastMode(saved.agentId), undefined);
+					assert.equal(broker.knownModel(saved.agentId), undefined);
+				}
 			});
 		}
+
+		test(`${readKind} cannot restore a superseded model and fast-mode combination`, async () => {
+			const store = new MemoryInstanceStore();
+			const roster = new MemoryRoster();
+			const saved = savedAgent(`agt_combo_${readKind}`, `combo-${readKind}`);
+			await store.put(saved);
+			roster.link(saved.alias, saved.agentId);
+			const broker = new SessionBroker({ store, roster, workerFactory: async () => new FakeWorker(saved.sessionId, saved.sessionFile) });
+			await broker.prewarmFastModes();
+
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			if (readKind === "listLinked") {
+				store.getStarted = () => started.resolve();
+				store.getBlockers.push(release.promise);
+			} else {
+				store.listStarted = () => started.resolve();
+				store.listBlockers.push(release.promise);
+			}
+			const oldRead = readKind === "listLinked" ? broker.listLinked() : broker.prewarmFastModes();
+			await started.promise;
+
+			const replacement: RailModelRef = { provider: "test", modelId: "combo-replacement" };
+			await broker.changeModel(saved.agentId, replacement);
+			await broker.setFastMode(saved.agentId, false, { sessionLeaseHeld: true });
+			release.resolve();
+			await oldRead;
+
+			assert.deepEqual(broker.knownModel(saved.agentId), replacement);
+			assert.equal(broker.knownFastMode(saved.agentId), false);
+		});
 	}
 
 	test("setFastMode updates an idle or stopped agent and reopens it with the saved policy", async () => {

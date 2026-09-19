@@ -97,7 +97,7 @@ test("stateless JSON adapter counts hosted search entries in final and streamed 
 	assert.equal(updates.every((update) => (update.usage.searches ?? 0) <= 3), true);
 });
 
-test("every stateless dispatch starts the standalone search extension in live mode", async () => {
+test("stateless dispatches load Fast and Search only for GPT models", async () => {
 	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
 	let capturedArgs: string[] = [];
 	const runner = createStatelessAgentRunner({
@@ -117,6 +117,12 @@ test("every stateless dispatch starts the standalone search extension in live mo
 		assert.equal(capturedArgs.filter((arg) => arg === railOaiSearchExtensionPath()).length, 1, `${label}: duplicate search extension`);
 		assert.equal(capturedArgs.filter((arg) => arg === `--${RAIL_OAI_SEARCH_MODE_FLAG}`).length, 1, `${label}: duplicate search flag`);
 	};
+	const assertNoNativeExtensions = (label: string) => {
+		assert.equal(capturedArgs.includes(railOaiSearchExtensionPath()), false, `${label}: non-GPT must not load Search`);
+		assert.equal(capturedArgs.includes(`--${RAIL_OAI_SEARCH_MODE_FLAG}`), false, `${label}: non-GPT must not pass the search flag`);
+		assert.equal(capturedArgs.includes(railFastExtensionPath()), false, `${label}: non-GPT must not load Fast`);
+		assert.equal(capturedArgs.includes(`--${RAIL_FAST_MODE_FLAG}`), false, `${label}: non-GPT must not pass the fast flag`);
+	};
 
 	await runner({ model, task: "default", cwd: process.cwd() });
 	assertLiveSearch("default");
@@ -124,11 +130,14 @@ test("every stateless dispatch starts the standalone search extension in live mo
 	assertLiveSearch("fastMode");
 	await runner({ model, task: "explicit budget", cwd: process.cwd(), contextWindow: 64_000 });
 	assertLiveSearch("contextWindow");
-	await runner({ model: { provider: "cus-resp", modelId: "deepseek-v4" }, task: "non-GPT", cwd: process.cwd() });
-	assertLiveSearch("non-GPT model");
+	const nonGptModel: RailModelRef = { provider: "cus-resp", modelId: "deepseek-v4" };
+	await runner({ model: nonGptModel, task: "non-GPT", cwd: process.cwd() });
+	assertNoNativeExtensions("non-GPT model");
+	await runner({ model: nonGptModel, task: "non-GPT fast", cwd: process.cwd(), fastMode: true });
+	assertNoNativeExtensions("non-GPT fastMode");
 });
 
-test("stateless runner forwards fastMode only for an explicit true dispatch", async () => {
+test("stateless runner forwards fastMode only for an explicit true GPT dispatch", async () => {
 	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
 	let capturedArgs: string[] = [];
 	const runner = createStatelessAgentRunner({
@@ -148,6 +157,11 @@ test("stateless runner forwards fastMode only for an explicit true dispatch", as
 
 	await runner({ model, task: "default", cwd: process.cwd() });
 	assert.deepEqual(capturedArgs.includes(`--${RAIL_FAST_MODE_FLAG}`), false);
+
+	await runner({ model: { provider: "cus-resp", modelId: "deepseek-v4" }, task: "non-GPT fast", cwd: process.cwd(), fastMode: true });
+	assert.equal(capturedArgs.includes(`--${RAIL_FAST_MODE_FLAG}`), false);
+	assert.equal(capturedArgs.includes(railFastExtensionPath()), false);
+	assert.equal(capturedArgs.includes(railOaiSearchExtensionPath()), false);
 });
 
 test("production stateless runner enables an ephemeral session from the persisted GPT setting", async (t) => {

@@ -4,6 +4,7 @@ import {
 	installRailOaiSearch,
 	isGptModel,
 	RAIL_OAI_SEARCH_MODE_FLAG,
+	supportsNativeGptSearch,
 	transformNativeSearchPayload,
 } from "../../commands/rail-oai-search";
 import { hostedSearchActivityForMessage } from "../../openai/hosted-search-activity";
@@ -27,6 +28,19 @@ test("recognizes GPT models by id or display name without restricting provider",
 	assert.equal(isGptModel({ id: "gpt-5.6-sol", name: "GPT", provider: "custom" }), true);
 	assert.equal(isGptModel({ id: "claude-opus", name: "Claude Opus" }), false);
 	assert.equal(isGptModel(undefined), false);
+});
+
+test("strict native search eligibility requires a GPT name and a Responses-capable API", () => {
+	assert.equal(supportsNativeGptSearch({ id: "gpt-5.6-sol", api: "openai-responses" }), true);
+	assert.equal(supportsNativeGptSearch({ id: "gpt-5.6-sol", api: "azure-openai-responses" }), true);
+	assert.equal(supportsNativeGptSearch({ id: "custom-latest", name: "GPT 5.6", api: "cus-resp" }), true);
+	assert.equal(supportsNativeGptSearch({ id: "gpt-5.6-sol", api: " openai-responses " }), true);
+	assert.equal(supportsNativeGptSearch({ id: "gpt-4.1", api: "openai-completions" }), false);
+	assert.equal(supportsNativeGptSearch({ id: "gpt-5.6-sol", api: "anthropic-messages" }), false);
+	assert.equal(supportsNativeGptSearch({ id: "gpt-5.6-sol" }), false);
+	assert.equal(supportsNativeGptSearch({ id: "gpt-5.6-sol", api: "   " }), false);
+	assert.equal(supportsNativeGptSearch({ id: "claude-opus", name: "Claude", api: "openai-responses" }), false);
+	assert.equal(supportsNativeGptSearch(undefined), false);
 });
 
 test("injects live hosted search, removes competing web search tools, and preserves includes", () => {
@@ -55,7 +69,7 @@ test("injects live hosted search, removes competing web search tools, and preser
 	};
 
 	const result = transformNativeSearchPayload(
-		{ id: "gpt-5.6-sol", name: "GPT 5.6" },
+		{ id: "gpt-5.6-sol", name: "GPT 5.6", api: "openai-responses" },
 		"live",
 		payload,
 	);
@@ -81,7 +95,7 @@ test("injects live hosted search, removes competing web search tools, and preser
 test("injects cached hosted search with external access disabled", () => {
 	const payload = { model: "gpt-5.6-sol", input: "Search for Pi releases", include: null };
 	assert.deepEqual(
-		transformNativeSearchPayload({ id: "gpt-5.6-sol", name: "GPT 5.6" }, "cached", payload),
+		transformNativeSearchPayload({ id: "gpt-5.6-sol", name: "GPT 5.6", api: "openai-responses" }, "cached", payload),
 		{
 			...payload,
 			tools: [{ type: "web_search", external_web_access: false }],
@@ -105,7 +119,7 @@ test("rewrites allowed tool choices without leaving removed search tools behind"
 		},
 	};
 	const result = transformNativeSearchPayload(
-		{ id: "gpt-5.6-sol", name: "GPT 5.6" },
+		{ id: "gpt-5.6-sol", name: "GPT 5.6", api: "openai-responses" },
 		"live",
 		payload,
 	) as Record<string, any>;
@@ -118,7 +132,7 @@ test("rewrites allowed tool choices without leaving removed search tools behind"
 });
 
 test("leaves disabled, non-GPT, non-Responses, and malformed payloads unchanged", () => {
-	const model = { id: "gpt-5.6-sol", name: "GPT 5.6" };
+	const model = { id: "gpt-5.6-sol", name: "GPT 5.6", api: "openai-responses" };
 	const responsesPayload = { model: "gpt-5.6-sol", input: [] };
 	const completionsPayload = { model: "gpt-5.6-sol", messages: [] };
 	const malformedTools = { model: "gpt-5.6-sol", input: [], tools: {} };
@@ -126,7 +140,15 @@ test("leaves disabled, non-GPT, non-Responses, and malformed payloads unchanged"
 
 	assert.equal(transformNativeSearchPayload(model, "off", responsesPayload), responsesPayload);
 	assert.equal(
-		transformNativeSearchPayload({ id: "claude-opus", name: "Claude" }, "live", responsesPayload),
+		transformNativeSearchPayload({ id: "claude-opus", name: "Claude", api: "openai-responses" }, "live", responsesPayload),
+		responsesPayload,
+	);
+	assert.equal(
+		transformNativeSearchPayload({ id: "gpt-4.1", api: "openai-completions" }, "live", responsesPayload),
+		responsesPayload,
+	);
+	assert.equal(
+		transformNativeSearchPayload({ id: "gpt-5.6-sol" }, "live", responsesPayload),
 		responsesPayload,
 	);
 	assert.equal(transformNativeSearchPayload(model, "live", completionsPayload), completionsPayload);
@@ -396,6 +418,59 @@ test("child startup flag enables hosted search before the first provider request
 		}
 		await handlers.get("session_shutdown")({}, ctx);
 	}
+});
+
+test("hosted search capture observes only eligible GPT Responses requests", async () => {
+	let command: any;
+	const handlers = new Map<string, any>();
+	const providerConfigs = new Map<string, any>();
+	let lastStreamOptions: any;
+	const provider: any = {
+		streamSimple: (_model: unknown, _context: unknown, options: unknown) => {
+			lastStreamOptions = options;
+			return {};
+		},
+	};
+	const pi: any = {
+		events: eventBus(),
+		registerCommand: (_name: string, definition: any) => { command = definition; },
+		registerFlag: () => undefined,
+		getFlag: () => undefined,
+		on: (event: string, handler: any) => handlers.set(event, handler),
+		registerProvider: (providerId: string, config: any) => {
+			providerConfigs.set(providerId, { ...(providerConfigs.get(providerId) ?? {}), ...config });
+		},
+		unregisterProvider: (providerId: string) => providerConfigs.delete(providerId),
+		appendEntry: () => undefined,
+	};
+	const ctx: any = {
+		hasUI: false,
+		model: { provider: "custom", api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" },
+		waitForIdle: async () => {},
+		sessionManager: { getBranch: () => [] },
+		modelRegistry: {
+			getProvider: () => provider,
+			getRegisteredProviderConfig: (providerId: string) => providerConfigs.get(providerId),
+			getRegisteredNativeProvider: () => undefined,
+		},
+		ui: { setStatus() {}, notify() {} },
+	};
+
+	installRailOaiSearch(pi);
+	await handlers.get("session_start")({}, ctx);
+	await command.handler("live", ctx);
+	await handlers.get("turn_start")({}, ctx);
+	const wrapper = providerConfigs.get("custom").streamSimple;
+	const baseOptions = {};
+	wrapper({ provider: "custom", api: "openai-responses", id: "gpt-5.6-sol" }, {}, baseOptions);
+	assert.equal(typeof (lastStreamOptions as any)?.fetch, "function", "eligible GPT request must be observed");
+	wrapper({ provider: "custom", api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" }, {}, baseOptions);
+	assert.equal(lastStreamOptions, baseOptions, "non-GPT request must not be observed");
+	wrapper({ provider: "custom", api: "openai-completions", id: "gpt-4.1" }, {}, baseOptions);
+	assert.equal(lastStreamOptions, baseOptions, "blocklisted API must not be observed");
+	wrapper({ provider: "custom", api: "openai-responses", id: "custom-latest", name: "GPT Custom" }, {}, baseOptions);
+	assert.equal(typeof (lastStreamOptions as any)?.fetch, "function", "GPT Responses request must be observed");
+	await handlers.get("session_shutdown")({}, ctx);
 });
 
 test("root and standalone search installers share one registration", () => {

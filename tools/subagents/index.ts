@@ -103,6 +103,8 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 	installStatefulSubagentTool(pi, {
 		broker: () => getRuntime().broker,
 		knownFastMode: (target) => runtime?.broker.knownFastMode(target),
+		knownModel: (target) => runtime?.broker.knownModel(target),
+		renderContext: () => runtime?.ctx,
 		runStateless: createStatelessAgentRunner(),
 		getMarkdownTheme,
 	});

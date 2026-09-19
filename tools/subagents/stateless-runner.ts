@@ -46,15 +46,15 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		const contextWindow = settings
 			? validateContextWindowReserve(requestedContextWindow, settings.reserveTokens, settings.enabled)
 			: undefined;
-		const gptCompactionEnabled = readGptCompactionSettings().mode === "on"
-			&& (isGptModelName(request.model.modelId) || isGptModelName(request.model.name));
+		const gptModel = isGptModelName(request.model.modelId) || isGptModelName(request.model.name);
+		const gptCompactionEnabled = readGptCompactionSettings().mode === "on" && gptModel;
 		const ephemeralSessionDir = gptCompactionEnabled ? await mkdtemp(join(tmpdir(), "pi-rail-stateless-compaction-")) : undefined;
 		const ephemeralSessionPath = ephemeralSessionDir ? join(ephemeralSessionDir, "session.jsonl") : undefined;
 		const args = ["--mode", "json", "-p", ...(ephemeralSessionPath ? ["--session", ephemeralSessionPath] : ["--no-session"]), "--model", railModelKey(request.model)];
 		if (gptCompactionEnabled) args.push("-e", gptCompactionExtensionPath());
 		if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
-		if (request.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
-		args.push("-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live");
+		if (gptModel && request.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
+		if (gptModel) args.push("-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live");
 		args.push("--exclude-tools", "subagent");
 		if (contextWindow !== undefined) {
 			args.push(

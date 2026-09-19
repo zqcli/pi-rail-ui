@@ -770,12 +770,14 @@ test("grouped panels retain child identity, explicit dispatch policy, and chain 
 		durationMs: 3000,
 		contextWindows: [undefined, "64K"],
 		fastModes: [undefined, "on"],
+		searchModes: [undefined, "on"],
 		sequenceTotal: 2,
 	}).render(120).join("\n");
 
 	assert.match(text, /2 model sessions · 1 complete · 0 running · 1 failed/);
 	assert.match(text, /3k in · 400 out · 600 cached · \$0\.100 · wall <1m/);
 	assert.match(text, /1\/2 · planner · one-off · provider\/gpt-plan/);
+	assert.match(text, /1\/2 · planner · one-off · provider\/gpt-plan · ContextWindow Default · FAST off · SEARCH off/);
 	assert.match(text, /2\/2 · reviewer · persistent · provider\/gpt-review · ContextWindow 64K · FAST on · SEARCH on/);
 	assert.match(text, /GROUP FIRST INITIAL TASK/);
 	assert.match(text, /GROUP SECOND INITIAL TASK/);
@@ -791,12 +793,13 @@ test("grouped panels retain child identity, explicit dispatch policy, and chain 
 		assert.ok(renderSubagentTranscript(runs, false, theme as any, {
 			contextWindows: [undefined, "64K"],
 			fastModes: [undefined, "on"],
+			searchModes: [undefined, "on"],
 			sequenceTotal: 2,
 		}).render(width).every((line) => visibleWidth(line) <= width));
 	}
 });
 
-test("grouped child panels append the fixed SEARCH on policy while single and control panels stay silent", () => {
+test("grouped child panels show the explicit per-slot search policy while single and control panels stay silent", () => {
 	const runs: SubagentTranscriptRun[] = [
 		{
 			alias: "planner",
@@ -817,29 +820,32 @@ test("grouped child panels append the fixed SEARCH on policy while single and co
 			usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 1 },
 		},
 	];
-	const options = { contextWindows: ["64K", "128K"], fastModes: ["off", "on"] as const };
+	const options = { contextWindows: ["64K", "128K"], fastModes: ["off", "on"] as const, searchModes: ["on", "off"] as const };
 
 	const text = renderSubagentTranscript(runs, false, theme as any, options).render(120).join("\n");
-	assert.equal((text.match(/SEARCH on/gu) ?? []).length, 2);
+	assert.equal((text.match(/SEARCH on/gu) ?? []).length, 1);
+	assert.equal((text.match(/SEARCH off/gu) ?? []).length, 1);
 	assert.doesNotMatch(text.slice(0, text.indexOf("╭")), /SEARCH/);
 	assert.match(text, /planner · one-off · provider\/gpt-plan · ContextWindow 64K · FAST off · SEARCH on/u);
-	assert.match(text, /reviewer · persistent · provider\/gpt-review · ContextWindow 128K · FAST on · SEARCH on/u);
+	assert.match(text, /reviewer · persistent · provider\/gpt-review · ContextWindow 128K · FAST on · SEARCH off/u);
 
 	for (const width of [1, 2, 3, 40, 60, 80, 100, 120]) {
 		const lines = renderSubagentTranscript(runs, false, theme as any, options).render(width);
 		assert.ok(lines.every((line) => visibleWidth(line) <= width), `grouped panel exceeded width ${width}`);
-		assert.equal(lines.some((line) => (line.match(/SEARCH on/gu) ?? []).length > 1), false, `SEARCH wrapped at width ${width}`);
+		assert.equal(lines.some((line) => (line.match(/SEARCH (?:on|off)/gu) ?? []).length > 1), false, `SEARCH wrapped at width ${width}`);
 	}
 
 	const single = renderSubagentTranscript([{ ...runs[0]!, status: "completed" }], false, theme as any, {
 		contextWindows: ["64K"],
 		fastModes: ["off"],
+		searchModes: ["on"],
 	}).render(120).join("\n");
 	assert.doesNotMatch(single, /SEARCH/);
 
 	const runningSingle = renderSubagentTranscript([{ ...runs[1]!, status: "running" }], false, theme as any, {
 		contextWindows: ["128K"],
 		fastModes: ["on"],
+		searchModes: ["off"],
 	}).render(120).join("\n");
 	assert.doesNotMatch(runningSingle, /SEARCH/);
 
@@ -847,8 +853,60 @@ test("grouped child panels append the fixed SEARCH on policy while single and co
 		control: true,
 		contextWindows: ["64K"],
 		fastModes: ["off"],
+		searchModes: ["on"],
 	}).render(120).join("\n");
 	assert.doesNotMatch(control, /SEARCH/);
+});
+
+test("grouped child panels default SEARCH off when no search policy is supplied", () => {
+	const runs: SubagentTranscriptRun[] = [
+		{ alias: "alpha", model: "provider/a", status: "completed", output: "a", persistent: false },
+		{ alias: "beta", model: "provider/b", status: "completed", output: "b", persistent: true },
+	];
+	const text = renderSubagentTranscript(runs, false, theme as any, { mode: "parallel" }).render(120).join("\n");
+
+	assert.equal((text.match(/SEARCH off/gu) ?? []).length, 2);
+	assert.doesNotMatch(text, /SEARCH on/u);
+	assert.doesNotMatch(text, /SEARCH (?:on|off) · SEARCH/u);
+});
+
+test("grouped child panels map FAST and SEARCH arrays by run.slot even when runs are out of order", () => {
+	const runs: SubagentTranscriptRun[] = [
+		{ alias: "second-slot", model: "provider/b", status: "completed", output: "b", persistent: true, slot: 2 },
+		{ alias: "first-slot", model: "provider/a", status: "completed", output: "a", persistent: false, slot: 0 },
+		{ alias: "middle-slot", model: "provider/c", status: "completed", output: "c", persistent: false, slot: 1 },
+	];
+	const text = renderSubagentTranscript(runs, false, theme as any, {
+		mode: "parallel",
+		contextWindows: ["64K", "128K", "256K"],
+		fastModes: ["on", "on", "off"],
+		searchModes: ["on", "off", "on"],
+	}).render(160).join("\n");
+
+	assert.match(text, /first-slot · one-off · provider\/a · ContextWindow 64K · FAST on · SEARCH on/u);
+	assert.match(text, /middle-slot · one-off · provider\/c · ContextWindow 128K · FAST on · SEARCH off/u);
+	assert.match(text, /second-slot · persistent · provider\/b · ContextWindow 256K · FAST off · SEARCH on/u);
+	assert.ok(text.indexOf("second-slot") < text.indexOf("first-slot"));
+});
+
+test("grouped child panels map a sparse slot beyond the result count", () => {
+	const runs: SubagentTranscriptRun[] = [{
+		alias: "only-run",
+		model: "provider/only",
+		status: "completed",
+		output: "only",
+		persistent: false,
+		slot: 2,
+	}];
+	const text = renderSubagentTranscript(runs, false, theme as any, {
+		mode: "parallel",
+		contextWindows: ["1K", "2K", "3K"],
+		fastModes: ["on", "on", "off"],
+		searchModes: ["on", "on", "off"],
+	}).render(160).join("\n");
+
+	assert.match(text, /only-run · one-off · provider\/only · ContextWindow 3K · FAST off · SEARCH off/u);
+	assert.doesNotMatch(text, /ContextWindow 1K|ContextWindow 2K/u);
 });
 
 test("control panels show only delivery status and alias, never control message as initial task", () => {

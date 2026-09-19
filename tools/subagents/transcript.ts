@@ -57,6 +57,7 @@ export interface SubagentTranscriptRun {
 	outputTruncated?: boolean;
 	contextWindowText?: string;
 	fastModeText?: "on" | "off";
+	searchModeText?: "on" | "off";
 }
 
 export interface SubagentTranscriptRenderOptions {
@@ -65,6 +66,7 @@ export interface SubagentTranscriptRenderOptions {
 	initialTasks?: readonly (string | undefined)[];
 	contextWindows?: readonly (string | undefined)[] | undefined;
 	fastModes?: readonly ("on" | "off" | undefined)[] | undefined;
+	searchModes?: readonly ("on" | "off" | undefined)[] | undefined;
 	mode?: "single" | "parallel" | "chain" | "control";
 	sequenceTotal?: number;
 	control?: boolean;
@@ -794,6 +796,18 @@ function runsWithFastModes(
 	});
 }
 
+function runsWithSearchModes(
+	runs: SubagentTranscriptRun[],
+	searchModes: readonly ("on" | "off" | undefined)[] | undefined,
+): SubagentTranscriptRun[] {
+	if (!searchModes) return runs;
+	return runs.map((run, runIndex) => {
+		const targetSlot = run.slot ?? runIndex;
+		const searchModeText = searchModes[targetSlot];
+		return searchModeText === undefined ? run : { ...run, searchModeText };
+	});
+}
+
 function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control", sequenceTotal?: number): string {
 	if (layout === "control") return `${run.status === "failed" ? "failed" : "accepted"} · ${run.alias}`;
 	const step = run.step !== undefined
@@ -801,7 +815,8 @@ function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control",
 		: "";
 	const contextWindow = ` · ContextWindow ${run.contextWindowText ?? "Default"}`;
 	const fast = ` · FAST ${run.fastModeText ?? "off"}`;
-	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast} · SEARCH on`;
+	const search = ` · SEARCH ${run.searchModeText ?? "off"}`;
+	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}${search}`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
@@ -1009,7 +1024,8 @@ export function renderSubagentTranscript(
 		options.contextWindows,
 	);
 	const runsWithFast = runsWithFastModes(runsWithContext, options.fastModes);
-	const boundedRuns = boundSubagentRunTranscripts(runsWithFast);
+	const runsWithSearch = runsWithSearchModes(runsWithFast, options.searchModes);
+	const boundedRuns = boundSubagentRunTranscripts(runsWithSearch);
 	const grouped = options.mode === "parallel" || options.mode === "chain"
 		|| (options.mode === undefined && boundedRuns.length > 1);
 	if (grouped) {

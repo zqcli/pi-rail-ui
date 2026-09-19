@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { installStatefulSubagentTool, type StatefulSubagentToolOptions } from "../../tools/subagents/tool";
 import { WorkerControlError, type ControlRequest, type ControlResult, type DispatchRequest, type DispatchResult, type SessionBroker } from "../../tools/subagents/session-broker";
+import type { RailModelRef } from "../../tools/subagents/models";
 import { RunResultCollector, assistantText } from "../../tools/subagents/run-result";
 import { SubagentTranscript } from "../../tools/subagents/transcript";
 
@@ -13,11 +14,41 @@ const model = {
 	name: "GPT 5.6 Sol",
 };
 
-const railModel = {
+const completionsModel = {
+	provider: "cus-oai",
+	api: "openai-completions",
+	id: "gpt-5.6-sol-completions",
+	name: "GPT 5.6 Sol Completions",
+};
+
+const nonGptModel = {
+	provider: "deepseek",
+	api: "openai-responses",
+	id: "deepseek-v4",
+	name: "DeepSeek V4",
+};
+
+const unknownApiModel = {
+	provider: "cus-mystery",
+	api: "",
+	id: "gpt-5.6-mystery",
+	name: "GPT 5.6 Mystery",
+};
+
+const knownModels = [model, completionsModel, nonGptModel, unknownApiModel] as const;
+
+const railModel: RailModelRef = {
 	provider: "cus-resp",
 	modelId: "gpt-5.6-sol",
 	name: "GPT 5.6 Sol",
-	thinkingLevel: "xhigh" as const,
+	thinkingLevel: "xhigh",
+};
+
+const completionsRailModel: RailModelRef = {
+	provider: "cus-oai",
+	modelId: "gpt-5.6-sol-completions",
+	name: "GPT 5.6 Sol Completions",
+	thinkingLevel: "xhigh",
 };
 
 function context() {
@@ -28,8 +59,8 @@ function context() {
 		thinkingLevel: "xhigh",
 		scopedModels: [{ model, thinkingLevel: "xhigh" }],
 		modelRegistry: {
-			getAvailable: () => [model],
-			find: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+			getAvailable: () => [...knownModels],
+			find: (provider: string, id: string) => knownModels.find((candidate) => candidate.provider === provider && candidate.id === id),
 		},
 		ui: { confirm: async () => true },
 	};
@@ -40,9 +71,16 @@ class FakeBroker {
 	readonly controls: ControlRequest[] = [];
 	controlError: Error | undefined;
 	targetFastMode = false;
+	targetModel: RailModelRef = structuredClone(railModel);
+	/** Models reported by successive onUpdate events; last one also completes the dispatch. */
+	instanceModels: RailModelRef[] = [];
 
 	knownFastMode(target: string): boolean | undefined {
 		return target === "auth-review" ? this.targetFastMode : undefined;
+	}
+
+	knownModel(target: string): RailModelRef | undefined {
+		return target === "auth-review" ? structuredClone(this.targetModel) : undefined;
 	}
 
 	async validateContextWindowForTarget(_target: string, contextWindow: number): Promise<void> {
@@ -51,13 +89,14 @@ class FakeBroker {
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		this.requests.push(request);
-		const selectedModel = request.model ?? railModel;
+		const selectedModel = request.target ? this.targetModel : request.model ?? railModel;
 		const fastMode = request.target ? this.targetFastMode : request.fastMode === true;
-		const instance = {
+		const updateModels = this.instanceModels.length > 0 ? this.instanceModels : [selectedModel];
+		const instanceFor = (model: RailModelRef) => ({
 			version: 2,
 			agentId: "agt_auth",
 			alias: request.alias ?? request.target ?? "auth-review",
-			model: selectedModel,
+			model,
 			sessionId: "session-auth",
 			sessionFile: "/tmp/auth.jsonl",
 			cwd: request.cwd ?? "/tmp/project",
@@ -66,16 +105,18 @@ class FakeBroker {
 			lastTask: request.task,
 			lastOutput: `done: ${request.task}`,
 			fastMode,
-		} as const;
-		request.onUpdate?.({
-			instance,
-			run: {
-				output: "(starting...)",
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			},
-		});
+		} as const);
+		for (const instanceModel of updateModels) {
+			request.onUpdate?.({
+				instance: instanceFor(instanceModel),
+				run: {
+					output: "(starting...)",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				},
+			});
+		}
 		return {
-			instance,
+			instance: instanceFor(updateModels[updateModels.length - 1]!),
 			run: {
 				output: `done: ${request.task}`,
 				usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0.1, contextTokens: 12, turns: 1 },
@@ -91,7 +132,7 @@ class FakeBroker {
 				version: 2,
 				agentId: "agt_auth",
 				alias: request.target,
-				model: railModel,
+				model: structuredClone(this.targetModel),
 				sessionId: "session-auth",
 				sessionFile: "/tmp/auth.jsonl",
 				cwd: "/tmp/project",
@@ -104,7 +145,10 @@ class FakeBroker {
 	}
 }
 
-function setupTool(options: { runStateless?: StatefulSubagentToolOptions["runStateless"] } = {}) {
+function setupTool(options: {
+	runStateless?: StatefulSubagentToolOptions["runStateless"];
+	renderContext?: () => unknown;
+} = {}) {
 	const broker = new FakeBroker();
 	let tool: any;
 	let hook: ((event: any) => any) | undefined;
@@ -117,9 +161,15 @@ function setupTool(options: { runStateless?: StatefulSubagentToolOptions["runSta
 	installStatefulSubagentTool(pi, {
 		broker: broker as unknown as SessionBroker,
 		knownFastMode: (target) => broker.knownFastMode(target),
+		knownModel: (target) => broker.knownModel(target),
+		renderContext: (options.renderContext ?? (() => context())) as NonNullable<StatefulSubagentToolOptions["renderContext"]>,
 		...(options.runStateless ? { runStateless: options.runStateless } : {}),
 	});
 	return { tool, broker, hook };
+}
+
+function liveContext(toolCallId: string) {
+	return { toolCallId, isPartial: true, executionStarted: true, invalidate: () => {} };
 }
 
 test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestration rules", () => {
@@ -371,6 +421,178 @@ test("dispatch headers always show defaults and use the saved fast policy for ex
 	} as any).render(120).join("\n");
 	assert.match(savedOffCall, /ContextWindow Default · FAST off · SEARCH on/);
 	await tool.execute("saved-off", { target: "auth-review", task: "continue" }, undefined, undefined, context());
+});
+
+test("dispatch headers derive FAST and SEARCH from the effective model and API", () => {
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const { tool } = setupTool();
+	const headerOf = (args: any): string => tool.renderCall(args, theme).render(200).join("\n");
+
+	// Omitted model resolves to the current GPT Responses model.
+	assert.match(headerOf({ task: "current" }), /ContextWindow Default · FAST off · SEARCH on/u);
+	// Explicit GPT Responses keeps the caller's Fast policy and Search on.
+	assert.match(headerOf({ model: "cus-resp/gpt-5.6-sol", task: "explicit", fastMode: true }), /FAST on · SEARCH on/u);
+	// GPT completions supports native Fast but never hosted Search.
+	assert.match(headerOf({ model: "cus-oai/gpt-5.6-sol-completions", task: "completions", fastMode: true }), /FAST on · SEARCH off/u);
+	// A non-GPT Responses model stays off for both policies.
+	assert.match(headerOf({ model: "deepseek/deepseek-v4", task: "non-gpt" }), /FAST off · SEARCH off/u);
+	// A GPT name with an unknown API is conservatively off for both.
+	assert.match(headerOf({ model: "cus-mystery/gpt-5.6-mystery", task: "unknown-api", fastMode: true }), /FAST off · SEARCH off/u);
+	// An unresolvable model cannot be evaluated, so both policies stay off.
+	assert.match(headerOf({ model: "cus-resp/ghost-model", task: "unknown-model" }), /FAST off · SEARCH off/u);
+
+	// The omitted-model path follows the current model's API as well.
+	const completions = setupTool({
+		renderContext: () => ({
+			...context(),
+			model: completionsModel,
+			scopedModels: [{ model: completionsModel, thinkingLevel: "xhigh" }],
+		}),
+	});
+	assert.match(
+		completions.tool.renderCall({ task: "omitted completions" }, theme).render(200).join("\n"),
+		/ContextWindow Default · FAST off · SEARCH off/u,
+	);
+	const nonGpt = setupTool({
+		renderContext: () => ({
+			...context(),
+			model: nonGptModel,
+			scopedModels: [{ model: nonGptModel, thinkingLevel: "xhigh" }],
+		}),
+	});
+	assert.match(
+		nonGpt.tool.renderCall({ task: "omitted non-gpt" }, theme).render(200).join("\n"),
+		/ContextWindow Default · FAST off · SEARCH off/u,
+	);
+});
+
+test("existing target first screen uses its descriptor model until the live instance overrides it", async () => {
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const { tool, broker } = setupTool({
+		runStateless: async () => ({
+			output: "done",
+			exitCode: 0,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+	broker.targetModel = structuredClone(completionsRailModel);
+	broker.targetFastMode = true;
+	const args = { target: "auth-review", task: "continue" };
+
+	// First screen: the prewarmed descriptor is GPT completions, so Search is off.
+	assert.match(tool.renderCall(args, theme).render(200).join("\n"), /ContextWindow Default · FAST on · SEARCH off/u);
+
+	// The live worker reports a GPT Responses model, which replaces the snapshot.
+	broker.instanceModels = [structuredClone(railModel)];
+	const liveHeaders: string[] = [];
+	await tool.execute("live-override", args, undefined, () => {
+		liveHeaders.push(tool.renderCall(args, theme, liveContext("live-override") as any).render(200).join("\n"));
+	}, context());
+	assert.ok(liveHeaders.length > 0);
+	for (const header of liveHeaders) assert.match(header, /ContextWindow Default · FAST on · SEARCH on/u);
+});
+
+test("an in-place model switch updates the cached dispatch metadata for a live target", async () => {
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const { tool, broker } = setupTool();
+	broker.targetModel = structuredClone(railModel);
+	broker.targetFastMode = true;
+	const args = { target: "auth-review", task: "switch models" };
+	assert.match(tool.renderCall(args, theme).render(200).join("\n"), /FAST on · SEARCH on/u);
+
+	// The child survives an in-place switch: the second onUpdate reports a GPT
+	// completions model, so the cached header must move with it.
+	broker.instanceModels = [structuredClone(railModel), structuredClone(completionsRailModel)];
+	const liveHeaders: string[] = [];
+	await tool.execute("model-switch", args, undefined, () => {
+		liveHeaders.push(tool.renderCall(args, theme, liveContext("model-switch") as any).render(200).join("\n"));
+	}, context());
+	assert.ok(liveHeaders.length >= 2);
+	assert.match(liveHeaders[0]!, /FAST on · SEARCH on/u);
+	for (const header of liveHeaders.slice(1)) assert.match(header, /FAST on · SEARCH off/u);
+});
+
+test("restored result panels resolve display models by run.slot instead of array position", () => {
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const { tool } = setupTool();
+	const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 };
+	const result = {
+		content: [{ type: "text", text: "done" }],
+		details: {
+			mode: "parallel",
+			durationMs: 1,
+			// Restored run arrays can be sparse or out of slot order; models must
+			// follow run.slot, never the array index.
+			results: [
+				{ alias: "second", slot: 1, model: "cus-oai/gpt-5.6-sol-completions:xhigh", status: "completed", output: "second", persistent: false, usage },
+				{ alias: "first", slot: 0, model: "cus-resp/gpt-5.6-sol:xhigh", status: "completed", output: "first", persistent: false, usage },
+			],
+		},
+	};
+	const panel = tool.renderResult(result, { expanded: false }, theme).render(240).join("\n");
+
+	assert.match(panel, /first · one-off · cus-resp\/gpt-5\.6-sol:xhigh · ContextWindow Default · FAST off · SEARCH on/u);
+	assert.match(panel, /second · one-off · cus-oai\/gpt-5\.6-sol-completions:xhigh · ContextWindow Default · FAST off · SEARCH off/u);
+});
+
+test("mixed grouped dispatch keeps independent FAST and SEARCH slot mappings", async () => {
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const { tool, broker } = setupTool({
+		runStateless: async (request) => ({
+			output: `done: ${request.task}`,
+			exitCode: 0,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+	broker.targetModel = structuredClone(completionsRailModel);
+	broker.targetFastMode = true;
+	const args = {
+		tasks: [
+			{ target: "auth-review", task: "saved fast completions child" },
+			{ model: "deepseek/deepseek-v4", task: "non-gpt child" },
+			{ task: "current child" },
+		],
+	};
+
+	assert.match(
+		tool.renderCall(args, theme).render(320).join("\n"),
+		/ContextWindow Default · FAST 1=on, 2=off, 3=off · SEARCH 1=off, 2=off, 3=on/u,
+	);
+	for (const width of [1, 2, 3, 40, 80, 120, 200]) {
+		const lines = tool.renderCall(args, theme).render(width);
+		assert.equal(lines.length, 1, `grouped dispatch header wrapped at width ${width}`);
+		assert.equal(visibleWidth(lines[0]!), width, `grouped dispatch header exceeded width ${width}`);
+	}
+
+	const result = await tool.execute("mixed-policy", args, undefined, undefined, context());
+	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(280).join("\n");
+	assert.match(panel, /auth-review · persistent · cus-oai\/gpt-5\.6-sol-completions:xhigh · ContextWindow Default · FAST on · SEARCH off/u);
+	assert.match(panel, /#2 · one-off · deepseek\/deepseek-v4 · ContextWindow Default · FAST off · SEARCH off/u);
+	assert.match(panel, /#3 · one-off · cus-resp\/gpt-5\.6-sol:xhigh · ContextWindow Default · FAST off · SEARCH on/u);
+	assert.doesNotMatch(JSON.stringify(result.details), /searchMode/iu);
+});
+
+test("effective policy repeats only in grouped panels, never in single or control results", async () => {
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const { tool, broker } = setupTool({
+		runStateless: async (request) => ({
+			output: `done: ${request.task}`,
+			exitCode: 0,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+	broker.targetModel = { provider: "deepseek", modelId: "deepseek-v4", name: "DeepSeek V4", thinkingLevel: "xhigh" };
+	broker.targetFastMode = true;
+
+	const singleArgs = { model: "deepseek/deepseek-v4:xhigh", task: "single non-gpt" };
+	assert.match(tool.renderCall(singleArgs, theme).render(200).join("\n"), /ContextWindow Default · FAST off · SEARCH off/u);
+	const single = await tool.execute("single-policy", singleArgs, undefined, undefined, context());
+	assert.doesNotMatch(tool.renderResult(single, { expanded: false }, theme, { args: singleArgs }).render(200).join("\n"), /FAST|SEARCH|ContextWindow/u);
+
+	const controlArgs = { target: "auth-review", control: { delivery: "steer" as const, message: "Focus on tests" } };
+	assert.doesNotMatch(tool.renderCall(controlArgs, theme).render(200).join("\n"), /FAST|SEARCH|ContextWindow/u);
+	const control = await tool.execute("control-policy", controlArgs, undefined, undefined, context());
+	assert.doesNotMatch(tool.renderResult(control, { expanded: false }, theme).render(200).join("\n"), /FAST|SEARCH|ContextWindow/u);
 });
 
 test("final Tool Call rendering releases the live header invalidator", async () => {
@@ -1213,7 +1435,7 @@ test("chain FAST metadata preserves a saved target policy for the target step", 
 	assert.doesNotMatch(JSON.stringify(result.details), /fastMode/);
 });
 
-test("panels show the fixed SEARCH on policy only after dispatch FAST metadata", async () => {
+test("panels show the effective per-slot SEARCH policy only in grouped child metadata", async () => {
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 	const { tool, broker } = setupTool({
 		runStateless: async (request) => ({
@@ -1257,7 +1479,7 @@ test("panels show the fixed SEARCH on policy only after dispatch FAST metadata",
 	}
 });
 
-test("narrow dispatch headers stay one physical line with the fixed SEARCH suffix last", () => {
+test("narrow dispatch headers stay one physical line with the SEARCH suffix last", () => {
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 	const { tool } = setupTool();
 	const args = { task: "default" };

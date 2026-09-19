@@ -4,6 +4,7 @@ import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@eare
 import { Type, type Static } from "typebox";
 import { normalizeContextWindow, validateContextWindowReserve } from "./context-window";
 import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
+import { supportsNativeGptSearch } from "../../commands/rail-oai-search";
 import {
 	railModelKey,
 	railModelReference,
@@ -124,6 +125,8 @@ export interface StatefulSubagentDetails {
 export interface StatefulSubagentToolOptions {
 	broker: SessionBroker | (() => SessionBroker);
 	readonly knownFastMode?: (target: string) => boolean | undefined;
+	readonly knownModel?: (target: string) => RailModelRef | undefined;
+	readonly renderContext?: () => Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel"> | undefined;
 	runStateless?: StatelessAgentRunner;
 	getMarkdownTheme?: () => MarkdownTheme;
 }
@@ -350,19 +353,25 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 	return { ...normalized, ...confirmSessionAttach };
 }
 
-function modelForFastMode(
-	item: TaskParams,
-	ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">,
-): NativeFastModel | undefined {
-	if (!item.model) return ctx.model;
-	const model = resolveRailModel(item.model, ctx);
+type RenderModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">;
+
+function nativeModelForRailRef(model: RailModelRef, ctx: RenderModelContext): NativeFastModel | undefined {
+	if (ctx.model?.provider === model.provider && ctx.model.id === model.modelId) return ctx.model;
 	return ctx.modelRegistry.find(model.provider, model.modelId)
 		?? ctx.modelRegistry.getAvailable().find((candidate) => candidate.provider === model.provider && candidate.id === model.modelId);
 }
 
+function modelForFastMode(
+	item: TaskParams,
+	ctx: RenderModelContext,
+): NativeFastModel | undefined {
+	if (!item.model) return ctx.model;
+	return nativeModelForRailRef(resolveRailModel(item.model, ctx), ctx);
+}
+
 function validateFastMode(
 	item: TaskParams,
-	ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">,
+	ctx: RenderModelContext,
 ): void {
 	if (item.fastMode !== true) return;
 	const model = modelForFastMode(item, ctx);
@@ -372,14 +381,65 @@ function validateFastMode(
 }
 
 type FastModeDisplay = "on" | "off";
+type SearchModeDisplay = "on" | "off";
 
 interface DispatchDisplayMetadata {
 	contextWindowText: string;
 	fastModeText: FastModeDisplay;
+	searchModeText: SearchModeDisplay;
 }
 
-function fastModeForDisplay(item: Pick<TaskParams, "fastMode">): FastModeDisplay {
-	return item.fastMode === true ? "on" : "off";
+function effectiveFastModeText(policy: boolean | undefined, model: NativeFastModel | undefined): FastModeDisplay {
+	return policy === true && supportsNativeGptFastMode(model) ? "on" : "off";
+}
+
+function effectiveSearchModeText(model: NativeFastModel | undefined): SearchModeDisplay {
+	return supportsNativeGptSearch(model) ? "on" : "off";
+}
+
+function resolveDisplayModel(reference: string, ctx: RenderModelContext): NativeFastModel | undefined {
+	try {
+		return nativeModelForRailRef(resolveRailModel(reference, ctx), ctx);
+	} catch {
+		return undefined;
+	}
+}
+
+interface DisplayModelSources {
+	knownModel?: ((target: string) => RailModelRef | undefined) | undefined;
+	knownFastMode?: ((target: string) => boolean | undefined) | undefined;
+	renderContext?: (() => RenderModelContext | undefined) | undefined;
+}
+
+function displayModelForSlot(
+	item: TaskParams | undefined,
+	resultModel: string | undefined,
+	sources: DisplayModelSources,
+	ctx = sources.renderContext?.(),
+): NativeFastModel | undefined {
+	if (!ctx) return undefined;
+	if (item?.target) {
+		const known = sources.knownModel?.(item.target.trim());
+		const knownModel = known ? nativeModelForRailRef(known, ctx) : undefined;
+		if (knownModel) return knownModel;
+		return resultModel ? resolveDisplayModel(resultModel, ctx) : undefined;
+	}
+	if (item?.model) return resolveDisplayModel(item.model, ctx);
+	if (resultModel) return resolveDisplayModel(resultModel, ctx);
+	return ctx.model;
+}
+
+/**
+ * Display metadata is cached per dispatch slot, and restored run arrays may be
+ * sparse or out of slot order, so result models must be indexed by run.slot
+ * rather than array position.
+ */
+function resultModelsBySlot(results: readonly StatefulSubagentRunDetails[]): Array<string | undefined> {
+	const models: Array<string | undefined> = [];
+	results.forEach((run, index) => {
+		models[run.slot ?? index] = run.model;
+	});
+	return models;
 }
 
 function initialTasksForRender(
@@ -448,30 +508,38 @@ function dispatchMetadataText(metadata: readonly DispatchDisplayMetadata[], grou
 	const fast = grouped && !sameFastMode
 		? metadata.map((item, index) => `${index + 1}=${item.fastModeText}`).join(", ")
 		: firstFastMode;
-	return `${contextWindow} · FAST ${fast} · SEARCH on`;
+	const firstSearchMode = metadata[0]?.searchModeText ?? "off";
+	const sameSearchMode = metadata.every((item) => item.searchModeText === firstSearchMode);
+	const search = grouped && !sameSearchMode
+		? metadata.map((item, index) => `${index + 1}=${item.searchModeText}`).join(", ")
+		: firstSearchMode;
+	return `${contextWindow} · FAST ${fast} · SEARCH ${search}`;
 }
 
 function dispatchMetadataForRender(
 	args: SubagentParamsValue | undefined,
 	mode: "single" | "parallel" | "chain" | "control" | undefined,
 	count: number,
-	cached?: ReadonlyMap<number, DispatchDisplayMetadata>,
-	knownFastMode?: (target: string) => boolean | undefined,
+	cached: ReadonlyMap<number, DispatchDisplayMetadata> | undefined,
+	sources: DisplayModelSources,
+	resultModels?: readonly (string | undefined)[],
 ): DispatchDisplayMetadata[] {
 	const renderMode = mode ?? renderModeForArgs(args);
 	if (renderMode === "control") return [];
 	const items = renderItemsForMode(args, renderMode);
-	const total = Math.max(count, items.length, cached?.size ?? 0, 1);
+	const total = Math.max(count, items.length, cached?.size ?? 0, resultModels?.length ?? 0, 1);
 	return Array.from({ length: total }, (_, index) => {
 		const cachedMetadata = cached?.get(index);
 		if (cachedMetadata) return cachedMetadata;
 		const item = items[index];
-		const known = item?.target && knownFastMode ? knownFastMode(item.target) : undefined;
+		const model = displayModelForSlot(item, resultModels?.[index], sources);
+		const fastModePolicy = item?.target
+			? sources.knownFastMode?.(item.target.trim())
+			: item?.fastMode === true;
 		return {
 			contextWindowText: formatContextWindowForDisplay(item?.contextWindow),
-			fastModeText: item?.target
-				? known === true ? "on" : "off"
-				: renderMode === "parallel" || renderMode === "chain" ? "off" : fastModeForDisplay(item ?? {}),
+			fastModeText: effectiveFastModeText(fastModePolicy, model),
+			searchModeText: effectiveSearchModeText(model),
 		};
 	});
 }
@@ -564,6 +632,14 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	const knownFastModeForRender = (target: string): boolean | undefined => {
 		return options.knownFastMode?.(target.trim());
 	};
+	const knownModelForRender = (target: string): RailModelRef | undefined => {
+		return options.knownModel?.(target.trim());
+	};
+	const displaySources: DisplayModelSources = {
+		knownFastMode: knownFastModeForRender,
+		knownModel: knownModelForRender,
+		renderContext: options.renderContext,
+	};
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -621,16 +697,23 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const liveResults = new Map<number, StatefulSubagentRunDetails>();
 			const runStartedAt = new Map<number, number>();
 			const runDuration = (slot: number) => Math.max(0, Math.round(performance.now() - (runStartedAt.get(slot) ?? performance.now())));
-			const setDispatchMetadata = (item: TaskParams, slot: number, actualFastMode?: boolean) => {
-				const grouped = mode === "parallel" || mode === "chain";
-				const known = item.target && actualFastMode === undefined ? knownFastModeForRender(item.target) : undefined;
+			const setDispatchMetadata = (
+				item: TaskParams,
+				slot: number,
+				actual?: { model: RailModelRef; fastMode: boolean | undefined },
+			) => {
+				const model = actual
+					? nativeModelForRailRef(actual.model, ctx)
+					: displayModelForSlot(item, undefined, displaySources, ctx);
+				const fastModePolicy = actual
+					? actual.fastMode
+					: item.target
+						? knownFastModeForRender(item.target)
+						: item.fastMode === true;
 				const metadata: DispatchDisplayMetadata = {
 					contextWindowText: formatContextWindowForDisplay(item.contextWindow),
-					fastModeText: actualFastMode !== undefined
-						? actualFastMode ? "on" : "off"
-						: item.target
-							? known === true ? "on" : "off"
-							: grouped ? "off" : fastModeForDisplay(item),
+					fastModeText: effectiveFastModeText(fastModePolicy, model),
+					searchModeText: effectiveSearchModeText(model),
 				};
 				dispatchMetadata.set(slot, metadata);
 				callHeaderInvalidators.get(toolCallId)?.();
@@ -738,6 +821,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				if (!persistent) {
 					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
 					const model = resolveRailModel(item.model, ctx);
+					setDispatchMetadata(item, slot, { model, fastMode: item.fastMode === true });
 					const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
 					publishLive(slot, {
 						alias,
@@ -787,7 +871,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					...(item.fastMode !== undefined && item.fastMode !== null ? { fastMode: item.fastMode } : {}),
 					...(signal ? { signal } : {}),
 					onUpdate: ({ instance, run: partial }) => {
-						setDispatchMetadata(item, slot, instance.fastMode === true);
+						setDispatchMetadata(item, slot, { model: instance.model, fastMode: instance.fastMode === true });
 						publishLive(slot, {
 							agentId: instance.agentId,
 							alias: instance.alias,
@@ -807,7 +891,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				};
 				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
 				const dispatched = await broker.dispatch(request);
-				setDispatchMetadata(item, slot, dispatched.instance.fastMode === true);
+				setDispatchMetadata(item, slot, { model: dispatched.instance.model, fastMode: dispatched.instance.fastMode === true });
 				const result = compactPersistentResult(dispatched, item.task, duration(), step);
 				publishLive(slot, result);
 				return result;
@@ -882,7 +966,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						renderMode,
 						grouped ? Math.max(args.tasks?.length ?? 0, args.chain?.length ?? 0) : 1,
 						context?.toolCallId ? dispatchMetadataByCall.get(context.toolCallId) : undefined,
-						knownFastModeForRender,
+						displaySources,
 					);
 				const metadata = dispatchMetadata.length > 0
 					? theme.fg("dim", ` · ${dispatchMetadataText(dispatchMetadata, grouped)}`)
@@ -906,7 +990,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				details.mode,
 				details.results.length,
 				(context?.toolCallId ? dispatchMetadataByCall.get(context.toolCallId) : undefined) ?? dispatchMetadataByDetails.get(details),
-				knownFastModeForRender,
+				displaySources,
+				resultModelsBySlot(details.results),
 			);
 			const fallbackTasks = details.results.map((run) => run.transcript?.entries.some((entry) => entry.initial)
 				? undefined
@@ -921,6 +1006,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				...(dispatchMetadata.length > 0 ? {
 					contextWindows: dispatchMetadata.map((item) => item.contextWindowText),
 					fastModes: dispatchMetadata.map((item) => item.fastModeText),
+					searchModes: dispatchMetadata.map((item) => item.searchModeText),
 				} : {}),
 				markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),
 			});

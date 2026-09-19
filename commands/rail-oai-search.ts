@@ -5,6 +5,7 @@ import {
 	HOSTED_SEARCH_ENTRY_TYPE,
 	restoreHostedSearchActivities,
 } from "../openai/hosted-search-activity";
+import { isGptModelName } from "../tools/gpt-compaction/model-eligibility";
 
 const STATUS_KEY = "rail-oai-search";
 const INSTALL_EVENT = "rail-oai-search:install";
@@ -98,7 +99,17 @@ function normalizeToolChoice(toolChoice: unknown): unknown {
 
 export function isGptModel(model: SearchModel | undefined): boolean {
 	if (!model) return false;
-	return `${model.id ?? ""} ${model.name ?? ""}`.toLowerCase().includes("gpt");
+	return isGptModelName(model.id) || isGptModelName(model.name);
+}
+
+/**
+ * Native hosted search is only meaningful for GPT models on a known
+ * Responses-capable API. Missing or blocklisted API ids stay inactive.
+ */
+export function supportsNativeGptSearch(model: SearchModel | undefined): boolean {
+	if (!isGptModel(model)) return false;
+	const api = model?.api?.trim().toLowerCase();
+	return !!api && !KNOWN_NON_RESPONSES_APIS.has(api);
 }
 
 export function transformNativeSearchPayload(
@@ -106,7 +117,7 @@ export function transformNativeSearchPayload(
 	searchMode: RailOaiSearchMode,
 	payload: unknown,
 ): unknown {
-	if (searchMode === "off" || !isGptModel(model) || !isResponsesPayload(payload)) return payload;
+	if (searchMode === "off" || !supportsNativeGptSearch(model) || !isResponsesPayload(payload)) return payload;
 
 	if (payload["tools"] !== undefined && !Array.isArray(payload["tools"])) return payload;
 	if (payload["include"] != null && !Array.isArray(payload["include"])) return payload;
@@ -143,10 +154,6 @@ export function transformNativeSearchPayload(
 	};
 }
 
-function isActiveSearchModel(model: SearchModel | undefined): boolean {
-	return isGptModel(model) && !KNOWN_NON_RESPONSES_APIS.has(model?.api?.toLowerCase() ?? "");
-}
-
 export function railOaiSearchFooterLabel(): string | undefined {
 	if (searchRunning) return "SEARCHING";
 	if (mode === "off") return undefined;
@@ -154,7 +161,7 @@ export function railOaiSearchFooterLabel(): string | undefined {
 }
 
 function updateStatus(ctx: ExtensionContext): void {
-	activeForCurrentModel = mode !== "off" && isActiveSearchModel(ctx.model);
+	activeForCurrentModel = mode !== "off" && supportsNativeGptSearch(ctx.model);
 	if (!ctx.hasUI) return;
 	ctx.ui.setStatus(STATUS_KEY, railOaiSearchFooterLabel());
 }
@@ -177,7 +184,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 		type: "string",
 	});
 	const capture = new HostedSearchProviderCapture(pi, {
-		isEnabled: (model) => mode !== "off" && isGptModel(model),
+		isEnabled: (model) => mode !== "off" && supportsNativeGptSearch(model),
 		onActivityChanged: (activity, ctx) => {
 			searchRunning = activity.observed && !activity.terminal;
 			updateStatus(ctx);
@@ -197,7 +204,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 			mode = action === "probe" ? "live" : action;
 			probeNextRequest = action === "probe";
 			searchRunning = false;
-			capture.sync(ctx, mode !== "off" && isActiveSearchModel(ctx.model));
+			capture.sync(ctx, mode !== "off" && supportsNativeGptSearch(ctx.model));
 			updateStatus(ctx);
 			if (action === "probe") {
 				if (ctx.hasUI) ctx.ui.notify("Rail native search probe armed for the next eligible request.", "info");
@@ -223,13 +230,13 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 
 	pi.on("model_select", async (_event, ctx) => {
 		searchRunning = false;
-		capture.sync(ctx, mode !== "off" && isActiveSearchModel(ctx.model));
+		capture.sync(ctx, mode !== "off" && supportsNativeGptSearch(ctx.model));
 		updateStatus(ctx);
 	});
 
 	pi.on("turn_start", async (_event, ctx) => {
 		turnActive = true;
-		capture.sync(ctx, mode !== "off" && isActiveSearchModel(ctx.model));
+		capture.sync(ctx, mode !== "off" && supportsNativeGptSearch(ctx.model));
 		capture.startTurn();
 	});
 

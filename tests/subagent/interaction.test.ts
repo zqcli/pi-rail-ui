@@ -317,7 +317,7 @@ test("session restore prewarms saved Fast policy before the Tool Call renderer r
 		};
 		const ctx = {
 			mode: "print", cwd: "/tmp/project", hasUI: false,
-			model: { provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" },
+			model: { provider: "cus-resp", api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" },
 			thinkingLevel: "xhigh", scopedModels: [], modelRegistry: { getAvailable: () => [], find: () => undefined },
 			sessionManager: {
 				getBranch: () => branch,
@@ -328,7 +328,7 @@ test("session restore prewarms saved Fast policy before the Tool Call renderer r
 		branch = [linkEntry];
 		await handlers.get("session_start")!({}, ctx);
 		const restored = tool.renderCall({ target: "restore-review", task: "continue" }, theme).render(120).join("\n");
-		assert.match(restored, /ContextWindow Default · FAST on/);
+		assert.match(restored, /ContextWindow Default · FAST on · SEARCH on/);
 
 		await writeFile(join(instancesDir, "agt_tree.json"), JSON.stringify({
 			version: 2,
@@ -346,7 +346,7 @@ test("session restore prewarms saved Fast policy before the Tool Call renderer r
 		branch = [{ ...linkEntry, id: "tree-link", data: { action: "link", alias: "tree-review", agentId: "agt_tree" } }];
 		await handlers.get("session_tree")!({}, ctx);
 		const treeRestored = tool.renderCall({ target: "tree-review", task: "continue" }, theme).render(120).join("\n");
-		assert.match(treeRestored, /ContextWindow Default · FAST on/);
+		assert.match(treeRestored, /ContextWindow Default · FAST on · SEARCH on/);
 	} finally {
 		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
 		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;

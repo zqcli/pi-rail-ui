@@ -184,6 +184,19 @@ interface WorkerState {
 	isCompacting: boolean;
 }
 
+/**
+ * Fast policy and model must always be read and written as one descriptor:
+ * the tool renderer derives both from a single cached snapshot.
+ */
+interface DescriptorSnapshot {
+	fastMode: boolean;
+	model: RailModelRef;
+}
+
+function descriptorSnapshotOf(instance: AgentInstance): DescriptorSnapshot {
+	return { fastMode: instance.fastMode === true, model: structuredClone(instance.model) };
+}
+
 export type AgentRuntimePhase = "starting" | "running" | "queued" | "idle" | "stopped" | "error";
 
 export interface AgentRuntimeStatus {
@@ -253,8 +266,8 @@ export class SessionBroker {
 	private readonly deletingAgents = new Set<string>();
 	private readonly modelChanges = new Map<string, Promise<AgentInstance>>();
 	private readonly fastModeChanges = new Map<string, Promise<AgentInstance>>();
-	private readonly fastModeSnapshots = new Map<string, boolean>();
-	private readonly fastModeSnapshotEpochs = new Map<string, number>();
+	private readonly descriptorSnapshots = new Map<string, DescriptorSnapshot>();
+	private readonly descriptorSnapshotEpochs = new Map<string, number>();
 
 	constructor(options: SessionBrokerOptions) {
 		this.store = options.store;
@@ -439,7 +452,7 @@ export class SessionBroker {
 
 	async listLinked(): Promise<AgentInstance[]> {
 		const values = await Promise.all(this.roster.list().map(async (link) => {
-			const snapshotEpoch = this.fastModeSnapshotEpoch(link.agentId);
+			const snapshotEpoch = this.descriptorSnapshotEpoch(link.agentId);
 			const instance = await this.store.get(link.agentId);
 			if (!instance) {
 				this.forgetInstanceAtEpoch(link.agentId, snapshotEpoch);
@@ -453,8 +466,8 @@ export class SessionBroker {
 	}
 
 	async prewarmFastModes(): Promise<void> {
-		const epochsAtStart = new Map(this.fastModeSnapshotEpochs);
-		const snapshotAgentIds = new Set(this.fastModeSnapshots.keys());
+		const epochsAtStart = new Map(this.descriptorSnapshotEpochs);
+		const snapshotAgentIds = new Set(this.descriptorSnapshots.keys());
 		const instances = await this.store.list();
 		const listedAgentIds = new Set<string>();
 		for (const instance of instances) {
@@ -469,7 +482,13 @@ export class SessionBroker {
 
 	knownFastMode(target: string): boolean | undefined {
 		const agentId = this.roster.resolve(target) ?? target;
-		return this.fastModeSnapshots.get(agentId);
+		return this.descriptorSnapshots.get(agentId)?.fastMode;
+	}
+
+	knownModel(target: string): RailModelRef | undefined {
+		const agentId = this.roster.resolve(target) ?? target;
+		const snapshot = this.descriptorSnapshots.get(agentId);
+		return snapshot ? structuredClone(snapshot.model) : undefined;
 	}
 
 	runtimeStatus(agentId: string): AgentRuntimeStatus {
@@ -734,7 +753,7 @@ export class SessionBroker {
 	private async resolveInstance(target: string): Promise<AgentInstance> {
 		const linkedAgentId = this.roster.resolve(target);
 		const agentId = linkedAgentId ?? target;
-		const snapshotEpoch = this.fastModeSnapshotEpoch(agentId);
+		const snapshotEpoch = this.descriptorSnapshotEpoch(agentId);
 		const instance = await this.store.get(agentId);
 		if (!instance) {
 			this.forgetInstanceAtEpoch(agentId, snapshotEpoch);
@@ -795,35 +814,35 @@ export class SessionBroker {
 		}
 	}
 
-	private fastModeSnapshotEpoch(agentId: string): number {
-		return this.fastModeSnapshotEpochs.get(agentId) ?? 0;
+	private descriptorSnapshotEpoch(agentId: string): number {
+		return this.descriptorSnapshotEpochs.get(agentId) ?? 0;
 	}
 
-	private bumpFastModeSnapshotEpoch(agentId: string): number {
-		const next = this.fastModeSnapshotEpoch(agentId) + 1;
-		this.fastModeSnapshotEpochs.set(agentId, next);
+	private bumpDescriptorSnapshotEpoch(agentId: string): number {
+		const next = this.descriptorSnapshotEpoch(agentId) + 1;
+		this.descriptorSnapshotEpochs.set(agentId, next);
 		return next;
 	}
 
 	private commitInstanceSnapshot(instance: AgentInstance): void {
-		this.bumpFastModeSnapshotEpoch(instance.agentId);
-		this.fastModeSnapshots.set(instance.agentId, instance.fastMode === true);
+		this.bumpDescriptorSnapshotEpoch(instance.agentId);
+		this.descriptorSnapshots.set(instance.agentId, descriptorSnapshotOf(instance));
 	}
 
 	private commitDeletedSnapshot(agentId: string): void {
-		this.bumpFastModeSnapshotEpoch(agentId);
-		this.fastModeSnapshots.delete(agentId);
+		this.bumpDescriptorSnapshotEpoch(agentId);
+		this.descriptorSnapshots.delete(agentId);
 	}
 
 	private rememberInstanceAtEpoch(instance: AgentInstance, epoch: number): boolean {
-		if (this.fastModeSnapshotEpoch(instance.agentId) !== epoch) return false;
-		this.fastModeSnapshots.set(instance.agentId, instance.fastMode === true);
+		if (this.descriptorSnapshotEpoch(instance.agentId) !== epoch) return false;
+		this.descriptorSnapshots.set(instance.agentId, descriptorSnapshotOf(instance));
 		return true;
 	}
 
 	private forgetInstanceAtEpoch(agentId: string, epoch: number): boolean {
-		if (this.fastModeSnapshotEpoch(agentId) !== epoch) return false;
-		this.fastModeSnapshots.delete(agentId);
+		if (this.descriptorSnapshotEpoch(agentId) !== epoch) return false;
+		this.descriptorSnapshots.delete(agentId);
 		return true;
 	}
 

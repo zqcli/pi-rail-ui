@@ -1,14 +1,38 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-	applyNativeFastMode,
 	installRailFast,
 	RAIL_FAST_MODE_FLAG,
 	railFastFooterLabel,
-	restoreNativeFastMode,
 	supportsNativeGptFastMode,
 	supportsNativeFastMode,
 } from "../../commands/rail-fast";
+
+function setupFast(getFlag: () => boolean | string | undefined = () => undefined) {
+	let command: any;
+	let flag: string | undefined;
+	const handlers = new Map<string, any>();
+	const pi = {
+		events: { emit: () => undefined, on: () => () => undefined },
+		registerCommand: (_name: string, definition: any) => { command = definition; },
+		registerFlag: (name: string) => { flag = name; },
+		getFlag,
+		on: (event: string, handler: any) => { handlers.set(event, handler); },
+	};
+	installRailFast(pi as any);
+	return { command, handlers, flag: flag! };
+}
+
+function context(model: any, statuses?: Array<string | undefined>, notices?: string[]) {
+	return {
+		hasUI: statuses !== undefined || notices !== undefined,
+		model,
+		ui: {
+			setStatus: (_key: string, value: string | undefined) => statuses?.push(value),
+			notify: (message: string) => notices?.push(message),
+		},
+	};
+}
 
 test("uses Pi native fast mode for every supported OpenAI-compatible API", () => {
 	assert.equal(supportsNativeFastMode({ api: "openai-completions", id: "chat-model" }), true);
@@ -19,120 +43,167 @@ test("uses Pi native fast mode for every supported OpenAI-compatible API", () =>
 	assert.equal(supportsNativeFastMode(undefined), false);
 });
 
-test("applies and restores service_tier through model samplingParams", () => {
-	restoreNativeFastMode();
-	const originalSamplingParams = { temperature: 0.2, service_tier: "flex" };
-	const model = { api: "openai-responses", id: "gpt-5.6-sol", samplingParams: originalSamplingParams };
-
-	assert.equal(applyNativeFastMode(model), true);
-	assert.notEqual(model.samplingParams, originalSamplingParams);
-	assert.deepEqual(model.samplingParams, { temperature: 0.2, service_tier: "priority" });
-	assert.deepEqual(originalSamplingParams, { temperature: 0.2, service_tier: "flex" });
-
-	restoreNativeFastMode();
-	assert.equal(model.samplingParams, originalSamplingParams);
-
-	const modelWithoutParams: { api: string; id: string; samplingParams?: Record<string, unknown> } = {
-		api: "openai-responses",
-		id: "gpt-5.6-terra",
-	};
-	assert.equal(applyNativeFastMode(modelWithoutParams), true);
-	assert.deepEqual(modelWithoutParams.samplingParams, { service_tier: "priority" });
-	restoreNativeFastMode();
-	assert.equal("samplingParams" in modelWithoutParams, false);
+test("subagent fast eligibility requires GPT naming and the native supported API", () => {
+	assert.equal(supportsNativeGptFastMode({ api: "openai-responses", id: "gpt-5.6-sol" }), true);
+	assert.equal(supportsNativeGptFastMode({ api: "openai-completions", id: "gpt-4.1" }), true);
+	assert.equal(supportsNativeGptFastMode({ api: "openai-responses", id: "deepseek-v4" }), false);
+	assert.equal(supportsNativeGptFastMode({ api: "openai-codex-responses", id: "gpt-5.6-sol" }), false);
+	assert.equal(supportsNativeGptFastMode({ api: "openai-responses", id: "custom-model", name: "GPT custom" }), true);
+	assert.equal(supportsNativeGptFastMode({ id: "gpt-5.6-sol" } as any), false);
 });
 
-test("/rail-oai-fast toggles the native model parameter without a provider hook", async () => {
-	restoreNativeFastMode();
-	let commandName: string | undefined;
-	let command: any;
-	const handlers = new Map<string, any>();
-	const notices: string[] = [];
-	const statuses: Array<string | undefined> = [];
-	const pi = {
-		events: { emit: () => undefined, on: () => () => undefined },
-		registerCommand: (name: string, definition: any) => {
-			commandName = name;
-			command = definition;
-		},
-		registerFlag: () => undefined,
-		getFlag: () => undefined,
-		on: (event: string, handler: any) => { handlers.set(event, handler); },
-	};
-	const ctx: any = {
-		hasUI: true,
-		model: { api: "openai-responses", id: "custom-model" },
-		ui: {
-			notify: (message: string) => notices.push(message),
-			setStatus: (_key: string, value: string | undefined) => statuses.push(value),
-		},
-	};
+test("injects service_tier into eligible GPT provider payloads without mutating models", async () => {
+	const { command, handlers } = setupFast();
+	const gptModel = { api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
+	const ctx = context(gptModel);
+	await handlers.get("session_start")({}, ctx);
+	assert.equal(handlers.has("before_provider_request"), true);
 
-	installRailFast(pi as any);
-	assert.equal(commandName, "rail-oai-fast");
-	assert.equal(handlers.has("before_provider_request"), false);
+	const payload = { model: "gpt-5.6-sol", input: [] };
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "policy off leaves the payload untouched");
+	await command.handler("on", ctx);
+	const injected = await handlers.get("before_provider_request")({ payload }, ctx);
+	assert.deepEqual(injected, { ...payload, service_tier: "priority" });
+	assert.notEqual(injected, payload);
+	assert.equal("samplingParams" in gptModel, false, "fast mode must not mutate the active model");
+	assert.equal(
+		await handlers.get("before_provider_request")({ payload: { ...payload, service_tier: "priority" } }, ctx),
+		undefined,
+		"an already-priority payload is not copied again",
+	);
+	await command.handler("off", ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	await handlers.get("session_shutdown")({}, ctx);
+});
+
+test("/rail-oai-fast toggles request-time service_tier and status", async () => {
+	const statuses: Array<string | undefined> = [];
+	const notices: string[] = [];
+	const { command, handlers, flag } = setupFast();
+	assert.equal(flag, RAIL_FAST_MODE_FLAG);
+	const ctx = context({ api: "openai-responses", id: "custom-model", name: "Custom GPT" }, statuses, notices);
+
 	await handlers.get("session_start")({}, ctx);
 	await command.handler("on", ctx);
-	assert.deepEqual(ctx.model.samplingParams, { service_tier: "priority" });
 	assert.equal(statuses.at(-1), "FAST");
 	assert.equal(railFastFooterLabel(), "FAST");
 	assert.match(notices.at(-1) ?? "", /enabled/);
-	const activeSamplingParams = ctx.model.samplingParams;
+	assert.deepEqual(
+		await handlers.get("before_provider_request")({ payload: { model: "custom-model", input: [] } }, ctx),
+		{ model: "custom-model", input: [], service_tier: "priority" },
+	);
+
 	await command.handler("status", ctx);
-	assert.equal(ctx.model.samplingParams, activeSamplingParams);
-
-	const previousModel = ctx.model;
-	ctx.model = { api: "anthropic-messages", id: "claude" };
-	await handlers.get("model_select")({}, ctx);
-	assert.equal("samplingParams" in previousModel, false);
-	assert.equal(statuses.at(-1), "FAST (inactive)");
-	assert.equal(railFastFooterLabel(), "FAST inactive");
-
-	ctx.model = { api: "openai-responses", id: "second-model" };
-	await handlers.get("model_select")({}, ctx);
-	assert.deepEqual(ctx.model.samplingParams, { service_tier: "priority" });
+	assert.equal(statuses.at(-1), "FAST");
+	await command.handler("off", ctx);
+	assert.equal(statuses.at(-1), undefined);
+	assert.equal(await handlers.get("before_provider_request")({ payload: { model: "custom-model", input: [] } }, ctx), undefined);
+	await command.handler("bogus", ctx);
+	assert.match(notices.at(-1) ?? "", /Usage: /);
 	await handlers.get("session_shutdown")({}, ctx);
-	assert.equal("samplingParams" in ctx.model, false);
 	assert.equal(railFastFooterLabel(), undefined);
 });
 
-test("child startup flag enables fast before the first provider request", async () => {
-	restoreNativeFastMode();
-	let startupFlag: string | undefined;
-	let getFlag: (() => boolean | string | undefined) | undefined;
-	const handlers = new Map<string, any>();
-	const pi = {
-		events: { emit: () => undefined, on: () => () => undefined },
-		registerCommand: () => undefined,
-		registerFlag: (name: string) => { startupFlag = name; },
-		getFlag: () => getFlag?.(),
-		on: (event: string, handler: any) => { handlers.set(event, handler); },
-	};
-	const model: any = { api: "openai-responses", id: "gpt-5.6-sol" };
-	const ctx: any = {
-		hasUI: false,
-		model,
-		ui: { setStatus: () => undefined },
-	};
+test("parent slash eligibility stays API-only for non-GPT models on supported APIs", async () => {
+	const statuses: Array<string | undefined> = [];
+	const { command, handlers } = setupFast();
+	const ctx = context({ api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" }, statuses);
+	const payload = { model: "probe", input: [] };
 
-	installRailFast(pi as any);
-	assert.equal(startupFlag, RAIL_FAST_MODE_FLAG);
-	getFlag = () => true;
 	await handlers.get("session_start")({}, ctx);
-	assert.deepEqual(model.samplingParams, { service_tier: "priority" });
+	assert.equal(statuses.at(-1), undefined);
+	await command.handler("on", ctx);
+	assert.equal(statuses.at(-1), "FAST");
+	assert.deepEqual(
+		await handlers.get("before_provider_request")({ payload }, ctx),
+		{ ...payload, service_tier: "priority" },
+		"a normal parent session keeps HEAD's API-only scope instead of GPT gating",
+	);
+	assert.equal(railFastFooterLabel(), "FAST");
+
+	ctx.model = { api: "openai-completions", id: "deepseek-chat", name: "DeepSeek Chat" };
+	await handlers.get("model_select")({}, ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+
+	ctx.model = { api: "anthropic-messages", id: "claude-opus", name: "Claude Opus" };
+	await handlers.get("model_select")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload: { messages: [] } }, ctx), undefined);
+	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(railFastFooterLabel(), "FAST inactive");
+
+	ctx.model = { api: "openai-codex-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
+	await handlers.get("model_select")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "codex stays outside the rewritten APIs");
+
+	await command.handler("off", ctx);
+	assert.equal(statuses.at(-1), undefined);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	await handlers.get("session_shutdown")({}, ctx);
+});
+
+test("child startup flag keeps fast GPT-only across a model switch and slash toggles", async () => {
+	const statuses: Array<string | undefined> = [];
+	let flagValue: boolean | undefined = true;
+	const { command, handlers, flag } = setupFast(() => flagValue);
+	assert.equal(flag, RAIL_FAST_MODE_FLAG);
+	const ctx = context({ api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" }, statuses);
+	const payload = { model: "probe", input: [] };
+
+	await handlers.get("session_start")({}, ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+
+	// A child may switch models in place, but it must never regain API-only scope.
+	ctx.model = { api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" };
+	await handlers.get("model_select")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	assert.equal(statuses.at(-1), "FAST (inactive)");
+
+	// Slash toggles inside the child must not lift the GPT-only restriction.
+	await command.handler("off", ctx);
+	await command.handler("on", ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(railFastFooterLabel(), "FAST inactive");
+
+	// Switching back to GPT restores injection with the restrictive scope intact.
+	ctx.model = { api: "openai-completions", id: "gpt-4.1", name: "GPT 4.1" };
+	await handlers.get("model_select")({}, ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+	assert.equal(railFastFooterLabel(), "FAST");
+
+	// Without the startup flag the same module instance becomes a normal
+	// API-only session once its slash command is enabled.
+	flagValue = undefined;
+	await handlers.get("session_shutdown")({}, ctx);
+	ctx.model = { api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" };
+	await handlers.get("session_start")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "a parent session is off until toggled on");
+	await command.handler("on", ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+
+	await handlers.get("session_shutdown")({}, ctx);
+});
+
+test("child startup flag enables fast before the first provider request and off disarms it", async () => {
+	let flagValue: boolean | undefined;
+	const { command, handlers, flag } = setupFast(() => flagValue);
+	assert.equal(flag, RAIL_FAST_MODE_FLAG);
+	const gptModel = { api: "openai-responses", id: "gpt-5.6-sol" };
+	const ctx = context(gptModel);
+
+	flagValue = true;
+	await handlers.get("session_start")({}, ctx);
+	const payload = { model: "gpt-5.6-sol", input: [] };
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+	assert.equal("samplingParams" in gptModel, false);
+	await command.handler("off", ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
 	await handlers.get("session_shutdown")({}, ctx);
 
 	ctx.model = { api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" };
 	await handlers.get("session_start")({}, ctx);
-	assert.equal("samplingParams" in ctx.model, false);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
 	await handlers.get("session_shutdown")({}, ctx);
-});
-
-test("subagent fast eligibility requires GPT naming and the native supported API", () => {
-	assert.equal(supportsNativeGptFastMode({ api: "openai-responses", id: "gpt-5.6-sol" }), true);
-	assert.equal(supportsNativeGptFastMode({ api: "openai-responses", id: "deepseek-v4" }), false);
-	assert.equal(supportsNativeGptFastMode({ api: "openai-codex-responses", id: "gpt-5.6-sol" }), false);
-	assert.equal(supportsNativeGptFastMode({ api: "openai-responses", id: "custom-model", name: "GPT custom" }), true);
 });
 
 test("root and standalone installers share one Fast registration through Pi's event bus", () => {

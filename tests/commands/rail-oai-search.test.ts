@@ -3,9 +3,23 @@ import { test } from "node:test";
 import {
 	installRailOaiSearch,
 	isGptModel,
+	RAIL_OAI_SEARCH_MODE_FLAG,
 	transformNativeSearchPayload,
 } from "../../commands/rail-oai-search";
 import { hostedSearchActivityForMessage } from "../../openai/hosted-search-activity";
+
+function eventBus() {
+	const listeners = new Map<string, Array<(data: unknown) => void>>();
+	return {
+		emit: (event: string, data: unknown) => listeners.get(event)?.forEach((listener) => listener(data)),
+		on: (event: string, listener: (data: unknown) => void) => {
+			const registered = listeners.get(event) ?? [];
+			registered.push(listener);
+			listeners.set(event, registered);
+			return () => undefined;
+		},
+	};
+}
 
 test("recognizes GPT models by id or display name without restricting provider", () => {
 	assert.equal(isGptModel({ id: "gpt-5.6-sol", name: "Custom model" }), true);
@@ -133,10 +147,13 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 		streamSimple: () => ({}),
 	};
 	const pi = {
+		events: eventBus(),
 		registerCommand: (name: string, definition: any) => {
 			commandName = name;
 			command = definition;
 		},
+		registerFlag: () => undefined,
+		getFlag: () => undefined,
 		on: (event: string, handler: any) => handlers.set(event, handler),
 		registerProvider: (providerId: string, config: any) => {
 			providerConfigs.set(providerId, { ...(providerConfigs.get(providerId) ?? {}), ...config });
@@ -265,7 +282,10 @@ test("persists observed search state before the assistant entry without requirin
 		},
 	};
 	const pi: any = {
+		events: eventBus(),
 		registerCommand: (_name: string, definition: any) => { command = definition; },
+		registerFlag: () => undefined,
+		getFlag: () => undefined,
 		on: (event: string, handler: any) => handlers.set(event, handler),
 		registerProvider: (providerId: string, config: any) => {
 			providerConfigs.set(providerId, { ...(providerConfigs.get(providerId) ?? {}), ...config });
@@ -327,4 +347,72 @@ test("persists observed search state before the assistant entry without requirin
 		timestamp: 4242,
 	})?.observed, true);
 	await handlers.get("turn_end")({}, ctx);
+	await handlers.get("session_shutdown")({}, ctx);
+});
+
+test("child startup flag enables hosted search before the first provider request", async () => {
+	const cases: Array<[string, boolean | undefined]> = [
+		["live", true],
+		["cached", false],
+		["bogus", undefined],
+	];
+	for (const [flag, externalWebAccess] of cases) {
+		let registeredFlag: string | undefined;
+		const handlers = new Map<string, any>();
+		const providerConfigs = new Map<string, any>();
+		const provider = { streamSimple: () => ({}) };
+		const pi: any = {
+			events: eventBus(),
+			registerCommand: () => undefined,
+			registerFlag: (name: string) => { registeredFlag = name; },
+			getFlag: () => flag,
+			on: (event: string, handler: any) => handlers.set(event, handler),
+			registerProvider: (providerId: string, config: any) => providerConfigs.set(providerId, config),
+			unregisterProvider: (providerId: string) => providerConfigs.delete(providerId),
+			appendEntry: () => undefined,
+		};
+		const ctx: any = {
+			hasUI: false,
+			model: { provider: "custom", api: "openai-responses", id: "gpt-child", name: "GPT child" },
+			sessionManager: { getBranch: () => [] },
+			modelRegistry: {
+				getProvider: () => provider,
+				getRegisteredProviderConfig: (providerId: string) => providerConfigs.get(providerId),
+				getRegisteredNativeProvider: () => undefined,
+			},
+			ui: { setStatus: () => undefined },
+		};
+
+		installRailOaiSearch(pi);
+		assert.equal(registeredFlag, RAIL_OAI_SEARCH_MODE_FLAG);
+		await handlers.get("session_start")({}, ctx);
+		await handlers.get("turn_start")({}, ctx);
+		const payload = await handlers.get("before_provider_request")({ payload: { input: [] } }, ctx);
+		if (externalWebAccess === undefined) {
+			assert.equal(payload, undefined);
+		} else {
+			assert.deepEqual(payload.tools, [{ type: "web_search", external_web_access: externalWebAccess }]);
+			assert.deepEqual(payload.include, ["web_search_call.action.sources"]);
+		}
+		await handlers.get("session_shutdown")({}, ctx);
+	}
+});
+
+test("root and standalone search installers share one registration", () => {
+	let commands = 0;
+	let flags = 0;
+	const pi: any = {
+		events: eventBus(),
+		registerCommand: () => { commands += 1; },
+		registerFlag: () => { flags += 1; },
+		getFlag: () => undefined,
+		on: () => undefined,
+		appendEntry: () => undefined,
+	};
+
+	installRailOaiSearch(pi);
+	installRailOaiSearch(pi);
+
+	assert.equal(commands, 1);
+	assert.equal(flags, 1);
 });

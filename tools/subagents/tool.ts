@@ -448,7 +448,7 @@ function dispatchMetadataText(metadata: readonly DispatchDisplayMetadata[], grou
 	const fast = grouped && !sameFastMode
 		? metadata.map((item, index) => `${index + 1}=${item.fastModeText}`).join(", ")
 		: firstFastMode;
-	return `${contextWindow} · FAST ${fast}`;
+	return `${contextWindow} · FAST ${fast} · SEARCH on`;
 }
 
 function dispatchMetadataForRender(

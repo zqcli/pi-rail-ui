@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
+import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import {
 	RpcSessionWorker,
 	buildRpcWorkerArgs,
@@ -212,9 +213,28 @@ describe("RPC worker arguments", () => {
 			"--model", "cus-resp/gpt-5.6-sol",
 			"--thinking", "xhigh",
 			"--exclude-tools", "subagent",
+			"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
 			"-e", gptCompactionExtensionPath(),
 			"-e", contextExtensionPath(), "--rail-context-protocol", "1",
 		]);
+	});
+
+	test("every persistent worker starts the standalone search extension in live mode", () => {
+		const assertLiveSearch = (args: string[]) => {
+			const extensionIndex = args.indexOf(railOaiSearchExtensionPath());
+			assert.notEqual(extensionIndex, -1);
+			assert.deepEqual(args.slice(extensionIndex - 1, extensionIndex + 3), [
+				"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
+			]);
+			assert.equal(args.filter((arg) => arg === railOaiSearchExtensionPath()).length, 1);
+			assert.equal(args.filter((arg) => arg === `--${RAIL_OAI_SEARCH_MODE_FLAG}`).length, 1);
+		};
+		assertLiveSearch(buildRpcWorkerArgs(spec("new")));
+		assertLiveSearch(buildRpcWorkerArgs(spec("fork", "/tmp/source.jsonl")));
+		assertLiveSearch(buildRpcWorkerArgs(spec("open", "/tmp/child.jsonl")));
+		assertLiveSearch(buildRpcWorkerArgs(spec("exclusive", "/tmp/source.jsonl")));
+		assertLiveSearch(buildRpcWorkerArgs({ ...spec("new"), fastMode: true } as any));
+		assertLiveSearch(buildRpcWorkerArgs({ ...spec("new"), fastMode: false } as any));
 	});
 
 	test("adds the private fast flag to new and resumed workers when enabled", () => {

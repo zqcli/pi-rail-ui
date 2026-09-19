@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HostedSearchProviderCapture } from "../openai/hosted-search-capture";
 import {
@@ -6,6 +7,8 @@ import {
 } from "../openai/hosted-search-activity";
 
 const STATUS_KEY = "rail-oai-search";
+const INSTALL_EVENT = "rail-oai-search:install";
+export const RAIL_OAI_SEARCH_MODE_FLAG = "rail-oai-search-mode";
 const SOURCE_INCLUDE = "web_search_call.action.sources";
 const KNOWN_NON_RESPONSES_APIS = new Set([
 	"openai-completions",
@@ -33,6 +36,27 @@ let activeForCurrentModel = false;
 let turnActive = false;
 let searchRunning = false;
 let probeNextRequest = false;
+
+type InstallClaim = { claimed: boolean };
+
+function claimSharedInstall(pi: ExtensionAPI): boolean {
+	const claim: InstallClaim = { claimed: false };
+	pi.events.emit(INSTALL_EVENT, claim);
+	if (claim.claimed) return false;
+	pi.events.on(INSTALL_EVENT, (data) => {
+		if (data && typeof data === "object" && "claimed" in data) (data as InstallClaim).claimed = true;
+	});
+	return true;
+}
+
+export function railOaiSearchExtensionPath(): string {
+	return fileURLToPath(new URL("./rail-oai-search-standalone.ts", import.meta.url));
+}
+
+function startupSearchMode(pi: ExtensionAPI): RailOaiSearchMode {
+	const value = pi.getFlag?.(RAIL_OAI_SEARCH_MODE_FLAG);
+	return value === "live" || value === "cached" ? value : "off";
+}
 
 function isRecord(value: unknown): value is JsonObject {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -147,6 +171,11 @@ function notifyStatus(ctx: ExtensionContext): void {
 }
 
 export function installRailOaiSearch(pi: ExtensionAPI): void {
+	if (!claimSharedInstall(pi)) return;
+	pi.registerFlag?.(RAIL_OAI_SEARCH_MODE_FLAG, {
+		description: "Set Rail native web search mode for this child process",
+		type: "string",
+	});
 	const capture = new HostedSearchProviderCapture(pi, {
 		isEnabled: (model) => mode !== "off" && isGptModel(model),
 		onActivityChanged: (activity, ctx) => {
@@ -179,7 +208,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		mode = "off";
+		mode = startupSearchMode(pi);
 		turnActive = false;
 		searchRunning = false;
 		probeNextRequest = false;

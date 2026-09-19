@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
+import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, formatContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
 import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
 import { isGptModelName } from "../gpt-compaction/model-eligibility";
@@ -53,6 +54,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		if (gptCompactionEnabled) args.push("-e", gptCompactionExtensionPath());
 		if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
 		if (request.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
+		args.push("-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live");
 		args.push("--exclude-tools", "subagent");
 		if (contextWindow !== undefined) {
 			args.push(

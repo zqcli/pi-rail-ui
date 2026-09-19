@@ -3,10 +3,11 @@ import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
+import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { test } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
-import { CONTEXT_PROTOCOL_ERROR_PREFIX } from "../../tools/subagents/context-window";
+import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools/subagents/context-window";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
@@ -37,6 +38,7 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		"--mode", "json", "-p", "--no-session",
 		"--model", "cus-resp/gpt-5.6-luna",
 		"--thinking", "xhigh",
+		"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
 		"--exclude-tools", "subagent",
 		"Task: inspect auth",
 	]);
@@ -60,6 +62,37 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		contextTokens: 17,
 		turns: 1,
 	});
+});
+
+test("every stateless dispatch starts the standalone search extension in live mode", async () => {
+	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
+	let capturedArgs: string[] = [];
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: (args) => {
+			capturedArgs = args;
+			return { command: process.execPath, args: [fixture] };
+		},
+	});
+	const assertLiveSearch = (label: string) => {
+		const extensionIndex = capturedArgs.indexOf(railOaiSearchExtensionPath());
+		assert.notEqual(extensionIndex, -1, `${label}: missing search extension`);
+		assert.deepEqual(
+			capturedArgs.slice(extensionIndex - 1, extensionIndex + 3),
+			["-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live"],
+			`${label}: hosted search must always start in live mode`,
+		);
+		assert.equal(capturedArgs.filter((arg) => arg === railOaiSearchExtensionPath()).length, 1, `${label}: duplicate search extension`);
+		assert.equal(capturedArgs.filter((arg) => arg === `--${RAIL_OAI_SEARCH_MODE_FLAG}`).length, 1, `${label}: duplicate search flag`);
+	};
+
+	await runner({ model, task: "default", cwd: process.cwd() });
+	assertLiveSearch("default");
+	await runner({ model, task: "fast", cwd: process.cwd(), fastMode: true });
+	assertLiveSearch("fastMode");
+	await runner({ model, task: "explicit budget", cwd: process.cwd(), contextWindow: 64_000 });
+	assertLiveSearch("contextWindow");
+	await runner({ model: { provider: "cus-resp", modelId: "deepseek-v4" }, task: "non-GPT", cwd: process.cwd() });
+	assertLiveSearch("non-GPT model");
 });
 
 test("stateless runner forwards fastMode only for an explicit true dispatch", async () => {
@@ -164,7 +197,7 @@ test("stateless runner adds the explicit context helper only for an explicit bud
 
 	await runner({ model, task: "explicit budget", cwd: process.cwd(), contextWindow: 64_000 });
 	assert.equal(explicitArgs.includes("-e"), true);
-	assert.equal(explicitArgs.at(explicitArgs.indexOf("-e") + 1)?.endsWith("context-extension.ts"), true);
+	assert.equal(explicitArgs.includes(contextExtensionPath()), true);
 	assert.deepEqual(explicitArgs.slice(-5), ["--rail-context-protocol", "1", "--rail-context-window", "64000", "Task: explicit budget"]);
 
 	let omittedArgs: string[] = [];
@@ -175,7 +208,8 @@ test("stateless runner adds the explicit context helper only for an explicit bud
 		},
 	});
 	await omittedRunner({ model, task: "omitted budget", cwd: process.cwd() });
-	assert.equal(omittedArgs.includes("-e"), false);
+	assert.equal(omittedArgs.includes(railOaiSearchExtensionPath()), true);
+	assert.equal(omittedArgs.includes(contextExtensionPath()), false);
 	assert.equal(omittedArgs.includes("--rail-context-window"), false);
 });
 

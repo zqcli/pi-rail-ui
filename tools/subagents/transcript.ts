@@ -794,7 +794,7 @@ function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control",
 		: "";
 	const contextWindow = ` · ContextWindow ${run.contextWindowText ?? "Default"}`;
 	const fast = ` · FAST ${run.fastModeText ?? "off"}`;
-	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}`;
+	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast} · SEARCH on`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {

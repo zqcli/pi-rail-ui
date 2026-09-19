@@ -9,6 +9,7 @@ import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
 import { RpcSessionWorker, buildRpcWorkerArgs } from "../../tools/subagents/rpc-worker";
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
 import { railFastExtensionPath } from "../../commands/rail-fast";
+import { railOaiSearchExtensionPath } from "../../commands/rail-oai-search";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
 
@@ -39,7 +40,7 @@ function responseEvents(text: string, responseId: string): string {
 	].join("");
 }
 
-test("real stateless and persistent children apply fast mode to their first provider payload", { timeout: 30_000 }, async (t) => {
+test("real stateless and persistent children apply fast mode and hosted search to their first provider payload", { timeout: 30_000 }, async (t) => {
 	const requests: Array<Record<string, unknown>> = [];
 	const server = createServer((request, response) => {
 		let raw = "";
@@ -109,6 +110,11 @@ test("real stateless and persistent children apply fast mode to their first prov
 
 	assert.equal(requests.length, 3);
 	assert.deepEqual(requests.map((body) => body["service_tier"]), ["priority", undefined, "priority"]);
+	for (const body of requests) {
+		const tools = body["tools"] as Array<Record<string, unknown>>;
+		assert.deepEqual(tools.filter((tool) => tool["type"] === "web_search"), [{ type: "web_search", external_web_access: true }]);
+		assert.deepEqual(body["include"], ["web_search_call.action.sources"]);
+	}
 
 	for (const extensions of [[railExtension, railFastExtensionPath()], [railFastExtensionPath(), railExtension]]) {
 		const dedupTransport = new PiRpcProcessTransport({
@@ -131,6 +137,48 @@ test("real stateless and persistent children apply fast mode to their first prov
 		try {
 			const commands = await dedupTransport.request({ type: "get_commands" }) as { commands?: Array<{ name?: string }> };
 			assert.equal(commands.commands?.filter((command) => command.name === "rail-oai-fast").length, 1);
+		} finally {
+			await dedupTransport.stop().catch(() => undefined);
+		}
+	}
+
+	for (const extensions of [[railExtension, railOaiSearchExtensionPath()], [railOaiSearchExtensionPath(), railExtension]]) {
+		const dedupTransport = new PiRpcProcessTransport({
+			command: process.execPath,
+			args: [
+				bundleCli,
+				"--mode", "rpc",
+				"--name", "rail-search-dedup",
+				"--no-extensions",
+				"--offline",
+				"-e", providerFixture,
+				"-e", extensions[0]!,
+				"-e", extensions[1]!,
+				"--rail-oai-search-mode", "live",
+				"--model", "rail-fast-probe/gpt-fast-probe",
+			],
+			cwd: process.cwd(),
+			env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_SUBAGENT_DEPTH: "1" },
+		});
+		await dedupTransport.start();
+		try {
+			const commands = await dedupTransport.request({ type: "get_commands" }) as { commands?: Array<{ name?: string }> };
+			assert.equal(commands.commands?.filter((command) => command.name === "rail-oai-search").length, 1);
+			let unsubscribeSettled!: () => void;
+			const settled = new Promise<void>((resolve) => {
+				unsubscribeSettled = dedupTransport.onEvent((event) => {
+					if (event.type !== "agent_settled") return;
+					unsubscribeSettled();
+					resolve();
+				});
+			});
+			await dedupTransport.request({ type: "prompt", message: "search install order probe" });
+			await settled;
+			const request = requests.at(-1);
+			assert.ok(request, "search install order probe did not reach the provider");
+			const tools = request["tools"] as Array<Record<string, unknown>>;
+			assert.deepEqual(tools.filter((tool) => tool["type"] === "web_search"), [{ type: "web_search", external_web_access: true }]);
+			assert.deepEqual(request["include"], ["web_search_call.action.sources"]);
 		} finally {
 			await dedupTransport.stop().catch(() => undefined);
 		}

@@ -88,20 +88,21 @@ export function createRpcWorkerFactory(options: RpcWorkerFactoryOptions): Sessio
 		let lease = await leases.acquire(startsWithSessionLease
 			? sessionLeaseKey(spec.sessionPath!)
 			: `agent:${spec.agentId}`);
-		const invocation = (options.resolveInvocation ?? resolvePiInvocation)(buildRpcWorkerArgs(spec));
-		const transport = new PiRpcProcessTransport({
-			command: invocation.command,
-			args: invocation.args,
-			cwd: spec.cwd,
-			env: {
-				...process.env,
-				PI_SUBAGENT_DEPTH: String(Number(process.env["PI_SUBAGENT_DEPTH"] ?? "0") + 1),
-			},
-			...(options.onUiRequest ? {
-				onUiRequest: (request: RpcEvent) => options.onUiRequest!(request, { agentId: spec.agentId, alias: spec.alias }),
-			} : {}),
-		});
+		let transport: PiRpcProcessTransport | undefined;
 		try {
+			const invocation = (options.resolveInvocation ?? resolvePiInvocation)(buildRpcWorkerArgs(spec));
+			transport = new PiRpcProcessTransport({
+				command: invocation.command,
+				args: invocation.args,
+				cwd: spec.cwd,
+				env: {
+					...process.env,
+					PI_SUBAGENT_DEPTH: String(Number(process.env["PI_SUBAGENT_DEPTH"] ?? "0") + 1),
+				},
+				...(options.onUiRequest ? {
+					onUiRequest: (request: RpcEvent) => options.onUiRequest!(request, { agentId: spec.agentId, alias: spec.alias }),
+				} : {}),
+			});
 			await transport.start();
 			const worker = await withTimeout(RpcSessionWorker.connect(spec, transport), options.startupTimeoutMs ?? 15_000);
 			if (!startsWithSessionLease) {
@@ -112,7 +113,7 @@ export function createRpcWorkerFactory(options: RpcWorkerFactoryOptions): Sessio
 			}
 			return new LeasedSessionWorker(worker, lease);
 		} catch (error) {
-			await transport.stop().catch(() => undefined);
+			await transport?.stop().catch(() => undefined);
 			await lease.release();
 			throw error;
 		}

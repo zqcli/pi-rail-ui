@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { teamExtensionPath, TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamWorkerChannel } from "../../tools/subagents/team-protocol";
+import { TEAM_COMMAND_DESCRIPTION } from "../../tools/subagents/team-extension";
 import { describe, test } from "node:test";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
@@ -227,6 +229,57 @@ function hostedSearchEntryEvent(id: string, callIds: string[]): RpcEvent {
 	};
 }
 
+test("team bind ACK precedes each native prompt; settled sends restore context and unbind", async () => {
+	const transport = new FakeTransport();
+	const request = transport.request.bind(transport);
+	transport.request = async (command) => {
+		if (command["type"] === "get_commands") {
+			const result = await request(command) as { commands: unknown[] };
+			return { commands: [...result.commands, { name: TEAM_COMMAND, source: "extension", description: TEAM_COMMAND_DESCRIPTION }] };
+		}
+		if (command["type"] === "prompt" && String(command["message"]).startsWith(`/${TEAM_COMMAND} `)) {
+			transport.commands.push(command);
+			const frame = JSON.parse(String(command["message"]).slice(TEAM_COMMAND.length + 2));
+			transport.emit({ type: "entry_appended", entry: { type: "custom", customType: TEAM_ENTRY_TYPE, data: { version: 1, kind: "ack", commandId: frame.commandId, binding: frame.binding, ok: true } } });
+			return undefined;
+		}
+		if (command["type"] === "prompt" && command["message"] === "empty") {
+			transport.commands.push(command);
+			transport.emit({ type: "agent_start" });
+			transport.emit({ type: "agent_settled" });
+			return undefined;
+		}
+		return request(command);
+	};
+	const worker = await RpcSessionWorker.connect(spec("new"), transport);
+	const team: TeamWorkerChannel = { binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }) };
+	await worker.send("initial", { contextWindow: 64000, team });
+	await worker.send("summary", { contextWindow: 64000, team });
+	const prompts = transport.commands.filter((command) => command["type"] === "prompt").map((command) => String(command["message"]));
+	assert.equal(prompts.length, 10);
+	for (const start of [0, 5]) {
+		assert.match(prompts[start]!, /"operation":"bind"/);
+		assert.match(prompts[start + 1]!, /prepare 64000/);
+		assert.equal(prompts[start + 2], start === 0 ? "initial" : "summary");
+		assert.match(prompts[start + 3]!, / reset$/);
+		assert.match(prompts[start + 4]!, /"operation":"unbind"/);
+	}
+	assert.equal((await worker.send("empty", { team })).output, "");
+	assert.equal((await worker.send("empty")).output, "(no output)");
+	assert.equal(transport.listeners.size, 0);
+});
+
+test("missing team helper fails closed without sending an ordinary task", async () => {
+	const transport = new FakeTransport();
+	const worker = await RpcSessionWorker.connect(spec("new"), transport);
+	await assert.rejects(worker.send("must not run", { team: {
+		binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }),
+	} }), /team command/);
+	assert.equal(transport.commands.some((command) => command["message"] === "must not run"), false);
+	assert.equal(worker.isReusable(), false);
+	assert.equal(transport.listeners.size, 0);
+});
+
 describe("RPC worker arguments", () => {
 	test("starts a forked child session with the selected Pi model", () => {
 		assert.deepEqual(buildRpcWorkerArgs(spec("fork", "/tmp/source.jsonl")), [
@@ -235,7 +288,8 @@ describe("RPC worker arguments", () => {
 			"--name", "subagent · Main Auth Work · auth-review",
 			"--model", "cus-resp/gpt-5.6-sol",
 			"--thinking", "xhigh",
-			"--exclude-tools", "subagent",
+			"--exclude-tools", "subagent,subagent_team",
+			"-e", teamExtensionPath(),
 			"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
 			"-e", gptCompactionExtensionPath(),
 			"-e", contextExtensionPath(), "--rail-context-protocol", "1",

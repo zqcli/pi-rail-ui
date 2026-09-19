@@ -1,3 +1,4 @@
+import { TeamRunManager, teamCallSignal, teamStatus } from "./team-runner";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -92,6 +93,7 @@ const ChainItem = Type.Object({
 });
 
 const SubagentParams = Type.Object({
+	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Prepared team id. Launch coordinator single and exact workers parallel as two sibling calls; new persistent aliases only." })),
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. In single mode, model+task without alias/session is stateless; model+alias+task creates persistent." })),
 	target: Type.Optional(Type.String({ description: "Continue the exact linked persistent alias or agentId and its existing conversation memory; do not also set model" })),
 	alias: Type.Optional(Type.String({ description: "Create a new persistent long-term helper expected to receive future follow-ups; omit for one-off stateless work" })),
@@ -124,6 +126,7 @@ export interface StatefulSubagentDetails {
 }
 
 export interface StatefulSubagentToolOptions {
+	team?: () => TeamRunManager;
 	broker: SessionBroker | (() => SessionBroker);
 	readonly knownFastMode?: (target: string) => boolean | undefined;
 	readonly knownModel?: (target: string) => RailModelRef | undefined;
@@ -320,12 +323,15 @@ function modeFor(params: SubagentParamsValue): SubagentMode {
 }
 
 function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
+	if (params.teamId != null && (mode === "chain" || mode === "control" || params.chain !== undefined || params.control !== undefined || params.target !== undefined || params.session !== undefined
+		|| params.tasks?.some((item) => item.target !== undefined || item.session !== undefined))) throw new Error("Team does not support target/session/chain/control");
 	if (mode !== "single" && normalizeContextWindow(params.contextWindow) !== undefined) {
 		throw new Error("contextWindow is only supported on the single task or on each parallel/chain item");
 	}
-	const confirmSessionAttach = typeof params.confirmSessionAttach === "boolean"
-		? { confirmSessionAttach: params.confirmSessionAttach }
-		: {};
+	const confirmSessionAttach = {
+		...(typeof params.confirmSessionAttach === "boolean" ? { confirmSessionAttach: params.confirmSessionAttach } : {}),
+		...(params.teamId !== undefined ? { teamId: params.teamId } : {}),
+	};
 	if (mode === "parallel") {
 		if ((params.fastMode !== undefined && params.fastMode !== null) || params.tasks!.some((item) => item.fastMode !== undefined && item.fastMode !== null)) {
 			throw new Error("fastMode is not supported on grouped dispatch; use separate stateless calls or /rail-agent");
@@ -692,6 +698,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			let toolStartedAt = performance.now();
+			const teamId = params.teamId ?? undefined;
+			const team = teamId !== undefined ? options.team?.() : undefined;
+			let teamScope: ReturnType<typeof teamCallSignal> | undefined;
+			let unsubscribeTeam: (() => void) | undefined;
+			let joinedTeam = false;
+			try {
+			if (teamId !== undefined && !team) throw new Error("Team runtime is not ready");
 			const mode = modeFor(params);
 			params = filterParamsForMode(params, mode);
 			const actualTasks = new Map<number, string>();
@@ -723,6 +736,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				callHeaderInvalidators.get(toolCallId)?.();
 			};
 			const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => {
+				if (team && teamId !== undefined) {
+					const members = new Map(team.hub.get(teamId).members.map((member) => [member.id, member]));
+					results = results.map((result) => {
+						const member = members.get(result.alias);
+						return member ? { ...result, coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) } } : result;
+					});
+				}
 				const details: StatefulSubagentDetails = {
 					mode,
 					results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
@@ -774,15 +794,15 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					throw error;
 				}
 			}
+			const orderedLiveResults = () => [...liveResults.entries()]
+				.sort(([left], [right]) => left - right)
+				.map(([slot, item]) => ({ ...item, slot }));
 			const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
 				liveResults.set(slot, result);
-				const results = [...liveResults.entries()]
-					.sort(([left], [right]) => left - right)
-					.map(([slot, item]) => ({ ...item, slot }));
-				const details = resultDetails(results);
+				const details = resultDetails(orderedLiveResults());
 				latestDetails.set(toolCallId, details);
 				onUpdate?.({
-					content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") }],
+					content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") + (team && teamId ? `\n${teamStatus(team.hub.get(teamId))}` : "") }],
 					details,
 				});
 			};
@@ -797,6 +817,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 			}
 			for (const item of requestedItems) {
+				if (team) resolveRailModel(item.model, ctx);
 				if (item.fastMode === true) effectiveFastModeRequest(item, modelForFastMode(item, ctx));
 			}
 			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
@@ -814,6 +835,18 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						.join("\n"),
 				);
 				if (!approved) throw new Error("Existing session attachment was not approved");
+			}
+			const bindings = team && teamId !== undefined ? team.join(teamId, mode, requestedItems) : undefined;
+			joinedTeam = bindings !== undefined;
+			if (team && teamId !== undefined) {
+				teamScope = teamCallSignal(team.hub, teamId, signal);
+				signal = teamScope.signal;
+				unsubscribeTeam = team.hub.subscribe((snapshot) => {
+					if (snapshot.id !== teamId) return;
+					const details = resultDetails(orderedLiveResults());
+					latestDetails.set(toolCallId, details);
+					onUpdate?.({ content: [{ type: "text", text: teamStatus(snapshot) }], details });
+				});
 			}
 			toolStartedAt = performance.now();
 
@@ -869,6 +902,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const model = item.target ? undefined : resolveRailModel(item.model, ctx);
 				const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
 				const request: DispatchRequest = {
+					...(team && bindings?.[slot] ? { team: team.channel(bindings[slot]!) } : {}),
 					...(model ? { model } : {}),
 					...(item.target ? { target: item.target } : {}),
 					...(item.alias ? { alias: item.alias } : {}),
@@ -909,6 +943,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				try {
 					return await dispatch(item, slot, step);
 				} catch (error) {
+					if (team && bindings?.[slot]) team.fail(bindings[slot]!, error, signal?.aborted);
 					const result = errorResult(item, error, runDuration(slot), signal?.aborted ?? false, step, liveResults.get(slot));
 					publishLive(slot, result);
 					return result;
@@ -923,7 +958,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				return { content: [{ type: "text", text: finalText(result) }], details };
 			}
 			if (mode === "parallel") {
-				const results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
+				let results: StatefulSubagentRunDetails[];
+				if (bindings) {
+					// Even an unexpected progress/finalization failure must not release the
+					// grouped call while another member is starting or cleaning its lease.
+					const settled = await Promise.allSettled(requestedItems.map((item, index) => runTask(item, index)));
+					results = settled.map((result) => { if (result.status === "rejected") throw result.reason; return result.value; });
+				} else results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
 				const details = resultDetails(results);
 				latestDetails.set(toolCallId, details);
 				return { content: [{ type: "text", text: aggregateText(mode, results) }], details };
@@ -941,6 +982,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const details = resultDetails(results);
 			latestDetails.set(toolCallId, details);
 			return { content: [{ type: "text", text: aggregateText(mode, results) }], details };
+			} catch (error) {
+				if (joinedTeam && team && teamId !== undefined) {
+					try { team.hub.cancel(teamId, error instanceof Error ? error.message : String(error)); }
+					catch { /* An unknown team must not replace the original validation error. */ }
+				}
+				throw error;
+			} finally { unsubscribeTeam?.(); teamScope?.dispose(); }
 		},
 
 		renderCall(args, theme, context) {

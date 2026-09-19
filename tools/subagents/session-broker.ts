@@ -1,3 +1,4 @@
+import type { TeamDispatchChannel, TeamWorkerChannel } from "./team-protocol";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
@@ -49,6 +50,7 @@ export interface WorkerStartSpec {
 }
 
 export interface WorkerSendOptions {
+	team?: TeamWorkerChannel;
 	contextWindow?: number;
 	signal?: AbortSignal;
 	onUpdate?: (result: WorkerRunResult) => void;
@@ -127,6 +129,7 @@ export interface SessionSource {
 }
 
 export interface DispatchRequest {
+	team?: TeamDispatchChannel;
 	model?: RailModelRef;
 	target?: string;
 	alias?: string;
@@ -247,8 +250,12 @@ function freshWorkerState(instance: AgentInstance, worker: SessionWorker): Worke
 	};
 }
 
+class TeamActiveError extends Error {}
+
 export class SessionBroker {
 	private readonly workers = new Map<string, WorkerState>();
+	private readonly teamActive = new Map<string, AbortController>();
+	private readonly teamAliases = new Set<string>();
 	private readonly workerStarts = new Map<string, Promise<WorkerState>>();
 	private readonly instanceCreations = new Set<Promise<AgentInstance>>();
 	private readonly pendingAliases = new Set<string>();
@@ -287,7 +294,9 @@ export class SessionBroker {
 			throw new Error("Provide exactly one of model (new instance) or target (existing instance)");
 		}
 		if (contextWindow !== undefined && request.model) this.validateContextWindow(contextWindow, request.cwd ?? this.defaultCwd);
+		if (request.team && (request.target || !request.alias || request.session)) throw new Error("Team dispatch requires a new persistent session");
 		const requestedAgentId = request.target ? (this.roster.resolve(request.target) ?? request.target) : undefined;
+		if (request.target && (this.teamAliases.has(request.target) || (requestedAgentId && this.teamActive.has(requestedAgentId)))) throw new Error("Subagent target has an active team operation");
 		const expectedEpoch = requestedAgentId ? this.lifecycleEpoch(requestedAgentId) : undefined;
 		if (request.target && request.fastMode !== undefined && request.fastMode !== null) {
 			throw new Error("fastMode for an existing target is managed through /rail-agent");
@@ -297,6 +306,12 @@ export class SessionBroker {
 		let instance: AgentInstance | undefined;
 		const createdInstance = Boolean(request.model);
 		let state: WorkerState | undefined;
+		let signal = request.signal;
+		const reservedTeamAlias = request.team ? request.alias!.trim() : undefined;
+		if (reservedTeamAlias !== undefined) {
+			if (this.teamAliases.has(reservedTeamAlias)) throw new TeamActiveError("Subagent alias has an active team operation");
+			this.teamAliases.add(reservedTeamAlias);
+		}
 		try {
 			instance = request.model
 				? await this.attach({
@@ -308,39 +323,71 @@ export class SessionBroker {
 				})
 				: await this.resolveInstance(request.target!);
 			const resolvedInstance = instance;
+			if (request.team) {
+				const operation = new AbortController();
+				this.teamActive.set(resolvedInstance.agentId, operation);
+				signal = signal ? AbortSignal.any([signal, operation.signal]) : operation.signal;
+			}
+			else if (this.teamActive.has(resolvedInstance.agentId) || this.teamAliases.has(resolvedInstance.alias)) throw new TeamActiveError("Subagent target has an active team operation");
 			if (this.shuttingDown || this.stoppingAgents.has(resolvedInstance.agentId) || this.deletingAgents.has(resolvedInstance.agentId)
 				|| (expectedEpoch !== undefined && this.lifecycleEpoch(resolvedInstance.agentId) !== expectedEpoch)) {
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 			}
+			if (request.team && signal?.aborted) throw new Error("Team request was aborted during startup");
 			if (contextWindow !== undefined) this.validateContextWindow(contextWindow, resolvedInstance.cwd);
 			if (request.target && !this.roster.resolve(request.target)) this.roster.link(resolvedInstance.alias, resolvedInstance.agentId);
 			request.onUpdate?.({ instance: resolvedInstance, run: { output: "(starting...)", usage: emptySubagentUsage() } });
 			const currentState = await this.workerState(resolvedInstance, expectedEpoch);
 			state = currentState;
 			return await this.enqueue(currentState, async () => {
-				const run = await currentState.worker.send(request.task, {
-					...(request.contextWindow !== undefined ? { contextWindow: request.contextWindow } : {}),
-					...(request.signal ? { signal: request.signal } : {}),
-					onUpdate: (partial) => {
-						const isCompacting = partial.isCompacting === true;
-						if (currentState.isCompacting !== isCompacting) {
-							currentState.isCompacting = isCompacting;
+				let task: string | undefined = request.task;
+				let run!: WorkerRunResult;
+				let usage = emptySubagentUsage();
+				const aggregateUsage = (next: SubagentUsage): SubagentUsage => {
+					const total = { ...next };
+					for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost", "turns"] as const) total[key] += usage[key];
+					const searches = (usage.searches ?? 0) + (next.searches ?? 0);
+					if (searches) total.searches = searches;
+					return total;
+				};
+				while (task !== undefined) {
+					if (signal?.aborted) throw new Error("Subagent request was aborted");
+					if (currentState.activeRunId === undefined) currentState.activeRunId = ++currentState.nextRunId;
+					const nativeRun = await currentState.worker.send(task, {
+						...(request.team ? { team: request.team } : {}),
+						...(request.contextWindow !== undefined ? { contextWindow: request.contextWindow } : {}),
+						...(signal ? { signal } : {}),
+						onUpdate: (partial) => {
+							const isCompacting = partial.isCompacting === true;
+							if (currentState.isCompacting !== isCompacting) {
+								currentState.isCompacting = isCompacting;
+								this.emitRuntimeChange();
+							}
+							request.onUpdate?.({ instance: resolvedInstance, run: request.team ? { ...partial, usage: aggregateUsage(partial.usage) } : partial });
+						},
+						onAccepted: () => {
+							if (currentState.activeRunId !== undefined && !currentState.stopping) {
+								currentState.activeRunAccepted = true;
+								this.emitRuntimeChange();
+							}
+						},
+						onSettled: () => {
+							currentState.activeRunId = undefined;
+							currentState.activeRunAccepted = false;
 							this.emitRuntimeChange();
-						}
-						request.onUpdate?.({ instance: resolvedInstance, run: partial });
-					},
-					onAccepted: () => {
-						if (currentState.activeRunId !== undefined && !currentState.stopping) {
-							currentState.activeRunAccepted = true;
-							this.emitRuntimeChange();
-						}
-					},
-					onSettled: () => {
-						currentState.activeRunId = undefined;
-						currentState.activeRunAccepted = false;
-						this.emitRuntimeChange();
-					},
-				});
+						},
+					});
+					currentState.activeRunId = undefined;
+					currentState.activeRunAccepted = false;
+					if (request.team) {
+						usage = aggregateUsage(nativeRun.usage);
+						run = { ...nativeRun, usage };
+						task = await request.team.afterRun?.(nativeRun, signal);
+					} else {
+						run = nativeRun;
+						task = undefined;
+					}
+				}
 				currentState.activeRunId = undefined;
 				currentState.activeRunAccepted = false;
 				currentState.isCompacting = false;
@@ -359,6 +406,7 @@ export class SessionBroker {
 				return { instance: { ...persisted, alias: resolvedInstance.alias }, run };
 			}, "run");
 		} catch (error) {
+			if (error instanceof TeamActiveError) throw error;
 			const failedAgentId = instance?.agentId;
 			if (!failedAgentId) {
 				this.emitRuntimeChange();
@@ -373,13 +421,19 @@ export class SessionBroker {
 			} else if (mustRetire) {
 				this.runtimeErrors.set(failedAgentId, error instanceof Error ? error.message : String(error));
 				await this.retireFailedWorker(failedAgentId);
-			} else if (this.stoppingAgents.has(failedAgentId) || request.signal?.aborted) this.runtimeErrors.delete(failedAgentId);
+			} else if (this.stoppingAgents.has(failedAgentId) || signal?.aborted) {
+				if (request.team) await this.retireFailedWorker(failedAgentId);
+				this.runtimeErrors.delete(failedAgentId);
+			}
 			else {
 				this.runtimeErrors.set(failedAgentId, error instanceof Error ? error.message : String(error));
 				await this.retireFailedWorker(failedAgentId);
 			}
 			this.emitRuntimeChange();
 			throw error;
+		} finally {
+			if (request.team && instance) this.teamActive.delete(instance.agentId);
+			if (reservedTeamAlias !== undefined) this.teamAliases.delete(reservedTeamAlias);
 		}
 	}
 
@@ -388,6 +442,7 @@ export class SessionBroker {
 		if (!message) throw new Error("Subagent control message cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent control was aborted before delivery");
 		const agentId = this.roster.resolve(request.target) ?? request.target;
+		if (this.teamActive.has(agentId)) throw new Error("Use team control for an active team member");
 		if (this.shuttingDown || this.stoppingAgents.has(agentId) || this.deletingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
 		if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
 		const state = this.workers.get(agentId);
@@ -883,6 +938,7 @@ export class SessionBroker {
 	}
 
 	private async stopWorker(agentId: string): Promise<void> {
+		this.teamActive.get(agentId)?.abort();
 		const starting = this.workerStarts.get(agentId);
 		if (starting) await starting.catch(() => undefined);
 		const state = this.workers.get(agentId);

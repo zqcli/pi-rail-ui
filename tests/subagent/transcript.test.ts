@@ -938,6 +938,25 @@ test("sparse dispatch metadata preserves existing fields without mutating runs o
 	assert.deepEqual({ runs, options }, before);
 });
 
+test("team panels show cooperation without turning a pending native run into a completed result", () => {
+	const run: SubagentTranscriptRun = {
+		alias: "B1", model: "provider/model", status: "running", output: "working", persistent: true,
+		coordination: { state: "waiting", waitingFor: "B8" },
+	};
+	for (const [state, expected] of [["waiting", "WAITING (B8)"], ["paused", "PAUSED"], ["pause_requested", "PAUSE REQUESTED"], ["finalizing", "FINALIZING"], ["cancelled", "CANCELLING"]] as const) {
+		const member = { ...run, coordination: { state, waitingFor: "B8" } };
+		for (const mode of ["single", "parallel"] as const) {
+			const component = renderSubagentTranscript([member], false, theme as any, { mode });
+			assert.ok(component.render(200).join("\n").includes(expected));
+			// The single-run Rail gutter itself has a four-column minimum.
+			for (const width of [4, 12, 40, 80]) assert.ok(component.render(width).every((line) => visibleWidth(line) <= width));
+		}
+	}
+	const done = renderSubagentTranscript([{ ...run, status: "completed" }], false, theme as any).render(200).join("\n");
+	assert.match(done, /Completed/u);
+	assert.doesNotMatch(done, /WAITING/u);
+});
+
 test("control panels show only delivery status and alias, never control message as initial task", () => {
 	const controlMessage = "CONTROL MESSAGE MUST NOT BE INITIAL TASK";
 	const run: SubagentTranscriptRun = {

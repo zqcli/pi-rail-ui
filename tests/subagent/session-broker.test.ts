@@ -20,6 +20,117 @@ import {
 } from "../../tools/subagents/session-broker";
 import type { RailModelRef } from "../../tools/subagents/models";
 
+test("team continuation reserves the operation, rejects target insertion and sums native usage", async () => {
+	const store = new MemoryInstanceStore();
+	const roster = new MemoryRoster();
+	const worker = new FakeWorker("team-session", "/tmp/team-session.jsonl");
+	const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
+	let release!: () => void;
+	const barrier = new Promise<void>((resolve) => { release = resolve; });
+	let waiting!: () => void;
+	const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
+	let runs = 0;
+	const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-A", task: "initial", team: {
+		binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
+		onRequest: async () => ({ ok: true }),
+		afterRun: async () => { if (++runs === 1) { waiting(); await barrier; return "summary"; } return undefined; },
+	} });
+	await atBarrier;
+	assert.equal(broker.runtimeStatus(roster.resolve("team-A")!).phase, "queued"); // Native run settled, but its operation is still reserved.
+	await assert.rejects(broker.dispatch({ target: "team-A", task: "intruder" }), /active team/);
+	await assert.rejects(broker.control({ target: "team-A", delivery: "steer", message: "intruder" }), /team control/);
+	assert.deepEqual(worker.tasks, ["initial"]);
+	release();
+	const result = await dispatch;
+	assert.deepEqual(worker.tasks, ["initial", "summary"]);
+	assert.equal(result.run.usage.turns, 2);
+	assert.equal(result.run.output, "done: summary");
+	assert.equal(JSON.stringify(result.instance).includes("epoch"), false);
+	await broker.dispatch({ target: "team-A", task: "ordinary followup" });
+	await broker.shutdown();
+});
+
+test("stopping a team member aborts its between-native-runs barrier without losing the lease reservation", async () => {
+	const worker = new FakeWorker("team-session", "/tmp/team-session.jsonl");
+	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => worker });
+	let waiting!: () => void;
+	const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
+	const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-A", task: "initial", team: {
+		binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
+		onRequest: async () => ({ ok: true }),
+		afterRun: async (_run, signal) => new Promise<undefined>((_resolve, reject) => {
+			signal!.addEventListener("abort", () => reject(new Error("barrier aborted")), { once: true });
+			waiting();
+		}),
+	} });
+	const rejected = assert.rejects(dispatch, /barrier aborted/);
+	await atBarrier;
+	await broker.stop("team-A");
+	await rejected;
+	assert.equal(worker.stopped, true);
+	assert.deepEqual(worker.tasks, ["initial"]);
+	await broker.shutdown();
+});
+
+test("a competing team cannot remove another dispatch's alias reservation", async () => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	let starting!: () => void;
+	const started = new Promise<void>((resolve) => { starting = resolve; });
+	const worker = new FakeWorker("reserved", "/tmp/reserved.jsonl");
+	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => { starting(); await gate; return worker; } });
+	const request = { model: reviewerModel(), alias: "shared", task: "work", team: {
+		binding: { version: 1 as const, teamId: "one", memberId: "shared", role: "worker" as const, epoch: "private" }, onRequest: async () => ({ ok: true }),
+	} };
+	const first = broker.dispatch(request);
+	try {
+		await started;
+		await assert.rejects(broker.dispatch({ ...request, alias: " shared ", team: { ...request.team, binding: { ...request.team.binding, teamId: "two" } } }), /active team/);
+		await assert.rejects(broker.dispatch({ target: "shared", task: "intruder" }), /active team/);
+	} finally { release(); await first; await broker.shutdown(); }
+});
+
+test("ordinary dispatch preserves the native run and usage objects", async () => {
+	const worker = new FakeWorker("ordinary", "/tmp/ordinary.jsonl");
+	const native = { output: "unchanged", usage: emptyUsage() };
+	worker.send = async () => native;
+	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => worker });
+	try {
+		const result = await broker.dispatch({ model: reviewerModel(), alias: "ordinary", task: "work" });
+		assert.equal(result.run, native);
+		assert.equal(result.run.usage, native.usage);
+	} finally { await broker.shutdown(); }
+});
+
+test("team cancellation during startup waits for the new worker's cleanup", async () => {
+	let finishStartup!: () => void;
+	const startup = new Promise<void>((resolve) => { finishStartup = resolve; });
+	let finishCleanup!: () => void;
+	const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
+	let notifyStartup!: () => void;
+	const starting = new Promise<void>((resolve) => { notifyStartup = resolve; });
+	let notifyCleanup!: () => void;
+	const cleaning = new Promise<void>((resolve) => { notifyCleanup = resolve; });
+	const worker = new FakeWorker("cancelled", "/tmp/cancelled.jsonl");
+	worker.stop = async () => { notifyCleanup(); await cleanup; worker.stopped = true; };
+	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => { notifyStartup(); await startup; return worker; } });
+	const controller = new AbortController();
+	let settled = false;
+	const result = broker.dispatch({ model: reviewerModel(), alias: "cancelled", task: "work", signal: controller.signal, team: {
+		binding: { version: 1, teamId: "team", memberId: "cancelled", role: "worker", epoch: "private" }, onRequest: async () => ({ ok: true }),
+	} }).finally(() => { settled = true; });
+	const rejected = assert.rejects(result, /aborted during startup/);
+	try {
+		await starting;
+		controller.abort();
+		finishStartup();
+		await cleaning;
+		assert.equal(settled, false);
+		assert.deepEqual(worker.tasks, []);
+	} finally { finishStartup(); finishCleanup(); await rejected; await broker.shutdown(); }
+	assert.equal(worker.stopped, true);
+});
+
 class MemoryInstanceStore implements AgentInstanceStore {
 	readonly instances = new Map<string, AgentInstance>();
 	getDelayMs = 0;

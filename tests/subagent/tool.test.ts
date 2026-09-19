@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { TeamHub } from "../../tools/subagents/team-hub";
+import { TeamRunManager } from "../../tools/subagents/team-runner";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { installStatefulSubagentTool, type StatefulSubagentToolOptions } from "../../tools/subagents/tool";
@@ -146,6 +148,7 @@ class FakeBroker {
 }
 
 function setupTool(options: {
+	team?: () => TeamRunManager;
 	runStateless?: StatefulSubagentToolOptions["runStateless"];
 	renderContext?: () => unknown;
 } = {}) {
@@ -160,6 +163,7 @@ function setupTool(options: {
 	};
 	installStatefulSubagentTool(pi, {
 		broker: broker as unknown as SessionBroker,
+		...(options.team ? { team: options.team } : {}),
 		knownFastMode: (target) => broker.knownFastMode(target),
 		knownModel: (target) => broker.knownModel(target),
 		renderContext: (options.renderContext ?? (() => context())) as NonNullable<StatefulSubagentToolOptions["renderContext"]>,
@@ -167,6 +171,166 @@ function setupTool(options: {
 	});
 	return { tool, broker, hook };
 }
+
+test("team workers start all eight without ordinary parallel's four lifetime slots", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const snapshot = hub.prepare({ coordinator: "A", workers: Array.from({ length: 8 }, (_, i) => `B${i}`) });
+		const { tool, broker } = setupTool({ team: () => manager });
+		let started = 0;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const original = broker.dispatch.bind(broker);
+		broker.dispatch = async (request) => {
+			started++;
+			if (started === 8) release();
+			await gate;
+			assert.equal(request.team?.binding.teamId, snapshot.id);
+			return original(request);
+		};
+		const args = tool.prepareArguments({ teamId: snapshot.id, tasks: snapshot.workers.map((alias) => ({ alias, task: "work" })) });
+		assert.equal(args.teamId, snapshot.id);
+		let timedOut = false;
+		const timeout = setTimeout(() => { timedOut = true; release(); }, 1000);
+		try { await tool.execute("team-workers", args, undefined, undefined, context()); }
+		finally { clearTimeout(timeout); }
+		assert.equal(timedOut, false, "all eight must start before any lifetime slot is released");
+		assert.equal(started, 8);
+		assert.equal(broker.requests.length, 8);
+	} finally { hub.dispose(); }
+});
+
+test("two sibling tool calls share the hub and return a newly generated coordinator summary", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B1", "B2"] });
+		const { tool, broker } = setupTool({ team: () => manager });
+		const original = broker.dispatch.bind(broker);
+		let summary = "";
+		broker.dispatch = async (request) => {
+			const result = await original(request);
+			const prompt = await request.team?.afterRun?.(result.run, request.signal);
+			if (prompt) {
+				summary = prompt;
+				result.run = { ...result.run, output: "fresh final summary" };
+				await request.team?.afterRun?.(result.run, request.signal);
+			}
+			return result;
+		};
+		const [coordinator, workers] = await Promise.all([
+			tool.execute("coordinator", { teamId: team.id, alias: "A", task: "coordinate" }, undefined, undefined, context()),
+			tool.execute("workers", { teamId: team.id, tasks: [{ alias: "B1", task: "one" }, { alias: "B2", task: "two" }] }, undefined, undefined, context()),
+		]);
+		assert.match(summary, /done: one/);
+		assert.match(summary, /done: two/);
+		assert.match(coordinator.content[0].text, /fresh final summary/);
+		assert.equal(workers.details.results.length, 2);
+		assert.equal(hub.get(team.id).phase, "completed");
+		assert.equal(JSON.stringify(coordinator.details).includes("epoch"), false);
+	} finally { hub.dispose(); }
+});
+
+test("unjoined preflight failures and duplicate joins cannot cancel a running team", async () => {
+	for (const invalid of [
+		{ alias: "A", task: "work", target: "old" },
+		{ target: "old", control: { delivery: "steer", message: "redirect" } },
+		{ alias: "A", task: "work", control: { delivery: "steer", message: "" } },
+		{ alias: "A", task: "work", session: { mode: "fork", path: "/tmp/old.jsonl" } },
+		{ tasks: [{ alias: "B", task: "work", session: { mode: "fork", path: "/tmp/old.jsonl" } }] },
+		{ chain: [{ alias: "A", task: "work" }] },
+		{ tasks: [{ alias: "wrong", task: "work" }] },
+		{ tasks: [{ alias: "B", task: "work", contextWindow: 1 }] },
+		{ alias: "A", task: "duplicate" },
+	]) {
+		const hub = new TeamHub();
+		try {
+			const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+			hub.join(team.id, ["A"]);
+			hub.join(team.id, ["B"]);
+			const before = hub.get(team.id);
+			const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+			let confirmed = false;
+			const ctx = context();
+			ctx.ui.confirm = async () => { confirmed = true; return true; };
+			const prepared = tool.prepareArguments({ teamId: team.id, ...invalid });
+			await assert.rejects(tool.execute("invalid", prepared, undefined, undefined, ctx));
+			assert.equal(confirmed, false);
+			assert.equal(broker.controls.length, 0);
+			assert.equal(hub.signal(team.id).aborted, false);
+			assert.deepEqual(hub.get(team.id), before);
+			assert.equal(broker.requests.length, 0);
+		} finally { hub.dispose(); }
+	}
+});
+
+test("unknown team cleanup does not mask an incompatible-mode validation error", async () => {
+	const hub = new TeamHub();
+	try {
+		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+		await assert.rejects(tool.execute("unknown", { teamId: "missing", target: "old", control: { delivery: "steer", message: "no" } }, undefined, undefined, context()), /Team does not support/);
+		assert.equal(broker.controls.length, 0);
+	} finally { hub.dispose(); }
+});
+
+test("team progress details map coordination by alias and keep explicit sorted slots", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const snapshot = hub.prepare({ coordinator: "A", workers: ["B1", "B2"] });
+		const { tool, broker } = setupTool({ team: () => manager });
+		const original = broker.dispatch.bind(broker);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		let secondStarted!: () => void;
+		const second = new Promise<void>((resolve) => { secondStarted = resolve; });
+		broker.dispatch = async (request) => {
+			if (request.alias === "B1") await second;
+			const result = await original(request);
+			if (request.alias === "B2") secondStarted();
+			await gate;
+			return result;
+		};
+		const updates: any[] = [];
+		const pending = tool.execute("coordination", { teamId: snapshot.id, tasks: snapshot.workers.map((alias) => ({ alias, task: "work" })) }, undefined, (update: any) => updates.push(update), context());
+		await second;
+		await new Promise((resolve) => setImmediate(resolve));
+		hub.cancel(snapshot.id, "trigger status subscription");
+		const status = updates.at(-1).details.results;
+		assert.deepEqual(status.map((result: any) => [result.slot, result.alias, result.coordination.state]), [[0, "B1", "cancelled"], [1, "B2", "cancelled"]]);
+		assert.ok(!JSON.stringify(status).includes("epoch"));
+		release();
+		await pending;
+		const plain = await setupTool().tool.execute("plain", { alias: "ordinary", task: "work" }, undefined, undefined, context());
+		assert.equal("coordination" in plain.details.results[0], false);
+	} finally { hub.dispose(); }
+});
+
+test("grouped team errors wait for every started member to finish cleanup", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const snapshot = hub.prepare({ coordinator: "A", workers: ["B1", "B2"] });
+		const { tool, broker } = setupTool({ team: () => manager });
+		let release!: () => void;
+		const cleanup = new Promise<void>((resolve) => { release = resolve; });
+		let notify!: () => void;
+		const started = new Promise<void>((resolve) => { notify = resolve; });
+		broker.dispatch = async (request) => {
+			if (request.alias === "B2") { notify(); await cleanup; }
+			throw new Error("native failure");
+		};
+		let settled = false;
+		const pending = tool.execute("cleanup", { teamId: snapshot.id, tasks: snapshot.workers.map((alias) => ({ alias, task: "work" })) }, undefined, () => { throw new Error("progress failed"); }, context()).finally(() => { settled = true; });
+		const rejected = assert.rejects(pending, /progress failed/);
+		await started;
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(settled, false);
+		release();
+		await rejected;
+	} finally { hub.dispose(); }
+});
 
 function liveContext(toolCallId: string) {
 	return { toolCallId, isPartial: true, executionStarted: true, invalidate: () => {} };

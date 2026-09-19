@@ -1,3 +1,5 @@
+import { TeamRpcConnection } from "./team-rpc";
+import { teamExtensionPath } from "./team-protocol";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
@@ -54,7 +56,8 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	if (spec.mode !== "open") args.push("--name", spec.sessionName ?? spec.alias);
 	args.push("--model", railModelKey(spec.model));
 	if (spec.model.thinkingLevel) args.push("--thinking", spec.model.thinkingLevel);
-	args.push("--exclude-tools", "subagent");
+	args.push("--exclude-tools", "subagent,subagent_team");
+	args.push("-e", teamExtensionPath());
 	if (spec.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
 	args.push("-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live");
 	args.push("-e", gptCompactionExtensionPath());
@@ -228,9 +231,12 @@ export class RpcSessionWorker implements SessionWorker {
 		if (options.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
 		this.runInFlight = true;
 		let restoreWindow: number | undefined;
+		const team = options.team ? new TeamRpcConnection(this.transport, options.team, options.signal) : undefined;
 		try {
+			if (team) await team.bind();
 			restoreWindow = await this.prepareContext(options.contextWindow);
 		} catch (error) {
+			if (team) { this.unusable = true; await team.close().catch(() => undefined); }
 			this.runInFlight = false;
 			throw error;
 		}
@@ -239,6 +245,7 @@ export class RpcSessionWorker implements SessionWorker {
 			try {
 				if (prepared) await this.resetContext(restoreWindow);
 			} finally {
+				try { await team?.close(); } catch { this.unusable = true; }
 				this.runInFlight = false;
 			}
 			throw new Error("Subagent request was aborted before dispatch");
@@ -320,7 +327,9 @@ export class RpcSessionWorker implements SessionWorker {
 		};
 		options.signal?.addEventListener("abort", abort, { once: true });
 
+		let sendFailed = false;
 		try {
+			if (options.signal?.aborted) throw new Error("Subagent request was aborted before prompt");
 			await this.transport.request({ type: "prompt", message: task });
 			if (!started && !settled) {
 				const state = await this.transport.request({ type: "get_state" }) as RpcState;
@@ -338,16 +347,21 @@ export class RpcSessionWorker implements SessionWorker {
 				const settledState = await this.confirmContextWindow();
 				await this.resetContext(settledState.model!.contextWindow);
 			}
-			return collector.result("(no output)");
+			// Keep an empty team answer distinguishable from a successful final summary.
+			return collector.result(options.team ? "" : "(no output)");
 		} catch (error) {
+			sendFailed = true;
 			if (!settled && prepared && !this.unusable) await this.resetContext(restoreWindow);
 			throw error;
 		} finally {
-			this.runInFlight = false;
 			await abortRequest;
 			if (updateTimer) clearTimeout(updateTimer);
 			options.signal?.removeEventListener("abort", abort);
 			unsubscribe();
+			try { await team?.close(); } catch (error) {
+				this.unusable = true;
+				if (!sendFailed) throw error;
+			} finally { this.runInFlight = false; }
 		}
 	}
 

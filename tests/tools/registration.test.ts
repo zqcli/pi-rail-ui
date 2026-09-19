@@ -32,7 +32,7 @@ async function collectRegistrations(depth: number): Promise<{ tools: string[]; c
 
 test("Rail root loads apply-patch and subagent tools", async () => {
 	const registrations = await collectRegistrations(0);
-	assert.deepEqual(registrations.tools, ["apply-patch", "subagent"]);
+	assert.deepEqual(registrations.tools, ["apply-patch", "subagent_team", "subagent"]);
 	assert.equal(registrations.commands.filter((name) => name === "rail-agent").length, 1);
 });
 

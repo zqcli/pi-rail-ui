@@ -1,3 +1,7 @@
+import { TeamHub } from "./team-hub";
+import { TeamRunManager } from "./team-runner";
+import { installTeamTool, restoreTeamHistory } from "./team-tool";
+import { TEAM_HISTORY_TYPE } from "./team-protocol";
 import * as path from "node:path";
 import {
 	getAgentDir,
@@ -27,6 +31,7 @@ import { installStatefulSubagentTool } from "./tool";
 import { createRpcWorkerFactory } from "./worker-factory";
 
 interface SubagentRuntime {
+	team: TeamRunManager;
 	ctx: ExtensionContext;
 	broker: SessionBroker;
 	roster: SessionAgentRoster;
@@ -100,7 +105,9 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		return { cancelled: true };
 	};
 
+	installTeamTool(pi, () => getRuntime().team.hub);
 	installStatefulSubagentTool(pi, {
+		team: () => getRuntime().team,
 		broker: () => getRuntime().broker,
 		knownFastMode: (target) => runtime?.broker.knownFastMode(target),
 		knownModel: (target) => runtime?.broker.knownModel(target),
@@ -154,6 +161,7 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		if (runtime) {
 			const previous = runtime;
 			runtime = undefined;
+			previous.team.hub.dispose();
 			await previous.broker.shutdown();
 		}
 		const store = new FileAgentInstanceStore(stateDir);
@@ -173,13 +181,19 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		});
 		await broker.prewarmFastModes();
 		const manager = new RailAgentManager(broker, store, roster, stateDir);
-		runtime = { ctx, broker, roster, store, manager };
+		const hub = new TeamHub({ onSnapshot: (snapshot) => pi.appendEntry(TEAM_HISTORY_TYPE, snapshot) });
+		restoreTeamHistory(hub, ctx.sessionManager.getBranch());
+		runtime = { ctx, broker, roster, store, manager, team: new TeamRunManager(hub) };
 		if (ctx.mode === "tui") installAutocomplete(ctx);
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
 		if (!runtime) return;
 		runtime.ctx = ctx;
+		runtime.team.hub.dispose();
+		const hub = new TeamHub({ onSnapshot: (snapshot) => pi.appendEntry(TEAM_HISTORY_TYPE, snapshot) });
+		restoreTeamHistory(hub, ctx.sessionManager.getBranch());
+		runtime.team = new TeamRunManager(hub);
 		runtime.roster.restore(ctx.sessionManager.getBranch());
 		await runtime.broker.prewarmFastModes();
 	});
@@ -205,7 +219,10 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		const active = runtime;
 		runtime = undefined;
-		if (active) await active.broker.shutdown();
+		if (active) {
+			active.team.hub.dispose();
+			await active.broker.shutdown();
+		}
 	});
 }
 

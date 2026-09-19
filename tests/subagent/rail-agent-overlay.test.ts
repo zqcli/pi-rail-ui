@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
-import { RailAgentOverlayComponent } from "../../tools/subagents/rail-agent-overlay";
+import { RailAgentOverlayComponent, showRailAgentOverlay } from "../../tools/subagents/rail-agent-overlay";
 import { RailAgentManager, type RailAgentView } from "../../tools/subagents/agent-manager";
 import { railModelReference, type RailModelRef } from "../../tools/subagents/models";
 
@@ -47,6 +47,8 @@ const snapshot = {
 function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "error" | "in-use-elsewhere" | "unknown" = "idle", terminalRows = 30, compacting = false) {
 	let renders = 0;
 	let closed = false;
+	let subscribed: (() => void) | undefined;
+	let unsubscribed = false;
 	const currentSnapshot: any = structuredClone(snapshot);
 	currentSnapshot.agents[0]!.phase = phase;
 	currentSnapshot.agents[0]!.isCompacting = compacting;
@@ -62,7 +64,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	}];
 	const manager = {
 		snapshot: async () => currentSnapshot,
-		subscribe: () => () => undefined,
+		subscribe: (listener: () => void) => { subscribed = listener; return () => { unsubscribed = true; }; },
 		changeModel: async () => snapshot.agents[0]!.instance,
 		link: async () => snapshot.agents[0]!.instance,
 		stop: async () => snapshot.agents[0]!.instance,
@@ -112,7 +114,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 		},
 		currentSnapshot,
 	);
-	return { component, controls, manager, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; } };
+	return { component, controls, manager, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
 }
 
 test("agent filtering preserves fields, input order, current-tab scope, selection, and fresh snapshots", async () => {
@@ -642,4 +644,133 @@ test("escape cancels a control that has not been delivered yet", async () => {
 	} finally {
 		state.component.dispose();
 	}
+});
+
+test("subscription refresh failures keep the last snapshot, surface the error, and recover on the next success", async () => {
+	const state = setup();
+	const rejections: unknown[] = [];
+	const onRejection = (reason: unknown) => rejections.push(reason);
+	process.on("unhandledRejection", onRejection);
+	try {
+		state.manager.snapshot = async () => { throw new Error("snapshot unavailable"); };
+		state.subscribed!();
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.deepEqual(rejections, []);
+		const failed = state.component.render(100).join("\n");
+		assert.match(failed, /snapshot unavailable/);
+		assert.match(failed, /auth-review/);
+
+		state.manager.snapshot = async () => {
+			const next = structuredClone(state.snapshot);
+			next.agents[0]!.linkedAliases = ["recovered-agent"];
+			return next;
+		};
+		state.subscribed!();
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const recovered = state.component.render(100).join("\n");
+		assert.doesNotMatch(recovered, /snapshot unavailable/);
+		assert.match(recovered, /recovered-agent/);
+	} finally {
+		process.off("unhandledRejection", onRejection);
+		state.component.dispose();
+	}
+});
+
+test("background refresh errors do not overwrite operation progress or its completed notice", async () => {
+	const state = setup("running");
+	let finishControl: () => void = () => undefined;
+	state.manager.control = async () => {
+		await new Promise<void>((resolve) => { finishControl = resolve; });
+		return { instance: state.snapshot.agents[0]!.instance, delivery: "steer" };
+	};
+	try {
+		state.component.handleInput("g");
+		state.component.handleInput("Focus on tests");
+		state.component.handleInput("\r");
+		state.manager.snapshot = async () => { throw new Error("background snapshot failed"); };
+		state.subscribed!();
+		await new Promise((resolve) => setImmediate(resolve));
+		const busy = state.component.render(100).join("\n");
+		assert.match(busy, /Sending steer/);
+		assert.doesNotMatch(busy, /background snapshot failed/);
+
+		state.manager.snapshot = async () => state.snapshot;
+		finishControl();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(state.component.render(100).join("\n"), /Steer accepted by auth-review/);
+
+		state.manager.snapshot = async () => { throw new Error("background snapshot failed"); };
+		state.subscribed!();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(state.component.render(100).join("\n"), /background snapshot failed/);
+		state.manager.snapshot = async () => state.snapshot;
+		state.subscribed!();
+		await new Promise((resolve) => setImmediate(resolve));
+		const recovered = state.component.render(100).join("\n");
+		assert.doesNotMatch(recovered, /background snapshot failed/);
+		assert.match(recovered, /Steer accepted by auth-review/);
+	} finally {
+		finishControl();
+		state.component.dispose();
+	}
+});
+
+test("timer-driven refresh failures surface the error while post-dispose ticks stay inert", async (t) => {
+	t.mock.timers.enable({ apis: ["setInterval"] });
+	const state = setup();
+	try {
+		state.manager.snapshot = async () => { throw new Error("periodic snapshot failed"); };
+		t.mock.timers.tick(1500);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(state.component.render(100).join("\n"), /periodic snapshot failed/);
+
+		const rendersBeforeDispose = state.renders;
+		state.component.dispose();
+		t.mock.timers.tick(4500);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(state.renders, rendersBeforeDispose);
+	} finally {
+		state.component.dispose();
+		t.mock.timers.reset();
+	}
+});
+
+test("dispose stops an in-flight refresh from applying its snapshot or rendering", async () => {
+	const state = setup();
+	let resolveSnapshot: (value: unknown) => void = () => undefined;
+	state.manager.snapshot = () => new Promise((resolve) => { resolveSnapshot = resolve; });
+	try {
+		const rendersBeforeDispose = state.renders;
+		state.subscribed!();
+		state.component.dispose();
+		assert.equal(state.unsubscribed, true);
+
+		resolveSnapshot({ ...structuredClone(state.snapshot), agents: [] });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(state.renders, rendersBeforeDispose);
+		assert.match(state.component.render(100).join("\n"), /auth-review/);
+
+		state.subscribed!();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(state.renders, rendersBeforeDispose);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("showRailAgentOverlay keeps rejecting on the initial snapshot error without opening the UI", async () => {
+	let opened = 0;
+	const manager = { snapshot: async () => { throw new Error("initial snapshot failed"); } };
+	await assert.rejects(
+		showRailAgentOverlay({ ui: { custom: async () => { opened += 1; } } } as any, {
+			manager: manager as any,
+			models: [],
+			currentCwd: "/tmp/project",
+			insertMention: () => undefined,
+		}),
+		/initial snapshot failed/,
+	);
+	assert.equal(opened, 0);
 });

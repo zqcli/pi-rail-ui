@@ -111,6 +111,7 @@ export class RailAgentOverlayComponent implements Focusable {
 	private notice = "";
 	private disposed = false;
 	private refreshing = false;
+	private refreshError: string | undefined;
 	private readonly unsubscribe: () => void;
 	private readonly interval: NodeJS.Timeout;
 	private _focused = false;
@@ -144,8 +145,8 @@ export class RailAgentOverlayComponent implements Focusable {
 			task: "",
 			fastMode: false,
 		};
-		this.unsubscribe = options.manager.subscribe(() => { void this.refresh(); });
-		this.interval = setInterval(() => { void this.refresh(); }, 1500);
+		this.unsubscribe = options.manager.subscribe(() => { this.refreshInBackground(); });
+		this.interval = setInterval(() => { this.refreshInBackground(); }, 1500);
 		this.interval.unref();
 	}
 
@@ -198,7 +199,8 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.picker) lines.push(...this.renderPicker(innerWidth).map(line));
 		else if (this.tab === "create") lines.push(...this.renderForm(innerWidth).map(line));
 		else lines.push(...this.renderAgents(innerWidth).map(line));
-		if (this.notice) lines.push(line(` ${this.theme.fg("warning", compact(this.notice, innerWidth - 2))}`));
+		const notice = this.busy ? this.notice : this.refreshError ?? this.notice;
+		if (notice) lines.push(line(` ${this.theme.fg("warning", compact(notice, innerWidth - 2))}`));
 		lines.push(line(` ${this.theme.fg("dim", this.helpText())}`));
 		lines.push(border(`╰${"─".repeat(innerWidth)}╯`));
 		return lines;
@@ -848,12 +850,23 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.control) this.control.input.focused = this._focused;
 	}
 
+	private refreshInBackground(): void {
+		void this.refresh().catch((error) => {
+			if (this.disposed) return;
+			this.refreshError = error instanceof Error ? error.message : String(error);
+			this.renderSoon();
+		});
+	}
+
 	private async refresh(): Promise<void> {
 		if (this.disposed || this.refreshing) return;
 		this.refreshing = true;
 		try {
-			this.snapshot = await this.options.manager.snapshot();
+			const snapshot = await this.options.manager.snapshot();
+			if (this.disposed) return;
+			this.snapshot = snapshot;
 			this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, this.filteredAgents().length - 1));
+			this.refreshError = undefined;
 			this.renderSoon();
 		} finally {
 			this.refreshing = false;

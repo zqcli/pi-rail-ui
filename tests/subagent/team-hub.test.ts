@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { TeamHub } from "../../tools/subagents/team-hub";
+import { publicTeamReply } from "../../tools/subagents/team-extension";
 import { TEAM_MAX_EVENTS, type TeamBinding, type TeamRequest, type TeamSnapshot } from "../../tools/subagents/team-protocol";
 
 function fixture(count = 2, options: ConstructorParameters<typeof TeamHub>[0] = {}) {
@@ -18,6 +19,16 @@ function fixture(count = 2, options: ConstructorParameters<typeof TeamHub>[0] = 
 }
 const outcome = { status: "completed", output: "native result" } as const;
 const tick = async () => { await Promise.resolve(); await Promise.resolve(); };
+
+test("fractional-second deadlines round up to transport-safe integer milliseconds", async (t) => {
+	const hub = new TeamHub({ now: () => 1_700_000_000_000 }); t.after(() => hub.dispose());
+	const team = hub.prepare({ coordinator: "A", workers: ["B1"], timeoutSeconds: 60.1234 });
+	assert.equal(team.deadline - team.createdAt, 60_124);
+	const [a] = hub.join(team.id, ["A"]);
+	hub.join(team.id, ["B1"]);
+	const reply = await hub.request(a!, { requestId: "fractional", sequence: 1, action: "checkpoint", receive: true });
+	assert.doesNotThrow(() => publicTeamReply(reply));
+});
 
 test("fixed roster validation and atomic joins; checkpoint waits for both sibling dispatches", async (t) => {
 	const hub = new TeamHub(); t.after(() => hub.dispose());

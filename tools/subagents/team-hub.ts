@@ -95,7 +95,7 @@ export class TeamHub {
 		const createdAt = this.now();
 		const view: TeamSnapshot = {
 			id: randomUUID(), coordinator: input.coordinator, workers: [...input.workers], phase: "prepared",
-			seq: 0, createdAt, deadline: createdAt + seconds * 1000, members: [], events: [],
+			seq: 0, createdAt, deadline: createdAt + Math.ceil(seconds * 1000), members: [], events: [],
 		};
 		const members = new Map<string, Member>();
 		for (const id of ids) {

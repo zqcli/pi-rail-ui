@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
 	addCompletedAssistantUsage,
 	addCompactionUsage,
+	addUsage,
 	emptySubagentUsage,
 	providerReportedUsage,
 	usageWithActiveTurn,
@@ -79,4 +80,39 @@ test("compaction usage adds billed tokens without adding an assistant turn", () 
 		contextTokens: 12,
 		turns: 1,
 	});
+});
+
+test("search counts stay optional, merge on demand, and survive compaction", () => {
+	assert.equal("searches" in emptySubagentUsage(), false);
+
+	const completed = emptySubagentUsage();
+	addCompletedAssistantUsage(completed, {
+		role: "assistant",
+		usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.1 } },
+	});
+	addUsage(completed, { ...emptySubagentUsage(), searches: 2 }, false);
+	addUsage(completed, emptySubagentUsage(), false);
+	assert.equal(completed.searches, 2);
+
+	assert.equal(addCompactionUsage(completed, {
+		usage: { input_tokens: 100, output_tokens: 5, total_tokens: 125, cost: { total: 0.5 } },
+	}), true);
+	assert.equal(completed.searches, 2);
+
+	const overlay = usageWithActiveTurn(completed, { ...emptySubagentUsage(), searches: 1 });
+	assert.equal(overlay.searches, 3);
+	assert.equal(completed.searches, 2);
+});
+
+test("usage overlays keep zero search counts out of the result object", () => {
+	const completed = emptySubagentUsage();
+	assert.equal("searches" in usageWithActiveTurn(completed, undefined), false);
+	assert.equal("searches" in usageWithActiveTurn(completed, emptySubagentUsage()), false);
+	const reported = providerReportedUsage({ input: 1, output: 1 });
+	assert.ok(reported);
+	assert.equal("searches" in reported, false);
+
+	const withSearches = usageWithActiveTurn({ ...completed, searches: 2 }, undefined);
+	assert.equal(withSearches.searches, 2);
+	assert.deepEqual(usageWithActiveTurn({ ...completed, searches: 2 }, emptySubagentUsage()).searches, 2);
 });

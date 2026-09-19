@@ -949,3 +949,99 @@ test("single and grouped headers stay one physical line while initial tasks may 
 		assert.ok(groupedLines.every((line) => visibleWidth(line) <= width));
 	}
 });
+
+test("single usage lines show hosted search counts and omit zero values", () => {
+	const runWithSearches = (searches: number | undefined): SubagentTranscriptRun => ({
+		alias: "worker",
+		model: "provider/gpt-worker",
+		status: "completed",
+		output: "done",
+		persistent: false,
+		usage: {
+			input: 10,
+			output: 2,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cost: 0,
+			contextTokens: 12,
+			turns: 1,
+			...(searches === undefined ? {} : { searches }),
+		},
+	});
+	const usageLineOf = (searches: number | undefined): { text: string; usageLine: string | undefined } => {
+		const text = renderSubagentTranscript([runWithSearches(searches)], false, theme as any).render(120).join("\n");
+		return { text, usageLine: text.split("\n").find((line) => line.includes(" in ")) };
+	};
+
+	const one = usageLineOf(1);
+	assert.match(one.usageLine ?? "", /\b1 search\b/u);
+	assert.doesNotMatch(one.usageLine ?? "", /\bsearches\b/u);
+
+	const two = usageLineOf(2);
+	assert.match(two.usageLine ?? "", /\b2 searches\b/u);
+
+	for (const none of [undefined, 0]) {
+		const rendered = usageLineOf(none);
+		assert.equal(rendered.usageLine?.trim(), "10 in · 2 out");
+		assert.doesNotMatch(rendered.text, /search/u);
+	}
+
+	for (const width of [1, 2, 10, 40, 80]) {
+		const lines = renderSubagentTranscript([runWithSearches(2)], false, theme as any).render(width);
+		assert.ok(lines.every((line) => visibleWidth(line) <= width), `single search usage exceeded width ${width}`);
+	}
+});
+
+test("running single panels show the hosted search count once in the live usage line", () => {
+	const transcript = new SubagentTranscript("Search and summarize");
+	transcript.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "searching" }] } });
+	const run: SubagentTranscriptRun = {
+		alias: "worker",
+		model: "provider/gpt-worker",
+		status: "running",
+		output: "searching",
+		persistent: false,
+		transcript: transcript.snapshot(),
+		usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 12, turns: 1, searches: 3 },
+		durationMs: 1500,
+	};
+	const text = renderSubagentTranscript([run], false, theme as any).render(120).join("\n");
+
+	assert.match(text, /Running · provider\/gpt-worker/);
+	const headerLine = text.split("\n")[0] ?? "";
+	assert.doesNotMatch(headerLine, /search/u);
+	const usageLine = text.split("\n").find((line) => line.includes(" in "));
+	assert.equal(usageLine?.trim(), "10 in · 2 out · 3 searches");
+	assert.equal((text.match(/3 searches/gu) ?? []).length, 1);
+	assert.equal((text.match(/searches/gu) ?? []).length, 1);
+
+	for (const width of [10, 40, 80, 120]) {
+		const lines = renderSubagentTranscript([run], false, theme as any).render(width);
+		assert.ok(lines.every((line) => visibleWidth(line) <= width), `running search usage exceeded width ${width}`);
+	}
+});
+
+test("grouped aggregate usage sums hosted search counts while child panels stay count-free", () => {
+	const runs: SubagentTranscriptRun[] = [
+		{
+			alias: "worker-a", model: "provider/model-a", status: "completed", output: "alpha", persistent: false,
+			usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 110, turns: 1, searches: 1 },
+		},
+		{
+			alias: "worker-b", model: "provider/model-b", status: "completed", output: "beta", persistent: true,
+			usage: { input: 200, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 220, turns: 1, searches: 2 },
+		},
+	];
+	const text = renderSubagentTranscript(runs, false, theme as any, { mode: "chain" }).render(120).join("\n");
+	const aggregateLine = text.split("\n").find((line) => line.includes(" in "));
+	assert.match(aggregateLine ?? "", /\b3 searches\b/u);
+
+	const panels = text.split("╭").slice(1).map((chunk) => chunk.split("╰")[0] ?? "");
+	assert.equal(panels.length, 2);
+	for (const panel of panels) assert.doesNotMatch(panel, /\b\d+ search/u);
+
+	for (const width of [1, 2, 10, 40, 80, 120]) {
+		const lines = renderSubagentTranscript(runs, false, theme as any, { mode: "chain" }).render(width);
+		assert.ok(lines.every((line) => visibleWidth(line) <= width), `grouped search usage exceeded width ${width}`);
+	}
+});

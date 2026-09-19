@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
+import { HOSTED_SEARCH_ENTRY_TYPE } from "../../openai/hosted-search-activity";
 import {
 	RpcSessionWorker,
 	buildRpcWorkerArgs,
@@ -201,6 +202,28 @@ function spec(mode: WorkerStartSpec["mode"], sessionPath?: string): WorkerStartS
 		sessionName: "subagent · Main Auth Work · auth-review",
 		cwd: "/tmp/project",
 		...(sessionPath ? { sessionPath } : {}),
+	};
+}
+
+function hostedSearchEntryEvent(id: string, callIds: string[]): RpcEvent {
+	return {
+		type: "entry_appended",
+		entry: {
+			id,
+			type: "custom",
+			customType: HOSTED_SEARCH_ENTRY_TYPE,
+			data: {
+				version: 1,
+				responseId: `resp_${id}`,
+				provider: "cus-resp",
+				model: "gpt-5.6-sol",
+				phase: "completed",
+				startedAt: 1000,
+				endedAt: 2000,
+				calls: callIds.map((callId) => ({ id: callId, status: "completed", type: "search", query: callId })),
+				sources: [],
+			},
+		},
 	};
 }
 
@@ -597,6 +620,41 @@ describe("RpcSessionWorker", () => {
 		});
 		await worker.stop();
 		assert.equal(transport.stopped, true);
+	});
+
+	test("counts hosted search entries in streamed and final usage", async () => {
+		const transport = new FakeTransport(false, undefined, true);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const updates: any[] = [];
+		const pending = worker.send("search child", { onUpdate: (update) => updates.push(update) });
+		await new Promise((resolve) => setImmediate(resolve));
+
+		transport.emit({ type: "agent_start" });
+		transport.emit({
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "searching" }], usage: { input: 4, output: 2, totalTokens: 6, cost: { total: 0.01 } }, stopReason: "stop" },
+		});
+		transport.emit(hostedSearchEntryEvent("search-1", ["ws_1", "ws_2"]));
+		transport.emit(hostedSearchEntryEvent("search-1", ["ws_1", "ws_2"]));
+		transport.emit(hostedSearchEntryEvent("search-2", ["ws_3"]));
+		await new Promise((resolve) => setImmediate(resolve));
+		transport.emit({ type: "agent_settled" });
+
+		const result = await pending;
+		assert.equal(result.output, "searching");
+		assert.deepEqual(result.usage, {
+			input: 4,
+			output: 2,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cost: 0.01,
+			contextTokens: 6,
+			turns: 1,
+			searches: 3,
+		});
+		assert.equal(updates.some((update) => update.usage.searches === 3), true);
+		assert.equal(updates.every((update) => (update.usage.searches ?? 0) <= 3), true);
+		await worker.stop();
 	});
 
 	test("rejects a run when the child exits after accepting the prompt", async () => {

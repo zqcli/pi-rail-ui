@@ -48,6 +48,7 @@ export interface SubagentTranscriptRun {
 		cost: number;
 		contextTokens: number;
 		turns: number;
+		searches?: number;
 	};
 	durationMs?: number;
 	stopReason?: string;
@@ -722,6 +723,10 @@ function compactDuration(durationMs: number | undefined): string {
 	return minutes > 0 ? `${minutes}m` : "<1m";
 }
 
+function hostedSearchText(count: number): string {
+	return count === 1 ? "1 search" : `${count} searches`;
+}
+
 function usageText(run: SubagentTranscriptRun): string {
 	const usage = run.usage;
 	const parts: string[] = [];
@@ -730,6 +735,8 @@ function usageText(run: SubagentTranscriptRun): string {
 		if (usage.cacheRead > 0) parts.push(`${compactNumber(usage.cacheRead)} cached`);
 		if (usage.cacheWrite > 0) parts.push(`${compactNumber(usage.cacheWrite)} cache write`);
 		if (usage.cost > 0) parts.push(costText(usage.cost));
+		const searches = usage.searches ?? 0;
+		if (searches > 0) parts.push(hostedSearchText(searches));
 	}
 	return parts.join(" · ");
 }
@@ -963,8 +970,9 @@ class MultiSubagentPanelView implements Component {
 			usage.cacheRead += run.usage.cacheRead;
 			usage.cacheWrite += run.usage.cacheWrite;
 			usage.cost += run.usage.cost;
+			usage.searches += run.usage.searches ?? 0;
 			return usage;
-		}, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+		}, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, searches: 0 });
 		const summary = `${this.runs.length} model ${this.runs.length === 1 ? "session" : "sessions"} · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running · ${failed} failed`;
 		const metrics = [
 			`${compactNumber(total.input)} in`,
@@ -972,6 +980,7 @@ class MultiSubagentPanelView implements Component {
 			...(total.cacheRead > 0 ? [`${compactNumber(total.cacheRead)} cached`] : []),
 			...(total.cacheWrite > 0 ? [`${compactNumber(total.cacheWrite)} cache write`] : []),
 			...(total.cost > 0 ? [costText(total.cost)] : []),
+			...(total.searches > 0 ? [hostedSearchText(total.searches)] : []),
 			...(this.durationMs !== undefined ? [`wall ${compactDuration(this.durationMs)}`] : []),
 		].join(" · ");
 		const lines = [

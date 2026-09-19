@@ -64,6 +64,39 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 	});
 });
 
+test("stateless JSON adapter counts hosted search entries in final and streamed usage", async () => {
+	const fixture = resolve("tests/fixtures/fake-pi-json-search.mjs");
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: () => ({ command: process.execPath, args: [fixture] }),
+	});
+	const updates: any[] = [];
+
+	const result = await runner({
+		model,
+		task: "hosted search",
+		cwd: process.cwd(),
+		onUpdate: (update) => updates.push(update),
+	});
+
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.output, "search done");
+	assert.deepEqual(result.usage, {
+		input: 97,
+		output: 9,
+		cacheRead: 22,
+		cacheWrite: 0,
+		cost: 0.55,
+		contextTokens: 6,
+		turns: 2,
+		searches: 3,
+	});
+	assert.equal(updates.some((update) => update.usage.searches === 3), true);
+	const flushed = updates.filter((update) => update.output === "search done");
+	assert.equal(flushed.length, 1, "the final assistant message_end should flush exactly once");
+	assert.equal(flushed[0]?.usage.searches, 3, "the message_end immediate flush should carry the final search count");
+	assert.equal(updates.every((update) => (update.usage.searches ?? 0) <= 3), true);
+});
+
 test("every stateless dispatch starts the standalone search extension in live mode", async () => {
 	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
 	let capturedArgs: string[] = [];

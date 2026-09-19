@@ -34,6 +34,8 @@ export type HostedSearchSnapshot = {
 	startedAt: number;
 	endedAt?: number | undefined;
 	calls: HostedSearchCall[];
+	/** Total distinct calls observed, even when `calls` is capped at MAX_CALLS. */
+	callCount?: number | undefined;
 	sources: HostedSearchSource[];
 	error?: string | undefined;
 };
@@ -71,6 +73,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export class HostedSearchActivity {
 	private readonly callsById = new Map<string, HostedSearchCall>();
+	private readonly countedCallIds = new Set<string>();
 	private readonly sourcesByUrl = new Map<string, HostedSearchSource>();
 	private readonly listeners = new Set<ActivityListener>();
 	private readonly observerTasks = new Set<Promise<void>>();
@@ -79,6 +82,7 @@ export class HostedSearchActivity {
 	private phaseValue: HostedSearchPhase;
 	private endedAtValue: number | undefined;
 	private errorValue: string | undefined;
+	private callCountValue = 0;
 
 	readonly provider: string;
 	readonly model: string;
@@ -111,6 +115,7 @@ export class HostedSearchActivity {
 		});
 		activity.endedAtValue = snapshot.endedAt;
 		for (const call of snapshot.calls.slice(0, MAX_CALLS)) activity.upsertCall(call.id, call.status, call);
+		activity.callCountValue = Math.max(snapshot.callCount ?? 0, activity.callCountValue);
 		for (const source of snapshot.sources.slice(0, MAX_SOURCES)) activity.addSource(source.url, source.title, false);
 		activity.phaseValue = snapshot.phase;
 		activity.errorValue = cleanText(snapshot.error) ?? (snapshot.phase === "failed" ? activity.errorValue : undefined);
@@ -148,7 +153,19 @@ export class HostedSearchActivity {
 		const callId = cleanText(id, 256);
 		if (!callId) return;
 		const existing = this.callsById.get(callId);
-		if (!existing && this.callsById.size >= MAX_CALLS) return;
+		if (!existing) {
+			const firstObservation = !this.countedCallIds.has(callId);
+			if (firstObservation) {
+				this.countedCallIds.add(callId);
+				this.callCountValue += 1;
+			}
+			if (this.callsById.size >= MAX_CALLS) {
+				// Keep counting distinct calls past the display cap; repeated
+				// in_progress/searching/completed events must still count once.
+				if (firstObservation) this.notify();
+				return;
+			}
+		}
 		const normalized = normalizeAction(action);
 		const call: HostedSearchCall = {
 			id: callId,
@@ -232,6 +249,7 @@ export class HostedSearchActivity {
 			startedAt: this.startedAt,
 			endedAt: this.endedAtValue,
 			calls: [...this.callsById.values()],
+			callCount: this.callCountValue,
 			sources: [...this.sourcesByUrl.values()],
 			error: this.errorValue,
 		};
@@ -469,6 +487,18 @@ export function restoreHostedSearchActivities(entries: readonly unknown[]): void
 	}
 }
 
+/**
+ * Returns the observed hosted `web_search_call` total for a Pi `entry_appended`
+ * rail-oai-hosted-search entry, or undefined when the entry is unrelated or its
+ * snapshot is malformed. Uses the snapshot's `callCount` so a `calls` display
+ * list capped at MAX_CALLS never truncates the total; duplicate call ids count
+ * once. Shares the strict parser used by session restore.
+ */
+export function hostedSearchCallsFromEntry(entry: unknown): number | undefined {
+	if (!isRecord(entry) || entry["type"] !== "custom" || entry["customType"] !== HOSTED_SEARCH_ENTRY_TYPE) return undefined;
+	return parseHostedSearchSnapshot(entry["data"])?.callCount;
+}
+
 function parseHostedSearchSnapshot(value: unknown): HostedSearchSnapshot | undefined {
 	if (!isRecord(value) || value["version"] !== HOSTED_SEARCH_ENTRY_VERSION) return undefined;
 	const provider = cleanText(value["provider"], 256);
@@ -480,6 +510,7 @@ function parseHostedSearchSnapshot(value: unknown): HostedSearchSnapshot | undef
 	if (!Array.isArray(value["calls"]) || !Array.isArray(value["sources"])) return undefined;
 
 	const calls: HostedSearchCall[] = [];
+	const uniqueCallIds = new Set<string>();
 	for (const raw of value["calls"].slice(0, MAX_CALLS)) {
 		if (!isRecord(raw)) continue;
 		const id = cleanText(raw["id"], 256);
@@ -488,7 +519,14 @@ function parseHostedSearchSnapshot(value: unknown): HostedSearchSnapshot | undef
 		if (!id || !status) continue;
 		const type: HostedSearchActionType = rawType === "search" || rawType === "open_page" || rawType === "find_in_page" ? rawType : "other";
 		calls.push({ id, status, type, query: cleanText(raw["query"]), url: cleanUrl(raw["url"]) });
+		uniqueCallIds.add(id);
 	}
+	const rawCallCount = value["callCount"];
+	if (rawCallCount !== undefined
+		&& (typeof rawCallCount !== "number" || !Number.isSafeInteger(rawCallCount) || rawCallCount < 0 || rawCallCount < uniqueCallIds.size)) {
+		return undefined;
+	}
+	const callCount = rawCallCount ?? uniqueCallIds.size;
 	const sources: HostedSearchSource[] = [];
 	for (const raw of value["sources"].slice(0, MAX_SOURCES)) {
 		if (!isRecord(raw)) continue;
@@ -512,6 +550,7 @@ function parseHostedSearchSnapshot(value: unknown): HostedSearchSnapshot | undef
 		startedAt,
 		endedAt,
 		calls,
+		callCount,
 		sources,
 		error: cleanText(value["error"]),
 	};

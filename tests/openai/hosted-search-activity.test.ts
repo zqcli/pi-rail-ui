@@ -5,9 +5,11 @@ import {
 	HostedSearchActivity,
 	HostedSearchSseObserver,
 	hostedSearchActivityForMessage,
+	hostedSearchCallsFromEntry,
 	resetHostedSearchActivities,
 	restoreHostedSearchActivities,
 	setActiveHostedSearchActivity,
+	type HostedSearchSnapshot,
 } from "../../openai/hosted-search-activity";
 
 function sse(event: string, data: unknown): string {
@@ -71,6 +73,7 @@ test("parses chunked hosted search calls, actions, sources, and terminal respons
 		version: 1,
 		responseId: "resp_1",
 		assistantTimestamp: undefined,
+		callCount: 2,
 		provider: "custom",
 		model: "gpt-5.6-luna",
 		phase: "completed",
@@ -256,6 +259,128 @@ test("scopes restored identities by provider and model with a timestamp fallback
 		model: "gpt-b",
 		responseId: "resp_shared",
 	}), undefined);
+});
+
+test("extracts hosted search call counts only from strictly valid custom entries", () => {
+	const snapshot = {
+		version: 1,
+		responseId: "resp_count",
+		provider: "custom",
+		model: "gpt-5.6-luna",
+		phase: "completed",
+		startedAt: 1000,
+		calls: [
+			{ id: "ws_1", status: "completed", type: "search", query: "one" },
+			{ id: "ws_2", status: "completed", type: "open_page", url: "https://example.com/page" },
+		],
+		sources: [{ title: "Example", url: "https://example.com/page" }],
+	};
+	const entry = (data: unknown, overrides: Record<string, unknown> = {}) => ({
+		id: "entry-count",
+		type: "custom",
+		customType: HOSTED_SEARCH_ENTRY_TYPE,
+		data,
+		...overrides,
+	});
+
+	assert.equal(hostedSearchCallsFromEntry(entry(snapshot)), 2);
+	assert.equal(hostedSearchCallsFromEntry(entry({ ...snapshot, version: 2 })), undefined);
+	assert.equal(hostedSearchCallsFromEntry(entry({ ...snapshot, phase: "done" })), undefined);
+	assert.equal(hostedSearchCallsFromEntry(entry({ ...snapshot, startedAt: Number.NaN })), undefined);
+	assert.equal(hostedSearchCallsFromEntry(entry({ ...snapshot, provider: "" })), undefined);
+	assert.equal(hostedSearchCallsFromEntry(entry({ ...snapshot, calls: undefined })), undefined);
+	assert.equal(hostedSearchCallsFromEntry(entry(snapshot, { type: "custom_message" })), undefined);
+	assert.equal(hostedSearchCallsFromEntry(entry(snapshot, { customType: "other" })), undefined);
+	assert.equal(hostedSearchCallsFromEntry(undefined), undefined);
+	assert.equal(hostedSearchCallsFromEntry({ type: "custom", customType: HOSTED_SEARCH_ENTRY_TYPE }), undefined);
+
+	const partiallyInvalid = entry({ ...snapshot, calls: [snapshot.calls[0], { status: "completed" }, null] });
+	assert.equal(hostedSearchCallsFromEntry(partiallyInvalid), 1);
+});
+
+test("tracks observed call ids beyond the bounded snapshot list", () => {
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
+	for (let index = 0; index < 40; index++) {
+		activity.upsertCall(`ws_${index}`, "in_progress");
+		activity.upsertCall(`ws_${index}`, "completed");
+	}
+
+	const snapshot = activity.snapshot();
+	assert.equal(snapshot.calls.length, 24);
+	assert.equal(snapshot.callCount, 40);
+	assert.equal(snapshot.calls[23]?.id, "ws_23");
+	assert.equal(snapshot.calls[23]?.status, "completed");
+
+	const entry = {
+		id: "entry-bounded",
+		type: "custom",
+		customType: HOSTED_SEARCH_ENTRY_TYPE,
+		data: snapshot,
+	};
+	assert.equal(hostedSearchCallsFromEntry(entry), 40);
+	assert.equal(HostedSearchActivity.restore(snapshot).snapshot().callCount, 40);
+});
+
+test("falls back to unique persisted call ids when a snapshot predates callCount", () => {
+	const legacySnapshot = (calls: HostedSearchSnapshot["calls"]): HostedSearchSnapshot => ({
+		version: 1,
+		responseId: "resp_legacy",
+		provider: "custom",
+		model: "gpt-5.6-luna",
+		phase: "completed",
+		startedAt: 1000,
+		calls,
+		sources: [],
+	});
+	const entry = (calls: HostedSearchSnapshot["calls"]) => ({
+		id: "legacy-count",
+		type: "custom",
+		customType: HOSTED_SEARCH_ENTRY_TYPE,
+		data: legacySnapshot(calls),
+	});
+	const call = (id: string) => ({ id, status: "completed", type: "search" as const, query: id });
+
+	assert.equal(hostedSearchCallsFromEntry(entry([call("ws_1"), call("ws_2"), call("ws_1")])), 2);
+	assert.equal(hostedSearchCallsFromEntry(entry([call("ws_1"), call("ws_1"), call("ws_1")])), 1);
+	assert.equal(hostedSearchCallsFromEntry(entry([])), 0);
+
+	const restored = HostedSearchActivity.restore(legacySnapshot([call("ws_1"), call("ws_2"), call("ws_1")]));
+	assert.equal(restored.snapshot().calls.length, 2);
+	assert.equal(restored.snapshot().callCount, 2);
+});
+
+test("rejects persisted call counts that are negative, fractional, or below the unique call ids", () => {
+	const calls = [
+		{ id: "ws_1", status: "completed", type: "search", query: "one" },
+		{ id: "ws_2", status: "completed", type: "search", query: "two" },
+		{ id: "ws_1", status: "completed", type: "search", query: "one again" },
+	];
+	const entry = (callCount: unknown) => ({
+		id: "invalid-count",
+		type: "custom",
+		customType: HOSTED_SEARCH_ENTRY_TYPE,
+		data: {
+			version: 1,
+			responseId: "resp_invalid",
+			provider: "custom",
+			model: "gpt-5.6-luna",
+			phase: "completed",
+			startedAt: 1000,
+			calls,
+			sources: [],
+			callCount,
+		},
+	});
+
+	for (const invalid of [-1, 0, 1, 1.5, "2", Number.NaN, Number.POSITIVE_INFINITY]) {
+		assert.equal(hostedSearchCallsFromEntry(entry(invalid)), undefined, `callCount ${String(invalid)} should be rejected`);
+	}
+	assert.equal(hostedSearchCallsFromEntry(entry(2)), 2);
+	assert.equal(hostedSearchCallsFromEntry(entry(7)), 7);
+
+	resetHostedSearchActivities();
+	restoreHostedSearchActivities([entry(-1)]);
+	assert.equal(hostedSearchActivityForMessage({ provider: "custom", model: "gpt-5.6-luna", responseId: "resp_invalid" }), undefined);
 });
 
 test("does not attach a live activity to another assistant and rejects invalid persisted phases", () => {

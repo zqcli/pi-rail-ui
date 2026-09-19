@@ -10,6 +10,7 @@ import { RpcSessionWorker, buildRpcWorkerArgs } from "../../tools/subagents/rpc-
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
 import { railFastExtensionPath } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath } from "../../commands/rail-oai-search";
+import { HostedSearchActivity, HostedSearchSseObserver } from "../../openai/hosted-search-activity";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
 
@@ -18,7 +19,25 @@ const providerFixture = fileURLToPath(new URL("../fixtures/rail-fast-provider.mj
 const railExtension = fileURLToPath(new URL("../../index.ts", import.meta.url));
 const model: RailModelRef = { provider: "rail-fast-probe", modelId: "gpt-fast-probe", name: "GPT fast probe" };
 
+function sse(event: string, data: unknown): string {
+	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+// Each response carries exactly one complete hosted web_search_call item with a
+// stable id plus the assistant's final text. The same bytes are read by Pi's
+// Responses parser (which ignores web_search_call items but must still surface the
+// final text) and by the rail-oai-search HostedSearchSseObserver (which must count
+// the stable id once, not once per lifecycle event and not once per output copy).
 function responseEvents(text: string, responseId: string): string {
+	const searchId = `${responseId}-web-search`;
+	const query = `hosted search for ${responseId}`;
+	const source = { type: "url", url: "https://example.com/rail-fast-source", title: "Rail fast source" };
+	const searchItem = {
+		id: searchId,
+		type: "web_search_call",
+		status: "completed",
+		action: { type: "search", query, sources: [source] },
+	};
 	const item = {
 		type: "message",
 		id: `${responseId}-message`,
@@ -30,17 +49,42 @@ function responseEvents(text: string, responseId: string): string {
 	const response = {
 		id: responseId,
 		status: "completed",
-		output: [item],
+		output: [searchItem, item],
 		usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 } },
 	};
 	return [
-		`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: responseId } })}\n\n`,
-		`event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item })}\n\n`,
-		`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\n`,
+		sse("response.created", { type: "response.created", response: { id: responseId } }),
+		sse("response.output_item.added", {
+			type: "response.output_item.added",
+			output_index: 0,
+			item: { id: searchId, type: "web_search_call", status: "in_progress", action: { type: "search", query } },
+		}),
+		sse("response.web_search_call.in_progress", { type: "response.web_search_call.in_progress", output_index: 0, item_id: searchId }),
+		sse("response.web_search_call.searching", { type: "response.web_search_call.searching", output_index: 0, item_id: searchId }),
+		sse("response.web_search_call.completed", { type: "response.web_search_call.completed", output_index: 0, item_id: searchId }),
+		sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: searchItem }),
+		sse("response.output_item.done", { type: "response.output_item.done", output_index: 1, item }),
+		sse("response.completed", { type: "response.completed", response }),
 	].join("");
 }
 
 test("real stateless and persistent children apply fast mode and hosted search to their first provider payload", { timeout: 30_000 }, async (t) => {
+	const observed = new HostedSearchActivity({ provider: model.provider, model: model.modelId });
+	const observer = new HostedSearchSseObserver(observed);
+	observer.push(responseEvents("observed probe", "resp_observe"));
+	observer.end();
+	const snapshot = observed.snapshot();
+	assert.equal(snapshot.callCount, 1);
+	assert.deepEqual(snapshot.calls, [{
+		id: "resp_observe-web-search",
+		status: "completed",
+		type: "search",
+		query: "hosted search for resp_observe",
+		url: undefined,
+	}]);
+	assert.deepEqual(snapshot.sources, [{ title: "Rail fast source", url: "https://example.com/rail-fast-source" }]);
+	assert.equal(snapshot.phase, "completed");
+
 	const requests: Array<Record<string, unknown>> = [];
 	const server = createServer((request, response) => {
 		let raw = "";
@@ -80,8 +124,10 @@ test("real stateless and persistent children apply fast mode and hosted search t
 	});
 	const stateless = await runner({ model, task: "stateless fast probe", cwd: process.cwd(), fastMode: true });
 	assert.equal(stateless.output, "fast response 1", JSON.stringify({ stateless, requests }));
+	assert.equal(stateless.usage.searches, 1, JSON.stringify({ stateless, requests }));
 	const ordinary = await runner({ model, task: "stateless ordinary probe", cwd: process.cwd() });
 	assert.equal(ordinary.output, "fast response 2", JSON.stringify({ ordinary, requests }));
+	assert.equal(ordinary.usage.searches, 1, JSON.stringify({ ordinary, requests }));
 
 	const spec: WorkerStartSpec = {
 		agentId: "agt_fast_probe",
@@ -103,6 +149,7 @@ test("real stateless and persistent children apply fast mode and hosted search t
 	try {
 		const persistent = await worker.send("persistent fast probe");
 		assert.equal(persistent.output, "fast response 3");
+		assert.equal(persistent.usage.searches, 1, JSON.stringify({ persistent, requests }));
 	} finally {
 		await worker.stop().catch(() => undefined);
 		await transport.stop().catch(() => undefined);

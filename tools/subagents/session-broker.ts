@@ -17,6 +17,8 @@ export interface SubagentUsage {
 	cost: number;
 	contextTokens: number;
 	turns: number;
+	/** Observed hosted web_search_call executions; omitted while zero. */
+	searches?: number;
 }
 
 export interface WorkerRunResult {

@@ -1,3 +1,4 @@
+import { hostedSearchCallsFromEntry } from "../../openai/hosted-search-activity";
 import { SubagentTranscript } from "./transcript";
 import type { SubagentUsage, WorkerRunResult } from "./session-broker";
 import { addCompactionUsage, addCompletedAssistantUsage, emptySubagentUsage, providerReportedUsage, usageWithActiveTurn } from "./usage";
@@ -59,6 +60,7 @@ export class RunResultCollector {
 	private readonly usage = emptySubagentUsage();
 	private readonly transcript: SubagentTranscript;
 	private readonly extractAssistantText: AssistantTextExtractor;
+	private readonly hostedSearchEntryIds = new Set<string>();
 	private activeUsage: SubagentUsage | undefined;
 	private output = "";
 	private stopReasonValue: string | undefined;
@@ -79,6 +81,7 @@ export class RunResultCollector {
 	// adapters' call based on event type. Strict extraction may throw here after
 	// the transcript was ingested, restoring the stateless malformed-tail behavior.
 	ingest(event: SubagentRunEvent): boolean {
+		const searchChanged = this.ingestHostedSearch(event);
 		const activityChanged = this.ingestActivity(event);
 		const transcriptChanged = this.transcript.ingest(event);
 		if (event.type === "message_update") {
@@ -100,7 +103,7 @@ export class RunResultCollector {
 		if (event.type === "compaction_end" && !this.compactionUsageAdded) {
 			this.compactionUsageAdded = addCompactionUsage(this.usage, event["result"]);
 		}
-		return activityChanged || transcriptChanged || (event.type === "message_update" && this.activeUsage !== undefined);
+		return searchChanged || activityChanged || transcriptChanged || (event.type === "message_update" && this.activeUsage !== undefined);
 	}
 
 	// Host-side failures share the same error message slot as message_end folding,
@@ -118,6 +121,21 @@ export class RunResultCollector {
 
 	markSettled(): void {
 		this.isCompactingValue = false;
+	}
+
+	private ingestHostedSearch(event: SubagentRunEvent): boolean {
+		if (event.type !== "entry_appended") return false;
+		const entry = event["entry"];
+		if (!entry || typeof entry !== "object") return false;
+		const id = (entry as { id?: unknown }).id;
+		if (typeof id !== "string" || id.length === 0) return false;
+		if (this.hostedSearchEntryIds.has(id)) return false;
+		const calls = hostedSearchCallsFromEntry(entry);
+		if (calls === undefined) return false;
+		this.hostedSearchEntryIds.add(id);
+		if (calls <= 0) return false;
+		this.usage.searches = (this.usage.searches ?? 0) + calls;
+		return true;
 	}
 
 	private ingestActivity(event: SubagentRunEvent): boolean {

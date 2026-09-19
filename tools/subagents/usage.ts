@@ -52,6 +52,8 @@ export function addUsage(total: SubagentUsage, usage: SubagentUsage, countTurn: 
 	total.cacheRead += usage.cacheRead;
 	total.cacheWrite += usage.cacheWrite;
 	total.cost += usage.cost;
+	const searches = usage.searches ?? 0;
+	if (searches > 0) total.searches = (total.searches ?? 0) + searches;
 	if (countTurn) {
 		total.contextTokens = usage.contextTokens || total.contextTokens;
 		total.turns++;
@@ -76,14 +78,19 @@ export function addCompactionUsage(total: SubagentUsage, result: unknown): boole
 }
 
 export function usageWithActiveTurn(completed: SubagentUsage, active: SubagentUsage | undefined): SubagentUsage {
-	if (!active) return { ...completed };
-	return {
-		input: completed.input + active.input,
-		output: completed.output + active.output,
-		cacheRead: completed.cacheRead + active.cacheRead,
-		cacheWrite: completed.cacheWrite + active.cacheWrite,
-		cost: completed.cost + active.cost,
-		contextTokens: active.contextTokens || completed.contextTokens,
-		turns: completed.turns + 1,
-	};
+	const searches = (completed.searches ?? 0) + (active?.searches ?? 0);
+	const result: SubagentUsage = active
+		? {
+			input: completed.input + active.input,
+			output: completed.output + active.output,
+			cacheRead: completed.cacheRead + active.cacheRead,
+			cacheWrite: completed.cacheWrite + active.cacheWrite,
+			cost: completed.cost + active.cost,
+			contextTokens: active.contextTokens || completed.contextTokens,
+			turns: completed.turns + 1,
+		}
+		: { ...completed };
+	if (searches > 0) result.searches = searches;
+	else delete result.searches;
+	return result;
 }

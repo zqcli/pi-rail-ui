@@ -8,7 +8,7 @@ import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, formatContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
 import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
-import { isGptModelName } from "../gpt-compaction/model-eligibility";
+import { isGptModel } from "../../openai/model-eligibility";
 import { readGptCompactionSettings } from "../gpt-compaction/settings";
 import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
@@ -46,7 +46,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 		const contextWindow = settings
 			? validateContextWindowReserve(requestedContextWindow, settings.reserveTokens, settings.enabled)
 			: undefined;
-		const gptModel = isGptModelName(request.model.modelId) || isGptModelName(request.model.name);
+		const gptModel = isGptModel({ id: request.model.modelId, name: request.model.name });
 		const gptCompactionEnabled = readGptCompactionSettings().mode === "on" && gptModel;
 		const ephemeralSessionDir = gptCompactionEnabled ? await mkdtemp(join(tmpdir(), "pi-rail-stateless-compaction-")) : undefined;
 		const ephemeralSessionPath = ephemeralSessionDir ? join(ephemeralSessionDir, "session.jsonl") : undefined;

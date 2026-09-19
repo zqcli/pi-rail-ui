@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isGptModelName } from "../tools/gpt-compaction/model-eligibility";
+import { isGptModel } from "../openai/model-eligibility";
 
 const STATUS_KEY = "rail-oai-fast";
 const INSTALL_EVENT = "rail-oai-fast:install";
@@ -19,10 +19,6 @@ export type NativeFastModel = {
 };
 
 let enabled = false;
-// Child processes start with the standalone flag and stay GPT-only; a normal
-// parent session keeps Pi's API-only scope. A slash toggle must not widen a
-// child's restriction.
-let restrictToGptModels = false;
 let activeForCurrentModel = false;
 
 type InstallClaim = { claimed: boolean };
@@ -46,18 +42,7 @@ export function supportsNativeFastMode(model: NativeFastModel | undefined): mode
 }
 
 export function supportsNativeGptFastMode(model: NativeFastModel | undefined): model is NativeFastModel {
-	return supportsNativeFastMode(model) && (isGptModelName(model.id) || isGptModelName(model.name));
-}
-
-/**
- * Single eligibility decision shared by the status/footer and the request hook
- * so a GPT-only child restriction and the parent's API-only scope can never
- * disagree. Eligibility is evaluated against the model of the moment, so an
- * in-place switch updates both without re-registering the extension.
- */
-function fastModeEligible(model: NativeFastModel | undefined): model is NativeFastModel {
-	if (!supportsNativeFastMode(model)) return false;
-	return !restrictToGptModels || supportsNativeGptFastMode(model);
+	return supportsNativeFastMode(model) && isGptModel(model);
 }
 
 /**
@@ -82,7 +67,7 @@ export function railFastFooterLabel(): string | undefined {
 
 function updateStatus(ctx: ExtensionContext): void {
 	const model = ctx.model as NativeFastModel | undefined;
-	activeForCurrentModel = enabled && fastModeEligible(model);
+	activeForCurrentModel = enabled && supportsNativeGptFastMode(model);
 	if (!ctx.hasUI) return;
 	const status = enabled
 		? activeForCurrentModel ? "FAST" : "FAST (inactive)"
@@ -127,8 +112,7 @@ export function installRailFast(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		restrictToGptModels = pi.getFlag?.(RAIL_FAST_MODE_FLAG) === true;
-		enabled = restrictToGptModels;
+		enabled = pi.getFlag?.(RAIL_FAST_MODE_FLAG) === true;
 		updateStatus(ctx);
 	});
 
@@ -137,13 +121,12 @@ export function installRailFast(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
-		if (!enabled || !fastModeEligible(ctx.model as NativeFastModel | undefined)) return undefined;
+		if (!enabled || !supportsNativeGptFastMode(ctx.model as NativeFastModel | undefined)) return undefined;
 		return withNativeFastServiceTier(event.payload);
 	});
 
 	pi.on("session_shutdown", async () => {
 		enabled = false;
-		restrictToGptModels = false;
 		activeForCurrentModel = false;
 	});
 }

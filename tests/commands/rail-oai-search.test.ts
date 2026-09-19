@@ -2,13 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	installRailOaiSearch,
-	isGptModel,
 	RAIL_OAI_SEARCH_MODE_FLAG,
 	supportsNativeGptSearch,
 	transformNativeSearchPayload,
 } from "../../commands/rail-oai-search";
 import { hostedSearchActivityForMessage } from "../../openai/hosted-search-activity";
-
 function eventBus() {
 	const listeners = new Map<string, Array<(data: unknown) => void>>();
 	return {
@@ -21,14 +19,6 @@ function eventBus() {
 		},
 	};
 }
-
-test("recognizes GPT models by id or display name without restricting provider", () => {
-	assert.equal(isGptModel({ id: "gpt-5.6-sol", name: "Custom model" }), true);
-	assert.equal(isGptModel({ id: "custom-latest", name: "GPT 5.6" }), true);
-	assert.equal(isGptModel({ id: "gpt-5.6-sol", name: "GPT", provider: "custom" }), true);
-	assert.equal(isGptModel({ id: "claude-opus", name: "Claude Opus" }), false);
-	assert.equal(isGptModel(undefined), false);
-});
 
 test("strict native search eligibility requires a GPT name and a Responses-capable API", () => {
 	assert.equal(supportsNativeGptSearch({ id: "gpt-5.6-sol", api: "openai-responses" }), true);

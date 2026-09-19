@@ -1,4 +1,5 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { isGptModel } from "../../openai/model-eligibility";
 
 /**
  * Remote compaction v2 speaks the plain `/responses` stream with a
@@ -33,15 +34,6 @@ export function isResponsesCompactionApi(api: string): api is ResponsesCompactio
 	return (RESPONSES_COMPACTION_APIS as readonly string[]).includes(api);
 }
 
-/**
- * GPT family match is intentionally provider-independent: custom Responses
- * gateways routinely register GPT models under their own provider id, while
- * non-GPT Responses models must stay on Pi's native compaction.
- */
-export function isGptModelName(value: string | undefined): boolean {
-	return !!value && /(^|[^a-z0-9])gpt([^a-z0-9]|$)/iu.test(value);
-}
-
 export function describeCompactionModel(model: Model<Api>): CompactionModelDescriptor {
 	return {
 		provider: model.provider,
@@ -59,7 +51,9 @@ export function modelSupportsRemoteCompaction(model: Model<Api> | undefined): Re
 	if (!isResponsesCompactionApi(model.api)) {
 		return { supported: false, reason: "unsupported-api", detail: `${model.provider}/${model.id} uses ${model.api}` };
 	}
-	if (!isGptModelName(model.id) && !isGptModelName(model.name)) {
+	// GPT matching is provider-independent; non-GPT Responses models must stay
+	// on Pi's native compaction.
+	if (!isGptModel(model)) {
 		return { supported: false, reason: "not-gpt-model", detail: `${model.provider}/${model.id} is not a GPT model` };
 	}
 	return { supported: true };

@@ -28,8 +28,8 @@ test("GPT compaction command parsing is strict and supports menu, on, and off", 
 	assert.deepEqual(parseGptCompactionCommand(""), { operation: "menu" });
 	assert.deepEqual(parseGptCompactionCommand("  on  "), { operation: "set", mode: "on" });
 	assert.deepEqual(parseGptCompactionCommand("off"), { operation: "set", mode: "off" });
-	assert.throws(() => parseGptCompactionCommand("yes"), /Usage/);
-	assert.throws(() => parseGptCompactionCommand("on extra"), /Usage/);
+	assert.throws(() => parseGptCompactionCommand("yes"), /Usage: \/rail-oai-compaction \[on\|off\]/);
+	assert.throws(() => parseGptCompactionCommand("on extra"), /Usage: \/rail-oai-compaction \[on\|off\]/);
 });
 
 test("the real extension registration exposes stateful menu, completion, and persistence", async (t) => {
@@ -66,8 +66,9 @@ test("the real extension registration exposes stateful menu, completion, and per
 	installGptCompaction(pi);
 	installGptCompactionExtension(pi);
 	assert.equal(commandRegistrations, 1);
-	assert.equal(commands.has("rail-gpt-compaction"), true);
-	const command = commands.get("rail-gpt-compaction");
+	assert.equal(commands.has("rail-oai-compaction"), true);
+	assert.equal(commands.has("rail-gpt-compaction"), false, "the old slash name must not remain registered");
+	const command = commands.get("rail-oai-compaction");
 	assert.deepEqual(command.getArgumentCompletions("")?.map((item: any) => item.value), ["on", "off"]);
 	assert.deepEqual(command.getArgumentCompletions("on")?.map((item: any) => item.value), ["on"]);
 	assert.deepEqual(command.getArgumentCompletions("off")?.map((item: any) => item.value), ["off"]);

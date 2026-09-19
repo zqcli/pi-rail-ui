@@ -5,7 +5,7 @@ import {
 	HOSTED_SEARCH_ENTRY_TYPE,
 	restoreHostedSearchActivities,
 } from "../openai/hosted-search-activity";
-import { isGptModelName } from "../tools/gpt-compaction/model-eligibility";
+import { isGptModel } from "../openai/model-eligibility";
 
 const STATUS_KEY = "rail-oai-search";
 const INSTALL_EVENT = "rail-oai-search:install";
@@ -95,11 +95,6 @@ function normalizeToolChoice(toolChoice: unknown): unknown {
 	if (!replacedSearchTool) return toolChoice;
 	tools.push({ type: "web_search" });
 	return { ...toolChoice, tools };
-}
-
-export function isGptModel(model: SearchModel | undefined): boolean {
-	if (!model) return false;
-	return isGptModelName(model.id) || isGptModelName(model.name);
 }
 
 /**

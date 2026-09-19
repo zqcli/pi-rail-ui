@@ -226,8 +226,8 @@ test("real CLI root and standalone extensions deduplicate in either load order",
 		await transport.start();
 		try {
 			const commandResult = await transport.request({ type: "get_commands" }) as { commands?: Array<{ name?: string }> };
-			assert.equal(commandResult.commands?.filter((command) => command.name === "rail-gpt-compaction").length, 1);
-			assert.equal(commandResult.commands?.some((command) => command.name?.startsWith("rail-gpt-compaction:")), false);
+			assert.equal(commandResult.commands?.filter((command) => command.name === "rail-oai-compaction").length, 1);
+			assert.equal(commandResult.commands?.some((command) => command.name?.startsWith("rail-oai-compaction:")), false);
 			await transport.request({ type: "compact" });
 		} finally {
 			await transport.stop();
@@ -370,7 +370,7 @@ test("slash off repairs an oversized remote leaf before the next prompt", { time
 				await transport.request({ type: "prompt", message: "live tail before off" });
 				await settled;
 			}
-			await transport.request({ type: "prompt", message: "/rail-gpt-compaction off" });
+			await transport.request({ type: "prompt", message: "/rail-oai-compaction off" });
 			for (let attempt = 0; attempt < 100; attempt += 1) {
 				const setting = JSON.parse(await readFile(join(agentDir, "rail-gpt-compaction", "settings.json"), "utf8")) as Record<string, unknown>;
 				if (setting["remoteCompaction"] === "off") break;
@@ -380,7 +380,7 @@ test("slash off repairs an oversized remote leaf before the next prompt", { time
 			await transport.request({ type: "prompt", message: "continue after off" });
 			await settled;
 			if (!withLiveTail) {
-				await transport.request({ type: "prompt", message: "/rail-gpt-compaction on" });
+				await transport.request({ type: "prompt", message: "/rail-oai-compaction on" });
 				for (let attempt = 0; attempt < 100; attempt += 1) {
 					const setting = JSON.parse(await readFile(join(agentDir, "rail-gpt-compaction", "settings.json"), "utf8")) as Record<string, unknown>;
 					if (setting["remoteCompaction"] === "on") break;

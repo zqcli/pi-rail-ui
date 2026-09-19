@@ -104,40 +104,105 @@ test("/rail-oai-fast toggles request-time service_tier and status", async () => 
 	assert.equal(railFastFooterLabel(), undefined);
 });
 
-test("parent slash eligibility stays API-only for non-GPT models on supported APIs", async () => {
+test("parent slash eligibility is GPT-only on supported APIs and never injects for non-GPT models", async () => {
 	const statuses: Array<string | undefined> = [];
 	const { command, handlers } = setupFast();
 	const ctx = context({ api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" }, statuses);
 	const payload = { model: "probe", input: [] };
 
 	await handlers.get("session_start")({}, ctx);
-	assert.equal(statuses.at(-1), undefined);
+	assert.equal(statuses.at(-1), undefined, "a non-GPT model starts inactive");
 	await command.handler("on", ctx);
-	assert.equal(statuses.at(-1), "FAST");
-	assert.deepEqual(
+	assert.equal(statuses.at(-1), "FAST (inactive)", "enabling the policy cannot widen a non-GPT model");
+	assert.equal(
 		await handlers.get("before_provider_request")({ payload }, ctx),
-		{ ...payload, service_tier: "priority" },
-		"a normal parent session keeps HEAD's API-only scope instead of GPT gating",
+		undefined,
+		"a normal parent session no longer gets the old API-only injection for non-GPT models",
 	);
-	assert.equal(railFastFooterLabel(), "FAST");
+	assert.equal(railFastFooterLabel(), "FAST inactive");
 
+	// A non-GPT model stays inactive across every API Fast supports, including
+	// the completions API that never had a GPT gate before.
 	ctx.model = { api: "openai-completions", id: "deepseek-chat", name: "DeepSeek Chat" };
 	await handlers.get("model_select")({}, ctx);
-	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	assert.equal(statuses.at(-1), "FAST (inactive)");
 
 	ctx.model = { api: "anthropic-messages", id: "claude-opus", name: "Claude Opus" };
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload: { messages: [] } }, ctx), undefined);
 	assert.equal(statuses.at(-1), "FAST (inactive)");
-	assert.equal(railFastFooterLabel(), "FAST inactive");
+
+	// Switching to a GPT model on a supported API activates the same policy.
+	ctx.model = { api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
+	await handlers.get("model_select")({}, ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+	assert.equal(statuses.at(-1), "FAST");
+	assert.equal(railFastFooterLabel(), "FAST");
 
 	ctx.model = { api: "openai-codex-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "codex stays outside the rewritten APIs");
+	assert.equal(statuses.at(-1), "FAST (inactive)");
 
 	await command.handler("off", ctx);
 	assert.equal(statuses.at(-1), undefined);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	await handlers.get("session_shutdown")({}, ctx);
+});
+
+test("parent and child share the same GPT-only injection across on/off and GPT ↔ non-GPT switches", async () => {
+	const statuses: Array<string | undefined> = [];
+	let flagValue: boolean | undefined;
+	const { command, handlers } = setupFast(() => flagValue);
+	const payload = { model: "probe", input: [] };
+	const gptModel = { api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
+	const nonGptModel = { api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" };
+	const ctx = context(gptModel, statuses);
+
+	// A parent without the child flag is off until toggled, then GPT-gated.
+	flagValue = undefined;
+	await handlers.get("session_start")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "off never injects");
+	await command.handler("on", ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+
+	// GPT → non-GPT: inactive, no injection, footer agrees with status.
+	ctx.model = nonGptModel;
+	await handlers.get("model_select")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	assert.equal(statuses.at(-1), "FAST (inactive)");
+	assert.equal(railFastFooterLabel(), "FAST inactive");
+
+	// Non-GPT → GPT restores injection without re-arming the command.
+	ctx.model = gptModel;
+	await handlers.get("model_select")({}, ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+	assert.equal(railFastFooterLabel(), "FAST");
+
+	// A child launched with the standalone flag behaves identically to a
+	// toggled-on parent, so the two paths cannot diverge.
+	flagValue = true;
+	await handlers.get("session_shutdown")({}, ctx);
+	ctx.model = nonGptModel;
+	await handlers.get("session_start")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "a child non-GPT model must not inject");
+	assert.equal(statuses.at(-1), "FAST (inactive)");
+
+	ctx.model = gptModel;
+	await handlers.get("model_select")({}, ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+	assert.equal(statuses.at(-1), "FAST");
+
+	// Slash toggles inside the child cannot widen the GPT scope either.
+	await command.handler("off", ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	await command.handler("on", ctx);
+	ctx.model = nonGptModel;
+	await handlers.get("model_select")({}, ctx);
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
+	assert.equal(statuses.at(-1), "FAST (inactive)");
+
 	await handlers.get("session_shutdown")({}, ctx);
 });
 
@@ -152,7 +217,7 @@ test("child startup flag keeps fast GPT-only across a model switch and slash tog
 	await handlers.get("session_start")({}, ctx);
 	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
 
-	// A child may switch models in place, but it must never regain API-only scope.
+	// A child may switch models in place, but it must never regain a non-GPT injection.
 	ctx.model = { api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" };
 	await handlers.get("model_select")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined);
@@ -171,14 +236,22 @@ test("child startup flag keeps fast GPT-only across a model switch and slash tog
 	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
 	assert.equal(railFastFooterLabel(), "FAST");
 
-	// Without the startup flag the same module instance becomes a normal
-	// API-only session once its slash command is enabled.
+	// Without the startup flag the same module instance becomes a normal parent
+	// session that is GPT-gated exactly like the child once toggled on.
 	flagValue = undefined;
 	await handlers.get("session_shutdown")({}, ctx);
 	ctx.model = { api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" };
 	await handlers.get("session_start")({}, ctx);
 	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "a parent session is off until toggled on");
 	await command.handler("on", ctx);
+	assert.equal(
+		await handlers.get("before_provider_request")({ payload }, ctx),
+		undefined,
+		"a toggled-on parent must not inject for a non-GPT model",
+	);
+	assert.equal(statuses.at(-1), "FAST (inactive)");
+	ctx.model = { api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" };
+	await handlers.get("model_select")({}, ctx);
 	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
 
 	await handlers.get("session_shutdown")({}, ctx);

@@ -32,7 +32,7 @@ export type AutocompleteCompletionInput = {
 	requestRender(): void;
 };
 
-const PARAMETERIZED_RAIL_COMMANDS = new Set(["rail-oai-fast", "rail-oai-search", "rail-gpt-compaction"]);
+const PARAMETERIZED_RAIL_COMMANDS = new Set(["rail-oai-fast", "rail-oai-search", "rail-oai-compaction"]);
 
 function selectedCommandKeptInEditor(editor: EditorAutocompleteInternals): AutocompleteItem | undefined {
 	const selected = editor.autocompleteList?.getSelectedItem?.();

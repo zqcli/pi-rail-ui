@@ -262,7 +262,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		return true;
 	};
 
-	pi.registerCommand("rail-gpt-compaction", {
+	pi.registerCommand("rail-oai-compaction", {
 		description: "Set GPT Remote Compaction v2 on or off",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const items: AutocompleteItem[] = [

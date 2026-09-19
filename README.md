@@ -97,17 +97,17 @@ Pi Rail UI registers the following slash commands:
 
 Toggles the extension on or off for the current UI session.
 
-### `/rail-gpt-compaction`
+### `/rail-oai-compaction`
 
 Controls the global GPT Remote Compaction v2 switch:
 
 ```text
-/rail-gpt-compaction
-/rail-gpt-compaction on
-/rail-gpt-compaction off
+/rail-oai-compaction
+/rail-oai-compaction on
+/rail-oai-compaction off
 ```
 
-With no argument, the command shows the current state and, in TUI mode, a menu titled with that state. The `on`/`off` choices are also available through slash-command completion. The setting is stored under `getAgentDir()/rail-gpt-compaction/settings.json`, defaults to `off`, and is shared by TUI, RPC, JSON, and Rail child processes. Remote compaction is enabled only for GPT-named `openai-responses` and `openai-codex-responses` models; Azure OpenAI Responses is deliberately not in the v2 support scope until its endpoint, query, and authentication behavior are covered by a matching implementation. Unsupported models keep Pi's native compaction. When this global switch is `on`, a production stateless GPT dispatch loads the standalone compaction helper and uses a temporary session only for that invocation; the directory is removed on success, setup failure, or child-process failure. With the switch `off`, or for non-GPT models, stateless dispatch remains Pi's normal `--no-session` path. Persistent RPC workers always load the helper, whose hooks remain inactive while the switch is off.
+With no argument, the command shows the current state and, in TUI mode, a menu titled with that state. The `on`/`off` choices are also available through slash-command completion. The setting is stored under `getAgentDir()/rail-gpt-compaction/settings.json`, defaults to `off`, and is shared by TUI, RPC, JSON, and Rail child processes. The previous `/rail-gpt-compaction` name is not kept as an alias; only the persisted settings path keeps the old `rail-gpt-compaction` directory name. Remote compaction is enabled only for GPT-named `openai-responses` and `openai-codex-responses` models; Azure OpenAI Responses is deliberately not in the v2 support scope until its endpoint, query, and authentication behavior are covered by a matching implementation. Unsupported models keep Pi's native compaction. When this global switch is `on`, a production stateless GPT dispatch loads the standalone compaction helper and uses a temporary session only for that invocation; the directory is removed on success, setup failure, or child-process failure. With the switch `off`, or for non-GPT models, stateless dispatch remains Pi's normal `--no-session` path. Persistent RPC workers always load the helper, whose hooks remain inactive while the switch is off.
 
 ### `/rail-duplicate`
 
@@ -135,9 +135,11 @@ Toggles Pi 0.85.1's native OpenAI-compatible priority service tier for the curre
 /rail-oai-fast on|off|status
 ```
 
-The command sets a session-local policy that Rail applies to each outgoing provider payload through Pi's `before_provider_request` hook: an eligible payload is returned as a copy with `service_tier: "priority"` added. Rail never mutates `model.samplingParams`, so the model's original sampling parameters are preserved exactly and the policy survives model switches, provider re-registration, and retries. Session shutdown clears the policy without any model-restore step. On a normal parent session the policy is API-only: it is active for `openai-completions`, `openai-responses`, and `azure-openai-responses` regardless of model name, and `openai-codex-responses` stays inactive because Rail does not rewrite Codex requests.
+The command sets a session-local policy that Rail applies to each outgoing provider payload through Pi's `before_provider_request` hook: an eligible payload is returned as a copy with `service_tier: "priority"` added. Rail never mutates `model.samplingParams`, so the model's original sampling parameters are preserved exactly and the policy survives model switches, provider re-registration, and retries. Session shutdown clears the policy without any model-restore step. Eligibility is GPT-only for the parent session and for Rail children alike: the model must be a GPT model on `openai-completions`, `openai-responses`, or `azure-openai-responses`, and a non-GPT model stays inactive no matter which supported API it uses. `openai-codex-responses` stays inactive because Rail does not rewrite Codex requests. There is no parent-only API scope: switching to a non-GPT model or an unsupported API makes the active policy show `FAST inactive` and inject nothing, and switching back to a GPT model on a supported API resumes injection without re-running the command.
 
-Rail Subagents use the same native mechanism through `fastMode: true`. Subagent Fast is deliberately GPT-only, applies before the child model's first provider request, and is a dispatch/persistent-agent policy rather than an implicit inheritance of the parent's current command state. A child that starts with the standalone `--rail-oai-fast-enabled` flag keeps that GPT-only restriction even if its own `/rail-oai-fast` command is later toggled, so status, footer, and the request hook always agree through one eligibility check.
+Rail Subagents use the same native mechanism through `fastMode: true`. Subagent Fast applies before the child model's first provider request, and is a dispatch/persistent-agent policy rather than an implicit inheritance of the parent's current command state. The standalone `--rail-oai-fast-enabled` flag, the parent's `/rail-oai-fast` toggle, and an in-place child model switch all run through the same GPT eligibility check, so status, footer, and the request hook always agree.
+
+The `/rail-oai-fast` and `/rail-oai-search` commands and remote compaction all share one GPT rule: a model is GPT when its id or display name contains an independent, case-insensitive `gpt` token, such as `gpt-5.6-sol` or `GPT 5.6`; substrings such as `gptx` do not match, and the provider id is never considered. Each feature still applies its own supported-API scope on top of that shared decision.
 
 ### `/rail-oai-search`
 

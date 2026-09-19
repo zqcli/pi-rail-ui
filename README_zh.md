@@ -97,17 +97,17 @@ Pi Rail UI 注册了以下 slash 命令：
 
 用于在当前 UI 会话中启用或禁用该扩展。
 
-### `/rail-gpt-compaction`
+### `/rail-oai-compaction`
 
 控制全局 GPT Remote Compaction v2 开关：
 
 ```text
-/rail-gpt-compaction
-/rail-gpt-compaction on
-/rail-gpt-compaction off
+/rail-oai-compaction
+/rail-oai-compaction on
+/rail-oai-compaction off
 ```
 
-不带参数时显示当前状态；在 TUI 中会打开带当前状态标题的菜单。`on`/`off` 也会通过 slash command completion 提供补全。设置保存在 `getAgentDir()/rail-gpt-compaction/settings.json`，默认是 `off`，并由 TUI、RPC、JSON 以及 Rail 子进程共享。远程压缩目前只对名称包含 GPT 的 `openai-responses` 和 `openai-codex-responses` 生效；Azure OpenAI Responses 暂不属于 v2 支持范围，待 endpoint、query 和认证行为有对应实现与测试后再启用。不符合条件的模型继续使用 Pi 原生压缩。全局开关为 `on` 时，生产 stateless GPT dispatch 会加载独立压缩 helper，并只在本次调用期间使用临时 session；正常完成、初始化失败或子进程失败都会清理临时目录。开关为 `off` 或模型不是 GPT 时，stateless dispatch 仍保持 Pi 原本的 `--no-session` 路径。persistent RPC worker 始终加载 helper，但开关关闭时其压缩 hook 不会生效。
+不带参数时显示当前状态；在 TUI 中会打开带当前状态标题的菜单。`on`/`off` 也会通过 slash command completion 提供补全。设置保存在 `getAgentDir()/rail-gpt-compaction/settings.json`，默认是 `off`，并由 TUI、RPC、JSON 以及 Rail 子进程共享。旧的 `/rail-gpt-compaction` 名称不再保留为别名；只有持久化设置目录仍沿用旧的 `rail-gpt-compaction` 名称。远程压缩目前只对名称包含 GPT 的 `openai-responses` 和 `openai-codex-responses` 生效；Azure OpenAI Responses 暂不属于 v2 支持范围，待 endpoint、query 和认证行为有对应实现与测试后再启用。不符合条件的模型继续使用 Pi 原生压缩。全局开关为 `on` 时，生产 stateless GPT dispatch 会加载独立压缩 helper，并只在本次调用期间使用临时 session；正常完成、初始化失败或子进程失败都会清理临时目录。开关为 `off` 或模型不是 GPT 时，stateless dispatch 仍保持 Pi 原本的 `--no-session` 路径。persistent RPC worker 始终加载 helper，但开关关闭时其压缩 hook 不会生效。
 
 ### `/rail-duplicate`
 
@@ -135,9 +135,11 @@ Pi Rail UI 注册了以下 slash 命令：
 /rail-oai-fast on|off|status
 ```
 
-该命令设置 session-local policy，Rail 通过 Pi 的 `before_provider_request` hook 在每次发出的 provider payload 上生效：命中资格的 payload 会以副本返回并附加 `service_tier: "priority"`。Rail 不修改 `model.samplingParams`，因此模型原有 sampling 参数完全保留，policy 也能跨模型切换、provider 重新注册和 retry 保持生效。Session shutdown 会清除该 policy，无需恢复模型参数。普通父会话中该 policy 只按 API 判断：`openai-completions`、`openai-responses` 与 `azure-openai-responses` 一律生效，与模型名称无关；`openai-codex-responses` 保持 inactive，因为 Rail 不重写 Codex 请求。
+该命令设置 session-local policy，Rail 通过 Pi 的 `before_provider_request` hook 在每次发出的 provider payload 上生效：命中资格的 payload 会以副本返回并附加 `service_tier: "priority"`。Rail 不修改 `model.samplingParams`，因此模型原有 sampling 参数完全保留，policy 也能跨模型切换、provider 重新注册和 retry 保持生效。Session shutdown 会清除该 policy，无需恢复模型参数。父会话和 Rail child 的资格判定统一为 GPT-only：模型必须是 `openai-completions`、`openai-responses` 或 `azure-openai-responses` 上的 GPT 模型；非 GPT 模型无论使用哪个受支持 API 都保持 inactive。`openai-codex-responses` 保持 inactive，因为 Rail 不重写 Codex 请求。不存在只针对父会话的 API 范围：切到非 GPT 模型或不支持的 API 时，已启用的 policy 会显示 `FAST inactive` 且不注入任何内容；切回受支持 API 上的 GPT 模型即自动恢复注入，无需重新执行命令。
 
-Rail Subagent 通过 `fastMode: true` 使用同一套原生机制。Subagent Fast 刻意只对 GPT 生效，会在 child 模型第一次 provider request 之前应用；它属于 dispatch/persistent-agent policy，不会隐式继承 parent 当前命令状态。通过 standalone `--rail-oai-fast-enabled` flag 启动的 child 即使随后执行自己的 `/rail-oai-fast` 命令，也会保持该 GPT-only 限制，确保 status、footer 与 request hook 始终通过同一个资格判定保持一致。
+Rail Subagent 通过 `fastMode: true` 使用同一套原生机制。Subagent Fast 会在 child 模型第一次 provider request 之前应用；它属于 dispatch/persistent-agent policy，不会隐式继承 parent 当前命令状态。standalone `--rail-oai-fast-enabled` flag、parent 的 `/rail-oai-fast` 开关以及 child 原地切换模型都走同一个 GPT 资格判定，确保 status、footer 与 request hook 始终一致。
+
+`/rail-oai-fast`、`/rail-oai-search` 与远程压缩共享同一条 GPT 规则：当 model id 或显示名称中包含独立的、忽略大小写的 `gpt` token（如 `gpt-5.6-sol`、`GPT 5.6`）时视为 GPT 模型；`gptx` 这类 substring 不匹配，provider id 从不参与判断。各功能在这条共享判定之上仍各自应用自己的 supported API 范围。
 
 ### `/rail-oai-search`
 

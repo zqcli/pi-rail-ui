@@ -78,7 +78,7 @@ export function parseGptCompactionCommand(args: string): GptCompactionCommand {
 		const mode = parseGptCompactionMode(parts[0]);
 		if (mode) return { operation: "set", mode };
 	}
-	throw new Error("Usage: /rail-gpt-compaction [on|off]");
+	throw new Error("Usage: /rail-oai-compaction [on|off]");
 }
 
 /**

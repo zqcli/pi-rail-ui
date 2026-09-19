@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth } from "../../tools/gpt-compaction/auth";
-import { isGptModelName, modelSupportsRemoteCompaction } from "../../tools/gpt-compaction/model-eligibility";
+import { isGptModel } from "../../openai/model-eligibility";
+import { modelSupportsRemoteCompaction } from "../../tools/gpt-compaction/model-eligibility";
 
 const model = {
 	provider: "cus-resp",
@@ -12,7 +13,7 @@ const model = {
 } as any;
 
 test("GPT Responses eligibility is provider-independent but not model-independent", () => {
-	assert.equal(isGptModelName("gpt-5.6-sol"), true);
+	assert.equal(isGptModel({ id: "gpt-5.6-sol" }), true);
 	assert.equal(modelSupportsRemoteCompaction(model).supported, true);
 	assert.equal(modelSupportsRemoteCompaction({ ...model, id: "claude-3", name: "Claude 3" }).supported, false);
 	assert.equal(modelSupportsRemoteCompaction({ ...model, api: "openai-completions" }).supported, false);

@@ -171,7 +171,13 @@ test("explicit coordinator reports complete the READY/pause/resume/dependency ha
 		const replies = entries.filter((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "team");
 		assert.ok(replies.length > 0);
 		assert.ok(replies.every((entry) => !entry.message.isError), "no Invalid team arguments/retry detour may be hidden");
-		if (alias !== "A") {
+		if (alias === "A") {
+			const calls = entries.flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content.filter((part: any) => part.type === "toolCall") : []);
+			const redirectAt = calls.findIndex((call: any) => call.name === "team" && call.arguments.command === "redirect");
+			const resumeAt = calls.findIndex((call: any) => call.name === "team" && call.arguments.command === "resume");
+			assert.ok(redirectAt >= 0 && resumeAt > redirectAt);
+			assert.equal(calls.slice(redirectAt + 1, resumeAt).filter((call: any) => call.name === "team_handshake_tick").length, 2);
+		} else {
 			const reports = entries.flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content.filter((part: any) => part.type === "toolCall" && part.name === "team" && part.arguments.action === "report") : []);
 			assert.equal(reports.length, alias === "B1" ? 3 : 2);
 			assert.ok(reports.every((call: any) => call.arguments.to === "A"));

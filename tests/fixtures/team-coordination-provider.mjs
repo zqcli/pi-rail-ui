@@ -1,23 +1,31 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 
 // Deterministic offline model: exercise the real Pi loop and RPC processes,
 // not the quality of an external model's coordination decisions.
 export default function install(pi) {
 	let turns = 0;
 	let coordinatorStep = 0;
-	let memberStep = 0;
-	const observedEvents = new Map();
-	let latestSnapshot;
-	const call = (args) => [{ type: "toolCall", id: `team-${turns}`, name: "team", arguments: args }];
+	const call = (args, name = "team") => [{ type: "toolCall", id: `team-${turns}`, name, arguments: args }];
+	pi.registerTool({ name: "team_handshake_tick", label: "Unrelated probe", description: "An unrelated tool turn for the local memory regression", parameters: Type.Object({}),
+		async execute() { return { content: [{ type: "text", text: "Unrelated tool completed" }], details: {} }; },
+	});
 	const answer = (text) => [{ type: "text", text }];
 	if (process.env.TEAM_E2E_SCENARIO === "compaction") pi.on("session_before_compact", (event, ctx) => {
 		pi.appendEntry("team-e2e-compaction", { contextWindow: ctx.model?.contextWindow });
 		return { compaction: { summary: "TEAM_MEMBER_B1 completed the assigned work.", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
 	});
 	function handshake(member, text, messages) {
+		// Deliberately no provider-side memory: all decisions must be supported by
+		// this request's actual messages, including receipts from previous turns.
+		const observedEvents = new Map();
+		let latestSnapshot;
+		const successful = new Set(messages.filter((m) => m.role === "toolResult" && !m.isError).map((m) => m.toolCallId));
+		const completed = messages.flatMap((m) => m.role === "assistant" ? m.content.filter((part) => part.type === "toolCall" && successful.has(part.id)) : []);
+		const did = (predicate) => completed.some((c) => c.name === "team" && predicate(c.arguments));
 		for (const message of messages) {
 			if (message.role === "toolResult" && message.isError) throw new Error("Handshake tool call failed");
-			for (const part of Array.isArray(message.content) ? message.content : []) {
+			for (const part of typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content ?? []) {
 				if (part.type !== "text") continue;
 				let reply;
 				try { reply = JSON.parse(part.text.replace(/^Team checkpoint data: /u, "")); } catch { continue; }
@@ -31,17 +39,17 @@ export default function install(pi) {
 		const waitMessage = () => call({ action: "wait", to: null, message: null, command: null, wait: { kind: "message", member: null, afterSeq: 0 } });
 		const report = (message, wait = null) => call({ action: "report", to: "A", message, command: null, wait });
 		if (member !== "A") {
-			if (memberStep === 0) { memberStep++; return report(`${member}_READY`, { kind: "message", member: null, afterSeq: 0 }); }
+			if (!did((a) => a.action === "report" && a.message === `${member}_READY`)) return report(`${member}_READY`, { kind: "message", member: null, afterSeq: 0 });
 			if (member === "B2") {
 				if (!received("A", "B2_RELEASE")) throw new Error("B2 resumed without release");
-				if (memberStep++ === 1) return report("B2_FINISHING");
+				if (!did((a) => a.action === "report" && a.message === "B2_FINISHING")) return report("B2_FINISHING");
 				return answer("B2 result");
 			}
 			if (!received("A", "B1_RESUMED_DIRECTION")) throw new Error("B1 resumed without direction");
-			if (memberStep === 1) { memberStep++; return report("B1_RESUMED"); }
-			if (memberStep === 2) { memberStep++; return call({ action: "wait", to: null, message: null, command: null, wait: { kind: "member", member: "B2", afterSeq: null } }); }
+			if (!did((a) => a.action === "report" && a.message === "B1_RESUMED")) return report("B1_RESUMED");
+			if (!did((a) => a.action === "wait" && a.wait?.kind === "member" && a.wait.member === "B2")) return call({ action: "wait", to: null, message: null, command: null, wait: { kind: "member", member: "B2", afterSeq: null } });
 			if (!latestSnapshot?.members.some((m) => m.id === "B2" && m.state === "completed" && m.output === "B2 result")) throw new Error("B1 did not receive B2 native result");
-			if (memberStep++ === 3) return report("B1_OBSERVED_B2_TERMINAL");
+			if (!did((a) => a.action === "report" && a.message === "B1_OBSERVED_B2_TERMINAL")) return report("B1_OBSERVED_B2_TERMINAL");
 			return answer("B1 result: observed B2 completed");
 		}
 		if (latestSnapshot?.members.some((m) => m.state === "failed" || m.state === "cancelled")) throw new Error("Handshake member failed");
@@ -49,20 +57,15 @@ export default function install(pi) {
 			if (!text.includes("B1 result: observed B2 completed") || !text.includes("B2 result")) throw new Error("Missing final results");
 			return answer("HANDSHAKE_FINAL: ready, paused, redirected, resumed, B2 released, both workers settled");
 		}
-		if (coordinatorStep === 0) {
-			if (!received("B1", "B1_READY") || !received("B2", "B2_READY")) return waitMessage();
-			coordinatorStep++; return call({ action: "control", to: "B1", command: "pause" });
-		}
-		if (coordinatorStep === 1) {
-			if (!seen((event) => event.member === "B1" && event.state === "paused")) return waitMessage();
-			coordinatorStep++; return call({ action: "control", to: "B1", command: "redirect", message: "B1_RESUMED_DIRECTION" });
-		}
-		if (coordinatorStep === 2) { coordinatorStep++; return call({ action: "control", to: "B1", command: "resume" }); }
-		if (coordinatorStep === 3) {
-			if (!received("B1", "B1_RESUMED") || !seen((event) => event.member === "B1" && event.state === "waiting" && event.message === "waiting for member B2")) return waitMessage();
-			coordinatorStep++; return call({ action: "send", to: "B2", message: "B2_RELEASE" });
-		}
-		if (coordinatorStep === 4) { coordinatorStep++; return call({ action: "finish", to: null, message: null, command: null, wait: null }); }
+		if (!received("B1", "B1_READY") || !received("B2", "B2_READY")) return waitMessage();
+		if (!did((a) => a.command === "pause")) return call({ action: "control", to: "B1", command: "pause" });
+		if (!seen((event) => event.member === "B1" && event.state === "paused")) return waitMessage();
+		if (!did((a) => a.command === "redirect")) return call({ action: "control", to: "B1", command: "redirect", message: "B1_RESUMED_DIRECTION" });
+		if (completed.filter((c) => c.name === "team_handshake_tick").length < 2) return call({}, "team_handshake_tick");
+		if (!did((a) => a.command === "resume")) return call({ action: "control", to: "B1", command: "resume" });
+		if (!received("B1", "B1_RESUMED") || !seen((event) => event.member === "B1" && event.state === "waiting" && event.message === "waiting for member B2")) return waitMessage();
+		if (!did((a) => a.action === "send" && a.message === "B2_RELEASE")) return call({ action: "send", to: "B2", message: "B2_RELEASE" });
+		if (!did((a) => a.action === "finish")) return call({ action: "finish", to: null, message: null, command: null, wait: null });
 		return answer("HANDSHAKE_COORDINATOR_READY");
 	}
 	function choose(member, text, messages) {

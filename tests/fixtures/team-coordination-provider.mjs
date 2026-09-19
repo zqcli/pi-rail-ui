@@ -5,13 +5,68 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 export default function install(pi) {
 	let turns = 0;
 	let coordinatorStep = 0;
+	let memberStep = 0;
+	const observedEvents = new Map();
+	let latestSnapshot;
 	const call = (args) => [{ type: "toolCall", id: `team-${turns}`, name: "team", arguments: args }];
 	const answer = (text) => [{ type: "text", text }];
 	if (process.env.TEAM_E2E_SCENARIO === "compaction") pi.on("session_before_compact", (event, ctx) => {
 		pi.appendEntry("team-e2e-compaction", { contextWindow: ctx.model?.contextWindow });
 		return { compaction: { summary: "TEAM_MEMBER_B1 completed the assigned work.", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
 	});
-	function choose(member, text) {
+	function handshake(member, text, messages) {
+		for (const message of messages) {
+			if (message.role === "toolResult" && message.isError) throw new Error("Handshake tool call failed");
+			for (const part of Array.isArray(message.content) ? message.content : []) {
+				if (part.type !== "text") continue;
+				let reply;
+				try { reply = JSON.parse(part.text.replace(/^Team checkpoint data: /u, "")); } catch { continue; }
+				if (reply?.ok !== true) continue;
+				for (const event of [...(reply.events ?? []), ...(reply.snapshot?.events ?? [])]) observedEvents.set(event.seq, event);
+				if (reply.snapshot && (!latestSnapshot || reply.snapshot.seq >= latestSnapshot.seq)) latestSnapshot = reply.snapshot;
+			}
+		}
+		const seen = (predicate) => [...observedEvents.values()].some(predicate);
+		const received = (from, marker) => seen((event) => event.from === from && event.message?.startsWith(marker));
+		const waitMessage = () => call({ action: "wait", to: null, message: null, command: null, wait: { kind: "message", member: null, afterSeq: 0 } });
+		const report = (message, wait = null) => call({ action: "report", to: "A", message, command: null, wait });
+		if (member !== "A") {
+			if (memberStep === 0) { memberStep++; return report(`${member}_READY`, { kind: "message", member: null, afterSeq: 0 }); }
+			if (member === "B2") {
+				if (!received("A", "B2_RELEASE")) throw new Error("B2 resumed without release");
+				if (memberStep++ === 1) return report("B2_FINISHING");
+				return answer("B2 result");
+			}
+			if (!received("A", "B1_RESUMED_DIRECTION")) throw new Error("B1 resumed without direction");
+			if (memberStep === 1) { memberStep++; return report("B1_RESUMED"); }
+			if (memberStep === 2) { memberStep++; return call({ action: "wait", to: null, message: null, command: null, wait: { kind: "member", member: "B2", afterSeq: null } }); }
+			if (!latestSnapshot?.members.some((m) => m.id === "B2" && m.state === "completed" && m.output === "B2 result")) throw new Error("B1 did not receive B2 native result");
+			if (memberStep++ === 3) return report("B1_OBSERVED_B2_TERMINAL");
+			return answer("B1 result: observed B2 completed");
+		}
+		if (latestSnapshot?.members.some((m) => m.state === "failed" || m.state === "cancelled")) throw new Error("Handshake member failed");
+		if (text.includes("All workers have settled.")) {
+			if (!text.includes("B1 result: observed B2 completed") || !text.includes("B2 result")) throw new Error("Missing final results");
+			return answer("HANDSHAKE_FINAL: ready, paused, redirected, resumed, B2 released, both workers settled");
+		}
+		if (coordinatorStep === 0) {
+			if (!received("B1", "B1_READY") || !received("B2", "B2_READY")) return waitMessage();
+			coordinatorStep++; return call({ action: "control", to: "B1", command: "pause" });
+		}
+		if (coordinatorStep === 1) {
+			if (!seen((event) => event.member === "B1" && event.state === "paused")) return waitMessage();
+			coordinatorStep++; return call({ action: "control", to: "B1", command: "redirect", message: "B1_RESUMED_DIRECTION" });
+		}
+		if (coordinatorStep === 2) { coordinatorStep++; return call({ action: "control", to: "B1", command: "resume" }); }
+		if (coordinatorStep === 3) {
+			if (!received("B1", "B1_RESUMED") || !seen((event) => event.member === "B1" && event.state === "waiting" && event.message === "waiting for member B2")) return waitMessage();
+			coordinatorStep++; return call({ action: "send", to: "B2", message: "B2_RELEASE" });
+		}
+		if (coordinatorStep === 4) { coordinatorStep++; return call({ action: "finish", to: null, message: null, command: null, wait: null }); }
+		return answer("HANDSHAKE_COORDINATOR_READY");
+	}
+	function choose(member, text, messages) {
+		if (process.env.TEAM_E2E_SCENARIO === "report-handshake") return handshake(member, text, messages);
 		if (["retry", "compaction"].includes(process.env.TEAM_E2E_SCENARIO)) {
 			if (member !== "A") return answer(`${member} result`);
 			if (!text.includes("All workers have settled.")) return answer("EARLY_COORDINATOR_OUTPUT");
@@ -61,10 +116,10 @@ export default function install(pi) {
 		streamSimple(model, context, options) {
 			const text = JSON.stringify(context.messages);
 			const member = text.match(/TEAM_MEMBER_(A|B[1-8])/u)?.[1];
-			if (!member || ++turns > 12) throw new Error("Unexpected team model turn/polling");
+			if (!member || ++turns > (process.env.TEAM_E2E_SCENARIO === "report-handshake" ? 20 : 12)) throw new Error("Unexpected team model turn/polling");
 			const retry = process.env.TEAM_E2E_SCENARIO === "retry" && member === "B1" && turns === 1;
 			const input = process.env.TEAM_E2E_SCENARIO === "compaction" && member === "B1" && turns === 1 ? 60000 : 1;
-			const content = retry ? [] : text.includes("VERIFY_NATIVE_WINDOW") ? answer(`window=${model.contextWindow}`) : choose(member, text);
+			const content = retry ? [] : text.includes("VERIFY_NATIVE_WINDOW") ? answer(`window=${model.contextWindow}`) : choose(member, text, context.messages);
 			const message = { role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
 				usage: { input, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: input + 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 				...(retry ? { errorMessage: "429 rate limit exceeded" } : {}),

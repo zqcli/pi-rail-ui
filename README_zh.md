@@ -102,12 +102,12 @@ Child 使用 `team` tool；发送者和所属 team 由运行时确定，不作�
 | Action | 参数示例 / 含义 |
 | --- | --- |
 | `send` | `{"action":"send","to":"B2","message":"请检查错误路径。"}`：向队友发消息。 |
-| `report` | `{"action":"report","message":"遇到阻碍，需要明确范围。","wait":{"kind":"message"}}`：向 A 报告并原子地等待回复；省略 `wait` 则只报告。 |
+| `report` | `{"action":"report","to":null,"message":"遇到阻碍，需要明确范围。","wait":{"kind":"message"}}`：向 A 报告并原子地等待回复；省略 `wait` 则只报告。`to` 默认省略/null，也可显式填写当前协调者的实际 alias，但不能指向其他成员。 |
 | `wait` | `{"action":"wait","wait":{"kind":"member","member":"B2"}}`：等指定成员的终态结果。`{"kind":"message"}` 等 inbox 消息；仅 A 可用 `{"kind":"workers"}` 等全部 worker 结果。 |
 | `control` | 仅 A：`{"action":"control","to":"B1","command":"pause"}`；`resume` 解除暂停。`redirect` 还必须提供 `message`，用新指令替换 pending wait，但不会解除显式暂停或撤销已有操作。 |
 | `finish` | `{"action":"finish"}`：表达完成意图，不等于终态结果。A 会等全部 worker；worker 仍需输出最终答复。 |
 
-**`wait`、带 `wait` 的 `report`、`finish` 都必须是该 assistant 批次唯一的 tool call**，不能与其他工具并发发出。使用事件等待，不要轮询；自等待、未知成员和依赖环会被拒绝。
+**`wait`、带 `wait` 的 `report`、`finish` 都必须是该 assistant 批次唯一的 tool call**，不能与其他工具并发发出。使用事件等待，不要轮询；自等待、未知成员和依赖环会被拒绝。`report` 返回参数错误表示报告尚未发出，应根据错误修正并重试，不能跳过必需报告直接 `wait`，否则协调者可能还在等待你的报告。
 
 - 调度默认允许 **4 个 active worker permit，A 独立准入**。等待或暂停的 worker 释放 permit，但保留 session；cooperative wait/pause 都不会结束外层父 Tool Call。运行中的成员先显示 `PAUSE REQUESTED`，到安全点后才是 `PAUSED`；已在途的模型请求、工具或 compaction 可能继续完成，不是立即冻结进程，也不回滚操作。`redirect` 的方向在下一个原生 context gate 进入模型；恢复时不会重写已经生成的请求 payload 或工具参数。
 - A 必须等每个 worker 都有 native 终态结果（含失败）后才生成最终总结，不能把 `report` 或 `finish` 自述当作完成。A 提前结束时，父调用仍保持 pending，随后以全部 worker 结果快照执行最终总结续轮。单个 worker 失败通常不阻止其余 worker 完成；A 失败或取消会停止 team，不能保证成功总结。

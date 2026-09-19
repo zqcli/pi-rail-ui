@@ -140,6 +140,46 @@ test("real coordinator pauses a worker, receives safe-point confirmation, redire
 	assert.ok(paused && redirect && paused.seq < redirect.seq);
 });
 
+test("explicit coordinator reports complete the READY/pause/resume/dependency handshake without a message-wait cycle", { timeout: 90_000 }, async (t) => {
+	const { hub, teamId, history, dispatch, journal } = await setup(t, 2, "report-handshake");
+	const timeout = setTimeout(() => hub.cancel(teamId, "Handshake regression timed out"), 15_000);
+	t.after(() => clearTimeout(timeout));
+	const [a, b] = await Promise.all(dispatch());
+	assert.equal(hub.get(teamId).phase, "completed");
+	assert.match(a.details.results[0].output, /HANDSHAKE_FINAL/u);
+	assert.ok(b.details.results.every((run: any) => run.status === "completed"));
+	const events = [...new Map(history.flatMap((snapshot) => snapshot.events.map((event) => [event.seq, event] as const))).values()];
+	const seq = (predicate: (event: typeof events[number]) => boolean) => {
+		const event = events.find(predicate);
+		assert.ok(event, "required handshake event must actually occur");
+		return event.seq;
+	};
+	const b1Ready = seq((e) => e.kind === "report" && e.from === "B1" && e.message === "B1_READY");
+	const b2Ready = seq((e) => e.kind === "report" && e.from === "B2" && e.message === "B2_READY");
+	const paused = seq((e) => e.member === "B1" && e.state === "paused");
+	const redirect = seq((e) => e.kind === "control" && e.to === "B1" && e.message === "redirect");
+	const resume = seq((e) => e.kind === "control" && e.to === "B1" && e.message === "resume");
+	const resumed = seq((e) => e.kind === "report" && e.from === "B1" && e.message === "B1_RESUMED");
+	const dependency = seq((e) => e.member === "B1" && e.state === "waiting" && e.message === "waiting for member B2");
+	const release = seq((e) => e.kind === "message" && e.from === "A" && e.to === "B2" && e.message === "B2_RELEASE");
+	const b2Done = seq((e) => e.member === "B2" && e.state === "completed");
+	const observed = seq((e) => e.kind === "report" && e.from === "B1" && e.message === "B1_OBSERVED_B2_TERMINAL");
+	const ordered = [Math.max(b1Ready, b2Ready), paused, redirect, resume, resumed, dependency, release, b2Done, observed];
+	assert.ok(ordered.every((value, index) => index === 0 || value > ordered[index - 1]!), JSON.stringify(ordered));
+	for (const alias of ["A", "B1", "B2"]) {
+		const entries = await journal(alias);
+		const replies = entries.filter((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "team");
+		assert.ok(replies.length > 0);
+		assert.ok(replies.every((entry) => !entry.message.isError), "no Invalid team arguments/retry detour may be hidden");
+		if (alias !== "A") {
+			const reports = entries.flatMap((entry) => entry.message?.role === "assistant" ? entry.message.content.filter((part: any) => part.type === "toolCall" && part.name === "team" && part.arguments.action === "report") : []);
+			assert.equal(reports.length, alias === "B1" ? 3 : 2);
+			assert.ok(reports.every((call: any) => call.arguments.to === "A"));
+		}
+	}
+	assert.ok(history.filter((snapshot) => snapshot.phase === "finalizing").every((snapshot) => snapshot.members.filter((member) => member.role === "worker").every((member) => member.state === "completed")));
+});
+
 test("native parent rejects a lone team call without starting members, then corrects full-property RPC siblings", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, tools, ctx, store } = await setup(t, 2, "control");
 	// Match the real smoke session's provider-filled optional fields, including

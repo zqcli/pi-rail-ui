@@ -3,8 +3,9 @@ import { getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionContext,
 import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { normalizeContextWindow, validateContextWindowReserve } from "./context-window";
-import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
+import { supportsNativeFastMode, supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { supportsNativeGptSearch } from "../../commands/rail-oai-search";
+import { isGptModel } from "../../openai/model-eligibility";
 import {
 	railModelKey,
 	railModelReference,
@@ -64,7 +65,7 @@ function fastModeSchema() {
 		Type.Null(),
 	], {
 		default: null,
-		description: "Use native OpenAI priority fast mode for a stateless call or a new persistent agent; null or omission means off. Existing targets are managed in /rail-agent.",
+		description: "Use native OpenAI priority fast mode for a stateless call or a new persistent agent. Ignored on a non-GPT model, where the dispatch still runs with Fast off; a GPT model on an API without native support still fails the eligibility check. null or omission means off. Existing targets are managed in /rail-agent.",
 	}));
 }
 
@@ -369,15 +370,18 @@ function modelForFastMode(
 	return nativeModelForRailRef(resolveRailModel(item.model, ctx), ctx);
 }
 
-function validateFastMode(
+// Validate and normalize in both preflight and dispatch, so an ignored value
+// cannot become a saved Fast policy when a non-GPT agent later changes models.
+function effectiveFastModeRequest(
 	item: TaskParams,
-	ctx: RenderModelContext,
-): void {
-	if (item.fastMode !== true) return;
-	const model = modelForFastMode(item, ctx);
-	if (!supportsNativeGptFastMode(model)) {
+	model: NativeFastModel | undefined,
+): boolean | undefined {
+	if (item.fastMode === false) return false;
+	if (item.fastMode !== true || !isGptModel(model)) return undefined;
+	if (!supportsNativeFastMode(model)) {
 		throw new Error("fastMode requires a GPT model using a supported native OpenAI API");
 	}
+	return true;
 }
 
 type FastModeDisplay = "on" | "off";
@@ -653,7 +657,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":null},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\",\"contextWindow\":null}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
-			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent when the selected model is a GPT model on a supported native OpenAI API. fastMode:false explicitly keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent, and grouped or control calls cannot set fastMode.\n"
+			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. This ignore rule applies only to legal parameter positions; target, grouped, and control calls still cannot set fastMode. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Non-GPT dispatch headers and grouped child panels always show FAST off · SEARCH off.\n"
 			+ "Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
@@ -665,7 +669,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"For stateless subagent work, call subagent with task, optional model, and contextWindow:null by default. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists. Stateless runs create no child JSONL and never appear in /resume.",
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
 			"Use contextWindow:null by default. Null or omission uses the selected child model's native default. Only use a positive integer when the user explicitly requests a specific child context or compaction budget; for parallel and chain calls, put an explicit numeric value on the individual item that owns it.",
-			"Use fastMode:true only for a stateless call or a new persistent agent on a GPT model with a supported native OpenAI API. Keep fastMode null or omitted by default. Existing persistent target policy is managed through /rail-agent; do not put fastMode on target, grouped, or control calls.",
+			"Use fastMode:true only for a stateless call or a new persistent agent. On a non-GPT model it is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Keep fastMode null or omitted by default. Existing persistent target policy is managed through /rail-agent; do not put fastMode on target, grouped, or control calls. Hosted Search is an internal policy with no search parameter; non-GPT dispatch headers and grouped child panels always show FAST off · SEARCH off.",
 			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
 			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
 			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call; contextWindow must be null or omitted, never numeric. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
@@ -792,7 +796,9 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 			}
-			for (const item of requestedItems) validateFastMode(item, ctx);
+			for (const item of requestedItems) {
+				if (item.fastMode === true) effectiveFastModeRequest(item, modelForFastMode(item, ctx));
+			}
 			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
 			const broker = contextTargetItems.length > 0
 				? (typeof options.broker === "function" ? options.broker() : options.broker)
@@ -821,7 +827,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				if (!persistent) {
 					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
 					const model = resolveRailModel(item.model, ctx);
-					setDispatchMetadata(item, slot, { model, fastMode: item.fastMode === true });
+					const fastMode = effectiveFastModeRequest(item, nativeModelForRailRef(model, ctx));
+					setDispatchMetadata(item, slot, { model, fastMode });
 					const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
 					publishLive(slot, {
 						alias,
@@ -839,7 +846,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						task: item.task,
 						cwd: item.cwd ?? ctx.cwd,
 						...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
-						...(item.fastMode !== undefined && item.fastMode !== null ? { fastMode: item.fastMode } : {}),
+						...(fastMode !== undefined ? { fastMode } : {}),
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => publishLive(slot, {
 							alias,
@@ -860,6 +867,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					return result;
 				}
 				const model = item.target ? undefined : resolveRailModel(item.model, ctx);
+				const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
 				const request: DispatchRequest = {
 					...(model ? { model } : {}),
 					...(item.target ? { target: item.target } : {}),
@@ -868,7 +876,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					...(item.cwd ? { cwd: item.cwd } : {}),
 					...(item.session ? { session: item.session } : {}),
 					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
-					...(item.fastMode !== undefined && item.fastMode !== null ? { fastMode: item.fastMode } : {}),
+					...(fastMode !== undefined ? { fastMode } : {}),
 					...(signal ? { signal } : {}),
 					onUpdate: ({ instance, run: partial }) => {
 						setDispatchMetadata(item, slot, { model: instance.model, fastMode: instance.fastMode === true });

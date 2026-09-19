@@ -186,6 +186,8 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(tool.description, /\{"target":"worker","control":\{"delivery":"steer","message":"redirect now"\}\}/);
 	assert.match(tool.description, /Set contextWindow to null by default/);
 	assert.match(tool.description, /fastMode/);
+	assert.match(tool.description, /ignore rule applies only to legal parameter positions; target, grouped, and control calls still cannot set fastMode/);
+	assert.match(tool.description, /no search parameter/);
 	assert.match(tool.description, /existing target.*descriptor|descriptor.*existing target/iu);
 	assert.match(tool.description, /through \/rail-agent/);
 	assert.match(tool.description, /Null or omission uses the selected child model's native default/);
@@ -212,6 +214,7 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	for (const schema of fastModeSchemas) {
 		assert.equal(schema.default, null);
 		assert.deepEqual(schema.anyOf.map((variant: any) => variant.type), ["boolean", "null"]);
+		assert.match(schema.description, /Ignored on a non-GPT model/);
 	}
 	const guidance = tool.promptGuidelines.join("\n");
 	assert.match(guidance, /lifecycle by continuity/);
@@ -225,6 +228,7 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /make the task self-contained/);
 	assert.match(guidance, /Use contextWindow:null by default/);
 	assert.match(guidance, /fastMode/);
+	assert.match(guidance, /On a non-GPT model it is silently ignored/);
 	assert.match(guidance, /existing.*rail-agent|rail-agent.*existing/iu);
 	assert.match(guidance, /Only use a positive integer when the user explicitly requests/);
 	assert.match(guidance, /Null or omission uses the selected child model's native default/);
@@ -313,7 +317,7 @@ test("control mode steers and queues follow-ups for an active persistent target"
 	assert.equal(broker.controls.length, 2);
 });
 
-test("fastMode null is the default, while explicit target/grouped/control values are rejected", async () => {
+test("fastMode null is the default, target/grouped/control stay rejected, and a non-GPT value is ignored", async () => {
 	const { tool, broker } = setupTool({
 		runStateless: async () => ({
 			exitCode: 0,
@@ -337,19 +341,138 @@ test("fastMode null is the default, while explicit target/grouped/control values
 		() => tool.execute("call-control-fast", { target: "auth-review", fastMode: true, control: { delivery: "steer", message: "Focus" } }, undefined, undefined, context()),
 		/fastMode.*control|control.*fastMode/iu,
 	);
-	const unsupported = {
+
+	// A GPT model on an API Rail cannot rewrite still fails loudly, because the
+	// caller asked for a real capability that only the API blocks.
+	const unsupportedApi = {
 		...context(),
-		model: { ...model, id: "deepseek-v4", name: "DeepSeek V4" },
+		model: unknownApiModel,
 		modelRegistry: {
-			getAvailable: () => [{ ...model, id: "deepseek-v4", name: "DeepSeek V4" }],
-			find: (provider: string, id: string) => provider === "cus-resp" && id === "deepseek-v4" ? { ...model, id, name: "DeepSeek V4" } : undefined,
+			getAvailable: () => [unknownApiModel],
+			find: (provider: string, id: string) => provider === unknownApiModel.provider && id === unknownApiModel.id ? unknownApiModel : undefined,
 		},
-		scopedModels: [{ model: { ...model, id: "deepseek-v4", name: "DeepSeek V4" }, thinkingLevel: "xhigh" }],
+		scopedModels: [{ model: unknownApiModel, thinkingLevel: "xhigh" }],
 	};
 	await assert.rejects(
-		() => tool.execute("call-unsupported-fast", { model: "cus-resp/deepseek-v4", task: "native only", fastMode: true }, undefined, undefined, unsupported as any),
+		() => tool.execute("call-unsupported-fast", { model: "cus-mystery/gpt-5.6-mystery", task: "native only", fastMode: true }, undefined, undefined, unsupportedApi as any),
 		/GPT.*supported|supported.*GPT/iu,
 	);
+
+	// A non-GPT model has no native tier, so the same legal fastMode:true is
+	// ignored instead of failing, and the dispatch still runs with Fast off.
+	const nonGpt = {
+		...context(),
+		model: nonGptModel,
+		modelRegistry: {
+			getAvailable: () => [nonGptModel],
+			find: (provider: string, id: string) => provider === nonGptModel.provider && id === nonGptModel.id ? nonGptModel : undefined,
+		},
+		scopedModels: [{ model: nonGptModel, thinkingLevel: "xhigh" }],
+	};
+	const requested: Array<{ fastMode?: boolean }> = [];
+	const ignored = setupTool({
+		runStateless: async (request) => {
+			requested.push(request);
+			return {
+				exitCode: 0,
+				output: "done",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+			};
+		},
+	});
+	const result = await ignored.tool.execute("call-non-gpt-fast", { model: "deepseek/deepseek-v4", task: "non-gpt fast", fastMode: true }, undefined, undefined, nonGpt as any);
+	assert.equal(requested.length, 1);
+	assert.equal(requested[0]?.fastMode, undefined, "a non-GPT fastMode:true must not reach the stateless runner");
+	assert.equal(result.details.results[0]?.status, "completed");
+	assert.doesNotMatch(JSON.stringify(result.details), /fastMode/);
+});
+
+test("a non-GPT fastMode:true is silently normalized off for stateless, new, and adopted dispatches", async () => {
+	const nonGptContext = () => ({
+		...context(),
+		model: nonGptModel,
+		modelRegistry: {
+			getAvailable: () => [nonGptModel],
+			find: (provider: string, id: string) => provider === nonGptModel.provider && id === nonGptModel.id ? nonGptModel : undefined,
+		},
+		scopedModels: [{ model: nonGptModel, thinkingLevel: "xhigh" }],
+	});
+	const statelessRequests: Array<{ fastMode?: boolean }> = [];
+	const { tool, broker } = setupTool({
+		renderContext: nonGptContext,
+		runStateless: async (request) => {
+			statelessRequests.push(request);
+			return {
+				exitCode: 0,
+				output: "done",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+			};
+		},
+	});
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const assertOffHeader = (args: unknown, toolCallId?: string) => {
+		assert.match(tool.renderCall(args, theme, toolCallId ? liveContext(toolCallId) : undefined).render(240).join("\n"),
+			/FAST off · SEARCH off/u);
+	};
+	assertOffHeader({ model: "deepseek/deepseek-v4", task: "explicit", fastMode: true });
+	assertOffHeader({ task: "current", fastMode: true });
+	// Explicit non-GPT model and the current non-GPT model both run with Fast off.
+	const explicit = await tool.execute("non-gpt-explicit", { model: "deepseek/deepseek-v4", task: "explicit", fastMode: true }, undefined, undefined, nonGptContext() as any);
+	const current = await tool.execute("non-gpt-current", { task: "current", fastMode: true }, undefined, undefined, nonGptContext() as any);
+	assert.equal(statelessRequests.length, 2);
+	assert.equal(statelessRequests[0]?.fastMode, undefined, "explicit non-GPT fastMode must not reach the runner");
+	assert.equal(statelessRequests[1]?.fastMode, undefined, "default non-GPT fastMode must not reach the runner");
+	assert.doesNotMatch(JSON.stringify([explicit.details, current.details]), /fastMode/);
+	assertOffHeader({ model: "deepseek/deepseek-v4", task: "explicit", fastMode: true }, "non-gpt-explicit");
+	assertOffHeader({ task: "current", fastMode: true }, "non-gpt-current");
+
+	// A new persistent agent and an adopted session must leave the broker request
+	// off, and must not mutate the caller-owned args object.
+	const newArgs = { model: "deepseek/deepseek-v4", alias: "non-gpt-review", task: "initial", fastMode: true };
+	await tool.execute("non-gpt-new", newArgs, undefined, undefined, nonGptContext() as any);
+	assert.equal(broker.requests[0]?.fastMode, undefined, "a non-GPT new agent must not persist fastMode");
+	assert.equal(newArgs.fastMode, true, "the caller args object must not be rewritten");
+	assertOffHeader(newArgs, "non-gpt-new");
+
+	const adoptArgs = { model: "deepseek/deepseek-v4", alias: "adopted-non-gpt", task: "resume", session: { mode: "fork" as const, path: "/tmp/existing.jsonl" }, fastMode: true };
+	await tool.execute("non-gpt-adopt", adoptArgs, undefined, undefined, nonGptContext() as any);
+	assert.equal(broker.requests[1]?.fastMode, undefined, "a non-GPT adopted agent must not persist fastMode");
+	assert.equal(adoptArgs.fastMode, true, "the caller args object must not be rewritten");
+	assertOffHeader(adoptArgs, "non-gpt-adopt");
+
+	// The GPT path still forwards the exact policy for the same syntax.
+	const gptRequests: Array<{ fastMode?: boolean }> = [];
+	const gpt = setupTool({
+		runStateless: async (request) => {
+			gptRequests.push(request);
+			return { exitCode: 0, output: "done", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } };
+		},
+	});
+	await gpt.tool.execute("gpt-fast", { task: "fast", fastMode: true }, undefined, undefined, context());
+	assert.equal(gptRequests[0]?.fastMode, true);
+});
+
+test("an existing non-GPT target keeps its saved policy but displays and dispatches Fast off", async () => {
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const { tool, broker } = setupTool({
+		runStateless: async () => ({
+			output: "done",
+			exitCode: 0,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		}),
+	});
+	broker.targetModel = { provider: "deepseek", modelId: "deepseek-v4", name: "DeepSeek V4", thinkingLevel: "xhigh" };
+	broker.targetFastMode = true;
+	const args = { target: "auth-review", task: "continue" };
+
+	// The saved descriptor policy is not cleared, but the effective state is off.
+	const header = tool.renderCall(args, theme).render(200).join("\n");
+	assert.match(header, /ContextWindow Default · FAST off · SEARCH off/u);
+	const result = await tool.execute("non-gpt-target", args, undefined, undefined, context());
+	assert.equal(result.details.results[0]?.status, "completed");
+	assert.equal(tool.renderCall(args, theme).render(200).join("\n"), header, "rendering must not mutate the saved policy");
+	assert.equal(broker.knownFastMode("auth-review"), true, "the descriptor policy must be retained");
 });
 
 test("fastMode is forwarded to stateless and initial persistent dispatches without entering result details", async () => {

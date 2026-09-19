@@ -322,7 +322,7 @@ test("grouped team errors wait for every started member to finish cleanup", asyn
 			throw new Error("native failure");
 		};
 		let settled = false;
-		const pending = tool.execute("cleanup", { teamId: snapshot.id, tasks: snapshot.workers.map((alias) => ({ alias, task: "work" })) }, undefined, () => { throw new Error("progress failed"); }, context()).finally(() => { settled = true; });
+		const pending = tool.execute("cleanup", { teamId: snapshot.id, tasks: snapshot.workers.map((alias) => ({ alias, task: "work" })) }, undefined, (update: any) => { if (update.details.results.some((run: any) => run.status === "failed")) throw new Error("progress failed"); }, context()).finally(() => { settled = true; });
 		const rejected = assert.rejects(pending, /progress failed/);
 		await started;
 		await new Promise((resolve) => setImmediate(resolve));

@@ -931,6 +931,15 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						});
 					},
 				};
+				if (request.team && model) {
+					// A member may pause at its very first native gate, before any
+					// transcript update exists. Keep its slot visible during startup.
+					publishLive(slot, {
+						alias: item.alias!, model: railModelReference(model), task: item.task,
+						status: "running", output: "(starting...)", usage: emptySubagentUsage(),
+						durationMs: duration(), persistent: true,
+					});
+				}
 				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
 				const dispatched = await broker.dispatch(request);
 				setDispatchMetadata(item, slot, { model: dispatched.instance.model, fastMode: dispatched.instance.fastMode === true });

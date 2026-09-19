@@ -412,7 +412,10 @@ export class TeamHub {
 					}
 				} else throw new Error("Missing control command");
 				this.event(team, { kind: "control", from: member.view.id, to: target.view.id, message: request.command });
-				break;
+				// Include immediate safe-point admission/wakeups, not a transient pre-pump state.
+				this.pump(team);
+				done({ ok: true, snapshot: copy(team.view) });
+				return;
 			}
 		}
 		done({ ok: true });

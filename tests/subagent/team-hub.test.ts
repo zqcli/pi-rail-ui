@@ -220,6 +220,104 @@ test("journal callback can reply synchronously to an atomic report+wait", async 
 	assert.equal(reply.events?.[0]?.message, "immediate");
 });
 
+test("control snapshots distinguish pause_requested from confirmed paused and reflect resume admission", async (t) => {
+	const { hub, a, b, request, id } = fixture(1); t.after(() => hub.dispose());
+	await request(b, { action: "checkpoint" });
+	const requested = await request(a, { action: "control", to: b.memberId, command: "pause" });
+	assert.equal(requested.snapshot?.members.find((member) => member.id === b.memberId)?.state, "pause_requested");
+	assert.equal(requested.snapshot?.events.at(-1)?.message, "pause");
+	assert.deepEqual(requested.snapshot, hub.get(id));
+	const checkpoint = request(b, { action: "checkpoint" });
+	const confirmed = await request(a, { action: "control", to: b.memberId, command: "pause" });
+	assert.equal(confirmed.snapshot?.members.find((member) => member.id === b.memberId)?.state, "paused");
+	const resumed = await request(a, { action: "control", to: b.memberId, command: "resume" });
+	assert.equal((await checkpoint).ok, true);
+	assert.equal(resumed.snapshot?.members.find((member) => member.id === b.memberId)?.state, "running");
+	assert.deepEqual(resumed.snapshot, hub.get(id));
+	for (const reply of [requested, confirmed, resumed]) assert.doesNotThrow(() => publicTeamReply(reply));
+});
+
+test("control snapshots preserve unresolved dependencies and redirect never clears manual pause", async (t) => {
+	const { hub, a, b, request, id } = fixture(); t.after(() => hub.dispose());
+	let ready = false;
+	const dependency = request(b, { action: "wait", wait: { kind: "member", member: "B2" } }).then((reply) => { ready = true; return reply; });
+	await request(a, { action: "control", to: b.memberId, command: "pause" });
+	const resumed = await request(a, { action: "control", to: b.memberId, command: "resume" });
+	const waiting = resumed.snapshot?.members.find((member) => member.id === b.memberId);
+	assert.equal(waiting?.state, "waiting");
+	assert.equal(waiting?.waitingFor, "B2");
+	await tick(); assert.equal(ready, false);
+	await request(a, { action: "control", to: b.memberId, command: "pause" });
+	const redirected = await request(a, { action: "control", to: b.memberId, command: "redirect", message: "new direction" });
+	const paused = redirected.snapshot?.members.find((member) => member.id === b.memberId);
+	assert.equal(paused?.state, "paused");
+	assert.equal(paused?.waitingFor, "message");
+	assert.equal(redirected.snapshot?.events.at(-1)?.kind, "control");
+	assert.equal(redirected.snapshot?.events.at(-1)?.message, "redirect");
+	assert.ok(redirected.snapshot?.events.some((event) => event.kind === "message" && event.message === "new direction"));
+	assert.deepEqual(redirected.snapshot, hub.get(id));
+	await tick(); assert.equal(ready, false);
+	await request(a, { action: "control", to: b.memberId, command: "resume" });
+	assert.equal((await dependency).events?.[0]?.message, "new direction");
+	for (const reply of [resumed, redirected]) assert.doesNotThrow(() => publicTeamReply(reply));
+});
+
+test("control snapshots are detached from Hub state and the cached duplicate reply", async (t) => {
+	const { hub, a, b, workers, id } = fixture(); t.after(() => hub.dispose());
+	const command: TeamRequest = { requestId: "pause-snapshot", sequence: 1, action: "control", to: b.memberId, command: "pause" };
+	const reply = await hub.request(a, command);
+	assert.ok(reply.snapshot);
+	const before = hub.get(id);
+	for (const binding of [a, ...workers]) assert.ok(!JSON.stringify(reply).includes(binding.epoch));
+	reply.snapshot.members[0]!.state = "failed";
+	reply.snapshot.workers.push("fake");
+	reply.snapshot.events[0]!.message = "mutated";
+	reply.snapshot.events.length = 0;
+	assert.deepEqual(hub.get(id), before);
+	assert.deepEqual((await hub.request(a, command)).snapshot, before);
+});
+
+test("rejected controls have no snapshot or state/message side effects", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(); t.after(() => hub.dispose());
+	hub.complete(workers[1]!, outcome);
+	const invalid: Array<{ binding: TeamBinding; fields: Omit<TeamRequest, "requestId" | "sequence"> }> = [
+		{ binding: b, fields: { action: "control", to: b.memberId, command: "pause" } },
+		{ binding: a, fields: { action: "control", to: "unknown", command: "pause" } },
+		{ binding: a, fields: { action: "control", to: a.memberId, command: "pause" } },
+		{ binding: a, fields: { action: "control", to: "B2", command: "resume" } },
+		{ binding: a, fields: { action: "control", to: b.memberId } },
+		{ binding: a, fields: { action: "control", to: b.memberId, command: "redirect" } },
+	];
+	for (const { binding, fields } of invalid) {
+		const before = hub.get(id);
+		const reply = await request(binding, fields);
+		assert.equal(reply.ok, false);
+		assert.equal(reply.snapshot, undefined);
+		assert.deepEqual(hub.get(id), before);
+		assert.doesNotThrow(() => publicTeamReply(reply));
+	}
+	for (let i = 0; i < TEAM_MAX_EVENTS; i++) await request(a, { action: "send", to: b.memberId, message: "full" });
+	const before = hub.get(id);
+	const overflow = await request(a, { action: "control", to: b.memberId, command: "redirect", message: "overflow" });
+	assert.equal(overflow.snapshot, undefined);
+	assert.match(overflow.error!, /overflow/);
+	assert.deepEqual(hub.get(id), before);
+});
+
+test("control snapshots remain publicTeamReply-compatible with a full roster and bounded large results", async (t) => {
+	const { hub, a, b, workers, request } = fixture(8); t.after(() => hub.dispose());
+	for (let i = 0; i < TEAM_MAX_EVENTS; i++) await request(b, { action: "report", message: "中".repeat(2700) });
+	for (const worker of workers.slice(1)) hub.complete(worker, { status: "failed", output: "🙂".repeat(10_000), error: "错".repeat(10_000) });
+	for (const command of ["pause", "redirect", "resume"] as const) {
+		const reply = await request(a, { action: "control", to: b.memberId, command, ...(command === "redirect" ? { message: "direction" } : {}) });
+		assert.equal(reply.ok, true);
+		assert.equal(reply.snapshot?.members.length, 9);
+		assert.ok(reply.snapshot!.events.length <= TEAM_MAX_EVENTS);
+		assert.ok(Buffer.byteLength(JSON.stringify(reply)) < 1024 * 1024);
+		assert.doesNotThrow(() => publicTeamReply(JSON.parse(JSON.stringify(reply))));
+	}
+});
+
 test("manual pause survives dependency readiness; resume does not bypass unresolved dependencies", async (t) => {
 	const { hub, a, b, workers, request, id } = fixture(); t.after(() => hub.dispose());
 	await request(b, { action: "checkpoint" });

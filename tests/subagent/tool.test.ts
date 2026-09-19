@@ -68,6 +68,14 @@ function context() {
 	};
 }
 
+function contextWithBatch(calls: Array<{ id: string; name?: string; arguments: Record<string, unknown> }>) {
+	const branch: any[] = [{
+		type: "message", id: "assistant-batch",
+		message: { role: "assistant", content: calls.map((call) => ({ ...call, type: "toolCall", name: call.name ?? "subagent" })) },
+	}];
+	return { ...context(), sessionManager: { getBranch: () => branch } };
+}
+
 class FakeBroker {
 	readonly requests: DispatchRequest[] = [];
 	readonly controls: ControlRequest[] = [];
@@ -251,7 +259,7 @@ test("full-property provider A/B team args normalize no-op placeholders without 
 				assert.deepEqual(tool.prepareArguments(expectedA), expectedA);
 				assert.deepEqual(tool.prepareArguments(expectedB), expectedB);
 			}
-			const ctx = context();
+			const ctx = contextWithBatch([{ id: "full-A", arguments: a }, { id: "full-B", arguments: b }]);
 			ctx.ui.confirm = async () => { assert.fail("empty session path must not prompt"); };
 			await Promise.all([
 				tool.execute("full-A", preflight ? tool.prepareArguments(a) : a, undefined, undefined, ctx),
@@ -315,6 +323,214 @@ test("empty teamId placeholders use ordinary dispatch without looking up a team 
 		assert.equal(broker.requests.length, 2);
 		assert.ok(broker.requests.every((request) => request.team === undefined));
 		assert.deepEqual(raw, before);
+	}
+});
+
+test("team batch rejects missing or duplicate sides before join, dispatch or cancellation", async () => {
+	const hub = new TeamHub();
+	try {
+		const snapshot = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const before = hub.get(snapshot.id);
+		let joins = 0;
+		let cancels = 0;
+		const join = hub.join.bind(hub);
+		const cancel = hub.cancel.bind(hub);
+		hub.join = (...args) => { joins++; return join(...args); };
+		hub.cancel = (...args) => { cancels++; cancel(...args); };
+		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+		const a = { teamId: snapshot.id, alias: "A", task: "coordinate" };
+		const b = { teamId: snapshot.id, tasks: [{ alias: "B", task: "work" }] };
+		for (const sides of [[a], [b], [a, a], [b, b], [a, b, a], [a, b, b], [{ ...a, alias: " " }, b]]) {
+			const calls = sides.map((args, index) => ({ id: `side-${index}`, arguments: args }));
+			const ctx = contextWithBatch(calls);
+			// Native sequential batches may already have trailing tool results. The
+			// last assistant message, not the last branch entry, owns the batch.
+			ctx.sessionManager.getBranch().push({ type: "message", message: { role: "toolResult", toolCallId: "unrelated" } });
+			const original = structuredClone(ctx.sessionManager.getBranch());
+			for (const call of calls) {
+				await assert.rejects(tool.execute(call.id, call.arguments, undefined, undefined, ctx), /This dispatch has not joined\/started; retry BOTH calls in same assistant message with same teamId, do not wait between them/);
+			}
+			assert.deepEqual(ctx.sessionManager.getBranch(), original);
+			assert.deepEqual(hub.get(snapshot.id), before);
+		}
+		assert.equal(joins, 0);
+		assert.equal(cancels, 0);
+		assert.equal(broker.requests.length, 0);
+		assert.equal(broker.controls.length, 0);
+		assert.equal(hub.signal(snapshot.id).aborted, false);
+	} finally { hub.dispose(); }
+});
+
+test("team batch can be corrected in the next assistant message using the same prepared team", async () => {
+	const hub = new TeamHub();
+	try {
+		const snapshot = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+		const a = { teamId: snapshot.id, alias: "A", task: "coordinate" };
+		const b = { teamId: snapshot.id, tasks: [{ alias: "B", task: "work" }] };
+		const ctx = contextWithBatch([{ id: "call-A", arguments: a }]);
+		await assert.rejects(tool.execute("call-A", a, undefined, undefined, ctx), /retry BOTH calls/);
+		assert.equal(hub.get(snapshot.id).phase, "prepared");
+		assert.equal(broker.requests.length, 0);
+		const corrected = contextWithBatch([{ id: "retry-A", arguments: a }, { id: "retry-B", arguments: b }]);
+		ctx.sessionManager.getBranch().push({ ...corrected.sessionManager.getBranch()[0], id: "next-assistant" });
+		await Promise.all([
+			tool.execute("retry-A", a, undefined, undefined, ctx),
+			tool.execute("retry-B", b, undefined, undefined, ctx),
+		]);
+		assert.deepEqual(broker.requests.map((request) => request.alias).sort(), ["A", "B"]);
+		assert.deepEqual(broker.requests.map((request) => request.task).sort(), ["coordinate", "work"]);
+		assert.equal(hub.signal(snapshot.id).aborted, false);
+	} finally { hub.dispose(); }
+});
+
+test("team batch groups by teamId and ignores unrelated ordinary tool calls", async () => {
+	const hub = new TeamHub();
+	try {
+		const first = hub.prepare({ coordinator: "A1", workers: ["B1"] });
+		const second = hub.prepare({ coordinator: "A2", workers: ["B2"] });
+		const untouched = hub.get(second.id);
+		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+		const a1 = { teamId: ` ${first.id} `, alias: "A1", task: "coordinate first" };
+		const b1 = { teamId: first.id, tasks: [{ alias: "B1", task: "work first" }] };
+		const a2 = { teamId: second.id, alias: "A2", task: "coordinate second" };
+		const ordinary = { alias: "ordinary", task: "independent" };
+		const ctx = contextWithBatch([
+			{ id: "A1", arguments: a1 }, { id: "A2", arguments: a2 },
+			{ id: "read", name: "read", arguments: { teamId: first.id, path: "unrelated" } },
+			{ id: "ordinary", arguments: ordinary }, { id: "B1", arguments: b1 },
+		]);
+		await assert.rejects(tool.execute("A2", a2, undefined, undefined, ctx), /retry BOTH calls/);
+		await Promise.all([
+			tool.execute("A1", a1, undefined, undefined, ctx),
+			tool.execute("B1", b1, undefined, undefined, ctx),
+			tool.execute("ordinary", ordinary, undefined, undefined, ctx),
+		]);
+		assert.deepEqual(broker.requests.map((request) => request.alias).sort(), ["A1", "B1", "ordinary"]);
+		assert.deepEqual(hub.get(second.id), untouched);
+		assert.equal(hub.signal(first.id).aborted, false);
+		assert.equal(hub.signal(second.id).aborted, false);
+	} finally { hub.dispose(); }
+});
+
+test("team batch falls back to admission for absent or stale native assistant context", async () => {
+	for (const kind of ["no-manager", "no-method", "no-branch", "empty", "no-assistant", "different-id", "different-tool", "different-team", "newer-assistant"]) {
+		const hub = new TeamHub();
+		try {
+			const snapshot = hub.prepare({ coordinator: "A", workers: ["B"] });
+			const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+			const args = { teamId: snapshot.id, alias: "A", task: "coordinate" };
+			let ctx: any = context();
+			if (kind === "no-method") ctx.sessionManager = {};
+			else if (kind === "no-branch") ctx.sessionManager = { getBranch: () => undefined };
+			else if (kind !== "no-manager") {
+				ctx = contextWithBatch([{ id: kind === "different-id" ? "old-call" : "current-call", name: kind === "different-tool" ? "read" : "subagent", arguments: kind === "different-team" ? { ...args, teamId: "old-team" } : args }]);
+				const branch = ctx.sessionManager.getBranch();
+				if (kind === "empty" || kind === "no-assistant") branch.length = 0;
+				if (kind === "no-assistant") branch.push({ type: "message", message: { role: "user", content: "task" } });
+				if (kind === "newer-assistant") branch.push({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "newer response" }] } });
+			}
+			await tool.execute("current-call", args, undefined, undefined, ctx);
+			assert.equal(broker.requests.length, 1, `${kind}: must not reject based on an unrelated batch`);
+			assert.equal(broker.requests[0]!.team?.binding.teamId, snapshot.id);
+		} finally { hub.dispose(); }
+	}
+});
+
+test("ordinary modes never inspect the native team batch", async () => {
+	for (const teamId of [undefined, null, "", "  "]) {
+		const { tool, broker } = setupTool({ team: () => { throw new Error("must not access team runtime"); } });
+		const ctx = { ...context(), sessionManager: { getBranch: () => { throw new Error("ordinary calls must not inspect team batches"); } } };
+		await tool.execute("single", { teamId, alias: "ordinary", task: "work" }, undefined, undefined, ctx);
+		await tool.execute("parallel", { teamId, tasks: [{ alias: "one", task: "work" }] }, undefined, undefined, ctx);
+		await tool.execute("control", { teamId, target: "ordinary", control: { delivery: "steer", message: "redirect" } }, undefined, undefined, ctx);
+		assert.equal(broker.requests.length, 2);
+		assert.equal(broker.controls.length, 1);
+	}
+});
+
+test("team deadlines remain the outer failure reason after transport stop and awaited cleanup", async () => {
+	for (const mode of ["single", "parallel"] as const) {
+		for (const deadline of ["startup", "team"] as const) {
+			for (const failure of ["throw", "result"] as const) {
+				let now = 0;
+				const hub = new TeamHub({ now: () => now, startupTimeoutMs: 1000 });
+				const releases: Array<() => void> = [];
+				try {
+					const snapshot = hub.prepare({ coordinator: "A", workers: ["B1", "B2"], timeoutSeconds: deadline === "team" ? 2 : 60 });
+					if (deadline === "team") hub.join(snapshot.id, mode === "single" ? snapshot.workers : [snapshot.coordinator]);
+					const { tool, broker, hook } = setupTool({ team: () => new TeamRunManager(hub) });
+					const original = broker.dispatch.bind(broker);
+					const signals: AbortSignal[] = [];
+					let started!: () => void;
+					const starting = new Promise<void>((resolve) => { started = resolve; });
+					const count = mode === "single" ? 1 : 2;
+					let cleaned = 0;
+					broker.dispatch = async (request) => {
+						const result = await original(request);
+						const cleanup = new Promise<void>((resolve) => { releases.push(resolve); });
+						signals.push(request.signal!);
+						const aborted = new Promise<void>((resolve) => request.signal!.addEventListener("abort", () => resolve(), { once: true }));
+						if (signals.length === count) started();
+						await aborted;
+						await cleanup;
+						cleaned++;
+						if (failure === "throw") throw new Error("Subagent RPC process stopped");
+						return { ...result, run: { ...result.run, output: "partial work", stopReason: "error", errorMessage: "Subagent RPC process stopped" } };
+					};
+					let finished = false;
+					const args = mode === "single" ? { teamId: snapshot.id, alias: "A", task: "coordinate" }
+						: { teamId: snapshot.id, tasks: snapshot.workers.map((alias) => ({ alias, task: "review" })) };
+					const pending = tool.execute("deadline", args, undefined, undefined, context())
+						.then((value: any) => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }))
+						.finally(() => { finished = true; });
+					await starting;
+					now = 2001;
+					hub.get(snapshot.id); // Deterministically expire the real Hub deadline.
+					await new Promise((resolve) => setImmediate(resolve));
+					assert.equal(finished, false);
+					releases[0]!();
+					if (count > 1) {
+						await new Promise((resolve) => setImmediate(resolve));
+						assert.equal(finished, false, "group must await the remaining member cleanup");
+						releases[1]!();
+					}
+					const outcome = await pending;
+					assert.equal(cleaned, count);
+					const reason = deadline === "startup" ? "Startup admission deadline exceeded: launch both sibling dispatches" : "Team deadline exceeded";
+					const text = mode === "single" ? outcome.error?.message : outcome.value.content[0].text;
+					assert.ok(text?.includes(reason), `${mode}/${deadline}/${failure}: ${text}`);
+					assert.match(text!, /Subagent RPC process stopped/);
+					const details = mode === "single" ? hook!({ toolName: "subagent", toolCallId: "deadline", isError: true }).details : outcome.value.details;
+					for (const result of details.results) {
+						assert.equal(result.status, "failed");
+						assert.ok(result.errorMessage.startsWith(reason));
+						assert.match(result.errorMessage, /Subagent RPC process stopped/);
+						assert.ok(result.output.startsWith(reason));
+					}
+					assert.ok(signals.every((signal) => signal.reason === hub.signal(snapshot.id).reason));
+				} finally { releases.forEach((release) => release()); hub.dispose(); }
+			}
+		}
+	}
+});
+
+test("real transport failures and ordinary abort errors are not relabelled as team cancellations", async () => {
+	for (const kind of ["team", "ordinary", "ordinary-abort"] as const) {
+		const hub = new TeamHub();
+		try {
+			const snapshot = hub.prepare({ coordinator: "A", workers: ["B"] });
+			const { tool, broker, hook } = setupTool({ team: () => new TeamRunManager(hub) });
+			const caller = new AbortController();
+			broker.dispatch = async () => {
+				if (kind === "ordinary-abort") caller.abort();
+				throw new Error("Subagent RPC process stopped");
+			};
+			await assert.rejects(tool.execute("transport", { alias: "A", task: "work", ...(kind === "team" ? { teamId: snapshot.id } : {}) }, caller.signal, undefined, context()), { message: "Subagent A failed: Subagent RPC process stopped" });
+			const details = hook!({ toolName: "subagent", toolCallId: "transport", isError: true }).details;
+			assert.equal(details.results[0].errorMessage, "Subagent RPC process stopped");
+			assert.equal(details.results[0].output, "Subagent RPC process stopped");
+		} finally { hub.dispose(); }
 	}
 });
 

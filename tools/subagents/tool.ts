@@ -368,6 +368,31 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 	return { ...normalized, ...confirmSessionAttach };
 }
 
+function assertTeamDispatchBatch(toolCallId: string, teamId: string, ctx: ExtensionContext): void {
+	// Native tool execution sees the finalized assistant message in memory. SDK
+	// callers without that matching context keep the existing admission deadline.
+	const branch = ctx.sessionManager?.getBranch?.();
+	const entry = branch?.findLast((item) => item.type === "message" && item.message.role === "assistant");
+	if (entry?.type !== "message" || entry.message.role !== "assistant") return;
+	const calls = entry.message.content.filter((part) => part.type === "toolCall")
+		.filter((call) => call.name === "subagent" && typeof call.arguments?.["teamId"] === "string" && nonEmpty(call.arguments["teamId"]) === teamId);
+	if (!calls.some((call) => call.id === toolCallId)) return;
+	const error = new Error("Team dispatch requires one new-alias single call and one grouped parallel call. This dispatch has not joined/started; retry BOTH calls in same assistant message with same teamId, do not wait between them.");
+	if (calls.length !== 2) throw error;
+	let singles = 0;
+	let parallels = 0;
+	try {
+		for (const call of calls) {
+			const raw = call.arguments as SubagentParamsValue;
+			const mode = modeFor(raw);
+			const normalized = filterParamsForMode(raw, mode);
+			if (mode === "single" && normalized.alias) singles++;
+			if (mode === "parallel" && normalized.tasks?.length) parallels++;
+		}
+	} catch { throw error; }
+	if (singles !== 1 || parallels !== 1) throw error;
+}
+
 type RenderModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">;
 
 function nativeModelForRailRef(model: RailModelRef, ctx: RenderModelContext): NativeFastModel | undefined {
@@ -715,6 +740,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			if (teamId !== undefined && !team) throw new Error("Team runtime is not ready");
 			const mode = modeFor(params);
 			params = filterParamsForMode(params, mode);
+			if (teamId !== undefined) assertTeamDispatchBatch(toolCallId, teamId, ctx);
 			const actualTasks = new Map<number, string>();
 			actualTasksByCall.set(toolCallId, actualTasks);
 			const dispatchMetadata = new Map<number, DispatchDisplayMetadata>();
@@ -951,7 +977,12 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
 				const dispatched = await broker.dispatch(request);
 				setDispatchMetadata(item, slot, { model: dispatched.instance.model, fastMode: dispatched.instance.fastMode === true });
-				const result = compactPersistentResult(dispatched, item.task, duration(), step);
+				let result = compactPersistentResult(dispatched, item.task, duration(), step);
+				if (team && bindings?.[slot] && result.status === "failed") {
+					const nativeError = new Error(runErrorMessage(dispatched.run)!);
+					const error = team.dispatchError(bindings[slot]!, nativeError);
+					if (error !== nativeError) result = errorResult(item, error, duration(), signal?.aborted ?? false, step, result);
+				}
 				publishLive(slot, result);
 				return result;
 			};
@@ -960,7 +991,11 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				try {
 					return await dispatch(item, slot, step);
 				} catch (error) {
-					if (team && bindings?.[slot]) team.fail(bindings[slot]!, error, signal?.aborted);
+					if (team && bindings?.[slot]) {
+						// Resolve the established Hub cause before this failure can cancel peers.
+						error = team.dispatchError(bindings[slot]!, error);
+						team.fail(bindings[slot]!, error, signal?.aborted);
+					}
 					const result = errorResult(item, error, runDuration(slot), signal?.aborted ?? false, step, liveResults.get(slot));
 					publishLive(slot, result);
 					return result;

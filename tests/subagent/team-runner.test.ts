@@ -113,6 +113,30 @@ test("coordinator failure and caller abort cancel teammates; signal listeners ca
 	} finally { hub.dispose(); }
 });
 
+test("confirmed team cancellation preserves its signal reason and the underlying error cause", () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "work" }]);
+		const transport = new Error("Subagent RPC process stopped");
+		assert.equal(manager.dispatchError(a!, transport), transport, "uncancelled transport failures must remain unchanged");
+		const scope = teamCallSignal(hub, team.id);
+		hub.cancel(team.id, "Team deadline exceeded");
+		assert.equal(scope.signal.reason, "Team deadline exceeded");
+		scope.dispose();
+		const lateScope = teamCallSignal(hub, team.id);
+		assert.equal(lateScope.signal.reason, "Team deadline exceeded");
+		lateScope.dispose();
+		const error = manager.dispatchError(a!, transport);
+		assert.ok(error instanceof Error);
+		assert.match(error.message, /^Team deadline exceeded\nUnderlying subagent error: Subagent RPC process stopped$/);
+		assert.equal(error.cause, transport);
+		const authoritative = new Error("Team deadline exceeded");
+		assert.equal(manager.dispatchError(a!, authoritative), authoritative);
+	} finally { hub.dispose(); }
+});
+
 test("missing sibling has a finite admission deadline", async () => {
 	const hub = new TeamHub({ startupTimeoutMs: 15 });
 	try {

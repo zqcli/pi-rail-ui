@@ -71,6 +71,16 @@ export class TeamRunManager {
 		};
 	}
 
+	dispatchError(binding: TeamBinding, error: unknown): unknown {
+		const phase = this.hub.get(binding.teamId).phase;
+		if (phase !== "cancelled" && phase !== "failed") return error;
+		const signal = this.hub.signal(binding.teamId);
+		if (!signal.aborted || typeof signal.reason !== "string" || !signal.reason.trim()) return error;
+		const message = error instanceof Error ? error.message : String(error);
+		if (message === signal.reason) return error;
+		return new Error(`${signal.reason}\nUnderlying subagent error: ${message}`, { cause: error });
+	}
+
 	fail(binding: TeamBinding, error: unknown, aborted = false): void {
 		const message = error instanceof Error ? error.message : String(error);
 		this.hub.complete(binding, { status: aborted ? "cancelled" : "failed", output: "", error: message });
@@ -82,8 +92,8 @@ export class TeamRunManager {
 export function teamCallSignal(hub: TeamHub, teamId: string, caller?: AbortSignal): { signal: AbortSignal; dispose(): void } {
 	const controller = new AbortController();
 	const team = hub.signal(teamId);
-	const cancel = () => { hub.cancel(teamId, "Parent subagent call aborted"); controller.abort(); };
-	const abort = () => controller.abort();
+	const abort = () => controller.abort(team.reason);
+	const cancel = () => { hub.cancel(teamId, "Parent subagent call aborted"); abort(); };
 	caller?.addEventListener("abort", cancel, { once: true });
 	team.addEventListener("abort", abort, { once: true });
 	if (caller?.aborted) cancel();

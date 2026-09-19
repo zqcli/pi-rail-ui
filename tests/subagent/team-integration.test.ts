@@ -140,7 +140,7 @@ test("real coordinator pauses a worker, receives safe-point confirmation, redire
 	assert.ok(paused && redirect && paused.seq < redirect.seq);
 });
 
-test("native parent prepares full-property team calls before validation and runs both RPC siblings", { timeout: 90_000 }, async (t) => {
+test("native parent rejects a lone team call without starting members, then corrects full-property RPC siblings", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, tools, ctx, store } = await setup(t, 2, "control");
 	// Match the real smoke session's provider-filled optional fields, including
 	// empty session/control objects at the top level and inside grouped tasks.
@@ -152,16 +152,29 @@ test("native parent prepares full-property team calls before validation and runs
 	];
 	const before = structuredClone(args);
 	const tool = tools.get("subagent");
+	const branch: any[] = [];
+	ctx.sessionManager = { getBranch: () => branch };
 	let requests = 0;
 	const messages = await runAgentLoop([{ role: "user", content: "Start both team siblings", timestamp: Date.now() }], {
 		systemPrompt: "Local parent integration probe", messages: [],
 		tools: [{ ...tool, execute: (id: string, params: any, signal: AbortSignal, onUpdate: any) => tool.execute(id, params, signal, onUpdate, ctx) }],
-	}, { model: nativeModel as any, convertToLlm: (items) => items as any, toolExecution: "parallel" }, () => undefined, t.signal, () => {
-		assert.ok(++requests <= 2, "the parent must not retry rejected tool calls");
+	}, { model: nativeModel as any, convertToLlm: (items) => items as any, toolExecution: "parallel" }, (event) => {
+		// Mirror native AgentSession's public in-memory branch after message_end.
+		if (event.type === "message_end") branch.push({ type: "message", message: event.message });
+	}, t.signal, async () => {
+		assert.ok(++requests <= 3, "one corrective turn is enough; no timeout/retry loop");
+		if (requests === 2) {
+			assert.equal((await store.list()).length, 0, "the lone call must not create a child session");
+			assert.ok(hub.get(teamId).members.every((member) => member.state === "registered"));
+			assert.equal(hub.signal(teamId).aborted, false);
+		}
+		const content = requests === 1 ? [{ type: "toolCall", id: "native-lone", name: "subagent", arguments: args[0] }]
+			: requests === 2 ? args.map((arguments_, index) => ({ type: "toolCall", id: `native-team-${index}`, name: "subagent", arguments: arguments_ }))
+			: [{ type: "text", text: "ROOT_DONE" }];
 		const message: any = { role: "assistant", api: nativeModel.api, provider: nativeModel.provider, model: nativeModel.id,
-			content: requests === 1 ? args.map((arguments_, index) => ({ type: "toolCall", id: `native-team-${index}`, name: "subagent", arguments: arguments_ })) : [{ type: "text", text: "ROOT_DONE" }],
+			content,
 			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			stopReason: requests === 1 ? "toolUse" : "stop", timestamp: Date.now() };
+			stopReason: requests < 3 ? "toolUse" : "stop", timestamp: Date.now() };
 		const stream = createAssistantMessageEventStream();
 		stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
 		stream.push({ type: "done", reason: message.stopReason, message });
@@ -169,8 +182,10 @@ test("native parent prepares full-property team calls before validation and runs
 		return stream;
 	});
 	const results = messages.filter((message) => message.role === "toolResult") as any[];
-	assert.equal(results.length, 2);
-	for (const result of results) assert.equal(result.isError, false, JSON.stringify(result.content));
+	assert.equal(results.length, 3);
+	assert.equal(results[0].isError, true);
+	assert.match(results[0].content[0].text, /retry BOTH calls in same assistant message/u);
+	for (const result of results.slice(1)) assert.equal(result.isError, false, JSON.stringify(result.content));
 	assert.match(results.find((result) => result.toolCallId === "native-team-0").details.results[0].output, /CONTROL_FINAL/u);
 	assert.equal(results.find((result) => result.toolCallId === "native-team-1").details.results.length, 2);
 	assert.equal(hub.get(teamId).phase, "completed");
@@ -190,7 +205,13 @@ test("real cancellation wakes both parked calls and awaits native lease cleanup 
 	const results = await settled;
 	assert.equal(hub.get(teamId).phase, "cancelled");
 	assert.ok(results.some((result) => result.status === "rejected"));
-	for (const result of results) if (result.status === "fulfilled") assert.ok(result.value.details.results.every((run: any) => run.status === "failed"));
+	for (const result of results) {
+		if (result.status === "rejected") assert.match(String(result.reason), /test cancellation/u);
+		else for (const run of result.value.details.results) {
+			assert.equal(run.status, "failed");
+			assert.match(run.errorMessage, /test cancellation/u);
+		}
+	}
 	for (const instance of await store.list()) assert.deepEqual(await leases.inspect(instance.sessionFile), { state: "free" });
 });
 

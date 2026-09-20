@@ -1,4 +1,4 @@
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 export default function install(pi) {
@@ -35,9 +35,10 @@ export default function install(pi) {
 		models: [{ id: "probe", name: "probe", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 128 }],
 		streamSimple(model, context, options) {
 			const scenario = process.env.TEAM_PROBE_SCENARIO;
+			// Pi 0.86 carries the prompt and tool declarations in transcript system messages.
 			pi.appendEntry("team-probe-provider", {
 				aborted: options?.signal?.aborted === true,
-				messages: context.messages, systemPrompt: context.systemPrompt, teamParameters: context.tools?.find((tool) => tool.name === "team")?.parameters,
+				messages: context.messages, systemPrompt: getCurrentSystemPrompt(context.messages), teamParameters: getCurrentTools(context.messages).find((tool) => tool.name === "team")?.parameters,
 			});
 			if (++turns > (scenario === "delivery" ? 8 : 3)) throw new Error("Unexpected provider polling");
 			const wait = ["wait", "mixed", "wait-null", "wait-empty", "queued-wait", "queued-report-wait"].includes(scenario) && turns === 1;

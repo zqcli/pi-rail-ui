@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { teamExtensionPath, TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamWorkerChannel } from "../../tools/subagents/team-protocol";
 import { TEAM_COMMAND_DESCRIPTION } from "../../tools/subagents/team-extension";
 import { describe, test } from "node:test";
@@ -191,18 +195,36 @@ function isContextPrompt(command: Record<string, unknown>): boolean {
 	return command["type"] === "prompt" && String(command["message"] ?? "").startsWith("/rail-context-internal-v1 ");
 }
 
+/** Acknowledge team wire commands so TeamRpcConnection can bind/unbind without real child events. */
+function withTeamAck(transport: FakeTransport): void {
+	const previous = transport.request.bind(transport);
+	transport.request = async (command) => {
+		if (command["type"] === "get_commands") {
+			const result = await previous(command) as { commands: unknown[] };
+			return { commands: [...result.commands, { name: TEAM_COMMAND, source: "extension", description: TEAM_COMMAND_DESCRIPTION }] };
+		}
+		if (command["type"] === "prompt" && String(command["message"]).startsWith(`/${TEAM_COMMAND} `)) {
+			transport.commands.push(command);
+			const frame = JSON.parse(String(command["message"]).slice(TEAM_COMMAND.length + 2));
+			transport.emit({ type: "entry_appended", entry: { type: "custom", customType: TEAM_ENTRY_TYPE, data: { version: 1, kind: "ack", commandId: frame.commandId, binding: frame.binding, ok: true } } });
+			return undefined;
+		}
+		return previous(command);
+	};
+}
+
 function model(): RailModelRef {
 	return { provider: "cus-resp", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" };
 }
 
-function spec(mode: WorkerStartSpec["mode"], sessionPath?: string): WorkerStartSpec {
+function spec(mode: WorkerStartSpec["mode"], sessionPath?: string, cwd = "/tmp/project"): WorkerStartSpec {
 	return {
 		agentId: "agt_auth",
 		mode,
 		model: model(),
 		alias: "auth-review",
 		sessionName: "subagent · Main Auth Work · auth-review",
-		cwd: "/tmp/project",
+		cwd,
 		...(sessionPath ? { sessionPath } : {}),
 	};
 }
@@ -816,5 +838,133 @@ describe("RpcSessionWorker", () => {
 		assert.equal(result.stopReason, "stop");
 		assert.deepEqual(result.usage, { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.02, contextTokens: 11, turns: 1 });
 		phaseUnsubscribe();
+	});
+
+	test("binds a team channel before preparing a budget that fits only the switched model", async (t) => {
+		const root = await mkdtemp(join(tmpdir(), "rail-rpc-worker-"));
+		const agentDir = join(root, "agent");
+		const project = join(root, "project");
+		const sessionFile = join(root, "child.jsonl");
+		const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+		process.env["PI_CODING_AGENT_DIR"] = agentDir;
+		t.after(async () => {
+			if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+			else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+			await rm(root, { recursive: true, force: true });
+		});
+		await mkdir(agentDir, { recursive: true });
+		await mkdir(join(project, ".pi"), { recursive: true });
+		await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { reserveTokens: 16_384 } }));
+		await writeFile(join(project, ".pi/settings.json"), JSON.stringify({ compaction: { modelOverrides: {
+			"cus-resp/gpt-5.6-sol": { reserveTokens: 60_000 },
+			"deepseek/deepseek-v4-flash": { reserveTokens: 8_192 },
+		} } }));
+		new ProjectTrustStore(agentDir).set(project, true);
+
+		const transport = new FakeTransport();
+		const request = transport.request.bind(transport);
+		transport.request = async (command) => {
+			if (command["type"] === "get_state") return { ...(await request(command)) as any, sessionFile };
+			return request(command);
+		};
+		withTeamAck(transport);
+		const worker = await RpcSessionWorker.connect(spec("new", undefined, project), transport);
+
+		// The same budget is rejected while the current model reserves 60000 tokens,
+		// so the prepare/team flow proves the reserve follows the actual child model.
+		await assert.rejects(() => worker.send("early task", { contextWindow: 30_000 }), /reserveTokens \(60000\)/);
+		assert.equal(worker.isReusable(), true);
+		assert.equal(transport.commands.some((command) => command["type"] === "prompt"), false);
+
+		await worker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash" });
+		const team: TeamWorkerChannel = { binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }) };
+		const result = await worker.send("team task", { contextWindow: 30_000, team });
+		assert.equal(result.output, "review complete");
+		const prompts = transport.commands.filter((command) => command["type"] === "prompt").map((command) => String(command["message"]));
+		assert.equal(prompts.length, 5);
+		assert.match(prompts[0]!, /"operation":"bind"/);
+		assert.match(prompts[1]!, /prepare 30000/);
+		assert.equal(prompts[2], "team task");
+		assert.match(prompts[3]!, / reset$/);
+		assert.match(prompts[4]!, /"operation":"unbind"/);
+		assert.equal(worker.isReusable(), true);
+		assert.equal(transport.listeners.size, 0);
+	});
+
+	test("serializes model changes against child runs in both directions", async () => {
+		const transport = new FakeTransport();
+		const request = transport.request.bind(transport);
+		let releaseModel!: () => void;
+		const modelGate = new Promise<void>((resolve) => { releaseModel = resolve; });
+		transport.request = async (command) => {
+			if (command["type"] === "set_model") await modelGate;
+			return request(command);
+		};
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const changing = worker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash" });
+		await new Promise((resolve) => setImmediate(resolve));
+		// No run may start while the child model is being switched.
+		await assert.rejects(() => worker.send("during change", { contextWindow: 64000 }), /model change is in progress/);
+		assert.equal(transport.commands.some((command) => command["type"] === "prompt"), false);
+		releaseModel();
+		await changing;
+		assert.equal((await worker.send("after change")).output, "review complete");
+
+		const gate = Promise.withResolvers<void>();
+		const gatedTransport = new FakeTransport();
+		const gatedRequest = gatedTransport.request.bind(gatedTransport);
+		gatedTransport.request = async (command) => {
+			if (isContextPrompt(command) && String(command["message"]).includes(" prepare ")) await gate.promise;
+			return gatedRequest(command);
+		};
+		const gatedWorker = await RpcSessionWorker.connect(spec("new"), gatedTransport);
+		const running = gatedWorker.send("first", { contextWindow: 64000 });
+		await new Promise((resolve) => setImmediate(resolve));
+		// Switching the model must wait for the active run to settle first.
+		await assert.rejects(() => gatedWorker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash" }), /requires an idle worker/);
+		gate.resolve();
+		await running;
+		const selected = await gatedWorker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash" });
+		assert.equal(selected.provider, "deepseek");
+		assert.equal(selected.modelId, "deepseek-v4-flash");
+	});
+
+	test("clears the change guard and retires the worker after a failed model switch", async () => {
+		const transport = new FakeTransport();
+		const request = transport.request.bind(transport);
+		let switched = false;
+		transport.request = async (command) => {
+			if (command["type"] === "set_model") {
+				switched = true;
+				return undefined;
+			}
+			if (command["type"] === "get_state" && switched) {
+				return { sessionId: "child-session", sessionFile: "/tmp/child.jsonl", model: { provider: "deepseek", id: "deepseek-v4-flash" } };
+			}
+			return request(command);
+		};
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		await assert.rejects(() => worker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash" }), /did not return a verifiable model contextWindow/);
+		// The guard is cleared and the worker is retired: the next run fails fast, not as "in progress".
+		await assert.rejects(() => worker.send("after failed switch", { contextWindow: 64000 }), /not reusable/);
+		assert.equal(transport.commands.some((command) => command["type"] === "prompt"), false);
+	});
+
+	test("closes a team channel and stays retired when its context command fails", async () => {
+		const transport = new FakeTransport();
+		transport.failContextCommand = true;
+		withTeamAck(transport);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const team: TeamWorkerChannel = { binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }) };
+
+		await assert.rejects(() => worker.send("must not run", { contextWindow: 64000, team }), /context command failed/);
+		const prompts = transport.commands.filter((command) => command["type"] === "prompt").map((command) => String(command["message"]));
+		assert.equal(prompts.some((message) => message === "must not run"), false);
+		assert.equal(prompts.some((message) => / reset$/.test(message)), false);
+		assert.equal(prompts.filter((message) => message.includes('"operation":"unbind"')).length, 1);
+		assert.equal(worker.isReusable(), false);
+		// runInFlight was cleared: the second attempt fails as retired, not as overlapping.
+		await assert.rejects(() => worker.send("again"), /not reusable/);
+		assert.equal(transport.listeners.size, 0);
 	});
 });

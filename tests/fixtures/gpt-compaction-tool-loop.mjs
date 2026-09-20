@@ -1,22 +1,28 @@
 import { appendFileSync } from "node:fs";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import assert from "node:assert/strict";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 const logPath = process.env.RAIL_GPT_COMPACTION_TOOL_LOG;
 let providerCalls = 0;
+let agentTurns = 0;
 
 function log(value) {
 	if (logPath) appendFileSync(logPath, `${JSON.stringify(value)}\n`, "utf8");
 }
 
 function streamLoop(model, context, options) {
+	const summarizing = getCurrentSystemPrompt(context.messages).includes("context summarization assistant");
+	const hasLoopTool = getCurrentTools(context.messages).some((tool) => tool.name === "gpt_compaction_loop_tool");
+	assert.ok(summarizing || hasLoopTool, "agent transcript must declare the loop tool");
 	const stream = createAssistantMessageEventStream();
 	(async () => {
 		providerCalls += 1;
 		const assistantTurns = context.messages.filter((message) => message.role === "assistant").length;
-		log({ kind: "provider", call: providerCalls, assistantTurns, messages: context.messages });
-		const summarizing = context.systemPrompt?.includes("context summarization assistant") === true;
-		const shouldFinish = summarizing || assistantTurns >= 3;
+		// Compaction can remove assistant history; summary calls must not advance the agent loop.
+		const agentTurn = summarizing ? null : ++agentTurns;
+		log({ kind: "provider", call: providerCalls, assistantTurns, summarizing, agentTurn, hasLoopTool, messages: context.messages });
+		const shouldFinish = summarizing || agentTurn > 3;
 		const message = {
 			role: "assistant",
 			content: shouldFinish
@@ -37,6 +43,7 @@ function streamLoop(model, context, options) {
 }
 
 export default function install(pi) {
+	pi.on("agent_start", () => { agentTurns = 0; });
 	pi.registerProvider("cus-resp", {
 		name: "Rail GPT compaction tool loop",
 		baseUrl: process.env.RAIL_GPT_COMPACTION_GATEWAY ?? "https://gateway.example/v1",

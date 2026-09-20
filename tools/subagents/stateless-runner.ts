@@ -3,10 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
-import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, formatContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
+import { CONTEXT_PROTOCOL_ERROR_PREFIX, CONTEXT_PROTOCOL_FLAG, CONTEXT_PROTOCOL_VERSION, CONTEXT_WINDOW_FLAG, contextExtensionPath, createChildContextSettings, formatContextWindow, normalizeContextWindow, readContextProtocolError, validateContextWindowReserve } from "./context-window";
 import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
 import { isGptModel } from "../../openai/model-eligibility";
 import { readGptCompactionSettings } from "../gpt-compaction/settings";
@@ -41,8 +40,8 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 	return async (request) => {
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
-		const requestedContextWindow = request.contextWindow;
-		const settings = requestedContextWindow === undefined ? undefined : SettingsManager.create(request.cwd, getAgentDir()).getCompactionSettings();
+		const requestedContextWindow = normalizeContextWindow(request.contextWindow);
+		const settings = requestedContextWindow === undefined ? undefined : createChildContextSettings(request.cwd).getCompactionSettings({ provider: request.model.provider, id: request.model.modelId });
 		const contextWindow = settings
 			? validateContextWindowReserve(requestedContextWindow, settings.reserveTokens, settings.enabled)
 			: undefined;

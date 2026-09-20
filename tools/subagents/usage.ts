@@ -69,6 +69,16 @@ export function addCompletedAssistantUsage(total: SubagentUsage, message: unknow
 	return true;
 }
 
+/** Tool-owned LLM work is billed without changing the main assistant context. */
+export function addCompletedToolResultUsage(total: SubagentUsage, message: unknown): boolean {
+	const value = record(message);
+	if (value?.["role"] !== "toolResult") return false;
+	const usage = providerReportedUsage(value["usage"]);
+	if (!usage) return false;
+	addUsage(total, usage, false);
+	return true;
+}
+
 /** Add one compaction provider call without turning it into an assistant turn. */
 export function addCompactionUsage(total: SubagentUsage, result: unknown): boolean {
 	const usage = providerReportedUsage(record(result)?.["usage"]);

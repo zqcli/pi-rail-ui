@@ -1,5 +1,5 @@
 import { appendFileSync } from "node:fs";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentTools } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
 const logPath = process.env.RAIL_CONTEXT_WINDOW_COMPACTION_LOG;
@@ -32,7 +32,9 @@ function register(pi, provider, contextWindow, version) {
 			const roles = context.messages.map((message) => message.role);
 			log({ kind: "provider", mode, call, version, contextWindow: model.contextWindow, provider: model.provider, model: model.id, roles, messageCount: context.messages.length });
 			const stream = createAssistantMessageEventStream();
-			const isFirstAgentCall = roles.length === 3 && roles.at(-1) === "user";
+			// Summary requests also end in a user message, but do not declare agent tools.
+			const isFirstAgentCall = roles.at(-1) === "user"
+				&& getCurrentTools(context.messages).some((tool) => tool.name === "compaction_probe_tool");
 			const message = isFirstAgentCall ? {
 				role: "assistant",
 				content: [{ type: "toolCall", id: "compaction-probe-call", name: "compaction_probe_tool", arguments: {} }],

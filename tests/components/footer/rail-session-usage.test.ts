@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
 import {
 	collectFooterUsageStats,
 	collectRailSessionSnapshot,
@@ -120,5 +122,60 @@ test("summary entries without usage keep message-only totals (legacy compatibili
 		cacheReadTokens: 25,
 		cacheWriteTokens: 5,
 		cost: 0.5,
+	});
+});
+
+test("official standalone usage entries add spend without changing message or context counts", () => {
+	const manager = SessionManager.inMemory("/tmp/project");
+	const usage: Usage = {
+		input: 2, output: 3, cacheRead: 100, cacheWrite: 5, totalTokens: 110,
+		cost: { input: 0, output: 0, cacheRead: 0.125, cacheWrite: 0, total: 0.125 },
+	};
+	manager.appendUsage("cache_warm", "anthropic", "fixture", usage);
+	manager.appendUsage("future_operation", "anthropic", "fixture", usage);
+	const entries = [
+		assistantEntry("m1"),
+		...manager.getEntries(),
+		summaryEntry("compaction", "c1", true),
+		summaryEntry("branch_summary", "b1", false),
+		{ type: "message", message: { role: "toolResult", usage } },
+	];
+	const ctx = snapshotContext(entries) as any;
+	assert.deepEqual(collectFooterUsageStats(ctx), {
+		inputTokens: 306, outputTokens: 159, cacheReadTokens: 325, cacheWriteTokens: 20, cost: 1.875,
+	});
+	const snapshot = collectRailSessionSnapshot(ctx, pi);
+	assert.equal(snapshot.session.tokens.total, 810);
+	assert.equal(snapshot.session.cost, 1.875);
+	assert.equal(snapshot.session.assistantMessages, 1);
+	assert.equal(snapshot.session.toolResults, 1);
+	assert.equal(snapshot.session.totalMessages, 2);
+	assert.equal(snapshot.state.contextTokens, 0);
+	assert.deepEqual(manager.buildSessionContext().messages, []);
+});
+
+test("standalone spend uses the whole session rather than only the active branch", () => {
+	const manager = SessionManager.inMemory("/tmp/project");
+	const usage: Usage = {
+		input: 2, output: 3, cacheRead: 100, cacheWrite: 5, totalTokens: 110,
+		cost: { input: 0, output: 0, cacheRead: 0.125, cacheWrite: 0, total: 0.125 },
+	};
+	manager.appendUsage("cache_warm", "anthropic", "fixture", usage);
+	manager.resetLeaf();
+	manager.appendUsage("unknown_kind", "anthropic", "fixture", usage);
+	assert.equal(manager.getBranch().length, 1);
+	const ctx = {
+		...snapshotContext([]),
+		sessionManager: manager,
+		getContextUsage: () => ({ tokens: 42, contextWindow: 100_000, percent: 0.042 }),
+	} as any;
+	const snapshot = collectRailSessionSnapshot(ctx, pi);
+	assert.equal(snapshot.session.tokens.total, 220);
+	assert.equal(snapshot.session.cost, 0.25);
+	assert.equal(snapshot.session.totalMessages, 0);
+	assert.equal(snapshot.state.contextTokens, 42);
+	assert.equal(snapshot.state.contextPercent, 0.042);
+	assert.deepEqual(collectFooterUsageStats(ctx), {
+		inputTokens: 4, outputTokens: 6, cacheReadTokens: 200, cacheWriteTokens: 10, cost: 0.25,
 	});
 });

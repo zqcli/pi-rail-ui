@@ -1,5 +1,7 @@
 # Subagent Team v1 — development plan and acceptance contract
 
+> Historical initial implementation contract and Pi 0.85.1 acceptance record. The current Pi 0.86.0 integration and its 832-test gates are documented in [the Team migration report](subagent-team-pi-0.86.0.md); the original results below are not presented as current-version validation.
+
 ## Workspace and execution rules
 
 - Base: `b93d171` on `feat/subagent-panel-layout`.

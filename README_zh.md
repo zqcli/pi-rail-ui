@@ -4,7 +4,7 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地视觉扩展。它为长时�
 
 它只定制视觉 surface 和工具展示，并保留 Pi 原有编辑器行为、快捷键和原生 TUI 功能。
 
-Pi Rail UI 要求 Pi `0.85.1`，不再支持旧版 Pi。
+Pi Rail UI 要求 Pi `0.86.0`，不再支持旧版 Pi。
 
 ## 功能概览
 
@@ -61,6 +61,7 @@ fi
 - 使用 `/rail-agent` 打开统一 TUI overlay，其中包含 **Current**、**All Persistent**、**Create / Adopt** 三个 tab。面板准确区分 `starting`、`running`、`queued`、`idle`、`not connected` 和 `error`；其他进程持有的 live lease 显示为 **In use elsewhere**，不会猜测它是否正在生成。Native Pi 压缩期间，local child 仍保持 `running` phase 以维持 control admission，同时显式显示 **COMPACTING**。Model 与 saved session 都在同一面板中通过可搜索 inline picker 选择；创建表单把选中的 model/thinking level 与 Fast policy 映射到一个独立 session，新 persistent agent 必须提供具体首个任务，adopt saved session 时保留原 cwd。`Shift+F` 可切换创建表单或 idle/stopped/error persistent agent 的 Fast；active、queued、compacting、foreign-owned 与 ownership unknown 状态会拒绝修改。对于当前进程内正在运行的 agent，按 `g` 打开 inline **Steer** 输入，按 `f` 排队 inline **Follow-up**。
 - Tool 提供 `model` 和 `task`、不提供 `alias/session` 时，执行无状态一次性 model session，不创建 persistent instance 或 child session；省略 `model` 时使用 Pi 当前模型。
 - `contextWindow` 是每次 dispatch 的可选、本地 Pi budget。single 模式放在顶层；`tasks` 和 `chain` 中必须放在各自 item 上，不存在数组级默认值或继承。它必须是正的 safe integer；省略时使用 Rail 临时 override 前当前选中的 child model 值。只有 catalog/registry 刷新不会迫使 Rail 把 registry 对象同步到当前 selected object。启用 compaction 时，值小于等于 child 实际 `reserveTokens` 会被拒绝；高于模型 metadata 的值可以使用，但它只改变本地 budgeting metadata，不提高 provider 服务端容量，也不修改 `maxTokens`。
+- 显式 context budget 按实际 child model 和 cwd 解析 Pi 0.86.0 的 `compaction.modelOverrides["provider/modelId"]`。父端预检遵循已保存／默认的非交互 project trust，child helper 再按实际 session trust 校验；不会隐式批准项目设置，省略 budget 时不会安装 override。
 - `fastMode: true` 为一次 stateless GPT dispatch 启用 Pi 原生 priority service tier，或在创建/adopt persistent GPT agent 时保存该 policy。默认关闭，也不会隐式继承 parent Pi session 当前的 Fast 状态。在非 GPT 模型上，合法位置的 `fastMode: true` 会被静默忽略而不是让 dispatch 失败：stateless 调用按 Fast off 运行，new/adopt persistent agent 以 off 创建而不是持久化 `true`（因此之后切到 GPT 也不会被隐式开启）。只有合法参数位置才容忍忽略；`target`、grouped 与 control 上的 `fastMode` 仍会被拒绝，GPT 模型落在 Rail 无法改写的 API 上仍会失败于 API 资格检查。已有 persistent target 使用 descriptor 中保存的 policy，只能通过 `/rail-agent` 修改；面板中的 **FAST inactive** 仍表示 saved policy 会保留给后续 eligible 模型。展示不会清除 saved policy：非 GPT target 保留 descriptor 值但显示 `FAST off`。Tool Call 头部与 grouped child 面板显示解析后 model 与 API 的有效状态：只有保存在 descriptor 或本次显式指定的 policy 落在 `openai-completions`、`openai-responses` 或 `azure-openai-responses` 的 GPT 模型上时才显示 `FAST on`；非 GPT 与未知/不支持的 API 显示 `FAST off`。
 - Stateless dispatch 仅在 GPT child model 且 policy 生效时为 Fast 加载独立 helper，并且仅在 GPT child model 时加载固定为 `live` 的独立原生搜索 helper（`-e <rail-oai-search-standalone> --rail-oai-search-mode live`）。Persistent RPC worker 把这两个 helper 保留在长生命周期 child session 上（search 始终加载，Fast 在 saved policy 开启时加载），由扩展自行对每次 model/request 门控，因此原地切到非 GPT 或不支持的 API 时无需重启即可保持 inactive。两者都不继承 parent session 的 `/rail-oai-search` 选择。非 GPT stateless child 不加载 Fast/Search helper；persistent worker 保留 helper，但对非 GPT 模型跳过注入。两者在 dispatch 头部和 grouped child 面板中均显示 `FAST off · SEARCH off`。父级 dispatch 头部以 `ContextWindow ... · FAST ... · SEARCH ...` 结尾，grouped 中每个 child 面板显示自己的有效值，single result 面板与 control 调用不会重复显示。Search 是 Rail 为 eligible GPT child 内部选择的 live policy，没有 `search`/`searchMode` 参数，也不会进入 Tool parameters schema 或 result details。
 - stateless 只有 explicit `contextWindow` budget 才会通过 `-e` 加载 child-local context-window helper；省略该 budget 时仍保持现有的 `--mode json -p --no-session` 调用。persistent worker 通过私有 handled command prepare 并确认 budget，在 retry、compaction 和 queued follow-up 期间保持它；helper 会在 `agent_settled` 时恢复自己拥有的 model 对象，然后由父进程确认 cleanup。省略 budget 的 persistent dispatch 不发送 private prepare/reset prompt。helper 缺失、model/window 不一致、transport 状态不确定或 reset 无法确认时会 fail closed，并 retire worker，不复用不确定状态。
@@ -69,7 +70,8 @@ fi
 - Tool 提示会引导父 LLM 主动把代码搜索、聚焦分析、验证、比较和 review 等自包含工作派发为 stateless session；只有确实需要后续连续追问时才创建 persistent alias。需要显示为独立顶层 Tool Call 的并行工作，会在同一 assistant turn 发出多个 sibling `subagent` call，由 Pi 并发执行；`tasks` 数组只用于一个 grouped parent Tool Call 内包含多个 child 面板的场景。Child session 当前不能递归调用 `subagent`，嵌套拆解仍由父 session 负责编排。
 - 可通过 `{ "target": "auth-review", "control": { "delivery": "steer", "message": "Focus on tests" } }` 或 `delivery: "followUp"` 控制 live persistent child。`steer` 会在当前 child assistant turn 及其 tool calls 完成后、下一次模型调用前送达；`followUp` 会在当前工作结束后继续执行。Control 不会启动 idle/stopped session，不能指向 stateless 或 foreign-owned worker，也不应和首次 dispatch 作为 sibling 同时发出，因为 startup 存在竞态。
 - 如果 child 在普通 final answer 中请求输入或另一位 specialist，可以使用 `needs_input` 或 `specialist_request` 这两个 plain-language label；它们只是提示约定，不是结构化 wire protocol。仍由 parent 负责解决问题或派发 specialist，然后使用 `target+task` 继续原 persistent child。这样递归、lineage、cost、取消和 single-writer ownership 都继续在 parent 可见。
-- Subagent Tool Call 面板在运行中实时展示 user task、thinking、assistant 文本、tool call 参数和 tool result，并且只保留最近 18 个 activity 事件。它消费 Pi 0.85.1 的 `compaction_start`/`compaction_end` 与 summarization retry 事件，在 child run 仍活跃时显式显示 **Compacting** 子状态；压缩 summary 不会复制进 parent transcript。运行期间会在有界 activity 和 `earlier activity hidden` 提示上方持续显示一行 live usage。完成后折叠态显示 final answer 预览；展开后显示保留的最后一条 assistant answer、近期 activity、input/output/cache/context token、turn、cost、耗时和 stop reason。Parallel 与 chain 调用为每个 child 渲染独立面板，同时提供汇总 token、cost、状态和 wall time。只有 Rail 在拦截的 Responses SSE 流上观测到的 hosted `web_search_call` 才会计数：child 执行过这类调用时，其 usage 行末尾会追加观测到的次数（`1 search` 或 `N searches`）；parallel/chain 的汇总 usage 行累加所有 child 的次数，grouped child 头部仍不显示 usage 行。child 通过未接管的 native extension provider 或 Codex 默认 WebSocket transport 执行的搜索不会被观测，也不会计入。
+- Subagent Tool Call 面板在运行中实时展示 user task、thinking、assistant 文本、tool call 参数和 tool result，并且只保留最近 18 个 activity 事件。它消费 Pi 0.86.0 的 `compaction_start`/`compaction_end` 与 summarization retry 事件，在 child run 仍活跃时显式显示 **Compacting** 子状态；压缩 summary 不会复制进 parent transcript。运行期间会在有界 activity 和 `earlier activity hidden` 提示上方持续显示一行 live usage。完成后折叠态显示 final answer 预览；展开后显示保留的最后一条 assistant answer、近期 activity、input/output/cache/context token、turn、cost、耗时和 stop reason。Parallel 与 chain 调用为每个 child 渲染独立面板，同时提供汇总 token、cost、状态和 wall time。只有 Rail 在拦截的 Responses SSE 流上观测到的 hosted `web_search_call` 才会计数：child 执行过这类调用时，其 usage 行末尾会追加观测到的次数（`1 search` 或 `N searches`）；parallel/chain 的汇总 usage 行累加所有 child 的次数，grouped child 头部仍不显示 usage 行。child 通过未接管的 native extension provider 或 Codex 默认 WebSocket transport 执行的搜索不会被观测，也不会计入。
+- Footer/session 总计包含 Pi 独立 usage entry（包括 cache warming）；child run 总计同时包含运行期间观察到的 usage entry 和工具结果中的嵌套模型 usage，去重累计但不增加 assistant turn，也不覆盖对话 context token 估计。settled 后的 idle cache warming 不计入已完成 dispatch。
 - Persistent child 在 `/resume` 中统一命名为 `subagent · <父 session> · <alias>`。创建它的父 session 名会写入 instance；父 session 未命名时使用 `<项目目录>-<sessionId 前缀>`。既有 managed session 会在下一次持有 lease 的 RPC worker open 时安全补名。Stateless 始终传入 `--no-session`，不创建 JSONL，也不会出现在 `/resume`。
 - 通过单 writer lease 和 per-agent queue，避免并发调用同时写入同一个 child JSONL session。
 
@@ -126,7 +128,16 @@ npm test
 npm run check
 ```
 
-项目把四个 Pi devDependencies 精确固定在 `0.85.1`，`npm run check` 针对这些本地依赖校验代码。需要版本匹配的交互启动时，运行 `node node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`；若改用全局 `pi` CLI，请安装相同 `0.85.1` 并启动新进程。`/reload` 只在当前运行进程内重载扩展，不会升级当前 runtime，因此旧全局安装永远不会切换既有会话。Rail 不会自动升级全局 CLI。
+项目把四个 Pi devDependencies 精确固定在 `0.86.0`，`npm run check` 针对这些本地依赖校验代码。需要版本匹配的交互启动时，运行 `node node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`；若改用全局 `pi` CLI，请安装相同 `0.86.0` 并启动新进程。`/reload` 只在当前运行进程内重载扩展，不会升级当前 runtime，因此旧全局安装永远不会切换既有会话。Rail 不会自动升级全局 CLI。
+
+为避免个人 Pi 设置影响测试，可使用临时 agent 目录执行可复现检查：
+
+```bash
+agent_dir=$(mktemp -d)
+PI_CODING_AGENT_DIR="$agent_dir" PI_OFFLINE=1 PI_TELEMETRY=0 npm run check
+```
+
+测试使用本地 mock provider 和仓库内的 Pi bundle，不调用付费模型。共享迁移与 Team 整合的范围、验证结果分别见 [Pi 0.86.0 迁移报告](docs/pi-0.86.0-migration.md)和 [Team 适配报告](docs/subagent-team-pi-0.86.0.md)；后者还覆盖 coordinator 停在轮间等待且有模型变更排队时，shutdown／删除操作的取消与收尾。
 
 ## 命令
 
@@ -170,7 +181,7 @@ Pi Rail UI 注册了以下 slash 命令：
 
 ### `/rail-oai-fast`
 
-切换当前模型的 Pi 0.85.1 原生 OpenAI-compatible priority service tier：
+切换当前模型的 Pi 0.86.0 原生 OpenAI-compatible priority service tier：
 
 ```text
 /rail-oai-fast on|off|status

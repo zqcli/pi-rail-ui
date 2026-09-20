@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
 import { HOSTED_SEARCH_ENTRY_TYPE } from "../../openai/hosted-search-activity";
 import { RunResultCollector, assistantText, strictAssistantText, type SubagentRunEvent } from "../../tools/subagents/run-result";
 
@@ -24,6 +26,166 @@ function hostedSearchEvent(id: string, callIds: string[]): SubagentRunEvent {
 		},
 	};
 }
+
+function usageEvent(kind = "cache_warm"): SubagentRunEvent {
+	const usage: Usage = {
+		input: 2, output: 1, cacheRead: 100, cacheWrite: 4, totalTokens: 107,
+		cost: { input: 0, output: 0, cacheRead: 0.125, cacheWrite: 0, total: 0.125 },
+	};
+	const manager = SessionManager.inMemory("/tmp/usage-test");
+	return { type: "entry_appended", entry: manager.appendUsage(kind, "anthropic", "fixture", usage) };
+}
+
+function toolResultMessage(toolCallId = "nested-1") {
+	return {
+		role: "toolResult" as const, toolCallId, toolName: "nested", content: [], isError: false, timestamp: 1000,
+		usage: { input: 8, output: 2, cacheRead: 16, cacheWrite: 4, totalTokens: 30,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 } },
+	};
+}
+
+test("standalone usage is counted once alongside live, tool-result, assistant and compaction events", () => {
+	const collector = new RunResultCollector("mixed usage", assistantText);
+	const warm = usageEvent();
+	assert.equal(collector.ingest(warm), true);
+	assert.deepEqual(collector.result("").usage, {
+		input: 2, output: 1, cacheRead: 100, cacheWrite: 4, cost: 0.125, contextTokens: 0, turns: 0,
+	});
+	collector.ingest({ type: "message_update", usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.25 } } });
+	assert.equal(collector.result("").usage.cost, 0.375);
+	assert.equal(collector.result("").usage.contextTokens, 12);
+	assert.equal(collector.result("").usage.turns, 1);
+	assert.equal(collector.ingest(structuredClone(warm)), false);
+	const toolMessage = toolResultMessage();
+	collector.ingest({ type: "entry_appended", entry: { type: "message", id: "t1", message: toolMessage } });
+	collector.ingest({ type: "tool_execution_end", toolCallId: toolMessage.toolCallId, result: toolMessage });
+	assert.equal(collector.result("").usage.cost, 0.375);
+	collector.ingest({ type: "message_end", message: toolMessage });
+	assert.deepEqual(collector.result("").usage, {
+		input: 20, output: 5, cacheRead: 116, cacheWrite: 8, cost: 0.875, contextTokens: 12, turns: 1,
+	});
+	const message = { role: "assistant", content: [], usage: { input: 20, output: 3, totalTokens: 23, cost: { total: 0.5 } } };
+	const result = { summary: "private", usage: { input: 30, output: 5, totalTokens: 35, cost: { total: 0.25 } } };
+	collector.ingest({ type: "entry_appended", entry: { type: "message", id: "m1", message } });
+	collector.ingest({ type: "message_end", message });
+	collector.ingest({ type: "compaction_start" });
+	collector.ingest({ type: "entry_appended", entry: { type: "compaction", id: "c1", ...result } });
+	collector.ingest({ type: "compaction_end", result });
+	collector.ingest({ type: "compaction_end", result });
+	collector.ingest({ type: "entry_appended", entry: { type: "message", id: "m1", message } });
+	collector.ingest(warm);
+	collector.ingest({ type: "entry_appended", entry: { type: "message", id: "t1", message: toolMessage } });
+	collector.ingest({ type: "message_end", message: structuredClone(toolMessage) });
+	assert.equal(collector.ingest(usageEvent("future_operation")), true);
+	assert.deepEqual(collector.result("").usage, {
+		input: 62, output: 12, cacheRead: 216, cacheWrite: 12, cost: 1.5, contextTokens: 23, turns: 1,
+	});
+});
+
+test("tool-result usage is counted once per call and run, only on message_end", () => {
+	for (const extract of [assistantText, strictAssistantText]) {
+		const collector = new RunResultCollector("tool usage", extract);
+		const message = toolResultMessage();
+		const entryEvent = { type: "entry_appended", entry: { type: "message", id: "t1", message } };
+		collector.ingest({ type: "message_end", message: { ...message, usage: undefined } });
+		assert.equal(collector.result("").usage.cost, 0);
+		assert.equal(collector.ingest({ type: "message_end", message }), true);
+		const expected = { input: 8, output: 2, cacheRead: 16, cacheWrite: 4, cost: 0.5, contextTokens: 0, turns: 0 };
+		assert.deepEqual(collector.result("").usage, expected);
+		collector.ingest(entryEvent);
+		collector.ingest({ type: "tool_execution_end", toolCallId: message.toolCallId, result: message });
+		collector.ingest({ type: "agent_end", willRetry: true });
+		collector.ingest({ type: "agent_start" });
+		collector.ingest({ type: "message_end", message: structuredClone(message) });
+		assert.deepEqual(collector.result("").usage, expected);
+		collector.ingest({ type: "message_end", message: toolResultMessage("nested-2") });
+		assert.equal(collector.result("").usage.cost, 1);
+		const next = new RunResultCollector("next send", extract);
+		next.ingest({ type: "message_end", message });
+		assert.deepEqual(next.result("").usage, expected);
+	}
+});
+
+test("usage dedup survives agent retries and compaction boundaries but is scoped to each run", () => {
+	const collector = new RunResultCollector("first send", assistantText);
+	const warm = usageEvent();
+	collector.ingest(warm);
+	collector.ingest({ type: "agent_end", willRetry: true });
+	collector.ingest({ type: "agent_start" });
+	collector.ingest({ type: "compaction_start" });
+	collector.ingest({ type: "compaction_end" });
+	assert.equal(collector.ingest(structuredClone(warm)), false);
+	assert.equal(collector.ingest(usageEvent()), true);
+	collector.ingest({ type: "agent_settled" });
+	const final = collector.result("");
+	assert.equal(collector.ingest(usageEvent()), false);
+	assert.deepEqual(collector.result(""), final);
+	const nextRun = new RunResultCollector("next send on persistent worker", assistantText);
+	assert.equal(nextRun.ingest(warm), true);
+	assert.equal(nextRun.result("").usage.cost, 0.125);
+});
+
+test("terminal lifecycle methods and transport failure exclude late idle usage", () => {
+	for (const settle of [
+		(c: RunResultCollector) => c.markSettled(),
+		(c: RunResultCollector) => c.markAborted(),
+		(c: RunResultCollector) => c.noteError("failed"),
+		(c: RunResultCollector) => c.ingest({ type: "transport_error" }),
+	]) {
+		const collector = new RunResultCollector("terminal", assistantText);
+		collector.ingest(usageEvent());
+		settle(collector);
+		assert.equal(collector.ingest(usageEvent()), false);
+		assert.equal(collector.result("").usage.cost, 0.125);
+	}
+});
+
+test("all usage stays frozen after settlement even while the persistent transport is subscribed", () => {
+	for (const settle of [
+		(c: RunResultCollector) => c.ingest({ type: "agent_settled" }),
+		(c: RunResultCollector) => c.markSettled(),
+		(c: RunResultCollector) => c.markAborted(),
+		(c: RunResultCollector) => c.noteError("failed"),
+		(c: RunResultCollector) => c.ingest({ type: "transport_error" }),
+	]) {
+		const collector = new RunResultCollector("persistent send", assistantText);
+		const message = { role: "assistant", content: [], usage: { input: 20, output: 3, totalTokens: 23, cost: { total: 0.5 } } };
+		collector.ingest({ type: "message_end", message });
+		collector.ingest(usageEvent());
+		collector.ingest({ type: "message_end", message: toolResultMessage() });
+		collector.ingest(hostedSearchEvent("before-settle", ["ws_before"]));
+		collector.ingest({ type: "message_update", usage: message.usage });
+		settle(collector);
+		const completedUsage = collector.result("").usage;
+		for (const event of [
+			usageEvent(),
+			hostedSearchEvent("after-settle", ["ws_late"]),
+			{ type: "agent_start" },
+			{ type: "message_update", usage: { input: 1000, totalTokens: 1000 } },
+			{ type: "message_end", message },
+			{ type: "message_end", message: toolResultMessage() },
+			{ type: "message_end", message: toolResultMessage("late-tool") },
+			{ type: "entry_appended", entry: { type: "message", id: "late-entry", message: toolResultMessage("late-entry-tool") } },
+			{ type: "tool_execution_end", toolCallId: "late-execution", result: toolResultMessage("late-execution") },
+			{ type: "compaction_start" },
+			{ type: "compaction_end", result: { usage: message.usage } },
+		]) {
+			collector.ingest(event);
+			assert.deepEqual(collector.result("").usage, completedUsage, `late ${event.type}`);
+		}
+	}
+});
+
+test("ignores malformed standalone entries without consuming their ids", () => {
+	const collector = new RunResultCollector("invalid usage", assistantText);
+	const event = usageEvent();
+	const entry = event["entry"] as Record<string, unknown>;
+	for (const invalid of [null, [], { ...entry, id: "" }, { ...entry, id: undefined }, { ...entry, usage: null }]) {
+		assert.equal(collector.ingest({ type: "entry_appended", entry: invalid }), false);
+	}
+	assert.equal(collector.ingest(event), true);
+	assert.equal(collector.result("").usage.cost, 0.125);
+});
 
 test("reports live usage during a turn and completed usage after message_end", () => {
 	const collector = new RunResultCollector("live usage", assistantText);

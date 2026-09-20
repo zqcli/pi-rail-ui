@@ -1,6 +1,5 @@
 import { TeamRpcConnection } from "./team-rpc";
 import { teamExtensionPath } from "./team-protocol";
-import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
@@ -11,8 +10,11 @@ import {
 	ContextProtocolError,
 	ContextWindowValidationError,
 	contextExtensionPath,
+	createChildContextSettings,
 	formatContextWindow,
+	normalizeContextWindow,
 	readContextProtocolError,
+	resolveChildContextCwd,
 	validateContextWindowReserve,
 } from "./context-window";
 import { railModelKey, type RailModelRef } from "./models";
@@ -76,6 +78,7 @@ export class RpcSessionWorker implements SessionWorker {
 	) {}
 	private unusable = false;
 	private runInFlight = false;
+	private modelChangeInFlight = false;
 
 	static async connect(spec: WorkerStartSpec, transport: RpcTransport): Promise<RpcSessionWorker> {
 		const state = await transport.request({ type: "get_state" }) as RpcState;
@@ -111,7 +114,7 @@ export class RpcSessionWorker implements SessionWorker {
 			state.sessionId,
 			state.sessionFile,
 			transport,
-			spec.cwd,
+			await resolveChildContextCwd(spec.cwd, { mode: "open", path: state.sessionFile }),
 			stateModel.provider,
 			stateModel.id,
 		);
@@ -129,7 +132,7 @@ export class RpcSessionWorker implements SessionWorker {
 
 	private validateBudget(value: number | undefined): number | undefined {
 		if (value === undefined) return undefined;
-		const settings = SettingsManager.create(this.cwd, getAgentDir()).getCompactionSettings();
+		const settings = createChildContextSettings(this.cwd).getCompactionSettings({ provider: this.modelProvider, id: this.modelId });
 		return validateContextWindowReserve(value, settings.reserveTokens, settings.enabled);
 	}
 
@@ -196,13 +199,13 @@ export class RpcSessionWorker implements SessionWorker {
 	}
 
 	private async prepareContext(contextWindow: number | undefined): Promise<number | undefined> {
-		const value = this.validateBudget(contextWindow);
-		if (value === undefined) return undefined;
+		if (contextWindow === undefined) return undefined;
 		let commandSent = false;
 		let restoreWindow: number | undefined;
 		try {
 			const before = await this.state();
 			this.assertModelState(before);
+			const value = this.validateBudget(contextWindow)!;
 			if (before.isStreaming === true || before.isCompacting === true) {
 				throw this.protocolFailure("Rail context protocol expected an idle child before its private command");
 			}
@@ -228,13 +231,14 @@ export class RpcSessionWorker implements SessionWorker {
 	async send(task: string, options: WorkerSendOptions = {}): Promise<WorkerRunResult> {
 		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
 		if (this.runInFlight) throw new ContextProtocolError("Subagent RPC worker received an overlapping run");
+		if (this.modelChangeInFlight) throw new ContextProtocolError("Subagent model change is in progress");
 		if (options.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
 		this.runInFlight = true;
 		let restoreWindow: number | undefined;
 		const team = options.team ? new TeamRpcConnection(this.transport, options.team, options.signal) : undefined;
 		try {
 			if (team) await team.bind();
-			restoreWindow = await this.prepareContext(options.contextWindow);
+			restoreWindow = await this.prepareContext(normalizeContextWindow(options.contextWindow));
 		} catch (error) {
 			if (team) { this.unusable = true; await team.close().catch(() => undefined); }
 			this.runInFlight = false;
@@ -382,6 +386,16 @@ export class RpcSessionWorker implements SessionWorker {
 	}
 
 	async setModel(model: RailModelRef): Promise<RailModelRef> {
+		if (this.runInFlight || this.modelChangeInFlight) throw new ContextProtocolError("Subagent model change requires an idle worker");
+		this.modelChangeInFlight = true;
+		try {
+			return await this.changeModel(model);
+		} finally {
+			this.modelChangeInFlight = false;
+		}
+	}
+
+	private async changeModel(model: RailModelRef): Promise<RailModelRef> {
 		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
 		const before = await this.state();
 		this.assertModelState(before);

@@ -15,7 +15,7 @@ import {
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth, resolveSessionId } from "./auth";
 import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, findLatestNativeHistoryBoundaryInRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
 import { compactionIdentity, identitiesMatch, type CompactionIdentity } from "./model-eligibility";
-import { getCompactionRequestExtras, rememberRequestContext } from "./request-context";
+import { resolveCompactionRequestExtras, rememberRequestContext } from "./request-context";
 import {
 	executeRemoteCompactionV2,
 	type RemoteCompactionResult,
@@ -222,9 +222,19 @@ export async function runRemoteCompaction(args: {
 	});
 	if (!request.ok) return { outcome: "failed", reason: request.reason };
 
-	const instructions = mergeCompactionInstructions(ctx.getSystemPrompt(), event.customInstructions);
+	const transcript = requestTranscript(event.branchEntries);
+	// Pi renders the effective current prompt, including before_agent_start's
+	// systemPrompt/forceSystemPrompt override, which is not persisted. This is a
+	// complete prompt, not a delta: appending transcript patches duplicates them.
+	const systemPrompt = ctx.getSystemPrompt();
+	const instructions = mergeCompactionInstructions(systemPrompt, event.customInstructions);
 	const body: Record<string, unknown> = { model: model.id, input: request.input, instructions };
-	const extras = getCompactionRequestExtras(auth.identity, sessionId);
+	let extras;
+	try {
+		extras = resolveCompactionRequestExtras(model, auth.identity, sessionId, transcript);
+	} catch (error) {
+		return { outcome: "failed", reason: "tool-declarations-invalid", detail: error instanceof Error ? error.message : String(error) };
+	}
 	if (extras) {
 		if (extras.tools) body["tools"] = extras.tools;
 		if (extras.parallel_tool_calls !== undefined) body["parallel_tool_calls"] = extras.parallel_tool_calls;
@@ -475,10 +485,28 @@ function currentBranchMessagesBeforeCut(
 	return rebuildNativeHistoryPrefix(branchEntries, cutIndex)?.messages;
 }
 
+/** Resolve declaration state independently of the conversation's compaction cut. */
+function requestTranscript(branchEntries: readonly SessionEntry[]) {
+	const messages: AgentMessage[] = [];
+	for (const entry of branchEntries) {
+		if (entry.type === "compaction" && entry.systemMessage) {
+			// A full checkpoint replaces all earlier deltas, including kept ones.
+			messages.length = 0;
+			messages.push(entry.systemMessage);
+		} else if (entry.type === "message" && entry.message.role === "system") {
+			messages.push(...sessionEntryToContextMessages(entry));
+		}
+		// Legacy compactions have no system snapshot. Keep replaying the real
+		// declarations even when only a partial delta follows that compaction.
+	}
+	return convertToLlm(messages);
+}
+
 export function rememberLiveRequestContext(ctx: ExtensionContext, payload: unknown): void {
 	const model = ctx.model;
 	if (!model) return;
-	rememberRequestContext(payload, compactionIdentity(model), resolveSessionId(ctx));
+	const branch = ctx.sessionManager.getBranch();
+	rememberRequestContext(payload, compactionIdentity(model), resolveSessionId(ctx), requestTranscript(branch));
 }
 
 export type ContextReplayDecision =

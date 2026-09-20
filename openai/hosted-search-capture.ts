@@ -1,6 +1,6 @@
 import type {
 	Api,
-	Context,
+	TranscriptContext,
 	FetchFunction,
 	Model,
 	SimpleStreamOptions,
@@ -163,7 +163,7 @@ export class HostedSearchProviderCapture {
 		const previousConfig = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
 		const wrapper = (
 			requestModel: Model<Api>,
-			context: Context,
+			context: TranscriptContext,
 			options?: SimpleStreamOptions,
 		) => {
 			let nextOptions = options;

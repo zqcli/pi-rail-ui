@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Provider } from "@earendil-works/pi-ai";
+import { normalizeContext, type Provider, type SimpleStreamOptions, type TranscriptContext } from "@earendil-works/pi-ai";
+import type { ProviderConfig } from "@earendil-works/pi-coding-agent";
 import {
 	HostedSearchProviderCapture,
 	createHostedSearchObservedFetch,
@@ -22,7 +23,8 @@ function eventStream(...events: unknown[]): Response {
 function fakeRuntime(options: { previousConfig?: any; native?: Provider } = {}) {
 	const configs = new Map<string, any>();
 	if (options.previousConfig) configs.set("custom", options.previousConfig);
-	let lastOptions: any;
+	let lastOptions: SimpleStreamOptions | undefined;
+	let lastContext: TranscriptContext | undefined;
 	const provider: Provider = {
 		id: "custom",
 		name: "Custom",
@@ -31,6 +33,7 @@ function fakeRuntime(options: { previousConfig?: any; native?: Provider } = {}) 
 		stream: () => ({}) as any,
 		streamSimple: (_model, _context, streamOptions) => {
 			lastOptions = streamOptions;
+			lastContext = _context;
 			return { original: true } as any;
 		},
 	};
@@ -51,7 +54,7 @@ function fakeRuntime(options: { previousConfig?: any; native?: Provider } = {}) 
 		},
 	};
 	const ctx: any = { model, modelRegistry: registry, ui: { setStatus() {} } };
-	return { configs, provider, registry, pi, ctx, calls, getLastOptions: () => lastOptions };
+	return { configs, provider, registry, pi, ctx, calls, getLastOptions: () => lastOptions, getLastContext: () => lastContext };
 }
 
 test("observed fetch returns the original response and captures hosted search SSE", async () => {
@@ -77,8 +80,8 @@ test("observed fetch returns the original response and captures hosted search SS
 		},
 		{ type: "response.completed", response: { id: "resp_capture", completed_at: 2, output: [] } },
 	);
-	assert.deepEqual(wrapper(model, {}, { fetch: async () => response }), { original: true });
-	const fetch = runtime.getLastOptions().fetch;
+	assert.deepEqual(wrapper(model, normalizeContext({ messages: [] }), { fetch: async () => response }), { original: true });
+	const fetch = runtime.getLastOptions()!.fetch!;
 	const observedFetch = createHostedSearchObservedFetch(
 		async () => response,
 		new HostedSearchActivity({ provider: "custom", model: "gpt" }),
@@ -97,6 +100,79 @@ test("observed fetch returns the original response and captures hosted search SS
 	assert.equal(snapshot?.calls[0]?.type, "open_page");
 	assert.equal(snapshot?.sources[0]?.url, "https://example.com/current");
 	assert.equal(activityEvents.includes("running"), true);
+});
+
+test("provider wrapper forwards the normalized transcript and preserves callbacks and options", () => {
+	const runtime = fakeRuntime();
+	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
+		isEnabled: () => true,
+		onActivityChanged() {},
+	});
+	assert.equal(capture.sync(runtime.ctx, true), true);
+	const wrapper: NonNullable<ProviderConfig["streamSimple"]> = runtime.configs.get("custom").streamSimple;
+	const context = normalizeContext({
+		systemPrompt: "keep the prompt",
+		messages: [
+			{ role: "user", content: "question", timestamp: 1 },
+			{ role: "system", content: "later system update", timestamp: 2 },
+		],
+	});
+	const options: SimpleStreamOptions = {
+		fetch: async () => new Response("local fixture"),
+		apiKey: "fixture-key",
+		sessionId: "fixture-session",
+		cacheRetention: "long",
+		reasoning: "high",
+		signal: new AbortController().signal,
+		headers: { "x-test": "preserved" },
+		maxTokens: 123,
+		onPayload: (payload) => payload,
+		onResponse: () => {},
+	};
+	Object.freeze(options);
+	wrapper(model, context);
+	assert.equal(runtime.getLastOptions(), undefined);
+	wrapper(model, context, options);
+	assert.equal(runtime.getLastContext(), context);
+	assert.equal(runtime.getLastOptions(), options);
+	capture.startTurn();
+	wrapper(model, context, options);
+	const forwarded = runtime.getLastOptions()!;
+	assert.equal(runtime.getLastContext(), context);
+	assert.notEqual(forwarded.fetch, options.fetch);
+	assert.deepEqual({ ...forwarded, fetch: options.fetch }, options);
+	assert.equal(forwarded.onPayload, options.onPayload);
+	assert.equal(forwarded.onResponse, options.onResponse);
+	capture.shutdown();
+});
+
+test("active capture uses global fetch when options are absent and bypasses disabled models", async (t) => {
+	const response = new Response("fixture");
+	const baseFetch = t.mock.fn(async () => response);
+	t.mock.method(globalThis, "fetch", baseFetch);
+	const runtime = fakeRuntime();
+	let enabled = true;
+	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
+		isEnabled: () => enabled,
+		onActivityChanged() {},
+	});
+	t.after(() => capture.shutdown());
+	capture.sync(runtime.ctx, true);
+	capture.startTurn();
+	const wrapper: NonNullable<ProviderConfig["streamSimple"]> = runtime.configs.get("custom").streamSimple;
+	const context = normalizeContext({ messages: [] });
+	wrapper(model, context);
+	const forwardedFetch = runtime.getLastOptions()!.fetch!;
+	const init = { headers: { "x-test": "unchanged" } };
+	assert.equal(await forwardedFetch("https://example.com/other", init), response);
+	assert.deepEqual(baseFetch.mock.calls[0]?.arguments, ["https://example.com/other", init]);
+	assert.equal(runtime.getLastContext(), context);
+	enabled = false;
+	const options: SimpleStreamOptions = { maxTokens: 10 };
+	wrapper(model, context, options);
+	assert.equal(runtime.getLastOptions(), options);
+	wrapper(model, context);
+	assert.equal(runtime.getLastOptions(), undefined);
 });
 
 test("settles observation on DONE even when the SSE connection stays open", async () => {

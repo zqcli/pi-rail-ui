@@ -17,7 +17,7 @@ import { installTeamTool } from "../../tools/subagents/team-tool";
 import { installStatefulSubagentTool } from "../../tools/subagents/tool";
 import type { TeamSnapshot } from "../../tools/subagents/team-protocol";
 
-const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/cli.js", import.meta.url));
+const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const fixture = fileURLToPath(new URL("../fixtures/team-coordination-provider.mjs", import.meta.url));
 const nativeModel = { provider: "rail-team-e2e", id: "probe", name: "Team probe", api: "rail-team-e2e-api", contextWindow: 128000 };
 
@@ -202,7 +202,8 @@ test("native parent rejects a lone team call without starting members, then corr
 	ctx.sessionManager = { getBranch: () => branch };
 	let requests = 0;
 	const messages = await runAgentLoop([{ role: "user", content: "Start both team siblings", timestamp: Date.now() }], {
-		systemPrompt: "Local parent integration probe", messages: [],
+		// Pi 0.86 carries the prompt in transcript system messages; AgentContext has no systemPrompt field.
+		messages: [{ role: "system", content: "Local parent integration probe", timestamp: Date.now() }],
 		tools: [{ ...tool, execute: (id: string, params: any, signal: AbortSignal, onUpdate: any) => tool.execute(id, params, signal, onUpdate, ctx) }],
 	}, { model: nativeModel as any, convertToLlm: (items) => items as any, toolExecution: "parallel" }, (event) => {
 		// Mirror native AgentSession's public in-memory branch after message_end.

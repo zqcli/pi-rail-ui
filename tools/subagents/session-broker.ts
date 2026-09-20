@@ -1,8 +1,7 @@
 import type { TeamDispatchChannel, TeamWorkerChannel } from "./team-protocol";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
-import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { ContextProtocolError, ContextWindowValidationError, normalizeContextWindow, validateContextWindowReserve } from "./context-window";
+import { ContextProtocolError, ContextWindowValidationError, createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";
 import { assertValidAgentAlias } from "./identity";
 import type { RailModelRef } from "./models";
 import { buildSubagentSessionName } from "./session-name";
@@ -293,7 +292,10 @@ export class SessionBroker {
 		if (Boolean(request.model) === Boolean(request.target)) {
 			throw new Error("Provide exactly one of model (new instance) or target (existing instance)");
 		}
-		if (contextWindow !== undefined && request.model) this.validateContextWindow(contextWindow, request.cwd ?? this.defaultCwd);
+		if (contextWindow !== undefined && request.model) {
+			const cwd = await resolveChildContextCwd(request.cwd ?? this.defaultCwd, request.session);
+			this.validateContextWindow(contextWindow, cwd, request.model);
+		}
 		if (request.team && (request.target || !request.alias || request.session)) throw new Error("Team dispatch requires a new persistent session");
 		const requestedAgentId = request.target ? (this.roster.resolve(request.target) ?? request.target) : undefined;
 		if (request.target && (this.teamAliases.has(request.target) || (requestedAgentId && this.teamActive.has(requestedAgentId)))) throw new Error("Subagent target has an active team operation");
@@ -334,12 +336,18 @@ export class SessionBroker {
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 			}
 			if (request.team && signal?.aborted) throw new Error("Team request was aborted during startup");
-			if (contextWindow !== undefined) this.validateContextWindow(contextWindow, resolvedInstance.cwd);
+			if (request.target && contextWindow !== undefined) await this.validateContextWindowForTarget(request.target, contextWindow);
 			if (request.target && !this.roster.resolve(request.target)) this.roster.link(resolvedInstance.alias, resolvedInstance.agentId);
 			request.onUpdate?.({ instance: resolvedInstance, run: { output: "(starting...)", usage: emptySubagentUsage() } });
 			const currentState = await this.workerState(resolvedInstance, expectedEpoch);
 			state = currentState;
 			return await this.enqueue(currentState, async () => {
+				// Model changes share this queue. Validate the descriptor paired with
+				// this worker, not the earlier store snapshot used to resolve the target.
+				if (contextWindow !== undefined) {
+					const cwd = await resolveChildContextCwd(currentState.instance.cwd, { mode: "open", path: currentState.worker.sessionFile });
+					this.validateContextWindow(contextWindow, cwd, currentState.instance.model);
+				}
 				let task: string | undefined = request.task;
 				let run!: WorkerRunResult;
 				let usage = emptySubagentUsage();
@@ -500,9 +508,16 @@ export class SessionBroker {
 	}
 
 	async validateContextWindowForTarget(target: string, contextWindow: number): Promise<void> {
-		const instance = await this.resolveInstance(target);
-		const settings = SettingsManager.create(instance.cwd, getAgentDir()).getCompactionSettings();
-		validateContextWindowReserve(contextWindow, settings.reserveTokens, settings.enabled);
+		let instance = await this.resolveInstance(target);
+		// A queued model change can make persisted target metadata stale. This is
+		// only preflight; dispatch revalidates inside the worker's operation queue.
+		while (this.modelChanges.has(instance.agentId)) {
+			await this.modelChanges.get(instance.agentId);
+			instance = await this.resolveInstance(target);
+		}
+		const selected = this.workers.get(instance.agentId)?.instance ?? instance;
+		const cwd = await resolveChildContextCwd(selected.cwd, { mode: "open", path: selected.sessionFile });
+		this.validateContextWindow(contextWindow, cwd, selected.model);
 	}
 
 	async listLinked(): Promise<AgentInstance[]> {
@@ -637,6 +652,7 @@ export class SessionBroker {
 
 	async changeModel(target: string, model: RailModelRef): Promise<AgentInstance> {
 		const instance = await this.resolveInstance(target);
+		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		if (this.deletingAgents.has(instance.agentId)) throw new Error("Subagent is being deleted");
 		if (this.workerStarts.has(instance.agentId)) throw new Error("Subagent worker is still starting");
 		if (this.modelChanges.has(instance.agentId)) throw new Error("Subagent model change is already pending");
@@ -645,6 +661,7 @@ export class SessionBroker {
 			const state = this.workers.get(instance.agentId);
 			const apply = async () => {
 				const latest = await this.store.get(instance.agentId) ?? instance;
+				if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 				if (!state) {
 					const updated = { ...latest, model: structuredClone(model), updatedAt: new Date().toISOString() };
 					await this.store.put(updated);
@@ -657,6 +674,7 @@ export class SessionBroker {
 					const updated = { ...latest, model: structuredClone(effective), updatedAt: new Date().toISOString() };
 					await this.store.put(updated);
 					this.commitInstanceSnapshot(updated);
+					state.instance = updated;
 					return updated;
 				} catch (error) {
 					try {
@@ -672,7 +690,6 @@ export class SessionBroker {
 				}
 			};
 			const updated = state ? await this.enqueue(state, apply) : await apply();
-			if (state) state.instance = updated;
 			this.runtimeErrors.delete(instance.agentId);
 			this.emitRuntimeChange();
 			return updated;
@@ -688,11 +705,16 @@ export class SessionBroker {
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true;
 		for (const state of this.workers.values()) state.stopping = true;
-		await Promise.allSettled([...this.workerStarts.values(), ...this.instanceCreations, ...this.fastModeChanges.values(), ...this.modelChanges.values()]);
+		// Cancel in-flight team dispatches so their tails settle instead of parking
+		// between coordinator rounds.
+		for (const operation of this.teamActive.values()) operation.abort();
+		// Stop active sends before awaiting model changes queued behind them.
+		await Promise.allSettled([...this.workerStarts.values(), ...this.instanceCreations, ...this.fastModeChanges.values()]);
 		const states = Array.from(this.workers.values());
 		this.workers.clear();
 		for (const state of states) state.stopping = true;
 		await Promise.allSettled(states.map((state) => state.worker.stop()));
+		await Promise.allSettled(this.modelChanges.values());
 		await Promise.allSettled(states.flatMap((state) => [state.tail, state.controlTail]));
 		this.emitRuntimeChange();
 	}
@@ -716,6 +738,9 @@ export class SessionBroker {
 		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
 		const state = this.workers.get(agentId);
 		if (state) state.stopping = true;
+		// Cancel an in-flight team dispatch before awaiting maintenance queued behind
+		// it; the coordinator's round barrier would otherwise park delete forever.
+		this.teamActive.get(agentId)?.abort();
 		this.emitRuntimeChange();
 		try {
 			const pending = [this.fastModeChanges.get(agentId), this.modelChanges.get(agentId)]
@@ -916,6 +941,10 @@ export class SessionBroker {
 				}
 			}
 			state.queued--;
+			if (this.shuttingDown) {
+				this.emitRuntimeChange();
+				throw new Error("Subagent broker is shutting down");
+			}
 			state.active = true;
 			const runId = kind === "run" ? ++state.nextRunId : undefined;
 			state.activeRunId = runId;
@@ -983,8 +1012,8 @@ export class SessionBroker {
 		return this.lifecycleEpochs.get(agentId) ?? 0;
 	}
 
-	private validateContextWindow(contextWindow: number, cwd: string): void {
-		const settings = SettingsManager.create(cwd, getAgentDir()).getCompactionSettings();
+	private validateContextWindow(contextWindow: number, cwd: string, model: RailModelRef): void {
+		const settings = createChildContextSettings(cwd).getCompactionSettings({ provider: model.provider, id: model.modelId });
 		validateContextWindowReserve(contextWindow, settings.reserveTokens, settings.enabled);
 	}
 }

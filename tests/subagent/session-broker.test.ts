@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
 import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
 import {
@@ -286,6 +287,206 @@ function setup() {
 }
 
 describe("SessionBroker", () => {
+	test("shutdown stops an active send before draining a queued model change", { timeout: 2000 }, async () => {
+		const { broker, workers, store } = setup();
+		const instance = await broker.attach({ model: reviewerModel(), alias: "shutdown-model" });
+		const worker = workers[0]!;
+		const started = Promise.withResolvers<void>();
+		const stopped = Promise.withResolvers<void>();
+		let modelUpdates = 0;
+		worker.send = async () => {
+			started.resolve();
+			await stopped.promise;
+			return { output: "stopped", usage: emptyUsage() };
+		};
+		worker.stop = async () => { worker.stopped = true; stopped.resolve(); };
+		worker.setModel = async (model) => { modelUpdates++; return model; };
+		const sending = broker.dispatch({ target: instance.agentId, task: "wait for stop" });
+		await started.promise;
+		const changing = broker.changeModel(instance.agentId, { provider: "test", modelId: "never-applied" });
+		const rejected = assert.rejects(changing, /shutting down/);
+		// Let resolveInstance finish so the model operation is actually queued.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(broker.runtimeStatus(instance.agentId).queued, 1);
+		await broker.shutdown();
+		await sending;
+		await rejected;
+		assert.equal(worker.stopped, true);
+		assert.equal(modelUpdates, 0);
+		assert.deepEqual((await store.get(instance.agentId))?.model, reviewerModel());
+		await assert.rejects(broker.changeModel(instance.agentId, reviewerModel()), /shutting down/);
+	});
+
+	test("team continuation serializes a queued model change until the coordinator's rounds settle", async () => {
+		const store = new MemoryInstanceStore();
+		const roster = new MemoryRoster();
+		const worker = new FakeWorker("team-model-session", "/tmp/team-model-session.jsonl");
+		const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
+		let release!: () => void;
+		const barrier = new Promise<void>((resolve) => { release = resolve; });
+		let waiting!: () => void;
+		const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
+		let rounds = 0;
+		const nextModel = { provider: "test", modelId: "queued-after-rounds" };
+		const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-model", task: "round-1", team: {
+			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
+			onRequest: async () => ({ ok: true }),
+			afterRun: async () => { if (++rounds === 1) { waiting(); await barrier; return "round-2"; } return undefined; },
+		} });
+		await atBarrier;
+		let setModelCalls = 0;
+		let sendsAtSetModel = -1;
+		worker.setModel = async (model) => { setModelCalls++; sendsAtSetModel = worker.tasks.length; return model; };
+		const changing = broker.changeModel("team-model", nextModel);
+		release();
+		const result = await dispatch;
+		await changing;
+		assert.equal(setModelCalls, 1);
+		assert.equal(sendsAtSetModel, 2);
+		assert.deepEqual(worker.tasks, ["round-1", "round-2"]);
+		assert.equal(result.run.usage.turns, 2);
+		const agentId = roster.resolve("team-model")!;
+		assert.deepEqual((await store.get(agentId))?.model, nextModel);
+		assert.equal(broker.runtimeStatus(agentId).phase, "idle");
+		await broker.shutdown();
+	});
+
+	test("shutdown cancels a coordinator waiting between rounds before draining a queued model change", { timeout: 2000 }, async () => {
+		const store = new MemoryInstanceStore();
+		const roster = new MemoryRoster();
+		const worker = new FakeWorker("team-halt-session", "/tmp/team-halt-session.jsonl");
+		const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
+		let waiting!: () => void;
+		const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
+		const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-halt", task: "initial", team: {
+			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
+			onRequest: async () => ({ ok: true }),
+			afterRun: async (_run, signal) => new Promise<undefined>((_resolve, reject) => {
+				signal!.addEventListener("abort", () => reject(new Error("coordinator barrier aborted")), { once: true });
+				waiting();
+			}),
+		} });
+		const rejected = assert.rejects(dispatch, /barrier aborted/);
+		await atBarrier;
+		const changing = broker.changeModel("team-halt", { provider: "test", modelId: "never-applied" });
+		const rejectedChange = assert.rejects(changing, /shutting down/);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(broker.runtimeStatus(roster.resolve("team-halt")!).queued, 1);
+		await broker.shutdown();
+		await rejected;
+		await rejectedChange;
+		assert.equal(worker.stopped, true);
+		assert.deepEqual(worker.tasks, ["initial"]);
+		assert.deepEqual((await store.get(roster.resolve("team-halt")!))?.model, reviewerModel());
+	});
+
+	test("delete cancels a coordinator waiting between rounds before converging a queued model change", { timeout: 2000 }, async (t) => {
+		const root = await mkdtemp(join(tmpdir(), "rail-team-delete-"));
+		t.after(() => rm(root, { recursive: true, force: true }));
+		const sessionFile = join(root, "child.jsonl");
+		await writeFile(sessionFile, "");
+		const store = new MemoryInstanceStore();
+		const roster = new MemoryRoster();
+		const worker = new FakeWorker("team-delete-session", sessionFile);
+		const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
+		let waiting!: () => void;
+		const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
+		const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-delete", task: "initial", team: {
+			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
+			onRequest: async () => ({ ok: true }),
+			afterRun: async (_run, signal) => new Promise<undefined>((_resolve, reject) => {
+				signal!.addEventListener("abort", () => reject(new Error("coordinator barrier aborted")), { once: true });
+				waiting();
+			}),
+		} });
+		const rejected = assert.rejects(dispatch, /barrier aborted/);
+		await atBarrier;
+		const agentId = roster.resolve("team-delete")!;
+		// The change queues behind the parked team operation; delete must cancel the
+		// operation so the maintenance can converge instead of blocking forever.
+		const changing = broker.changeModel("team-delete", { provider: "test", modelId: "queued" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(broker.runtimeStatus(agentId).queued, 1);
+		await broker.delete("team-delete");
+		await rejected;
+		await changing;
+		assert.deepEqual(worker.model, { provider: "test", modelId: "queued" });
+		assert.equal(worker.stopped, true);
+		assert.deepEqual(worker.tasks, ["initial"]);
+		assert.equal(await store.get(agentId), undefined);
+		assert.equal(roster.resolve("team-delete"), undefined);
+		await assert.rejects(access(sessionFile), { code: "ENOENT" });
+		assert.equal(broker.hasLocalWorker(agentId), false);
+		assert.equal(broker.runtimeStatus(agentId).phase, "stopped");
+		await broker.shutdown();
+	});
+
+	test("context window budgets follow the actual child model through pending changes and team dispatch", async (t) => {
+		const root = await mkdtemp(join(tmpdir(), "broker-budget-086-"));
+		const agentDir = join(root, "agent");
+		const childCwd = join(root, "child");
+		const previous = process.env["PI_CODING_AGENT_DIR"];
+		process.env["PI_CODING_AGENT_DIR"] = agentDir;
+		t.after(async () => {
+			if (previous === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+			else process.env["PI_CODING_AGENT_DIR"] = previous;
+			await rm(root, { recursive: true, force: true });
+		});
+		await mkdir(agentDir, { recursive: true });
+		await mkdir(join(childCwd, ".pi"), { recursive: true });
+		await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { reserveTokens: 65_536 } }));
+		await writeFile(join(childCwd, ".pi/settings.json"), JSON.stringify({ compaction: { modelOverrides: {
+			"budget-test/child/small": { reserveTokens: 8192 },
+			"budget-test/child/large": { reserveTokens: 32_768 },
+		} } }));
+		new ProjectTrustStore(agentDir).set(root, true);
+		const small = { provider: "budget-test", modelId: "child/small" };
+		const large = { provider: "budget-test", modelId: "child/large" };
+		const store = new MemoryInstanceStore();
+		const roster = new MemoryRoster();
+		const workers: FakeWorker[] = [];
+		const broker = new SessionBroker({ store, roster, defaultCwd: childCwd, workerFactory: async () => {
+			const worker = new FakeWorker(`budget-${workers.length + 1}`, "/tmp/budget-session.jsonl");
+			workers.push(worker);
+			return worker;
+		} });
+		// Team dispatch validates the requested child model before any worker exists.
+		await assert.rejects(
+			broker.dispatch({ model: large, alias: "team-budget", task: "must not start", contextWindow: 16_000, team: {
+				binding: { version: 1, teamId: "team", memberId: "budget", role: "worker", epoch: "private" },
+				onRequest: async () => ({ ok: true }),
+			} }),
+			/reserveTokens \(32768\)/u,
+		);
+		assert.equal(workers.length, 0);
+		assert.deepEqual(await store.list(), []);
+		const instance = await broker.attach({ model: small, alias: "budget-target", cwd: childCwd });
+		const worker = workers[0]!;
+		let setModelStarted!: () => void;
+		const startedSetModel = new Promise<void>((resolve) => { setModelStarted = resolve; });
+		let releaseSetModel!: () => void;
+		const setModelGate = new Promise<void>((resolve) => { releaseSetModel = resolve; });
+		worker.setModel = async (model) => { setModelStarted(); await setModelGate; worker.model = model; return model; };
+		const changing = broker.changeModel("budget-target", large);
+		await startedSetModel;
+		// Preflight and/or the worker queue must reject after the pending change's budget applies.
+		const blocked = assert.rejects(
+			broker.dispatch({ target: "budget-target", task: "blocked", contextWindow: 24_000 }),
+			/reserveTokens \(32768\)/u,
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(worker.tasks, []);
+		releaseSetModel();
+		await changing;
+		await blocked;
+		assert.deepEqual((await store.get(instance.agentId))?.model, large);
+		const resumed = await broker.dispatch({ target: "budget-target", task: "resumed", contextWindow: 40_000 });
+		assert.equal(resumed.run.output, "done: resumed");
+		assert.deepEqual(worker.tasks, ["resumed"]);
+		assert.equal(broker.runtimeStatus(instance.agentId).phase, "idle");
+		await broker.shutdown();
+	});
+
 	test("rejects an invalid new-instance budget before creating a worker", async () => {
 		const { broker, store, workers } = setup();
 

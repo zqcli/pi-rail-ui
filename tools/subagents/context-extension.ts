@@ -74,7 +74,7 @@ function ensureCurrentOverride(ctx: ExtensionContext, active: ActiveOverride): A
 }
 
 function resolvedReserve(ctx: ExtensionContext): { enabled: boolean; reserveTokens: number } {
-	return SettingsManager.create(ctx.cwd, getAgentDir()).getCompactionSettings();
+	return SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() }).getCompactionSettings(currentModel(ctx));
 }
 
 function parseCommand(args: string): { operation: "prepare" | "reset"; value?: number } {

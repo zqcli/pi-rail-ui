@@ -175,6 +175,36 @@ function setup() {
 }
 
 describe("SessionBroker", () => {
+	test("shutdown stops an active send before draining a queued model change", { timeout: 2000 }, async () => {
+		const { broker, workers, store } = setup();
+		const instance = await broker.attach({ model: reviewerModel(), alias: "shutdown-model" });
+		const worker = workers[0]!;
+		const started = Promise.withResolvers<void>();
+		const stopped = Promise.withResolvers<void>();
+		let modelUpdates = 0;
+		worker.send = async () => {
+			started.resolve();
+			await stopped.promise;
+			return { output: "stopped", usage: emptyUsage() };
+		};
+		worker.stop = async () => { worker.stopped = true; stopped.resolve(); };
+		worker.setModel = async (model) => { modelUpdates++; return model; };
+		const sending = broker.dispatch({ target: instance.agentId, task: "wait for stop" });
+		await started.promise;
+		const changing = broker.changeModel(instance.agentId, { provider: "test", modelId: "never-applied" });
+		const rejected = assert.rejects(changing, /shutting down/);
+		// Let resolveInstance finish so the model operation is actually queued.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(broker.runtimeStatus(instance.agentId).queued, 1);
+		await broker.shutdown();
+		await sending;
+		await rejected;
+		assert.equal(worker.stopped, true);
+		assert.equal(modelUpdates, 0);
+		assert.deepEqual((await store.get(instance.agentId))?.model, reviewerModel());
+		await assert.rejects(broker.changeModel(instance.agentId, reviewerModel()), /shutting down/);
+	});
+
 	test("rejects an invalid new-instance budget before creating a worker", async () => {
 		const { broker, store, workers } = setup();
 

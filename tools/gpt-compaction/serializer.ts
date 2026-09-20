@@ -14,8 +14,8 @@ import type { Api } from "@earendil-works/pi-ai";
 /**
  * Local Responses-family serializer for synthetic compaction requests.
  *
- * Pi does not export its Responses converter, and the converter is model- and
- * provider-aware (developer vs system role, tool-call id normalization, phase
+ * Pi's Responses converter is model- and provider-aware (developer vs system
+ * role, tool-call id normalization, phase
  * signatures). This mirrors the parts that matter for a same-model compaction
  * request: text, images, assistant phase signatures, reasoning signatures, tool
  * calls/results, and synthetic results for unpaired calls.
@@ -118,6 +118,12 @@ export function transformMessagesForResponses(messages: readonly Message[], mode
 	};
 
 	for (const message of messages) {
+		if (message.role === "system") {
+			// Declaration updates are not conversation boundaries. In particular,
+			// they must not replace a pending call's real result with a synthetic one.
+			transformed.push(message);
+			continue;
+		}
 		if (message.role === "assistant") {
 			flushPending();
 			if (message.stopReason === "error" || message.stopReason === "aborted") continue;

@@ -39,6 +39,7 @@ test("child context extension restores the selected object's original value", as
 	const current = { ...canonical };
 	const ctx = {
 		cwd: process.cwd(),
+		isProjectTrusted: () => true,
 		model: current,
 		modelRegistry: { find: () => canonical },
 	};
@@ -89,7 +90,7 @@ test("child context extension restores the selected object's original value", as
 	const originalError = console.error;
 	console.error = (message: string) => errors.push(message);
 	try {
-		await frozenHandlers.get("session_start")?.({}, { cwd: process.cwd(), model: Object.freeze({ provider: "test", id: "model", contextWindow: 150_000 }) });
+		await frozenHandlers.get("session_start")?.({}, { cwd: process.cwd(), isProjectTrusted: () => true, model: Object.freeze({ provider: "test", id: "model", contextWindow: 150_000 }) });
 	} finally {
 		console.error = originalError;
 	}

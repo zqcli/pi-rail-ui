@@ -89,10 +89,9 @@ export function usageStatsFromEntries(entries: any[]): FooterUsageStats {
 
 	for (const entry of entries) {
 		if (!entry || typeof entry !== "object") continue;
-		// Compaction and branch summaries are LLM work too: Pi stores their
-		// summary-generation usage on the entry itself (not on a message), and
-		// session docs include it in token and cost totals.
-		if (entry.type === "compaction" || entry.type === "branch_summary") {
+		// Summaries and standalone work (including cache warming) store usage
+		// on the entry itself rather than on a conversation message.
+		if (entry.type === "compaction" || entry.type === "branch_summary" || entry.type === "usage") {
 			applyEntryUsage(totals, entry.usage);
 			continue;
 		}

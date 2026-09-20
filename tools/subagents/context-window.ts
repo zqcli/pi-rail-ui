@@ -1,4 +1,45 @@
+import { createReadStream } from "node:fs";
+import { resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { getAgentDir, hasTrustRequiringProjectResources, parseSessionEntries, ProjectTrustStore, SettingsManager } from "@earendil-works/pi-coding-agent";
+
+/**
+ * Noninteractive CLI fallback: nearest saved cwd/ancestor decision, then the
+ * global default (ask cannot prompt). Never inherit the parent's temporary
+ * trust or approve a child. The helper uses its actual ExtensionContext trust,
+ * which additionally accounts for child-local project_trust extension decisions.
+ */
+export function createChildContextSettings(cwd: string): SettingsManager {
+	const agentDir = getAgentDir();
+	const global = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+	const trusted = !hasTrustRequiringProjectResources(cwd)
+		|| (new ProjectTrustStore(agentDir).get(cwd) ?? (global.getDefaultProjectTrust() === "always"));
+	return trusted ? SettingsManager.create(cwd, agentDir, { projectTrusted: true }) : global;
+}
+
+/** --session restores the saved cwd; --fork creates a session in the requested cwd. */
+export async function resolveChildContextCwd(cwd: string, session?: { mode: string; path?: string }): Promise<string> {
+	if (!session?.path || (session.mode !== "open" && session.mode !== "exclusive")) return cwd;
+	const stream = createReadStream(resolve(cwd, session.path), { encoding: "utf8" });
+	const lines = createInterface({ input: stream, crlfDelay: Infinity });
+	try {
+		// Only the header is needed; do not load a potentially large conversation.
+		for await (const line of lines) {
+			const entry = parseSessionEntries(line)[0];
+			if (entry?.type !== "session") continue;
+			return typeof entry.cwd === "string" && entry.cwd.trim() ? resolve(cwd, entry.cwd) : cwd;
+		}
+	} catch (error) {
+		// Pi also accepts a new explicit session path, which has no saved cwd yet.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return cwd;
+		throw error;
+	} finally {
+		lines.close();
+		stream.destroy();
+	}
+	return cwd;
+}
 
 export const CONTEXT_WINDOW_FLAG = "rail-context-window";
 export const CONTEXT_PROTOCOL_FLAG = "rail-context-protocol";

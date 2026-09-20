@@ -1,3 +1,6 @@
+import { isDeepStrictEqual } from "node:util";
+import { getCurrentTools, hasApi, toToolDeclaration, type Api, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
+import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { requestIdentitiesMatch, type CompactionIdentity } from "./model-eligibility";
 
 /**
@@ -21,6 +24,8 @@ interface CachedRequestContext {
 	identity: CompactionIdentity;
 	sessionId?: string;
 	extras: CompactionRequestExtras;
+	/** Declaration provenance, not wire tools: provider hooks may transform schemas. */
+	tools?: Tool[];
 }
 
 const cached = new Map<string, CachedRequestContext>();
@@ -45,6 +50,7 @@ export function rememberRequestContext(
 	payload: unknown,
 	identity: CompactionIdentity,
 	sessionId?: string,
+	messages?: readonly Message[],
 ): void {
 	try {
 		if (!isRecord(payload) || payload["model"] !== identity.model) {
@@ -64,6 +70,9 @@ export function rememberRequestContext(
 			extras.prompt_cache_key = payload["prompt_cache_key"];
 		}
 		const record: CachedRequestContext = { identity: clone(identity), extras };
+		if (messages?.some((message) => message.role === "system")) {
+			record.tools = clone(getCurrentTools([...messages]).map(toToolDeclaration));
+		}
 		if (sessionId) record.sessionId = sessionId;
 		const key = cacheKey(identity, sessionId);
 		cached.set(key, record);
@@ -90,6 +99,74 @@ export function getCompactionRequestExtras(
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Collapse transcript tool deltas into a complete Responses loadout. Never copy
+ * raw declarations into the wire payload. Stable declarations keep their exact
+ * provider formatting; hosted tools and non-tool extras remain provider-owned.
+ * Without provenance, only an exact canonical wire match is safe to reuse.
+ */
+export function resolveCompactionRequestExtras(
+	model: Model<Api>,
+	identity: CompactionIdentity,
+	sessionId: string | undefined,
+	messages: readonly Message[],
+): CompactionRequestExtras {
+	const extras = getCompactionRequestExtras(identity, sessionId) ?? {};
+	// Legacy sessions have no declaration state; retain the old payload behavior.
+	if (!messages.some((message) => message.role === "system")) return extras;
+	const record = cached.get(cacheKey(identity, sessionId));
+	const previous = record && requestIdentitiesMatch(record.identity, identity) && record.sessionId === sessionId
+		? record.tools : undefined;
+	const current = getCurrentTools([...messages]);
+	const byName = new Map(current.map((tool) => [tool.name, tool]));
+	const previousByName = new Map(previous?.map((tool) => [tool.name, tool]));
+	const codex = model.api === "openai-codex-responses";
+	const compat = hasApi(model, "openai-responses") || hasApi(model, "openai-codex-responses") || hasApi(model, "azure-openai-responses")
+		? model.compat : undefined;
+	const convert = (tool: Tool): unknown => convertResponsesTools([tool], {
+		// Synthetic requests must not opt into server-inferred strict schemas
+		// (Codex's ordinary default is null). Explicit constrained sampling still
+		// goes through Pi's converter and can opt individual tools into strict.
+		strict: false,
+		supportsStrictMode: compat?.supportsStrictMode ?? codex,
+		supportsOpenAIGrammarTools: compat?.supportsOpenAIGrammarTools ?? false,
+	})[0];
+	const tools: unknown[] = [];
+	for (const wire of extras.tools ?? []) {
+		if (!isRecord(wire)) continue;
+		const local = wire["type"] === "function" || wire["type"] === "custom"
+			|| (wire["type"] === undefined && typeof wire["name"] === "string");
+		if (!local) {
+			tools.push(wire);
+			continue;
+		}
+		const name = wire["name"];
+		if (typeof name !== "string") continue;
+		const tool = byName.get(name);
+		if (!tool) continue;
+		const old = previousByName.get(name);
+		const stable = old && isDeepStrictEqual(toToolDeclaration(old), toToolDeclaration(tool));
+		const converted = stable ? undefined : convert(tool);
+		tools.push(stable || isDeepStrictEqual(wire, converted) ? wire : converted);
+		byName.delete(name);
+	}
+	// Tool-search/additional-tools transports may have omitted later declarations
+	// from the top-level tools. Synthetic input has no such anchors: declare all.
+	for (const tool of byName.values()) tools.push(convert(tool));
+	// Rail's hosted search hook replaces the local web_search function. Restoring
+	// transcript declarations must not undo that policy, even after tool changes.
+	// Do not treat other omitted tools as suppressed: additive transports omit
+	// declarations from top-level tools too, and those still need reconstruction.
+	const hostedSearch = tools.some((tool) => isRecord(tool) && typeof tool["type"] === "string"
+		&& /^web_search(?:_preview)?(?:_\d{4}_\d{2}_\d{2})?$/.test(tool["type"]));
+	const effectiveTools = hostedSearch
+		? tools.filter((tool) => !isRecord(tool) || tool["type"] !== "function" || tool["name"] !== "web_search")
+		: tools;
+	// Non-strict conversion can return the transcript's original schema object.
+	// Neither callers nor provider hooks may mutate session declaration state.
+	return clone({ ...extras, tools: effectiveTools });
 }
 
 export function clearRequestContextCache(sessionId?: string): void {

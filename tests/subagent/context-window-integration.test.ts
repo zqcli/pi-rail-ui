@@ -269,7 +269,7 @@ test("turn_end guard preserves native next-turn compaction after same-key model 
 	const rail = await runCompactionBoundary(sandbox, "rail");
 	const expectedEvents = [
 		"agent_start", "turn_start", "message_start", "message_end", "message_start", "message_end",
-		"tool_execution_start", "tool_execution_end", "message_start", "message_end", "turn_end",
+		"message_start", "message_end", "tool_execution_start", "tool_execution_end", "message_start", "message_end", "turn_end",
 		"compaction_start", "compaction_end", "turn_start", "message_start", "message_end", "turn_end",
 		"agent_end", "agent_settled",
 	];
@@ -287,9 +287,9 @@ test("turn_end guard preserves native next-turn compaction after same-key model 
 		const providers = result.records.filter((record) => record["kind"] === "provider");
 		const finalProvider = providers.at(-1)!;
 		assert.equal(finalProvider["contextWindow"], 64_000);
-		assert.equal(finalProvider["messageCount"], 3);
-		assert.deepEqual(finalProvider["roles"], ["user", "assistant", "toolResult"]);
-		assert.equal(result.messageCount, 4);
+		assert.equal(finalProvider["messageCount"], 4);
+		assert.deepEqual(finalProvider["roles"], ["system", "user", "assistant", "toolResult"]);
+		assert.equal(result.messageCount, 5);
 	}
 	assert.deepEqual(rail.events, oracle.events);
 	const railRecords = rail.records;

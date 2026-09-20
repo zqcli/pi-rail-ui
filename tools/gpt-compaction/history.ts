@@ -136,6 +136,9 @@ export function rebuildNativeHistory(branchEntries: readonly SessionEntry[]): Hi
 			skippedCompactions += 1;
 			continue;
 		}
+		// Pi's native checkpoint replaces all system deltas before its physical
+		// boundary, including those in the retained range (also for legacy entries).
+		if (nativeBoundary && index < nativeBoundary.compactionIndex && entry.type === "message" && entry.message.role === "system") continue;
 		messages.push(...sessionEntryToContextMessages(entry));
 	}
 	return { messages, skippedCompactions, ...(nativeBoundary ? { nativeBoundary } : {}) };
@@ -151,7 +154,9 @@ export function rebuildNativeHistoryPrefix(
 	if (!nativeBoundary) return rebuildNativeHistory(branchEntries.slice(0, endIndex));
 	const messages = [
 		...sessionEntryToContextMessages(nativeBoundary.entry),
-		...collectMessages(branchEntries.slice(nativeBoundary.firstKeptIndex, endIndex).filter((entry) => entry.type !== "compaction")),
+		...collectMessages(branchEntries.slice(nativeBoundary.firstKeptIndex, endIndex).filter((entry, offset) =>
+			entry.type !== "compaction"
+			&& !(nativeBoundary.firstKeptIndex + offset < nativeBoundary.compactionIndex && entry.type === "message" && entry.message.role === "system"))),
 	];
 	return { messages, skippedCompactions: 1, nativeBoundary };
 }

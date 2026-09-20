@@ -150,6 +150,17 @@ async function runStatelessProbe(agentDir: string, gateway: string, logPath: str
 	return { code, stdout, stderr };
 }
 
+function assertToolLoop(records: Array<Record<string, any>>): void {
+	const turns = records.filter((record) => record["kind"] === "provider" && !record["summarizing"]);
+	assert.deepEqual(turns.map((record) => record["agentTurn"]), [1, 2, 3, 4], "compaction must not reset or consume the three-tool loop");
+	assert.ok(turns.every((record) => record["hasLoopTool"] === true), "every agent turn must retain the loop tool declaration");
+	assert.deepEqual(
+		records.filter((record) => record["kind"] === "tool").map((record) => record["call"]),
+		turns.slice(0, 3).map((record) => record["call"]),
+		"each of the first three provider turns must execute its tool exactly once",
+	);
+}
+
 async function readProbe(logPath: string): Promise<Record<string, any>> {
 	const content = await readFile(logPath, "utf8");
 	const record = content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>).find((entry) => entry["kind"] === "provider");
@@ -157,7 +168,7 @@ async function readProbe(logPath: string): Promise<Record<string, any>> {
 	return record;
 }
 
-test("real Pi 0.85.1 loads the root extension and preserves live input in off/on replay", { timeout: 30_000 }, async (t) => {
+test("real Pi 0.86.0 loads the root extension and preserves live input in off/on replay", { timeout: 30_000 }, async (t) => {
 	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-"));
 	t.after(() => rm(sandbox, { recursive: true, force: true }));
 
@@ -464,7 +475,13 @@ test("a live worker preflights global off before a multi-turn tool run", { timeo
 	const records = (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
 	const providerRecords = records.filter((record) => record["kind"] === "provider");
 	assert.ok(providerRecords.length >= 4, "the same run must include multiple tool/provider turns");
-	assert.ok(records.some((record) => record["kind"] === "tool"));
+	assertToolLoop(records);
+	const summaryRecords = providerRecords.filter((record) => record["summarizing"]);
+	assert.ok(summaryRecords.length > 0, "native repair must use the summary prompt");
+	assert.ok(summaryRecords.every((record) => record["agentTurn"] === null && record["hasLoopTool"] === false), "native repair chunks must not declare agent tools or consume a tool turn");
+	assert.ok(saved.some((entry) => entry["message"]?.role === "assistant"
+		&& entry["message"].stopReason === "stop"
+		&& entry["message"].content.some((block: any) => block.type === "text" && block.text === "tool loop complete")), "the live worker must finish the tool loop normally");
 	for (const record of providerRecords) {
 		assert.doesNotMatch(JSON.stringify(record), /opaque-server-checkpoint|GPT remote compaction checkpoint/);
 		const promptCount = JSON.stringify(record).split("run tool loop after global off").length - 1;
@@ -904,7 +921,7 @@ test("real stateless runner can use an ephemeral session for a multi-turn tool c
 	assert.equal(result.output, "tool loop complete");
 	assert.ok(requests.length >= 1, "the ephemeral stateless session must enter the real Remote v2 handshake");
 	const records = (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, any>);
-	assert.ok(records.some((record) => record["kind"] === "tool"), "the runner must execute real tool turns");
+	assertToolLoop(records);
 	assert.ok(records.filter((record) => record["kind"] === "provider").length >= 3, "the runner must make multiple provider turns");
 });
 

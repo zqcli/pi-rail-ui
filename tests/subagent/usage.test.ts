@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	addCompletedAssistantUsage,
+	addCompletedToolResultUsage,
 	addCompactionUsage,
 	addUsage,
 	emptySubagentUsage,
@@ -80,6 +81,28 @@ test("compaction usage adds billed tokens without adding an assistant turn", () 
 		contextTokens: 12,
 		turns: 1,
 	});
+});
+
+test("tool-result usage adds billed tokens without changing assistant turns or context", () => {
+	const total = emptySubagentUsage();
+	addCompletedAssistantUsage(total, {
+		role: "assistant",
+		usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.25 } },
+	});
+	assert.equal(addCompletedToolResultUsage(total, {
+		role: "toolResult",
+		usage: { input: 100, output: 5, cacheRead: 20, cacheWrite: 4, totalTokens: 129, cost: { total: 0.5 } },
+	}), true);
+	assert.deepEqual(total, {
+		input: 110, output: 7, cacheRead: 20, cacheWrite: 4, cost: 0.75, contextTokens: 12, turns: 1,
+	});
+	const before = { ...total };
+	for (const message of [null, [], { role: "toolResult" }, { role: "toolResult", usage: null },
+		{ role: "toolResult", usage: [] }, { role: "assistant", usage: { input: 100 } },
+		{ role: "user", usage: { input: 100 } }]) {
+		assert.equal(addCompletedToolResultUsage(total, message), false);
+		assert.deepEqual(total, before);
+	}
 });
 
 test("search counts stay optional, merge on demand, and survive compaction", () => {

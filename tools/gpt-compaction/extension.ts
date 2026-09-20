@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { buildSessionContext, estimateTokens, findCutPoint, getAgentDir, sessionEntryToContextMessages, SettingsManager, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionEntry, type SessionManager } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, findCutPoint, getAgentDir, sessionEntryToContextMessages, SettingsManager, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionEntry, type SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import {
 	compactionIdentity,
@@ -22,7 +22,7 @@ import { resolveCompactionAuth } from "./auth";
 import { rebuildNativeHistoryPrefix } from "./history";
 import { clearRequestContextCache } from "./request-context";
 import { rejectRailOaiCommandForModel } from "../../commands/rail-oai-command";
-import { resolveSessionCheckpoint } from "./types";
+import { getGptCompactionDetails, isGptCompactionSummaryText, resolveSessionCheckpoint } from "./types";
 import {
 	gptCompactionSettingsScope,
 	parseGptCompactionCommand,
@@ -93,46 +93,50 @@ type PendingNativeRepair = {
 	manager: SessionManager;
 	sessionId: string;
 	originalLeafId: string | null;
+	expectedLeafId: string | null;
+	branch: SessionEntry[];
+	restoreBeforeSummary: boolean;
 	preparation: SessionBeforeCompactEvent["preparation"];
 	cancelled: boolean;
 };
 
-function isReplayableTailEntry(entry: SessionEntry): boolean {
-	return entry.type === "message"
-		|| entry.type === "model_change"
-		|| entry.type === "thinking_level_change"
-		|| entry.type === "custom"
-		|| entry.type === "custom_message"
-		|| entry.type === "session_info"
-		|| entry.type === "label";
-}
-
-function appendTailEntry(manager: SessionManager, entry: SessionEntry): void {
-	switch (entry.type) {
-		case "message":
-			manager.appendMessage(entry.message as Parameters<SessionManager["appendMessage"]>[0]);
-			return;
-		case "model_change":
-			manager.appendModelChange(entry.provider, entry.modelId);
-			return;
-		case "thinking_level_change":
-			manager.appendThinkingLevelChange(entry.thinkingLevel);
-			return;
-		case "custom":
-			manager.appendCustomEntry(entry.customType, entry.data);
-			return;
-		case "custom_message":
-			manager.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
-			return;
-		case "session_info":
-			if (entry.name !== undefined) manager.appendSessionInfo(entry.name);
-			return;
-		case "label":
-			manager.appendLabelChange(entry.targetId, entry.label);
-			return;
-		default:
-			throw new Error(`unsupported-live-tail-entry:${entry.type}`);
+function nativeRepairPreparation(
+	branch: SessionEntry[],
+	settings: SessionBeforeCompactEvent["preparation"]["settings"],
+): SessionBeforeCompactEvent["preparation"] | undefined {
+	const checkpointIndex = branch.findLastIndex((entry) => entry.type === "compaction"
+		&& (getGptCompactionDetails(entry) || isGptCompactionSummaryText(entry.summary)));
+	// Preserve usage ancestry. A retained opaque checkpoint would leak back into
+	// native context, so the anchor must already exist strictly after it.
+	if (checkpointIndex < 0 || checkpointIndex + 1 >= branch.length) return undefined;
+	const cut = findCutPoint(branch, checkpointIndex + 1, branch.length, settings.keepRecentTokens);
+	let firstKeptIndex = cut.firstKeptEntryIndex;
+	const calls = new Set<string>();
+	for (let index = firstKeptIndex; index < branch.length; index += 1) {
+		const entry = branch[index]!;
+		for (const message of sessionEntryToContextMessages(entry)) {
+			if (message.role === "assistant") {
+				for (const block of message.content) if (block.type === "toolCall") calls.add(block.id);
+			} else if (message.role === "toolResult" && !calls.has(message.toolCallId)) {
+				// Summarize crossing results rather than retain orphaned results.
+				firstKeptIndex = index + 1;
+				calls.clear();
+			}
+		}
 	}
+	const firstKeptEntry = branch[firstKeptIndex];
+	if (!firstKeptEntry) return undefined;
+	const prefix = rebuildNativeHistoryPrefix(branch, firstKeptIndex);
+	if (!prefix?.messages.length) return undefined;
+	return {
+		firstKeptEntryId: firstKeptEntry.id,
+		messagesToSummarize: prefix.messages,
+		turnPrefixMessages: [],
+		isSplitTurn: false,
+		tokensBefore: rebuiltBranchMessages(branch).reduce((total, message) => total + estimateTokens(message), 0),
+		fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
+		settings,
+	};
 }
 
 function blockedProviderPayload(payload: unknown, reason: string): unknown {
@@ -162,51 +166,59 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		mode = readGptCompactionSettings().mode;
 		return mode;
 	};
-	const restoreLeaf = (repair: PendingNativeRepair): void => {
-		if (repair.originalLeafId) repair.manager.branch(repair.originalLeafId);
-		else repair.manager.resetLeaf();
-	};
 	const repairBeforeDisabling = async (ctx: ExtensionContext): Promise<{ ok: true } | { ok: false; detail: string }> => {
 		if (pendingNativeRepair) return { ok: false, detail: "native-repair-already-running" };
 		const branch = ctx.sessionManager.getBranch();
 		const checkpoint = resolveSessionCheckpoint(branch);
 		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return { ok: true };
 		const manager = ctx.sessionManager as unknown as SessionManager;
+		const settings = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() }).getCompactionSettings(ctx.model);
 		const checkpointIndex = branch.findIndex((entry) => entry.id === checkpoint.entry.id);
-		if (checkpointIndex < 0) return { ok: false, detail: "checkpoint-boundary-not-found" };
 		const originalBranch = branch.slice(0, checkpointIndex);
-		const settings = SettingsManager.create(ctx.cwd, getAgentDir()).getCompactionSettings();
-		const checkpointFirstKeptIndex = originalBranch.findIndex((entry) => entry.id === checkpoint.entry.firstKeptEntryId);
-		const cutPoint = checkpointFirstKeptIndex > 0
-			? undefined
-			: findCutPoint(originalBranch, 0, originalBranch.length, settings.keepRecentTokens);
-		const firstKeptIndex = checkpointFirstKeptIndex > 0 ? checkpointFirstKeptIndex : cutPoint?.firstKeptEntryIndex ?? -1;
-		const firstKeptEntry = originalBranch[firstKeptIndex];
-		if (!firstKeptEntry?.id) return { ok: false, detail: "no-repair-source" };
-		const rebuiltPrefix = rebuildNativeHistoryPrefix(originalBranch, firstKeptIndex);
-		const preparation = {
-			firstKeptEntryId: firstKeptEntry.id,
-			messagesToSummarize: rebuiltPrefix?.messages ?? [],
-			turnPrefixMessages: [],
-			isSplitTurn: false,
-			tokensBefore: buildSessionContext(originalBranch).messages.reduce((total, message) => total + estimateTokens(message), 0),
-			fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() },
-			settings,
+		const hasTail = checkpointIndex + 1 < branch.length;
+		// A checkpoint-only leaf has no append-only anchor. Keep the original
+		// sibling-native repair without replaying or duplicating any entries.
+		const keptIndex = originalBranch.findIndex((entry) => entry.id === checkpoint.entry.firstKeptEntryId);
+		const siblingCut = keptIndex > 0 ? keptIndex
+			: findCutPoint(originalBranch, 0, originalBranch.length, settings.keepRecentTokens).firstKeptEntryIndex;
+		const siblingAnchor = originalBranch[siblingCut];
+		// Removing only the newest checkpoint can leave older opaque markers in
+		// the sibling's retained span. Summarize through those markers instead.
+		const siblingHasOpaqueHistory = originalBranch.slice(siblingCut).some((entry) => entry.type === "compaction"
+			&& (getGptCompactionDetails(entry) || isGptCompactionSummaryText(entry.summary)));
+		const preparation = hasTail ? nativeRepairPreparation(branch, settings)
+			: siblingHasOpaqueHistory ? nativeRepairPreparation(originalBranch, settings) : siblingAnchor && {
+			firstKeptEntryId: siblingAnchor.id,
+			messagesToSummarize: rebuildNativeHistoryPrefix(originalBranch, siblingCut)?.messages ?? [],
+			turnPrefixMessages: [], isSplitTurn: false,
+			tokensBefore: rebuiltBranchMessages(originalBranch).reduce((total, message) => total + estimateTokens(message), 0),
+			fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() }, settings,
 		};
-		if (preparation.messagesToSummarize.length === 0) return { ok: false, detail: "no-repair-source" };
-		const tail = branch.slice(checkpointIndex + 1);
-		if (tail.some((entry) => !isReplayableTailEntry(entry))) return { ok: false, detail: "unsupported-live-tail-entry" };
+		if (!preparation?.messagesToSummarize.length) return { ok: false, detail: "no-safe-native-repair-boundary" };
+		// Match Pi's admission cut: either a history prefix or a split-turn
+		// prefix must contain conversation, not just system state/compactions.
+		const admissionStart = keptIndex >= 0 ? keptIndex : checkpointIndex + 1;
+		const admissionCut = findCutPoint(branch, admissionStart, branch.length, settings.keepRecentTokens);
+		const admitsOriginal = hasTail && branch.slice(admissionStart, admissionCut.firstKeptEntryIndex)
+			.some((entry) => entry.type !== "compaction"
+				&& sessionEntryToContextMessages(entry).some((message) => message.role !== "system"));
 		const repair: PendingNativeRepair = {
 			manager,
 			sessionId: manager.getSessionId(),
 			originalLeafId: manager.getLeafId(),
+			expectedLeafId: admitsOriginal ? manager.getLeafId() : checkpoint.entry.parentId,
+			branch: hasTail ? branch : originalBranch,
+			restoreBeforeSummary: hasTail,
 			preparation,
 			cancelled: false,
 		};
 		try {
-			if (checkpoint.entry.parentId) manager.branch(checkpoint.entry.parentId);
-			else manager.resetLeaf();
-			for (const entry of tail) appendTailEntry(manager, entry);
+			// Only borrow the source branch when native admission would reject the
+			// current leaf. No entries are appended until after our hook restores it.
+			if (!admitsOriginal) {
+				if (repair.expectedLeafId) manager.branch(repair.expectedLeafId);
+				else manager.resetLeaf();
+			}
 			pendingNativeRepair = repair;
 			const result = await new Promise<{ ok: true } | { ok: false; detail: string }>((resolve) => {
 				try {
@@ -219,18 +231,17 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 				}
 			});
 			if (!result.ok || repair.cancelled || manager.getSessionId() !== repair.sessionId) {
-				if (manager.getSessionId() === repair.sessionId) restoreLeaf(repair);
 				return result.ok ? { ok: false, detail: "native-repair-session-changed" } : result;
 			}
 			return { ok: true };
 		} catch (error) {
-			try {
-				if (manager.getSessionId() === repair.sessionId) restoreLeaf(repair);
-			} catch {
-				// The session may already have been disposed or replaced.
-			}
 			return { ok: false, detail: error instanceof Error ? error.message : String(error) };
 		} finally {
+			// Never clobber an externally selected leaf or a successful new checkpoint.
+			if (manager.getSessionId() === repair.sessionId && manager.getLeafId() === repair.expectedLeafId) {
+				if (repair.originalLeafId) manager.branch(repair.originalLeafId);
+				else manager.resetLeaf();
+			}
 			if (pendingNativeRepair === repair) pendingNativeRepair = undefined;
 		}
 	};
@@ -253,7 +264,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 			const identity = await resolveRuntimeIdentity(ctx);
 			if (identity && identitiesMatch(checkpoint.details.consumer, identity)) return true;
 		}
-		const settings = SettingsManager.create(ctx.cwd, getAgentDir()).getCompactionSettings();
+		const settings = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() }).getCompactionSettings(ctx.model);
 		const rebuilt = rebuiltBranchMessages(branch);
 		const outputBudget = Math.max(settings.reserveTokens, model.maxTokens ?? 0);
 		const available = model.contextWindow - outputBudget - 256;
@@ -366,11 +377,20 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		syncMode();
 		const pendingRepair = pendingNativeRepair;
 		if (pendingRepair) {
-			if (pendingRepair.cancelled || event.signal.aborted) return { cancel: true };
+			if (pendingRepair.cancelled || event.signal.aborted
+				|| pendingRepair.manager.getSessionId() !== pendingRepair.sessionId
+				|| pendingRepair.manager.getLeafId() !== pendingRepair.expectedLeafId) return { cancel: true };
+			if (pendingRepair.restoreBeforeSummary) {
+				if (pendingRepair.originalLeafId) pendingRepair.manager.branch(pendingRepair.originalLeafId);
+				else pendingRepair.manager.resetLeaf();
+				pendingRepair.expectedLeafId = pendingRepair.originalLeafId;
+			}
 			const outcome = await runNativeRepairCompaction({
-				event: { ...event, preparation: pendingRepair.preparation },
+				event: { ...event, branchEntries: pendingRepair.branch, preparation: pendingRepair.preparation },
 				ctx,
 			});
+			if (pendingRepair.cancelled || pendingRepair.manager.getSessionId() !== pendingRepair.sessionId
+				|| pendingRepair.manager.getLeafId() !== pendingRepair.expectedLeafId) return { cancel: true };
 			if (outcome.outcome === "success") return { compaction: outcome.compaction };
 			if (outcome.outcome === "aborted") return { cancel: true };
 			notifyFailure(ctx, "while repairing native history", outcome.reason, outcome.detail);
@@ -383,7 +403,12 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		const mustRepairNative = checkpoint.status === "invalid"
 			|| (checkpoint.status === "remote" && (mode !== "on" || !support.supported));
 		if (mustRepairNative) {
-			const outcome = await runNativeRepairCompaction({ event, ctx });
+			const preparation = nativeRepairPreparation(event.branchEntries, event.preparation.settings);
+			if (!preparation) {
+				notifyFailure(ctx, "while repairing native history", "no-safe-native-repair-boundary");
+				return { cancel: true };
+			}
+			const outcome = await runNativeRepairCompaction({ event: { ...event, preparation }, ctx });
 			if (outcome.outcome === "success") return { compaction: outcome.compaction };
 			if (outcome.outcome === "aborted") return { cancel: true };
 			notifyFailure(ctx, "while repairing native history", outcome.reason, outcome.detail);

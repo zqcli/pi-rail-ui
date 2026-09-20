@@ -1,8 +1,8 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import { getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-import { normalizeContextWindow, validateContextWindowReserve } from "./context-window";
+import { createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";
 import { supportsNativeFastMode, supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { supportsNativeGptSearch } from "../../commands/rail-oai-search";
 import { isGptModel } from "../../openai/model-eligibility";
@@ -559,8 +559,8 @@ class SingleLineText implements Component {
 	invalidate(): void {}
 }
 
-async function validateTaskContextWindows(items: TaskParams[], broker: SessionBroker | undefined, defaultCwd: string): Promise<void> {
-	for (const item of items) {
+async function validateTaskContextWindows(items: TaskParams[], models: (RailModelRef | undefined)[], broker: SessionBroker | undefined, defaultCwd: string): Promise<void> {
+	for (const [index, item] of items.entries()) {
 		const contextWindow = normalizeContextWindow(item.contextWindow);
 		if (contextWindow === undefined) continue;
 		if (item.target) {
@@ -568,7 +568,9 @@ async function validateTaskContextWindows(items: TaskParams[], broker: SessionBr
 			await broker.validateContextWindowForTarget(item.target, contextWindow);
 			continue;
 		}
-		const settings = SettingsManager.create(item.cwd ?? defaultCwd, getAgentDir()).getCompactionSettings();
+		const model = models[index]!;
+		const cwd = await resolveChildContextCwd(item.cwd ?? defaultCwd, item.session);
+		const settings = createChildContextSettings(cwd).getCompactionSettings({ provider: model.provider, id: model.modelId });
 		validateContextWindowReserve(contextWindow, settings.reserveTokens, settings.enabled);
 	}
 }
@@ -803,7 +805,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const broker = contextTargetItems.length > 0
 				? (typeof options.broker === "function" ? options.broker() : options.broker)
 				: undefined;
-			await validateTaskContextWindows(requestedItems, broker, ctx.cwd);
+			// Pin budgeted selections before asynchronous preflight/confirmation so a parent
+			// model switch cannot change the child after its reserve was validated.
+			const budgetModels = requestedItems.map((item) => !item.target && item.contextWindow != null ? resolveRailModel(item.model, ctx) : undefined);
+			await validateTaskContextWindows(requestedItems, budgetModels, broker, ctx.cwd);
 			const sessionAttachments = requestedItems.filter((item) => item.session !== undefined);
 			if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
 				if (!ctx.hasUI) throw new Error("Attaching an existing session requires UI confirmation or confirmSessionAttach=false");
@@ -826,7 +831,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const persistent = isPersistentTask(item);
 				if (!persistent) {
 					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
-					const model = resolveRailModel(item.model, ctx);
+					const model = budgetModels[slot] ?? resolveRailModel(item.model, ctx);
 					const fastMode = effectiveFastModeRequest(item, nativeModelForRailRef(model, ctx));
 					setDispatchMetadata(item, slot, { model, fastMode });
 					const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
@@ -866,7 +871,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					publishLive(slot, result);
 					return result;
 				}
-				const model = item.target ? undefined : resolveRailModel(item.model, ctx);
+				const model = item.target ? undefined : budgetModels[slot] ?? resolveRailModel(item.model, ctx);
 				const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
 				const request: DispatchRequest = {
 					...(model ? { model } : {}),

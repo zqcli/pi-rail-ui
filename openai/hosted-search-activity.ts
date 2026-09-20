@@ -384,60 +384,60 @@ export class HostedSearchSseObserver {
 			return;
 		}
 		try {
-			this.handleEvent(JSON.parse(data));
+			observeHostedSearchEvent(this.activity, JSON.parse(data));
 		} catch {
 			// Capture is observational; malformed provider events must not affect the model stream.
 		}
 	}
+}
 
-	private handleEvent(value: unknown): void {
-		if (!isRecord(value)) return;
-		const type = value["type"];
-		if (type === "response.created" && isRecord(value["response"])) {
-			this.activity.setResponseId(value["response"]["id"]);
-			return;
-		}
-		if (type === "response.web_search_call.in_progress" || type === "response.web_search_call.searching") {
-			this.activity.upsertCall(value["item_id"], type.endsWith("searching") ? "searching" : "in_progress");
-			return;
-		}
-		if (type === "response.web_search_call.completed") {
-			this.activity.upsertCall(value["item_id"], "completed");
-			return;
-		}
-		if (type === "response.output_item.added" || type === "response.output_item.done") {
-			this.handleOutputItem(value["item"]);
-			return;
-		}
-		if (type === "response.content_part.done" && isRecord(value["part"])) {
-			for (const annotation of annotationsFrom({ content: [value["part"]] })) this.activity.addSource(annotation.url, annotation.title);
-			return;
-		}
-		if (type === "response.output_text.annotation.added") {
-			const citation = citationFrom(value["annotation"]);
-			if (citation) this.activity.addSource(citation.url, citation.title);
-			return;
-		}
-		if (type === "response.completed" && isRecord(value["response"])) {
-			const response = value["response"];
-			this.activity.setResponseId(response["id"]);
-			for (const item of Array.isArray(response["output"]) ? response["output"] : []) this.handleOutputItem(item);
-			this.activity.complete(typeof response["completed_at"] === "number" ? response["completed_at"] * 1000 : Date.now());
-			return;
-		}
-		if (type === "response.failed" || type === "error") {
-			const error = isRecord(value["response"]) ? value["response"]["error"] : value["message"] ?? value["error"];
-			this.activity.fail(isRecord(error) ? error["message"] : error);
-		}
+function observeHostedSearchOutputItem(activity: HostedSearchActivity, item: unknown): void {
+	if (!isRecord(item)) return;
+	if (item["type"] === "web_search_call") {
+		activity.upsertCall(item["id"], item["status"], item["action"]);
+		return;
 	}
+	for (const annotation of annotationsFrom(item)) activity.addSource(annotation.url, annotation.title);
+}
 
-	private handleOutputItem(item: unknown): void {
-		if (!isRecord(item)) return;
-		if (item["type"] === "web_search_call") {
-			this.activity.upsertCall(item["id"], item["status"], item["action"]);
-			return;
-		}
-		for (const annotation of annotationsFrom(item)) this.activity.addSource(annotation.url, annotation.title);
+export function observeHostedSearchEvent(activity: HostedSearchActivity, value: unknown): void {
+	if (!isRecord(value)) return;
+	const type = value["type"];
+	if (type === "response.created" && isRecord(value["response"])) {
+		activity.setResponseId(value["response"]["id"]);
+		return;
+	}
+	if (type === "response.web_search_call.in_progress" || type === "response.web_search_call.searching") {
+		activity.upsertCall(value["item_id"], type.endsWith("searching") ? "searching" : "in_progress");
+		return;
+	}
+	if (type === "response.web_search_call.completed") {
+		activity.upsertCall(value["item_id"], "completed");
+		return;
+	}
+	if (type === "response.output_item.added" || type === "response.output_item.done") {
+		observeHostedSearchOutputItem(activity, value["item"]);
+		return;
+	}
+	if (type === "response.content_part.done" && isRecord(value["part"])) {
+		for (const annotation of annotationsFrom({ content: [value["part"]] })) activity.addSource(annotation.url, annotation.title);
+		return;
+	}
+	if (type === "response.output_text.annotation.added") {
+		const citation = citationFrom(value["annotation"]);
+		if (citation) activity.addSource(citation.url, citation.title);
+		return;
+	}
+	if (type === "response.completed" && isRecord(value["response"])) {
+		const response = value["response"];
+		activity.setResponseId(response["id"]);
+		for (const item of Array.isArray(response["output"]) ? response["output"] : []) observeHostedSearchOutputItem(activity, item);
+		activity.complete(typeof response["completed_at"] === "number" ? response["completed_at"] * 1000 : Date.now());
+		return;
+	}
+	if (type === "response.failed" || type === "error") {
+		const error = isRecord(value["response"]) ? value["response"]["error"] : value["message"] ?? value["error"];
+		activity.fail(isRecord(error) ? error["message"] : error);
 	}
 }
 
@@ -459,6 +459,15 @@ export function resetHostedSearchActivities(): void {
 
 export function setActiveHostedSearchActivity(activity: HostedSearchActivity | undefined): void {
 	activeActivity = activity;
+}
+
+export function observeActiveHostedSearchEvent(provider: string, model: string, value: unknown): void {
+	if (!activeActivity || activeActivity.provider !== provider || activeActivity.model !== model) return;
+	try {
+		observeHostedSearchEvent(activeActivity, value);
+	} catch {
+		// Observation must never affect the provider stream.
+	}
 }
 
 export function indexHostedSearchActivity(activity: HostedSearchActivity): void {

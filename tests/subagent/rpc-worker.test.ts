@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
+import { railResponsesWebSocketExtensionPath } from "../../openai/responses-websocket";
 import { HOSTED_SEARCH_ENTRY_TYPE } from "../../openai/hosted-search-activity";
 import {
 	RpcSessionWorker,
@@ -237,6 +238,7 @@ describe("RPC worker arguments", () => {
 			"--thinking", "xhigh",
 			"--exclude-tools", "subagent",
 			"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
+			"-e", railResponsesWebSocketExtensionPath(),
 			"-e", gptCompactionExtensionPath(),
 			"-e", contextExtensionPath(), "--rail-context-protocol", "1",
 		]);

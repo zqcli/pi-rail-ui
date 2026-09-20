@@ -2,16 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import installRailUi from "../../index";
 
-async function collectRegistrations(depth: number): Promise<{ tools: string[]; commands: string[] }> {
+async function collectRegistrations(depth: number): Promise<{ tools: string[]; commands: string[]; providers: string[] }> {
 	const previousDepth = process.env["PI_SUBAGENT_DEPTH"];
 	process.env["PI_SUBAGENT_DEPTH"] = String(depth);
 	const tools: string[] = [];
 	const commands: string[] = [];
+	const providers: string[] = [];
 	const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
 	try {
 		await installRailUi({
 			registerTool: (definition: { name: string }) => { tools.push(definition.name); },
 			registerCommand: (name: string) => { commands.push(name); },
+			registerProvider: (name: string) => { providers.push(name); },
 			on: () => undefined,
 			events: {
 				emit: (channel: string, data: unknown) => { for (const handler of eventHandlers.get(channel) ?? []) handler(data); },
@@ -23,7 +25,7 @@ async function collectRegistrations(depth: number): Promise<{ tools: string[]; c
 				},
 			},
 		} as any);
-		return { tools, commands };
+		return { tools, commands, providers };
 	} finally {
 		if (previousDepth === undefined) delete process.env["PI_SUBAGENT_DEPTH"];
 		else process.env["PI_SUBAGENT_DEPTH"] = previousDepth;

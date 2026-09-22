@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import WebSocket, { type RawData } from "ws";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
+
+const require = createRequire(import.meta.url);
+const { HttpsProxyAgent } = require("https-proxy-agent") as typeof import("https-proxy-agent");
+const { getProxyForUrl } = require("proxy-from-env") as typeof import("proxy-from-env");
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const CONNECTION_IDLE_TTL_MS = 5 * 60 * 1000;
@@ -94,6 +99,15 @@ export function isResponsesWebSocketContinuationError(error: unknown): boolean {
 	return error.code === "previous_response_not_found"
 		|| error.code === "response_not_found"
 		|| /previous[_ ]response.*not found/iu.test(error.message);
+}
+
+export function resolveResponsesWebSocketProxy(endpoint: string): string | undefined {
+	const websocketProxy = getProxyForUrl(endpoint);
+	if (websocketProxy) return websocketProxy;
+	const lookupUrl = new URL(endpoint);
+	if (lookupUrl.protocol === "wss:") lookupUrl.protocol = "https:";
+	else if (lookupUrl.protocol === "ws:") lookupUrl.protocol = "http:";
+	return getProxyForUrl(lookupUrl.toString()) || undefined;
 }
 
 function credentialFingerprint(apiKey: string | undefined): string {
@@ -238,7 +252,11 @@ async function connectWebSocket(
 		let socket: WebSocket;
 		let response: WebSocketUpgradeResponse = { status: 101, headers: {} };
 		try {
-			socket = new WebSocket(endpoint, { headers });
+			const proxy = resolveResponsesWebSocketProxy(endpoint);
+			socket = new WebSocket(endpoint, {
+				headers,
+				...(proxy ? { agent: new HttpsProxyAgent(proxy) } : {}),
+			});
 		} catch (error) {
 			const cause = error instanceof Error ? error : new Error(String(error));
 			reject(new ResponsesWebSocketHandshakeError(cause.message, { cause }));

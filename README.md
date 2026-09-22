@@ -31,6 +31,13 @@ The active entry point is:
 ~/.pi/agent/extensions/pi-rail-ui/index.ts
 ```
 
+Install production dependencies after cloning or updating the extension:
+
+```bash
+cd ~/.pi/agent/extensions/pi-rail-ui
+npm ci --omit=dev
+```
+
 After editing or installing it, reload Pi with:
 
 ```text
@@ -126,7 +133,7 @@ Rail can replace HTTP SSE with the native Responses WebSocket protocol for an ex
 }
 ```
 
-Only `wss:` endpoints ending in `/responses` are accepted. Models not listed in a route keep their original provider transport. Pi's normal `transport` setting controls behavior: `sse` bypasses Rail, `websocket` forces a one-off WebSocket, and `auto`/`websocket-cached` enable session connection reuse plus incremental continuation unless `cacheRetention` is `none`. In `auto`, a failed WebSocket handshake or an explicit pre-generation unavailable-channel/model routing error falls back to the provider's original SSE adapter; ambiguous disconnects do not retry because the upstream may already have started generation. Run `/reload` after changing the route file.
+Only `wss:` endpoints ending in `/responses` are accepted. Models not listed in a route keep their original provider transport. Pi's normal `transport` setting controls behavior: `sse` bypasses Rail, `websocket` forces a one-off WebSocket, and `auto`/`websocket-cached` enable session connection reuse plus incremental continuation unless `cacheRetention` is `none`. In `auto`, a failed WebSocket handshake or an explicit pre-generation unavailable-channel/model routing error falls back to the provider's original SSE adapter; ambiguous disconnects do not retry because the upstream may already have started generation. WebSocket connections honor `WSS_PROXY`/`ALL_PROXY`, fall back to `HTTPS_PROXY` for `wss:` endpoints, and respect `NO_PROXY`. Run `/reload` after changing the route file.
 
 ### `/rail-ui`
 

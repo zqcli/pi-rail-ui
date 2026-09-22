@@ -31,6 +31,13 @@ Pi Rail UI 的开发和完整测试基线为 Pi `0.86.0`；原生扩展加载还
 ~/.pi/agent/extensions/pi-rail-ui/index.ts
 ```
 
+克隆或更新扩展后安装生产运行依赖：
+
+```bash
+cd ~/.pi/agent/extensions/pi-rail-ui
+npm ci --omit=dev
+```
+
 安装或修改后，在 Pi 中执行：
 
 ```text
@@ -103,6 +110,29 @@ PI_CODING_AGENT_DIR="$agent_dir" PI_OFFLINE=1 PI_TELEMETRY=0 npm run check
 ## 命令
 
 Pi Rail UI 注册了以下 slash 命令：
+
+### 原生 Responses WebSocket 路由
+
+Rail 可按 provider/model 白名单把 HTTP SSE 替换为原生 Responses WebSocket，同时保留原 provider 的模型目录和 API key。全局路由配置位于：
+
+```text
+~/.pi/agent/rail-openai-responses-ws/settings.json
+```
+
+```json
+{
+  "version": 1,
+  "routes": [
+    {
+      "provider": "cus-resp",
+      "endpoint": "wss://ai.example.com/v1/responses",
+      "models": ["gpt-5.6-luna"]
+    }
+  ]
+}
+```
+
+只接受以 `/responses` 结尾的 `wss:` 地址。未列入路由的模型继续使用原 provider transport。Pi 的 `transport` 设置决定行为：`sse` 绕过 Rail，`websocket` 强制一次性 WebSocket，`auto`/`websocket-cached` 启用会话连接复用和增量续传。WebSocket 会读取 `WSS_PROXY`/`ALL_PROXY`，`wss:` 地址还会回退使用 `HTTPS_PROXY`，并遵守 `NO_PROXY`。修改路由文件后执行 `/reload`。
 
 ### `/rail-ui`
 

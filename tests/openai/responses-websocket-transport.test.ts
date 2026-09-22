@@ -10,8 +10,26 @@ import {
 	ResponsesWebSocketError,
 	ResponsesWebSocketHandshakeError,
 	resetRailResponsesWebSocketStats,
+	resolveResponsesWebSocketProxy,
 	runResponsesWebSocketRequest,
 } from "../../openai/responses-websocket/transport";
+
+function withProxyEnv<T>(values: Record<string, string | undefined>, run: () => T): T {
+	const previous = new Map<string, string | undefined>();
+	for (const [key, value] of Object.entries(values)) {
+		previous.set(key, process.env[key]);
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	try {
+		return run();
+	} finally {
+		for (const [key, value] of previous) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
 
 test("only pre-generation handshake and routing failures are safe SSE fallbacks", () => {
 	assert.equal(isSafeResponsesWebSocketFallback(new ResponsesWebSocketHandshakeError("connect failed")), true);
@@ -21,6 +39,25 @@ test("only pre-generation handshake and routing failures are safe SSE fallbacks"
 	assert.equal(isSafeResponsesWebSocketFallback(new Error("network failed after output")), false);
 	assert.equal(isResponsesWebSocketContinuationError(new ResponsesWebSocketError("cached response expired", "previous_response_not_found")), true);
 	assert.equal(isResponsesWebSocketContinuationError(new ResponsesWebSocketError("stream failed", "server_error")), false);
+});
+
+test("Responses WebSocket proxy resolution supports HTTPS_PROXY and NO_PROXY", () => {
+	const keys = {
+		WSS_PROXY: undefined,
+		ALL_PROXY: undefined,
+		HTTPS_PROXY: "http://127.0.0.1:12081",
+		NO_PROXY: undefined,
+		npm_config_wss_proxy: undefined,
+		npm_config_https_proxy: undefined,
+		npm_config_proxy: undefined,
+		npm_config_no_proxy: undefined,
+	};
+	withProxyEnv(keys, () => {
+		assert.equal(resolveResponsesWebSocketProxy("wss://ai.example.com/v1/responses"), "http://127.0.0.1:12081");
+	});
+	withProxyEnv({ ...keys, NO_PROXY: "ai.example.com" }, () => {
+		assert.equal(resolveResponsesWebSocketProxy("wss://ai.example.com/v1/responses"), undefined);
+	});
 });
 
 test("Responses WebSocket transport reuses a session connection and sends an input delta", async (t) => {

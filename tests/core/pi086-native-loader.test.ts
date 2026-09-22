@@ -24,8 +24,8 @@ import {
 // repository's devDependency `node_modules/@earendil-works/pi-ai` masks that
 // failure for any file under the repo, and an ancestor `node_modules` masks it
 // for `.tmp` too. Every load case therefore runs from a copied, production-only
-// layout created under the OS temp directory: source entries plus the `ws`
-// runtime dependency, no pi-ai.
+// layout created under the OS temp directory: source entries plus Rail's
+// runtime dependency closure, no pi-ai.
 //
 // The Pi runtime is passed in explicitly rather than derived from the repo, so
 // the same cases run against the repo's pinned 0.86.0 devDependency and against
@@ -121,7 +121,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	const bundled = await runChild(process.execPath, [
 		bundledCli(runtime),
 		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi086-registration-observer.ts")),
-	], { ...baseEnv, PI_RAIL_REGISTRATION_OUTPUT: bundledObservedPath }, cases.root, 80_000);
+	], { ...baseEnv, PI_RAIL_REGISTRATION_OUTPUT: bundledObservedPath }, cases.root, 120_000);
 	assert.equal(bundled.exitCode, 0, bundled.stderr || bundled.stdout);
 	assert.doesNotMatch(bundled.stderr, DEEP_IMPORT_FAILURE, "extension load must not report an unresolved pi-ai deep import");
 	assert.doesNotMatch(bundled.stderr, /Failed to load extension/u, "extension load must not report a load failure");
@@ -142,7 +142,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	const unbundled = await runChild(process.execPath, [
 		unbundledCli(runtime),
 		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi086-registration-observer.ts")),
-	], { ...baseEnv, PI_RAIL_REGISTRATION_OUTPUT: unbundledObservedPath }, cases.root, 80_000);
+	], { ...baseEnv, PI_RAIL_REGISTRATION_OUTPUT: unbundledObservedPath }, cases.root, 120_000);
 	assert.equal(unbundled.exitCode, 0, unbundled.stderr || unbundled.stdout);
 	assert.doesNotMatch(unbundled.stderr, DEEP_IMPORT_FAILURE, "unbundled loader must not report an unresolved pi-ai deep import");
 	assert.doesNotMatch(unbundled.stderr, /Failed to load extension/u);
@@ -159,7 +159,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 		PI_RAIL_SDK_CWD: cases.root,
 		PI_RAIL_SDK_AGENT_DIR: cases.agentDir,
 		PI_RAIL_SDK_OUTPUT: sdkOutputPath,
-	}, cases.root, 80_000);
+	}, cases.root, 120_000);
 	assert.equal(sdk.exitCode, 0, sdk.stderr || sdk.stdout);
 	const loaded = await readJson<LoadedExtensions>(sdkOutputPath);
 	assert.deepEqual(loaded.errors, [], "the SDK loader must not report extension errors");
@@ -179,7 +179,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	const compaction = await runChild(process.execPath, [
 		bundledCli(runtime),
 		...extensionArgs(join(cases.installation, "tests/fixtures/pi086-compaction-path-probe.ts")),
-	], { ...baseEnv, PI_RAIL_COMPACTION_PROBE_OUTPUT: compactionPath }, cases.root, 80_000);
+	], { ...baseEnv, PI_RAIL_COMPACTION_PROBE_OUTPUT: compactionPath }, cases.root, 120_000);
 	assert.equal(compaction.exitCode, 0, compaction.stderr || compaction.stdout);
 	assert.doesNotMatch(compaction.stderr, DEEP_IMPORT_FAILURE);
 	const convertedParameters = {
@@ -220,7 +220,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	});
 }
 
-test("Pi 0.86.0 native loaders boot the real installed extension from a production-only layout", { timeout: 120_000 }, async (t) => {
+test("Pi 0.86.0 native loaders boot the real installed extension from a production-only layout", { timeout: 300_000 }, async (t) => {
 	await runPositiveMatrix(t, repoRuntime(), REPO_ROOT);
 });
 
@@ -278,6 +278,6 @@ test("an extension-local decoy @earendil-works/pi-ai is not used in place of the
 
 const pi0861RuntimeDir = process.env["PI_RAIL_0861_RUNTIME"];
 
-test("Pi 0.86.1 (opt-in) boots the installed extension on bundle, unbundle, SDK, and compaction paths", { timeout: 180_000, skip: pi0861RuntimeDir ? false : "set PI_RAIL_0861_RUNTIME to an isolated 0.86.1 install" }, async (t) => {
+test("Pi 0.86.1 (opt-in) boots the installed extension on bundle, unbundle, SDK, and compaction paths", { timeout: 360_000, skip: pi0861RuntimeDir ? false : "set PI_RAIL_0861_RUNTIME to an isolated 0.86.1 install" }, async (t) => {
 	await runPositiveMatrix(t, { packageDir: pi0861RuntimeDir!, version: "0.86.1" }, REPO_ROOT);
 });

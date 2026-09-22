@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { cp, mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Shared harness for the native-loader regression shard. It takes an explicit Pi
@@ -40,6 +41,36 @@ export function runtimeEntry(runtime: RuntimePackage): string {
 
 function fixture(name: string): string {
 	return join(REPO_ROOT, "tests/fixtures", name);
+}
+
+async function copyRuntimeDependency(
+	name: string,
+	require: NodeJS.Require,
+	targetNodeModules: string,
+	copied: Set<string>,
+): Promise<void> {
+	if (copied.has(name)) return;
+	const packageJsonPath = require.resolve(`${name}/package.json`);
+	const packageDir = dirname(packageJsonPath);
+	const target = join(targetNodeModules, ...name.split("/"));
+	copied.add(name);
+	await mkdir(dirname(target), { recursive: true });
+	await cp(packageDir, target, { recursive: true });
+	const manifest = JSON.parse(await readFile(packageJsonPath, "utf8")) as { dependencies?: Record<string, string> };
+	const packageRequire = createRequire(packageJsonPath);
+	for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+		await copyRuntimeDependency(dependency, packageRequire, targetNodeModules, copied);
+	}
+}
+
+async function copyRuntimeDependencies(sourceRoot: string, targetNodeModules: string): Promise<void> {
+	const packageJsonPath = join(sourceRoot, "package.json");
+	const manifest = JSON.parse(await readFile(packageJsonPath, "utf8")) as { dependencies?: Record<string, string> };
+	const require = createRequire(packageJsonPath);
+	const copied = new Set<string>();
+	for (const dependency of Object.keys(manifest.dependencies ?? {})) {
+		await copyRuntimeDependency(dependency, require, targetNodeModules, copied);
+	}
 }
 
 export async function runChild(command: string, args: string[], env: NodeJS.ProcessEnv, cwd: string, timeoutMs: number): Promise<ChildResult> {
@@ -88,7 +119,8 @@ export async function runChild(command: string, args: string[], env: NodeJS.Proc
 
 /**
  * Copy the extension sources into `root` as a production deployment: source
- * entries, `ui-style.json`, the `ws` runtime dependency, and the probe fixtures.
+ * entries, `ui-style.json`, the runtime dependency closure, and the probe
+ * fixtures.
  * No `@earendil-works/pi-ai` is copied, which is what makes a deep pi-ai import
  * fail like it does for a real user. The runtime is reached by explicit path
  * (`-e` CLI, or PI_RAIL_SDK_RUNTIME_ENTRY), so the copy needs no
@@ -105,7 +137,7 @@ export async function installProductionCopy(root: string, sourceRoot: string, op
 		await cp(join(sourceRoot, entry), join(extension, entry), { recursive: true });
 	}
 	await cp(join(sourceRoot, "ui-style.json"), join(extension, "ui-style.json"));
-	await cp(join(REPO_ROOT, "node_modules/ws"), join(extension, "node_modules/ws"), { recursive: true });
+	await copyRuntimeDependencies(sourceRoot, join(extension, "node_modules"));
 	if (options.piAiDecoy) await writePiAiDecoy(join(extension, "node_modules/@earendil-works/pi-ai"));
 	// Probes are copied to the same depth they occupy in the repo (tests/fixtures)
 	// so their `../../tools/...` imports resolve inside the install copy too.

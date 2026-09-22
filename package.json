@@ -16,12 +16,15 @@
     "@earendil-works/pi-coding-agent": "0.86.0",
     "@earendil-works/pi-tui": "0.86.0",
     "@types/node": "22.19.19",
+    "@types/proxy-from-env": "1.0.4",
     "@types/ws": "8.18.1",
     "tsx": "4.23.12",
     "typebox": "1.3.7",
     "typescript": "5.9.3"
   },
   "dependencies": {
+    "https-proxy-agent": "7.0.6",
+    "proxy-from-env": "1.1.0",
     "ws": "8.21.3"
   }
 }

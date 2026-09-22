@@ -186,7 +186,8 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(tool.description, /\{"target":"worker","control":\{"delivery":"steer","message":"redirect now"\}\}/);
 	assert.match(tool.description, /Set contextWindow to null by default/);
 	assert.match(tool.description, /fastMode/);
-	assert.match(tool.description, /ignore rule applies only to legal parameter positions; target, grouped, and control calls still cannot set fastMode/);
+	assert.match(tool.description, /Parallel and chain calls may set fastMode independently on each eligible item/);
+	assert.match(tool.description, /do not set a grouped top-level fastMode/);
 	assert.match(tool.description, /no search parameter/);
 	assert.match(tool.description, /existing target.*descriptor|descriptor.*existing target/iu);
 	assert.match(tool.description, /through \/rail-agent/);
@@ -229,6 +230,7 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /Use contextWindow:null by default/);
 	assert.match(guidance, /fastMode/);
 	assert.match(guidance, /On a non-GPT model it is silently ignored/);
+	assert.match(guidance, /parallel and chain.*individual item/iu);
 	assert.match(guidance, /existing.*rail-agent|rail-agent.*existing/iu);
 	assert.match(guidance, /Only use a positive integer when the user explicitly requests/);
 	assert.match(guidance, /Null or omission uses the selected child model's native default/);
@@ -317,7 +319,7 @@ test("control mode steers and queues follow-ups for an active persistent target"
 	assert.equal(broker.controls.length, 2);
 });
 
-test("fastMode null is the default, target/grouped/control stay rejected, and a non-GPT value is ignored", async () => {
+test("fastMode null is the default, target/grouped-top-level/control stay rejected, and a non-GPT value is ignored", async () => {
 	const { tool, broker } = setupTool({
 		runStateless: async () => ({
 			exitCode: 0,
@@ -335,7 +337,11 @@ test("fastMode null is the default, target/grouped/control stay rejected, and a 
 	);
 	await assert.rejects(
 		() => tool.execute("call-group-fast", { tasks: [{ task: "one" }], fastMode: true }, undefined, undefined, context()),
-		/fastMode.*grouped|grouped.*fastMode/iu,
+		/fastMode.*single task.*parallel\/chain item/iu,
+	);
+	await assert.rejects(
+		() => tool.execute("call-group-target-fast", { tasks: [{ target: "auth-review", task: "one", fastMode: true }] }, undefined, undefined, context()),
+		/existing target.*rail-agent|rail-agent.*existing target/iu,
 	);
 	await assert.rejects(
 		() => tool.execute("call-control-fast", { target: "auth-review", fastMode: true, control: { delivery: "steer", message: "Focus" } }, undefined, undefined, context()),
@@ -512,6 +518,47 @@ test("fastMode is forwarded to stateless and initial persistent dispatches witho
 	assert.match(tool.renderCall(targetArgs, theme).render(120).join("\n"), /FAST off/);
 	assert.doesNotMatch(tool.renderResult(persistent, { expanded: false }, theme, { args: targetArgs }).render(120).join("\n"), /FAST|fast (?:on|off|agent)/u);
 	assert.doesNotMatch(JSON.stringify(persistent.details), /fastMode/);
+});
+
+test("grouped tasks forward independent fastMode policies to stateless and new persistent dispatches", async () => {
+	const statelessRequests: Array<{ task: string; fastMode?: boolean }> = [];
+	const { tool, broker } = setupTool({
+		runStateless: async (request) => {
+			statelessRequests.push({ task: request.task, ...(request.fastMode !== undefined ? { fastMode: request.fastMode } : {}) });
+			return {
+				exitCode: 0,
+				output: `done: ${request.task}`,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+			};
+		},
+	});
+	const args = {
+		tasks: [
+			{ task: "fast stateless", fastMode: true },
+			{ task: "slow stateless", fastMode: false },
+			{ alias: "fast-persistent", task: "fast persistent", fastMode: true },
+			{ model: "deepseek/deepseek-v4", task: "non-gpt ignored", fastMode: true },
+		],
+	};
+	const result = await tool.execute("grouped-fast", args, undefined, undefined, context());
+
+	assert.deepEqual(statelessRequests, [
+		{ task: "fast stateless", fastMode: true },
+		{ task: "slow stateless", fastMode: false },
+		{ task: "non-gpt ignored" },
+	]);
+	assert.equal(broker.requests.length, 1);
+	assert.equal(broker.requests[0]?.alias, "fast-persistent");
+	assert.equal(broker.requests[0]?.fastMode, true);
+	assert.doesNotMatch(JSON.stringify(result.details), /fastMode/);
+
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	assert.match(tool.renderCall(args, theme).render(320).join("\n"), /FAST 1=on, 2=off, 3=on, 4=off/u);
+	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(320).join("\n");
+	assert.match(panel, /#1 · one-off · .* · ContextWindow Default · FAST on · SEARCH on/u);
+	assert.match(panel, /#2 · one-off · .* · ContextWindow Default · FAST off · SEARCH on/u);
+	assert.match(panel, /fast-persistent · persistent · .* · ContextWindow Default · FAST on · SEARCH on/u);
+	assert.match(panel, /#4 · one-off · deepseek\/deepseek-v4 · ContextWindow Default · FAST off · SEARCH off/u);
 });
 
 test("dispatch headers always show defaults and use the saved fast policy for existing targets", async () => {
@@ -1294,8 +1341,8 @@ test("chain mode preserves ordering and substitutes the previous final output", 
 
 	const result = await tool.execute("call-chain", {
 		chain: [
-			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "planner", task: "make a plan" },
-			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "reviewer", task: "review this: {previous}" },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "planner", task: "make a plan", fastMode: true },
+			{ model: "cus-resp/gpt-5.6-sol:xhigh", alias: "reviewer", task: "review this: {previous}", fastMode: false },
 		],
 	}, undefined, undefined, context());
 
@@ -1304,6 +1351,7 @@ test("chain mode preserves ordering and substitutes the previous final output", 
 		"make a plan",
 		"review this: done: make a plan",
 	]);
+	assert.deepEqual(broker.requests.map((request) => request.fastMode), [true, false]);
 	assert.deepEqual(result.details.results.map((item: any) => item.step), [1, 2]);
 	assert.match(result.content[0].text, /Chain: 2\/2 succeeded/);
 });
@@ -1697,10 +1745,11 @@ test("normalization trims placeholders for single, parallel, and chain and keeps
 	assert.deepEqual(tool.prepareArguments({
 		contextWindow: null,
 		tasks: [
-			{ model: "", target: " keep-target ", alias: " ", task: "alpha", cwd: " ", session: { mode: "fork", path: "  " }, contextWindow: null },
+			{ model: " ", alias: " ", task: "alpha", cwd: " ", session: { mode: "fork", path: "  " }, contextWindow: null, fastMode: true },
+			{ target: " keep-target ", task: "beta" },
 		],
 	}), {
-		tasks: [{ target: "keep-target", task: "alpha" }],
+		tasks: [{ task: "alpha", fastMode: true }, { target: "keep-target", task: "beta" }],
 	});
 	assert.deepEqual(tool.prepareArguments({
 		contextWindow: null,

@@ -1,7 +1,7 @@
 // Drives the SDK extension loader directly against an explicitly provided Pi
 // runtime package. Importing by file URL (instead of the bare specifier) keeps
 // a repo-local `@earendil-works/pi-coding-agent` from silently resolving when
-// this runs against an isolated 0.86.1 install. `discoverAndLoadExtensions` is
+// this runs against the repository's isolated 0.87.0 install. `discoverAndLoadExtensions` is
 // the public entry point for the loader branch the unbundled runtime and
 // DefaultResourceLoader use; cwd and agentDir point at isolated temp dirs so
 // discovery contributes nothing and the result is exactly the explicit install.

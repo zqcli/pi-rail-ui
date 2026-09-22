@@ -6,9 +6,8 @@ import { fileURLToPath } from "node:url";
 
 // Shared harness for the native-loader regression shard. It takes an explicit Pi
 // coding-agent package directory instead of deriving the runtime from the repo,
-// so the same cases run against the repo's pinned 0.86.0 devDependency and
-// against an explicitly provided 0.86.1 install without letting the repo copy
-// leak into the run.
+// so the same cases run against the repo's pinned 0.87.0 devDependency without
+// letting the repo copy leak into the run.
 
 export interface RuntimePackage {
 	/** Absolute path to an installed `@earendil-works/pi-coding-agent` package. */
@@ -143,9 +142,9 @@ export async function installProductionCopy(root: string, sourceRoot: string, op
 	// so their `../../tools/...` imports resolve inside the install copy too.
 	const fixtures = join(extension, "tests/fixtures");
 	await mkdir(fixtures, { recursive: true });
-	await cp(fixture("pi086-registration-observer.ts"), join(fixtures, "pi086-registration-observer.ts"));
-	await cp(fixture("pi086-compaction-path-probe.ts"), join(fixtures, "pi086-compaction-path-probe.ts"));
-	await cp(fixture("pi086-sdk-loader.mjs"), join(fixtures, "pi086-sdk-loader.mjs"));
+	await cp(fixture("pi087-registration-observer.ts"), join(fixtures, "pi087-registration-observer.ts"));
+	await cp(fixture("pi087-compaction-path-probe.ts"), join(fixtures, "pi087-compaction-path-probe.ts"));
+	await cp(fixture("pi087-sdk-loader.mjs"), join(fixtures, "pi087-sdk-loader.mjs"));
 	return extension;
 }
 

@@ -1,7 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+	buildSessionProjection,
 	sessionEntryToContextMessages,
 	type CompactionEntry,
+	type ProjectedSessionEntry,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -63,8 +65,89 @@ export function resolveCheckpointBoundary(
 	};
 }
 
+/**
+ * A Rail compaction is opaque provider state. It may be replayed only by the
+ * matching provider identity; all recovery paths must remove it before asking
+ * Pi to project the original transcript.
+ */
+export function isRailCompactionEntry(entry: SessionEntry | undefined): entry is CompactionEntry {
+	return entry?.type === "compaction"
+		&& (getGptCompactionDetails(entry) !== undefined || isGptCompactionSummaryText(entry.summary));
+}
+
+/**
+ * Make a path-shaped copy without changing any source entry. The public
+ * projection API follows parentId links, while callers often pass a detached
+ * branch slice or a branch with opaque entries removed. Re-linking that copy
+ * lets the canonical SessionManager projection still apply ContextEditEntry
+ * omission/replacement and native compaction rules.
+ */
+function relinkLinearEntries(entries: readonly SessionEntry[]): SessionEntry[] {
+	let parentId: string | null = null;
+	return entries.map((entry) => {
+		const copy = structuredClone(entry);
+		copy.parentId = parentId;
+		parentId = copy.id;
+		return copy;
+	});
+}
+
+function projectLinearEntries(entries: readonly SessionEntry[]): ProjectedSessionEntry[] {
+	return buildSessionProjection(relinkLinearEntries(entries)).entries;
+}
+
+/**
+ * Return a path with Rail checkpoints removed. Context edits remain in the path
+ * and are applied by buildSessionProjection(), so omitted responses cannot be
+ * revived merely because recovery is rebuilding the raw append-only records.
+ */
+export function buildRailFreeBranch(branchEntries: readonly SessionEntry[]): SessionEntry[] {
+	return relinkLinearEntries(branchEntries.filter((entry) => !isRailCompactionEntry(entry)));
+}
+
+/**
+ * Materialize the canonical projection as ordinary entries for cut-point
+ * decisions. The source IDs are preserved, while context-edit replacements are
+ * copied into the source message and omissions remove the source message. This
+ * is deliberately only a temporary in-memory view; session history stays
+ * append-only and untouched.
+ */
+export function materializeRailFreeProjection(branchEntries: readonly SessionEntry[]): SessionEntry[] {
+	const projection = projectLinearEntries(branchEntries.filter((entry) => !isRailCompactionEntry(entry)));
+	const materialized: SessionEntry[] = [];
+	for (const projected of projection) {
+		const source = projected.sourceEntry;
+		if (source.type === "context_edit") continue;
+		if (source.type === "compaction") {
+			materialized.push(source);
+			continue;
+		}
+		if (projected.messages.length === 0) {
+			// Keep state-only entries (usage/model/labels) so raw IDs still mark
+			// the same admission boundary; omit only intrinsically visible entries
+			// that canonical projection intentionally removed.
+			if (sessionEntryToContextMessages(source).length === 0) materialized.push(source);
+			continue;
+		}
+		if (source.type === "message" && projected.messages.length === 1 && projected.messages[0]) {
+			const message = projected.messages[0];
+			materialized.push({ ...source, message } as SessionEntry);
+			continue;
+		}
+		if (source.type === "custom_message" && projected.messages.length === 1) {
+			const message = projected.messages[0];
+			if (message?.role === "custom" && "content" in message) {
+				materialized.push({ ...source, content: message.content } as SessionEntry);
+				continue;
+			}
+		}
+		materialized.push(source);
+	}
+	return relinkLinearEntries(materialized);
+}
+
 export function collectMessages(entries: readonly SessionEntry[]): AgentMessage[] {
-	return entries.flatMap(sessionEntryToContextMessages);
+	return projectLinearEntries(entries).flatMap((entry) => entry.messages);
 }
 
 export interface HistoryRebuildResult {
@@ -113,50 +196,116 @@ export function findLatestNativeHistoryBoundaryInRange(
 	return undefined;
 }
 
+function projectedMessagesForNativeRange(
+	branchEntries: readonly SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+): { messages: AgentMessage[]; nativeBoundary?: NativeHistoryBoundary } {
+	const nativeBoundary = findLatestNativeHistoryBoundaryInRange(branchEntries, startIndex, endIndex);
+	// Project the complete branch first. An edit may be appended after the
+	// requested interval while targeting a retained message inside it; slicing
+	// before projection would silently restore the old content.
+	const projectedById = new Map(projectLinearEntries(branchEntries).map((entry) => [entry.sourceEntry.id, entry.messages]));
+	if (!nativeBoundary) {
+		const latestNative = findLatestNativeHistoryBoundary(branchEntries);
+		// A prefix ending before the native compaction's logical anchor cannot use
+		// the later snapshot: the complete projection intentionally hides that
+		// older source range. Project this detached prefix directly instead.
+		if (latestNative && latestNative.firstKeptIndex >= endIndex) {
+			const selected = branchEntries.slice(startIndex, endIndex).filter((entry) => entry.type !== "compaction");
+			return { messages: projectLinearEntries(selected).flatMap((entry) => entry.messages) };
+		}
+		return {
+			messages: branchEntries.slice(startIndex, endIndex)
+				.filter((entry) => entry.type !== "compaction")
+				.flatMap((entry) => projectedById.get(entry.id) ?? []),
+		};
+	}
+
+	const messages: AgentMessage[] = [
+		// An older native compaction can be hidden by a newer opaque checkpoint in
+		// the canonical projection, so restore its own authoritative snapshot here.
+		...sessionEntryToContextMessages(nativeBoundary.entry),
+	];
+	for (let index = nativeBoundary.firstKeptIndex; index < endIndex; index += 1) {
+		const entry = branchEntries[index];
+		if (!entry || entry.type === "compaction") continue;
+		// The native snapshot replaces all system deltas before its physical entry.
+		if (index < nativeBoundary.compactionIndex && entry.type === "message" && entry.message.role === "system") continue;
+		messages.push(...(projectedById.get(entry.id) ?? []));
+	}
+	return { messages, nativeBoundary };
+}
+
+function projectRecoveryPrefix(
+	branchEntries: readonly SessionEntry[],
+	endIndex: number,
+): { messages: AgentMessage[]; nativeBoundary?: NativeHistoryBoundary } {
+	const rawPrefix = branchEntries.slice(0, endIndex);
+	const targetIds = new Set(rawPrefix.map((entry) => entry.id));
+	const futureEdits = branchEntries.slice(endIndex).filter((entry) => entry.type === "context_edit" && targetIds.has(entry.targetId));
+	const nativeBoundary = findLatestNativeHistoryBoundaryInRange(branchEntries, 0, endIndex);
+	const selected: SessionEntry[] = [];
+	if (nativeBoundary) {
+		selected.push(nativeBoundary.entry);
+		for (let index = nativeBoundary.firstKeptIndex; index < endIndex; index += 1) {
+			const entry = branchEntries[index];
+			if (!entry || entry.type === "compaction") continue;
+			if (index < nativeBoundary.compactionIndex && entry.type === "message" && entry.message.role === "system") continue;
+			selected.push(entry);
+		}
+	} else {
+		selected.push(...rawPrefix.filter((entry) => !isRailCompactionEntry(entry)));
+	}
+	selected.push(...futureEdits);
+	return {
+		messages: projectLinearEntries(selected).flatMap((entry) => entry.messages),
+		...(nativeBoundary ? { nativeBoundary } : {}),
+	};
+}
+
+/**
+ * Project a logical interval using Pi 0.87's canonical SessionManager rules.
+ * The interval is expressed in the original branch's indices; context-edit
+ * entries in the interval therefore affect their target before serialization.
+ */
+export function projectHistoryRange(
+	branchEntries: readonly SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+): AgentMessage[] {
+	if (startIndex < 0 || endIndex < startIndex || endIndex > branchEntries.length) return [];
+	return projectedMessagesForNativeRange(branchEntries, startIndex, endIndex).messages;
+}
+
 /**
  * Rebuild the real, provider-independent conversation from session entries.
  *
- * Pi stores every original entry, so flattening every non-compaction entry
- * restores the exact pre-compaction conversation. This is the recovery path
- * used when an opaque checkpoint cannot be replayed: either the feature is off,
- * the active model/account/gateway differs, or native compaction must run.
- * Compaction entries themselves are skipped because their ciphertext is bound
- * to one provider and must never reach another.
+ * Remote/invalid Rail checkpoints are removed from a path-shaped copy before
+ * canonical projection. This preserves ContextEditEntry omissions and content
+ * replacements while retaining Pi's latest usable native compaction snapshot.
  */
 export function rebuildNativeHistory(branchEntries: readonly SessionEntry[]): HistoryRebuildResult {
-	const messages: AgentMessage[] = [];
-	let skippedCompactions = 0;
+	const railFree = buildRailFreeBranch(branchEntries);
+	const projection = buildSessionProjection(railFree);
 	const nativeBoundary = findLatestNativeHistoryBoundary(branchEntries);
-	const startIndex = nativeBoundary?.firstKeptIndex ?? 0;
-	if (nativeBoundary) messages.push(...sessionEntryToContextMessages(nativeBoundary.entry));
-	for (let index = startIndex; index < branchEntries.length; index += 1) {
-		const entry = branchEntries[index];
-		if (!entry) continue;
-		if (entry.type === "compaction") {
-			skippedCompactions += 1;
-			continue;
-		}
-		// Pi's native checkpoint replaces all system deltas before its physical
-		// boundary, including those in the retained range (also for legacy entries).
-		if (nativeBoundary && index < nativeBoundary.compactionIndex && entry.type === "message" && entry.message.role === "system") continue;
-		messages.push(...sessionEntryToContextMessages(entry));
-	}
-	return { messages, skippedCompactions, ...(nativeBoundary ? { nativeBoundary } : {}) };
+	return {
+		messages: projection.messages,
+		skippedCompactions: branchEntries.filter((entry) => entry.type === "compaction" && !isNativeCompactionEntry(entry)).length,
+		...(nativeBoundary ? { nativeBoundary } : {}),
+	};
 }
 
-/** Rebuild a branch prefix using the same native-boundary rules as full replay. */
+/** Rebuild a branch prefix using the same native-boundary and context-edit rules as full replay. */
 export function rebuildNativeHistoryPrefix(
 	branchEntries: readonly SessionEntry[],
 	endIndex: number,
 ): HistoryRebuildResult | undefined {
 	if (endIndex < 0 || endIndex > branchEntries.length) return undefined;
-	const nativeBoundary = findLatestNativeHistoryBoundaryInRange(branchEntries, 0, endIndex);
-	if (!nativeBoundary) return rebuildNativeHistory(branchEntries.slice(0, endIndex));
-	const messages = [
-		...sessionEntryToContextMessages(nativeBoundary.entry),
-		...collectMessages(branchEntries.slice(nativeBoundary.firstKeptIndex, endIndex).filter((entry, offset) =>
-			entry.type !== "compaction"
-			&& !(nativeBoundary.firstKeptIndex + offset < nativeBoundary.compactionIndex && entry.type === "message" && entry.message.role === "system"))),
-	];
-	return { messages, skippedCompactions: 1, nativeBoundary };
+	const range = projectRecoveryPrefix(branchEntries, endIndex);
+	return {
+		messages: range.messages,
+		skippedCompactions: branchEntries.slice(0, endIndex).filter((entry) => entry.type === "compaction" && !isNativeCompactionEntry(entry)).length,
+		...(range.nativeBoundary ? { nativeBoundary: range.nativeBoundary } : {}),
+	};
 }

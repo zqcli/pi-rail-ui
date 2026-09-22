@@ -17,8 +17,8 @@ import {
 } from "../helpers/native-loader-harness";
 
 // Regression for the Pi startup failure "Cannot find module
-// '@earendil-works/pi-ai/api/constrained-sampling'", reported on 0.86.0 and
-// 0.86.1. Pi's native extension loader (jiti) virtualizes only the pi-ai
+// '@earendil-works/pi-ai/api/constrained-sampling'", reported on 0.87.0.
+// Pi's native extension loader (jiti) virtualizes only the pi-ai
 // root/compat/oauth/providers entrypoints, so any `@earendil-works/pi-ai/api/*`
 // or `.../utils/*` deep import in an installed extension cannot resolve. The
 // repository's devDependency `node_modules/@earendil-works/pi-ai` masks that
@@ -28,9 +28,8 @@ import {
 // runtime dependency closure, no pi-ai.
 //
 // The Pi runtime is passed in explicitly rather than derived from the repo, so
-// the same cases run against the repo's pinned 0.86.0 devDependency and against
-// an explicitly provided 0.86.1 install without the repo copy leaking into the
-// run. The default suite never downloads anything.
+// the same cases run against the repo's pinned 0.87.0 devDependency without the
+// repo copy leaking into the run. The default suite never downloads anything.
 //
 // A generation is never started: children receive only a `get_state` RPC and the
 // probe fixtures never call a provider, read credentials, or read user logs.
@@ -64,7 +63,7 @@ interface LoadedExtensions {
 }
 
 function repoRuntime(): RuntimePackage {
-	return { packageDir: join(REPO_ROOT, "node_modules/@earendil-works/pi-coding-agent"), version: "0.86.0" };
+	return { packageDir: join(REPO_ROOT, "node_modules/@earendil-works/pi-coding-agent"), version: "0.87.0" };
 }
 
 /** Read the installed version so a mismatched runtime path cannot pass silently. */
@@ -120,7 +119,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	const bundledObservedPath = join(cases.root, "observed-bundled.json");
 	const bundled = await runChild(process.execPath, [
 		bundledCli(runtime),
-		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi086-registration-observer.ts")),
+		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi087-registration-observer.ts")),
 	], { ...baseEnv, PI_RAIL_REGISTRATION_OUTPUT: bundledObservedPath }, cases.root, 120_000);
 	assert.equal(bundled.exitCode, 0, bundled.stderr || bundled.stdout);
 	assert.doesNotMatch(bundled.stderr, DEEP_IMPORT_FAILURE, "extension load must not report an unresolved pi-ai deep import");
@@ -141,7 +140,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	const unbundledObservedPath = join(cases.root, "observed-unbundled.json");
 	const unbundled = await runChild(process.execPath, [
 		unbundledCli(runtime),
-		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi086-registration-observer.ts")),
+		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi087-registration-observer.ts")),
 	], { ...baseEnv, PI_RAIL_REGISTRATION_OUTPUT: unbundledObservedPath }, cases.root, 120_000);
 	assert.equal(unbundled.exitCode, 0, unbundled.stderr || unbundled.stdout);
 	assert.doesNotMatch(unbundled.stderr, DEEP_IMPORT_FAILURE, "unbundled loader must not report an unresolved pi-ai deep import");
@@ -152,7 +151,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 
 	// SDK loader, importing the runtime by explicit path.
 	const sdkOutputPath = join(cases.root, "sdk-loader.json");
-	const sdk = await runChild(process.execPath, [join(cases.installation, "tests/fixtures/pi086-sdk-loader.mjs")], {
+	const sdk = await runChild(process.execPath, [join(cases.installation, "tests/fixtures/pi087-sdk-loader.mjs")], {
 		...baseEnv,
 		PI_RAIL_SDK_INDEX: cases.index,
 		PI_RAIL_SDK_RUNTIME_ENTRY: runtimeEntry(runtime),
@@ -166,9 +165,10 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	assert.equal(loaded.extensionCount, 1);
 	for (const tool of EXPECTED_TOOLS) assert.ok(loaded.tools.includes(tool), `tool ${tool} must be registered`);
 	for (const command of EXPECTED_COMMANDS) assert.ok(loaded.commands.includes(command), `command ${command} must be registered`);
-	for (const event of ["session_start", "before_provider_request", "session_before_compact"]) {
+	for (const event of ["session_start", "before_provider_request", "session_before_compact", "context_with_system"]) {
 		assert.ok(loaded.events.includes(event), `hook ${event} must be registered`);
 	}
+	assert.equal(loaded.events.includes("context"), false, "full-transcript replay must use context_with_system");
 
 	// Compaction path: in-memory exercise of the openai-responses-shared binding.
 	// The fixture forces the reconstruction loop (cached wire has no tools) and the
@@ -178,7 +178,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	const compactionPath = join(cases.root, "compaction-path.json");
 	const compaction = await runChild(process.execPath, [
 		bundledCli(runtime),
-		...extensionArgs(join(cases.installation, "tests/fixtures/pi086-compaction-path-probe.ts")),
+		...extensionArgs(join(cases.installation, "tests/fixtures/pi087-compaction-path-probe.ts")),
 	], { ...baseEnv, PI_RAIL_COMPACTION_PROBE_OUTPUT: compactionPath }, cases.root, 120_000);
 	assert.equal(compaction.exitCode, 0, compaction.stderr || compaction.stdout);
 	assert.doesNotMatch(compaction.stderr, DEEP_IMPORT_FAILURE);
@@ -220,7 +220,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	});
 }
 
-test("Pi 0.86.0 native loaders boot the real installed extension from a production-only layout", { timeout: 300_000 }, async (t) => {
+test("Pi 0.87.0 native loaders boot the real installed extension from a production-only layout", { timeout: 300_000 }, async (t) => {
 	await runPositiveMatrix(t, repoRuntime(), REPO_ROOT);
 });
 
@@ -253,31 +253,11 @@ test("an extension-local decoy @earendil-works/pi-ai is not used in place of the
 	const cases = await setupCase(t, REPO_ROOT, { piAiDecoy: true });
 	const result = await runChild(process.execPath, [
 		bundledCli(runtime),
-		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi086-registration-observer.ts")),
+		...extensionArgs(cases.index, join(cases.installation, "tests/fixtures/pi087-registration-observer.ts")),
 	], { HOME: cases.home, PI_CODING_AGENT_DIR: cases.agentDir, PI_RAIL_REGISTRATION_OUTPUT: join(cases.root, "observed.json") }, cases.root, 80_000);
 	assert.equal(result.exitCode, 0, result.stderr || result.stdout);
 	assert.doesNotMatch(result.stderr, /decoy @earendil-works\/pi-ai must not be imported/u);
 	assert.doesNotMatch(result.stderr, /Failed to load extension/u);
 	const observed = await readJson<ObservedRegistrations>(join(cases.root, "observed.json"));
 	for (const tool of EXPECTED_TOOLS) assert.ok(observed.tools.includes(tool), `tool ${tool} must be registered`);
-});
-
-// ---------------------------------------------------------------------------
-// Opt-in Pi 0.86.1 matrix
-// ---------------------------------------------------------------------------
-// The default suite never downloads Pi and never touches the repo package files.
-// To verify 0.86.1, install it yourself into an isolated temp prefix outside the
-// repo and point PI_RAIL_0861_RUNTIME at the package directory:
-//
-//   npm install --prefix /tmp/pi-0861 --no-save @earendil-works/pi-coding-agent@0.86.1
-//   PI_RAIL_0861_RUNTIME=/tmp/pi-0861/node_modules/@earendil-works/pi-coding-agent \
-//     npx --no-install tsx --test tests/core/pi086-native-loader.test.ts
-//
-// The version is read from the package's own package.json and asserted against
-// 0.86.1, so a stale repo copy cannot masquerade as the download.
-
-const pi0861RuntimeDir = process.env["PI_RAIL_0861_RUNTIME"];
-
-test("Pi 0.86.1 (opt-in) boots the installed extension on bundle, unbundle, SDK, and compaction paths", { timeout: 360_000, skip: pi0861RuntimeDir ? false : "set PI_RAIL_0861_RUNTIME to an isolated 0.86.1 install" }, async (t) => {
-	await runPositiveMatrix(t, { packageDir: pi0861RuntimeDir!, version: "0.86.1" }, REPO_ROOT);
 });

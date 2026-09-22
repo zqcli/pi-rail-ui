@@ -19,7 +19,7 @@ import {
 	runRemoteCompaction,
 } from "./core";
 import { resolveCompactionAuth } from "./auth";
-import { rebuildNativeHistoryPrefix } from "./history";
+import { isRailCompactionEntry, materializeRailFreeProjection, rebuildNativeHistoryPrefix } from "./history";
 import { clearRequestContextCache } from "./request-context";
 import { rejectRailOaiCommandForModel } from "../../commands/rail-oai-command";
 import { getGptCompactionDetails, isGptCompactionSummaryText, resolveSessionCheckpoint } from "./types";
@@ -104,16 +104,26 @@ function nativeRepairPreparation(
 	branch: SessionEntry[],
 	settings: SessionBeforeCompactEvent["preparation"]["settings"],
 ): SessionBeforeCompactEvent["preparation"] | undefined {
-	const checkpointIndex = branch.findLastIndex((entry) => entry.type === "compaction"
-		&& (getGptCompactionDetails(entry) || isGptCompactionSummaryText(entry.summary)));
-	// Preserve usage ancestry. A retained opaque checkpoint would leak back into
-	// native context, so the anchor must already exist strictly after it.
-	if (checkpointIndex < 0 || checkpointIndex + 1 >= branch.length) return undefined;
-	const cut = findCutPoint(branch, checkpointIndex + 1, branch.length, settings.keepRecentTokens);
+	// Use the 0.87 canonical projection before choosing a repair boundary. This
+	// applies context_edit omission/replacement and removes opaque Rail entries;
+	// choosing a cut from raw entries would resurrect an aborted response.
+	const projectedBranch = materializeRailFreeProjection(branch);
+	if (projectedBranch.length === 0) return undefined;
+	// Preserve the opaque checkpoint's logical prefix. Native repair must choose
+	// an anchor from the tail after the newest Rail checkpoint; otherwise a small
+	// keepRecentTokens budget would retain an old response and fail to summarize
+	// the whole pre-checkpoint interval.
+	const railIndex = branch.findLastIndex((entry) => isRailCompactionEntry(entry));
+	const rawAdmissionStart = railIndex >= 0 ? railIndex + 1 : 0;
+	const admissionStartId = branch[rawAdmissionStart]?.id;
+	const projectedAdmissionStart = admissionStartId
+		? projectedBranch.findIndex((entry) => entry.id === admissionStartId)
+		: projectedBranch.length;
+	const cut = findCutPoint(projectedBranch, Math.max(0, projectedAdmissionStart), projectedBranch.length, settings.keepRecentTokens);
 	let firstKeptIndex = cut.firstKeptEntryIndex;
 	const calls = new Set<string>();
-	for (let index = firstKeptIndex; index < branch.length; index += 1) {
-		const entry = branch[index]!;
+	for (let index = firstKeptIndex; index < projectedBranch.length; index += 1) {
+		const entry = projectedBranch[index]!;
 		for (const message of sessionEntryToContextMessages(entry)) {
 			if (message.role === "assistant") {
 				for (const block of message.content) if (block.type === "toolCall") calls.add(block.id);
@@ -124,9 +134,11 @@ function nativeRepairPreparation(
 			}
 		}
 	}
-	const firstKeptEntry = branch[firstKeptIndex];
+	const firstKeptEntry = projectedBranch[firstKeptIndex];
 	if (!firstKeptEntry) return undefined;
-	const prefix = rebuildNativeHistoryPrefix(branch, firstKeptIndex);
+	const rawCutIndex = branch.findIndex((entry) => entry.id === firstKeptEntry.id);
+	if (rawCutIndex < 0) return undefined;
+	const prefix = rebuildNativeHistoryPrefix(branch, rawCutIndex);
 	if (!prefix?.messages.length) return undefined;
 	return {
 		firstKeptEntryId: firstKeptEntry.id,
@@ -177,29 +189,38 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		const originalBranch = branch.slice(0, checkpointIndex);
 		const hasTail = checkpointIndex + 1 < branch.length;
 		// A checkpoint-only leaf has no append-only anchor. Keep the original
-		// sibling-native repair without replaying or duplicating any entries.
+		// sibling-native repair without replaying or duplicating any entries, but
+		// choose the sibling boundary from Pi's canonical projected messages.
 		const keptIndex = originalBranch.findIndex((entry) => entry.id === checkpoint.entry.firstKeptEntryId);
-		const siblingCut = keptIndex > 0 ? keptIndex
-			: findCutPoint(originalBranch, 0, originalBranch.length, settings.keepRecentTokens).firstKeptEntryIndex;
-		const siblingAnchor = originalBranch[siblingCut];
+		const projectedOriginal = materializeRailFreeProjection(originalBranch);
+		const projectedKeptIndex = projectedOriginal.findIndex((entry) => entry.id === checkpoint.entry.firstKeptEntryId);
+		const projectedSiblingCut = projectedKeptIndex > 0 ? projectedKeptIndex
+			: findCutPoint(projectedOriginal, 0, projectedOriginal.length, settings.keepRecentTokens).firstKeptEntryIndex;
+		const siblingAnchor = projectedOriginal[projectedSiblingCut];
+		const siblingCut = siblingAnchor ? originalBranch.findIndex((entry) => entry.id === siblingAnchor.id) : -1;
 		// Removing only the newest checkpoint can leave older opaque markers in
 		// the sibling's retained span. Summarize through those markers instead.
 		const siblingHasOpaqueHistory = originalBranch.slice(siblingCut).some((entry) => entry.type === "compaction"
 			&& (getGptCompactionDetails(entry) || isGptCompactionSummaryText(entry.summary)));
 		const preparation = hasTail ? nativeRepairPreparation(branch, settings)
-			: siblingHasOpaqueHistory ? nativeRepairPreparation(originalBranch, settings) : siblingAnchor && {
-			firstKeptEntryId: siblingAnchor.id,
-			messagesToSummarize: rebuildNativeHistoryPrefix(originalBranch, siblingCut)?.messages ?? [],
-			turnPrefixMessages: [], isSplitTurn: false,
-			tokensBefore: rebuiltBranchMessages(originalBranch).reduce((total, message) => total + estimateTokens(message), 0),
-			fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() }, settings,
-		};
+			: siblingHasOpaqueHistory ? nativeRepairPreparation(originalBranch, settings)
+				: siblingAnchor && siblingCut >= 0 ? {
+					firstKeptEntryId: siblingAnchor.id,
+					messagesToSummarize: rebuildNativeHistoryPrefix(originalBranch, siblingCut)?.messages ?? [],
+					turnPrefixMessages: [], isSplitTurn: false,
+					tokensBefore: rebuiltBranchMessages(originalBranch).reduce((total, message) => total + estimateTokens(message), 0),
+					fileOps: { read: new Set<string>(), written: new Set<string>(), edited: new Set<string>() }, settings,
+				} : undefined;
 		if (!preparation?.messagesToSummarize.length) return { ok: false, detail: "no-safe-native-repair-boundary" };
 		// Match Pi's admission cut: either a history prefix or a split-turn
 		// prefix must contain conversation, not just system state/compactions.
-		const admissionStart = keptIndex >= 0 ? keptIndex : checkpointIndex + 1;
-		const admissionCut = findCutPoint(branch, admissionStart, branch.length, settings.keepRecentTokens);
-		const admitsOriginal = hasTail && branch.slice(admissionStart, admissionCut.firstKeptEntryIndex)
+		const projectedBranch = materializeRailFreeProjection(branch);
+		const admissionSourceId = keptIndex >= 0 ? originalBranch[keptIndex]?.id : branch[checkpointIndex + 1]?.id;
+		const admissionStart = admissionSourceId ? projectedBranch.findIndex((entry) => entry.id === admissionSourceId) : -1;
+		const admissionCut = admissionStart >= 0
+			? findCutPoint(projectedBranch, admissionStart, projectedBranch.length, settings.keepRecentTokens)
+			: { firstKeptEntryIndex: 0 };
+		const admitsOriginal = hasTail && admissionStart >= 0 && projectedBranch.slice(admissionStart, admissionCut.firstKeptEntryIndex)
 			.some((entry) => entry.type !== "compaction"
 				&& sessionEntryToContextMessages(entry).some((message) => message.role !== "system"));
 		const repair: PendingNativeRepair = {
@@ -429,14 +450,16 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	pi.on("context", async (event, ctx) => {
+	pi.on("context_with_system", async (event, ctx) => {
 		syncMode();
 		const branchEntries = ctx.sessionManager.getBranch();
 		const checkpoint = resolveSessionCheckpoint(branchEntries);
 		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return undefined;
 		const support = modelSupportsRemoteCompaction(ctx.model);
 		const identity = support.supported ? await resolveRuntimeIdentity(ctx) : safeIdentity(ctx);
-		const storedMessages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
+		// Pi 0.87 has already applied ContextEditEntry edits in this canonical
+		// projection. Keep it as the live prefix when merging transient messages.
+		const storedMessages = ctx.sessionManager.buildSessionProjection().messages;
 		const decision = planContextReplay({
 			ctx,
 			branchEntries,

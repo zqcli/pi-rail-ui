@@ -168,7 +168,7 @@ async function readProbe(logPath: string): Promise<Record<string, any>> {
 	return record;
 }
 
-test("real Pi 0.86.0 loads the root extension and preserves live input in off/on replay", { timeout: 30_000 }, async (t) => {
+test("real Pi 0.87.0 loads the root extension and preserves live input in off/on replay", { timeout: 30_000 }, async (t) => {
 	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-"));
 	t.after(() => rm(sandbox, { recursive: true, force: true }));
 

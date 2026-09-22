@@ -13,7 +13,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth, resolveSessionId } from "./auth";
-import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, findLatestNativeHistoryBoundaryInRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
+import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, projectHistoryRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
 import { compactionIdentity, identitiesMatch, type CompactionIdentity } from "./model-eligibility";
 import { resolveCompactionRequestExtras, rememberRequestContext } from "./request-context";
 import {
@@ -97,25 +97,13 @@ export function rebuiltBranchInput(model: Model<Api>, branchEntries: readonly Se
 	return serializeMessagesToResponsesInput(model, convertToLlm(rebuiltBranchMessages(branchEntries)));
 }
 
-function serializeEntries(model: Model<Api>, entries: readonly SessionEntry[]): unknown[] {
-	return serializeMessagesToResponsesInput(model, convertToLlm(collectMessages(entries)));
-}
-
-function serializeLogicalCompactionInterval(
+function serializeHistoryRange(
 	model: Model<Api>,
 	branchEntries: readonly SessionEntry[],
 	startIndex: number,
 	endIndex: number,
 ): unknown[] {
-	const nativeBoundary = findLatestNativeHistoryBoundaryInRange(branchEntries, startIndex, endIndex);
-	if (!nativeBoundary) {
-		return serializeEntries(model, branchEntries.slice(startIndex, endIndex).filter((entry) => entry.type !== "compaction"));
-	}
-	const messages = [
-		...sessionEntryToContextMessages(nativeBoundary.entry),
-		...collectMessages(branchEntries.slice(nativeBoundary.firstKeptIndex, endIndex).filter((entry) => entry.type !== "compaction")),
-	];
-	return serializeMessagesToResponsesInput(model, convertToLlm(messages));
+	return serializeMessagesToResponsesInput(model, convertToLlm(projectHistoryRange(branchEntries, startIndex, endIndex)));
 }
 
 function safeHistoryPrefixInput(model: Model<Api>, branchEntries: readonly SessionEntry[], endIndex: number): unknown[] | undefined {
@@ -177,7 +165,7 @@ export function buildRemoteCompactionRequest(args: {
 			ok: true,
 			input: [
 				...cloneCheckpointItems(checkpoint.details.replacement),
-				...serializeLogicalCompactionInterval(args.model, args.branchEntries, boundary.firstKeptIndex, cutIndex),
+				...serializeHistoryRange(args.model, args.branchEntries, boundary.firstKeptIndex, cutIndex),
 			],
 		};
 	}
@@ -185,8 +173,8 @@ export function buildRemoteCompactionRequest(args: {
 		ok: true,
 		input: [
 			...cloneCheckpointItems(checkpoint.details.replacement),
-			...serializeLogicalCompactionInterval(args.model, args.branchEntries, boundary.firstKeptIndex, boundary.boundaryIndex),
-			...serializeEntries(args.model, boundary.liveTail),
+			...serializeHistoryRange(args.model, args.branchEntries, boundary.firstKeptIndex, boundary.boundaryIndex),
+			...serializeHistoryRange(args.model, args.branchEntries, boundary.boundaryIndex + 1, args.branchEntries.length),
 		],
 	};
 }
@@ -485,21 +473,25 @@ function currentBranchMessagesBeforeCut(
 	return rebuildNativeHistoryPrefix(branchEntries, cutIndex)?.messages;
 }
 
-/** Resolve declaration state independently of the conversation's compaction cut. */
+/** Resolve declaration state from Pi's canonical projected transcript. */
 function requestTranscript(branchEntries: readonly SessionEntry[]) {
-	const messages: AgentMessage[] = [];
-	for (const entry of branchEntries) {
-		if (entry.type === "compaction" && entry.systemMessage) {
-			// A full checkpoint replaces all earlier deltas, including kept ones.
-			messages.length = 0;
-			messages.push(entry.systemMessage);
-		} else if (entry.type === "message" && entry.message.role === "system") {
-			messages.push(...sessionEntryToContextMessages(entry));
+	const latestCompaction = [...branchEntries].reverse().find((entry) => entry.type === "compaction");
+	if (latestCompaction?.type === "compaction" && !latestCompaction.systemMessage) {
+		// Pre-0.87/hand-edited native entries may not carry the authoritative
+		// system snapshot. Preserve the legacy declaration delta stream in that
+		// case; ContextEditEntry cannot target system messages.
+		const messages: AgentMessage[] = [];
+		for (const entry of branchEntries) {
+			if (entry.type === "compaction" && entry.systemMessage) {
+				messages.length = 0;
+				messages.push(entry.systemMessage);
+			} else if (entry.type === "message" && entry.message.role === "system") {
+				messages.push(...sessionEntryToContextMessages(entry));
+			}
 		}
-		// Legacy compactions have no system snapshot. Keep replaying the real
-		// declarations even when only a partial delta follows that compaction.
+		return convertToLlm(messages);
 	}
-	return convertToLlm(messages);
+	return convertToLlm(collectMessages(branchEntries).filter((message) => message.role === "system"));
 }
 
 export function rememberLiveRequestContext(ctx: ExtensionContext, payload: unknown): void {

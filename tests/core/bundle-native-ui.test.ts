@@ -9,9 +9,9 @@ const bundleCli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-c
 const probeExtension = fileURLToPath(new URL("../fixtures/bundle-native-ui-probe.ts", import.meta.url));
 const railPackage = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/package.json", import.meta.url));
 
-test("Pi 0.86.0 bundled native-UI: editor, chat-tree, and renderer behaviors via public seams", { timeout: 60_000 }, async (t) => {
+test("Pi 0.87.0 bundled native-UI: editor, chat-tree, and renderer behaviors via public seams", { timeout: 60_000 }, async (t) => {
 	const { version } = JSON.parse(await readFile(railPackage, "utf8"));
-	assert.equal(version, "0.86.0", "repo-local 0.86.0 bundle expected");
+	assert.equal(version, "0.87.0", "repo-local 0.87.0 bundle expected");
 
 	const tempParent = join(process.cwd(), ".tmp");
 	await mkdir(tempParent, { recursive: true });

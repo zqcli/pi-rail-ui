@@ -4,7 +4,7 @@ import { writeFileSync } from "node:fs";
 // observes the public ExtensionAPI/ExtensionContext surface only, so it proves
 // the Rail factory completed and its registrations reached the live runtime
 // without importing Rail at test time (which would bypass the native loader).
-export default function pi086RegistrationObserver(pi: any): void {
+export default function pi087RegistrationObserver(pi: any): void {
 	pi.on("session_start", (_event: any, ctx: any) => {
 		const outputPath = process.env["PI_RAIL_REGISTRATION_OUTPUT"];
 		if (!outputPath) throw new Error("PI_RAIL_REGISTRATION_OUTPUT is required");

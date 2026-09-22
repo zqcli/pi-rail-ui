@@ -30,7 +30,7 @@ function nativeBranch() {
 	return { manager, kept, native };
 }
 
-test("native replay matches Pi 0.86 snapshot and post-boundary system deltas", () => {
+test("native replay matches Pi 0.87 snapshot and post-boundary system deltas", () => {
 	const { manager } = nativeBranch();
 	const expected = manager.buildSessionContext().messages;
 	const rebuilt = rebuildNativeHistory(manager.getBranch()).messages;
@@ -78,7 +78,7 @@ test("replay across a later remote checkpoint uses only the native snapshot and 
 });
 
 async function harness(t: TestContext, withUsage: boolean, reserveTokens = 200, validCheckpoint = true, tail: "messages" | "metadata" | "none" = "messages", withNative = false, history = ["history to summarize"]) {
-	const sandbox = await mkdtemp(join(tmpdir(), "pi086-repair-"));
+	const sandbox = await mkdtemp(join(tmpdir(), "pi087-repair-"));
 	const previous = process.env["PI_CODING_AGENT_DIR"];
 	process.env["PI_CODING_AGENT_DIR"] = sandbox;
 	t.after(async () => {
@@ -163,6 +163,9 @@ async function harness(t: TestContext, withUsage: boolean, reserveTokens = 200, 
 				_getSummarizationRequestAuth: async () => {
 					beforeHook?.();
 					return { model, apiKey: "local-test" };
+				},
+				_refreshFinalizedContext: () => {
+					session.agent.state.messages = manager.buildSessionProjection().messages;
 				},
 				_extensionRunner: {
 					hasHandlers: (name: string) => handlers.has(name),

@@ -3,34 +3,30 @@ import {
 	AssistantMessageEventStream,
 	clampThinkingLevel,
 	createAssistantMessageEventStream,
+	getDeclaredTools,
+	normalizeContext,
 	registerSessionResourceCleanup,
+	resolveTranscript,
+	resolveTranscriptTools,
 	type Api,
 	type AssistantMessage,
 	type Model,
+	type OpenAIResponsesOptions,
 	type Provider,
 	type SimpleStreamOptions,
 	type StreamOptions,
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import { createGrammarToolInputProperties } from "@earendil-works/pi-ai/api/constrained-sampling";
-import type { OpenAIResponsesOptions } from "@earendil-works/pi-ai/api/openai-responses";
-import { clampOpenAIPromptCacheKey } from "@earendil-works/pi-ai/api/openai-prompt-cache";
-import {
-	convertResponsesMessages,
-	convertResponsesTools,
-	processResponsesStream,
-} from "@earendil-works/pi-ai/api/openai-responses-shared";
-import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
-import { formatProviderError, normalizeProviderError } from "@earendil-works/pi-ai/utils/error-body";
-import { getProviderEnvValue } from "@earendil-works/pi-ai/utils/provider-env";
-import {
-	getDeclaredTools,
-	normalizeContext,
-	resolveTranscript,
-	resolveTranscriptTools,
-} from "@earendil-works/pi-ai/utils/transcript";
 import type { ExtensionAPI, ExtensionContext, ProviderConfig } from "@earendil-works/pi-coding-agent";
+import {
+	constrainedSampling,
+	promptCache,
+	providerEnv,
+	providerErrors,
+	responsesShared,
+	simpleOptions,
+} from "../../core/pi-ai-internal";
 import { observeActiveHostedSearchEvent } from "../hosted-search-activity";
 import {
 	readRailResponsesWebSocketSettings,
@@ -43,6 +39,13 @@ import {
 	isSafeResponsesWebSocketFallback,
 	runResponsesWebSocketRequest,
 } from "./transport";
+
+const { createGrammarToolInputProperties } = constrainedSampling;
+const { clampOpenAIPromptCacheKey } = promptCache;
+const { convertResponsesMessages, convertResponsesTools, processResponsesStream } = responsesShared;
+const { buildBaseOptions } = simpleOptions;
+const { formatProviderError, normalizeProviderError } = providerErrors;
+const { getProviderEnvValue } = providerEnv;
 
 const INSTALL_EVENT = "rail-openai-responses-ws:install";
 const RESPONSES_API = "openai-responses";

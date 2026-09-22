@@ -4,7 +4,7 @@ Pi Rail UI is a local visual extension for the Pi coding agent. It adds a rail-b
 
 It customizes visual surfaces and tool presentation while preserving Pi's normal editor behavior, keybindings, and native TUI features.
 
-Pi Rail UI requires Pi `0.86.0`. Earlier Pi releases are not supported.
+Pi Rail UI's development and full-suite baseline is Pi `0.86.0`. Native extension loading is also verified against npm Pi `0.86.1`; see the [startup fix and verification scope](docs/pi-ai-extension-loading.md). Earlier Pi releases are not supported.
 
 ## Highlights
 

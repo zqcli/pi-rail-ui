@@ -17,7 +17,8 @@ import {
 } from "../helpers/native-loader-harness";
 
 // Regression for the Pi startup failure "Cannot find module
-// '@earendil-works/pi-ai/api/constrained-sampling'", reported on 0.87.0.
+// '@earendil-works/pi-ai/api/constrained-sampling'", reported on 0.86.0 and
+// 0.86.1 and revalidated against 0.87.0.
 // Pi's native extension loader (jiti) virtualizes only the pi-ai
 // root/compat/oauth/providers entrypoints, so any `@earendil-works/pi-ai/api/*`
 // or `.../utils/*` deep import in an installed extension cannot resolve. The

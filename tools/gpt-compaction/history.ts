@@ -119,7 +119,11 @@ export function materializeRailFreeProjection(branchEntries: readonly SessionEnt
 		const source = projected.sourceEntry;
 		if (source.type === "context_edit") continue;
 		if (source.type === "compaction") {
-			materialized.push(source);
+			// buildSessionProjection() can retain an older compaction source inside
+			// the newest checkpoint's raw kept range, but gives it no messages. Do
+			// not turn that inert provenance marker back into a visible summary for
+			// findCutPoint(), which operates on ordinary SessionEntry values.
+			if (projected.messages.length > 0) materialized.push(source);
 			continue;
 		}
 		if (projected.messages.length === 0) {
@@ -188,8 +192,14 @@ export function findLatestNativeHistoryBoundaryInRange(
 	for (let compactionIndex = entries.length - 1; compactionIndex >= 0; compactionIndex -= 1) {
 		const entry = entries[compactionIndex];
 		if (!isNativeCompactionEntry(entry)) continue;
-		const firstKeptIndex = findEntryIndex(entries, entry.firstKeptEntryId);
-		if (firstKeptIndex >= startIndex && firstKeptIndex < endIndex && firstKeptIndex < compactionIndex) {
+		// appendCompaction() uses the compaction's own ID when no raw entry is
+		// retained. Treat that as a boundary at the compaction index so ranges
+		// before it can still be projected independently, while ranges crossing it
+		// use the authoritative native summary.
+		const firstKeptIndex = entry.firstKeptEntryId === entry.id
+			? compactionIndex
+			: findEntryIndex(entries, entry.firstKeptEntryId);
+		if (firstKeptIndex >= startIndex && firstKeptIndex < endIndex && firstKeptIndex <= compactionIndex) {
 			return { compactionIndex, firstKeptIndex, entry };
 		}
 	}
@@ -213,7 +223,10 @@ function projectedMessagesForNativeRange(
 		// older source range. Project this detached prefix directly instead.
 		if (latestNative && latestNative.firstKeptIndex >= endIndex) {
 			const selected = branchEntries.slice(startIndex, endIndex).filter((entry) => entry.type !== "compaction");
-			return { messages: projectLinearEntries(selected).flatMap((entry) => entry.messages) };
+			const targetIds = new Set(selected.map((entry) => entry.id));
+			const futureEdits = branchEntries.slice(endIndex)
+				.filter((entry) => entry.type === "context_edit" && targetIds.has(entry.targetId));
+			return { messages: projectLinearEntries([...selected, ...futureEdits]).flatMap((entry) => entry.messages) };
 		}
 		return {
 			messages: branchEntries.slice(startIndex, endIndex)

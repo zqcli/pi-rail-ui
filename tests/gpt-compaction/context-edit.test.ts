@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { SessionManager, sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	buildRemoteCompactionRequest,
 	planContextReplay,
@@ -8,6 +8,7 @@ import {
 } from "../../tools/gpt-compaction/core";
 import { compactionIdentity } from "../../tools/gpt-compaction/model-eligibility";
 import { installGptCompaction } from "../../tools/gpt-compaction/extension";
+import { materializeRailFreeProjection, projectHistoryRange } from "../../tools/gpt-compaction/history";
 import { gptCompactionSummary, type GptCompactionDetails } from "../../tools/gpt-compaction/types";
 
 const model = {
@@ -117,6 +118,85 @@ test("context replay replaces the full canonical transcript without reviving omi
 	assert.match(transcript, /system prompt/);
 	assert.match(transcript, /post-checkpoint kept replacement|after omission/);
 	assert.doesNotMatch(transcript, /stale placeholder|kept original|discarded pre-checkpoint response|discarded live response/);
+});
+
+test("context replay removes an opaque checkpoint when canonical recovery is empty", () => {
+	const manager = SessionManager.inMemory();
+	const omitted = appendUser(manager, "only persisted message");
+	manager.appendContextEdit(omitted, null);
+	const identity = compactionIdentity(model);
+	const checkpoint = { type: "compaction" as const, encrypted_content: "opaque-empty-recovery" };
+	const parentEntryId = manager.getLeafId();
+	const details: GptCompactionDetails = {
+		version: 2,
+		strategy: "gpt-remote-compaction-v2",
+		checkpointId: "empty-recovery",
+		consumer: identity,
+		producer: identity,
+		checkpoint,
+		replacement: [checkpoint],
+		boundary: { parentEntryId, firstKeptEntryId: omitted, tokensBefore: 1 },
+		createdAt: "2026-01-01T00:00:00.000Z",
+	};
+	manager.appendCompaction(gptCompactionSummary(details.checkpointId), omitted, 1, details, true);
+	const branch = manager.getBranch();
+	const canonical = manager.buildSessionProjection().messages;
+	assert.match(JSON.stringify(canonical), /empty-recovery/);
+
+	const decision = planContextReplay({
+		ctx: replayContext(branch),
+		branchEntries: branch,
+		remoteEnabled: false,
+		identity,
+		messages: canonical,
+		storedMessages: canonical,
+	});
+	assert.deepEqual(decision, { action: "replace", messages: [] });
+});
+
+test("detached history ranges apply later context edits to their selected source entries", () => {
+	const manager = SessionManager.inMemory();
+	const edited = appendUser(manager, "old detached content");
+	const kept = appendUser(manager, "native retained anchor");
+	manager.appendCompaction("native summary", kept, 10);
+	manager.appendContextEdit(edited, { content: "edited detached content" });
+
+	const range = projectHistoryRange(manager.getBranch(), 0, 1);
+	assert.match(JSON.stringify(range), /edited detached content/);
+	assert.doesNotMatch(JSON.stringify(range), /old detached content/);
+});
+
+test("retain-none native compactions separate detached raw prefixes from the native summary", () => {
+	const manager = SessionManager.inMemory();
+	appendUser(manager, "raw history before retain-none");
+	const nativeId = manager.appendCompaction("retain-none native summary", undefined as unknown as string, 10);
+	appendUser(manager, "live history after retain-none");
+	const branch = manager.getBranch();
+	const nativeIndex = branch.findIndex((entry) => entry.id === nativeId);
+	assert.equal(branch[nativeIndex]?.type, "compaction");
+	assert.equal(branch[nativeIndex]?.type === "compaction" && branch[nativeIndex].firstKeptEntryId, nativeId);
+
+	const detached = JSON.stringify(projectHistoryRange(branch, 0, nativeIndex));
+	assert.match(detached, /raw history before retain-none/);
+	assert.doesNotMatch(detached, /retain-none native summary/);
+	const crossing = JSON.stringify(projectHistoryRange(branch, 0, nativeIndex + 1));
+	assert.match(crossing, /retain-none native summary/);
+	assert.doesNotMatch(crossing, /raw history before retain-none/);
+});
+
+test("materialized projections do not revive older inert native compactions", () => {
+	const manager = SessionManager.inMemory();
+	appendUser(manager, "summarized before both native checkpoints");
+	const kept = appendUser(manager, "shared retained history");
+	manager.appendCompaction("older native summary", kept, 10);
+	appendUser(manager, "between native checkpoints");
+	manager.appendCompaction("newest native summary", kept, 20);
+	appendUser(manager, "live native tail");
+
+	const canonical = manager.buildSessionProjection().messages;
+	const materialized = materializeRailFreeProjection(manager.getBranch());
+	assert.equal(materialized.filter((entry) => entry.type === "compaction").length, 1);
+	assert.deepEqual(materialized.flatMap(sessionEntryToContextMessages), canonical);
 });
 
 test("GPT compaction registers the full-transcript 0.87 context_with_system hook", () => {

@@ -128,6 +128,54 @@ test("remote checkpoint replay follows the branch boundary and supports continuo
 	assert.equal(resolveSessionCheckpoint([u1, a1, u2, a2, c1, u3, a3, c2]).status, "remote");
 });
 
+test("remote checkpoint replay preserves tool call/result pairing across the checkpoint entry", () => {
+	const kept = message("cross-boundary-user", null, "inspect the file");
+	const toolAssistant = {
+		type: "message",
+		id: "cross-boundary-assistant",
+		parentId: kept.id,
+		timestamp: "2025-01-01T00:00:01.000Z",
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "cross-boundary-call|fc-cross", name: "read", arguments: { path: "a.ts" } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "toolUse",
+			timestamp: 2,
+		},
+	} as unknown as SessionEntry;
+	const checkpointDetails = details("cross-boundary", toolAssistant.id, kept.id);
+	const checkpoint = remoteEntry("cross-boundary-checkpoint", toolAssistant.id, checkpointDetails);
+	const toolResult = {
+		type: "message",
+		id: "cross-boundary-result",
+		parentId: checkpoint.id,
+		timestamp: "2025-01-01T00:00:03.000Z",
+		message: {
+			role: "toolResult",
+			toolCallId: "cross-boundary-call|fc-cross",
+			toolName: "read",
+			content: [{ type: "text", text: "real cross-boundary output" }],
+			isError: false,
+			timestamp: 3,
+		},
+	} as SessionEntry;
+
+	const request = buildRemoteCompactionRequest({
+		model,
+		branchEntries: [kept, toolAssistant, checkpoint, toolResult],
+		identity,
+	});
+	assert.equal(request.ok, true);
+	if (!request.ok) return;
+	const serialized = JSON.stringify(request.input);
+	assert.match(serialized, /real cross-boundary output/);
+	assert.doesNotMatch(serialized, /No result provided/);
+	assert.equal(serialized.match(/cross-boundary-call/gu)?.length, 2, "one call and its one real result must remain paired");
+});
+
 test("remote cut inside an older retained interval preserves the latest native prefix", () => {
 	const oldUser = message("old-user", null, "history covered by native summary");
 	const oldAssistant = message("old-assistant", "old-user", "old answer", "assistant");

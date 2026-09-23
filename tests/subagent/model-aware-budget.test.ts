@@ -21,7 +21,7 @@ const native = (model: typeof small) => ({ provider: model.provider, id: model.m
 const run = () => ({ output: "done", usage: emptySubagentUsage() });
 
 async function setup(t: TestContext, trusted = true) {
-	const root = await mkdtemp(join(tmpdir(), "rail-budget-086-"));
+	const root = await mkdtemp(join(tmpdir(), "rail-budget-087-"));
 	const agentDir = join(root, "agent");
 	const childCwd = join(root, "child");
 	const parentCwd = join(root, "parent");

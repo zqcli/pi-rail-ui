@@ -84,9 +84,9 @@ function usageFromResponse(usage: RemoteCompactionUsage | undefined, model: Mode
 /**
  * Rebuild the real, provider-independent conversation from session entries.
  *
- * Pi stores every original entry, so flattening non-compaction entries restores
- * the exact conversation that existed before any Rail checkpoint. Compaction
- * entries are skipped because their ciphertext is bound to one provider.
+ * Pi stores original entries, but context edits can replace or omit them. Use
+ * the canonical projection of the Rail-free branch, so discarded responses
+ * cannot reappear and provider-bound ciphertext stays out of recovery.
  */
 export function rebuiltBranchMessages(branchEntries: readonly SessionEntry[]): AgentMessage[] {
 	return rebuildNativeHistory(branchEntries).messages;
@@ -97,13 +97,8 @@ export function rebuiltBranchInput(model: Model<Api>, branchEntries: readonly Se
 	return serializeMessagesToResponsesInput(model, convertToLlm(rebuiltBranchMessages(branchEntries)));
 }
 
-function serializeHistoryRange(
-	model: Model<Api>,
-	branchEntries: readonly SessionEntry[],
-	startIndex: number,
-	endIndex: number,
-): unknown[] {
-	return serializeMessagesToResponsesInput(model, convertToLlm(projectHistoryRange(branchEntries, startIndex, endIndex)));
+function serializeHistoryMessages(model: Model<Api>, messages: readonly AgentMessage[]): unknown[] {
+	return serializeMessagesToResponsesInput(model, convertToLlm([...messages]));
 }
 
 function safeHistoryPrefixInput(model: Model<Api>, branchEntries: readonly SessionEntry[], endIndex: number): unknown[] | undefined {
@@ -165,16 +160,23 @@ export function buildRemoteCompactionRequest(args: {
 			ok: true,
 			input: [
 				...cloneCheckpointItems(checkpoint.details.replacement),
-				...serializeHistoryRange(args.model, args.branchEntries, boundary.firstKeptIndex, cutIndex),
+				...serializeHistoryMessages(args.model, projectHistoryRange(args.branchEntries, boundary.firstKeptIndex, cutIndex)),
 			],
 		};
 	}
+	// Serialize the retained interval and live tail as one conversation. A tool
+	// call may be retained immediately before the checkpoint while its real tool
+	// result is appended immediately after it; serializing the ranges separately
+	// would synthesize a fake result for the first range and drop the real one.
+	const replayMessages = [
+		...projectHistoryRange(args.branchEntries, boundary.firstKeptIndex, boundary.boundaryIndex),
+		...projectHistoryRange(args.branchEntries, boundary.boundaryIndex + 1, args.branchEntries.length),
+	];
 	return {
 		ok: true,
 		input: [
 			...cloneCheckpointItems(checkpoint.details.replacement),
-			...serializeHistoryRange(args.model, args.branchEntries, boundary.firstKeptIndex, boundary.boundaryIndex),
-			...serializeHistoryRange(args.model, args.branchEntries, boundary.boundaryIndex + 1, args.branchEntries.length),
+			...serializeHistoryMessages(args.model, replayMessages),
 		],
 	};
 }
@@ -530,9 +532,14 @@ function rebuiltContextMessages(args: {
 		}
 		return true;
 	};
-	if (startsWith(rebuilt)) return args.messages.map((message) => structuredClone(message));
-	if (!startsWith(args.storedMessages)) return undefined;
-	return [...rebuilt, ...args.messages.slice(args.storedMessages.length).map((message) => structuredClone(message))];
+	if (startsWith(args.storedMessages)) {
+		return [...rebuilt, ...args.messages.slice(args.storedMessages.length).map((message) => structuredClone(message))];
+	}
+	// Another context hook may already have installed the rebuilt prefix. An
+	// empty rebuilt history is not evidence of that: every message list starts
+	// with [], and accepting it would preserve an opaque checkpoint summary.
+	if (rebuilt.length > 0 && startsWith(rebuilt)) return args.messages.map((message) => structuredClone(message));
+	return undefined;
 }
 
 /**

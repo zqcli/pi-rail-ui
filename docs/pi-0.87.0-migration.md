@@ -2,7 +2,7 @@
 
 ## 结果
 
-- 日期：2026-09-22。
+- 日期：2026-09-23。
 - 四个 Pi 包精确固定为 `0.87.0`，并同步更新 `package-lock.json`：
   `@earendil-works/pi-agent-core`、`@earendil-works/pi-ai`、
   `@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`。
@@ -21,7 +21,7 @@
 Pi 0.87 的 `SessionManager` 增加了 append-only `ContextEditEntry` 和 provenance-preserving `buildSessionProjection()`。Rail 的 replay/repair 不再把 raw branch 直接 flatten 成消息：
 
 - recovery 会先移除 provider-bound 的 Rail checkpoint，再对重新链接的内存 branch 使用官方 canonical projection；这样 `replacement: null` 的 omission 和 replacement content 都会生效。
-- remote compaction 的 retained/live interval 通过 canonical projected range 序列化，ContextEditEntry 不能被遗漏，也不能把已废弃的 assistant response 重新发给 provider。
+- remote compaction 的 retained/live interval 通过 canonical projected range 序列化，并在 checkpoint 两侧合并工具调用与结果后一次性序列化；ContextEditEntry 不会被遗漏，已废弃的 assistant response 不会重新发给 provider。
 - native repair 的 cut point 在 canonical projection materialized view 上计算；state-only usage entries 保留为 boundary anchor，而被 projection omission 的可见 message 不会成为新的 retained history。
 - 0.87 原生 compaction 的 system snapshot、旧 native boundary 和 detached prefix cut 继续按 Pi 的投影规则处理；opaque Rail checkpoint 不会进入 native summary。
 - 运行时没有改写 append-only session source。临时 relink/materialized view 只用于 replay、cut point 和 summary request，外部 leaf、usage ledger 与 branched-session extraction 保持原有语义。
@@ -30,6 +30,8 @@ Pi 0.87 的 `SessionManager` 增加了 append-only `ContextEditEntry` 和 proven
 
 - omission 不会复活 pre-checkpoint 或 live-tail response；
 - replacement 会同时出现在 native recovery、context replay 和 remote compaction input；
+- 空 canonical recovery、跨 native 边界的 edit、retain-none native compaction 和重叠 native summary 不会复活 opaque marker 或旧消息；
+- `tests/gpt-compaction/core.test.ts` 覆盖 checkpoint 两侧工具调用与真实结果的配对；
 - GPT extension 注册 `context_with_system` 而不是 `context`。
 
 ## Native loader、bundle 与 harness
@@ -54,7 +56,7 @@ npx --no-install tsx --test tests/core/pi087-native-loader.test.ts
 npm test
 ```
 
-实际验证结果：`npm run check` 通过，TypeScript 通过，完整测试为 **687 tests / 28 suites，687 passed，0 failed / cancelled / skipped / todo**，总测试耗时约 20.2 秒；此前的 0.87 定向 compaction/context-edit 分片、native loader/bundle 分片和 subagent integration 分片也全部通过。`git diff --check` 同样通过。测试使用仓库内 mock provider 和 Pi bundle，不调用付费模型。
+实际验证结果：`npm run check` 通过，TypeScript 通过，完整测试为 **692 tests / 28 suites，692 passed，0 failed / cancelled / skipped / todo**，总测试耗时约 19.9 秒；0.87 定向 compaction/context-edit 分片、native loader 与 subagent integration 分片也全部通过。`git diff --check` 同样通过。测试使用仓库内 mock provider 和 Pi bundle，不调用付费模型。
 
 ## 验证边界
 

@@ -12,7 +12,7 @@ import { modelSupportsRemoteCompaction } from "../../tools/gpt-compaction/model-
  * consume, so a regression here has to fail in one place.
  */
 test("shared GPT matching accepts delimited tokens anywhere in the id", () => {
-	for (const id of ["gpt", "GPT", "gpt-5.6-sol", "GPT-4.1", "custom-gpt", "gpt_5", "gpt:1", "openai/gpt", "my.gpt.x", "-gpt-", "gpt-"]) {
+	for (const id of ["gpt", "GPT", "gpt-5.6-sol", "gpt-6-luna", "gpt-6-sol", "GPT-4.1", "custom-gpt", "gpt_5", "gpt:1", "openai/gpt", "my.gpt.x", "-gpt-", "gpt-"]) {
 		assert.equal(isGptModel({ id }), true, `id ${JSON.stringify(id)} must match`);
 	}
 });
@@ -54,11 +54,14 @@ test("shared GPT matching ignores the provider id and API", () => {
 /** Models that all three features must agree on when they share `openai-responses`. */
 const RESPONSES_GPT_MODELS = [
 	{ provider: "openai", api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol", baseUrl: "https://gateway.example/v1" },
+	{ provider: "openai", api: "openai-responses", id: "gpt-6-luna", name: "GPT-6 Luna", baseUrl: "https://gateway.example/v1" },
+	{ provider: "github-copilot", api: "openai-responses", id: "gpt-6-sol", name: "GPT-6 Sol", baseUrl: "https://gateway.example/v1" },
 	{ provider: "custom", api: "openai-responses", id: "custom-latest", name: "GPT 5.6", baseUrl: "https://gateway.example/v1" },
 	{ provider: "another", api: "openai-responses", id: "GPT-4.1", baseUrl: "https://gateway.example/v1" },
 ];
 const RESPONSES_NON_GPT_MODELS = [
 	{ provider: "openai", api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4", baseUrl: "https://gateway.example/v1" },
+	{ provider: "xai", api: "openai-responses", id: "grok-4.7", name: "Grok 4.7", baseUrl: "https://gateway.example/v1" },
 	{ provider: "custom", api: "openai-responses", id: "claude-opus", name: "Claude Opus", baseUrl: "https://gateway.example/v1" },
 	{ provider: "another", api: "openai-responses", id: "custom-latest", name: "Custom latest", baseUrl: "https://gateway.example/v1" },
 ];

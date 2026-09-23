@@ -18,7 +18,7 @@ import {
 
 // Regression for the Pi startup failure "Cannot find module
 // '@earendil-works/pi-ai/api/constrained-sampling'", reported on 0.86.0 and
-// 0.86.1 and revalidated against 0.87.0.
+// 0.86.1 and revalidated against 0.87.1.
 // Pi's native extension loader (jiti) virtualizes only the pi-ai
 // root/compat/oauth/providers entrypoints, so any `@earendil-works/pi-ai/api/*`
 // or `.../utils/*` deep import in an installed extension cannot resolve. The
@@ -29,7 +29,7 @@ import {
 // runtime dependency closure, no pi-ai.
 //
 // The Pi runtime is passed in explicitly rather than derived from the repo, so
-// the same cases run against the repo's pinned 0.87.0 devDependency without the
+// the same cases run against the repo's pinned 0.87.1 devDependency without the
 // repo copy leaking into the run. The default suite never downloads anything.
 //
 // A generation is never started: children receive only a `get_state` RPC and the
@@ -64,7 +64,7 @@ interface LoadedExtensions {
 }
 
 function repoRuntime(): RuntimePackage {
-	return { packageDir: join(REPO_ROOT, "node_modules/@earendil-works/pi-coding-agent"), version: "0.87.0" };
+	return { packageDir: join(REPO_ROOT, "node_modules/@earendil-works/pi-coding-agent"), version: "0.87.1" };
 }
 
 /** Read the installed version so a mismatched runtime path cannot pass silently. */
@@ -221,7 +221,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	});
 }
 
-test("Pi 0.87.0 native loaders boot the real installed extension from a production-only layout", { timeout: 300_000 }, async (t) => {
+test("Pi 0.87.1 native loaders boot the real installed extension from a production-only layout", { timeout: 300_000 }, async (t) => {
 	await runPositiveMatrix(t, repoRuntime(), REPO_ROOT);
 });
 

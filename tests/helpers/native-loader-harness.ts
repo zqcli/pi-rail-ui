@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 // Shared harness for the native-loader regression shard. It takes an explicit Pi
 // coding-agent package directory instead of deriving the runtime from the repo,
-// so the same cases run against the repo's pinned 0.87.0 devDependency without
+// so the same cases run against the repo's pinned 0.87.1 devDependency without
 // letting the repo copy leak into the run.
 
 export interface RuntimePackage {

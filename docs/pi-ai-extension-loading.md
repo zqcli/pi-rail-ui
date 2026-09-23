@@ -1,4 +1,4 @@
-# Pi 0.87.0 扩展启动与 native loader 验证
+# Pi 0.87.1 扩展启动与 native loader 验证
 
 ## 问题与根因
 
@@ -29,7 +29,7 @@ Pi 0.87 的 GPT compaction full-transcript hook 使用 `context_with_system`。l
 - 重新引入 `@earendil-works/pi-ai/api/constrained-sampling` 时确实失败；
 - extension-local decoy `@earendil-works/pi-ai` 不会替代宿主依赖。
 
-默认矩阵只使用仓库固定的 Pi `0.87.0`，不下载额外 runtime，也不启动模型生成。子进程只发送离线 `get_state` RPC；HOME、agent directory 和 loader environment 都隔离。
+默认矩阵只使用仓库固定的 Pi `0.87.1`，不下载额外 runtime，也不启动模型生成。子进程只发送离线 `get_state` RPC；HOME、agent directory 和 loader environment 都隔离。
 
 ```bash
 npx --no-install tsx --test tests/core/pi087-native-loader.test.ts
@@ -44,6 +44,6 @@ bundle 与真实生命周期 smoke 还由以下测试覆盖：
 
 ## 边界
 
-- 本测试验证 macOS 当前环境中的 npm Pi 0.87.0 loader/bundle 行为，不等同于 Windows fullscreen 或人工 iTerm2 验收。
+- 本测试验证 macOS 当前环境中的 npm Pi 0.87.1 loader/bundle 行为，不等同于 Windows fullscreen 或人工 iTerm2 验收。
 - 不支持没有磁盘 `pi-ai` 依赖的单文件 Bun/SEA 二进制安装；这类安装会明确报告宿主依赖缺失，而不是静默吞掉扩展错误。
-- `/reload` 只会在当前进程内重载扩展，不会把旧 Pi runtime 升级到 0.87.0。
+- `/reload` 只会在当前进程内重载扩展，不会把旧 Pi runtime 升级到 0.87.1。

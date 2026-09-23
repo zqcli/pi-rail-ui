@@ -2,6 +2,7 @@ import { TeamRpcConnection } from "./team-rpc";
 import { teamExtensionPath } from "./team-protocol";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
+import { railResponsesWebSocketExtensionPath } from "../../openai/responses-websocket";
 import { gptCompactionExtensionPath } from "../gpt-compaction/extension";
 import {
 	CONTEXT_COMMAND,
@@ -62,6 +63,7 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	args.push("-e", teamExtensionPath());
 	if (spec.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
 	args.push("-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live");
+	args.push("-e", railResponsesWebSocketExtensionPath());
 	args.push("-e", gptCompactionExtensionPath());
 	args.push("-e", contextExtensionPath(), `--${CONTEXT_PROTOCOL_FLAG}`, CONTEXT_PROTOCOL_VERSION);
 	return args;

@@ -4,7 +4,7 @@ Pi Rail UI 是一个用于 Pi coding agent 的本地视觉扩展。它为长时�
 
 它只定制视觉 surface 和工具展示，并保留 Pi 原有编辑器行为、快捷键和原生 TUI 功能。
 
-Pi Rail UI 要求 Pi `0.86.0`，不再支持旧版 Pi。
+Pi Rail UI 的开发和完整测试基线为 Pi `0.86.0`；原生扩展加载还验证了 npm Pi `0.86.1`，详见[启动修复与验证范围](docs/pi-ai-extension-loading.md)。不再支持更早版本的 Pi。
 
 ## 功能概览
 

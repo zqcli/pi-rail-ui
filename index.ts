@@ -9,6 +9,7 @@ import { createRailFooter, openRailSessionModal, setTurnEndTime, setTurnStartTim
 import { handleDuplicateCommand } from "./commands/duplicate";
 import { installRailFast } from "./commands/rail-fast";
 import { installRailOaiSearch } from "./commands/rail-oai-search";
+import { installRailResponsesWebSocket } from "./openai/responses-websocket";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
 import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
@@ -32,6 +33,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	installApplyPatchTool(pi);
 	installRailFast(pi);
 	installRailOaiSearch(pi);
+	installRailResponsesWebSocket(pi);
 	installGptCompaction(pi);
 
 	function installEditor(ctx: ExtensionContext) {

@@ -4,7 +4,7 @@ Pi Rail UI is a local visual extension for the Pi coding agent. It adds a rail-b
 
 It customizes visual surfaces and tool presentation while preserving Pi's normal editor behavior, keybindings, and native TUI features.
 
-Pi Rail UI requires Pi `0.86.0`. Earlier Pi releases are not supported.
+Pi Rail UI's development and full-suite baseline is Pi `0.86.0`. Native extension loading is also verified against npm Pi `0.86.1`; see the [startup fix and verification scope](docs/pi-ai-extension-loading.md). Earlier Pi releases are not supported.
 
 ## Highlights
 
@@ -15,6 +15,7 @@ Pi Rail UI requires Pi `0.86.0`. Earlier Pi releases are not supported.
 - Rail collapse presentation follows Pi's native `Ctrl+O` expansion state; single-click tool/bash/thinking toggles and editor cursor placement use Pi's native component `handleMouse` routing.
 - User messages, assistant thinking, assistant replies, tool output, and command output use a consistent left-gap layout.
 - Centralized visual configuration in `ui-style.json`.
+- Optional native OpenAI Responses WebSocket routing for selected custom-provider models, including cached connection reuse and `previous_response_id` continuation.
 
 ## Installation / Location
 
@@ -142,6 +143,29 @@ The tests use local mock providers and the repository's Pi bundle, not paid mode
 ## Commands
 
 Pi Rail UI registers the following slash commands:
+
+### Native Responses WebSocket routing
+
+Rail can replace HTTP SSE with the native Responses WebSocket protocol for an explicit provider/model allowlist while preserving the provider's existing model catalog and API key. Configure global routes in:
+
+```text
+~/.pi/agent/rail-openai-responses-ws/settings.json
+```
+
+```json
+{
+  "version": 1,
+  "routes": [
+    {
+      "provider": "cus-resp",
+      "endpoint": "wss://ai.example.com/v1/responses",
+      "models": ["gpt-5.6-luna"]
+    }
+  ]
+}
+```
+
+Only `wss:` endpoints ending in `/responses` are accepted. Models not listed in a route keep their original provider transport. Pi's normal `transport` setting controls behavior: `sse` bypasses Rail, `websocket` forces a one-off WebSocket, and `auto`/`websocket-cached` enable session connection reuse plus incremental continuation unless `cacheRetention` is `none`. In `auto`, a failed WebSocket handshake or an explicit pre-generation unavailable-channel/model routing error falls back to the provider's original SSE adapter; ambiguous disconnects do not retry because the upstream may already have started generation. Run `/reload` after changing the route file.
 
 ### `/rail-ui`
 

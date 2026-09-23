@@ -4,6 +4,7 @@ import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
+import { railResponsesWebSocketExtensionPath } from "../../openai/responses-websocket";
 import { test } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
@@ -17,6 +18,14 @@ function inlineScript(events: unknown[]): string {
 }
 
 test("stateless runner uses Pi JSON mode without creating a session", async () => {
+	const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+	const agentDir = await mkdtemp(join(tmpdir(), "rail-stateless-ws-route-"));
+	process.env["PI_CODING_AGENT_DIR"] = agentDir;
+	await mkdir(join(agentDir, "rail-openai-responses-ws"), { recursive: true });
+	await writeFile(join(agentDir, "rail-openai-responses-ws", "settings.json"), JSON.stringify({
+		version: 1,
+		routes: [{ provider: "cus-resp", endpoint: "wss://ai.example.test/v1/responses", models: ["gpt-5.6-luna"] }],
+	}));
 	let capturedArgs: string[] = [];
 	const fixture = resolve("tests/fixtures/fake-pi-json.mjs");
 	const runner = createStatelessAgentRunner({
@@ -27,16 +36,24 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 	});
 	const updates: any[] = [];
 
-	const result = await runner({
-		model,
-		task: "inspect auth",
-		cwd: process.cwd(),
-		onUpdate: (update) => updates.push(update),
-	});
+	let result;
+	try {
+		result = await runner({
+			model,
+			task: "inspect auth",
+			cwd: process.cwd(),
+			onUpdate: (update) => updates.push(update),
+		});
+	} finally {
+		if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+		await rm(agentDir, { recursive: true, force: true });
+	}
 
 	assert.deepEqual(capturedArgs, [
 		"--mode", "json", "-p", "--no-session",
 		"--model", "cus-resp/gpt-5.6-luna",
+		"-e", railResponsesWebSocketExtensionPath(),
 		"--thinking", "xhigh",
 		"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
 		"--exclude-tools", "subagent",

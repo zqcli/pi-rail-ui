@@ -4,6 +4,7 @@ import {
 	HOSTED_SEARCH_ENTRY_TYPE,
 	HostedSearchActivity,
 	HostedSearchSseObserver,
+	observeActiveHostedSearchEvent,
 	hostedSearchActivityForMessage,
 	hostedSearchCallsFromEntry,
 	resetHostedSearchActivities,
@@ -15,6 +16,23 @@ import {
 function sse(event: string, data: unknown): string {
 	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
+
+test("active hosted search observation accepts transport-neutral Responses events", () => {
+	resetHostedSearchActivities();
+	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
+	setActiveHostedSearchActivity(activity);
+	observeActiveHostedSearchEvent("custom", "gpt-5.6-luna", {
+		type: "response.output_item.done",
+		item: { id: "ws_native", type: "web_search_call", status: "completed", action: { type: "search", query: "native ws" } },
+	});
+	observeActiveHostedSearchEvent("other", "gpt-5.6-luna", {
+		type: "response.output_item.done",
+		item: { id: "ignored", type: "web_search_call", status: "completed" },
+	});
+	assert.equal(activity.observed, true);
+	assert.equal(activity.snapshot().callCount, 1);
+	assert.equal(activity.snapshot().calls[0]?.query, "native ws");
+});
 
 test("parses chunked hosted search calls, actions, sources, and terminal response", () => {
 	resetHostedSearchActivities();

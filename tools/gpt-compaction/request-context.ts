@@ -1,7 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
 import { getCurrentTools, hasApi, toToolDeclaration, type Api, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
-import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { responsesShared } from "../../core/pi-ai-internal";
 import { requestIdentitiesMatch, type CompactionIdentity } from "./model-eligibility";
+
+const { convertResponsesTools } = responsesShared;
 
 /**
  * Explicit allowlist of fields mirrored from the latest live Responses request.

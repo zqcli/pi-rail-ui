@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { StringEnum, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import { Type, type TSchema } from "typebox";
 import {
 	TEAM_COMMAND, TEAM_ENTRY_TYPE, TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES,
@@ -14,9 +14,11 @@ export const TEAM_FRAME_BYTES = 1024 * 1024;
 export const TEAM_DELIVERY_TYPE = "rail-team-delivery";
 
 type Delivery = {
-	role: "custom"; customType: typeof TEAM_DELIVERY_TYPE; content: string; display: false;
+	role: "custom"; customType: typeof TEAM_DELIVERY_TYPE; content: string | (TextContent | ImageContent)[]; display: false;
 	details: { teamId: string; memberId: string; deliveryId: string }; timestamp: number;
 };
+type DeliveryCandidate = { message: Delivery; edited: boolean };
+type ContextEdit = Extract<SessionEntry, { type: "context_edit" }>;
 
 function bindingOrigin(ctx: ExtensionContext, binding: TeamBinding): string | undefined {
 	const branch = ctx.sessionManager.getBranch();
@@ -51,51 +53,63 @@ function selectDeliveries(ctx: ExtensionContext, binding: TeamBinding, startId: 
 	const branch = ctx.sessionManager.getBranch();
 	const start = startId === undefined ? 0 : branch.findIndex((entry) => entry.id === startId) + 1;
 	if (startId !== undefined && start === 0) return current ? [current] : [];
-	const read = (entry: (typeof branch)[number]): Delivery | undefined => {
+	const contextEdits = new Map<string, ContextEdit["replacement"]>();
+	for (const entry of branch) if (entry.type === "context_edit") contextEdits.set(entry.targetId, entry.replacement);
+	const read = (entry: (typeof branch)[number]): DeliveryCandidate | undefined => {
 		if (entry.type !== "custom_message" || entry.customType !== TEAM_DELIVERY_TYPE) return;
-		return publicDelivery(entry.content, entry.details, Date.parse(entry.timestamp), binding);
+		const message = publicDelivery(entry.content, entry.details, Date.parse(entry.timestamp), binding);
+		if (!message) return;
+		if (!contextEdits.has(entry.id)) return { message, edited: false };
+		const replacement = contextEdits.get(entry.id);
+		if (replacement === null) return;
+		if (replacement) return { message: { ...message, content: replacement.content as Delivery["content"] }, edited: true };
+		return { message, edited: false };
 	};
-	const added: Delivery[] = [];
+	const added: DeliveryCandidate[] = [];
 	const positions = new Map<string, number>();
-	let roster: Delivery | undefined;
+	let roster: DeliveryCandidate | undefined;
 	let bytes = 2; // Include the JSON array delimiters and element separators in the budget.
-	const add = (message: Delivery, position = branch.length) => {
+	const add = (candidate: DeliveryCandidate, position = branch.length) => {
+		const message = candidate.message;
 		if (positions.has(message.details.deliveryId)) return;
 		const size = Buffer.byteLength(JSON.stringify(message)) + (added.length ? 1 : 0);
 		if (added.length >= TEAM_MAX_EVENTS || bytes + size > TEAM_FRAME_BYTES) return;
-		added.push(message); bytes += size;
+		added.push(candidate); bytes += size;
 		positions.set(message.details.deliveryId, position);
 	};
 	if (current) {
-		add(current);
-		if (!added.includes(current)) throw new Error("Current team delivery could not fit context");
+		const candidate = { message: current, edited: false };
+		add(candidate);
+		if (!added.includes(candidate)) throw new Error("Current team delivery could not fit context");
 	}
 	// Reserve a compact copy of the original roster even when its delivery ages
 	// out of the recent window. Its ID still identifies one selected delivery.
 	for (let i = start; i < branch.length; i++) {
-		const message = read(branch[i]!);
-		if (!message) continue;
+		const candidate = read(branch[i]!);
+		if (!candidate || candidate.edited || typeof candidate.message.content !== "string") continue;
 		try {
-			const reply = publicTeamReply(JSON.parse(message.content));
+			const reply = publicTeamReply(JSON.parse(candidate.message.content));
 			if (!reply.snapshot) continue;
 			const s = reply.snapshot;
-			message.content = JSON.stringify({ ok: true, snapshot: { ...s, events: [], members: s.members.map(({ id, role, state }) => ({ id, role, state })) } });
-			add(message, i);
-			if (added.includes(message)) roster = message;
+			candidate.message.content = JSON.stringify({ ok: true, snapshot: { ...s, events: [], members: s.members.map(({ id, role, state }) => ({ id, role, state })) } });
+			add(candidate, i);
+			if (added.includes(candidate)) roster = candidate;
 			break;
 		} catch { /* Ignore malformed historical extension data. */ }
 	}
 	let recent = 0;
 	for (let i = branch.length - 1; i >= start && recent < TEAM_MAX_EVENTS && added.length < TEAM_MAX_EVENTS; i--) {
-		const message = read(branch[i]!);
-		if (!message) continue;
+		const candidate = read(branch[i]!);
+		if (!candidate) continue;
 		recent++;
-		if (roster?.details.deliveryId === message.details.deliveryId) {
-			const extra = Buffer.byteLength(JSON.stringify(message)) - Buffer.byteLength(JSON.stringify(roster));
-			if (bytes + extra <= TEAM_FRAME_BYTES) { roster.content = message.content; bytes += extra; }
-		} else add(message, i);
+		if (roster?.message.details.deliveryId === candidate.message.details.deliveryId) {
+			const extra = Buffer.byteLength(JSON.stringify(candidate.message)) - Buffer.byteLength(JSON.stringify(roster.message));
+			if (bytes + extra <= TEAM_FRAME_BYTES) { roster.message.content = candidate.message.content; bytes += extra; }
+		} else add(candidate, i);
 	}
-	return added.sort((a, b) => positions.get(a.details.deliveryId)! - positions.get(b.details.deliveryId)!);
+	return added
+		.sort((a, b) => positions.get(a.message.details.deliveryId)! - positions.get(b.message.details.deliveryId)!)
+		.map(({ message }) => message);
 }
 
 const REPORT_GUIDANCE = "report defaults to the coordinator (A role) identified in the public roster. Prefer to:null or omit to; a supplied to asserts the coordinator alias and must match it. Use send to address another member.";

@@ -1,5 +1,5 @@
 import { TeamRunManager, teamCallSignal, teamStatus } from "./team-runner";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -322,6 +322,12 @@ function modeFor(params: SubagentParamsValue): SubagentMode {
 	return hasControl ? "control" : hasChain ? "chain" : hasParallel ? "parallel" : "single";
 }
 
+function validateFastModePlacement(item: TaskParams): void {
+	if (item.target && item.fastMode !== undefined && item.fastMode !== null) {
+		throw new Error("fastMode for an existing target is managed through /rail-agent");
+	}
+}
+
 function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
 	const teamId = nonEmpty(params.teamId ?? undefined);
 	if (teamId) {
@@ -341,16 +347,20 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 		...(teamId ? { teamId } : {}),
 	};
 	if (mode === "parallel") {
-		if ((params.fastMode !== undefined && params.fastMode !== null) || params.tasks!.some((item) => item.fastMode !== undefined && item.fastMode !== null)) {
-			throw new Error("fastMode is not supported on grouped dispatch; use separate stateless calls or /rail-agent");
+		if (params.fastMode !== undefined && params.fastMode !== null) {
+			throw new Error("fastMode is only supported on the single task or on each parallel/chain item");
 		}
-		return { tasks: params.tasks!.map(normalizeTask), ...confirmSessionAttach };
+		const tasks = params.tasks!.map(normalizeTask);
+		tasks.forEach(validateFastModePlacement);
+		return { tasks, ...confirmSessionAttach };
 	}
 	if (mode === "chain") {
-		if ((params.fastMode !== undefined && params.fastMode !== null) || params.chain!.some((item) => item.fastMode !== undefined && item.fastMode !== null)) {
-			throw new Error("fastMode is not supported on grouped dispatch; use separate stateless calls or /rail-agent");
+		if (params.fastMode !== undefined && params.fastMode !== null) {
+			throw new Error("fastMode is only supported on the single task or on each parallel/chain item");
 		}
-		return { chain: params.chain!.map(normalizeTask), ...confirmSessionAttach };
+		const chain = params.chain!.map(normalizeTask);
+		chain.forEach(validateFastModePlacement);
+		return { chain, ...confirmSessionAttach };
 	}
 	if (mode === "control") {
 		if (params.fastMode !== undefined && params.fastMode !== null) throw new Error("fastMode is not supported on control; manage persistent policy through /rail-agent");
@@ -362,9 +372,7 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 		};
 	}
 	const normalized = normalizeTask({ ...params, task: params.task! });
-	if (normalized.target && normalized.fastMode !== undefined && normalized.fastMode !== null) {
-		throw new Error("fastMode for an existing target is managed through /rail-agent");
-	}
+	validateFastModePlacement(normalized);
 	return { ...normalized, ...confirmSessionAttach };
 }
 
@@ -658,6 +666,30 @@ function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunD
 	return truncateParentContent(`${summary}\n\n${outputs}`);
 }
 
+function nestedToolUsage(results: readonly StatefulSubagentRunDetails[]): Usage | undefined {
+	const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	let observed = false;
+	for (const result of results) {
+		const usage = result.usage;
+		if (usage.turns > 0 || usage.input !== 0 || usage.output !== 0 || usage.cacheRead !== 0 || usage.cacheWrite !== 0 || usage.cost !== 0) observed = true;
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+		total.cost += usage.cost;
+	}
+	if (!observed) return undefined;
+	return {
+		input: total.input,
+		output: total.output,
+		cacheRead: total.cacheRead,
+		cacheWrite: total.cacheWrite,
+		totalTokens: total.input + total.output + total.cacheRead + total.cacheWrite,
+		// SubagentUsage retains aggregate cost only; do not invent a provider breakdown.
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: total.cost },
+	};
+}
+
 export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulSubagentToolOptions): void {
 	const latestDetails = new Map<string, StatefulSubagentDetails>();
 	const actualTasksByCall = new Map<string, Map<number, string>>();
@@ -673,7 +705,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		actualTasksByCall.delete(event.toolCallId);
 		dispatchMetadataByCall.delete(event.toolCallId);
 		callHeaderInvalidators.delete(event.toolCallId);
-		if (event.isError && details) return { details };
+		if (event.isError && details) {
+			const usage = nestedToolUsage(details.results);
+			return { details, ...(usage ? { usage } : {}) };
+		}
 		return undefined;
 	});
 	const knownFastModeForRender = (target: string): boolean | undefined => {
@@ -700,7 +735,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":null},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\",\"contextWindow\":null}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
-			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. This ignore rule applies only to legal parameter positions; target, grouped, and control calls still cannot set fastMode. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Non-GPT dispatch headers and grouped child panels always show FAST off · SEARCH off.\n"
+			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Parallel and chain calls may set fastMode independently on each eligible item; do not set a grouped top-level fastMode or put it on an existing target or control call. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Grouped child panels show each item's effective FAST and SEARCH state.\n"
 			+ "Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
@@ -712,7 +747,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"For stateless subagent work, call subagent with task, optional model, and contextWindow:null by default. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists. Stateless runs create no child JSONL and never appear in /resume.",
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
 			"Use contextWindow:null by default. Null or omission uses the selected child model's native default. Only use a positive integer when the user explicitly requests a specific child context or compaction budget; for parallel and chain calls, put an explicit numeric value on the individual item that owns it.",
-			"Use fastMode:true only for a stateless call or a new persistent agent. On a non-GPT model it is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Keep fastMode null or omitted by default. Existing persistent target policy is managed through /rail-agent; do not put fastMode on target, grouped, or control calls. Hosted Search is an internal policy with no search parameter; non-GPT dispatch headers and grouped child panels always show FAST off · SEARCH off.",
+			"Use fastMode:true only for a stateless call or a new persistent agent. On a non-GPT model it is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Keep fastMode null or omitted by default. For parallel and chain, put fastMode on the individual item that owns it; do not use a grouped top-level fastMode or put it on an existing target or control call. Existing persistent target policy is managed through /rail-agent. Hosted Search is an internal policy with no search parameter; grouped child panels show each item's effective FAST and SEARCH state.",
 			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
 			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
 			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call; contextWindow must be null or omitted, never numeric. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
@@ -1014,7 +1049,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				if (result.status === "failed") throw new Error(finalText(result));
 				const details = resultDetails([result]);
 				latestDetails.set(toolCallId, details);
-				return { content: [{ type: "text", text: finalText(result) }], details };
+				const usage = nestedToolUsage(details.results);
+				return { content: [{ type: "text", text: finalText(result) }], details, ...(usage ? { usage } : {}) };
 			}
 			if (mode === "parallel") {
 				let results: StatefulSubagentRunDetails[];
@@ -1026,7 +1062,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				} else results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
 				const details = resultDetails(results);
 				latestDetails.set(toolCallId, details);
-				return { content: [{ type: "text", text: aggregateText(mode, results) }], details };
+				const usage = nestedToolUsage(details.results);
+				return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
 			}
 			const results: StatefulSubagentRunDetails[] = [];
 			let previous = "";
@@ -1040,7 +1077,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			}
 			const details = resultDetails(results);
 			latestDetails.set(toolCallId, details);
-			return { content: [{ type: "text", text: aggregateText(mode, results) }], details };
+			const usage = nestedToolUsage(details.results);
+			return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
 			} catch (error) {
 				if (joinedTeam && team && teamId !== undefined) {
 					try { team.hub.cancel(teamId, error instanceof Error ? error.message : String(error)); }

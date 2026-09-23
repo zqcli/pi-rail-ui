@@ -53,7 +53,7 @@ function firstTool(extras: { tools?: unknown[] } | undefined): Record<string, un
 	return (extras?.tools?.[0] ?? {}) as Record<string, unknown>;
 }
 
-export default function pi086CompactionPathProbe(): void {
+export default function pi087CompactionPathProbe(): void {
 	const outputPath = process.env["PI_RAIL_COMPACTION_PROBE_OUTPUT"];
 	if (!outputPath) throw new Error("PI_RAIL_COMPACTION_PROBE_OUTPUT is required");
 

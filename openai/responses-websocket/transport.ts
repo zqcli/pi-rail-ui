@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import WebSocket, { type RawData } from "ws";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
+
+const require = createRequire(import.meta.url);
+const { HttpsProxyAgent } = require("https-proxy-agent") as typeof import("https-proxy-agent");
+const { getProxyForUrl } = require("proxy-from-env") as typeof import("proxy-from-env");
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const CONNECTION_IDLE_TTL_MS = 5 * 60 * 1000;
@@ -36,6 +41,7 @@ interface AcquiredConnection {
 
 interface SessionGeneration {
 	active: boolean;
+	pendingConnects: Set<AbortController>;
 }
 
 interface WebSocketUpgradeResponse {
@@ -107,6 +113,15 @@ export function isResponsesWebSocketContinuationError(error: unknown): boolean {
 		|| /previous[_ ]response.*not found/iu.test(error.message);
 }
 
+export function resolveResponsesWebSocketProxy(endpoint: string): string | undefined {
+	const websocketProxy = getProxyForUrl(endpoint);
+	if (websocketProxy) return websocketProxy;
+	const lookupUrl = new URL(endpoint);
+	if (lookupUrl.protocol === "wss:") lookupUrl.protocol = "https:";
+	else if (lookupUrl.protocol === "ws:") lookupUrl.protocol = "http:";
+	return getProxyForUrl(lookupUrl.toString()) || undefined;
+}
+
 function credentialFingerprint(apiKey: string | undefined): string {
 	return createHash("sha256").update(apiKey ?? "").digest("hex").slice(0, 24);
 }
@@ -168,15 +183,21 @@ function removeEntry(sessionId: string, identity: string, entry: ConnectionEntry
 function generationFor(sessionId: string): SessionGeneration {
 	let generation = sessionGenerations.get(sessionId);
 	if (!generation) {
-		generation = { active: true };
+		generation = { active: true, pendingConnects: new Set() };
 		sessionGenerations.set(sessionId, generation);
 	}
 	return generation;
 }
 
+function deactivateGeneration(generation: SessionGeneration): void {
+	generation.active = false;
+	for (const controller of generation.pendingConnects) controller.abort();
+	generation.pendingConnects.clear();
+}
+
 function invalidateGeneration(sessionId: string): void {
 	const generation = sessionGenerations.get(sessionId);
-	if (generation) generation.active = false;
+	if (generation) deactivateGeneration(generation);
 	sessionGenerations.delete(sessionId);
 }
 
@@ -226,7 +247,7 @@ export function closeRailResponsesWebSocketSessions(sessionId?: string): void {
 		sessionSockets.delete(sessionId);
 		return;
 	}
-	for (const generation of sessionGenerations.values()) generation.active = false;
+	for (const generation of sessionGenerations.values()) deactivateGeneration(generation);
 	sessionGenerations.clear();
 	const sockets = new Set<WebSocket>();
 	for (const entries of connectionCache.values()) addEntries(sockets, entries);
@@ -297,7 +318,11 @@ async function connectWebSocket(
 		let socket: WebSocket;
 		let response: WebSocketUpgradeResponse = { status: 101, headers: {} };
 		try {
-			socket = new WebSocket(endpoint, { headers });
+			const proxy = resolveResponsesWebSocketProxy(endpoint);
+			socket = new WebSocket(endpoint, {
+				headers,
+				...(proxy ? { agent: new HttpsProxyAgent(proxy) } : {}),
+			});
 		} catch (error) {
 			const cause = error instanceof Error ? error : new Error(String(error));
 			reject(new ResponsesWebSocketHandshakeError(cause.message, { cause }));
@@ -398,7 +423,20 @@ async function acquireConnection(options: ResponsesWebSocketRequestOptions): Pro
 			removeEntry(options.sessionId, identity, cached);
 		}
 	}
-	const connected = await connectWebSocket(options.endpoint, headers, options.signal, options.connectTimeoutMs);
+	const connectController = new AbortController();
+	generation.pendingConnects.add(connectController);
+	let connected: { socket: WebSocket; response: WebSocketUpgradeResponse };
+	try {
+		const signal = options.signal
+			? AbortSignal.any([options.signal, connectController.signal])
+			: connectController.signal;
+		connected = await connectWebSocket(options.endpoint, headers, signal, options.connectTimeoutMs);
+	} catch (error) {
+		if (!isCurrent()) throw new Error("Responses WebSocket session was cleaned up while connecting", { cause: error });
+		throw error;
+	} finally {
+		generation.pendingConnects.delete(connectController);
+	}
 	if (!isCurrent()) {
 		closeSilently(connected.socket, 1000, "session_cleanup");
 		throw new Error("Responses WebSocket session was cleaned up while connecting");

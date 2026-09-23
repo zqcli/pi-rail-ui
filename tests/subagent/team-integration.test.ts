@@ -102,6 +102,12 @@ test("real RPC team keeps two parent calls pending, wakes B1 from B8, and gives 
 	assert.equal(b.details.results.length, 8);
 	for (const result of b.details.results) assert.equal(result.status, "completed", JSON.stringify(result));
 	assert.match(b.details.results[0].output, /consumed B8 result and B2 peer evidence/u);
+	for (const result of [a, b]) {
+		const runs = result.details.results;
+		assert.equal(result.usage.input, runs.reduce((sum: number, run: any) => sum + run.usage.input, 0));
+		assert.equal(result.usage.output, runs.reduce((sum: number, run: any) => sum + run.usage.output, 0));
+		assert.equal(result.usage.totalTokens, runs.reduce((sum: number, run: any) => sum + run.usage.input + run.usage.output + run.usage.cacheRead + run.usage.cacheWrite, 0));
+	}
 	assert.equal(hub.get(teamId).phase, "completed");
 	for (const snapshot of history.filter((s) => s.phase === "finalizing" || s.phase === "completed")) assert.ok(snapshot.members.filter((m) => m.role === "worker").every((m) => m.state === "completed"));
 	assert.ok(updates.some((u) => u.details.results.some((r: any) => r.coordination?.state === "waiting")));
@@ -202,7 +208,7 @@ test("native parent rejects a lone team call without starting members, then corr
 	ctx.sessionManager = { getBranch: () => branch };
 	let requests = 0;
 	const messages = await runAgentLoop([{ role: "user", content: "Start both team siblings", timestamp: Date.now() }], {
-		// Pi 0.86 carries the prompt in transcript system messages; AgentContext has no systemPrompt field.
+		// Pi 0.87 carries the prompt in transcript system messages; AgentContext has no systemPrompt field.
 		messages: [{ role: "system", content: "Local parent integration probe", timestamp: Date.now() }],
 		tools: [{ ...tool, execute: (id: string, params: any, signal: AbortSignal, onUpdate: any) => tool.execute(id, params, signal, onUpdate, ctx) }],
 	}, { model: nativeModel as any, convertToLlm: (items) => items as any, toolExecution: "parallel" }, (event) => {

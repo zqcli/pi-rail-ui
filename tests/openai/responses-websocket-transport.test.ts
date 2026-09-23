@@ -10,6 +10,7 @@ import {
 	ResponsesWebSocketError,
 	ResponsesWebSocketHandshakeError,
 	resetRailResponsesWebSocketStats,
+	resolveResponsesWebSocketProxy,
 	runResponsesWebSocketRequest,
 } from "../../openai/responses-websocket/transport";
 
@@ -29,6 +30,23 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 	});
 }
 
+function withProxyEnv<T>(values: Record<string, string | undefined>, run: () => T): T {
+	const previous = new Map<string, string | undefined>();
+	for (const [key, value] of Object.entries(values)) {
+		previous.set(key, process.env[key]);
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	try {
+		return run();
+	} finally {
+		for (const [key, value] of previous) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
 test("only pre-generation handshake and routing failures are safe SSE fallbacks", () => {
 	assert.equal(isSafeResponsesWebSocketFallback(new ResponsesWebSocketHandshakeError("connect failed")), true);
 	assert.equal(isSafeResponsesWebSocketFallback(new ResponsesWebSocketError("no available distributor", "model_not_found")), true);
@@ -37,6 +55,32 @@ test("only pre-generation handshake and routing failures are safe SSE fallbacks"
 	assert.equal(isSafeResponsesWebSocketFallback(new Error("network failed after output")), false);
 	assert.equal(isResponsesWebSocketContinuationError(new ResponsesWebSocketError("cached response expired", "previous_response_not_found")), true);
 	assert.equal(isResponsesWebSocketContinuationError(new ResponsesWebSocketError("stream failed", "server_error")), false);
+});
+
+test("Responses WebSocket proxy resolution follows scheme-specific proxy precedence", () => {
+	const keys = {
+		WSS_PROXY: undefined,
+		wss_proxy: undefined,
+		ALL_PROXY: undefined,
+		all_proxy: undefined,
+		HTTPS_PROXY: "http://127.0.0.1:12081",
+		https_proxy: undefined,
+		NO_PROXY: undefined,
+		no_proxy: undefined,
+		npm_config_wss_proxy: undefined,
+		npm_config_https_proxy: undefined,
+		npm_config_proxy: undefined,
+		npm_config_no_proxy: undefined,
+	};
+	withProxyEnv(keys, () => {
+		assert.equal(resolveResponsesWebSocketProxy("wss://ai.example.com/v1/responses"), "http://127.0.0.1:12081");
+	});
+	withProxyEnv({ ...keys, NO_PROXY: "ai.example.com" }, () => {
+		assert.equal(resolveResponsesWebSocketProxy("wss://ai.example.com/v1/responses"), undefined);
+	});
+	withProxyEnv({ ...keys, ALL_PROXY: "socks5://127.0.0.1:12082" }, () => {
+		assert.equal(resolveResponsesWebSocketProxy("wss://ai.example.com/v1/responses"), "socks5://127.0.0.1:12082");
+	});
 });
 
 test("Responses WebSocket transport reuses a session connection and sends an input delta", async (t) => {
@@ -452,26 +496,36 @@ test("session cleanup during a pending WebSocket upgrade prevents the request", 
 	const upgradeGate = new Promise<void>((resolve) => { releaseUpgrade = resolve; });
 	let notifyUpgradeStarted!: () => void;
 	const upgradeStarted = new Promise<void>((resolve) => { notifyUpgradeStarted = resolve; });
+	let upgradeCount = 0;
 	let requestsReceived = 0;
 	const server = new WebSocketServer({
 		port: 0,
 		verifyClient: (_info, callback) => {
-			notifyUpgradeStarted();
-			void upgradeGate.then(() => callback(true));
+			if (upgradeCount++ === 0) {
+				notifyUpgradeStarted();
+				void upgradeGate.then(() => callback(true));
+			} else {
+				callback(true);
+			}
 		},
 	});
 	await new Promise<void>((resolve) => server.once("listening", resolve));
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("WebSocket test server did not expose a TCP port");
 	const sessionId = "cleanup-during-upgrade";
-	server.on("connection", (socket) => socket.on("message", () => { requestsReceived += 1; }));
+	server.on("connection", (socket) => socket.on("message", () => {
+		requestsReceived += 1;
+		socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_after_cleanup", status: "completed", output: [] } }));
+	}));
 	t.after(() => {
 		releaseUpgrade();
 		closeRailResponsesWebSocketSessions(sessionId);
 		server.close();
 	});
-	const request = runResponsesWebSocketRequest({ model: "gpt-test", stream: true, input: [] }, {
-		endpoint: `ws://127.0.0.1:${address.port}/v1/responses`,
+	const endpoint = `ws://127.0.0.1:${address.port}/v1/responses`;
+	const body = { model: "gpt-test", stream: true, input: [] };
+	const options = {
+		endpoint,
 		provider: "test-provider",
 		apiKey: "test-key",
 		sessionId,
@@ -479,12 +533,20 @@ test("session cleanup during a pending WebSocket upgrade prevents the request", 
 		useCachedContext: true,
 		onStart: () => undefined,
 		responseItems: () => [],
-	});
+	};
+	const request = runResponsesWebSocketRequest(body, options);
 	await withTimeout(upgradeStarted, 1_000, "the delayed WebSocket upgrade");
 	closeRailResponsesWebSocketSessions(sessionId);
+	await assert.rejects(withTimeout(request, 500, "pending WebSocket handshake cancellation"), /session was cleaned up while connecting/u);
+	const nextRequest = await withTimeout(runResponsesWebSocketRequest(body, options), 1_000, "a fresh request for the cleaned-up session");
+	for await (const _event of nextRequest.events) {
+		// Drain the terminal event from the new generation.
+	}
+	nextRequest.finalize("resp_after_cleanup");
+	assert.equal(requestsReceived, 1, "only the fresh request may reach the provider");
 	releaseUpgrade();
-	await assert.rejects(request, /session was cleaned up while connecting/u);
-	assert.equal(requestsReceived, 0, "a connection completing after cleanup must not receive response.create");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(requestsReceived, 1, "the canceled handshake must not send a request after its gate opens");
 });
 
 test("session cleanup closes both concurrent active sockets, including the overflow socket", { timeout: 5_000 }, async (t) => {

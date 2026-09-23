@@ -21,7 +21,7 @@ const native = (model: typeof small) => ({ provider: model.provider, id: model.m
 const run = () => ({ output: "done", usage: emptySubagentUsage() });
 
 async function setup(t: TestContext, trusted = true) {
-	const root = await mkdtemp(join(tmpdir(), "rail-budget-086-"));
+	const root = await mkdtemp(join(tmpdir(), "rail-budget-087-"));
 	const agentDir = join(root, "agent");
 	const childCwd = join(root, "child");
 	const parentCwd = join(root, "parent");
@@ -93,7 +93,7 @@ class BudgetTransport implements RpcTransport {
 	async stop() { this.stopped = true; }
 }
 
-test("0.86 real CLI helper and parent honor noninteractive saved/default project trust", { timeout: 60_000 }, async (t) => {
+test("0.87 real CLI helper and parent honor noninteractive saved/default project trust", { timeout: 60_000 }, async (t) => {
 	const { root, agentDir, childCwd } = await setup(t, false);
 	const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 	const probe = join(root, "trust-probe.mjs");
@@ -197,7 +197,7 @@ function toolHarness(broker: SessionBroker, cwd: string, runStateless = async (_
 	return { ctx, execute: (args: any) => tool.execute("budget-call", args, undefined, undefined, ctx) };
 }
 
-test("0.86 stateless budgets use selected child model and cwd, not ordinary reserve", async (t) => {
+test("0.87 stateless budgets use selected child model and cwd, not ordinary reserve", async (t) => {
 	const { childCwd } = await setup(t);
 	const invocations: string[][] = [];
 	const runner = createStatelessAgentRunner({ resolveInvocation: (args) => {
@@ -213,7 +213,7 @@ test("0.86 stateless budgets use selected child model and cwd, not ordinary rese
 	assert.equal(invocations[1]?.some((arg) => arg.includes("rail-context")), false);
 });
 
-test("0.86 untrusted child reserves gate every parent path including restored cwd", async (t) => {
+test("0.87 untrusted child reserves gate every parent path including restored cwd", async (t) => {
 	const { agentDir, childCwd, parentCwd, sessionFile } = await setup(t, false);
 	// Trust of the caller must not approve another cwd, including --session cwd.
 	new ProjectTrustStore(agentDir).set(parentCwd, true);
@@ -241,7 +241,7 @@ test("0.86 untrusted child reserves gate every parent path including restored cw
 	await assert.rejects(broker.dispatch({ target: "untrusted", task: "blocked", contextWindow: 12_000 }), /reserveTokens \(16384\)/);
 });
 
-test("0.86 tool preflight uses explicit child selection for parallel and chain before any dispatch", async (t) => {
+test("0.87 tool preflight uses explicit child selection for parallel and chain before any dispatch", async (t) => {
 	const { childCwd, parentCwd, sessionFile } = await setup(t);
 	const { broker, starts } = brokerHarness(parentCwd, sessionFile);
 	t.after(() => broker.shutdown());
@@ -262,7 +262,7 @@ test("0.86 tool preflight uses explicit child selection for parallel and chain b
 	await assert.rejects(execute({ cwd: childCwd, task: "default parent", contextWindow: 12_000 }), /reserveTokens \(60000\)/);
 });
 
-test("0.86 budgeted default model is pinned across async session confirmation", async (t) => {
+test("0.87 budgeted default model is pinned across async session confirmation", async (t) => {
 	const { childCwd, sessionFile } = await setup(t);
 	const { broker, starts } = brokerHarness(childCwd, sessionFile);
 	t.after(() => broker.shutdown());
@@ -274,7 +274,7 @@ test("0.86 budgeted default model is pinned across async session confirmation", 
 });
 
 for (const mode of ["new", "fork", "exclusive"] as const) {
-	test(`0.86 persistent ${mode} budgets use child model and effective cwd`, async (t) => {
+	test(`0.87 persistent ${mode} budgets use child model and effective cwd`, async (t) => {
 		const { childCwd, parentCwd, sessionFile } = await setup(t);
 		const { broker, starts, transports } = brokerHarness(parentCwd, sessionFile);
 		t.after(() => broker.shutdown());
@@ -297,7 +297,7 @@ for (const mode of ["new", "fork", "exclusive"] as const) {
 	});
 }
 
-test("0.86 stopped target preflight uses saved model and cwd, never caller cwd", async (t) => {
+test("0.87 stopped target preflight uses saved model and cwd, never caller cwd", async (t) => {
 	const { childCwd, parentCwd, sessionFile } = await setup(t);
 	const { broker, starts } = brokerHarness(parentCwd, sessionFile);
 	t.after(() => broker.shutdown());
@@ -313,7 +313,7 @@ test("0.86 stopped target preflight uses saved model and cwd, never caller cwd",
 	assert.equal(starts[1]?.model.modelId, small.modelId);
 });
 
-test("0.86 queued target model change is awaited by budget preflight", async (t) => {
+test("0.87 queued target model change is awaited by budget preflight", async (t) => {
 	const { childCwd, sessionFile } = await setup(t);
 	const { broker, transports } = brokerHarness(childCwd, sessionFile);
 	t.after(() => broker.shutdown());
@@ -331,7 +331,7 @@ test("0.86 queued target model change is awaited by budget preflight", async (t)
 	await broker.dispatch({ target: "changing", task: "new model", contextWindow: 12_000 });
 });
 
-test("0.86 RPC validates actual model before budget; mismatches remain fail-closed", async (t) => {
+test("0.87 RPC validates actual model before budget; mismatches remain fail-closed", async (t) => {
 	const { childCwd, parentCwd, sessionFile } = await setup(t);
 	const transport = new BudgetTransport(sessionFile);
 	const worker = await RpcSessionWorker.connect(spec(parentCwd, sessionFile, "exclusive"), transport);
@@ -354,7 +354,7 @@ test("0.86 RPC validates actual model before budget; mismatches remain fail-clos
 	}
 });
 
-test("0.86 RPC prevents dispatch while model selection is unconfirmed", async (t) => {
+test("0.87 RPC prevents dispatch while model selection is unconfirmed", async (t) => {
 	const { childCwd, sessionFile } = await setup(t);
 	const transport = new BudgetTransport(sessionFile);
 	const worker = await RpcSessionWorker.connect(spec(childCwd, sessionFile), transport);
@@ -386,7 +386,7 @@ function extensionHarness(cwd: string, startupBudget?: string) {
 	return { ctx, handlers, command: (args: string) => command(args, ctx), aborts: () => aborts };
 }
 
-test("0.86 child helper uses current model for startup and prepare, restores and omits overrides", async (t) => {
+test("0.87 child helper uses current model for startup and prepare, restores and omits overrides", async (t) => {
 	const { childCwd } = await setup(t);
 	const helper = extensionHarness(childCwd, "12000");
 	helper.handlers.get("session_start")!({}, helper.ctx);
@@ -408,7 +408,7 @@ test("0.86 child helper uses current model for startup and prepare, restores and
 	assert.deepEqual(helper.handlers.get("input")!({}, helper.ctx), { action: "handled" });
 });
 
-test("0.86 child helper rejects invalid startup budget before provider dispatch", async (t) => {
+test("0.87 child helper rejects invalid startup budget before provider dispatch", async (t) => {
 	const { childCwd } = await setup(t);
 	const helper = extensionHarness(childCwd, "24576");
 	helper.ctx.model = native(large);
@@ -421,7 +421,7 @@ test("0.86 child helper rejects invalid startup budget before provider dispatch"
 	assert.equal(helper.aborts(), 1);
 });
 
-test("0.86 helper uses actual session trust rather than saved trust for startup and prepare", async (t) => {
+test("0.87 helper uses actual session trust rather than saved trust for startup and prepare", async (t) => {
 	const { childCwd } = await setup(t);
 	const helper = extensionHarness(childCwd);
 	helper.ctx.isProjectTrusted = () => false;
@@ -438,7 +438,7 @@ test("0.86 helper uses actual session trust rather than saved trust for startup 
 	assert.equal(startup.ctx.model.contextWindow, 128_000);
 });
 
-test("0.86 session cwd resolution distinguishes fork from open without modifying history", async (t) => {
+test("0.87 session cwd resolution distinguishes fork from open without modifying history", async (t) => {
 	const { childCwd, parentCwd, sessionFile } = await setup(t);
 	const original = await readFile(sessionFile, "utf8");
 	assert.equal(await resolveChildContextCwd(parentCwd, { mode: "fork", path: sessionFile }), parentCwd);
@@ -447,7 +447,7 @@ test("0.86 session cwd resolution distinguishes fork from open without modifying
 	assert.equal(await readFile(sessionFile, "utf8"), original);
 });
 
-test("0.86 null and omitted budgets never resolve reserves or issue override commands", async (t) => {
+test("0.87 null and omitted budgets never resolve reserves or issue override commands", async (t) => {
 	const { childCwd, sessionFile } = await setup(t);
 	const { broker, transports } = brokerHarness(childCwd, sessionFile);
 	t.after(() => broker.shutdown());

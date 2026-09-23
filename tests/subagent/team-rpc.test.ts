@@ -273,7 +273,7 @@ test("native sendMessage context probe persists only after tool results, without
 		await settled;
 		assert.equal(providers.length, abort ? 1 : 2, "context-only delivery never schedules a provider turn");
 		assert.equal(JSON.stringify(providers[0].messages).split("native-delivery-probe-fact").length - 1, 1);
-		if (!abort) assert.doesNotMatch(JSON.stringify(providers[1].messages), /native-delivery-probe-fact/, "Pi 0.85.1 continuation has a separate context array: native branch repair is required");
+		if (!abort) assert.equal(JSON.stringify(providers[1].messages).split("native-delivery-probe-fact").length - 1, 1, "native continuation context includes the single persisted delivery without another turn");
 		const state = await transport.request({ type: "get_state" }) as { sessionFile: string };
 		const entries = (await readFile(state.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
 		const delivered = entries.findIndex((entry) => entry.type === "custom_message" && entry.customType === "team-delivery-api-probe");

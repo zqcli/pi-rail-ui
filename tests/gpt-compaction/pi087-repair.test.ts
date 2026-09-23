@@ -30,7 +30,7 @@ function nativeBranch() {
 	return { manager, kept, native };
 }
 
-test("native replay matches Pi 0.86 snapshot and post-boundary system deltas", () => {
+test("native replay matches Pi 0.87 snapshot and post-boundary system deltas", () => {
 	const { manager } = nativeBranch();
 	const expected = manager.buildSessionContext().messages;
 	const rebuilt = rebuildNativeHistory(manager.getBranch()).messages;
@@ -78,7 +78,7 @@ test("replay across a later remote checkpoint uses only the native snapshot and 
 });
 
 async function harness(t: TestContext, withUsage: boolean, reserveTokens = 200, validCheckpoint = true, tail: "messages" | "metadata" | "none" = "messages", withNative = false, history = ["history to summarize"]) {
-	const sandbox = await mkdtemp(join(tmpdir(), "pi086-repair-"));
+	const sandbox = await mkdtemp(join(tmpdir(), "pi087-repair-"));
 	const previous = process.env["PI_CODING_AGENT_DIR"];
 	process.env["PI_CODING_AGENT_DIR"] = sandbox;
 	t.after(async () => {
@@ -163,6 +163,9 @@ async function harness(t: TestContext, withUsage: boolean, reserveTokens = 200, 
 				_getSummarizationRequestAuth: async () => {
 					beforeHook?.();
 					return { model, apiKey: "local-test" };
+				},
+				_refreshFinalizedContext: () => {
+					session.agent.state.messages = manager.buildSessionProjection().messages;
 				},
 				_extensionRunner: {
 					hasHandlers: (name: string) => handlers.has(name),
@@ -412,6 +415,29 @@ test("small usage-only tail repairs through source-branch admission when origina
 	assert.deepEqual(h.manager.getBranch().slice(0, -1), h.originalBranch);
 	h.manager.createBranchedSession(h.manager.getLeafId()!);
 	assert.deepEqual(h.manager.getEntries().filter((entry) => entry.type === "usage"), h.usageEntries);
+});
+
+test("native repair starts at the first canonical survivor after a remote checkpoint", async (t) => {
+	const h = await harness(t, false, 200, true, "none");
+	const omitted = user(h.manager, "post-checkpoint response omitted by context edit");
+	h.manager.appendContextEdit(omitted, null);
+	const live = user(h.manager, "post-checkpoint live request");
+	// Make Pi's native preparation admit the compaction hook, while keeping its budget above the short live tail.
+	h.settingsSpy.mock.mockImplementation(() => ({ enabled: true, reserveTokens: 200, keepRecentTokens: 10 }));
+
+	await h.off();
+
+	assert.equal(readGptCompactionSettings().mode, "off", h.notices.join("\n"));
+	const native = h.manager.getLeafEntry();
+	assert.equal(native?.type, "compaction");
+	if (native?.type !== "compaction") return;
+	assert.equal(native.firstKeptEntryId, live);
+	const branch = h.manager.getBranch();
+	assert.ok(branch.findIndex((entry) => entry.id === native.firstKeptEntryId) > branch.findIndex((entry) => entry.id === h.checkpoint));
+	const request = JSON.stringify(h.requests[0]?.context);
+	assert.match(request, /history to summarize/);
+	assert.match(request, /retained work/);
+	assert.doesNotMatch(request, /post-checkpoint response omitted by context edit|post-checkpoint live request/);
 });
 
 test("repair summarizes the logical native prefix, not previously discarded messages", async (t) => {

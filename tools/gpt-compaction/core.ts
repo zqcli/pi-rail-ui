@@ -13,7 +13,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth, resolveSessionId } from "./auth";
-import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, findLatestNativeHistoryBoundaryInRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
+import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, projectHistoryRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
 import { compactionIdentity, identitiesMatch, type CompactionIdentity } from "./model-eligibility";
 import { resolveCompactionRequestExtras, rememberRequestContext } from "./request-context";
 import {
@@ -84,9 +84,9 @@ function usageFromResponse(usage: RemoteCompactionUsage | undefined, model: Mode
 /**
  * Rebuild the real, provider-independent conversation from session entries.
  *
- * Pi stores every original entry, so flattening non-compaction entries restores
- * the exact conversation that existed before any Rail checkpoint. Compaction
- * entries are skipped because their ciphertext is bound to one provider.
+ * Pi stores original entries, but context edits can replace or omit them. Use
+ * the canonical projection of the Rail-free branch, so discarded responses
+ * cannot reappear and provider-bound ciphertext stays out of recovery.
  */
 export function rebuiltBranchMessages(branchEntries: readonly SessionEntry[]): AgentMessage[] {
 	return rebuildNativeHistory(branchEntries).messages;
@@ -97,25 +97,8 @@ export function rebuiltBranchInput(model: Model<Api>, branchEntries: readonly Se
 	return serializeMessagesToResponsesInput(model, convertToLlm(rebuiltBranchMessages(branchEntries)));
 }
 
-function serializeEntries(model: Model<Api>, entries: readonly SessionEntry[]): unknown[] {
-	return serializeMessagesToResponsesInput(model, convertToLlm(collectMessages(entries)));
-}
-
-function serializeLogicalCompactionInterval(
-	model: Model<Api>,
-	branchEntries: readonly SessionEntry[],
-	startIndex: number,
-	endIndex: number,
-): unknown[] {
-	const nativeBoundary = findLatestNativeHistoryBoundaryInRange(branchEntries, startIndex, endIndex);
-	if (!nativeBoundary) {
-		return serializeEntries(model, branchEntries.slice(startIndex, endIndex).filter((entry) => entry.type !== "compaction"));
-	}
-	const messages = [
-		...sessionEntryToContextMessages(nativeBoundary.entry),
-		...collectMessages(branchEntries.slice(nativeBoundary.firstKeptIndex, endIndex).filter((entry) => entry.type !== "compaction")),
-	];
-	return serializeMessagesToResponsesInput(model, convertToLlm(messages));
+function serializeHistoryMessages(model: Model<Api>, messages: readonly AgentMessage[]): unknown[] {
+	return serializeMessagesToResponsesInput(model, convertToLlm([...messages]));
 }
 
 function safeHistoryPrefixInput(model: Model<Api>, branchEntries: readonly SessionEntry[], endIndex: number): unknown[] | undefined {
@@ -177,16 +160,23 @@ export function buildRemoteCompactionRequest(args: {
 			ok: true,
 			input: [
 				...cloneCheckpointItems(checkpoint.details.replacement),
-				...serializeLogicalCompactionInterval(args.model, args.branchEntries, boundary.firstKeptIndex, cutIndex),
+				...serializeHistoryMessages(args.model, projectHistoryRange(args.branchEntries, boundary.firstKeptIndex, cutIndex)),
 			],
 		};
 	}
+	// Serialize the retained interval and live tail as one conversation. A tool
+	// call may be retained immediately before the checkpoint while its real tool
+	// result is appended immediately after it; serializing the ranges separately
+	// would synthesize a fake result for the first range and drop the real one.
+	const replayMessages = [
+		...projectHistoryRange(args.branchEntries, boundary.firstKeptIndex, boundary.boundaryIndex),
+		...projectHistoryRange(args.branchEntries, boundary.boundaryIndex + 1, args.branchEntries.length),
+	];
 	return {
 		ok: true,
 		input: [
 			...cloneCheckpointItems(checkpoint.details.replacement),
-			...serializeLogicalCompactionInterval(args.model, args.branchEntries, boundary.firstKeptIndex, boundary.boundaryIndex),
-			...serializeEntries(args.model, boundary.liveTail),
+			...serializeHistoryMessages(args.model, replayMessages),
 		],
 	};
 }
@@ -485,21 +475,25 @@ function currentBranchMessagesBeforeCut(
 	return rebuildNativeHistoryPrefix(branchEntries, cutIndex)?.messages;
 }
 
-/** Resolve declaration state independently of the conversation's compaction cut. */
+/** Resolve declaration state from Pi's canonical projected transcript. */
 function requestTranscript(branchEntries: readonly SessionEntry[]) {
-	const messages: AgentMessage[] = [];
-	for (const entry of branchEntries) {
-		if (entry.type === "compaction" && entry.systemMessage) {
-			// A full checkpoint replaces all earlier deltas, including kept ones.
-			messages.length = 0;
-			messages.push(entry.systemMessage);
-		} else if (entry.type === "message" && entry.message.role === "system") {
-			messages.push(...sessionEntryToContextMessages(entry));
+	const latestCompaction = [...branchEntries].reverse().find((entry) => entry.type === "compaction");
+	if (latestCompaction?.type === "compaction" && !latestCompaction.systemMessage) {
+		// Pre-0.87/hand-edited native entries may not carry the authoritative
+		// system snapshot. Preserve the legacy declaration delta stream in that
+		// case; ContextEditEntry cannot target system messages.
+		const messages: AgentMessage[] = [];
+		for (const entry of branchEntries) {
+			if (entry.type === "compaction" && entry.systemMessage) {
+				messages.length = 0;
+				messages.push(entry.systemMessage);
+			} else if (entry.type === "message" && entry.message.role === "system") {
+				messages.push(...sessionEntryToContextMessages(entry));
+			}
 		}
-		// Legacy compactions have no system snapshot. Keep replaying the real
-		// declarations even when only a partial delta follows that compaction.
+		return convertToLlm(messages);
 	}
-	return convertToLlm(messages);
+	return convertToLlm(collectMessages(branchEntries).filter((message) => message.role === "system"));
 }
 
 export function rememberLiveRequestContext(ctx: ExtensionContext, payload: unknown): void {
@@ -538,9 +532,14 @@ function rebuiltContextMessages(args: {
 		}
 		return true;
 	};
-	if (startsWith(rebuilt)) return args.messages.map((message) => structuredClone(message));
-	if (!startsWith(args.storedMessages)) return undefined;
-	return [...rebuilt, ...args.messages.slice(args.storedMessages.length).map((message) => structuredClone(message))];
+	if (startsWith(args.storedMessages)) {
+		return [...rebuilt, ...args.messages.slice(args.storedMessages.length).map((message) => structuredClone(message))];
+	}
+	// Another context hook may already have installed the rebuilt prefix. An
+	// empty rebuilt history is not evidence of that: every message list starts
+	// with [], and accepting it would preserve an opaque checkpoint summary.
+	if (rebuilt.length > 0 && startsWith(rebuilt)) return args.messages.map((message) => structuredClone(message));
+	return undefined;
 }
 
 /**

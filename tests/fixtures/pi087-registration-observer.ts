@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 
-const OBSERVE_COMMAND = "pi086-observe-registrations";
+const OBSERVE_COMMAND = "pi087-observe-registrations";
 
 function observe(pi: any, ctx: any, requestedPath: string | undefined, phase: string): void {
 	const outputPath = requestedPath?.trim() || process.env["PI_RAIL_REGISTRATION_OUTPUT"];
@@ -33,7 +33,7 @@ function observe(pi: any, ctx: any, requestedPath: string | undefined, phase: st
 // without importing Rail at test time (which would bypass the native loader).
 // The explicit observation command also lets the native child-helper probe
 // inspect the post-bind tool registry without starting a model generation.
-export default function pi086RegistrationObserver(pi: any): void {
+export default function pi087RegistrationObserver(pi: any): void {
 	pi.registerCommand(OBSERVE_COMMAND, {
 		description: "Write the native registration snapshot to a test path",
 		handler: async (args: string, ctx: any) => {

@@ -8,7 +8,7 @@ import { test } from "node:test";
 const bundleCli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const probeExtension = fileURLToPath(new URL("../fixtures/bundle-constructor-probe.ts", import.meta.url));
 
-test("Pi 0.86.0 bundled loader preserves constructor identity and leaves retired TUI methods unpatched", { timeout: 30_000 }, async (t) => {
+test("Pi 0.87.1 bundled loader preserves constructor identity and leaves retired TUI methods unpatched", { timeout: 30_000 }, async (t) => {
 	const tempParent = join(process.cwd(), ".tmp");
 	await mkdir(tempParent, { recursive: true });
 	const tempDir = await mkdtemp(join(tempParent, "pi-bundle-loader-"));

@@ -23,7 +23,7 @@ import { installAssistantMessageRail, uninstallAssistantMessageRail } from "../.
 import { installExecutionRails, uninstallExecutionRails } from "../../components/executions";
 import { defineRailSection, setRailUiActive, wasRailSectionManuallyToggled } from "../../rail/rail-section";
 
-// Real 0.86.0 bundled native-UI smoke. Input goes through the public Terminal
+// Real 0.87.1 bundled native-UI smoke. Input goes through the public Terminal
 // seam: `tui.start()` captures the fake terminal's onInput handler and every
 // SGR press/motion/release travels that real path. The displayed viewport is
 // rebuilt from the public `Terminal.write()` stream; editor/autocomplete/

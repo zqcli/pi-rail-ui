@@ -167,6 +167,46 @@ test("deliveries use native persistence once, repair missing IDs, and isolate bi
 	}
 });
 
+test("context-edit omissions are not revived by durable team delivery recovery", async () => {
+	const content = JSON.stringify({ ok: true, events: [{ seq: 1, kind: "message", message: "ORIGINAL-DELIVERY" }] });
+	const branch = [
+		{ id: "protocol", type: "custom", customType: TEAM_ENTRY_TYPE, data: { version: 1, kind: "ack", binding, ok: true } },
+		{ id: "delivery", type: "custom_message", customType: TEAM_DELIVERY_TYPE, content, display: false,
+			details: { teamId: "t", memberId: "b", deliveryId: "delivery" }, timestamp: new Date(1).toISOString() },
+		{ id: "edit", type: "context_edit", targetId: "delivery", replacement: null, timestamp: new Date(2).toISOString() },
+	];
+	const h = harness("worker", branch);
+	await h.command("bind");
+	const waiting = h.handlers.get("context")!({ messages: [{ role: "custom", customType: TEAM_DELIVERY_TYPE, content, display: false,
+		details: { teamId: "t", memberId: "b", deliveryId: "delivery" }, timestamp: 1 }] }, h.ctx);
+	await h.command("reply", { requestId: h.entries.at(-1).request.requestId, reply: { ok: true } });
+	const result = await waiting;
+
+	assert.deepEqual(result.messages, []);
+	assert.equal(branch[1]?.content, content, "recovery must not rewrite append-only native history");
+});
+
+test("durable team delivery recovery uses the latest context-edit replacement", async () => {
+	const content = JSON.stringify({ ok: true, events: [{ seq: 1, kind: "message", message: "ORIGINAL-DELIVERY" }] });
+	const branch = [
+		{ id: "protocol", type: "custom", customType: TEAM_ENTRY_TYPE, data: { version: 1, kind: "ack", binding, ok: true } },
+		{ id: "delivery", type: "custom_message", customType: TEAM_DELIVERY_TYPE, content, display: false,
+			details: { teamId: "t", memberId: "b", deliveryId: "delivery" }, timestamp: new Date(1).toISOString() },
+		{ id: "edit-1", type: "context_edit", targetId: "delivery", replacement: { content: "earlier replacement" }, timestamp: new Date(2).toISOString() },
+		{ id: "edit-2", type: "context_edit", targetId: "delivery", replacement: { content: "latest replacement" }, timestamp: new Date(3).toISOString() },
+	];
+	const h = harness("worker", branch);
+	await h.command("bind");
+	const waiting = h.handlers.get("context")!({ messages: [] }, h.ctx);
+	await h.command("reply", { requestId: h.entries.at(-1).request.requestId, reply: { ok: true } });
+	const result = await waiting;
+
+	assert.equal(result.messages.length, 1);
+	assert.equal(result.messages[0]?.content, "latest replacement");
+	assert.doesNotMatch(JSON.stringify(result.messages), /ORIGINAL-DELIVERY|earlier replacement/);
+	assert.equal(branch[1]?.content, content, "recovery must not rewrite append-only native history");
+});
+
 test("reload recovers facts only with matching native protocol lifetime evidence", async () => {
 	for (const evidence of [binding, { ...binding, epoch: "older-epoch" }, undefined]) {
 		const branch: any[] = [

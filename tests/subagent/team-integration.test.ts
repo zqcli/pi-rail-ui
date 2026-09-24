@@ -15,13 +15,13 @@ import { TeamHub } from "../../tools/subagents/team-hub";
 import { TeamRunManager } from "../../tools/subagents/team-runner";
 import { installTeamTool } from "../../tools/subagents/team-tool";
 import { installStatefulSubagentTool } from "../../tools/subagents/tool";
-import type { TeamSnapshot } from "../../tools/subagents/team-protocol";
+import type { TeamBrief, TeamSnapshot } from "../../tools/subagents/team-protocol";
 
 const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const fixture = fileURLToPath(new URL("../fixtures/team-coordination-provider.mjs", import.meta.url));
 const nativeModel = { provider: "rail-team-e2e", id: "probe", name: "Team probe", api: "rail-team-e2e-api", contextWindow: 128000 };
 
-async function setup(t: TestContext, count: number, scenario = "eight") {
+async function setup(t: TestContext, count: number, scenario = "eight", brief?: TeamBrief) {
 	const sandbox = await mkdtemp(join(tmpdir(), "rail-team-e2e-"));
 	const agentDir = join(sandbox, "agent");
 	await mkdir(agentDir, { recursive: true });
@@ -58,7 +58,7 @@ async function setup(t: TestContext, count: number, scenario = "eight") {
 	const manager = new TeamRunManager(hub);
 	installTeamTool(pi, () => hub);
 	installStatefulSubagentTool(pi, { broker, team: () => manager, renderContext: () => ctx });
-	const prepared = await tools.get("subagent_team").execute("prepare", { action: "prepare", coordinator: "A", workers: Array.from({ length: count }, (_, i) => `B${i + 1}`), timeoutSeconds: 60.1234 }, undefined, undefined, ctx);
+	const prepared = await tools.get("subagent_team").execute("prepare", { action: "prepare", coordinator: "A", workers: Array.from({ length: count }, (_, i) => `B${i + 1}`), timeoutSeconds: 60.1234, ...(brief ? { brief } : {}) }, undefined, undefined, ctx);
 	const teamId = prepared.details.snapshots[0].id;
 	const updates: any[] = [];
 	const subagent = tools.get("subagent");
@@ -244,6 +244,39 @@ test("native parent rejects a lone team call without starting members, then corr
 	assert.equal(hub.get(teamId).phase, "completed");
 	assert.equal((await store.list()).length, 3, "all three real child sessions must be created");
 	assert.deepEqual(args, before);
+});
+
+test("real RPC shares member scope and policies, preserves structured empty-text outcomes, and summarizes only once", { timeout: 90_000 }, async (t) => {
+	const { hub, teamId, dispatch, journal } = await setup(t, 2, "contract", {
+		goal: "Verify shared scope and structured outcomes",
+		target: "offline synthetic fixture",
+		acceptanceCriteria: ["No business system access", "Return structured evidence"],
+		constraints: ["No external side effects"],
+		authorizations: [
+			{ member: "A", allowed: ["coordinate"], forbidden: ["synthetic-work"] },
+			{ member: "B1", allowed: ["synthetic-work"] },
+		],
+	});
+	const [coordinator, workers] = await Promise.all(dispatch());
+	assert.equal(hub.get(teamId).phase, "completed");
+	assert.match(coordinator.details.results[0].output, /CONTRACT_FINAL/);
+	assert.ok(workers.details.results.every((run: any) => run.status === "completed" && run.output === ""));
+	assert.equal(workers.details.results[0].teamResult.status, "partial");
+	assert.equal(workers.details.results[1].teamResult.status, "succeeded");
+	assert.match(workers.content[0].text, /runtime completions/);
+	assert.match(workers.content[0].text, /task partial/);
+	for (const alias of ["A", "B1", "B2"]) {
+		const entries = await journal(alias);
+		const firstDelivery = entries.find((entry) => entry.customType === "rail-team-delivery");
+		const roster = JSON.parse(firstDelivery.content).snapshot;
+		assert.equal(roster.brief.goal, "Verify shared scope and structured outcomes");
+		assert.ok(roster.members.every((member: any) => member.assignment?.memberId === member.id));
+		assert.ok(entries.filter((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "team").every((entry) => !entry.message.isError));
+		if (alias === "A") {
+			assert.equal(entries.filter((entry) => entry.message?.role === "assistant" && entry.message.stopReason === "stop").length, 1);
+			assert.ok(!entries.some((entry) => entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("All workers have settled.")), "an observed explicit barrier must not generate a second summary prompt");
+		}
+	}
 });
 
 test("real cancellation wakes both parked calls and awaits native lease cleanup without a final summary", { timeout: 90_000 }, async (t) => {

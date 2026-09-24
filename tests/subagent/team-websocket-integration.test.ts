@@ -124,7 +124,12 @@ function decideResponse(body: Payload, scenario: Scenario): Decision {
 	const text = payloadText(body);
 	const calls = completedTeamCalls(body);
 	if (member === "A") {
-		if (text.includes("All workers have settled.")) {
+		const barrier = calls.find((call) => call.arguments.action === "wait" && call.arguments.wait?.kind === "workers");
+		if (barrier || text.includes("All workers have settled.")) {
+			const results = barrier ? JSON.parse(barrier.output).snapshot?.members : undefined;
+			if (barrier && (!Array.isArray(results) || !["B1", "B2"].every((id) => results.some((result) => result.id === id && result.state === "completed" && result.output === `${id}_NATIVE_RESULT`)))) {
+				return { kind: "text", text: "WS_PROTOCOL_ERROR: final barrier missing native results" };
+			}
 			return { kind: "text", text: "WS_FINAL: B1_NATIVE_RESULT and B2_NATIVE_RESULT" };
 		}
 		if (!hasCompletedCall(calls, (arguments_) => arguments_.action === "control" && arguments_.to === "B1" && arguments_.command === "pause")) {
@@ -434,11 +439,15 @@ test("real Team RPC children use the configured loopback Responses WebSocket for
 	assert.ok(b1Requests.length >= 1 && b1Requests.length <= 2, `B1 must have only its initial/resumed native turns, got ${b1Requests.length}`);
 	assert.equal(b1Requests.filter((request) => payloadText(request).includes("B1_RESUMED")).length, 1, "resume must wake B1 once from the native Team delivery, not by polling");
 	assert.ok(server.requests.some((request) => payloadText(request).includes("B1_RESUMED")), "the resumed worker must receive the native Team direction in its request payload");
-	assert.ok(server.requests.some((request) => payloadText(request).includes("All workers have settled.")), "the coordinator summary must be a new native request after the worker barrier");
-	assert.ok(server.requests.some((request) => payloadText(request).includes("B1_NATIVE_RESULT") && payloadText(request).includes("B2_NATIVE_RESULT")), "the final WebSocket payload must contain both native worker results");
+	const summaryRequests = server.requests.filter((request) => memberFromPayload(request) === "A"
+		&& hasCompletedCall(completedTeamCalls(request), (args) => args.action === "wait" && args.wait?.kind === "workers"));
+	assert.equal(summaryRequests.length, 1, "the complete worker barrier must cause exactly one native summary request");
+	assert.ok(payloadText(summaryRequests[0]!).includes("B1_NATIVE_RESULT") && payloadText(summaryRequests[0]!).includes("B2_NATIVE_RESULT"), "the summary payload must contain both native worker results");
+	assert.ok(server.requests.every((request) => !payloadText(request).includes("All workers have settled.")), "an explicitly observed barrier must not trigger a redundant host continuation");
 
 	const coordinatorJournal = await harness.journal("A");
-	assert.ok(coordinatorJournal.some((entry) => JSON.stringify(entry).includes("All workers have settled.")));
+	const finalEntries = coordinatorJournal.filter((entry) => entry.message?.role === "assistant" && entry.message.stopReason === "stop");
+	assert.equal(finalEntries.length, 1, "the coordinator must generate its final answer only once");
 	assert.ok((await harness.journal("B1")).some((entry) => JSON.stringify(entry).includes("B1_RESUMED")));
 	await waitForServer(server, () => server.openSockets.size === 0, "normal Team shutdown left a WebSocket open", 10_000);
 });

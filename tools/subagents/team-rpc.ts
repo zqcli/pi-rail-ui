@@ -146,7 +146,10 @@ export class TeamRpcConnection {
 					return this.channel.onRequest(request, this.controller.signal);
 				}).then(async (reply) => {
 					if (this.closing || this.controller.signal.aborted) return;
-					await this.command({ version: 1, operation: "reply", commandId: randomUUID(), binding: this.channel.binding, requestId: request.requestId, reply: publicTeamReply(reply) });
+					const publicReply = publicTeamReply(reply);
+					if (publicReply.from !== undefined && (publicReply.from !== "@hub" || publicReply.to !== this.channel.binding.memberId)) throw new Error("Mismatched team reply routing");
+					if (publicReply.requestId !== undefined && publicReply.requestId !== request.requestId) throw new Error("Mismatched team reply request id");
+					await this.command({ version: 1, operation: "reply", commandId: randomUUID(), binding: this.channel.binding, requestId: request.requestId, reply: publicReply });
 				}).catch((error) => {
 					if (!this.closing && !this.controller.signal.aborted) this.fail(error);
 				});

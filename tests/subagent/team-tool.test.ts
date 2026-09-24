@@ -12,14 +12,50 @@ test("parent prepare/status/cancel handles null defaults and exposes no binding"
 		assert.equal(tool.parameters.properties.action.type, "string");
 		assert.deepEqual(tool.parameters.properties.action.enum, ["prepare", "status", "cancel"]);
 		assert.equal(tool.parameters.properties.action.anyOf, undefined);
-		const prepared = await tool.execute("prepare", { action: "prepare", coordinator: "A", workers: ["B"], timeoutSeconds: null });
+		await assert.rejects(tool.execute("bad-prepare", { action: "prepare", teamId: "ignored-id", coordinator: "A", workers: ["B"] }), /does not accept teamId/u);
+		assert.equal(hub.list().length, 0, "a rejected prepare must not create a team");
+		const prepared = await tool.execute("prepare", {
+			action: "prepare", coordinator: "A", workers: ["B"], timeoutSeconds: null,
+			brief: {
+				goal: "Review the target service",
+				target: "https://example.invalid/service",
+				acceptanceCriteria: null,
+				constraints: ["Do not modify production"],
+				authorizations: [{ member: "B", allowed: ["Read repository files"], forbidden: null }],
+			},
+		});
 		const snapshot = prepared.details.snapshots[0];
 		assert.equal(snapshot.deadline - snapshot.createdAt, 3600000);
+		assert.deepEqual(snapshot.brief, {
+			goal: "Review the target service",
+			target: "https://example.invalid/service",
+			constraints: ["Do not modify production"],
+			authorizations: [{ member: "B", allowed: ["Read repository files"] }],
+		});
 		assert.match(prepared.content[0].text, /Budget: 3600s total from prepare/u);
 		assert.match(prepared.content[0].text, /BOTH coordinator single and all workers grouped.*ONE assistant message/u);
+		const payload = JSON.parse(prepared.content[0].text.split("JSON:\n")[1]!);
+		assert.equal(payload.action, "prepare");
+		assert.equal(payload.teamId, snapshot.id);
+		assert.equal(payload.from, "@hub");
+		assert.equal(payload.to, "@parent");
+		assert.equal(payload.snapshot.brief.goal, "Review the target service");
+		assert.match(payload.next, /do not wake or interrupt/u);
 		const status = await tool.execute("status", { action: "status", teamId: snapshot.id });
 		assert.match(status.content[0].text, /REGISTERED/);
+		assert.equal(JSON.parse(status.content[0].text.split("JSON:\n")[1]!).action, "status");
 		assert.equal(JSON.stringify(status).includes("epoch"), false);
+		hub.join(snapshot.id, ["A"], [{ memberId: "A", task: "Coordinate", model: "provider/model", fastMode: false, searchMode: "on" }]);
+		const [worker] = hub.join(snapshot.id, ["B"], [{ memberId: "B", task: "Inspect the service", cwd: "/tmp/service", model: "provider/model", fastMode: true, searchMode: "on" }]);
+		await hub.request(worker!, { requestId: "blocked", sequence: 1, action: "finish", result: { status: "blocked", summary: "Need approved credentials" } });
+		const assignedStatus = await tool.execute("assigned-status", { action: "status", teamId: snapshot.id });
+		const modelSnapshot = JSON.parse(assignedStatus.content[0].text.split("JSON:\n")[1]!).snapshot;
+		const assignedWorker = modelSnapshot.members.find((member: any) => member.id === "B");
+		assert.equal(assignedWorker.assignment.taskPreview, "Inspect the service");
+		assert.equal(assignedWorker.assignment.fastMode, true);
+		assert.equal(assignedWorker.result.status, "blocked");
+		assert.equal(assignedWorker.result.summaryPreview, "Need approved credentials");
+		assert.equal(JSON.stringify(modelSnapshot).includes("epoch"), false);
 		const cancelled = await tool.execute("cancel", { action: "cancel", teamId: snapshot.id, reason: null });
 		assert.equal(cancelled.details.snapshots[0].phase, "cancelled");
 		assert.equal((await tool.execute("list", { action: "status", teamId: null })).details.snapshots.length, 1);
@@ -37,6 +73,40 @@ test("prepare explains an explicit short total deadline without silently extendi
 	assert.equal(snapshot.deadline - snapshot.createdAt, 120000);
 	assert.match(result.content[0].text, /Budget: 120s total from prepare, including reasoning, tools, waiting and final summary/u);
 	assert.equal(snapshot.phase, "prepared");
+});
+
+test("status previews and a full 32-team listing stay bounded without discarding stored outcomes", async (t) => {
+	const source = new TeamHub();
+	const hub = new TeamHub();
+	t.after(() => { source.dispose(); hub.dispose(); });
+	const ids = Array.from({ length: 8 }, (_, index) => `B${index + 1}`);
+	const snapshot = source.prepare({ coordinator: "A", workers: ids, brief: {
+		goal: "g".repeat(8192), target: "t".repeat(8192), constraints: ["c".repeat(8192)],
+	} });
+	const assignment = (memberId: string) => ({ memberId, task: "\u0000".repeat(1200), cwd: "\u0000".repeat(1200), model: "provider/model", fastMode: false });
+	const [coordinator] = source.join(snapshot.id, ["A"], [assignment("A")]);
+	const workers = source.join(snapshot.id, ids, ids.map(assignment));
+	for (const worker of workers) {
+		assert.equal((await source.request(worker, { requestId: "result", sequence: 1, action: "finish", result: {
+			status: "partial", summary: "\u0000".repeat(1200), findings: ["\u0000".repeat(700)],
+		} })).ok, true);
+		source.complete(worker, { status: "completed", output: "native result" });
+	}
+	await source.waitForWorkers(coordinator!);
+	source.complete(coordinator!, { status: "completed", output: "final summary" });
+	const completed = source.get(snapshot.id);
+	hub.restore(Array.from({ length: 32 }, (_, index) => ({ ...completed, id: `history-${index}`, events: [] })));
+	let tool: any;
+	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
+	const listed = await tool.execute("list", { action: "status" });
+	assert.equal(listed.details.response.snapshots.length, 32);
+	assert.ok(Buffer.byteLength(listed.content[0].text) < 32 * 1024, "listing must not repeat every team's full brief, assignments and results");
+	const status = await tool.execute("status", { action: "status", teamId: "history-0" });
+	assert.ok(Buffer.byteLength(status.content[0].text) < 64 * 1024, "single-team previews count JSON escaping overhead");
+	const worker = status.details.response.snapshot.members.find((member: any) => member.id === "B1");
+	assert.match(worker.result.summaryPreview, /…$/u);
+	assert.equal(worker.result.findingsCount, 1);
+	assert.equal(status.details.snapshots[0].members.find((member: any) => member.id === "B1").result.summary, "\u0000".repeat(1200), "stored outcome is complete; only status previews are bounded");
 });
 
 test("history restores latest journal snapshot per team as interrupted, rejecting old bindings", () => {
@@ -82,6 +152,6 @@ test("cancel reason is visible but bounded and stripped of terminal control sequ
 	const text = cancelled.content[0].text;
 	assert.match(text, /Reason: Requested stop more context/u);
 	assert.doesNotMatch(text, /\u001b/u);
-	assert.ok(text.length < 500);
+	assert.ok(text.length < 2500, "model-visible status JSON keeps cancellation context bounded");
 	assert.match(tool.renderResult(cancelled).render(120).join("\n"), /Reason: Requested stop/u);
 });

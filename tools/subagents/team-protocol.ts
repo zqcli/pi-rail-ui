@@ -8,6 +8,13 @@ export const TEAM_MAX_MESSAGE_BYTES = 8 * 1024;
 export const TEAM_MAX_EVENTS = 64;
 export const TEAM_MAX_WORKERS = 8;
 
+const TEAM_MAX_TEXT_BYTES = 8 * 1024;
+export const TEAM_MAX_RESULT_ITEMS = 32;
+const TEAM_MAX_BRIEF_AUTHORIZATIONS = TEAM_MAX_WORKERS + 1;
+export const TEAM_MAX_BRIEF_BYTES = 32 * 1024;
+export const TEAM_MAX_ASSIGNMENT_BYTES = 16 * 1024;
+export const TEAM_MAX_TASK_RESULT_BYTES = 12 * 1024;
+
 export function teamExtensionPath(): string {
 	return fileURLToPath(new URL("./team-extension.ts", import.meta.url));
 }
@@ -28,7 +35,42 @@ export interface TeamBinding {
 export interface TeamWait {
 	kind: "message" | "member" | "workers";
 	member?: string;
+	/** Filter message/report deliveries by authenticated sender, not member terminal state. */
+	from?: string;
 	afterSeq?: number;
+}
+
+export interface TeamEvidence {
+	source: string;
+	locator?: string;
+	basis: "observed" | "verified" | "inferred" | "unverified";
+}
+
+export interface TeamTaskResult {
+	status: "succeeded" | "partial" | "blocked" | "failed";
+	summary: string;
+	findings?: string[];
+	evidence?: TeamEvidence[];
+	limitations?: string[];
+	artifacts?: string[];
+}
+
+/** Parent-supplied scope, not a grant of additional operating-system privileges. */
+export interface TeamBrief {
+	goal: string;
+	target?: string;
+	acceptanceCriteria?: string[];
+	constraints?: string[];
+	authorizations?: { member: string; allowed: string[]; forbidden?: string[] }[];
+}
+
+export interface TeamAssignment {
+	memberId: string;
+	task: string;
+	cwd?: string;
+	model?: string;
+	fastMode?: boolean;
+	searchMode?: string;
 }
 
 export interface TeamRequest {
@@ -37,13 +79,24 @@ export interface TeamRequest {
 	action: "checkpoint" | "send" | "report" | "wait" | "control" | "finish";
 	/** Only the native context gate may consume inbox messages into model context. */
 	receive?: boolean;
+	/** Context revision under which a tool call was generated. Internal only. */
+	revision?: number;
 	to?: string;
 	message?: string;
+	replyTo?: string;
+	supersedes?: string;
+	result?: TeamTaskResult;
 	wait?: TeamWait;
 	command?: "pause" | "resume" | "redirect";
 }
 
 export interface TeamEvent {
+	/** Absent only on legacy persisted events. New public events use v2 routing. */
+	version?: 2;
+	messageId?: string;
+	timestamp?: number;
+	replyTo?: string;
+	supersedes?: string;
 	seq: number;
 	kind: "message" | "report" | "state" | "result" | "control" | "cancelled";
 	from?: string;
@@ -60,6 +113,10 @@ export interface TeamMemberSnapshot {
 	waitingFor?: string;
 	output?: string;
 	error?: string;
+	assignment?: TeamAssignment;
+	result?: TeamTaskResult;
+	instructionRevision?: number;
+	observedRevision?: number;
 }
 
 export interface TeamSnapshot {
@@ -70,12 +127,20 @@ export interface TeamSnapshot {
 	seq: number;
 	createdAt: number;
 	deadline: number;
+	brief?: TeamBrief;
 	members: TeamMemberSnapshot[];
 	events: TeamEvent[];
 }
 
 export interface TeamReply {
 	ok: boolean;
+	/** Runtime-authenticated reply routing; absent only on legacy fixtures/history. */
+	from?: string;
+	to?: string;
+	requestId?: string;
+	revision?: number;
+	code?: "stale_instruction";
+	receipt?: { status: "queued" | "applied"; messageId?: string; recipient?: string; seq?: number };
 	events?: TeamEvent[];
 	snapshot?: TeamSnapshot;
 	error?: string;
@@ -122,22 +187,112 @@ export function isTeamBinding(value: unknown): value is TeamBinding {
 		&& (item["role"] === "coordinator" || item["role"] === "worker");
 }
 
+function record(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function onlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+	return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function boundedText(value: unknown, maxBytes = TEAM_MAX_TEXT_BYTES): value is string {
+	return typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
+function boundedStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.length <= TEAM_MAX_RESULT_ITEMS && value.every((item) => boundedText(item));
+}
+
+export function isTeamTaskResult(value: unknown): value is TeamTaskResult {
+	if (!record(value) || !onlyKeys(value, ["status", "summary", "findings", "evidence", "limitations", "artifacts"])) return false;
+	if (!["succeeded", "partial", "blocked", "failed"].includes(String(value["status"])) || !boundedText(value["summary"])) return false;
+	for (const key of ["findings", "limitations", "artifacts"] as const) {
+		if (value[key] !== undefined && !boundedStringArray(value[key])) return false;
+	}
+	if (value["evidence"] !== undefined) {
+		if (!Array.isArray(value["evidence"]) || value["evidence"].length > TEAM_MAX_RESULT_ITEMS) return false;
+		for (const item of value["evidence"]) {
+			if (!record(item) || !onlyKeys(item, ["source", "locator", "basis"]) || !boundedText(item["source"])
+				|| (item["locator"] !== undefined && !boundedText(item["locator"]))
+				|| !["observed", "verified", "inferred", "unverified"].includes(String(item["basis"]))) return false;
+		}
+	}
+	const json = JSON.stringify(value);
+	return json !== undefined && Buffer.byteLength(json, "utf8") <= TEAM_MAX_TASK_RESULT_BYTES;
+}
+
+export function isTeamBrief(value: unknown): value is TeamBrief {
+	if (!record(value) || !onlyKeys(value, ["goal", "target", "acceptanceCriteria", "constraints", "authorizations"])
+		|| !boundedText(value["goal"])) return false;
+	if (value["target"] !== undefined && !boundedText(value["target"])) return false;
+	for (const key of ["acceptanceCriteria", "constraints"] as const) {
+		if (value[key] !== undefined && !boundedStringArray(value[key])) return false;
+	}
+	if (value["authorizations"] !== undefined) {
+		const authorizations = value["authorizations"];
+		if (!Array.isArray(authorizations) || authorizations.length > TEAM_MAX_BRIEF_AUTHORIZATIONS) return false;
+		for (const item of authorizations) {
+			if (!record(item) || !onlyKeys(item, ["member", "allowed", "forbidden"])
+				|| !boundedText(item["member"], 64) || !boundedStringArray(item["allowed"])
+				|| (item["forbidden"] !== undefined && !boundedStringArray(item["forbidden"]))) return false;
+		}
+	}
+	const json = JSON.stringify(value);
+	return json !== undefined && Buffer.byteLength(json, "utf8") <= TEAM_MAX_BRIEF_BYTES;
+}
+
+export function isTeamAssignment(value: unknown): value is TeamAssignment {
+	if (!record(value) || !onlyKeys(value, ["memberId", "task", "cwd", "model", "fastMode", "searchMode"])
+		|| !boundedText(value["memberId"], 64) || !boundedText(value["task"])) return false;
+	for (const key of ["cwd", "model", "searchMode"] as const) {
+		if (value[key] !== undefined && !boundedText(value[key])) return false;
+	}
+	if (value["fastMode"] !== undefined && typeof value["fastMode"] !== "boolean") return false;
+	const json = JSON.stringify(value);
+	return json !== undefined && Buffer.byteLength(json, "utf8") <= TEAM_MAX_ASSIGNMENT_BYTES;
+}
+
+function validMessageReference(value: unknown): value is string {
+	return typeof value === "string" && value.length <= 256 && /^[A-Za-z0-9._-]{1,128}:\d+$/u.test(value);
+}
+
 export function isTeamRequest(value: unknown): value is TeamRequest {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const item = value as Record<string, unknown>;
+	if (!record(value)) return false;
+	const item = value;
 	if (typeof item["requestId"] !== "string" || !item["requestId"] || item["requestId"].length > 128
 		|| !Number.isSafeInteger(item["sequence"]) || (item["sequence"] as number) < 1
 		|| !["checkpoint", "send", "report", "wait", "control", "finish"].includes(String(item["action"]))) return false;
 	if (item["receive"] !== undefined && (typeof item["receive"] !== "boolean" || item["action"] !== "checkpoint")) return false;
+	if (item["revision"] !== undefined && (!Number.isSafeInteger(item["revision"]) || (item["revision"] as number) < 0 || item["action"] !== "checkpoint")) return false;
 	if (item["to"] !== undefined && (typeof item["to"] !== "string" || item["to"].length > 64)) return false;
 	if (item["message"] !== undefined && (typeof item["message"] !== "string" || Buffer.byteLength(item["message"], "utf8") > TEAM_MAX_MESSAGE_BYTES)) return false;
 	if (item["command"] !== undefined && !["pause", "resume", "redirect"].includes(String(item["command"]))) return false;
+	if (item["replyTo"] !== undefined && (!validMessageReference(item["replyTo"]) || !["send", "report"].includes(String(item["action"])))) return false;
+	if (item["supersedes"] !== undefined && (!validMessageReference(item["supersedes"]) || !["send", "report"].includes(String(item["action"])))) return false;
+	if (item["result"] !== undefined && (item["action"] !== "finish" || !isTeamTaskResult(item["result"]))) return false;
+	if (item["action"] === "finish" && item["message"] !== undefined && item["result"] !== undefined) return false;
+	if (item["message"] !== undefined && (typeof item["message"] !== "string" || !item["message"].trim())) return false;
 	if (item["wait"] !== undefined) {
-		if (!item["wait"] || typeof item["wait"] !== "object" || Array.isArray(item["wait"])) return false;
-		const wait = item["wait"] as Record<string, unknown>;
+		if (!record(item["wait"])) return false;
+		const wait = item["wait"];
 		if (!["message", "member", "workers"].includes(String(wait["kind"]))) return false;
-		if (wait["member"] !== undefined && (typeof wait["member"] !== "string" || wait["member"].length > 64)) return false;
-		if (wait["afterSeq"] !== undefined && (!Number.isSafeInteger(wait["afterSeq"]) || (wait["afterSeq"] as number) < 0)) return false;
+		if (wait["member"] !== undefined && (typeof wait["member"] !== "string" || !wait["member"].trim() || wait["member"].length > 64 || wait["kind"] !== "member")) return false;
+		if (wait["afterSeq"] !== undefined && (!Number.isSafeInteger(wait["afterSeq"]) || (wait["afterSeq"] as number) < 0 || wait["kind"] !== "message")) return false;
+		if (wait["from"] !== undefined && (typeof wait["from"] !== "string" || !wait["from"].trim() || wait["from"].length > 64 || wait["kind"] !== "message")) return false;
 	}
-	return true;
+	switch (item["action"]) {
+		case "checkpoint": return item["to"] === undefined && item["message"] === undefined && item["replyTo"] === undefined
+			&& item["supersedes"] === undefined && item["result"] === undefined && item["wait"] === undefined && item["command"] === undefined;
+		case "send": return typeof item["to"] === "string" && !!item["to"] && typeof item["message"] === "string"
+			&& item["wait"] === undefined && item["command"] === undefined && item["result"] === undefined;
+		case "report": return typeof item["message"] === "string" && item["command"] === undefined && item["result"] === undefined;
+		case "wait": return item["wait"] !== undefined && item["to"] === undefined && item["message"] === undefined
+			&& item["replyTo"] === undefined && item["supersedes"] === undefined && item["result"] === undefined && item["command"] === undefined;
+		case "control": return typeof item["to"] === "string" && !!item["to"] && typeof item["command"] === "string"
+			&& item["wait"] === undefined && item["replyTo"] === undefined && item["supersedes"] === undefined && item["result"] === undefined
+			&& (item["command"] === "redirect" ? typeof item["message"] === "string" : item["message"] === undefined);
+		case "finish": return item["to"] === undefined && item["wait"] === undefined && item["command"] === undefined
+			&& item["replyTo"] === undefined && item["supersedes"] === undefined;
+	}
+	return false;
 }

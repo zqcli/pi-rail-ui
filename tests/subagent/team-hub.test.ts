@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { TeamHub } from "../../tools/subagents/team-hub";
-import { publicTeamReply } from "../../tools/subagents/team-extension";
-import { TEAM_MAX_EVENTS, type TeamBinding, type TeamRequest, type TeamSnapshot } from "../../tools/subagents/team-protocol";
+import { publicTeamReply, TEAM_DELIVERY_TYPE, TEAM_FRAME_BYTES } from "../../tools/subagents/team-extension";
+import {
+	isTeamAssignment, isTeamBrief, isTeamRequest, isTeamTaskResult,
+	TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, type TeamAssignment, type TeamBinding, type TeamBrief, type TeamRequest, type TeamSnapshot, type TeamTaskResult,
+} from "../../tools/subagents/team-protocol";
 
 function fixture(count = 2, options: ConstructorParameters<typeof TeamHub>[0] = {}) {
 	const hub = new TeamHub(options);
@@ -10,10 +13,15 @@ function fixture(count = 2, options: ConstructorParameters<typeof TeamHub>[0] = 
 	const [a] = hub.join(snapshot.id, ["A"]);
 	const workers = hub.join(snapshot.id, snapshot.workers);
 	const sequences = new Map<string, number>();
-	const request = (binding: TeamBinding, fields: Omit<TeamRequest, "requestId" | "sequence">, signal?: AbortSignal) => {
+	const request = async (binding: TeamBinding, fields: Omit<TeamRequest, "requestId" | "sequence">, signal?: AbortSignal) => {
 		const sequence = (sequences.get(binding.memberId) ?? 0) + 1;
 		sequences.set(binding.memberId, sequence);
-		return hub.request(binding, { requestId: `${binding.memberId}-${sequence}`, sequence, ...fields }, signal);
+		const requestId = `${binding.memberId}-${sequence}`;
+		const reply = await hub.request(binding, { requestId, sequence, ...fields }, signal);
+		assert.equal(reply.from, "@hub");
+		assert.equal(reply.to, binding.memberId);
+		assert.equal(reply.requestId, requestId);
+		return reply;
 	};
 	return { hub, id: snapshot.id, a: a!, workers, b: workers[0]!, request };
 }
@@ -258,7 +266,9 @@ test("control snapshots preserve unresolved dependencies and redirect never clea
 	assert.deepEqual(redirected.snapshot, hub.get(id));
 	await tick(); assert.equal(ready, false);
 	await request(a, { action: "control", to: b.memberId, command: "resume" });
-	assert.equal((await dependency).events?.[0]?.message, "new direction");
+	assert.deepEqual((await dependency).events, [], "redirect wakes the parked tool without consuming its context-slot direction");
+	const received = await request(b, { action: "checkpoint", receive: true });
+	assert.equal(received.events?.[0]?.message, "new direction");
 	for (const reply of [resumed, redirected]) assert.doesNotThrow(() => publicTeamReply(reply));
 });
 
@@ -298,10 +308,16 @@ test("rejected controls have no snapshot or state/message side effects", async (
 	}
 	for (let i = 0; i < TEAM_MAX_EVENTS; i++) await request(a, { action: "send", to: b.memberId, message: "full" });
 	const before = hub.get(id);
-	const overflow = await request(a, { action: "control", to: b.memberId, command: "redirect", message: "overflow" });
-	assert.equal(overflow.snapshot, undefined);
+	const redirected = await request(a, { action: "control", to: b.memberId, command: "redirect", message: "reserved direction" });
+	assert.equal(redirected.ok, true, "the direction slot remains available when the ordinary inbox is full");
+	assert.equal(redirected.receipt?.status, "applied");
+	assert.equal(hub.get(id).members.find((member) => member.id === b.memberId)?.instructionRevision, 1);
+	const afterRedirect = hub.get(id);
+	assert.notDeepEqual(afterRedirect, before);
+	const overflow = await request(a, { action: "send", to: b.memberId, message: "ordinary overflow" });
+	assert.equal(overflow.ok, false);
 	assert.match(overflow.error!, /overflow/);
-	assert.deepEqual(hub.get(id), before);
+	assert.deepEqual(hub.get(id), afterRedirect);
 });
 
 test("control snapshots remain publicTeamReply-compatible with a full roster and bounded large results", async (t) => {
@@ -350,7 +366,9 @@ test("redirect replaces wait but not manual pause; control scope and dependency 
 	let settled = false; void pending.then(() => { settled = true; });
 	await tick(); assert.equal(settled, false);
 	await request(a, { action: "control", to: "B1", command: "resume" });
-	assert.equal((await pending).events?.[0]?.message, "new direction");
+	assert.deepEqual((await pending).events, [], "redirect wakes the parked wait but remains reserved for context delivery");
+	const received = await request(b, { action: "checkpoint", receive: true });
+	assert.equal(received.events?.[0]?.message, "new direction");
 });
 
 test("native complete is authoritative; coordinator receives sealed barrier; terminal cannot resurrect", async (t) => {
@@ -595,7 +613,8 @@ for (const receive of [undefined, false] as const) {
 		for (const message of ["before first gate", "before running gate"]) {
 			await request(a, { action: "send", to: "B1", message });
 			const gate = await request(b, { action: "checkpoint", ...(receive === undefined ? {} : { receive }) });
-			assert.deepEqual(gate, { ok: true });
+			assert.equal(gate.ok, true);
+			assert.deepEqual(gate.events, undefined);
 			let settled = false;
 			const waiting = request(b, { action: "wait", wait: { kind: "message" } }).then((reply) => { settled = true; return reply; });
 			await tick();
@@ -608,8 +627,8 @@ for (const receive of [undefined, false] as const) {
 
 test("first receiving context announces public roster once per member, not on permission-only gates", async (t) => {
 	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
-	assert.deepEqual(await request(b, { action: "checkpoint", receive: false }), { ok: true });
-	assert.deepEqual(await request(b, { action: "checkpoint" }), { ok: true });
+	assert.equal((await request(b, { action: "checkpoint", receive: false })).ok, true);
+	assert.equal((await request(b, { action: "checkpoint" })).ok, true);
 	const first = await request(b, { action: "checkpoint", receive: true });
 	assert.deepEqual(first.events, []);
 	assert.equal(first.snapshot?.coordinator, "A");
@@ -653,18 +672,17 @@ test("receive participates in dedup and is rejected on non-checkpoint actions", 
 	assert.equal((await hub.request(b, { ...checkpoint, requestId: "next", sequence: 2 })).snapshot, undefined);
 });
 
-test("paused permission gate preserves redirect until the following wait", async (t) => {
+test("paused permission gate does not consume redirect; receiving context gets the reserved direction", async (t) => {
 	const { hub, a, b, request } = fixture(1); t.after(() => hub.dispose());
 	await request(b, { action: "checkpoint", receive: true });
 	await request(a, { action: "control", command: "pause", to: "B1" });
 	const gate = request(b, { action: "checkpoint", receive: false });
 	await request(a, { action: "control", command: "redirect", to: "B1", message: "redirect before wait" });
 	await request(a, { action: "control", command: "resume", to: "B1" });
-	assert.deepEqual(await gate, { ok: true });
-	let settled = false;
-	const waiting = request(b, { action: "wait", wait: { kind: "message" } }).then((reply) => { settled = true; return reply; });
-	await tick(); assert.equal(settled, true);
-	assert.equal((await waiting).events?.[0]?.message, "redirect before wait");
+	assert.equal((await gate).ok, true);
+	const received = await request(b, { action: "checkpoint", receive: true });
+	assert.equal(received.revision, 1);
+	assert.equal(received.events?.[0]?.message, "redirect before wait");
 });
 
 test("running checkpoint consumes peer messages and redirects without permit churn or redundant journals", async (t) => {
@@ -686,7 +704,8 @@ test("running checkpoint consumes peer messages and redirects without permit chu
 		assert.deepEqual((await hub.request(b, { ...checkpoint, sequence: i, requestId: `gate-${i}` })).events, []);
 	}
 	assert.equal(hub.get(id).seq, seq);
-	assert.equal(journal.length, count);
+	assert.equal(journal.length, count + 1, "observing the redirected instruction is durably published once");
+	assert.equal(journal.at(-1)?.members.find((member) => member.id === "B1")?.observedRevision, 1);
 	assert.equal(queuedGranted, false);
 	assert.equal(hub.get(id).members.find((member) => member.id === "B1")?.state, "running");
 	hub.cancel(id); await queued;
@@ -698,8 +717,8 @@ test("checkpoint admission also returns early inbox messages; reserved results d
 	assert.equal((await request(b, { action: "checkpoint", receive: true })).events?.[0]?.message, "before first turn");
 	for (let i = 0; i < TEAM_MAX_EVENTS; i++) await request(b, { action: "report", message: `report${i}` });
 	for (const worker of workers) hub.complete(worker, outcome);
-	assert.deepEqual(await request(a, { action: "checkpoint", receive: false }), { ok: true });
-	assert.deepEqual(await request(a, { action: "checkpoint" }), { ok: true });
+	assert.equal((await request(a, { action: "checkpoint", receive: false })).ok, true);
+	assert.equal((await request(a, { action: "checkpoint" })).ok, true);
 	const first = await request(a, { action: "checkpoint", receive: true });
 	const second = await request(a, { action: "checkpoint", receive: true });
 	assert.equal(first.events?.length, 64);
@@ -836,7 +855,7 @@ test("alias rules match host and team/history session capacity is explicitly bou
 	restored.restore(hub.list());
 	assert.equal(restored.list().length, 32);
 	assert.throws(() => restored.prepare({ coordinator: "A", workers: ["B"] }), /capacity/);
-	assert.throws(() => restored.restore([{ ...hub.list()[0]!, id: "extra" }]), /capacity/);
+	assert.throws(() => restored.restore([{ ...hub.list()[0]!, id: "extra", seq: 0, events: [] }]), /capacity/);
 });
 
 test("restore validates unknown input atomically and bounds known fields without retaining arbitrary properties", (t) => {
@@ -901,4 +920,471 @@ test("restore is read-only interrupted history; snapshots and journal observers 
 	assert.throws(() => restored.complete(b, outcome), /stale/);
 	const history = restored.get(id); restored.cancel(id); assert.deepEqual(restored.get(id), history);
 	assert.equal(restored.list().length, 1);
+});
+
+test("shared Team validators enforce bounded UTF-8 fields, arrays, and known shapes", () => {
+	const result = { status: "partial", summary: "Checked the relevant path", findings: ["One finding"],
+		evidence: [{ source: "test", locator: "tests/example.test.ts:4", basis: "verified" }], limitations: [], artifacts: ["report.md"] } as const;
+	assert.equal(isTeamTaskResult(result), true);
+	assert.equal(isTeamTaskResult({ ...result, extra: true }), false);
+	assert.equal(isTeamTaskResult({ status: "succeeded", summary: "🙂".repeat(2049) }), false);
+	assert.equal(isTeamTaskResult({ status: "succeeded", summary: "ok", findings: Array(33).fill("finding") }), false);
+	assert.equal(isTeamTaskResult({ status: "succeeded", summary: "ok", evidence: [{ source: "x", basis: "observed", secret: "x" }] }), false);
+	assert.equal(isTeamTaskResult({ status: "succeeded", summary: "s".repeat(8192), findings: ["f".repeat(4500)] }), false,
+		"task result JSON is bounded in aggregate, not only per field");
+
+	const brief = { goal: "Review the change", acceptanceCriteria: ["Check regressions"], constraints: ["Read only"],
+		authorizations: [{ member: "B1", allowed: ["read files"], forbidden: ["write files"] }] } as const;
+	assert.equal(isTeamBrief(brief), true);
+	assert.equal(isTeamBrief({ ...brief, unknown: "field" }), false);
+	assert.equal(isTeamBrief({ goal: "goal", constraints: ["🙂".repeat(2049)] }), false);
+	assert.equal(isTeamBrief({ goal: "goal", authorizations: Array(10).fill({ member: "B1", allowed: ["read"] }) }), false);
+	assert.equal(isTeamBrief({ goal: "g".repeat(8192), target: "t".repeat(8192),
+		acceptanceCriteria: ["a".repeat(8192)], constraints: ["c".repeat(8192)] }), false,
+		"shared brief is bounded in aggregate, not only per field");
+
+	const assignment = { memberId: "B1", task: "Inspect the tests", cwd: "D:/repo", model: "provider/model", fastMode: true, searchMode: "live" } as const;
+	assert.equal(isTeamAssignment(assignment), true);
+	assert.equal(isTeamAssignment({ ...assignment, extra: true }), false);
+	assert.equal(isTeamAssignment({ ...assignment, fastMode: "yes" }), false);
+	assert.equal(isTeamAssignment({ ...assignment, task: "🙂".repeat(2049) }), false);
+	assert.equal(isTeamAssignment({ memberId: "B1", task: "t".repeat(8192), cwd: "c".repeat(8192) }), false,
+		"assignment JSON is bounded in aggregate, not only per field");
+
+	assert.equal(isTeamRequest({ requestId: "r", sequence: 1, action: "wait", wait: { kind: "message", from: "B2" } }), true);
+	assert.equal(isTeamRequest({ requestId: "r", sequence: 1, action: "wait", wait: { kind: "member", member: "B2", from: "B2" } }), false);
+	assert.equal(isTeamRequest({ requestId: "r", sequence: 1, action: "checkpoint", revision: -1 }), false);
+	assert.equal(isTeamRequest({ requestId: "r", sequence: 1, action: "finish", message: "done", result }), false);
+	const negativeClock = new TeamHub({ now: () => -0.5 });
+	assert.throws(() => negativeClock.prepare({ coordinator: "A", workers: ["B"] }), /clock/);
+	assert.deepEqual(negativeClock.list(), []);
+	negativeClock.dispose();
+});
+
+test("prepare copies an authorized brief; join atomically stores copied assignments before admission", (t) => {
+	const journal: TeamSnapshot[] = [];
+	const hub = new TeamHub({ onSnapshot: (snapshot) => journal.push(snapshot) }); t.after(() => hub.dispose());
+	const brief: TeamBrief = { goal: "Coordinate a review", constraints: ["Read only"], authorizations: [{ member: "B1", allowed: ["read files"] }] };
+	const team = hub.prepare({ coordinator: "A", workers: ["B1", "B2"], brief });
+	brief.goal = "caller mutation";
+	brief.constraints![0] = "changed";
+	assert.deepEqual(hub.get(team.id).brief, { goal: "Coordinate a review", constraints: ["Read only"], authorizations: [{ member: "B1", allowed: ["read files"] }] });
+	assert.throws(() => hub.prepare({ coordinator: "C", workers: ["D"], brief: { goal: "x", authorizations: [{ member: "outsider", allowed: ["read"] }] } }), /authorization/);
+	assert.equal(hub.list().length, 1, "invalid brief does not create a team");
+
+	const before = hub.get(team.id);
+	assert.throws(() => hub.join(team.id, ["A"], [{ memberId: "B1", task: "wrong cohort" }]), /match.*roster/);
+	assert.throws(() => hub.join(team.id, ["A"], [{ memberId: "A", task: "valid", unknown: true } as unknown as TeamAssignment]), /valid assignment/);
+	assert.deepEqual(hub.get(team.id), before, "invalid assignment cohorts do not bind members or start admission");
+	const coordinatorAssignment: TeamAssignment = { memberId: "A", task: "Coordinate", cwd: "D:/repo", model: "m1" };
+	const workerAssignments: TeamAssignment[] = [
+		{ memberId: "B1", task: "Review tests", fastMode: true, searchMode: "live" },
+		{ memberId: "B2", task: "Review code", fastMode: false, searchMode: "off" },
+	];
+	hub.join(team.id, ["A"], [coordinatorAssignment]);
+	coordinatorAssignment.task = "mutated";
+	hub.join(team.id, ["B2", "B1"], workerAssignments);
+	workerAssignments[0]!.task = "mutated";
+	const stored = hub.get(team.id);
+	assert.equal(stored.members.find((member) => member.id === "A")?.assignment?.task, "Coordinate");
+	assert.equal(stored.members.find((member) => member.id === "B1")?.assignment?.task, "Review tests");
+	assert.equal(stored.members.find((member) => member.id === "B1")?.assignment?.fastMode, true);
+	assert.ok(journal.some((snapshot) => snapshot.members.find((member) => member.id === "A")?.state === "starting"
+		&& snapshot.members.find((member) => member.id === "A")?.assignment?.task === "Coordinate"));
+	const restored = new TeamHub(); t.after(() => restored.dispose());
+	restored.restore([stored]);
+	assert.deepEqual(restored.get(team.id).brief, stored.brief);
+	assert.deepEqual(restored.get(team.id).members.map((member) => member.assignment), stored.members.map((member) => member.assignment));
+});
+
+test("request replies are routed; messages and controls return accurate receipts; generated events are public v2", async (t) => {
+	const hub = new TeamHub({ now: () => 1234.5 }); t.after(() => hub.dispose());
+	const snapshot = hub.prepare({ coordinator: "A", workers: ["B1"] });
+	const [a] = hub.join(snapshot.id, ["A"]);
+	const [b] = hub.join(snapshot.id, ["B1"]);
+	const sent = await hub.request(a!, { requestId: "send-1", sequence: 1, action: "send", to: "B1", message: "hello" });
+	assert.deepEqual([sent.from, sent.to, sent.requestId], ["@hub", "A", "send-1"]);
+	assert.equal(sent.receipt?.status, "queued");
+	assert.equal(sent.receipt?.recipient, "B1");
+	assert.equal(sent.receipt?.seq, sent.receipt?.messageId ? Number(sent.receipt.messageId.split(":").at(-1)) : undefined);
+	const reported = await hub.request(b!, { requestId: "report-1", sequence: 1, action: "report", message: "progress" });
+	assert.equal(reported.receipt?.status, "queued");
+	assert.equal(reported.receipt?.recipient, "A");
+	const control = await hub.request(a!, { requestId: "pause-1", sequence: 2, action: "control", command: "pause", to: "B1" });
+	assert.equal(control.receipt?.status, "applied");
+	assert.equal(control.receipt?.recipient, "B1");
+	assert.equal(control.receipt?.seq, control.snapshot?.events.at(-1)?.seq);
+	const before = hub.get(snapshot.id);
+	const selfSend = await hub.request(a!, { requestId: "self-send", sequence: 3, action: "send", to: "A", message: "invalid" });
+	assert.equal(selfSend.ok, false);
+	assert.deepEqual([selfSend.from, selfSend.to, selfSend.requestId], ["@hub", "A", "self-send"]);
+	assert.match(selfSend.error!, /self/);
+	assert.deepEqual(hub.get(snapshot.id), before);
+	const selfReport = await hub.request(a!, { requestId: "self-report", sequence: 4, action: "report", to: "A", message: "invalid" });
+	assert.equal(selfReport.ok, false);
+	assert.match(selfReport.error!, /self/);
+	assert.deepEqual(hub.get(snapshot.id), before);
+	hub.complete(b!, { status: "failed", output: "", error: "native failure" });
+	hub.cancel(snapshot.id, "stop");
+	const events = hub.get(snapshot.id).events;
+	assert.ok(events.length > 0);
+	for (const event of events) {
+		assert.equal(event.version, 2);
+		assert.equal(event.messageId, `${snapshot.id}:${event.seq}`);
+		assert.equal(event.timestamp, 1234.5);
+		if (["message", "report", "control"].includes(event.kind)) {
+			assert.ok(["A", "B1"].includes(event.from!));
+			assert.ok(["A", "B1"].includes(event.to!));
+		} else {
+			assert.equal(event.from, "@hub");
+			assert.equal(event.to, "A");
+		}
+	}
+});
+
+test("coordinator terminal results use @hub routing to the parent", (t) => {
+	const hub = new TeamHub(); t.after(() => hub.dispose());
+	const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+	const [a] = hub.join(team.id, ["A"]);
+	const [b] = hub.join(team.id, ["B"]);
+	hub.complete(b!, { status: "failed", output: "", error: "worker failed" });
+	hub.complete(a!, { status: "failed", output: "", error: "coordinator failed" });
+	const result = hub.get(team.id).events.find((event) => event.kind === "result" && event.member === "A");
+	assert.equal(result?.from, "@hub");
+	assert.equal(result?.to, "@parent");
+});
+
+test("wait.from consumes only matching message events and acknowledges afterSeq within that sender stream", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	const old = await request(a, { action: "send", to: "B1", message: "old from A" });
+	await request(workers[1]!, { action: "send", to: "B1", message: "keep from B2" });
+	const before = hub.get(id);
+	const unknown = await request(b, { action: "wait", wait: { kind: "message", from: "missing" } });
+	assert.equal(unknown.ok, false);
+	assert.match(unknown.error!, /sender/);
+	const self = await request(b, { action: "wait", wait: { kind: "message", from: "B1" } });
+	assert.equal(self.ok, false);
+	assert.match(self.error!, /own|self/i);
+	assert.deepEqual(hub.get(id), before);
+	const nonMessage = await request(b, { action: "wait", wait: { kind: "member", member: "B2", from: "A" } });
+	assert.equal(nonMessage.ok, false);
+	assert.deepEqual(hub.get(id), before);
+	let settled = false;
+	const filtered = request(b, { action: "wait", wait: { kind: "message", from: "A", afterSeq: old.receipt!.seq! } })
+		.then((reply) => { settled = true; return reply; });
+	await tick();
+	assert.equal(settled, false, "unmatched B2 messages do not wake a filtered wait");
+	await request(a, { action: "send", to: "B1", message: "new from A" });
+	const matched = await filtered;
+	assert.deepEqual(matched.events?.map((event) => [event.kind, event.from, event.message]), [["message", "A", "new from A"]]);
+	const unmatched = await request(b, { action: "wait", wait: { kind: "message" } });
+	assert.deepEqual(unmatched.events?.map((event) => event.message), ["keep from B2"]);
+});
+
+test("wait.from wakes on a matching report and leaves other senders' messages queued", async (t) => {
+	const { hub, a, b, workers, request } = fixture(2); t.after(() => hub.dispose());
+	await request(workers[1]!, { action: "send", to: "A", message: "from B2" });
+	let settled = false;
+	const waiting = request(a, { action: "wait", wait: { kind: "message", from: "B1" } })
+		.then((reply) => { settled = true; return reply; });
+	await tick();
+	assert.equal(settled, false);
+	await request(b, { action: "report", message: "progress report" });
+	const reply = await waiting;
+	assert.deepEqual(reply.events?.map((event) => [event.kind, event.from, event.message]), [["report", "B1", "progress report"]]);
+	const unmatched = await request(a, { action: "wait", wait: { kind: "message" } });
+	assert.deepEqual(unmatched.events?.map((event) => [event.from, event.message]), [["B2", "from B2"]]);
+});
+
+test("a reserved latest redirect survives inbox byte caps, afterSeq ack, filtered waits, history eviction, and multiple redirects", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	for (let index = 0; index < TEAM_MAX_EVENTS; index++) {
+		assert.equal((await request(a, { action: "send", to: "B1", message: "\u0000".repeat(TEAM_MAX_MESSAGE_BYTES) })).ok, true);
+	}
+	await request(a, { action: "control", to: "B1", command: "redirect", message: "first direction" });
+	await request(a, { action: "control", to: "B1", command: "redirect", message: "latest direction" });
+	const latestSeq = hub.get(id).seq;
+	// Evict the redirect from bounded public history; the private latest-direction slot remains authoritative.
+	for (let index = 0; index < TEAM_MAX_EVENTS; index++) {
+		await request(workers[1]!, { action: "send", to: "A", message: `history filler ${index}` });
+	}
+	assert.ok(!hub.get(id).events.some((event) => event.message === "latest direction"));
+	let ackSettled = false;
+	const acknowledgeOld = request(b, { action: "wait", wait: { kind: "message", afterSeq: latestSeq } })
+		.then((reply) => { ackSettled = true; return reply; });
+	await tick();
+	assert.equal(ackSettled, false, "afterSeq acknowledges ordinary inbox events, not the reserved redirect slot");
+	await request(workers[1]!, { action: "send", to: "B1", message: "wake after acknowledgement" });
+	assert.deepEqual((await acknowledgeOld).events?.map((event) => event.message), ["wake after acknowledgement"]);
+	let settled = false;
+	const filtered = request(b, { action: "wait", wait: { kind: "message", from: "B2", afterSeq: latestSeq } })
+		.then((reply) => { settled = true; return reply; });
+	await tick();
+	assert.equal(settled, false, "pending redirect does not satisfy an unrelated filtered wait");
+	await request(workers[1]!, { action: "send", to: "B1", message: "wake from B2" });
+	const waitReply = await filtered;
+	assert.deepEqual(waitReply.events?.map((event) => event.message), ["wake from B2"]);
+	const context = await request(b, { action: "checkpoint", receive: true });
+	assert.equal(context.revision, 2);
+	assert.equal(context.events?.filter((event) => event.message === "latest direction").length, 1);
+	assert.equal(context.events?.some((event) => event.message === "first direction"), false, "newer redirect supersedes the older pending direction");
+	assert.equal(context.events?.[0]?.message, "latest direction", "reserved direction is returned in sequence order");
+	assert.deepEqual(context.events?.map((event) => event.seq), [...(context.events?.map((event) => event.seq) ?? [])].sort((left, right) => left - right));
+	const afterDelivery = await request(b, { action: "checkpoint", receive: true });
+	assert.equal(afterDelivery.revision, 2);
+	assert.equal(afterDelivery.events?.some((event) => event.message === "latest direction"), false, "a delivered direction is not duplicated");
+});
+
+test("receiving checkpoint reserves one event slot and byte budget for a redirect after a full escaped inbox", async (t) => {
+	const { hub, a, b, request, id } = fixture(1); t.after(() => hub.dispose());
+	const largeMessage = "\u0000".repeat(TEAM_MAX_MESSAGE_BYTES);
+	for (let index = 0; index < TEAM_MAX_EVENTS; index++) {
+		await request(a, { action: "send", to: "B1", message: largeMessage });
+	}
+	await request(a, { action: "control", to: "B1", command: "redirect", message: largeMessage });
+	const reply = await request(b, { action: "checkpoint", receive: true });
+	assert.equal(reply.revision, 1);
+	assert.equal(reply.events?.at(-1)?.message, largeMessage);
+	assert.ok(reply.events!.length < TEAM_MAX_EVENTS, "regular inbox consumption reserves a slot for direction");
+	const eventBytes = Buffer.byteLength(JSON.stringify(reply.events));
+	assert.ok(eventBytes > 256 * 1024, "the reserved redirect is included even when it exceeds the ordinary batch cap");
+	assert.ok(eventBytes <= 256 * 1024 + 56 * 1024);
+	assert.equal(hub.get(id).members.find((member) => member.id === "B1")?.observedRevision, 1);
+});
+
+test("replyTo and supersedes validate before delivery and retain correlation metadata", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	const original = await request(a, { action: "send", to: "B1", message: "question" });
+	const own = await request(b, { action: "send", to: "A", message: "first answer" });
+	const other = await request(workers[1]!, { action: "send", to: "A", message: "other answer" });
+	const reply = await request(b, { action: "send", to: "A", message: "corrected answer",
+		replyTo: original.receipt!.messageId!, supersedes: own.receipt!.messageId! });
+	const correlated = hub.get(id).events.find((event) => event.messageId === reply.receipt?.messageId);
+	assert.equal(correlated?.replyTo, original.receipt?.messageId);
+	assert.equal(correlated?.supersedes, own.receipt?.messageId);
+	const restored = new TeamHub(); t.after(() => restored.dispose());
+	restored.restore([hub.get(id)]);
+	assert.equal(restored.get(id).events.find((event) => event.messageId === reply.receipt?.messageId)?.replyTo, original.receipt?.messageId);
+	assert.equal(restored.get(id).events.find((event) => event.messageId === reply.receipt?.messageId)?.supersedes, own.receipt?.messageId);
+	const before = hub.get(id);
+	const foreign = await request(b, { action: "send", to: "A", message: "invalid",
+		replyTo: "foreign-team-id:1" });
+	assert.equal(foreign.ok, false);
+	assert.match(foreign.error!, /replyTo.*known message/);
+	assert.deepEqual(hub.get(id), before);
+	const wrongAuthor = await request(b, { action: "send", to: "A", message: "invalid", supersedes: other.receipt!.messageId! });
+	assert.equal(wrongAuthor.ok, false);
+	assert.match(wrongAuthor.error!, /own prior message/);
+	assert.deepEqual(hub.get(id), before);
+	const unknown = await request(b, { action: "send", to: "A", message: "invalid", replyTo: `${id}:999999` });
+	assert.equal(unknown.ok, false);
+	assert.deepEqual(hub.get(id), before);
+});
+
+
+test("worker finish stores a nonterminal structured candidate; report remains progress", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	await request(b, { action: "report", message: "still working" });
+	assert.equal(hub.get(id).members.find((member) => member.id === "B1")?.result, undefined);
+	const finish = await request(b, { action: "finish", message: "Reviewed the tests" });
+	assert.equal(finish.ok, true);
+	let member = hub.get(id).members.find((candidate) => candidate.id === "B1")!;
+	assert.equal(member.state, "waiting");
+	assert.deepEqual(member.result, { status: "succeeded", summary: "Reviewed the tests" });
+	const candidate: TeamTaskResult = { status: "blocked", summary: "Needs a parent decision", findings: ["Missing access"] };
+	assert.equal((await request(workers[1]!, { action: "finish", result: candidate })).ok, true);
+	member = hub.get(id).members.find((candidateMember) => candidateMember.id === "B2")!;
+	assert.equal(member.state, "waiting");
+	assert.deepEqual(member.result, candidate);
+	const before = hub.get(id);
+	const invalid = await request(workers[1]!, { action: "finish", message: "both", result: candidate });
+	assert.equal(invalid.ok, false);
+	assert.deepEqual(hub.get(id), before);
+	hub.complete(b, outcome);
+	assert.deepEqual(hub.get(id).members.find((candidateMember) => candidateMember.id === "B1")?.result,
+		{ status: "succeeded", summary: "Reviewed the tests" });
+	const restored = new TeamHub(); t.after(() => restored.dispose());
+	restored.restore([hub.get(id)]);
+	assert.deepEqual(restored.get(id).members.find((candidateMember) => candidateMember.id === "B2")?.result, candidate);
+	assert.ok(a);
+});
+
+test("finish shorthand is size-checked atomically and replacement candidates are journaled without a state change", async (t) => {
+	const history: TeamSnapshot[] = [];
+	const { hub, id, b, a, request } = fixture(1, { onSnapshot: (snapshot) => history.push(snapshot) });
+	t.after(() => hub.dispose());
+	const before = hub.get(id);
+	const rejected = await request(b, { action: "finish", message: "\u0000".repeat(TEAM_MAX_MESSAGE_BYTES) });
+	assert.equal(rejected.ok, false);
+	assert.match(rejected.error!, /serialized limit/);
+	assert.deepEqual(hub.get(id), before, "invalid shorthand cannot store an untransferable result or release its permit");
+	assert.equal((await request(b, { action: "finish", message: "first candidate" })).ok, true);
+	const seq = hub.get(id).seq;
+	const count = history.length;
+	assert.equal((await request(b, { action: "finish", message: "corrected candidate" })).ok, true);
+	assert.equal(hub.get(id).seq, seq, "candidate replacement need not invent a state event");
+	assert.equal(history.length, count + 1);
+	assert.equal(history.at(-1)?.members.find((member) => member.id === "B1")?.result?.summary, "corrected candidate");
+	assert.equal((await request(a, { action: "control", to: "B1", command: "redirect", message: "new assignment" })).ok, true);
+	assert.equal(hub.get(id).members.find((member) => member.id === "B1")?.result, undefined, "a redirected member must not reuse an old deliverable candidate");
+});
+
+test("redirect revisions invalidate stale and parked checkpoints without cancelling the team", async (t) => {
+	const journal: TeamSnapshot[] = [];
+	const { hub, a, b, request, id } = fixture(1, { onSnapshot: (snapshot) => journal.push(snapshot) }); t.after(() => hub.dispose());
+	assert.equal((await request(b, { action: "checkpoint", receive: true })).revision, 0);
+	await request(a, { action: "control", to: "B1", command: "pause" });
+	const parked = request(b, { action: "checkpoint", revision: 0 });
+	await tick();
+	const redirect = await request(a, { action: "control", to: "B1", command: "redirect", message: "new direction" });
+	assert.equal(redirect.receipt?.status, "applied");
+	let member = hub.get(id).members.find((candidate) => candidate.id === "B1")!;
+	assert.equal(member.instructionRevision, 1);
+	assert.equal(member.observedRevision, 0);
+	await request(a, { action: "control", to: "B1", command: "resume" });
+	const parkedReply = await parked;
+	assert.equal(parkedReply.ok, false);
+	assert.equal(parkedReply.code, "stale_instruction");
+	assert.equal(parkedReply.revision, 1);
+	assert.equal(hub.signal(id).aborted, false);
+	const stale = await request(b, { action: "checkpoint", revision: 0 });
+	assert.equal(stale.ok, false);
+	assert.equal(stale.code, "stale_instruction");
+	assert.equal(stale.revision, 1);
+	assert.equal(hub.signal(id).aborted, false);
+	assert.throws(() => hub.complete(b, outcome), /latest redirected instruction/);
+	const received = await request(b, { action: "checkpoint", receive: true });
+	assert.equal(received.revision, 1);
+	assert.equal(received.events?.some((event) => event.message === "new direction"), true);
+	member = hub.get(id).members.find((candidate) => candidate.id === "B1")!;
+	assert.equal(member.observedRevision, 1);
+	assert.equal(journal.at(-1)?.members.find((candidate) => candidate.id === "B1")?.observedRevision, 1);
+	hub.complete(b, outcome);
+	assert.equal(hub.get(id).members.find((candidate) => candidate.id === "B1")?.state, "completed");
+});
+
+test("unobserved redirect blocks successful native completion but still accepts native failure", async (t) => {
+	const { hub, a, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	await request(a, { action: "control", to: "B2", command: "redirect", message: "updated task" });
+	assert.throws(() => hub.complete(workers[1]!, outcome), /latest redirected instruction/);
+	hub.complete(workers[1]!, { status: "failed", output: "", error: "worker failed" });
+	assert.equal(hub.get(id).members.find((member) => member.id === "B2")?.state, "failed");
+	assert.equal(hub.signal(id).aborted, false);
+});
+
+test("legacy event history remains readable without fabricated v2 metadata", (t) => {
+	const source = new TeamHub(); t.after(() => source.dispose());
+	const prepared = source.prepare({ coordinator: "A", workers: ["B"] });
+	const legacy = { ...prepared, seq: 1, events: [{ seq: 1, kind: "message", from: "B", to: "A", message: "legacy delivery" }] } as unknown as TeamSnapshot;
+	const hub = new TeamHub(); t.after(() => hub.dispose());
+	hub.restore([legacy]);
+	const event = hub.get(prepared.id).events[0]!;
+	assert.equal(event.kind, "message");
+	assert.equal(event.from, "B");
+	assert.equal(event.to, "A");
+	assert.equal(event.version, undefined);
+	assert.equal(event.messageId, undefined);
+	assert.equal(event.timestamp, undefined);
+	assert.throws(() => hub.restore([{ ...prepared, seq: 1, events: [{ seq: 1, kind: "message", version: 2,
+		messageId: `${prepared.id}:1`, timestamp: 1, from: "@hub", to: "A", message: "forged" }] } as unknown as TeamSnapshot]), /Invalid historical/);
+});
+
+test("restore validates v2 event IDs, timestamps, authoritative routes, and own supersedes history", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	const first = await request(a, { action: "send", to: "B1", message: "first" });
+	const own = await request(b, { action: "send", to: "A", message: "own" });
+	const other = await request(workers[1]!, { action: "send", to: "A", message: "other" });
+	const valid = await request(b, { action: "send", to: "A", message: "replacement",
+		replyTo: first.receipt!.messageId!, supersedes: own.receipt!.messageId! });
+	const snapshot = hub.get(id);
+	const eventIndex = snapshot.events.findIndex((event) => event.messageId === valid.receipt?.messageId);
+	assert.ok(eventIndex >= 0);
+	const invalidSnapshots: TeamSnapshot[] = [];
+	for (const mutate of [
+		(event: Record<string, unknown>) => { event["messageId"] = `${id}:999`; },
+		(event: Record<string, unknown>) => { event["timestamp"] = Number.NaN; },
+		(event: Record<string, unknown>) => { event["timestamp"] = -1; },
+		(event: Record<string, unknown>) => { event["version"] = 1; },
+		(event: Record<string, unknown>) => { event["from"] = "@hub"; },
+		(event: Record<string, unknown>) => { event["supersedes"] = other.receipt!.messageId!; },
+	]) {
+		const invalid = structuredClone(snapshot) as unknown as { events: Array<Record<string, unknown>> };
+		mutate(invalid.events[eventIndex]!);
+		invalidSnapshots.push(invalid as unknown as TeamSnapshot);
+	}
+	const restored = new TeamHub(); t.after(() => restored.dispose());
+	for (const invalid of invalidSnapshots) {
+		assert.throws(() => restored.restore([invalid]), /Invalid historical/);
+		assert.equal(restored.list().length, 0, "a bad v2 event cannot partially adopt history");
+	}
+});
+
+test("worst-case eight-worker snapshots fit public, private-frame, and durable-delivery limits", async (t) => {
+	const workerIds = Array.from({ length: 8 }, (_, index) => `W${index + 1}`);
+	const brief: TeamBrief = {
+		goal: "\u0000".repeat(1000), target: "\u0000".repeat(1000),
+		acceptanceCriteria: Array(8).fill("\u0000".repeat(250)),
+		constraints: Array(4).fill("\u0000".repeat(250)),
+	};
+	assert.ok(isTeamBrief(brief));
+	const assignment = (memberId: string): TeamAssignment => ({ memberId, task: "\u0000".repeat(800),
+		cwd: "\u0000".repeat(800), model: "\u0000".repeat(800), fastMode: true, searchMode: "s".repeat(700) });
+	const result: TeamTaskResult = { status: "partial", summary: "\u0000".repeat(800),
+		findings: ["\u0000".repeat(500), "\u0000".repeat(500)], limitations: ["\u0000".repeat(100)] };
+	assert.ok(workerIds.every((id) => isTeamAssignment(assignment(id))));
+	assert.ok(isTeamAssignment(assignment("A")));
+	assert.ok(isTeamTaskResult(result));
+
+	const hub = new TeamHub(); t.after(() => hub.dispose());
+	const team = hub.prepare({ coordinator: "A", workers: workerIds, brief });
+	const assignments = [assignment("A"), ...workerIds.map(assignment)];
+	const [coordinator] = hub.join(team.id, ["A"], [assignments[0]!]);
+	const workers = hub.join(team.id, workerIds, assignments.slice(1));
+	for (let index = 0; index < TEAM_MAX_EVENTS; index++) {
+		const reply = await hub.request(workers[0]!, {
+			requestId: `large-report-${index}`, sequence: index + 1, action: "report", message: "x".repeat(TEAM_MAX_MESSAGE_BYTES),
+		});
+		assert.equal(reply.ok, true);
+	}
+	for (let index = 0; index < workers.length; index++) {
+		const binding = workers[index]!;
+		const finished = await hub.request(binding, {
+			requestId: `large-finish-${index}`, sequence: index === 0 ? TEAM_MAX_EVENTS + 1 : 1, action: "finish", result,
+		});
+		assert.equal(finished.ok, true);
+		hub.complete(binding, { status: "completed", output: "\u0000".repeat(100_000), error: "\u0000".repeat(100_000) });
+	}
+	const reply = await hub.request(coordinator!, {
+		requestId: "large-wait", sequence: 1, action: "wait", wait: { kind: "message" },
+	});
+	assert.equal(reply.ok, true);
+	assert.equal(reply.snapshot?.events.length, 0, "wait snapshot projects current status; top-level events carry consumed history");
+	assert.ok(reply.snapshot?.members.every((member) => member.assignment));
+	assert.ok(reply.snapshot?.members.filter((member) => member.role === "worker").every((member) => member.result));
+	const publicReply = publicTeamReply(reply);
+	const replyJson = JSON.stringify(publicReply);
+	const frame = {
+		version: 1, commandId: "worst-case", operation: "reply", binding: coordinator!,
+		requestId: publicReply.requestId!, reply: publicReply,
+	};
+	const privateFrameBytes = Buffer.byteLength(JSON.stringify(frame), "utf8");
+	const delivery = {
+		role: "custom", customType: TEAM_DELIVERY_TYPE, content: replyJson, display: false,
+		details: { teamId: team.id, memberId: "A", deliveryId: "worst-case-delivery" }, timestamp: Date.now(),
+	};
+	const durableDeliveryBytes = Buffer.byteLength(JSON.stringify([delivery]), "utf8");
+	const publicReplyBytes = Buffer.byteLength(replyJson, "utf8");
+	assert.ok(publicReplyBytes > 650 * 1024, `test should exercise a near-cap public reply (${publicReplyBytes} bytes)`);
+	assert.ok(publicReplyBytes <= TEAM_FRAME_BYTES);
+	assert.ok(privateFrameBytes <= TEAM_FRAME_BYTES);
+	assert.ok(durableDeliveryBytes <= TEAM_FRAME_BYTES);
+	await hub.waitForWorkers(coordinator!);
+	hub.complete(coordinator!, { status: "completed", output: "\u0000".repeat(100_000), error: "\u0000".repeat(100_000) });
+	const terminalReply = publicTeamReply({ ok: true, from: "@hub", to: "A", requestId: "terminal-snapshot", snapshot: hub.get(team.id) });
+	const terminalFrame = {
+		version: 1, commandId: "terminal-size", operation: "reply", binding: coordinator!,
+		requestId: terminalReply.requestId!, reply: terminalReply,
+	};
+	assert.ok(Buffer.byteLength(JSON.stringify(terminalReply), "utf8") <= TEAM_FRAME_BYTES);
+	assert.ok(Buffer.byteLength(JSON.stringify(terminalFrame), "utf8") <= TEAM_FRAME_BYTES);
 });

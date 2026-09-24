@@ -11,6 +11,14 @@ export default function install(pi) {
 		async execute() { return { content: [{ type: "text", text: "Unrelated tool completed" }], details: {} }; },
 	});
 	const answer = (text) => [{ type: "text", text }];
+	const workerBarrier = (messages) => messages.some((message) => {
+		if (message.role !== "toolResult" || message.toolName !== "team" || message.isError) return false;
+		try {
+			const reply = JSON.parse(message.content.find((part) => part.type === "text").text);
+			return reply.ok && reply.snapshot?.phase === "finalizing"
+				&& reply.snapshot.members.filter((member) => member.role === "worker").every((member) => ["completed", "failed", "cancelled"].includes(member.state));
+		} catch { return false; }
+	});
 	if (process.env.TEAM_E2E_SCENARIO === "compaction") pi.on("session_before_compact", (event, ctx) => {
 		pi.appendEntry("team-e2e-compaction", { contextWindow: ctx.model?.contextWindow });
 		return { compaction: { summary: "TEAM_MEMBER_B1 completed the assigned work.", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
@@ -53,7 +61,7 @@ export default function install(pi) {
 			return answer("B1 result: observed B2 completed");
 		}
 		if (latestSnapshot?.members.some((m) => m.state === "failed" || m.state === "cancelled")) throw new Error("Handshake member failed");
-		if (text.includes("All workers have settled.")) {
+		if (workerBarrier(messages) || text.includes("All workers have settled.")) {
 			if (!text.includes("B1 result: observed B2 completed") || !text.includes("B2 result")) throw new Error("Missing final results");
 			return answer("HANDSHAKE_FINAL: ready, paused, redirected, resumed, B2 released, both workers settled");
 		}
@@ -68,7 +76,45 @@ export default function install(pi) {
 		if (!did((a) => a.action === "finish")) return call({ action: "finish", to: null, message: null, command: null, wait: null });
 		return answer("HANDSHAKE_COORDINATOR_READY");
 	}
+	function contract(member, messages) {
+		const replies = messages.flatMap((message) => {
+			const parts = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content ?? [];
+			return parts.flatMap((part) => {
+				if (part.type !== "text") return [];
+				try { const value = JSON.parse(part.text); return value.ok === true ? [value] : []; } catch { return []; }
+			});
+		});
+		const roster = replies.find((reply) => reply.snapshot?.members.every((item) => item.assignment))?.snapshot;
+		if (roster?.brief?.goal !== "Verify shared scope and structured outcomes"
+			|| !roster.brief.authorizations.some((scope) => scope.member === "A" && scope.forbidden.includes("synthetic-work"))
+			|| !roster.brief.authorizations.some((scope) => scope.member === "B1" && scope.allowed.includes("synthetic-work"))) throw new Error("Shared authorization scope missing");
+		for (const item of roster.members) {
+			if (!item.assignment.task.includes(`TEAM_MEMBER_${item.id}`) || item.assignment.model !== "rail-team-e2e/probe"
+				|| item.assignment.fastMode !== false || item.assignment.searchMode !== "off" || !item.assignment.cwd) throw new Error("Incomplete shared assignment/policy");
+		}
+		const successful = new Set(messages.filter((message) => message.role === "toolResult" && !message.isError).map((message) => message.toolCallId));
+		const completed = messages.flatMap((message) => message.role === "assistant"
+			? message.content.filter((part) => part.type === "toolCall" && part.name === "team" && successful.has(part.id)) : []);
+		const did = (action) => completed.some((part) => part.arguments.action === action);
+		const seen = (from, message) => replies.some((reply) => reply.events?.some((event) => event.from === from && event.message === message));
+		if (member === "A") {
+			if (!did("send")) return call({ action: "send", to: "B1", message: "CONTRACT_START" });
+			if (!seen("B1", "CONTRACT_READY")) return call({ action: "wait", wait: { kind: "message", from: "B1" } });
+			if (!workerBarrier(messages)) return call({ action: "finish" });
+			const final = replies.find((reply) => reply.snapshot?.phase === "finalizing").snapshot;
+			if (!final.members.some((item) => item.id === "B1" && item.state === "completed" && item.output === "" && item.result?.status === "partial")
+				|| !final.members.some((item) => item.id === "B2" && item.state === "completed" && item.output === "" && item.result?.summary === "B2 structured completion")) throw new Error("Structured native outcomes missing");
+			return answer("CONTRACT_FINAL: shared scope preserved; B1 partial; B2 succeeded");
+		}
+		if (member === "B1") {
+			if (!seen("A", "CONTRACT_START")) return call({ action: "wait", wait: { kind: "message", from: "A" } });
+			if (!did("report")) return call({ action: "report", message: "CONTRACT_READY" });
+			if (!did("finish")) return call({ action: "finish", result: { status: "partial", summary: "B1 structured completion", evidence: [{ source: "synthetic-fixture", basis: "observed" }], limitations: ["No business system accessed"] } });
+		} else if (!did("finish")) return call({ action: "finish", message: "B2 structured completion" });
+		return answer("");
+	}
 	function choose(member, text, messages) {
+		if (process.env.TEAM_E2E_SCENARIO === "contract") return contract(member, messages);
 		if (process.env.TEAM_E2E_SCENARIO === "report-handshake") return handshake(member, text, messages);
 		if (["retry", "compaction"].includes(process.env.TEAM_E2E_SCENARIO)) {
 			if (member !== "A") return answer(`${member} result`);
@@ -82,7 +128,7 @@ export default function install(pi) {
 				if (member === "B1" && !text.includes("CORRECTED_DIRECTION")) return call({ action: "report", message: "B1 needs direction", wait: { kind: "message" } });
 				return answer(`${member} result${member === "B1" ? ": CORRECTED_DIRECTION" : ""}`);
 			}
-			if (text.includes("All workers have settled.")) {
+			if (workerBarrier(messages) || text.includes("All workers have settled.")) {
 				if (!text.includes("B1 result: CORRECTED_DIRECTION")) throw new Error("Missing corrected result");
 				return answer("CONTROL_FINAL: corrected B1 and completed B2");
 			}

@@ -3,6 +3,7 @@ import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { resolve as resolvePath } from "node:path";
 import { createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";
 import { supportsNativeFastMode, supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { supportsNativeGptSearch } from "../../commands/rail-oai-search";
@@ -29,6 +30,7 @@ import {
 	type SubagentTranscriptSnapshot,
 } from "./transcript";
 import { emptySubagentUsage } from "./usage";
+import type { TeamAssignment, TeamSnapshot, TeamTaskResult } from "./team-protocol";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CHAIN_TASKS = 8;
@@ -93,7 +95,7 @@ const ChainItem = Type.Object({
 });
 
 const SubagentParams = Type.Object({
-	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Prepared team id. Launch coordinator single and exact workers parallel as two sibling calls; new persistent aliases only." })),
+	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Prepared team id. Launch the designated child coordinator single and exact workers parallel as two sibling calls; new persistent aliases only. Host preloads every assignment, effective model/Fast/Search policy and cwd before releasing the first child context." })),
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. In single mode, model+task without alias/session is stateless; model+alias+task creates persistent." })),
 	target: Type.Optional(Type.String({ description: "Continue the exact linked persistent alias or agentId and its existing conversation memory; do not also set model" })),
 	alias: Type.Optional(Type.String({ description: "Create a new persistent long-term helper expected to receive future follow-ups; omit for one-off stateless work" })),
@@ -117,6 +119,8 @@ export interface StatefulSubagentRunDetails extends SubagentTranscriptRun {
 	task: string;
 	usage: SubagentUsage;
 	durationMs: number;
+	teamAssignment?: TeamAssignment;
+	teamResult?: TeamTaskResult;
 }
 
 export interface StatefulSubagentDetails {
@@ -648,20 +652,35 @@ function finalText(result: StatefulSubagentRunDetails): string {
 	].join("\n"));
 }
 
+function appendTeamStatus(text: string, snapshot?: TeamSnapshot): string {
+	if (!snapshot) return truncateParentContent(text);
+	const status = teamStatus(snapshot);
+	const separator = "\n\n";
+	const remaining = Math.max(0, OUTPUT_CAP - Buffer.byteLength(status, "utf8") - Buffer.byteLength(separator, "utf8"));
+	const bounded = truncateUtf8(text, remaining, "\n\n[team result text truncated; team status retained]").value;
+	return `${bounded}${separator}${status}`;
+}
+
 function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunDetails[]): string {
 	const succeeded = results.filter((result) => result.status === "completed").length;
+	const completionLabel = results.some((result) => result.teamResult) ? "runtime completions" : "succeeded";
 	const summary = [
-		`${mode === "parallel" ? "Parallel" : "Chain"}: ${succeeded}/${results.length} succeeded`,
+		`${mode === "parallel" ? "Parallel" : "Chain"}: ${succeeded}/${results.length} ${completionLabel}`,
 		...results.map((result) => {
 			const error = result.errorMessage?.replace(/\s+/gu, " ").trim();
-			return `- ${result.alias} · ${result.status} · ${result.model ?? "model unavailable"}${error ? ` · ${error.slice(0, 300)}` : ""}`;
+			const assignment = result.teamAssignment;
+			const outcome = result.teamResult;
+			const policy = assignment ? ` · FAST ${assignment.fastMode ? "on" : "off"} · SEARCH ${assignment.searchMode ?? "off"}` : "";
+			const structured = outcome ? ` · task ${outcome.status}${outcome.summary ? `: ${truncateUtf8(outcome.summary, 500, "…").value}` : ""}` : "";
+			return `- ${result.alias} · ${result.status} · ${result.model ?? "model unavailable"}${policy}${structured}${error ? ` · ${error.slice(0, 300)}` : ""}`;
 		}),
 	].join("\n");
 	const remaining = Math.max(1024, OUTPUT_CAP - Buffer.byteLength(summary, "utf8") - 512);
 	const perRun = Math.max(512, Math.floor(remaining / Math.max(1, results.length)));
 	const outputs = results.map((result) => {
 		const snippet = truncateUtf8(result.output, perRun, "\n[answer snippet truncated]").value;
-		return `### ${result.alias} [${result.status}]\n\n${snippet}`;
+		const outcome = result.teamResult;
+		return `### ${result.alias} [${result.status}${outcome ? `; task ${outcome.status}` : ""}]\n\n${snippet}`;
 	}).join("\n\n---\n\n");
 	return truncateParentContent(`${summary}\n\n${outputs}`);
 }
@@ -736,7 +755,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
 			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Parallel and chain calls may set fastMode independently on each eligible item; do not set a grouped top-level fastMode or put it on an existing target or control call. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Grouped child panels show each item's effective FAST and SEARCH state.\n"
-			+ "Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
+			+ "Team dispatch: the host is not a team member or coordinator. Use subagent_team prepare with the shared goal/target/URL, acceptance criteria, constraints and per-member allowed/forbidden operations in brief; make every worker task self-contained. Then dispatch the designated child coordinator and the complete worker roster as sibling calls in one assistant message. Ordinary team send queues work for a recipient checkpoint; it does not immediately stop an active turn or wake the hosting parent model. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
 		promptGuidelines: [
@@ -813,7 +832,12 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					const members = new Map(team.hub.get(teamId).members.map((member) => [member.id, member]));
 					results = results.map((result) => {
 						const member = members.get(result.alias);
-						return member ? { ...result, coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) } } : result;
+						return member ? {
+							...result,
+							coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
+							...(member.assignment ? { teamAssignment: member.assignment } : {}),
+							...(member.result ? { teamResult: member.result } : {}),
+						} : result;
 					});
 				}
 				const details: StatefulSubagentDetails = {
@@ -889,9 +913,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 			}
-			for (const item of requestedItems) {
-				if (team) resolveRailModel(item.model, ctx);
-				if (item.fastMode === true) effectiveFastModeRequest(item, modelForFastMode(item, ctx));
+			const teamModels = team ? requestedItems.map((item) => resolveRailModel(item.model, ctx)) : undefined;
+			for (const [index, item] of requestedItems.entries()) {
+				const model = teamModels?.[index];
+				if (item.fastMode === true) effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : modelForFastMode(item, ctx));
 			}
 			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
 			const broker = contextTargetItems.length > 0
@@ -899,7 +924,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				: undefined;
 			// Pin budgeted selections before asynchronous preflight/confirmation so a parent
 			// model switch cannot change the child after its reserve was validated.
-			const budgetModels = requestedItems.map((item) => !item.target && item.contextWindow != null ? resolveRailModel(item.model, ctx) : undefined);
+			const budgetModels = requestedItems.map((item, index) => !item.target && item.contextWindow != null ? teamModels?.[index] ?? resolveRailModel(item.model, ctx) : undefined);
 			await validateTaskContextWindows(requestedItems, budgetModels, broker, ctx.cwd);
 			const sessionAttachments = requestedItems.filter((item) => item.session !== undefined);
 			if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
@@ -912,7 +937,27 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				);
 				if (!approved) throw new Error("Existing session attachment was not approved");
 			}
-			const bindings = team && teamId !== undefined ? team.join(teamId, mode, requestedItems) : undefined;
+			const teamCwds = team
+				? await Promise.all(requestedItems.map(async (item) => resolvePath(await resolveChildContextCwd(item.cwd ?? ctx.cwd, item.session))))
+				: undefined;
+			const teamAssignments = team && teamModels && teamCwds
+				? requestedItems.map((item, index) => {
+					const model = teamModels[index]!;
+					const native = nativeModelForRailRef(model, ctx);
+					const fastRequest = effectiveFastModeRequest(item, native);
+					return {
+						...(item.alias ? { alias: item.alias } : {}),
+						task: item.task,
+						cwd: teamCwds[index]!,
+						model: railModelReference(model),
+						fastMode: effectiveFastModeText(fastRequest, native) === "on",
+						searchMode: effectiveSearchModeText(native),
+					};
+				})
+				: undefined;
+			const bindings = team && teamId !== undefined && teamAssignments
+				? team.join(teamId, mode, teamAssignments)
+				: undefined;
 			joinedTeam = bindings !== undefined;
 			if (team && teamId !== undefined) {
 				teamScope = teamCallSignal(team.hub, teamId, signal);
@@ -935,7 +980,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const persistent = isPersistentTask(item);
 				if (!persistent) {
 					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
-					const model = budgetModels[slot] ?? resolveRailModel(item.model, ctx);
+					const model = teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
 					const fastMode = effectiveFastModeRequest(item, nativeModelForRailRef(model, ctx));
 					setDispatchMetadata(item, slot, { model, fastMode });
 					const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
@@ -975,7 +1020,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					publishLive(slot, result);
 					return result;
 				}
-				const model = item.target ? undefined : budgetModels[slot] ?? resolveRailModel(item.model, ctx);
+				const model = item.target ? undefined : teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
 				const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
 				const request: DispatchRequest = {
 					...(team && bindings?.[slot] ? { team: team.channel(bindings[slot]!) } : {}),
@@ -983,7 +1028,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					...(item.target ? { target: item.target } : {}),
 					...(item.alias ? { alias: item.alias } : {}),
 					task: item.task,
-					...(item.cwd ? { cwd: item.cwd } : {}),
+					...(team ? { cwd: teamCwds?.[slot] ?? resolvePath(item.cwd ?? ctx.cwd) } : item.cwd ? { cwd: item.cwd } : {}),
 					...(item.session ? { session: item.session } : {}),
 					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
 					...(fastMode !== undefined ? { fastMode } : {}),
@@ -1020,8 +1065,28 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const dispatched = await broker.dispatch(request);
 				setDispatchMetadata(item, slot, { model: dispatched.instance.model, fastMode: dispatched.instance.fastMode === true });
 				let result = compactPersistentResult(dispatched, item.task, duration(), step);
-				if (team && bindings?.[slot] && result.status === "failed") {
-					const nativeError = new Error(runErrorMessage(dispatched.run)!);
+				if (team && bindings?.[slot]) {
+					const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
+					if (member) {
+						result = {
+							...result,
+							coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
+							...(member.assignment ? { teamAssignment: member.assignment } : {}),
+							...(member.result ? { teamResult: member.result } : {}),
+						};
+					}
+					if (member && ["failed", "cancelled"].includes(member.state) && result.status !== "failed") {
+						result = {
+							...result,
+							status: "failed",
+							output: member.output ?? result.output,
+							...(member.error ? { errorMessage: truncateParentContent(member.error), stopReason: member.state === "cancelled" ? "aborted" : "error" } : {}),
+						};
+					}
+				}
+				const nativeErrorMessage = runErrorMessage(dispatched.run);
+				if (team && bindings?.[slot] && result.status === "failed" && nativeErrorMessage) {
+					const nativeError = new Error(nativeErrorMessage);
 					const error = team.dispatchError(bindings[slot]!, nativeError);
 					if (error !== nativeError) result = errorResult(item, error, duration(), signal?.aborted ?? false, step, result);
 				}
@@ -1050,7 +1115,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const details = resultDetails([result]);
 				latestDetails.set(toolCallId, details);
 				const usage = nestedToolUsage(details.results);
-				return { content: [{ type: "text", text: finalText(result) }], details, ...(usage ? { usage } : {}) };
+				return { content: [{ type: "text", text: appendTeamStatus(finalText(result), team && teamId ? team.hub.get(teamId) : undefined) }], details, ...(usage ? { usage } : {}) };
 			}
 			if (mode === "parallel") {
 				let results: StatefulSubagentRunDetails[];
@@ -1063,7 +1128,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const details = resultDetails(results);
 				latestDetails.set(toolCallId, details);
 				const usage = nestedToolUsage(details.results);
-				return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
+				return { content: [{ type: "text", text: appendTeamStatus(aggregateText(mode, results), team && teamId ? team.hub.get(teamId) : undefined) }], details, ...(usage ? { usage } : {}) };
 			}
 			const results: StatefulSubagentRunDetails[] = [];
 			let previous = "";

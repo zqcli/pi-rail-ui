@@ -137,6 +137,69 @@ test("RPC forwards internal receive flags only on checkpoints and rejects a publ
 	await assert.rejects(connection.close(), /Invalid team request/);
 });
 
+test("RPC preserves additive routing, sender-filtered waits, finish results and v2 public replies", async () => {
+	const transport = new Transport();
+	const requests: TeamRequest[] = [];
+	const connection = new TeamRpcConnection(transport, { binding, onRequest: async (request) => {
+		requests.push(request);
+		if (request.action === "send") return {
+			ok: true, from: "@hub", to: "b", requestId: request.requestId, revision: 2,
+			receipt: { status: "queued", messageId: "t:4", recipient: "a", seq: 4 },
+			events: [{ version: 2, messageId: "t:4", timestamp: 1700000000000, from: "b", to: "a", replyTo: "t:0", supersedes: "t:1", seq: 4, kind: "message", message: "READY" }],
+			snapshot: { id: "t", coordinator: "a", workers: ["b"], phase: "running", seq: 4, createdAt: 1, deadline: 100,
+				brief: { goal: "Review the assigned module", authorizations: [{ member: "b", allowed: ["read"] }] },
+				members: [{ id: "a", role: "coordinator", state: "running" }, { id: "b", role: "worker", state: "running",
+					assignment: { memberId: "b", task: "Review the assigned module" },
+					result: { status: "partial", summary: "In progress", evidence: [{ source: "test", basis: "observed" }] }, instructionRevision: 2, observedRevision: 1 }], events: [] },
+		};
+		return { ok: true, from: "@hub", to: "b", requestId: request.requestId };
+	} });
+	await connection.bind();
+	const wireRequests = [
+		{ requestId: "send-r", sequence: 1, action: "send", to: "a", message: "READY", replyTo: "t:0", supersedes: "t:1" },
+		{ requestId: "wait-r", sequence: 2, action: "wait", wait: { kind: "message", from: "a" } },
+		{ requestId: "finish-r", sequence: 3, action: "finish", result: { status: "succeeded", summary: "Complete" } },
+	] as const;
+	for (const request of wireRequests) {
+		transport.emit({ version: 1, kind: "request", binding, request });
+		await tick();
+		await tick();
+	}
+	assert.deepEqual(requests.map(({ action, to, message, replyTo, supersedes, wait, result }) => ({ action, to, message, replyTo, supersedes, wait, result })), [
+		{ action: "send", to: "a", message: "READY", replyTo: "t:0", supersedes: "t:1", wait: undefined, result: undefined },
+		{ action: "wait", to: undefined, message: undefined, replyTo: undefined, supersedes: undefined, wait: { kind: "message", from: "a" }, result: undefined },
+		{ action: "finish", to: undefined, message: undefined, replyTo: undefined, supersedes: undefined, wait: undefined, result: { status: "succeeded", summary: "Complete" } },
+	]);
+	transport.emit({ version: 1, kind: "request", binding, request: { requestId: "checkpoint-r", sequence: 4, action: "checkpoint", receive: false, revision: 3 } });
+	await tick();
+	await tick();
+	assert.equal(requests[3]?.revision, 3, "internal context revision survives strict RPC request parsing");
+	const promptFrames = transport.calls.filter((call) => call["type"] === "prompt").map((call) => JSON.parse(String(call["message"]).slice(TEAM_COMMAND.length + 2)));
+	const replyFrame = promptFrames.find((frame) => frame.operation === "reply" && frame.requestId === "send-r");
+	assert.ok(replyFrame);
+	assert.equal(replyFrame.version, 1, "additive public events do not change the wire protocol version");
+	assert.equal(replyFrame.reply.receipt.status, "queued");
+	assert.equal(replyFrame.reply.events[0].messageId, "t:4");
+	assert.equal(replyFrame.reply.events[0].replyTo, "t:0");
+	assert.equal(replyFrame.reply.snapshot.brief.goal, "Review the assigned module");
+	assert.equal(replyFrame.reply.snapshot.members[1].assignment.task, "Review the assigned module");
+	assert.equal(replyFrame.reply.snapshot.members[1].result.summary, "In progress");
+	assert.doesNotMatch(JSON.stringify(replyFrame.reply), /private-epoch|binding|epoch/);
+	await connection.close();
+});
+
+test("RPC rejects a routed reply whose request ID does not match the pending child request", async () => {
+	const transport = new Transport();
+	const connection = new TeamRpcConnection(transport, { binding, onRequest: async () => ({ ok: true, from: "@hub", to: "b", requestId: "wrong-request" }) });
+	await connection.bind();
+	transport.emit({ version: 1, kind: "request", binding, request: { requestId: "expected-request", sequence: 1, action: "checkpoint", receive: false } });
+	await tick();
+	await tick();
+	assert.equal(transport.stopped, true);
+	assert.equal(transport.calls.filter((call) => call["type"] === "prompt").length, 1, "mismatched route is never sent as a child command");
+	await assert.rejects(connection.close(), /Mismatched team reply request id/);
+});
+
 test("monotonic requests have no lifetime ID-cache ceiling and replay still fails closed", async () => {
 	const transport = new Transport();
 	let requests = 0;
@@ -245,6 +308,17 @@ async function local(t: { after(fn: () => Promise<void>): void }, scenario: stri
 	});
 	t.after(async () => { await transport.stop(); await rm(sandbox, { recursive: true, force: true }); });
 	await transport.start();
+	// spawn is not RPC readiness. Production workers await get_state before binding;
+	// keep cold native startup outside the separate five-second application ACK budget.
+	let startupTimer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			transport.request({ type: "get_state" }),
+			new Promise<never>((_resolve, reject) => {
+				startupTimer = setTimeout(() => reject(new Error("Local team probe RPC startup timed out")), 15_000);
+			}),
+		]);
+	} finally { clearTimeout(startupTimer); }
 	return transport;
 }
 function eventOnce(transport: RpcTransport, predicate: (event: RpcEvent) => boolean): Promise<RpcEvent> {
@@ -581,7 +655,53 @@ test("real Pi reports READY to an explicit coordinator alias through native RPC 
 	}
 });
 
-test("real Pi validates nullable/empty optional fields and marks business denials as non-aborting tool errors", { timeout: 20000 }, async (t) => {
+test("real Pi blocks a generated stale tool and replans with the redirected context without aborting", { timeout: 20000 }, async (t) => {
+	const transport = await local(t, "work");
+	const hub = new TeamHub();
+	t.after(() => hub.dispose());
+	const team = hub.prepare({ coordinator: "a", workers: ["b"] });
+	const [coordinator] = hub.join(team.id, ["a"]);
+	const [worker] = hub.join(team.id, ["b"]);
+	const providers: any[] = [];
+	let executed = 0;
+	transport.onEvent((event) => {
+		if (event.type !== "entry_appended") return;
+		const entry = event["entry"] as any;
+		if (entry?.customType === "team-probe-provider") providers.push(entry.data);
+		if (entry?.customType === "team-probe-work") executed++;
+	});
+	let redirected = false;
+	const replies: TeamReply[] = [];
+	const connection = new TeamRpcConnection(transport, { binding: worker!, onRequest: async (request, signal) => {
+		if (!redirected && request.action === "checkpoint" && request.revision === 0 && !request.receive) {
+			redirected = true;
+			const control = await hub.request(coordinator!, { requestId: "redirect-before-tool", sequence: 1,
+				action: "control", command: "redirect", to: "b", message: "NEW_DIRECTION_DO_NOT_RUN_OLD_WORK" });
+			assert.equal(control.ok, true);
+		}
+		const reply = await hub.request(worker!, request, signal);
+		replies.push(reply);
+		return reply;
+	} });
+	t.after(async () => { await connection.close().catch(() => undefined); });
+	await connection.bind();
+	const settled = eventOnce(transport, (event) => event.type === "agent_settled");
+	await transport.request({ type: "prompt", message: "Generate the local probe tool once" });
+	await settled;
+	assert.equal(redirected, true);
+	assert.equal(executed, 0, "the already-generated tool must never execute after the redirect");
+	assert.equal(providers.length, 2, "one normal replan, without cancellation or provider polling");
+	assert.ok(replies.some((reply) => reply.code === "stale_instruction"));
+	assert.doesNotMatch(JSON.stringify(providers[0].messages), /NEW_DIRECTION_DO_NOT_RUN_OLD_WORK/);
+	assert.match(JSON.stringify(providers[1].messages), /NEW_DIRECTION_DO_NOT_RUN_OLD_WORK/);
+	assert.equal(hub.get(team.id).members.find((member) => member.id === "b")?.observedRevision, 1);
+	assert.equal(hub.signal(team.id).aborted, false);
+	const messages = await transport.request({ type: "get_messages" });
+	assert.match(JSON.stringify(messages), /local-provider-done/);
+	await connection.close();
+});
+
+test("real Pi validates nullable/empty optional fields and marks business denials as non-aborting tool errors", { timeout: 60000 }, async (t) => {
 	for (const scenario of ["wait-null", "wait-empty", "send-null", "send-empty", "send-denied"]) {
 		const transport = await local(t, scenario);
 		const requests: TeamRequest[] = [];
@@ -619,7 +739,9 @@ test("real Pi runtime command conflicts invalidate bind-time discovery before an
 	assert.doesNotMatch(JSON.stringify(messages), /rail-subagent-team-protocol|private-epoch|local-provider-done/);
 });
 
-test("real Pi close/abort releases parked native context and tool gates; late callbacks cannot resurrect them", { timeout: 20000 }, async (t) => {
+// Three fresh processes each have a separate 15s startup budget; this outer test
+// budget includes all three plus close/abort cleanup, not a longer protocol ACK.
+test("real Pi close/abort releases parked native context and tool gates; late callbacks cannot resurrect them", { timeout: 60000 }, async (t) => {
 	for (const mode of ["close-context", "close-wait", "abort-wait"]) {
 		const transport = await local(t, mode === "close-context" ? "text" : "wait");
 		const controller = new AbortController();

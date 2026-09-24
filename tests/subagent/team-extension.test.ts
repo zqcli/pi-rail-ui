@@ -5,6 +5,10 @@ import install, { parseTeamCommand, publicTeamReply, strictTeamRequest, TEAM_DEL
 import { TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamBinding } from "../../tools/subagents/team-protocol";
 
 const binding: TeamBinding = { version: 1, teamId: "t", memberId: "b", role: "worker", epoch: "private-epoch" };
+const structuredResult = {
+	status: "partial" as const, summary: "Checked the assigned files", findings: ["One finding"],
+	evidence: [{ source: "local test", locator: "case-1", basis: "verified" as const }], limitations: ["No integration run"], artifacts: ["report.md"],
+};
 function harness(role: TeamBinding["role"] = "worker", branch: any[] = []) {
 	const runtimeBinding = { ...binding, role };
 	const handlers = new Map<string, (...args: any[]) => any>();
@@ -33,11 +37,20 @@ function harness(role: TeamBinding["role"] = "worker", branch: any[] = []) {
 
 test("strict team parser rejects sender injection, extra fields and UTF-8 overflow", () => {
 	assert.equal(strictTeamRequest({ requestId: "r", sequence: 1, action: "send", to: "a", message: "hello" }), true);
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 2, action: "send", to: "a", message: "hello", replyTo: "t:1", supersedes: "t:0" }), true);
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 3, action: "wait", wait: { kind: "message", from: "a" } }), true);
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 4, action: "finish", message: "candidate" }), true);
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 5, action: "finish", result: structuredResult }), true);
 	for (const input of [
 		{ action: "send", to: "a", message: "x", sender: "a" },
+		{ action: "send", to: "a", message: "x", from: "a" },
 		{ action: "send", to: "a", message: "中".repeat(3000) },
 		{ action: "wait", wait: { kind: "member" } },
+		{ action: "wait", wait: { kind: "workers", from: "a" } },
 		{ action: "finish", wait: { kind: "message" } },
+		{ action: "finish", message: "candidate", result: structuredResult },
+		{ action: "finish", result: { status: "done", summary: "invalid" } },
+		{ action: "send", to: "a", message: "x", revision: 1 },
 		{ action: "control", to: "a", command: "redirect" },
 		{ action: "send", to: "a", message: "" },
 		{ action: "send", to: "a", message: "  " },
@@ -49,6 +62,70 @@ test("strict team parser rejects sender injection, extra fields and UTF-8 overfl
 	assert.throws(() => parseTeamCommand("{"));
 	assert.throws(() => publicTeamReply({ ok: true, events: Array(65).fill({ seq: 1, kind: "message" }) }));
 	assert.equal(JSON.stringify(publicTeamReply({ ok: true, events: [{ seq: 1, kind: "message", message: "hi", epoch: "secret" }] })).includes("secret"), false);
+});
+
+test("public replies preserve strict routing, receipts, v2 events and scoped snapshots without private binding data", () => {
+	const result = { ...structuredResult, evidence: [{ source: "test", locator: "line-1", basis: "verified" as const, epoch: "hidden" }] };
+	const reply = {
+		ok: true, from: "b", to: "a", requestId: "request-7", revision: 4,
+		receipt: { status: "queued", messageId: "t:9", recipient: "a", seq: 9 },
+		events: [{ version: 2, messageId: "t:9", timestamp: 1700000000000, from: "b", to: "a", replyTo: "t:8", supersedes: "t:7", seq: 9, kind: "message", message: "READY", epoch: "hidden" },
+			{ seq: 10, kind: "state", member: "b", state: "running" }],
+		snapshot: {
+			id: "t", coordinator: "a", workers: ["b"], phase: "running", seq: 10, createdAt: 1, deadline: 100,
+			brief: { goal: "Complete the assigned review", target: "module", acceptanceCriteria: ["Report findings"], constraints: ["Stay in scope"],
+				authorizations: [{ member: "b", allowed: ["read"], forbidden: ["write"], epoch: "hidden" }], epoch: "hidden" },
+			members: [
+				{ id: "a", role: "coordinator", state: "running" },
+				{ id: "b", role: "worker", state: "running", assignment: { memberId: "b", task: "Review module", epoch: "hidden" }, result, instructionRevision: 4, observedRevision: 3, epoch: "hidden" },
+			], events: [{ seq: 10, kind: "state", member: "b", state: "running" }], epoch: "hidden",
+		},
+	};
+	const projected = publicTeamReply(reply);
+	assert.deepEqual(projected.from, "b");
+	assert.deepEqual(projected.to, "a");
+	assert.deepEqual(projected.requestId, "request-7");
+	assert.deepEqual(projected.receipt, reply.receipt);
+	assert.deepEqual(projected.events?.[0], { version: 2, messageId: "t:9", timestamp: 1700000000000, replyTo: "t:8", supersedes: "t:7", seq: 9, kind: "message", from: "b", to: "a", message: "READY" });
+	assert.deepEqual(projected.events?.[1], { seq: 10, kind: "state", member: "b", state: "running" });
+	assert.equal(projected.snapshot?.brief?.goal, "Complete the assigned review");
+	assert.deepEqual(projected.snapshot?.members[1]?.assignment, { memberId: "b", task: "Review module" });
+	assert.deepEqual(projected.snapshot?.members[1]?.result?.evidence, [{ source: "test", locator: "line-1", basis: "verified" }]);
+	assert.equal(projected.snapshot?.members[1]?.instructionRevision, 4);
+	assert.equal(projected.snapshot?.members[1]?.observedRevision, 3);
+	assert.doesNotMatch(JSON.stringify(projected), /hidden|epoch|binding/);
+	assert.deepEqual(publicTeamReply({ ok: true, from: "@hub", to: "b", requestId: "control-1", receipt: { status: "applied", recipient: "b", seq: 11 } }).receipt,
+		{ status: "applied", recipient: "b", seq: 11 });
+	const routedReply = { ...projected, from: "@hub", to: "b" };
+	const command = parseTeamCommand(JSON.stringify({ version: 1, commandId: "c1", operation: "reply", binding, requestId: "request-7", reply: routedReply }));
+	assert.equal(command.operation, "reply");
+	if (command.operation === "reply") assert.deepEqual(command.reply, routedReply, "v1 wire framing preserves the additive public reply schema");
+	assert.throws(() => parseTeamCommand(JSON.stringify({ version: 1, commandId: "c2", operation: "reply", binding, requestId: "other", reply: routedReply })), /Mismatched team reply request id/);
+	assert.throws(() => parseTeamCommand(JSON.stringify({ version: 1, commandId: "c3", operation: "reply", binding, requestId: "request-7", reply: { ...routedReply, from: "b" } })), /Mismatched team reply routing/);
+
+	for (const mutate of [
+		(value: any) => { value.from = ""; },
+		(value: any) => { value.requestId = null; },
+		(value: any) => { value.receipt.status = "sent"; },
+		(value: any) => { value.receipt.seq = -1; },
+		(value: any) => { delete value.receipt.recipient; },
+		(value: any) => { value.events[0].version = 3; },
+		(value: any) => { value.events[0].timestamp = -1; },
+		(value: any) => { value.events[0].messageId = "t:10"; },
+		(value: any) => { delete value.events[0].from; },
+		(value: any) => { value.snapshot.members[1].assignment.fastMode = "yes"; },
+		(value: any) => { value.snapshot.members[1].result.status = "unknown"; },
+		(value: any) => { value.snapshot.members[1].instructionRevision = -1; },
+		(value: any) => { value.code = "stale_instruction"; },
+		(value: any) => { value.events[0].unexpected = true; },
+	]) {
+		const invalid = structuredClone(reply);
+		mutate(invalid);
+		assert.throws(() => publicTeamReply(invalid));
+	}
+	assert.throws(() => publicTeamReply({ ...reply, ok: false, code: "other" }));
+	assert.throws(() => publicTeamReply({ ...reply, epoch: "private" }));
+	assert.throws(() => publicTeamReply({ ok: true, from: "b" }), /Incomplete team reply routing/);
 });
 
 test("wire receive is a boolean restricted to internal checkpoint requests", () => {
@@ -87,6 +164,11 @@ test("bound collaboration guidance names only public identity and leaves ordinar
 		assert.match(systemPrompt, /historical facts/);
 		assert.match(systemPrompt, /latest seq and authoritative control snapshots/);
 		assert.match(systemPrompt, /redirect changes direction but does not clear pause; explicitly resume/);
+		assert.match(systemPrompt, /parent waits for the outer dispatch to settle and cannot answer questions/);
+		assert.match(systemPrompt, /shared brief is context, not a privilege grant/);
+		assert.match(systemPrompt, /must not impose its own personal read-only restriction/);
+		assert.match(systemPrompt, /queued, not that the recipient stopped or paused/);
+		if (role === "coordinator") assert.match(systemPrompt, /Do not report to yourself or self-send/);
 		assert.doesNotMatch(systemPrompt, /epoch|private-epoch|rail-subagent-team-protocol/);
 		assert.equal(h.entries.filter((entry) => entry.kind === "request").length, 0, "before_agent_start has no native signal and must not checkpoint");
 		await h.command("unbind");
@@ -258,8 +340,12 @@ test("recovery retains a compact roster with at most 64 messages and a total fra
 	for (const large of [false, true]) {
 		const h = harness();
 		await h.command("bind");
+		const assignment = { memberId: "b", task: "Inspect assigned files" };
 		const snapshot = { id: "t", coordinator: "a", workers: ["b"], phase: "running", seq: 1, createdAt: 1, deadline: 100,
-			members: [{ id: "a", role: "coordinator", state: "running", output: "obsolete-output" }, { id: "b", role: "worker", state: "running" }], events: [] };
+			brief: { goal: "Review the assigned module", authorizations: [{ member: "b", allowed: ["read"] }] },
+			members: [{ id: "a", role: "coordinator", state: "running", output: "obsolete-output" },
+				{ id: "b", role: "worker", state: "running", assignment,
+					result: { status: "partial", summary: "obsolete-result" }, instructionRevision: 3, observedRevision: 2 }], events: [] };
 		const add = (id: string, data: any) => h.branch.push({ id, type: "custom_message", customType: TEAM_DELIVERY_TYPE, display: false, timestamp: new Date().toISOString(),
 			content: JSON.stringify(data), details: { teamId: "t", memberId: "b", deliveryId: id } });
 		add("roster", { ok: true, snapshot });
@@ -274,8 +360,15 @@ test("recovery retains a compact roster with at most 64 messages and a total fra
 		assert.ok(messages.some((m: any) => m.details.deliveryId === "delivery-79"));
 		assert.ok(!messages.some((m: any) => m.details.deliveryId === "delivery-0"));
 		const roster = messages.find((m: any) => m.details.deliveryId === "roster");
-		assert.equal(JSON.parse(roster.content).snapshot.coordinator, "a");
-		assert.doesNotMatch(roster.content, /obsolete-output/);
+		const compactRoster = JSON.parse(roster.content).snapshot;
+		assert.equal(compactRoster.coordinator, "a");
+		assert.deepEqual(compactRoster.brief, snapshot.brief);
+		assert.deepEqual(compactRoster.members[1].assignment, assignment);
+		assert.equal(compactRoster.members[1].instructionRevision, 3);
+		assert.equal(compactRoster.members[1].observedRevision, 2);
+		assert.equal(Object.hasOwn(compactRoster.members[1], "result"), false);
+		assert.equal(Object.hasOwn(compactRoster.members[0], "output"), false);
+		assert.doesNotMatch(roster.content, /obsolete-output|obsolete-result/);
 		assert.equal(messages[0].details.deliveryId, "roster", "restoration preserves native delivery chronology");
 		assert.equal(h.deliveries.length, large ? 1 : 0);
 		if (large) assert.match(messages.at(-1).content, /CURRENT/);
@@ -375,6 +468,39 @@ test("only context checkpoints receive messages; provider/tool checkpoints reque
 	assert.equal(await next, undefined);
 });
 
+test("stale tool preflight blocks only the generated call and leaves redirected inbox messages for context", async () => {
+	const h = harness();
+	await h.command("bind");
+	const initialContext = h.handlers.get("context")!({ messages: [] }, h.ctx);
+	assert.equal(h.entries.at(-1).request.receive, true);
+	await h.command("reply", { requestId: h.entries.at(-1).request.requestId, reply: { ok: true, revision: 5 } });
+	await initialContext;
+
+	h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "generated-read" }] } });
+	const preflight = h.handlers.get("tool_call")!({ toolName: "read" }, h.ctx);
+	const checkpoint = h.entries.at(-1).request;
+	assert.equal(checkpoint.action, "checkpoint");
+	assert.equal(checkpoint.receive, false);
+	assert.equal(checkpoint.revision, 5);
+	await h.command("reply", { requestId: checkpoint.requestId, reply: { ok: false, code: "stale_instruction", revision: 6, error: "redirected" } });
+	const blocked = await preflight;
+	assert.equal(blocked.block, true);
+	assert.match(blocked.reason, /replan against the latest team direction/);
+	assert.equal(blocked.terminate, undefined, "a redirect is recoverable and should trigger a fresh model plan");
+	assert.equal(h.aborted(), 0);
+	assert.equal(h.deliveries.length, 0, "permit-only stale reply cannot consume an inbox message");
+
+	const nextContext = h.handlers.get("context")!({ messages: [] }, h.ctx);
+	const receive = h.entries.at(-1).request;
+	assert.equal(receive.action, "checkpoint");
+	assert.equal(receive.receive, true);
+	await h.command("reply", { requestId: receive.requestId, reply: { ok: true, revision: 6, events: [{ seq: 1, kind: "message", from: "a", to: "b", message: "redirected work" }] } });
+	const contextResult = await nextContext;
+	assert.match(JSON.stringify(contextResult), /redirected work/);
+	assert.equal(h.deliveries.length, 1);
+	assert.equal(h.aborted(), 0);
+});
+
 test("a helper returning consumed messages to a permit-only gate fails closed instead of losing the wakeup", async () => {
 	const h = harness();
 	await h.command("bind");
@@ -454,6 +580,7 @@ test("argument errors identify action and corrective fields without sending an e
 		[{ action: "wait", wait: { kind: "message", member: "a" } }, /action=wait:.*wait\.member/],
 		[{ action: "send", message: "hello" }, /action=send:.*requires non-empty to and message/],
 		[{ action: "finish", to: "a" }, /action=finish:.*takes no to/],
+		[{ action: "finish", message: "candidate", result: structuredResult }, /action=finish:.*message or structured result/],
 	] as const) {
 		const before = structuredClone(params);
 		await assert.rejects(h.tools.get("team").execute("one", params, h.ctx.signal, undefined, h.ctx), expected);
@@ -461,6 +588,7 @@ test("argument errors identify action and corrective fields without sending an e
 	}
 	assert.equal(strictTeamRequest({ requestId: "r", sequence: 1, action: "report", to: "a", message: "READY", wait: { kind: "message", member: "a" } }), false);
 	assert.equal(strictTeamRequest({ requestId: "r", sequence: 1, action: "report", to: "a", message: "READY", command: "pause" }), false);
+	assert.equal(strictTeamRequest({ requestId: "r", sequence: 1, action: "wait", wait: { kind: "member", member: "a", from: "b" } }), false);
 	assert.equal(h.entries.filter((entry) => entry.kind === "request").length, 0);
 	assert.equal(h.aborted(), 0);
 });
@@ -473,22 +601,35 @@ test("team optional schemas are nullable/default null and provider placeholders 
 	assert.match(tool.description, /report defaults to the coordinator/);
 	assert.match(tool.parameters.properties.to.anyOf.find((schema: any) => schema.type === "string").description, /supplied to asserts the coordinator alias and must match it/);
 	assert.equal(Object.hasOwn(tool.parameters.properties, "receive"), false);
-	for (const name of ["to", "message", "command", "wait"]) {
+	for (const name of ["to", "message", "replyTo", "supersedes", "result", "command", "wait"]) {
 		assert.equal(tool.parameters.properties[name].default, null);
 		assert.ok(tool.parameters.properties[name].anyOf.some((schema: any) => schema.type === "null"));
 	}
+	assert.equal(Object.hasOwn(tool.parameters.properties, "from"), false, "sender identity is runtime-bound, not model-selected");
+	assert.equal(Object.hasOwn(tool.parameters.properties, "revision"), false, "context revision is internal to preflight");
 	const waitSchema = tool.parameters.properties.wait.anyOf.find((schema: any) => schema.type === "object");
-	for (const name of ["member", "afterSeq"]) {
+	for (const name of ["member", "from", "afterSeq"]) {
 		assert.equal(waitSchema.properties[name].default, null);
 		assert.ok(waitSchema.properties[name].anyOf.some((schema: any) => schema.type === "null"));
 	}
+	const resultSchema = tool.parameters.properties.result.anyOf.find((schema: any) => schema.type === "object");
+	for (const name of ["findings", "evidence", "limitations", "artifacts"]) {
+		assert.equal(resultSchema.properties[name].default, null);
+		assert.ok(resultSchema.properties[name].anyOf.some((schema: any) => schema.type === "null"));
+	}
+	const evidenceSchema = resultSchema.properties.evidence.anyOf.find((schema: any) => schema.type === "array").items;
+	assert.equal(evidenceSchema.properties.locator.default, null);
+	assert.ok(evidenceSchema.properties.locator.anyOf.some((schema: any) => schema.type === "null"));
 	const cases = [
-		{ input: { action: "send", to: " a ", message: "  keep message spacing  ", wait: null, command: null }, expected: { action: "send", to: "a", message: "  keep message spacing  " } },
-		{ input: { action: "wait", to: null, message: null, command: null, wait: { kind: "message", member: null, afterSeq: null } }, expected: { action: "wait", wait: { kind: "message" } } },
-		{ input: { action: "wait", to: " ", message: "", command: "", wait: { kind: "message", member: " ", afterSeq: 0 } }, expected: { action: "wait", wait: { kind: "message", afterSeq: 0 } } },
-		{ input: { action: "report", to: "", message: "done", command: null, wait: { kind: "member", member: " a ", afterSeq: null } }, expected: { action: "report", message: "done", wait: { kind: "member", member: "a" } } },
+		{ input: { action: "send", to: " a ", message: "  keep message spacing  ", replyTo: " t:1 ", supersedes: null, wait: null, command: null }, expected: { action: "send", to: "a", message: "  keep message spacing  ", replyTo: "t:1" } },
+		{ input: { action: "wait", to: null, message: null, command: null, wait: { kind: "message", member: null, from: null, afterSeq: null } }, expected: { action: "wait", wait: { kind: "message" } } },
+		{ input: { action: "wait", to: " ", message: "", command: "", wait: { kind: "message", member: " ", from: " a ", afterSeq: 0 } }, expected: { action: "wait", wait: { kind: "message", from: "a", afterSeq: 0 } } },
+		{ input: { action: "report", to: "", message: "done", replyTo: "t:1", supersedes: "t:0", command: null, wait: { kind: "member", member: " a ", from: null, afterSeq: null } }, expected: { action: "report", message: "done", replyTo: "t:1", supersedes: "t:0", wait: { kind: "member", member: "a" } } },
 		{ input: { action: "control", to: " a ", message: null, command: "pause", wait: null }, expected: { action: "control", to: "a", command: "pause" } },
 		{ input: { action: "finish", to: "", message: "", command: "", wait: null }, expected: { action: "finish" } },
+		{ input: { action: "finish", to: null, message: "candidate", result: null, command: null, wait: null }, expected: { action: "finish", message: "candidate" } },
+		{ input: { action: "finish", to: null, message: null, result: { ...structuredResult, findings: null, evidence: [{ source: "test", basis: "verified", locator: null }], limitations: null, artifacts: null }, command: null, wait: null },
+			expected: { action: "finish", result: { status: "partial", summary: "Checked the assigned files", evidence: [{ source: "test", basis: "verified" }] } } },
 	];
 	for (const { input, expected } of cases) {
 		const original = structuredClone(input);
@@ -521,6 +662,7 @@ test("normalization does not hide missing meaningful messages, invalid waits or 
 		{ action: "checkpoint" },
 		{ action: "wait", wait: { kind: "member", member: "" } },
 		{ action: "wait", wait: { kind: "message", afterSeq: "" } },
+		{ action: "wait", wait: { kind: "message", from: " " } },
 	]) await assert.rejects(h.tools.get("team").execute("one", input, h.ctx.signal, undefined, h.ctx), /Invalid team arguments/);
 	assert.equal(h.entries.filter((entry) => entry.kind === "request").length, 0);
 	assert.equal(h.aborted(), 0);

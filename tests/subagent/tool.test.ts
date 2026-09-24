@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import { TeamHub } from "../../tools/subagents/team-hub";
 import { TeamRunManager } from "../../tools/subagents/team-runner";
 import { test } from "node:test";
@@ -218,7 +219,22 @@ test("two sibling tool calls share the hub and return a newly generated coordina
 		const original = broker.dispatch.bind(broker);
 		let summary = "";
 		broker.dispatch = async (request) => {
+			const contextReply = await request.team?.onRequest({
+				requestId: `first-context-${request.alias}`,
+				sequence: 1,
+				action: "checkpoint",
+				receive: true,
+			}, request.signal);
+			assert.ok(contextReply?.snapshot?.members.every((member) => member.assignment), "all assignments are durable before the first child context is admitted");
 			const result = await original(request);
+			if (request.team?.binding.role === "worker") {
+				await request.team.onRequest({
+					requestId: `structured-result-${request.alias}`,
+					sequence: 2,
+					action: "finish",
+					result: { status: "succeeded", summary: `Completed ${request.task}`, findings: ["Verified the assigned scope"] },
+				}, request.signal);
+			}
 			const prompt = await request.team?.afterRun?.(result.run, request.signal);
 			if (prompt) {
 				summary = prompt;
@@ -229,7 +245,10 @@ test("two sibling tool calls share the hub and return a newly generated coordina
 		};
 		const [coordinator, workers] = await Promise.all([
 			tool.execute("coordinator", { teamId: team.id, alias: "A", task: "coordinate" }, undefined, undefined, context()),
-			tool.execute("workers", { teamId: team.id, tasks: [{ alias: "B1", task: "one" }, { alias: "B2", task: "two" }] }, undefined, undefined, context()),
+			tool.execute("workers", { teamId: team.id, tasks: [
+				{ alias: "B1", task: "one", cwd: "/tmp/team-worker-one", model: "cus-resp/gpt-5.6-sol", fastMode: true },
+				{ alias: "B2", task: "two", model: "cus-oai/gpt-5.6-sol-completions", fastMode: false },
+			] }, undefined, undefined, context()),
 		]);
 		assert.match(summary, /done: one/);
 		assert.match(summary, /done: two/);
@@ -237,6 +256,86 @@ test("two sibling tool calls share the hub and return a newly generated coordina
 		assert.equal(workers.details.results.length, 2);
 		assert.equal(hub.get(team.id).phase, "completed");
 		assert.equal(JSON.stringify(coordinator.details).includes("epoch"), false);
+		const assignments = new Map(hub.get(team.id).members.map((member) => [member.id, member.assignment]));
+		assert.deepEqual(assignments.get("B1"), {
+			memberId: "B1", task: "one", cwd: resolve("/tmp/team-worker-one"), model: "cus-resp/gpt-5.6-sol:xhigh", fastMode: true, searchMode: "on",
+		});
+		assert.deepEqual(assignments.get("B2"), {
+			memberId: "B2", task: "two", cwd: resolve("/tmp/project"), model: "cus-oai/gpt-5.6-sol-completions", fastMode: false, searchMode: "off",
+		});
+		assert.match(workers.content[0].text, /task succeeded: Completed one/u);
+		assert.match(workers.content[0].text, /task succeeded: Completed two/u);
+		assert.match(workers.content[0].text, /FAST on · SEARCH on/u);
+	} finally { hub.dispose(); }
+});
+
+test("parent-facing team output preserves an empty native answer and exposes blocked result plus effective policy", async () => {
+	const hub = new TeamHub();
+	try {
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const manager = new TeamRunManager(hub);
+		manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const { tool, broker } = setupTool({ team: () => manager });
+		broker.dispatch = async (request) => {
+			await request.team!.onRequest({ requestId: "receive", sequence: 1, action: "checkpoint", receive: true }, request.signal);
+			await request.team!.onRequest({
+				requestId: "blocked-result", sequence: 2, action: "finish",
+				result: { status: "blocked", summary: "No approved credentials were provided", limitations: ["Cannot verify authenticated behavior"] },
+			}, request.signal);
+			const nativeRun = { output: "", usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 1, turns: 1 } };
+			await request.team!.afterRun!(nativeRun, request.signal);
+			return {
+				instance: {
+					version: 2, agentId: "agt_auth", alias: request.alias!, model: request.model!, sessionId: "session-auth",
+					sessionFile: "/tmp/auth.jsonl", cwd: request.cwd!, createdAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z", lastTask: request.task, fastMode: request.fastMode === true,
+				},
+				run: nativeRun,
+			};
+		};
+		const result = await tool.execute("blocked-worker", {
+			teamId: team.id,
+			tasks: [{ alias: "B", model: "cus-resp/gpt-5.6-sol", task: "Verify authenticated behavior", fastMode: true }],
+		}, undefined, undefined, context());
+		assert.match(result.content[0].text, /task blocked: No approved credentials were provided/u);
+		assert.match(result.content[0].text, /FAST on · SEARCH on/u);
+		assert.doesNotMatch(result.content[0].text, /done: Verify authenticated behavior/u);
+		assert.equal(result.details.results[0].output, "");
+		assert.equal(result.details.results[0].teamResult?.status, "blocked");
+		assert.deepEqual(result.details.results[0].teamResult?.limitations, ["Cannot verify authenticated behavior"]);
+	} finally { hub.dispose(); }
+});
+
+test("parent-facing team output marks empty native output without a structured result as failed", async () => {
+	const hub = new TeamHub();
+	try {
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const manager = new TeamRunManager(hub);
+		manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const { tool, broker } = setupTool({ team: () => manager });
+		broker.dispatch = async (request) => {
+			await request.team!.onRequest({ requestId: "receive", sequence: 1, action: "checkpoint", receive: true }, request.signal);
+			const nativeRun = { output: "", usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 1, turns: 1 } };
+			await request.team!.afterRun!(nativeRun, request.signal);
+			return {
+				instance: {
+					version: 2, agentId: "agt_auth", alias: request.alias!, model: request.model!, sessionId: "session-auth",
+					sessionFile: "/tmp/auth.jsonl", cwd: request.cwd!, createdAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z", lastTask: request.task, fastMode: request.fastMode === true,
+				},
+				run: nativeRun,
+			};
+		};
+		const result = await tool.execute("empty-worker", {
+			teamId: team.id,
+			tasks: [{ alias: "B", model: "cus-resp/gpt-5.6-sol", task: "Verify the service" }],
+		}, undefined, undefined, context());
+		assert.equal(result.details.results[0].status, "failed");
+		assert.equal(result.details.results[0].output, "");
+		assert.match(result.content[0].text, /B · failed/u);
+		assert.match(result.content[0].text, /native output is empty and no structured team result/u);
+		assert.equal(hub.get(team.id).members.find((member) => member.id === "B")?.state, "failed");
+		assert.equal(hub.signal(team.id).aborted, false);
 	} finally { hub.dispose(); }
 });
 

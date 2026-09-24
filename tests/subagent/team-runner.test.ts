@@ -48,6 +48,108 @@ test("continuation rebinding retains monotonically increasing hub request sequen
 	} finally { hub.dispose(); }
 });
 
+test("an explicit finish or workers barrier plus receiving checkpoint avoids another continuation", async () => {
+	for (const action of ["finish", "wait"] as const) {
+		const hub = new TeamHub();
+		try {
+			const manager = new TeamRunManager(hub);
+			const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+			const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+			const [b] = manager.join(team.id, "parallel", [{ alias: "B", task: "work" }]);
+			const coordinator = manager.channel(a!);
+			await manager.channel(b!).afterRun!(run("worker result"));
+			const barrier = await coordinator.onRequest(action === "wait"
+				? { requestId: "workers-done", sequence: 1, action, wait: { kind: "workers" } }
+				: { requestId: "workers-done", sequence: 1, action });
+			assert.equal(barrier.ok, true);
+			assert.equal(barrier.snapshot?.phase, "finalizing");
+			const received = await coordinator.onRequest({
+				requestId: "receive-results", sequence: 2, action: "checkpoint", receive: true,
+			});
+			assert.equal(received.ok, true);
+			assert.ok(received.events?.some((event) => event.kind === "result"));
+			assert.equal(await coordinator.afterRun!(run("summary from complete results")), undefined);
+			assert.equal(hub.get(team.id).phase, "completed");
+			assert.equal(hub.get(team.id).members[0]!.output, "summary from complete results");
+		} finally { hub.dispose(); }
+	}
+});
+
+test("a completed barrier without a receiving checkpoint keeps the one continuation fallback", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const [b] = manager.join(team.id, "parallel", [{ alias: "B", task: "work" }]);
+		const coordinator = manager.channel(a!);
+		await manager.channel(b!).afterRun!(run("worker result"));
+		await coordinator.onRequest({ requestId: "workers-done", sequence: 1, action: "finish" });
+		const continuation = await coordinator.afterRun!(run("premature natural answer"));
+		assert.match(continuation!, /complete team snapshot/u);
+		assert.equal(hub.get(team.id).phase, "finalizing");
+		assert.equal(await coordinator.afterRun!(run("final summary")), undefined);
+		assert.equal(hub.get(team.id).phase, "completed");
+	} finally { hub.dispose(); }
+});
+
+test("worker empty native output fails only that member unless a structured result was reported", async () => {
+	for (const structured of [false, true]) {
+		const hub = new TeamHub();
+		try {
+			const manager = new TeamRunManager(hub);
+			const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+			manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+			const [worker] = manager.join(team.id, "parallel", [{ alias: "B", task: "work" }]);
+			if (structured) {
+				await manager.channel(worker!).onRequest({
+					requestId: "structured-result", sequence: 1, action: "finish",
+					result: { status: "failed", summary: "The task could not be completed" },
+				});
+			}
+			await manager.channel(worker!).afterRun!(run("  "));
+			const member = hub.get(team.id).members.find((item) => item.id === "B")!;
+			if (structured) {
+				assert.equal(member.state, "completed", "runtime completion is separate from the task result status");
+				assert.equal(member.output, "  ", "the team preserves the native output verbatim instead of inventing a replacement");
+				assert.equal(member.result?.status, "failed");
+			} else {
+				assert.equal(member.state, "failed");
+				assert.match(member.error!, /native output is empty/u);
+				assert.equal(hub.get(team.id).phase, "running", "one worker failure must not cancel the team");
+				assert.equal(hub.signal(team.id).aborted, false);
+			}
+		} finally { hub.dispose(); }
+	}
+});
+
+test("assignment status shows task policy and bounded recent routes without exposing dispatch bindings", () => {
+	const hub = new TeamHub();
+	try {
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const snapshot = {
+			...team,
+			members: team.members.map((member) => member.id === "B" ? {
+				...member,
+				assignment: { memberId: "B", task: "Inspect the target", cwd: "/tmp/project", model: "provider/model", fastMode: true, searchMode: "on" },
+				result: { status: "blocked" as const, summary: "Waiting for an approved test account" },
+			} : member),
+			events: Array.from({ length: 12 }, (_, index) => ({
+				seq: index + 1, kind: "message" as const, from: "B", to: "A", message: `message ${index}`,
+			})),
+		};
+		const text = teamStatus(snapshot);
+		assert.match(text, /B: REGISTERED · blocked/u);
+		assert.match(text, /task: Inspect the target/u);
+		assert.match(text, /provider\/model · FAST on · SEARCH on/u);
+		assert.match(text, /result BLOCKED: Waiting for an approved test account/u);
+		assert.match(text, /Message B -> A: message 11/u);
+		assert.doesNotMatch(text, /message 0(?:\D|$)/u);
+		assert.doesNotMatch(text, /epoch|binding/u);
+		assert.ok(Buffer.byteLength(text, "utf8") <= 8 * 1024);
+	} finally { hub.dispose(); }
+});
+
 test("final summary rejects new cooperation, empty output, native error and cancelled completion", async () => {
 	for (const failure of ["wait", "empty", "error", "cancelled"] as const) {
 		const hub = new TeamHub();
@@ -86,6 +188,9 @@ test("fixed roster validation is atomic and rejects incompatible lifecycle befor
 			[{ alias: "B1", task: "one" }, { alias: "B2", task: "two", target: "old" }],
 			[{ alias: "B1", task: "one" }, { alias: "B2", task: "two", session: {} }],
 		]) assert.throws(() => manager.join(team.id, "parallel", items), /Team requires/);
+		assert.throws(() => manager.join(team.id, "parallel", [
+			{ alias: "B1", task: "x".repeat(8 * 1024 + 1) }, { alias: "B2", task: "two" },
+		]), /exceeds 8192 UTF-8 bytes/u);
 		assert.ok(hub.get(team.id).members.every((member) => member.state === "registered"));
 		assert.throws(() => manager.join(team.id, "chain", [{ alias: "A", task: "work" }]), /Team requires/);
 	} finally { hub.dispose(); }

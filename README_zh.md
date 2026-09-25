@@ -96,7 +96,7 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 {"action":"prepare","coordinator":"A","workers":["B1","B2"]}
 ```
 
-再用返回的 id 替换 `<teamId>`，在**同一 assistant turn 发出以下两个 sibling `subagent` tool call 并行执行**，不能串行等待，也不能合并为一个 `tasks` 数组。A 使用 single，所有预登记 B 放在一个 grouped call；两边的 `teamId` 都只放顶层。示例省略 `model`，使用当前 Pi 模型；每次建队请换用全新 alias。原生父会话会在启动成员前检查同一消息内是否齐备两侧调用；若因缺侧被拒绝，可沿用该 prepared teamId，在下一条消息中同时重发两侧，不要只补发另一侧。
+再用返回的 id 替换 `<teamId>`，在**同一 assistant turn 发出以下两个 sibling `subagent` tool call 并行执行**，不能串行等待，也不能合并为一个 `tasks` 数组。A 使用 single，所有预登记 B 放在一个 grouped call；两边的 `teamId` 都只放顶层。示例省略 `model`，使用当前 Pi 模型；每次建队请换用全新 alias。原生父会话会在启动成员前检查同一消息内是否齐备两侧调用；若因缺侧被拒绝，可沿用该 prepared teamId，在下一条消息中同时重发两侧，不要只补发另一侧。prepare 的返回结果会带上填好真实 teamId 和 alias 的两条调用；即使只有一个 worker，也要放进 `tasks` 数组。`target`、`session`、`control`、`chain` 应省略或设为 `null`（`session`／`control` 接受 `null`），不要填占位值：非空的 `control.message` 会把调用变成 control 模式。被拒绝时，错误信息会指出具体字段并附上正确的调用形状。
 
 ```json
 {"teamId":"<teamId>","alias":"A","task":"协调 B1/B2 的只读审查。用 team finish 等待全部 worker 结果，再总结发现与失败。"}

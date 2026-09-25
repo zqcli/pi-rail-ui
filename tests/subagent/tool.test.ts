@@ -842,7 +842,9 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
 	assert.match(guidance, /separate top-level Tool Call panels/);
 	assert.match(guidance, /Pi preflights sibling calls in order and executes them concurrently/);
-	assert.match(guidance, /tasks array only when the user wants one grouped subagent Tool Call/);
+	assert.match(guidance, /tasks array when the user wants one grouped subagent Tool Call/);
+	assert.match(guidance, /always for the workers of a prepared team/);
+	assert.match(guidance, /Never invent placeholder values/);
 	assert.match(guidance, /Live controls apply only to an already-running local persistent subagent/);
 	assert.match(guidance, /needs_input.*specialist_request/);
 	assert.match(guidance, /permanently deleted from the \/rail-agent panel/);
@@ -2608,4 +2610,60 @@ test("single, parallel, and chain carry per-mode alias and step for the same sta
 		assert.equal(Object.hasOwn(run, "step"), mode === "chain");
 		assert.equal(run.step, step);
 	}
+});
+
+test("full-property placeholders seen from a real provider get null options and actionable team errors", async () => {
+	const hub = new TeamHub();
+	try {
+		const team = hub.prepare({ coordinator: "mgr", workers: ["w1", "w2"] });
+		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+		const control = tool.parameters.properties.control;
+		assert.ok(control.anyOf.some((schema: any) => schema.type === "null"), "control accepts null");
+		assert.ok(tool.parameters.properties.session.anyOf.some((schema: any) => schema.type === "null"), "session accepts null");
+		assert.ok(tool.parameters.properties.tasks.items.properties.session.anyOf.some((schema: any) => schema.type === "null"));
+		// Arguments recorded from a GPT provider that fills every property with a plausible value.
+		const filler = { target: "", cwd: "", session: { mode: "fork", path: "/nonexistent" }, contextWindow: null, fastMode: null,
+			control: { delivery: "steer", message: "start" }, tasks: [], chain: [], confirmSessionAttach: true };
+		const coordinator = { ...filler, teamId: team.id, model: "", alias: "mgr", task: "coordinate" };
+		const workers = { ...filler, teamId: team.id, model: "", alias: "", task: "",
+			tasks: ["w1", "w2"].map((alias) => ({ target: "", alias, task: `work ${alias}`, cwd: "", session: { mode: "fork", path: "/nonexistent" }, contextWindow: null, fastMode: true })) };
+		const ctx = contextWithBatch([{ id: "a", arguments: coordinator }, { id: "b", arguments: workers }]);
+		await assert.rejects(tool.execute("a", coordinator, undefined, undefined, ctx), (error: Error) => {
+			assert.match(error.message, /This call sets single \(task\) \+ control \(control\.message="start"\)/u);
+			assert.ok(error.message.includes(`{"teamId":"${team.id}","tasks":[{"alias":"w1","task":"<w1 task>"},{"alias":"w2","task":"<w2 task>"}]}`));
+			return true;
+		});
+		await assert.rejects(tool.execute("b", { ...workers, control: null }, undefined, undefined, ctx),
+			/This call sets session\.path="\/nonexistent", tasks\[0\]\.session\.path="\/nonexistent", tasks\[1\]\.session\.path="\/nonexistent"; omit these fields or set them to null/u);
+		assert.equal(broker.requests.length, 0);
+		assert.equal(hub.get(team.id).phase, "prepared", "rejected launch attempts leave the prepared team reusable");
+
+		// With the null options the same provider can express a valid launch.
+		const nulls = { control: null, session: null };
+		const fixedA = { ...coordinator, ...nulls };
+		const fixedB = { ...workers, ...nulls, tasks: workers.tasks.map((item) => ({ ...item, session: null })) };
+		const fixed = contextWithBatch([{ id: "a2", arguments: fixedA }, { id: "b2", arguments: fixedB }]);
+		await Promise.all([tool.execute("a2", fixedA, undefined, undefined, fixed), tool.execute("b2", fixedB, undefined, undefined, fixed)]);
+		assert.deepEqual(broker.requests.map((request) => request.alias).sort(), ["mgr", "w1", "w2"]);
+	} finally { hub.dispose(); }
+});
+
+test("an unpaired or wrong-id team launch says what was found and shows the exact launch calls", async () => {
+	const hub = new TeamHub();
+	try {
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const { tool, broker } = setupTool({ team: () => new TeamRunManager(hub) });
+		const lone = { teamId: team.id, alias: "A", task: "coordinate" };
+		const workerAsSingle = { teamId: team.id, alias: "B", task: "work" };
+		const ctx = contextWithBatch([{ id: "a", arguments: lone }, { id: "b", arguments: workerAsSingle }]);
+		await assert.rejects(tool.execute("a", lone, undefined, undefined, ctx), (error: Error) => {
+			assert.match(error.message, /has 2 subagent calls with this teamId: single alias "A"; single alias "B"/u);
+			assert.match(error.message, /every worker in ONE tasks array, even if there is only one worker/u);
+			return true;
+		});
+		const wrong = { teamId: "not-the-team", alias: "A", task: "coordinate" };
+		await assert.rejects(tool.execute("w", wrong, undefined, undefined, contextWithBatch([{ id: "w", arguments: wrong }])),
+			/Unknown teamId "not-the-team": use the exact teamId returned by subagent_team prepare/u);
+		assert.equal(broker.requests.length, 0);
+	} finally { hub.dispose(); }
 });

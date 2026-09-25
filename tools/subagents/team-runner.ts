@@ -59,6 +59,18 @@ export function teamStatus(snapshot: TeamSnapshot): string {
 	return boundedStatus(complete, STATUS_CAP_BYTES);
 }
 
+/** The exact pair of `subagent` calls that launches a prepared team, with its real id and aliases. */
+export function teamDispatchTemplate(snapshot: Pick<TeamSnapshot, "id" | "coordinator" | "workers">): string {
+	const coordinator = JSON.stringify({ teamId: snapshot.id, alias: snapshot.coordinator, task: "<coordinator task>" });
+	const workers = JSON.stringify({ teamId: snapshot.id, tasks: snapshot.workers.map((alias) => ({ alias, task: `<${alias} task>` })) });
+	return [
+		"Launch the team with exactly these two subagent calls, as siblings in ONE assistant message:",
+		`1. coordinator (single): ${coordinator}`,
+		`2. every worker in ONE tasks array, even if there is only one worker: ${workers}`,
+		"Replace each <... task> with a concrete self-contained task. Optionally add model, fastMode or cwd to the coordinator call or to a tasks item. Omit target, session, control and chain, or set them to null.",
+	].join("\n");
+}
+
 function hasStructuredResult(result: TeamTaskResult | undefined): result is TeamTaskResult {
 	return !!result && ["succeeded", "partial", "blocked", "failed"].includes(result.status)
 		&& typeof result.summary === "string";
@@ -73,7 +85,8 @@ export class TeamRunManager {
 		if (!expected.length || items.length !== expected.length
 			|| new Set(items.map((item) => item.alias)).size !== expected.length
 			|| items.some((item) => !item.alias || !expected.includes(item.alias) || item.target !== undefined || item.session !== undefined || !item.task?.trim())) {
-			throw new Error("Team requires a new persistent coordinator single call and exact worker aliases in a parallel call; target/session/chain/control are not supported");
+			const got = items.map((item) => item.alias ?? "");
+			throw new Error(`Team requires a new persistent coordinator single call and exact worker aliases in a parallel call; target/session/chain/control are not supported. This ${mode} call has aliases ${JSON.stringify(got)}.\n${teamDispatchTemplate(snapshot)}`);
 		}
 		const assignments: TeamAssignment[] = items.map((item) => {
 			if (Buffer.byteLength(item.task!, "utf8") > TEAM_MAX_MESSAGE_BYTES) {

@@ -39,6 +39,16 @@
 - broker 转发规范化后的 `contextWindow`，直接调用时传 `null` 与工具调用行为一致。
 - 成员状态、阶段、事件类型、控制命令、回复码、消息 ID 格式，以及人数、输出、错误上限，统一由 `team-protocol.ts` 导出，Hub、子进程回复投影和父工具共用。父工具 brief schema 的长度上限与共享校验器对齐（原先是 2048/4096 字符，校验器允许 8 KiB），总大小交由 `isTeamBrief` 判定，含 JSON 转义开销。
 
+## 追加：启动失败清理与 Team 派发可用性
+
+- **启动失败路径释放租约（高风险）**：`createRpcWorkerFactory` 在子进程已启动但连接失败时，原先吞掉 `transport.stop()` 的错误并无条件释放租约。若进程在 SIGKILL 后仍未退出，新 worker 可以拿到同一个 session。现在启动失败路径与 `LeasedSessionWorker.stop` 共用 `stopThenRelease`：遇到 `RpcProcessExitTimeoutError` 时，租约保留到进程真正退出；对外仍报告原始启动错误。open 与 new 两种模式都有回归测试，旧代码在这两个测试上均失败。
+- **Team 派发需要多次重试**：分析父会话 `2026-09-25T04-35-49…jsonl`，gpt-6-sol 会把每个字段都填上值。`control`、`session` 这类对象没有 null 选项，模型就编造了 `{"message":"start"}` 和 `{"path":"/nonexistent"}` 这样的占位值。于是每次调用都同时带 task 与 control，被判定为“两种模式”；错误只写着 “Provide exactly one mode”，没有指出是哪个字段。该会话三次组队，前后约 50 次调用被拒，直到模型自己试出空字符串才成功。修复如下：
+  - `session` 与 `control` 接受 `null`，描述写明“不用时 null，不要填占位值”。
+  - 模式错误写明本次调用设置了哪些字段，例如 `single (task) + control (control.message="start")`。Team 字段错误逐项列出违规字段及路径。未知 teamId 会单独提示。缺侧或形状不对时，列出本条消息中实际找到的调用。
+  - `subagent_team prepare` 的返回，以及所有 Team 派发错误，都附带填好真实 teamId 与 alias 的两条调用模板；只有一个 worker 时也使用 `tasks` 数组。
+  - `subagent`/`subagent_team` 的描述与 guideline 明确：Team 的 worker 属于“优先用独立 sibling 调用”这条通用建议的例外，并且不存在单独的 `parallel` 字段。
+  - 用该会话中记录的真实参数写了回归测试：旧参数得到可操作的错误，同一 provider 改用 `null` 后即可成功组队。改进后的实际模型成功率尚未经真实模型重测。
+
 ## 未在本轮完成
 
 - **一次调用启动 team**（在 `subagent_team` 中一次传入 coordinator、workers 和 brief，由宿主内部并行派发）。这能消除“两个配对调用”的误用，但属于公共接口变更，还涉及 grouped 面板渲染和结果合并，需要单独设计与验收。现有的配对派发和 30 秒入队截止时间保持不变。
@@ -47,5 +57,5 @@
 ## 验证
 
 - 每个问题都有对应的回归测试，覆盖 Hub、runner、工具层、broker、子扩展、传输层和 worker factory。其中，原生 RPC 压缩测试的预期已改为“压缩后不再补回已总结的消息，只补精简 roster”。
-- 隔离 HOME/`PI_CODING_AGENT_DIR`、离线、清除代理变量后运行全量测试：`tsc --noEmit` 通过；全部 `tests/**/*.test.ts` 在 `PI_SUBAGENT_DEPTH=0` 与 `PI_SUBAGENT_DEPTH=1` 下均 **923/923 通过**，没有失败、取消或跳过；`git diff --check` 通过。
+- 隔离 HOME/`PI_CODING_AGENT_DIR`、离线、清除代理变量后运行全量测试：`tsc --noEmit` 通过；全部 `tests/**/*.test.ts` 在 `PI_SUBAGENT_DEPTH=0` 与 `PI_SUBAGENT_DEPTH=1` 下均 **927/927 通过**（含追加修复），没有失败、取消或跳过；`git diff --check` 通过。
 - 真实子进程测试使用本地合成 provider 和 loopback WSS，不代表外部模型的协作决策质量，也没有进行交互式 TUI 实测。

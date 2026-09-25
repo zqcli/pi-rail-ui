@@ -33,7 +33,9 @@ test("parent prepare/status/cancel handles null defaults and exposes no binding"
 			authorizations: [{ member: "B", allowed: ["Read repository files"] }],
 		});
 		assert.match(prepared.content[0].text, /Budget: 3600s total from prepare/u);
-		assert.match(prepared.content[0].text, /BOTH coordinator single and all workers grouped.*ONE assistant message/u);
+		assert.match(prepared.content[0].text, /exactly these two subagent calls, as siblings in ONE assistant message/u);
+		assert.ok(prepared.content[0].text.includes(`{"teamId":"${snapshot.id}","alias":"A","task":"<coordinator task>"}`), "the coordinator call is copyable");
+		assert.ok(prepared.content[0].text.includes(`{"teamId":"${snapshot.id}","tasks":[{"alias":"B","task":"<B task>"}]}`), "a single worker still uses a tasks array");
 		const payload = JSON.parse(prepared.content[0].text.split("JSON:\n")[1]!);
 		assert.equal(payload.action, "prepare");
 		assert.equal(payload.teamId, snapshot.id);

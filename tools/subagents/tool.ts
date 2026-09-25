@@ -1,4 +1,4 @@
-import { TeamRunManager, teamCallSignal, teamStatus } from "./team-runner";
+import { TeamRunManager, teamCallSignal, teamDispatchTemplate, teamStatus } from "./team-runner";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -52,6 +52,14 @@ const ControlSchema = Type.Object({
 	message: Type.String({ description: "Control message for an already-running local persistent subagent" }),
 });
 
+// Providers that fill every property need a real no-op value for these objects;
+// otherwise they invent placeholders such as {"path":"/nonexistent"} or {"message":"start"}.
+function sessionSourceSchema() {
+	return Type.Optional(Type.Union([SessionSourceSchema, Type.Null()], {
+		description: "Only to adopt an existing saved Pi session. Otherwise omit it or use null; never a placeholder path.",
+	}));
+}
+
 function contextWindowSchema() {
 	return Type.Optional(Type.Union([
 		Type.Number(),
@@ -78,7 +86,7 @@ const TaskItem = Type.Object({
 	alias: Type.Optional(Type.String({ description: "Alias for a new persistent long-term helper that is expected to receive follow-ups; omit for one-off stateless work" })),
 	task: Type.String({ description: "Self-contained one-off task for stateless work, concrete initial task for a new persistent helper, or follow-up message for target" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; when adopting a cross-project saved session, use its original project directory when known" })),
-	session: Type.Optional(SessionSourceSchema),
+	session: sessionSourceSchema(),
 	contextWindow: contextWindowSchema(),
 	fastMode: fastModeSchema(),
 });
@@ -89,22 +97,24 @@ const ChainItem = Type.Object({
 	alias: Type.Optional(Type.String({ description: "Alias for a new persistent helper expected to receive follow-ups; omit for stateless work" })),
 	task: Type.String({ description: "Self-contained task, persistent initial/follow-up task, and optional {previous} placeholder" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session" })),
-	session: Type.Optional(SessionSourceSchema),
+	session: sessionSourceSchema(),
 	contextWindow: contextWindowSchema(),
 	fastMode: fastModeSchema(),
 });
 
 const SubagentParams = Type.Object({
-	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Prepared team id. Launch the designated child coordinator single and exact workers parallel as two sibling calls; new persistent aliases only. Host preloads every assignment, effective model/Fast/Search policy and cwd before releasing the first child context." })),
+	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Only after subagent_team prepare: the exact returned teamId; otherwise omit or null. A team launches with exactly two sibling calls in one assistant message: {teamId, alias:<coordinator>, task} and {teamId, tasks:[{alias:<worker>, task} for every worker]}. Workers always share one tasks array, even a single worker. Omit or null target, session, control and chain." })),
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. In single mode, model+task without alias/session is stateless; model+alias+task creates persistent." })),
 	target: Type.Optional(Type.String({ description: "Continue the exact linked persistent alias or agentId and its existing conversation memory; do not also set model" })),
 	alias: Type.Optional(Type.String({ description: "Create a new persistent long-term helper expected to receive future follow-ups; omit for one-off stateless work" })),
 	task: Type.Optional(Type.String({ description: "Self-contained stateless task, concrete initial task for a new persistent helper, or persistent follow-up message" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
-	session: Type.Optional(SessionSourceSchema),
+	session: sessionSourceSchema(),
 	contextWindow: contextWindowSchema(),
 	fastMode: fastModeSchema(),
-	control: Type.Optional(ControlSchema),
+	control: Type.Optional(Type.Union([ControlSchema, Type.Null()], {
+		description: "Only for control mode (target + control, no task). For every other call omit it or use null; a non-empty message makes the call a control.",
+	})),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Group independent model-session tasks inside one subagent Tool Call; each item may be stateless or persistent. Use only when one grouped parent Tool Call with child panels is desired." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
 	confirmSessionAttach: Type.Optional(Type.Boolean({
@@ -321,7 +331,14 @@ function modeFor(params: SubagentParamsValue): SubagentMode {
 	const hasChain = (params.chain?.length ?? 0) > 0;
 	const hasControl = Boolean(nonEmpty(params.control?.message));
 	if (Number(hasSingle) + Number(hasParallel) + Number(hasChain) + Number(hasControl) !== 1) {
-		throw new Error("Provide exactly one mode: single, parallel, chain, or control");
+		const found = [
+			hasSingle ? "single (task)" : undefined,
+			hasParallel ? "parallel (tasks)" : undefined,
+			hasChain ? "chain (chain)" : undefined,
+			hasControl ? `control (control.message=${JSON.stringify(params.control!.message.slice(0, 80))})` : undefined,
+		].filter((mode) => mode !== undefined);
+		throw new Error(`Provide exactly one mode: single, parallel, chain, or control. This call sets ${found.length ? found.join(" + ") : "none of task, tasks, chain or control.message"}. `
+			+ "Omit the fields of unused modes or set them to null (tasks/chain may also be []).");
 	}
 	return hasControl ? "control" : hasChain ? "chain" : hasParallel ? "parallel" : "single";
 }
@@ -338,9 +355,17 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 		// Providers may fill optional fields with no-op placeholders. Apply the
 		// same task normalization used for dispatch before checking team lifecycle.
 		const items = [normalizeTask({ ...params, task: params.task! }), ...(params.tasks ?? []).map(normalizeTask)];
-		if (mode === "chain" || mode === "control" || params.chain?.length || nonEmpty(params.control?.message)
-			|| items.some((item) => item.target !== undefined || item.session !== undefined)) {
-			throw new Error("Team does not support target/session/chain/control");
+		const label = (index: number) => index === 0 ? "" : `tasks[${index - 1}].`;
+		const found = [
+			...(mode === "chain" || params.chain?.length ? ["chain"] : []),
+			...(mode === "control" || nonEmpty(params.control?.message) ? [`control.message=${JSON.stringify(params.control?.message?.slice(0, 80) ?? "")}`] : []),
+			...items.flatMap((item, index) => [
+				...(item.target !== undefined ? [`${label(index)}target=${JSON.stringify(item.target.slice(0, 80))}`] : []),
+				...(item.session ? [`${label(index)}session.path=${JSON.stringify(item.session.path.slice(0, 120))}`] : []),
+			]),
+		];
+		if (found.length) {
+			throw new Error(`Team does not support target/session/chain/control: members are new persistent aliases. This call sets ${found.join(", ")}; omit these fields or set them to null.`);
 		}
 	}
 	if (mode !== "single" && normalizeContextWindow(params.contextWindow) !== undefined) {
@@ -380,7 +405,22 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 	return { ...normalized, ...confirmSessionAttach };
 }
 
-function assertTeamDispatchBatch(toolCallId: string, teamId: string, ctx: ExtensionContext): void {
+function preparedTeam(team: TeamRunManager, teamId: string): TeamSnapshot {
+	try {
+		return team.hub.get(teamId);
+	} catch {
+		throw new Error(`Unknown teamId ${JSON.stringify(teamId.slice(0, 128))}: use the exact teamId returned by subagent_team prepare (subagent_team status without teamId lists teams). Nothing was started.`);
+	}
+}
+
+function describeTeamCall(raw: SubagentParamsValue): string {
+	const tasks = raw.tasks?.length ? `tasks aliases ${JSON.stringify(raw.tasks.map((item) => nonEmpty(item.alias) ?? ""))}` : undefined;
+	const single = nonEmpty(raw.task) ? `single alias ${JSON.stringify(nonEmpty(raw.alias) ?? "")}` : undefined;
+	return [single, tasks].filter(Boolean).join(" + ") || "no task";
+}
+
+function assertTeamDispatchBatch(toolCallId: string, snapshot: TeamSnapshot, ctx: ExtensionContext): void {
+	const teamId = snapshot.id;
 	// Native tool execution sees the finalized assistant message in memory. SDK
 	// callers without that matching context keep the existing admission deadline.
 	const branch = ctx.sessionManager?.getBranch?.();
@@ -389,7 +429,8 @@ function assertTeamDispatchBatch(toolCallId: string, teamId: string, ctx: Extens
 	const calls = entry.message.content.filter((part) => part.type === "toolCall")
 		.filter((call) => call.name === "subagent" && typeof call.arguments?.["teamId"] === "string" && nonEmpty(call.arguments["teamId"]) === teamId);
 	if (!calls.some((call) => call.id === toolCallId)) return;
-	const error = new Error("Team dispatch requires one new-alias single call and one grouped parallel call. This dispatch has not joined/started; retry BOTH calls in same assistant message with same teamId, do not wait between them.");
+	const found = `This assistant message has ${calls.length} subagent call${calls.length === 1 ? "" : "s"} with this teamId: ${calls.map((call) => describeTeamCall(call.arguments as SubagentParamsValue)).join("; ")}.`;
+	const error = new Error(`Team dispatch requires one new-alias single call and one grouped parallel call. This dispatch has not joined/started; retry BOTH calls in same assistant message with same teamId, do not wait between them. ${found}\n${teamDispatchTemplate(snapshot)}`);
 	if (calls.length !== 2) throw error;
 	let singles = 0;
 	let parallels = 0;
@@ -622,7 +663,7 @@ async function validateTaskContextWindows(items: TaskParams[], models: (RailMode
 			continue;
 		}
 		const model = models[index]!;
-		const cwd = await resolveChildContextCwd(item.cwd ?? defaultCwd, item.session);
+		const cwd = await resolveChildContextCwd(item.cwd ?? defaultCwd, item.session ?? undefined);
 		const settings = createChildContextSettings(cwd).getCompactionSettings({ provider: model.provider, id: model.modelId });
 		validateContextWindowReserve(contextWindow, settings.reserveTokens, settings.enabled);
 	}
@@ -758,7 +799,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
 			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Parallel and chain calls may set fastMode independently on each eligible item; do not set a grouped top-level fastMode or put it on an existing target or control call. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Grouped child panels show each item's effective FAST and SEARCH state.\n"
-			+ "Team dispatch: the host is not a team member or coordinator. Use subagent_team prepare with the shared goal/target/URL, acceptance criteria, constraints and per-member allowed/forbidden operations in brief; make every worker task self-contained. Then dispatch the designated child coordinator and the complete worker roster as sibling calls in one assistant message. Ordinary team send queues work for a recipient checkpoint; it does not immediately stop an active turn or wake the hosting parent model. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
+			+ "Team dispatch: the host is not a team member or coordinator. Use subagent_team prepare with the shared goal/target/URL, acceptance criteria, constraints and per-member allowed/forbidden operations in brief; make every worker task self-contained. Then launch with exactly two sibling subagent calls in one assistant message, using the teamId and aliases from prepare: {\"teamId\":\"<teamId>\",\"alias\":\"<coordinator>\",\"task\":\"...\"} and {\"teamId\":\"<teamId>\",\"tasks\":[{\"alias\":\"<worker>\",\"task\":\"...\"}, ...one item per worker]}. Workers always share one tasks array, even a single worker. Omit target, session, control and chain or set them to null. Ordinary team send queues work for a recipient checkpoint; it does not immediately stop an active turn or wake the hosting parent model. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
 		promptGuidelines: [
@@ -770,14 +811,15 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
 			"Use contextWindow:null by default. Null or omission uses the selected child model's native default. Only use a positive integer when the user explicitly requests a specific child context or compaction budget; for parallel and chain calls, put an explicit numeric value on the individual item that owns it.",
 			"Use fastMode:true only for a stateless call or a new persistent agent. On a non-GPT model it is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Keep fastMode null or omitted by default. For parallel and chain, put fastMode on the individual item that owns it; do not use a grouped top-level fastMode or put it on an existing target or control call. Existing persistent target policy is managed through /rail-agent. Hosted Search is an internal policy with no search parameter; grouped child panels show each item's effective FAST and SEARCH state.",
-			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
-			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
+			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently. Team launches are the exception: all workers of a prepared team go in one tasks array.",
+			"Use the tasks array when the user wants one grouped subagent Tool Call with multiple child panels, and always for the workers of a prepared team. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
 			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call; contextWindow must be null or omitted, never numeric. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
 			"When a child asks for input or another specialist in its ordinary final answer (for example by using the plain-language labels needs_input or specialist_request), keep orchestration in the parent: resolve the question or dispatch the specialist, then continue the original persistent child with target+task. These labels are guidance, not a structured wire protocol. Do not enable recursive child subagent calls.",
 			"When the user names @agent/<alias> or agent://<alias>, use subagent with target set to that exact alias.",
 			"When the user names @new/<provider>/<modelId> or new://<provider>/<modelId>, use subagent with model set to that canonical model reference and assign a concise alias.",
 			"Subagent child sessions cannot recursively call subagent. Keep nested decomposition and orchestration in the parent session.",
 			"In subagent calls, use session only to adopt an existing saved Pi session; do not set it for ordinary stateless work or a newly created persistent helper.",
+			"Leave fields of unused modes out or null: session and control accept null, and tasks/chain accept []. Never invent placeholder values (for example a dummy session path or a control message such as \"start\"); any non-empty control.message turns the call into a control call.",
 			"Persistent subagents may be permanently deleted from the /rail-agent panel. Deletion intentionally removes only that child JSONL and Rail descriptor; it does not rewrite links stored in other parent sessions, so later target calls from those sessions fail with an unknown persistent subagent error.",
 		],
 		parameters: SubagentParams,
@@ -799,9 +841,19 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			let joinedTeam = false;
 			try {
 			if (teamId !== undefined && !team) throw new Error("Team runtime is not ready");
-			const mode = modeFor(params);
-			params = filterParamsForMode(params, mode);
-			if (teamId !== undefined) assertTeamDispatchBatch(toolCallId, teamId, ctx);
+			let mode: SubagentMode;
+			try {
+				mode = modeFor(params);
+				params = filterParamsForMode(params, mode);
+			} catch (error) {
+				// Show a team caller the exact call shape instead of only the rejected field.
+				let known: TeamSnapshot | undefined;
+				try { known = team && teamId !== undefined ? team.hub.get(teamId) : undefined; } catch { known = undefined; }
+				if (known && error instanceof Error) throw new Error(`${error.message}\n${teamDispatchTemplate(known)}`);
+				throw error;
+			}
+			const preparedSnapshot = team && teamId !== undefined ? preparedTeam(team, teamId) : undefined;
+			if (preparedSnapshot) assertTeamDispatchBatch(toolCallId, preparedSnapshot, ctx);
 			const actualTasks = new Map<number, string>();
 			actualTasksByCall.set(toolCallId, actualTasks);
 			const dispatchMetadata = new Map<number, DispatchDisplayMetadata>();
@@ -929,7 +981,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			// model switch cannot change the child after its reserve was validated.
 			const budgetModels = requestedItems.map((item, index) => !item.target && item.contextWindow != null ? teamModels?.[index] ?? resolveRailModel(item.model, ctx) : undefined);
 			await validateTaskContextWindows(requestedItems, budgetModels, broker, ctx.cwd);
-			const sessionAttachments = requestedItems.filter((item) => item.session !== undefined);
+			const sessionAttachments = requestedItems.filter((item) => item.session != null);
 			if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
 				if (!ctx.hasUI) throw new Error("Attaching an existing session requires UI confirmation or confirmSessionAttach=false");
 				const approved = await ctx.ui.confirm(
@@ -941,7 +993,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				if (!approved) throw new Error("Existing session attachment was not approved");
 			}
 			const teamCwds = team
-				? await Promise.all(requestedItems.map(async (item) => resolvePath(await resolveChildContextCwd(item.cwd ?? ctx.cwd, item.session))))
+				? await Promise.all(requestedItems.map(async (item) => resolvePath(await resolveChildContextCwd(item.cwd ?? ctx.cwd, item.session ?? undefined))))
 				: undefined;
 			const teamAssignments = team && teamModels && teamCwds
 				? requestedItems.map((item, index) => {

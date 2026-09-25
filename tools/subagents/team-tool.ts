@@ -7,7 +7,7 @@ import {
 	isTeamBrief, TEAM_HISTORY_TYPE, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_MEMBERS, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_TEXT_BYTES,
 	type TeamBrief, type TeamSnapshot,
 } from "./team-protocol";
-import { teamStatus } from "./team-runner";
+import { teamDispatchTemplate, teamStatus } from "./team-runner";
 
 function nullable(schema: TSchema) {
 	return Type.Optional(Type.Union([schema, Type.Null()]));
@@ -148,18 +148,21 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {
 	pi.registerTool({
 		name: "subagent_team",
 		label: "Subagent Team",
-		description: "Prepare a fixed team, inspect status, or cancel. After prepare, launch two sibling subagent calls with teamId: one single call for the designated child coordinator and one parallel call containing exactly all worker aliases. Give every member a self-contained task and put shared goal, target/URL, acceptance criteria, constraints and per-member authorization in brief. Emit BOTH calls in the same assistant message; never wait for one before starting the other. The hosting parent is not a team member/coordinator. Team messages are queued for a recipient's receiving context checkpoint; ordinary send does not interrupt an active turn or wake the parent model. Keep timeoutSeconds null (default 3600s) unless the user requests a deadline; it covers the whole team including reasoning, tools, waiting and the final summary. Pause is cooperative at safe points. Reload interrupts unfinished teams.",
+		description: "Prepare a fixed team (one coordinator + 1–8 workers, all new persistent aliases), inspect status, or cancel. prepare returns the teamId and the exact launch calls. Launch = exactly two sibling subagent calls in the same assistant message: "
+			+ "{\"teamId\":\"<teamId>\",\"alias\":\"<coordinator>\",\"task\":\"...\"} and {\"teamId\":\"<teamId>\",\"tasks\":[{\"alias\":\"<worker>\",\"task\":\"...\"}, ...one item per worker]}. "
+			+ "All workers go in that one tasks array, even a single worker; for teams this replaces the general advice to prefer separate sibling calls. model, fastMode and cwd may be set per call or per tasks item; omit target, session, control and chain or set them to null. "
+			+ "Never wait for one call before emitting the other. Give every member a self-contained task and put shared goal, target/URL, acceptance criteria, constraints and per-member authorization in brief. The hosting parent is not a team member/coordinator. Team messages are queued for a recipient's receiving context checkpoint; ordinary send does not interrupt an active turn or wake the parent model. Keep timeoutSeconds null (default 3600s) unless the user requests a deadline; it covers the whole team including reasoning, tools, waiting and the final summary. Pause is cooperative at safe points. Reload interrupts unfinished teams.",
 		promptGuidelines: [
 			"Team prepare: default timeoutSeconds to null. Do not invent short 120/180-second limits for code review or max-thinking models; explicit deadlines bound the entire workflow, not one tool call.",
 			"Make each worker task self-contained: include the necessary target/URL, expected inputs, acceptance criteria, relevant constraints, and its own allowed/forbidden operations. Put shared goal and per-member authorization in brief so all assignments and policy are present before any child receives its first context.",
-			"After Team prepare, emit the designated child coordinator single and all workers grouped in parallel as two sibling subagent calls in ONE assistant message. The hosting parent is not the team's coordinator and should not claim it receives a live wakeup. Ordinary team send queues a message for a recipient checkpoint; it is not an immediate stop or parent-model wakeup. If an unpaired call is rejected before joining, retry BOTH using the same prepared teamId rather than launching the missing side alone. After a team fails or is cancelled, prepare a new team; started members keep their aliases, so use new aliases for them.",
+			"After Team prepare, copy the two launch calls it returns and emit both in ONE assistant message: the coordinator as {teamId, alias, task} and every worker inside one tasks array {teamId, tasks:[{alias, task}, ...]}. There is no separate \"parallel\" field: a non-empty tasks array is the grouped call. Omit target, session, control and chain or set them to null; never fill them with placeholder values such as a dummy path or message. The hosting parent is not the team's coordinator and should not claim it receives a live wakeup. Ordinary team send queues a message for a recipient checkpoint; it is not an immediate stop or parent-model wakeup. If a call is rejected before joining, read which field the error names, fix it, and retry BOTH calls with the same prepared teamId rather than launching one side alone. After a team fails or is cancelled, prepare a new team; started members keep their aliases, so use new aliases for them.",
 		],
 		executionMode: "parallel",
 		parameters: Type.Object({
 			action: StringEnum(["prepare", "status", "cancel"]),
-			teamId: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-			coordinator: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-			workers: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()])),
+			teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "status/cancel: an existing teamId (status without it lists teams). prepare: null; prepare generates the id." })),
+			coordinator: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "prepare: new persistent alias of the child coordinator (not the hosting parent). Reuse it as alias in the coordinator's subagent call." })),
+			workers: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()], { description: "prepare: 1–8 new persistent worker aliases. Reuse exactly these as the aliases of the tasks array in the workers' subagent call." })),
 			timeoutSeconds: Type.Optional(Type.Union([Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), Type.Null()], { description: "Default null = 3600 seconds. Set only for a user-requested deadline. Total team budget from prepare, including startup, all model/tool work, waits and final summary; not a per-call timeout." })),
 			reason: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 			brief: Type.Optional(Type.Union([BriefSchema, Type.Null()], { description: "Shared goal, target, acceptance criteria, constraints and member-specific authorization. Null optional fields are normalized away." })),
@@ -182,10 +185,10 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {
 				if (listing) return `${snapshot.id} · ${snapshot.phase.toUpperCase()} · coordinator ${snapshot.coordinator} · ${snapshot.workers.length} workers`;
 				const status = `${snapshot.id}\n${teamStatus(snapshot)}`;
 				if (params.action !== "prepare") return status;
-				return `${status}\nBudget: ${(snapshot.deadline - snapshot.createdAt) / 1000}s total from prepare, including reasoning, tools, waiting and final summary.\nNext: emit BOTH coordinator single and all workers grouped with this teamId in ONE assistant message; do not wait between them.`;
+				return `${status}\nBudget: ${(snapshot.deadline - snapshot.createdAt) / 1000}s total from prepare, including reasoning, tools, waiting and final summary.\nNext: ${teamDispatchTemplate(snapshot)}`;
 			}).join("\n") || "No teams";
 			const next = params.action === "prepare"
-				? "Emit the designated child coordinator single call and all workers in one grouped parallel call as sibling subagent calls in the same assistant message. Messages are queued for receiving checkpoints; they do not wake or interrupt the hosting parent model."
+				? "Emit the two launch calls shown above as sibling subagent calls in the same assistant message; do not wait between them. Messages are queued for receiving checkpoints; they do not wake or interrupt the hosting parent model."
 				: "Use status with a specific teamId to inspect assignment/result previews and recent message routes. Previews are not full deliverables; structured results are retained in the native subagent result details and team journal. Listing teams returns summaries only. This response does not provide a live wakeup channel to the hosting parent model.";
 			const response = {
 				action: params.action,

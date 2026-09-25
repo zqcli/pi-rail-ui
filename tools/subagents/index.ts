@@ -27,7 +27,7 @@ import { SessionAgentRoster } from "./session-links";
 import { FileSessionLeaseManager } from "./session-lease";
 import { buildParentSessionLabel } from "./session-name";
 import { createStatelessAgentRunner } from "./stateless-runner";
-import { installStatefulSubagentTool } from "./tool";
+import { installStatefulSubagentTool, type TeamLauncher } from "./tool";
 import { createRpcWorkerFactory } from "./worker-factory";
 
 interface SubagentRuntime {
@@ -105,8 +105,9 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		return { cancelled: true };
 	};
 
-	installTeamTool(pi, () => getRuntime().team.hub);
-	installStatefulSubagentTool(pi, {
+	let teamLauncher: TeamLauncher | undefined;
+	installTeamTool(pi, () => getRuntime().team.hub, () => teamLauncher);
+	teamLauncher = installStatefulSubagentTool(pi, {
 		team: () => getRuntime().team,
 		broker: () => getRuntime().broker,
 		knownFastMode: (target) => runtime?.broker.knownFastMode(target),

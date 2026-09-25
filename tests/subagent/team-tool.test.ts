@@ -10,7 +10,7 @@ test("parent prepare/status/cancel handles null defaults and exposes no binding"
 	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
 	try {
 		assert.equal(tool.parameters.properties.action.type, "string");
-		assert.deepEqual(tool.parameters.properties.action.enum, ["prepare", "status", "cancel"]);
+		assert.deepEqual(tool.parameters.properties.action.enum, ["prepare", "launch", "status", "cancel"]);
 		assert.equal(tool.parameters.properties.action.anyOf, undefined);
 		await assert.rejects(tool.execute("bad-prepare", { action: "prepare", teamId: "ignored-id", coordinator: "A", workers: ["B"] }), /does not accept teamId/u);
 		assert.equal(hub.list().length, 0, "a rejected prepare must not create a team");

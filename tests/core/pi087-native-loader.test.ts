@@ -102,11 +102,11 @@ function assertParentTeamRegistration(observed: ObservedRegistrations): void {
 	assert.equal(observed.tools.includes("team"), false, "the parent must not expose the child-only team helper");
 	assert.ok(observed.activeTools.includes("subagent_team"), "the Team parent tool must be active");
 	const team = observedTool(observed, "subagent_team");
-	assert.deepEqual(observedEnum(team, "action"), ["prepare", "status", "cancel"]);
+	assert.deepEqual(observedEnum(team, "action"), ["prepare", "launch", "status", "cancel"]);
 	assert.ok(Object.hasOwn(team.parameters["properties"], "coordinator"));
 	assert.ok(Object.hasOwn(team.parameters["properties"], "workers"));
-	assert.match(team.description, /two sibling subagent calls/u);
-	assert.match(team.description, /same assistant message/u);
+	assert.match(team.description, /\{"action":"launch","teamId":"<teamId>"\}/u);
+	assert.match(team.description, /Do not use the subagent tool for team members/u);
 }
 
 function assertBoundTeamHelper(observed: ObservedRegistrations): void {

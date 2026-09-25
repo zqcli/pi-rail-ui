@@ -1,8 +1,15 @@
-import { TeamRunManager, teamCallSignal, teamDispatchTemplate, teamStatus } from "./team-runner";
+import {
+	deleteTeamLaunchPlan, TeamRunManager, teamCallSignal, teamDispatchTemplate, teamLaunchPlan, teamStatus,
+	type TeamLaunchPlan, type TeamMemberPlan,
+} from "./team-runner";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import {
+	type AgentToolResult, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type Theme,
+	type ToolRenderResultOptions,
+} from "@earendil-works/pi-coding-agent";
 import { type Component, type MarkdownTheme, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import { statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";
 import { supportsNativeFastMode, supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
@@ -30,7 +37,7 @@ import {
 	type SubagentTranscriptSnapshot,
 } from "./transcript";
 import { emptySubagentUsage } from "./usage";
-import type { TeamAssignment, TeamSnapshot, TeamTaskResult } from "./team-protocol";
+import type { TeamAssignment, TeamBinding, TeamSnapshot, TeamTaskResult } from "./team-protocol";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CHAIN_TASKS = 8;
@@ -103,7 +110,7 @@ const ChainItem = Type.Object({
 });
 
 const SubagentParams = Type.Object({
-	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Only after subagent_team prepare: the exact returned teamId; otherwise omit or null. A team launches with exactly two sibling calls in one assistant message: {teamId, alias:<coordinator>, task} and {teamId, tasks:[{alias:<worker>, task} for every worker]}. Workers always share one tasks array, even a single worker. Omit or null target, session, control and chain." })),
+	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Omit or null. Teams are started with subagent_team launch. Only a team prepared with alias strings (no member plan) is launched by two sibling subagent calls carrying its teamId." })),
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. In single mode, model+task without alias/session is stateless; model+alias+task creates persistent." })),
 	target: Type.Optional(Type.String({ description: "Continue the exact linked persistent alias or agentId and its existing conversation memory; do not also set model" })),
 	alias: Type.Optional(Type.String({ description: "Create a new persistent long-term helper expected to receive future follow-ups; omit for one-off stateless work" })),
@@ -705,11 +712,11 @@ function appendTeamStatus(text: string, snapshot?: TeamSnapshot): string {
 	return `${bounded}${separator}${status}`;
 }
 
-function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunDetails[]): string {
+function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunDetails[], label?: string): string {
 	const succeeded = results.filter((result) => result.status === "completed").length;
 	const completionLabel = results.some((result) => result.teamResult) ? "runtime completions" : "succeeded";
 	const summary = [
-		`${mode === "parallel" ? "Parallel" : "Chain"}: ${succeeded}/${results.length} ${completionLabel}`,
+		`${label ?? (mode === "parallel" ? "Parallel" : "Chain")}: ${succeeded}/${results.length} ${completionLabel}`,
 		...results.map((result) => {
 			const error = result.errorMessage?.replace(/\s+/gu, " ").trim();
 			const assignment = result.teamAssignment;
@@ -753,7 +760,36 @@ function nestedToolUsage(results: readonly StatefulSubagentRunDetails[]): Usage 
 	};
 }
 
-export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulSubagentToolOptions): void {
+export interface TeamPlanSummary {
+	alias: string;
+	role: "coordinator" | "worker";
+	model: string;
+	fastMode: boolean;
+	searchMode: "on" | "off";
+	cwd: string;
+}
+
+/** Starts a planned team through the same dispatch, rendering and cleanup path as subagent calls. */
+export interface TeamLauncher {
+	/** Resolves models, Fast eligibility, cwd and alias availability without starting anything. */
+	validate(plan: TeamLaunchPlan, ctx: ExtensionContext): Promise<TeamPlanSummary[]>;
+	launch(
+		toolCallId: string,
+		teamId: string,
+		plan: TeamLaunchPlan,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<StatefulSubagentDetails> | undefined,
+		ctx: ExtensionContext,
+	): Promise<AgentToolResult<StatefulSubagentDetails>>;
+	renderResult(
+		result: AgentToolResult<unknown>,
+		options: ToolRenderResultOptions,
+		theme: Theme,
+		context: { readonly toolCallId?: string } | undefined,
+	): Component;
+}
+
+export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulSubagentToolOptions): TeamLauncher {
 	const latestDetails = new Map<string, StatefulSubagentDetails>();
 	const actualTasksByCall = new Map<string, Map<number, string>>();
 	const actualTasksByDetails = new WeakMap<StatefulSubagentDetails, Map<number, string>>();
@@ -762,7 +798,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	const callHeaderInvalidators = new Map<string, () => void>();
 	const eventApi = pi as Partial<Pick<ExtensionAPI, "on">>;
 	eventApi.on?.("tool_result", (event) => {
-		if (event.toolName !== "subagent") return;
+		if (event.toolName !== "subagent" && event.toolName !== "subagent_team") return;
 		const details = latestDetails.get(event.toolCallId);
 		latestDetails.delete(event.toolCallId);
 		actualTasksByCall.delete(event.toolCallId);
@@ -785,6 +821,454 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		knownModel: knownModelForRender,
 		renderContext: options.renderContext,
 	};
+	const runDispatch = async (
+		toolCallId: string,
+		params: SubagentParamsValue,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<StatefulSubagentDetails> | undefined,
+		ctx: ExtensionContext,
+		launch?: { readonly plan: TeamLaunchPlan },
+	): Promise<AgentToolResult<StatefulSubagentDetails>> => {
+		let toolStartedAt = performance.now();
+		const teamId = nonEmpty(params.teamId ?? undefined);
+		const team = teamId !== undefined ? options.team?.() : undefined;
+		let teamScope: ReturnType<typeof teamCallSignal> | undefined;
+		let unsubscribeTeam: (() => void) | undefined;
+		let joinedTeam = false;
+		try {
+		if (teamId !== undefined && !team) throw new Error("Team runtime is not ready");
+		let mode: SubagentMode;
+		try {
+			mode = modeFor(params);
+			params = filterParamsForMode(params, mode);
+		} catch (error) {
+			// Show a team caller the exact call shape instead of only the rejected field.
+			let known: TeamSnapshot | undefined;
+			try { known = team && teamId !== undefined ? team.hub.get(teamId) : undefined; } catch { known = undefined; }
+			if (known && error instanceof Error) throw new Error(`${error.message}\n${teamDispatchTemplate(known)}`);
+			throw error;
+		}
+		const preparedSnapshot = team && teamId !== undefined ? preparedTeam(team, teamId) : undefined;
+		if (preparedSnapshot && !launch) {
+			if (teamLaunchPlan(team!.hub, preparedSnapshot.id)) {
+				throw new Error(`Team ${preparedSnapshot.id} was prepared with a launch plan. Start it with subagent_team {"action":"launch","teamId":"${preparedSnapshot.id}"} instead of subagent calls.`);
+			}
+			assertTeamDispatchBatch(toolCallId, preparedSnapshot, ctx);
+		}
+		const actualTasks = new Map<number, string>();
+		actualTasksByCall.set(toolCallId, actualTasks);
+		const dispatchMetadata = new Map<number, DispatchDisplayMetadata>();
+		dispatchMetadataByCall.set(toolCallId, dispatchMetadata);
+		const liveResults = new Map<number, StatefulSubagentRunDetails>();
+		const runStartedAt = new Map<number, number>();
+		const runDuration = (slot: number) => Math.max(0, Math.round(performance.now() - (runStartedAt.get(slot) ?? performance.now())));
+		const setDispatchMetadata = (
+			item: TaskParams,
+			slot: number,
+			actual?: { model: RailModelRef; fastMode: boolean | undefined },
+		) => {
+			const model = actual
+				? nativeModelForRailRef(actual.model, ctx)
+				: displayModelForSlot(item, undefined, displaySources, ctx);
+			const fastModePolicy = actual
+				? actual.fastMode
+				: item.target
+					? knownFastModeForRender(item.target)
+					: item.fastMode === true;
+			const metadata: DispatchDisplayMetadata = {
+				contextWindowText: formatContextWindowForDisplay(item.contextWindow),
+				fastModeText: effectiveFastModeText(fastModePolicy, model),
+				searchModeText: effectiveSearchModeText(model),
+			};
+			dispatchMetadata.set(slot, metadata);
+			callHeaderInvalidators.get(toolCallId)?.();
+		};
+		const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => {
+			if (team && teamId !== undefined) {
+				const members = new Map(team.hub.get(teamId).members.map((member) => [member.id, member]));
+				results = results.map((result) => {
+					const member = members.get(result.alias);
+					return member ? {
+						...result,
+						coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
+						...(member.assignment ? { teamAssignment: member.assignment } : {}),
+						...(member.result ? { teamResult: member.result } : {}),
+					} : result;
+				});
+			}
+			const details: StatefulSubagentDetails = {
+				mode,
+				results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
+				durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
+			};
+			actualTasksByDetails.set(details, actualTasks);
+			dispatchMetadataByDetails.set(details, dispatchMetadata);
+			return details;
+		};
+		if (mode === "control") {
+			if (!params.target?.trim()) throw new Error("Control mode requires target for an existing persistent subagent");
+			const message = params.control!.message.trim();
+			if (!message) throw new Error("Subagent control message cannot be empty");
+			if (signal?.aborted) throw new Error("Subagent control was aborted before delivery");
+			const broker = typeof options.broker === "function" ? options.broker() : options.broker;
+			try {
+				const controlled = await broker.control({
+					target: params.target.trim(),
+					delivery: params.control!.delivery,
+					message,
+					...(signal ? { signal } : {}),
+				});
+				const label = controlled.delivery === "steer" ? "Steer" : "Follow-up";
+				const output = `${label} accepted by ${controlled.instance.alias}`;
+				const result: StatefulSubagentRunDetails = {
+					agentId: controlled.instance.agentId,
+					alias: controlled.instance.alias,
+					model: railModelReference(controlled.instance.model),
+					sessionId: controlled.instance.sessionId,
+					task: message,
+					status: "accepted",
+					output,
+					usage: emptySubagentUsage(),
+					durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
+					stopReason: "accepted",
+					persistent: true,
+				};
+				const details = resultDetails([result]);
+				latestDetails.set(toolCallId, details);
+				return { content: [{ type: "text", text: output }], details };
+			} catch (error) {
+				const failed = errorResult(
+					{ target: params.target.trim(), task: message },
+					error,
+					Math.max(0, Math.round(performance.now() - toolStartedAt)),
+					signal?.aborted ?? false,
+				);
+				latestDetails.set(toolCallId, resultDetails([failed]));
+				throw error;
+			}
+		}
+		const orderedLiveResults = () => [...liveResults.entries()]
+			.sort(([left], [right]) => left - right)
+			.map(([slot, item]) => ({ ...item, slot }));
+		const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
+			liveResults.set(slot, result);
+			const details = resultDetails(orderedLiveResults());
+			latestDetails.set(toolCallId, details);
+			onUpdate?.({
+				content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") + (team && teamId ? `\n${teamStatus(team.hub.get(teamId))}` : "") }],
+				details,
+			});
+		};
+		const requestedItems: TaskParams[] = mode === "single"
+			? [{ ...params, task: params.task! } as TaskParams]
+			: (mode === "parallel" ? params.tasks! : params.chain!) as TaskParams[];
+		requestedItems.forEach((item, index) => setDispatchMetadata(item, index));
+		if (mode === "parallel" && !launch && requestedItems.length > MAX_PARALLEL_TASKS) {
+			throw new Error(`Too many parallel tasks (${requestedItems.length}); max is ${MAX_PARALLEL_TASKS}`);
+		}
+		if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
+			throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
+		}
+		const teamModels = team ? requestedItems.map((item) => resolveRailModel(item.model, ctx)) : undefined;
+		for (const [index, item] of requestedItems.entries()) {
+			const model = teamModels?.[index];
+			if (item.fastMode === true) effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : modelForFastMode(item, ctx));
+		}
+		const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
+		const broker = contextTargetItems.length > 0
+			? (typeof options.broker === "function" ? options.broker() : options.broker)
+			: undefined;
+		// Pin budgeted selections before asynchronous preflight/confirmation so a parent
+		// model switch cannot change the child after its reserve was validated.
+		const budgetModels = requestedItems.map((item, index) => !item.target && item.contextWindow != null ? teamModels?.[index] ?? resolveRailModel(item.model, ctx) : undefined);
+		await validateTaskContextWindows(requestedItems, budgetModels, broker, ctx.cwd);
+		const sessionAttachments = requestedItems.filter((item) => item.session != null);
+		if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
+			if (!ctx.hasUI) throw new Error("Attaching an existing session requires UI confirmation or confirmSessionAttach=false");
+			const approved = await ctx.ui.confirm(
+				"Attach existing session as a Rail model session?",
+				sessionAttachments
+					.map((item) => `${item.alias ?? item.model ?? "current-model"}: ${item.session!.mode} ${item.session!.path}`)
+					.join("\n"),
+			);
+			if (!approved) throw new Error("Existing session attachment was not approved");
+		}
+		const teamCwds = team
+			? await Promise.all(requestedItems.map(async (item) => resolvePath(await resolveChildContextCwd(item.cwd ?? ctx.cwd, item.session ?? undefined))))
+			: undefined;
+		const teamAssignments = team && teamModels && teamCwds
+			? requestedItems.map((item, index) => {
+				const model = teamModels[index]!;
+				const native = nativeModelForRailRef(model, ctx);
+				const fastRequest = effectiveFastModeRequest(item, native);
+				return {
+					...(item.alias ? { alias: item.alias } : {}),
+					task: item.task,
+					cwd: teamCwds[index]!,
+					model: railModelReference(model),
+					fastMode: effectiveFastModeText(fastRequest, native) === "on",
+					searchMode: effectiveSearchModeText(native),
+				};
+			})
+			: undefined;
+		let bindings: TeamBinding[] | undefined;
+		if (team && teamId !== undefined && teamAssignments) {
+			if (launch) {
+				// The host admits both sides of a planned team itself; there is no second model-authored call to pair.
+				const [coordinator, ...workers] = teamAssignments;
+				bindings = team.join(teamId, "single", [coordinator!]);
+				joinedTeam = true;
+				bindings = [...bindings, ...team.join(teamId, "parallel", workers)];
+				deleteTeamLaunchPlan(team.hub, teamId);
+			} else bindings = team.join(teamId, mode, teamAssignments);
+		}
+		joinedTeam = bindings !== undefined;
+		if (team && teamId !== undefined) {
+			teamScope = teamCallSignal(team.hub, teamId, signal);
+			signal = teamScope.signal;
+			unsubscribeTeam = team.hub.subscribe((snapshot) => {
+				if (snapshot.id !== teamId) return;
+				const details = resultDetails(orderedLiveResults());
+				latestDetails.set(toolCallId, details);
+				onUpdate?.({ content: [{ type: "text", text: teamStatus(snapshot) }], details });
+			});
+		}
+		toolStartedAt = performance.now();
+
+		const dispatch = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
+			actualTasks.set(slot, item.task);
+			runStartedAt.set(slot, performance.now());
+			const duration = () => runDuration(slot);
+			if (signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
+			if (item.target && item.model) throw new Error("A follow-up target cannot also select a model");
+			const persistent = isPersistentTask(item);
+			if (!persistent) {
+				if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
+				const model = teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
+				const fastMode = effectiveFastModeRequest(item, nativeModelForRailRef(model, ctx));
+				setDispatchMetadata(item, slot, { model, fastMode });
+				const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
+				publishLive(slot, {
+					alias,
+					model: railModelReference(model),
+					task: item.task,
+					status: "running",
+					output: "(starting...)",
+					usage: emptySubagentUsage(),
+					durationMs: duration(),
+					...(step !== undefined ? { step } : {}),
+					persistent: false,
+				});
+				const run = await options.runStateless({
+					model,
+					task: item.task,
+					cwd: item.cwd ?? ctx.cwd,
+					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
+					...(fastMode !== undefined ? { fastMode } : {}),
+					...(signal ? { signal } : {}),
+					onUpdate: (partial) => publishLive(slot, {
+						alias,
+						model: railModelReference(model),
+						task: item.task,
+						status: "running",
+						output: partial.output,
+						...(partial.transcript ? { transcript: partial.transcript } : {}),
+						...(partial.isCompacting ? { isCompacting: true } : {}),
+						usage: partial.usage,
+						durationMs: duration(),
+						...(step !== undefined ? { step } : {}),
+						persistent: false,
+					}),
+				});
+				const result = compactStatelessResult(alias, model, item.task, run, duration(), step);
+				publishLive(slot, result);
+				return result;
+			}
+			const model = item.target ? undefined : teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
+			const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
+			// A coordinator cancel aborts only this member; the tool-level signal stays team-wide.
+			const memberSignal = team && bindings?.[slot] ? team.hub.memberSignal(teamId!, bindings[slot]!.memberId) : undefined;
+			const dispatchSignal = memberSignal && signal ? AbortSignal.any([signal, memberSignal]) : signal;
+			const request: DispatchRequest = {
+				...(team && bindings?.[slot] ? { team: team.channel(bindings[slot]!) } : {}),
+				...(model ? { model } : {}),
+				...(item.target ? { target: item.target } : {}),
+				...(item.alias ? { alias: item.alias } : {}),
+				task: item.task,
+				...(team ? { cwd: teamCwds?.[slot] ?? resolvePath(item.cwd ?? ctx.cwd) } : item.cwd ? { cwd: item.cwd } : {}),
+				...(item.session ? { session: item.session } : {}),
+				...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
+				...(fastMode !== undefined ? { fastMode } : {}),
+				...(dispatchSignal ? { signal: dispatchSignal } : {}),
+				onUpdate: ({ instance, run: partial }) => {
+					setDispatchMetadata(item, slot, { model: instance.model, fastMode: instance.fastMode === true });
+					publishLive(slot, {
+						agentId: instance.agentId,
+						alias: instance.alias,
+						model: railModelReference(instance.model),
+						sessionId: instance.sessionId,
+						task: item.task,
+						status: "running",
+						output: partial.output,
+						...(partial.transcript ? { transcript: partial.transcript } : {}),
+						...(partial.isCompacting ? { isCompacting: true } : {}),
+						usage: partial.usage,
+						durationMs: duration(),
+						...(step !== undefined ? { step } : {}),
+						persistent: true,
+					});
+				},
+			};
+			if (request.team && model) {
+				// A member may pause at its very first native gate, before any
+				// transcript update exists. Keep its slot visible during startup.
+				publishLive(slot, {
+					alias: item.alias!, model: railModelReference(model), task: item.task,
+					status: "running", output: "(starting...)", usage: emptySubagentUsage(),
+					durationMs: duration(), persistent: true,
+				});
+			}
+			const broker = typeof options.broker === "function" ? options.broker() : options.broker;
+			const dispatched = await broker.dispatch(request);
+			setDispatchMetadata(item, slot, { model: dispatched.instance.model, fastMode: dispatched.instance.fastMode === true });
+			let result = compactPersistentResult(dispatched, item.task, duration(), step);
+			if (team && bindings?.[slot]) {
+				const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
+				if (member) {
+					result = {
+						...result,
+						coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
+						...(member.assignment ? { teamAssignment: member.assignment } : {}),
+						...(member.result ? { teamResult: member.result } : {}),
+					};
+				}
+				if (member && ["failed", "cancelled"].includes(member.state) && result.status !== "failed") {
+					result = {
+						...result,
+						status: "failed",
+						output: member.output ?? result.output,
+						...(member.error ? { errorMessage: truncateParentContent(member.error), stopReason: member.state === "cancelled" ? "aborted" : "error" } : {}),
+					};
+				}
+			}
+			const nativeErrorMessage = runErrorMessage(dispatched.run);
+			if (team && bindings?.[slot] && result.status === "failed" && nativeErrorMessage) {
+				const nativeError = new Error(nativeErrorMessage);
+				const error = team.dispatchError(bindings[slot]!, nativeError);
+				if (error !== nativeError) result = errorResult(item, error, duration(), signal?.aborted ?? false, step, result);
+			}
+			publishLive(slot, result);
+			return result;
+		};
+
+		const runTask = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
+			try {
+				return await dispatch(item, slot, step);
+			} catch (error) {
+				let cancelledByCoordinator = false;
+				if (team && bindings?.[slot]) {
+					const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
+					cancelledByCoordinator = member?.state === "cancelled" && team.hub.memberSignal(teamId!, member.id).aborted;
+					// Resolve the established Hub cause before this failure can cancel peers.
+					error = cancelledByCoordinator ? new Error(member!.error ?? "Cancelled by coordinator", { cause: error })
+						: team.dispatchError(bindings[slot]!, error);
+					team.fail(bindings[slot]!, error, signal?.aborted);
+				}
+				const result = errorResult(item, error, runDuration(slot), (signal?.aborted ?? false) || cancelledByCoordinator, step, liveResults.get(slot));
+				publishLive(slot, result);
+				return result;
+			}
+		};
+
+		if (mode === "single") {
+			const result = await runTask(requestedItems[0]!, 0);
+			if (result.status === "failed") throw new Error(finalText(result));
+			const details = resultDetails([result]);
+			latestDetails.set(toolCallId, details);
+			const usage = nestedToolUsage(details.results);
+			return { content: [{ type: "text", text: appendTeamStatus(finalText(result), team && teamId ? team.hub.get(teamId) : undefined) }], details, ...(usage ? { usage } : {}) };
+		}
+		if (mode === "parallel") {
+			let results: StatefulSubagentRunDetails[];
+			if (bindings) {
+				// Even an unexpected progress/finalization failure must not release the
+				// grouped call while another member is starting or cleaning its lease.
+				const settled = await Promise.allSettled(requestedItems.map((item, index) => runTask(item, index)));
+				results = settled.map((result) => { if (result.status === "rejected") throw result.reason; return result.value; });
+			} else results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
+			const details = resultDetails(results);
+			latestDetails.set(toolCallId, details);
+			const usage = nestedToolUsage(details.results);
+			const text = appendTeamStatus(aggregateText(mode, results, launch ? "Team" : undefined), team && teamId ? team.hub.get(teamId) : undefined);
+			// A planned team succeeds or fails with its coordinator, like the coordinator's own single call.
+			if (launch && results[0]?.status === "failed") throw new Error(text);
+			return { content: [{ type: "text", text }], details, ...(usage ? { usage } : {}) };
+		}
+		const results: StatefulSubagentRunDetails[] = [];
+		let previous = "";
+		for (let index = 0; index < requestedItems.length; index++) {
+			const raw = requestedItems[index]!;
+			const item = { ...raw, task: raw.task.replaceAll("{previous}", previous) };
+			const result = await runTask(item, index, index + 1);
+			results.push(result);
+			if (result.status === "failed") break;
+			previous = result.output;
+		}
+		const details = resultDetails(results);
+		latestDetails.set(toolCallId, details);
+		const usage = nestedToolUsage(details.results);
+		return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
+		} catch (error) {
+			if (joinedTeam && team && teamId !== undefined) {
+				try { team.hub.cancel(teamId, error instanceof Error ? error.message : String(error)); }
+				catch { /* An unknown team must not replace the original validation error. */ }
+			}
+			throw error;
+		} finally { unsubscribeTeam?.(); teamScope?.dispose(); }
+	};
+
+	const renderDispatchResult = (
+		result: AgentToolResult<unknown>,
+		{ expanded, isPartial }: ToolRenderResultOptions,
+		theme: Theme,
+		context: { readonly toolCallId?: string; readonly args?: SubagentParamsValue } | undefined,
+	): Component => {
+		if (context?.toolCallId && !isPartial) callHeaderInvalidators.delete(context.toolCallId);
+		const details = result.details as StatefulSubagentDetails | undefined;
+		if (!details?.results.length) {
+			const content = result.content[0];
+			return new Text(content?.type === "text" ? content.text : "(no output)", 0, 0);
+		}
+		const isControl = details.mode === "control" || Boolean(context?.args?.control?.message);
+		const actualTasks = (context?.toolCallId ? actualTasksByCall.get(context.toolCallId) : undefined)
+			?? actualTasksByDetails.get(details);
+		const dispatchMetadata = isControl ? [] : dispatchMetadataForRender(
+			context?.args,
+			details.mode,
+			details.results.length,
+			(context?.toolCallId ? dispatchMetadataByCall.get(context.toolCallId) : undefined) ?? dispatchMetadataByDetails.get(details),
+			displaySources,
+			resultModelsBySlot(details.results),
+		);
+		const fallbackTasks = details.results.map((run) => run.transcript?.entries.some((entry) => entry.initial)
+			? undefined
+			: run.task);
+		return renderSubagentTranscript(details.results, expanded, theme, {
+			isPartial,
+			durationMs: details.durationMs,
+			initialTasks: initialTasksForRender(context?.args, details.mode, details.results.length, actualTasks, fallbackTasks),
+			mode: details.mode,
+			...(isControl ? { control: true } : {}),
+			...(details.mode === "chain" ? { sequenceTotal: context?.args?.chain?.length ?? details.results.length } : {}),
+			...(dispatchMetadata.length > 0 ? {
+				contextWindows: dispatchMetadata.map((item) => item.contextWindowText),
+				fastModes: dispatchMetadata.map((item) => item.fastModeText),
+				searchModes: dispatchMetadata.map((item) => item.searchModeText),
+			} : {}),
+			markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),
+		});
+	};
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -799,7 +1283,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
 			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Parallel and chain calls may set fastMode independently on each eligible item; do not set a grouped top-level fastMode or put it on an existing target or control call. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Grouped child panels show each item's effective FAST and SEARCH state.\n"
-			+ "Team dispatch: the host is not a team member or coordinator. Use subagent_team prepare with the shared goal/target/URL, acceptance criteria, constraints and per-member allowed/forbidden operations in brief; make every worker task self-contained. Then launch with exactly two sibling subagent calls in one assistant message, using the teamId and aliases from prepare: {\"teamId\":\"<teamId>\",\"alias\":\"<coordinator>\",\"task\":\"...\"} and {\"teamId\":\"<teamId>\",\"tasks\":[{\"alias\":\"<worker>\",\"task\":\"...\"}, ...one item per worker]}. Workers always share one tasks array, even a single worker. Omit target, session, control and chain or set them to null. Ordinary team send queues work for a recipient checkpoint; it does not immediately stop an active turn or wake the hosting parent model. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
+			+ "Team dispatch: the host is not a team member or coordinator. Run teams with the subagent_team tool, not with subagent: prepare with the complete member plan (coordinator and workers, each with alias and task) plus shared brief, then launch with only the returned teamId in the next message. Ordinary team send queues work for a recipient checkpoint; it does not immediately stop an active turn or wake the hosting parent model. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
 		promptGuidelines: [
@@ -811,8 +1295,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
 			"Use contextWindow:null by default. Null or omission uses the selected child model's native default. Only use a positive integer when the user explicitly requests a specific child context or compaction budget; for parallel and chain calls, put an explicit numeric value on the individual item that owns it.",
 			"Use fastMode:true only for a stateless call or a new persistent agent. On a non-GPT model it is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Keep fastMode null or omitted by default. For parallel and chain, put fastMode on the individual item that owns it; do not use a grouped top-level fastMode or put it on an existing target or control call. Existing persistent target policy is managed through /rail-agent. Hosted Search is an internal policy with no search parameter; grouped child panels show each item's effective FAST and SEARCH state.",
-			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently. Team launches are the exception: all workers of a prepared team go in one tasks array.",
-			"Use the tasks array when the user wants one grouped subagent Tool Call with multiple child panels, and always for the workers of a prepared team. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
+			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
+			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Team members are started by subagent_team launch, never by subagent. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
 			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call; contextWindow must be null or omitted, never numeric. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
 			"When a child asks for input or another specialist in its ordinary final answer (for example by using the plain-language labels needs_input or specialist_request), keep orchestration in the parent: resolve the question or dispatch the specialist, then continue the original persistent child with target+task. These labels are guidance, not a structured wire protocol. Do not enable recursive child subagent calls.",
 			"When the user names @agent/<alias> or agent://<alias>, use subagent with target set to that exact alias.",
@@ -832,388 +1316,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			}
 		},
 
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			let toolStartedAt = performance.now();
-			const teamId = nonEmpty(params.teamId ?? undefined);
-			const team = teamId !== undefined ? options.team?.() : undefined;
-			let teamScope: ReturnType<typeof teamCallSignal> | undefined;
-			let unsubscribeTeam: (() => void) | undefined;
-			let joinedTeam = false;
-			try {
-			if (teamId !== undefined && !team) throw new Error("Team runtime is not ready");
-			let mode: SubagentMode;
-			try {
-				mode = modeFor(params);
-				params = filterParamsForMode(params, mode);
-			} catch (error) {
-				// Show a team caller the exact call shape instead of only the rejected field.
-				let known: TeamSnapshot | undefined;
-				try { known = team && teamId !== undefined ? team.hub.get(teamId) : undefined; } catch { known = undefined; }
-				if (known && error instanceof Error) throw new Error(`${error.message}\n${teamDispatchTemplate(known)}`);
-				throw error;
-			}
-			const preparedSnapshot = team && teamId !== undefined ? preparedTeam(team, teamId) : undefined;
-			if (preparedSnapshot) assertTeamDispatchBatch(toolCallId, preparedSnapshot, ctx);
-			const actualTasks = new Map<number, string>();
-			actualTasksByCall.set(toolCallId, actualTasks);
-			const dispatchMetadata = new Map<number, DispatchDisplayMetadata>();
-			dispatchMetadataByCall.set(toolCallId, dispatchMetadata);
-			const liveResults = new Map<number, StatefulSubagentRunDetails>();
-			const runStartedAt = new Map<number, number>();
-			const runDuration = (slot: number) => Math.max(0, Math.round(performance.now() - (runStartedAt.get(slot) ?? performance.now())));
-			const setDispatchMetadata = (
-				item: TaskParams,
-				slot: number,
-				actual?: { model: RailModelRef; fastMode: boolean | undefined },
-			) => {
-				const model = actual
-					? nativeModelForRailRef(actual.model, ctx)
-					: displayModelForSlot(item, undefined, displaySources, ctx);
-				const fastModePolicy = actual
-					? actual.fastMode
-					: item.target
-						? knownFastModeForRender(item.target)
-						: item.fastMode === true;
-				const metadata: DispatchDisplayMetadata = {
-					contextWindowText: formatContextWindowForDisplay(item.contextWindow),
-					fastModeText: effectiveFastModeText(fastModePolicy, model),
-					searchModeText: effectiveSearchModeText(model),
-				};
-				dispatchMetadata.set(slot, metadata);
-				callHeaderInvalidators.get(toolCallId)?.();
-			};
-			const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => {
-				if (team && teamId !== undefined) {
-					const members = new Map(team.hub.get(teamId).members.map((member) => [member.id, member]));
-					results = results.map((result) => {
-						const member = members.get(result.alias);
-						return member ? {
-							...result,
-							coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
-							...(member.assignment ? { teamAssignment: member.assignment } : {}),
-							...(member.result ? { teamResult: member.result } : {}),
-						} : result;
-					});
-				}
-				const details: StatefulSubagentDetails = {
-					mode,
-					results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
-					durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
-				};
-				actualTasksByDetails.set(details, actualTasks);
-				dispatchMetadataByDetails.set(details, dispatchMetadata);
-				return details;
-			};
-			if (mode === "control") {
-				if (!params.target?.trim()) throw new Error("Control mode requires target for an existing persistent subagent");
-				const message = params.control!.message.trim();
-				if (!message) throw new Error("Subagent control message cannot be empty");
-				if (signal?.aborted) throw new Error("Subagent control was aborted before delivery");
-				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
-				try {
-					const controlled = await broker.control({
-						target: params.target.trim(),
-						delivery: params.control!.delivery,
-						message,
-						...(signal ? { signal } : {}),
-					});
-					const label = controlled.delivery === "steer" ? "Steer" : "Follow-up";
-					const output = `${label} accepted by ${controlled.instance.alias}`;
-					const result: StatefulSubagentRunDetails = {
-						agentId: controlled.instance.agentId,
-						alias: controlled.instance.alias,
-						model: railModelReference(controlled.instance.model),
-						sessionId: controlled.instance.sessionId,
-						task: message,
-						status: "accepted",
-						output,
-						usage: emptySubagentUsage(),
-						durationMs: Math.max(0, Math.round(performance.now() - toolStartedAt)),
-						stopReason: "accepted",
-						persistent: true,
-					};
-					const details = resultDetails([result]);
-					latestDetails.set(toolCallId, details);
-					return { content: [{ type: "text", text: output }], details };
-				} catch (error) {
-					const failed = errorResult(
-						{ target: params.target.trim(), task: message },
-						error,
-						Math.max(0, Math.round(performance.now() - toolStartedAt)),
-						signal?.aborted ?? false,
-					);
-					latestDetails.set(toolCallId, resultDetails([failed]));
-					throw error;
-				}
-			}
-			const orderedLiveResults = () => [...liveResults.entries()]
-				.sort(([left], [right]) => left - right)
-				.map(([slot, item]) => ({ ...item, slot }));
-			const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
-				liveResults.set(slot, result);
-				const details = resultDetails(orderedLiveResults());
-				latestDetails.set(toolCallId, details);
-				onUpdate?.({
-					content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") + (team && teamId ? `\n${teamStatus(team.hub.get(teamId))}` : "") }],
-					details,
-				});
-			};
-			const requestedItems: TaskParams[] = mode === "single"
-				? [{ ...params, task: params.task! } as TaskParams]
-				: (mode === "parallel" ? params.tasks! : params.chain!) as TaskParams[];
-			requestedItems.forEach((item, index) => setDispatchMetadata(item, index));
-			if (mode === "parallel" && requestedItems.length > MAX_PARALLEL_TASKS) {
-				throw new Error(`Too many parallel tasks (${requestedItems.length}); max is ${MAX_PARALLEL_TASKS}`);
-			}
-			if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
-				throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
-			}
-			const teamModels = team ? requestedItems.map((item) => resolveRailModel(item.model, ctx)) : undefined;
-			for (const [index, item] of requestedItems.entries()) {
-				const model = teamModels?.[index];
-				if (item.fastMode === true) effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : modelForFastMode(item, ctx));
-			}
-			const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
-			const broker = contextTargetItems.length > 0
-				? (typeof options.broker === "function" ? options.broker() : options.broker)
-				: undefined;
-			// Pin budgeted selections before asynchronous preflight/confirmation so a parent
-			// model switch cannot change the child after its reserve was validated.
-			const budgetModels = requestedItems.map((item, index) => !item.target && item.contextWindow != null ? teamModels?.[index] ?? resolveRailModel(item.model, ctx) : undefined);
-			await validateTaskContextWindows(requestedItems, budgetModels, broker, ctx.cwd);
-			const sessionAttachments = requestedItems.filter((item) => item.session != null);
-			if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
-				if (!ctx.hasUI) throw new Error("Attaching an existing session requires UI confirmation or confirmSessionAttach=false");
-				const approved = await ctx.ui.confirm(
-					"Attach existing session as a Rail model session?",
-					sessionAttachments
-						.map((item) => `${item.alias ?? item.model ?? "current-model"}: ${item.session!.mode} ${item.session!.path}`)
-						.join("\n"),
-				);
-				if (!approved) throw new Error("Existing session attachment was not approved");
-			}
-			const teamCwds = team
-				? await Promise.all(requestedItems.map(async (item) => resolvePath(await resolveChildContextCwd(item.cwd ?? ctx.cwd, item.session ?? undefined))))
-				: undefined;
-			const teamAssignments = team && teamModels && teamCwds
-				? requestedItems.map((item, index) => {
-					const model = teamModels[index]!;
-					const native = nativeModelForRailRef(model, ctx);
-					const fastRequest = effectiveFastModeRequest(item, native);
-					return {
-						...(item.alias ? { alias: item.alias } : {}),
-						task: item.task,
-						cwd: teamCwds[index]!,
-						model: railModelReference(model),
-						fastMode: effectiveFastModeText(fastRequest, native) === "on",
-						searchMode: effectiveSearchModeText(native),
-					};
-				})
-				: undefined;
-			const bindings = team && teamId !== undefined && teamAssignments
-				? team.join(teamId, mode, teamAssignments)
-				: undefined;
-			joinedTeam = bindings !== undefined;
-			if (team && teamId !== undefined) {
-				teamScope = teamCallSignal(team.hub, teamId, signal);
-				signal = teamScope.signal;
-				unsubscribeTeam = team.hub.subscribe((snapshot) => {
-					if (snapshot.id !== teamId) return;
-					const details = resultDetails(orderedLiveResults());
-					latestDetails.set(toolCallId, details);
-					onUpdate?.({ content: [{ type: "text", text: teamStatus(snapshot) }], details });
-				});
-			}
-			toolStartedAt = performance.now();
-
-			const dispatch = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
-				actualTasks.set(slot, item.task);
-				runStartedAt.set(slot, performance.now());
-				const duration = () => runDuration(slot);
-				if (signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
-				if (item.target && item.model) throw new Error("A follow-up target cannot also select a model");
-				const persistent = isPersistentTask(item);
-				if (!persistent) {
-					if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
-					const model = teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
-					const fastMode = effectiveFastModeRequest(item, nativeModelForRailRef(model, ctx));
-					setDispatchMetadata(item, slot, { model, fastMode });
-					const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
-					publishLive(slot, {
-						alias,
-						model: railModelReference(model),
-						task: item.task,
-						status: "running",
-						output: "(starting...)",
-						usage: emptySubagentUsage(),
-						durationMs: duration(),
-						...(step !== undefined ? { step } : {}),
-						persistent: false,
-					});
-					const run = await options.runStateless({
-						model,
-						task: item.task,
-						cwd: item.cwd ?? ctx.cwd,
-						...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
-						...(fastMode !== undefined ? { fastMode } : {}),
-						...(signal ? { signal } : {}),
-						onUpdate: (partial) => publishLive(slot, {
-							alias,
-							model: railModelReference(model),
-							task: item.task,
-							status: "running",
-							output: partial.output,
-							...(partial.transcript ? { transcript: partial.transcript } : {}),
-							...(partial.isCompacting ? { isCompacting: true } : {}),
-							usage: partial.usage,
-							durationMs: duration(),
-							...(step !== undefined ? { step } : {}),
-							persistent: false,
-						}),
-					});
-					const result = compactStatelessResult(alias, model, item.task, run, duration(), step);
-					publishLive(slot, result);
-					return result;
-				}
-				const model = item.target ? undefined : teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
-				const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
-				// A coordinator cancel aborts only this member; the tool-level signal stays team-wide.
-				const memberSignal = team && bindings?.[slot] ? team.hub.memberSignal(teamId!, bindings[slot]!.memberId) : undefined;
-				const dispatchSignal = memberSignal && signal ? AbortSignal.any([signal, memberSignal]) : signal;
-				const request: DispatchRequest = {
-					...(team && bindings?.[slot] ? { team: team.channel(bindings[slot]!) } : {}),
-					...(model ? { model } : {}),
-					...(item.target ? { target: item.target } : {}),
-					...(item.alias ? { alias: item.alias } : {}),
-					task: item.task,
-					...(team ? { cwd: teamCwds?.[slot] ?? resolvePath(item.cwd ?? ctx.cwd) } : item.cwd ? { cwd: item.cwd } : {}),
-					...(item.session ? { session: item.session } : {}),
-					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
-					...(fastMode !== undefined ? { fastMode } : {}),
-					...(dispatchSignal ? { signal: dispatchSignal } : {}),
-					onUpdate: ({ instance, run: partial }) => {
-						setDispatchMetadata(item, slot, { model: instance.model, fastMode: instance.fastMode === true });
-						publishLive(slot, {
-							agentId: instance.agentId,
-							alias: instance.alias,
-							model: railModelReference(instance.model),
-							sessionId: instance.sessionId,
-							task: item.task,
-							status: "running",
-							output: partial.output,
-							...(partial.transcript ? { transcript: partial.transcript } : {}),
-							...(partial.isCompacting ? { isCompacting: true } : {}),
-							usage: partial.usage,
-							durationMs: duration(),
-							...(step !== undefined ? { step } : {}),
-							persistent: true,
-						});
-					},
-				};
-				if (request.team && model) {
-					// A member may pause at its very first native gate, before any
-					// transcript update exists. Keep its slot visible during startup.
-					publishLive(slot, {
-						alias: item.alias!, model: railModelReference(model), task: item.task,
-						status: "running", output: "(starting...)", usage: emptySubagentUsage(),
-						durationMs: duration(), persistent: true,
-					});
-				}
-				const broker = typeof options.broker === "function" ? options.broker() : options.broker;
-				const dispatched = await broker.dispatch(request);
-				setDispatchMetadata(item, slot, { model: dispatched.instance.model, fastMode: dispatched.instance.fastMode === true });
-				let result = compactPersistentResult(dispatched, item.task, duration(), step);
-				if (team && bindings?.[slot]) {
-					const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
-					if (member) {
-						result = {
-							...result,
-							coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
-							...(member.assignment ? { teamAssignment: member.assignment } : {}),
-							...(member.result ? { teamResult: member.result } : {}),
-						};
-					}
-					if (member && ["failed", "cancelled"].includes(member.state) && result.status !== "failed") {
-						result = {
-							...result,
-							status: "failed",
-							output: member.output ?? result.output,
-							...(member.error ? { errorMessage: truncateParentContent(member.error), stopReason: member.state === "cancelled" ? "aborted" : "error" } : {}),
-						};
-					}
-				}
-				const nativeErrorMessage = runErrorMessage(dispatched.run);
-				if (team && bindings?.[slot] && result.status === "failed" && nativeErrorMessage) {
-					const nativeError = new Error(nativeErrorMessage);
-					const error = team.dispatchError(bindings[slot]!, nativeError);
-					if (error !== nativeError) result = errorResult(item, error, duration(), signal?.aborted ?? false, step, result);
-				}
-				publishLive(slot, result);
-				return result;
-			};
-
-			const runTask = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
-				try {
-					return await dispatch(item, slot, step);
-				} catch (error) {
-					let cancelledByCoordinator = false;
-					if (team && bindings?.[slot]) {
-						const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
-						cancelledByCoordinator = member?.state === "cancelled" && team.hub.memberSignal(teamId!, member.id).aborted;
-						// Resolve the established Hub cause before this failure can cancel peers.
-						error = cancelledByCoordinator ? new Error(member!.error ?? "Cancelled by coordinator", { cause: error })
-							: team.dispatchError(bindings[slot]!, error);
-						team.fail(bindings[slot]!, error, signal?.aborted);
-					}
-					const result = errorResult(item, error, runDuration(slot), (signal?.aborted ?? false) || cancelledByCoordinator, step, liveResults.get(slot));
-					publishLive(slot, result);
-					return result;
-				}
-			};
-
-			if (mode === "single") {
-				const result = await runTask(requestedItems[0]!, 0);
-				if (result.status === "failed") throw new Error(finalText(result));
-				const details = resultDetails([result]);
-				latestDetails.set(toolCallId, details);
-				const usage = nestedToolUsage(details.results);
-				return { content: [{ type: "text", text: appendTeamStatus(finalText(result), team && teamId ? team.hub.get(teamId) : undefined) }], details, ...(usage ? { usage } : {}) };
-			}
-			if (mode === "parallel") {
-				let results: StatefulSubagentRunDetails[];
-				if (bindings) {
-					// Even an unexpected progress/finalization failure must not release the
-					// grouped call while another member is starting or cleaning its lease.
-					const settled = await Promise.allSettled(requestedItems.map((item, index) => runTask(item, index)));
-					results = settled.map((result) => { if (result.status === "rejected") throw result.reason; return result.value; });
-				} else results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
-				const details = resultDetails(results);
-				latestDetails.set(toolCallId, details);
-				const usage = nestedToolUsage(details.results);
-				return { content: [{ type: "text", text: appendTeamStatus(aggregateText(mode, results), team && teamId ? team.hub.get(teamId) : undefined) }], details, ...(usage ? { usage } : {}) };
-			}
-			const results: StatefulSubagentRunDetails[] = [];
-			let previous = "";
-			for (let index = 0; index < requestedItems.length; index++) {
-				const raw = requestedItems[index]!;
-				const item = { ...raw, task: raw.task.replaceAll("{previous}", previous) };
-				const result = await runTask(item, index, index + 1);
-				results.push(result);
-				if (result.status === "failed") break;
-				previous = result.output;
-			}
-			const details = resultDetails(results);
-			latestDetails.set(toolCallId, details);
-			const usage = nestedToolUsage(details.results);
-			return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
-			} catch (error) {
-				if (joinedTeam && team && teamId !== undefined) {
-					try { team.hub.cancel(teamId, error instanceof Error ? error.message : String(error)); }
-					catch { /* An unknown team must not replace the original validation error. */ }
-				}
-				throw error;
-			} finally { unsubscribeTeam?.(); teamScope?.dispose(); }
-		},
+		execute: (toolCallId, params, signal, onUpdate, ctx) => runDispatch(toolCallId, params, signal, onUpdate, ctx),
 
 		renderCall(args, theme, context) {
 			const controlMessage = nonEmpty(args.control?.message);
@@ -1255,41 +1358,39 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			});
 		},
 
-		renderResult(result, { expanded, isPartial }, theme, context) {
-			if (context?.toolCallId && !isPartial) callHeaderInvalidators.delete(context.toolCallId);
-			const details = result.details as StatefulSubagentDetails | undefined;
-			if (!details?.results.length) {
-				const content = result.content[0];
-				return new Text(content?.type === "text" ? content.text : "(no output)", 0, 0);
-			}
-			const isControl = details.mode === "control" || Boolean(context?.args?.control?.message);
-			const actualTasks = (context?.toolCallId ? actualTasksByCall.get(context.toolCallId) : undefined)
-				?? actualTasksByDetails.get(details);
-			const dispatchMetadata = isControl ? [] : dispatchMetadataForRender(
-				context?.args,
-				details.mode,
-				details.results.length,
-				(context?.toolCallId ? dispatchMetadataByCall.get(context.toolCallId) : undefined) ?? dispatchMetadataByDetails.get(details),
-				displaySources,
-				resultModelsBySlot(details.results),
-			);
-			const fallbackTasks = details.results.map((run) => run.transcript?.entries.some((entry) => entry.initial)
-				? undefined
-				: run.task);
-			return renderSubagentTranscript(details.results, expanded, theme, {
-				isPartial,
-				durationMs: details.durationMs,
-				initialTasks: initialTasksForRender(context?.args, details.mode, details.results.length, actualTasks, fallbackTasks),
-				mode: details.mode,
-				...(isControl ? { control: true } : {}),
-				...(details.mode === "chain" ? { sequenceTotal: context?.args?.chain?.length ?? details.results.length } : {}),
-				...(dispatchMetadata.length > 0 ? {
-					contextWindows: dispatchMetadata.map((item) => item.contextWindowText),
-					fastModes: dispatchMetadata.map((item) => item.fastModeText),
-					searchModes: dispatchMetadata.map((item) => item.searchModeText),
-				} : {}),
-				markdownTheme: options.getMarkdownTheme?.() ?? markdownThemeFromTheme(theme),
-			});
-		},
+		renderResult: (result, renderOptions, theme, context) => renderDispatchResult(result, renderOptions, theme, context),
 	});
+	const planItems = (plan: TeamLaunchPlan): TaskParams[] => [plan.coordinator, ...plan.workers].map((member: TeamMemberPlan) => ({
+		alias: member.alias,
+		task: member.task,
+		...(member.model ? { model: member.model } : {}),
+		...(member.fastMode !== undefined ? { fastMode: member.fastMode } : {}),
+		...(member.cwd ? { cwd: member.cwd } : {}),
+	}));
+	return {
+		async validate(plan, ctx) {
+			const items = planItems(plan);
+			const summaries = items.map((item, index): TeamPlanSummary => {
+				try {
+					const model = resolveRailModel(item.model, ctx);
+					const native = nativeModelForRailRef(model, ctx);
+					const fastMode = effectiveFastModeRequest(item, native);
+					const cwd = resolvePath(item.cwd ?? ctx.cwd);
+					if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
+					return {
+						alias: item.alias!, role: index === 0 ? "coordinator" : "worker", model: railModelReference(model), cwd,
+						fastMode: effectiveFastModeText(fastMode, native) === "on", searchMode: effectiveSearchModeText(native),
+					};
+				} catch (error) {
+					throw new Error(`${item.alias}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			});
+			const broker = typeof options.broker === "function" ? options.broker() : options.broker;
+			if (typeof broker.assertAliasesAvailable === "function") await broker.assertAliasesAvailable(items.map((item) => item.alias!));
+			return summaries;
+		},
+		launch: (toolCallId, teamId, plan, signal, onUpdate, ctx) => runDispatch(
+			toolCallId, { teamId, tasks: planItems(plan) } as SubagentParamsValue, signal, onUpdate, ctx, { plan }),
+		renderResult: renderDispatchResult,
+	};
 }

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { TeamHub } from "../../tools/subagents/team-hub";
-import { TeamRunManager } from "../../tools/subagents/team-runner";
+import { TeamRunManager, teamLaunchPlan } from "../../tools/subagents/team-runner";
+import { installTeamTool } from "../../tools/subagents/team-tool";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { installStatefulSubagentTool, type StatefulSubagentToolOptions } from "../../tools/subagents/tool";
@@ -170,7 +172,7 @@ function setupTool(options: {
 			if (event === "tool_result") hook = handler;
 		},
 	};
-	installStatefulSubagentTool(pi, {
+	const launcher = installStatefulSubagentTool(pi, {
 		broker: broker as unknown as SessionBroker,
 		...(options.team ? { team: options.team } : {}),
 		knownFastMode: (target) => broker.knownFastMode(target),
@@ -178,7 +180,7 @@ function setupTool(options: {
 		renderContext: (options.renderContext ?? (() => context())) as NonNullable<StatefulSubagentToolOptions["renderContext"]>,
 		...(options.runStateless ? { runStateless: options.runStateless } : {}),
 	});
-	return { tool, broker, hook };
+	return { tool, broker, hook, launcher };
 }
 
 test("team workers start all eight without ordinary parallel's four lifetime slots", async () => {
@@ -842,8 +844,8 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
 	assert.match(guidance, /separate top-level Tool Call panels/);
 	assert.match(guidance, /Pi preflights sibling calls in order and executes them concurrently/);
-	assert.match(guidance, /tasks array when the user wants one grouped subagent Tool Call/);
-	assert.match(guidance, /always for the workers of a prepared team/);
+	assert.match(guidance, /tasks array only when the user wants one grouped subagent Tool Call/);
+	assert.match(guidance, /started by subagent_team launch, never by subagent/);
 	assert.match(guidance, /Never invent placeholder values/);
 	assert.match(guidance, /Live controls apply only to an already-running local persistent subagent/);
 	assert.match(guidance, /needs_input.*specialist_request/);
@@ -2664,6 +2666,121 @@ test("an unpaired or wrong-id team launch says what was found and shows the exac
 		const wrong = { teamId: "not-the-team", alias: "A", task: "coordinate" };
 		await assert.rejects(tool.execute("w", wrong, undefined, undefined, contextWithBatch([{ id: "w", arguments: wrong }])),
 			/Unknown teamId "not-the-team": use the exact teamId returned by subagent_team prepare/u);
+		assert.equal(broker.requests.length, 0);
+	} finally { hub.dispose(); }
+});
+
+/** Planned-team validation checks that cwd exists, so these tests use a real directory. */
+function teamContext() {
+	return { ...context(), cwd: tmpdir() };
+}
+
+/** Simulates members that finish through the real team channel: workers with a structured result, the coordinator after the barrier. */
+function cooperativeDispatch(broker: FakeBroker) {
+	const original = broker.dispatch.bind(broker);
+	broker.dispatch = async (request) => {
+		await request.team?.onRequest({ requestId: `ctx-${request.alias}`, sequence: 1, action: "checkpoint", receive: true }, request.signal);
+		const result = await original(request);
+		if (request.team?.binding.role === "worker") {
+			await request.team.onRequest({ requestId: `finish-${request.alias}`, sequence: 2, action: "finish",
+				result: { status: "succeeded", summary: `Completed ${request.task}` } }, request.signal);
+		}
+		const prompt = await request.team?.afterRun?.(result.run, request.signal);
+		if (prompt) {
+			result.run = { ...result.run, output: "coordinator summary of all workers" };
+			await request.team?.afterRun?.(result.run, request.signal);
+		}
+		return result;
+	};
+}
+
+function setupTeamTools() {
+	const hub = new TeamHub();
+	const manager = new TeamRunManager(hub);
+	const setup = setupTool({ team: () => manager });
+	let teamTool: any;
+	installTeamTool({ registerTool: (definition: any) => { teamTool = definition; } } as any, () => hub, () => setup.launcher);
+	return { hub, manager, teamTool, ...setup };
+}
+
+test("a planned team starts every member from one launch call carrying only the teamId", async () => {
+	const { hub, teamTool, tool, broker } = setupTeamTools();
+	try {
+		cooperativeDispatch(broker);
+		// A provider that fills every property sends null for unused fields.
+		const prepared = await teamTool.execute("prepare", {
+			action: "prepare", teamId: null, timeoutSeconds: null, reason: null, brief: { goal: "Review the change" },
+			coordinator: { alias: "A", task: "coordinate the review", model: null, fastMode: null, cwd: null },
+			workers: [
+				{ alias: "B1", task: "review one", model: "cus-resp/gpt-5.6-sol", fastMode: true, cwd: null },
+				{ alias: "B2", task: "review two", model: null, fastMode: null, cwd: null },
+			],
+		}, undefined, undefined, teamContext());
+		const teamId = prepared.details.response.teamId;
+		assert.match(prepared.content[0].text, /Plan \(validated; nothing has started\)/u);
+		assert.match(prepared.content[0].text, /B1 \(worker\) · cus-resp\/gpt-5\.6-sol:xhigh · FAST on · SEARCH on · task: review one/u);
+		assert.match(prepared.content[0].text, new RegExp(`subagent_team \\{"action":"launch","teamId":"${teamId}"\\}`, "u"));
+		assert.equal(broker.requests.length, 0, "prepare starts nothing");
+		assert.equal(hub.get(teamId).phase, "prepared");
+
+		await assert.rejects(tool.execute("paired", { teamId, alias: "A", task: "x" }, undefined, undefined, teamContext()),
+			/prepared with a launch plan\. Start it with subagent_team/u, "a planned team cannot be started with divergent subagent tasks");
+
+		const updates: any[] = [];
+		const launched = await teamTool.execute("launch", { action: "launch", teamId, coordinator: null, workers: null, brief: null, timeoutSeconds: null, reason: null },
+			undefined, (update: any) => updates.push(update), teamContext());
+		assert.deepEqual(broker.requests.map((request) => [request.alias, request.team?.binding.role, request.task]).sort(),
+			[["A", "coordinator", "coordinate the review"], ["B1", "worker", "review one"], ["B2", "worker", "review two"]]);
+		assert.equal(broker.requests.find((request) => request.alias === "B1")!.fastMode, true);
+		assert.equal(hub.get(teamId).phase, "completed");
+		assert.equal(teamLaunchPlan(hub, teamId), undefined, "a launched plan is consumed");
+		assert.match(launched.content[0].text, /^Team: 3\/3 runtime completions/u);
+		assert.match(launched.content[0].text, /coordinator summary of all workers/u);
+		assert.deepEqual(launched.details.results.map((result: any) => result.alias), ["A", "B1", "B2"]);
+		assert.ok(updates.length > 0, "the launch call streams live member progress");
+		assert.ok(teamTool.renderResult(launched, { expanded: false, isPartial: false }, { fg: (_: string, text: string) => text, bold: (text: string) => text } as any, { toolCallId: "launch" }));
+
+		await assert.rejects(teamTool.execute("again", { action: "launch", teamId }, undefined, undefined, teamContext()), /already been launched/u);
+	} finally { hub.dispose(); }
+});
+
+test("prepare rejects an invalid plan before creating a team, naming the member and field", async () => {
+	const { hub, teamTool, broker } = setupTeamTools();
+	try {
+		const worker = { alias: "B", task: "work" };
+		for (const [args, pattern] of [
+			[{ coordinator: { alias: "A", task: "  " }, workers: [worker] }, /coordinator\.task is required/u],
+			[{ coordinator: "A", workers: [worker] }, /do not mix alias strings and member objects/u],
+			[{ coordinator: { alias: "A", task: "x", target: "/" }, workers: [worker] }, /coordinator has unsupported field\(s\) target/u],
+			[{ coordinator: { alias: "A", task: "x" }, workers: [{ alias: "B", task: "x", model: "cus-mystery/gpt-5.6-mystery", fastMode: true }] }, /^Error: B: fastMode requires/u],
+			[{ coordinator: { alias: "A", task: "x" }, workers: [{ alias: "B", task: "x", cwd: "/definitely/missing/dir" }] }, /B: cwd is not a directory/u],
+			[{ coordinator: { alias: "A", task: "x" }, workers: [] }, /workers must list 1–8 members/u],
+		] as const) {
+			await assert.rejects(teamTool.execute("bad", { action: "prepare", ...args }, undefined, undefined, teamContext()), pattern);
+		}
+		(broker as any).assertAliasesAvailable = async (aliases: string[]) => {
+			if (aliases.includes("B")) throw new Error("Persistent subagent alias already exists: B. Team members need new aliases; choose different ones.");
+		};
+		await assert.rejects(teamTool.execute("taken", { action: "prepare", coordinator: { alias: "A", task: "x" }, workers: [worker] }, undefined, undefined, teamContext()),
+			/alias already exists: B/u);
+		assert.equal(hub.list().length, 0, "no rejected plan creates a team");
+		assert.equal(broker.requests.length, 0);
+	} finally { hub.dispose(); }
+});
+
+test("launch explains unknown, alias-only and runtime-less teams without starting anything", async () => {
+	const { hub, teamTool, broker } = setupTeamTools();
+	try {
+		await assert.rejects(teamTool.execute("x", { action: "launch", teamId: "nope" }, undefined, undefined, teamContext()), /Unknown teamId "nope"/u);
+		const legacy = hub.prepare({ coordinator: "A", workers: ["B"] });
+		await assert.rejects(teamTool.execute("x", { action: "launch", teamId: legacy.id }, undefined, undefined, teamContext()), /prepared with aliases only/u);
+		let bare: any;
+		installTeamTool({ registerTool: (definition: any) => { bare = definition; } } as any, () => hub);
+		const planned = await bare.execute("p", { action: "prepare", coordinator: { alias: "A2", task: "x" }, workers: [{ alias: "B2", task: "y" }] }, undefined, undefined, teamContext());
+		await assert.rejects(bare.execute("l", { action: "launch", teamId: planned.details.response.teamId }, undefined, undefined, teamContext()), /not available/u);
+		const cancelled = await teamTool.execute("c", { action: "cancel", teamId: planned.details.response.teamId }, undefined, undefined, teamContext());
+		assert.equal(cancelled.details.snapshots[0].phase, "cancelled");
+		assert.equal(teamLaunchPlan(hub, planned.details.response.teamId), undefined);
 		assert.equal(broker.requests.length, 0);
 	} finally { hub.dispose(); }
 });

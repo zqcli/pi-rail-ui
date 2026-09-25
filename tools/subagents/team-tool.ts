@@ -1,13 +1,17 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { TeamHub } from "./team-hub";
 import {
-	isTeamBrief, TEAM_HISTORY_TYPE, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_MEMBERS, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_TEXT_BYTES,
-	type TeamBrief, type TeamSnapshot,
+	isTeamBrief, TEAM_HISTORY_TYPE, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_MEMBERS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_RESULT_ITEMS,
+	TEAM_MAX_TEXT_BYTES, TEAM_MAX_WORKERS, type TeamBrief, type TeamSnapshot,
 } from "./team-protocol";
-import { teamDispatchTemplate, teamStatus } from "./team-runner";
+import {
+	deleteTeamLaunchPlan, setTeamLaunchPlan, teamDispatchTemplate, teamLaunchPlan, teamStatus,
+	type TeamLaunchPlan, type TeamMemberPlan,
+} from "./team-runner";
+import type { TeamLauncher, TeamPlanSummary } from "./tool";
 
 function nullable(schema: TSchema) {
 	return Type.Optional(Type.Union([schema, Type.Null()]));
@@ -27,6 +31,67 @@ const BriefSchema = Type.Object({
 		forbidden: nullable(BriefList()),
 	}, { additionalProperties: false }), { maxItems: TEAM_MAX_MEMBERS })),
 }, { additionalProperties: false, description: `At most ${TEAM_MAX_BRIEF_BYTES} serialized UTF-8 bytes in total.` });
+
+// A member is fully described at prepare, so launch needs nothing but the teamId.
+const MemberPlanSchema = Type.Object({
+	alias: Type.String({ minLength: 1, maxLength: 64, description: "New persistent alias for this member" }),
+	task: Type.String({ minLength: 1, description: "Concrete self-contained task for this member" }),
+	model: nullable(Type.String({ description: "Pi model reference such as provider/model:thinking; null uses the current model" })),
+	fastMode: nullable(Type.Boolean({ description: "true enables native Fast for an eligible GPT model; null means off" })),
+	cwd: nullable(Type.String({ description: "Working directory; null uses the parent cwd" })),
+}, { additionalProperties: false });
+
+function normalizeMember(value: unknown, field: string): TeamMemberPlan {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} must be an object {alias, task, model?, fastMode?, cwd?}`);
+	const input = value as Record<string, unknown>;
+	const unknown = Object.keys(input).filter((key) => !["alias", "task", "model", "fastMode", "cwd"].includes(key));
+	if (unknown.length) throw new Error(`${field} has unsupported field(s) ${unknown.join(", ")}; a member plan only has alias, task, model, fastMode and cwd`);
+	const text = (key: string): string | undefined => {
+		const raw = input[key];
+		if (raw == null) return undefined;
+		if (typeof raw !== "string") throw new Error(`${field}.${key} must be a string or null`);
+		return raw.trim() || undefined;
+	};
+	const alias = text("alias");
+	const task = text("task");
+	if (!alias) throw new Error(`${field}.alias is required`);
+	if (!task) throw new Error(`${field}.task is required: give ${alias} a concrete self-contained task`);
+	if (Buffer.byteLength(task, "utf8") > TEAM_MAX_MESSAGE_BYTES) throw new Error(`${field}.task exceeds ${TEAM_MAX_MESSAGE_BYTES} UTF-8 bytes`);
+	if (input["fastMode"] != null && typeof input["fastMode"] !== "boolean") throw new Error(`${field}.fastMode must be a boolean or null`);
+	const model = text("model");
+	const cwd = text("cwd");
+	return {
+		alias, task,
+		...(model ? { model } : {}),
+		...(typeof input["fastMode"] === "boolean" ? { fastMode: input["fastMode"] } : {}),
+		...(cwd ? { cwd } : {}),
+	};
+}
+
+/** Returns the launch plan, or undefined for the legacy alias-only form that is dispatched with paired subagent calls. */
+function normalizePlan(coordinator: unknown, workers: unknown): { aliases: { coordinator: string; workers: string[] }; plan?: TeamLaunchPlan } {
+	if (!Array.isArray(workers)) throw new Error("prepare requires coordinator and workers");
+	if (typeof coordinator === "string" && workers.every((worker) => typeof worker === "string")) {
+		return { aliases: { coordinator, workers: workers as string[] } };
+	}
+	if (typeof coordinator === "string" || workers.some((worker) => typeof worker === "string")) {
+		throw new Error("Give every member as an object {alias, task, model?, fastMode?, cwd?}; do not mix alias strings and member objects");
+	}
+	if (workers.length < 1 || workers.length > TEAM_MAX_WORKERS) throw new Error(`workers must list 1–${TEAM_MAX_WORKERS} members`);
+	const plan: TeamLaunchPlan = {
+		coordinator: normalizeMember(coordinator, "coordinator"),
+		workers: workers.map((worker, index) => normalizeMember(worker, `workers[${index}]`)),
+	};
+	return { aliases: { coordinator: plan.coordinator.alias, workers: plan.workers.map((worker) => worker.alias) }, plan };
+}
+
+function planLines(summaries: readonly TeamPlanSummary[] | undefined, plan: TeamLaunchPlan): string[] {
+	return [plan.coordinator, ...plan.workers].map((member, index) => {
+		const summary = summaries?.[index];
+		const policy = summary ? ` · ${summary.model} · FAST ${summary.fastMode ? "on" : "off"} · SEARCH ${summary.searchMode}` : member.model ? ` · ${member.model}` : "";
+		return `- ${member.alias} (${index === 0 ? "coordinator" : "worker"})${policy} · task: ${previewText(member.task, 200)}`;
+	});
+}
 
 function normalizeList(value: unknown, field: string): string[] | undefined {
 	if (value == null) return undefined;
@@ -144,40 +209,67 @@ export function restoreTeamHistory(hub: TeamHub, entries: readonly { type: strin
 	return hub.restore(snapshots);
 }
 
-export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {
+export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub, getLauncher?: () => TeamLauncher | undefined): void {
 	pi.registerTool({
 		name: "subagent_team",
 		label: "Subagent Team",
-		description: "Prepare a fixed team (one coordinator + 1–8 workers, all new persistent aliases), inspect status, or cancel. prepare returns the teamId and the exact launch calls. Launch = exactly two sibling subagent calls in the same assistant message: "
-			+ "{\"teamId\":\"<teamId>\",\"alias\":\"<coordinator>\",\"task\":\"...\"} and {\"teamId\":\"<teamId>\",\"tasks\":[{\"alias\":\"<worker>\",\"task\":\"...\"}, ...one item per worker]}. "
-			+ "All workers go in that one tasks array, even a single worker; for teams this replaces the general advice to prefer separate sibling calls. model, fastMode and cwd may be set per call or per tasks item; omit target, session, control and chain or set them to null. "
-			+ "Never wait for one call before emitting the other. Give every member a self-contained task and put shared goal, target/URL, acceptance criteria, constraints and per-member authorization in brief. The hosting parent is not a team member/coordinator. Team messages are queued for a recipient's receiving context checkpoint; ordinary send does not interrupt an active turn or wake the parent model. Keep timeoutSeconds null (default 3600s) unless the user requests a deadline; it covers the whole team including reasoning, tools, waiting and the final summary. Pause is cooperative at safe points. Reload interrupts unfinished teams.",
+		description: "Run a fixed team: one child coordinator plus 1–8 workers, all new persistent aliases. Two steps, one call each: "
+			+ "(1) {\"action\":\"prepare\",\"coordinator\":{\"alias\":\"<A>\",\"task\":\"...\",\"model\":null,\"fastMode\":null,\"cwd\":null},\"workers\":[{\"alias\":\"<B1>\",\"task\":\"...\",\"model\":null,\"fastMode\":null,\"cwd\":null}, ...],\"brief\":{...}} "
+			+ "validates the whole plan and returns the teamId without starting anything; "
+			+ "(2) in your next message {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts every member and returns when the coordinator has finished with all worker outcomes. "
+			+ "Do not use the subagent tool for team members. status and cancel take a teamId. "
+			+ "Give every member a self-contained task and put shared goal, target/URL, acceptance criteria, constraints and per-member authorization in brief. The hosting parent is not a team member/coordinator. Team messages are queued for a recipient's receiving context checkpoint; ordinary send does not interrupt an active turn or wake the parent model. Keep timeoutSeconds null (default 3600s) unless the user requests a deadline; it covers the whole team including reasoning, tools, waiting and the final summary. Pause is cooperative at safe points. Reload interrupts unfinished teams.",
 		promptGuidelines: [
 			"Team prepare: default timeoutSeconds to null. Do not invent short 120/180-second limits for code review or max-thinking models; explicit deadlines bound the entire workflow, not one tool call.",
 			"Make each worker task self-contained: include the necessary target/URL, expected inputs, acceptance criteria, relevant constraints, and its own allowed/forbidden operations. Put shared goal and per-member authorization in brief so all assignments and policy are present before any child receives its first context.",
-			"After Team prepare, copy the two launch calls it returns and emit both in ONE assistant message: the coordinator as {teamId, alias, task} and every worker inside one tasks array {teamId, tasks:[{alias, task}, ...]}. There is no separate \"parallel\" field: a non-empty tasks array is the grouped call. Omit target, session, control and chain or set them to null; never fill them with placeholder values such as a dummy path or message. The hosting parent is not the team's coordinator and should not claim it receives a live wakeup. Ordinary team send queues a message for a recipient checkpoint; it is not an immediate stop or parent-model wakeup. If a call is rejected before joining, read which field the error names, fix it, and retry BOTH calls with the same prepared teamId rather than launching one side alone. After a team fails or is cancelled, prepare a new team; started members keep their aliases, so use new aliases for them.",
+			"Run a team with two subagent_team calls in consecutive messages: prepare with the complete member plan (coordinator object and workers array, each with alias, task and optional model/fastMode/cwd), then launch with only the returned teamId. Never start team members with the subagent tool. If prepare is rejected, fix the named field and prepare again; nothing was started. The hosting parent is not the team's coordinator and should not claim it receives a live wakeup. After a team fails or is cancelled, prepare a new team; started members keep their aliases, so use new aliases for them.",
 		],
 		executionMode: "parallel",
 		parameters: Type.Object({
-			action: StringEnum(["prepare", "status", "cancel"]),
-			teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "status/cancel: an existing teamId (status without it lists teams). prepare: null; prepare generates the id." })),
-			coordinator: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "prepare: new persistent alias of the child coordinator (not the hosting parent). Reuse it as alias in the coordinator's subagent call." })),
-			workers: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()], { description: "prepare: 1–8 new persistent worker aliases. Reuse exactly these as the aliases of the tasks array in the workers' subagent call." })),
+			action: StringEnum(["prepare", "launch", "status", "cancel"]),
+			teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "launch/status/cancel: the teamId returned by prepare (status without it lists teams). prepare: null." })),
+			coordinator: Type.Optional(Type.Union([MemberPlanSchema, Type.String(), Type.Null()], { description: "prepare: the child coordinator as {alias, task, model, fastMode, cwd}. Other actions: null." })),
+			workers: Type.Optional(Type.Union([Type.Array(Type.Union([MemberPlanSchema, Type.String()]), { minItems: 1, maxItems: TEAM_MAX_WORKERS }), Type.Null()], { description: "prepare: 1–8 workers, each {alias, task, model, fastMode, cwd}. Other actions: null." })),
 			timeoutSeconds: Type.Optional(Type.Union([Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), Type.Null()], { description: "Default null = 3600 seconds. Set only for a user-requested deadline. Total team budget from prepare, including startup, all model/tool work, waits and final summary; not a per-call timeout." })),
 			reason: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 			brief: Type.Optional(Type.Union([BriefSchema, Type.Null()], { description: "Shared goal, target, acceptance criteria, constraints and member-specific authorization. Null optional fields are normalized away." })),
 		}),
-		async execute(_id, params) {
+		async execute(toolCallId, params, signal, onUpdate, ctx: ExtensionContext) {
 			const hub = getHub();
+			if (params.action === "launch") {
+				const teamId = params.teamId?.trim();
+				if (!teamId) throw new Error("launch requires the teamId returned by prepare");
+				let snapshot: TeamSnapshot;
+				try { snapshot = hub.get(teamId); }
+				catch { throw new Error(`Unknown teamId ${JSON.stringify(teamId.slice(0, 128))}: use the exact teamId returned by prepare (status without teamId lists teams).`); }
+				const plan = teamLaunchPlan(hub, teamId);
+				if (!plan) {
+					if (snapshot.phase !== "prepared" || snapshot.members.some((member) => member.state !== "registered")) {
+						throw new Error(`Team ${teamId} has already been launched (phase ${snapshot.phase}); use status to inspect it.`);
+					}
+					throw new Error(`Team ${teamId} was prepared with aliases only and has no launch plan. Cancel it and prepare again with member objects {alias, task, ...}.`);
+				}
+				const launcher = getLauncher?.();
+				if (!launcher) throw new Error("Team launch is not available in this runtime");
+				return launcher.launch(toolCallId, teamId, plan, signal, onUpdate as never, ctx) as never;
+			}
 			let snapshots: TeamSnapshot[];
+			let prepared: { plan: TeamLaunchPlan; summaries?: TeamPlanSummary[] } | undefined;
 			if (params.action === "prepare") {
 				if (params.teamId?.trim()) throw new Error("prepare creates a new team and does not accept teamId");
-				if (!params.coordinator || !params.workers) throw new Error("prepare requires coordinator and workers");
-				const brief = normalizeBrief(params.brief, [params.coordinator, ...params.workers]);
-				snapshots = [hub.prepare({ coordinator: params.coordinator, workers: params.workers, ...(params.timeoutSeconds != null ? { timeoutSeconds: params.timeoutSeconds } : {}), ...(brief ? { brief } : {}) })];
+				if (params.coordinator == null || params.workers == null) throw new Error("prepare requires coordinator and workers");
+				const { aliases, plan } = normalizePlan(params.coordinator, params.workers);
+				const brief = normalizeBrief(params.brief, [aliases.coordinator, ...aliases.workers]);
+				const summaries = plan ? await getLauncher?.()?.validate(plan, ctx) : undefined;
+				snapshots = [hub.prepare({ ...aliases, ...(params.timeoutSeconds != null ? { timeoutSeconds: params.timeoutSeconds } : {}), ...(brief ? { brief } : {}) })];
+				if (plan) {
+					setTeamLaunchPlan(hub, snapshots[0]!.id, plan);
+					prepared = { plan, ...(summaries ? { summaries } : {}) };
+				}
 			} else if (params.action === "cancel") {
 				if (!params.teamId) throw new Error("cancel requires teamId");
 				hub.cancel(params.teamId, params.reason ?? undefined);
+				deleteTeamLaunchPlan(hub, params.teamId);
 				snapshots = [hub.get(params.teamId)];
 			} else snapshots = params.teamId ? [hub.get(params.teamId)] : hub.list();
 			const listing = params.action === "status" && !params.teamId;
@@ -185,10 +277,15 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {
 				if (listing) return `${snapshot.id} · ${snapshot.phase.toUpperCase()} · coordinator ${snapshot.coordinator} · ${snapshot.workers.length} workers`;
 				const status = `${snapshot.id}\n${teamStatus(snapshot)}`;
 				if (params.action !== "prepare") return status;
-				return `${status}\nBudget: ${(snapshot.deadline - snapshot.createdAt) / 1000}s total from prepare, including reasoning, tools, waiting and final summary.\nNext: ${teamDispatchTemplate(snapshot)}`;
+				const budget = `Budget: ${(snapshot.deadline - snapshot.createdAt) / 1000}s total from prepare, including reasoning, tools, waiting and final summary.`;
+				if (!prepared) return `${status}\n${budget}\nNext: ${teamDispatchTemplate(snapshot)}`;
+				return [status, "Plan (validated; nothing has started):", ...planLines(prepared.summaries, prepared.plan), budget,
+					`Next: in your next message call subagent_team {"action":"launch","teamId":"${snapshot.id}"}. It starts every member and returns when the coordinator has finished. Do not start members with the subagent tool.`].join("\n");
 			}).join("\n") || "No teams";
 			const next = params.action === "prepare"
-				? "Emit the two launch calls shown above as sibling subagent calls in the same assistant message; do not wait between them. Messages are queued for receiving checkpoints; they do not wake or interrupt the hosting parent model."
+				? prepared
+					? `Call subagent_team {"action":"launch","teamId":"${snapshots[0]!.id}"} in your next message. Messages are queued for receiving checkpoints; they do not wake or interrupt the hosting parent model.`
+					: "Emit the two launch calls shown above as sibling subagent calls in the same assistant message; do not wait between them. Messages are queued for receiving checkpoints; they do not wake or interrupt the hosting parent model."
 				: "Use status with a specific teamId to inspect assignment/result previews and recent message routes. Previews are not full deliverables; structured results are retained in the native subagent result details and team journal. Listing teams returns summaries only. This response does not provide a live wakeup channel to the hosting parent model.";
 			const response = {
 				action: params.action,
@@ -202,11 +299,24 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {
 					failed: snapshot.members.filter((member) => member.state === "failed").length,
 					blocked: snapshot.members.filter((member) => member.result?.status === "blocked").length,
 				})) } : snapshots.length === 1 ? { snapshot: modelSnapshot(snapshots[0]!) } : { snapshots: [] }),
+				...(prepared ? { plan: [prepared.plan.coordinator, ...prepared.plan.workers].map((member, index) => ({
+					alias: member.alias, role: index === 0 ? "coordinator" : "worker", taskPreview: previewText(member.task, 512),
+					...(prepared!.summaries?.[index] ? { model: prepared!.summaries[index]!.model, fastMode: prepared!.summaries[index]!.fastMode, searchMode: prepared!.summaries[index]!.searchMode } : {}),
+				})) } : {}),
 				next,
 			};
 			return { content: [{ type: "text", text: `${readable}\nJSON:\n${JSON.stringify(response)}` }], details: { snapshots, response } };
 		},
-		renderResult(result) {
+		renderCall(args, theme) {
+			const action = String(args.action ?? "");
+			const team = typeof args.teamId === "string" && args.teamId.trim() ? ` · ${args.teamId.trim().slice(0, 8)}` : "";
+			const members = action === "prepare" && Array.isArray(args.workers) ? ` · 1 coordinator + ${args.workers.length} workers` : "";
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_team "))}${theme.fg("accent", `${action}${team}${members}`)}`, 0, 0);
+		},
+		renderResult(result, renderOptions, theme, context) {
+			const details = result.details as { results?: unknown[] } | undefined;
+			const launcher = getLauncher?.();
+			if (launcher && Array.isArray(details?.results)) return launcher.renderResult(result, renderOptions, theme, context);
 			return new Text(result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n"), 0, 0);
 		},
 	});

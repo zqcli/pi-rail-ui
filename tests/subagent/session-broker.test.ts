@@ -1565,3 +1565,12 @@ describe("SessionBroker", () => {
 		assert.equal(worker.stopped, true);
 	});
 });
+
+test("team prepare can reject aliases that a new persistent member could not claim", async () => {
+	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => new FakeWorker("taken", "/tmp/taken.jsonl") });
+	try {
+		await broker.dispatch({ model: reviewerModel(), alias: "taken", task: "work" });
+		await assert.rejects(broker.assertAliasesAvailable(["free", "taken"]), /alias already exists: taken\. Team members need new aliases/u);
+		await broker.assertAliasesAvailable(["free", "other"]);
+	} finally { await broker.shutdown(); }
+});

@@ -59,6 +59,37 @@ export function teamStatus(snapshot: TeamSnapshot): string {
 	return boundedStatus(complete, STATUS_CAP_BYTES);
 }
 
+/** One member of a launch plan: everything the host needs to start it without a second model-authored call. */
+export interface TeamMemberPlan {
+	alias: string;
+	task: string;
+	model?: string;
+	fastMode?: boolean;
+	cwd?: string;
+}
+
+export interface TeamLaunchPlan {
+	coordinator: TeamMemberPlan;
+	workers: TeamMemberPlan[];
+}
+
+// Plans are in-memory only: a reload interrupts unfinished teams, so there is nothing to resume.
+const launchPlans = new WeakMap<TeamHub, Map<string, TeamLaunchPlan>>();
+
+export function setTeamLaunchPlan(hub: TeamHub, teamId: string, plan: TeamLaunchPlan): void {
+	let plans = launchPlans.get(hub);
+	if (!plans) launchPlans.set(hub, plans = new Map());
+	plans.set(teamId, plan);
+}
+
+export function teamLaunchPlan(hub: TeamHub, teamId: string): TeamLaunchPlan | undefined {
+	return launchPlans.get(hub)?.get(teamId);
+}
+
+export function deleteTeamLaunchPlan(hub: TeamHub, teamId: string): void {
+	launchPlans.get(hub)?.delete(teamId);
+}
+
 /** The exact pair of `subagent` calls that launches a prepared team, with its real id and aliases. */
 export function teamDispatchTemplate(snapshot: Pick<TeamSnapshot, "id" | "coordinator" | "workers">): string {
 	const coordinator = JSON.stringify({ teamId: snapshot.id, alias: snapshot.coordinator, task: "<coordinator task>" });

@@ -558,6 +558,15 @@ export class SessionBroker {
 		}
 	}
 
+	/** Rejects aliases a new persistent session could not claim: linked, being created, or saved by any parent. */
+	async assertAliasesAvailable(aliases: readonly string[]): Promise<void> {
+		const saved = new Set((await this.store.list()).map((instance) => instance.alias));
+		const taken = aliases.filter((alias) => this.roster.resolve(alias) || this.pendingAliases.has(alias) || saved.has(alias));
+		if (taken.length) {
+			throw new Error(`Persistent subagent alias already exists: ${taken.join(", ")}. Team members need new aliases; choose different ones.`);
+		}
+	}
+
 	knownFastMode(target: string): boolean | undefined {
 		const agentId = this.roster.resolve(target) ?? target;
 		return this.descriptorSnapshots.get(agentId)?.fastMode;

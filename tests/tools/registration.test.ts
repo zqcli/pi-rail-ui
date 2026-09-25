@@ -47,8 +47,8 @@ test("Rail root loads apply-patch and subagent tools", async () => {
 	const team = registrations.toolDefinitions.find((definition) => definition.name === "subagent_team");
 	assert.ok(team, "the Team parent tool must be registered");
 	assert.equal(team.executionMode, "parallel");
-	assert.deepEqual(team.parameters?.properties?.action?.enum, ["prepare", "status", "cancel"]);
-	assert.match(team.description ?? "", /two sibling subagent calls/);
+	assert.deepEqual(team.parameters?.properties?.action?.enum, ["prepare", "launch", "status", "cancel"]);
+	assert.match(team.description ?? "", /\{"action":"launch","teamId":"<teamId>"\}/);
 	assert.equal(registrations.commands.filter((name) => name === "rail-agent").length, 1);
 });
 

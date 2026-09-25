@@ -31,7 +31,10 @@ async function setup(t: TestContext, count: number, scenario = "eight", brief?: 
 	process.env["PI_CODING_AGENT_DIR"] = agentDir;
 	process.env["TEAM_E2E_SCENARIO"] = scenario;
 	const history: TeamSnapshot[] = [];
-	const hub = new TeamHub({ startupTimeoutMs: 30_000, onSnapshot: (value) => { history.push(value); } });
+	const journaled: TeamSnapshot[] = [];
+	const hub = new TeamHub({ startupTimeoutMs: 30_000, onSnapshot: (value) => { journaled.push(value); } });
+	// Observe every live state change; the durable journal records milestones only.
+	hub.subscribe((value) => { history.push(value); });
 	const stateDir = join(agentDir, "stateful-subagents");
 	const store = new FileAgentInstanceStore(stateDir);
 	const leases = new FileSessionLeaseManager(stateDir);
@@ -70,7 +73,7 @@ async function setup(t: TestContext, count: number, scenario = "eight", brief?: 
 		const instance = (await store.list()).find((item) => item.alias === alias)!;
 		return (await readFile(instance.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
 	};
-	return { hub, teamId, history, tools, ctx, dispatch, updates, journal, store, leases, broker };
+	return { hub, teamId, history, journaled, tools, ctx, dispatch, updates, journal, store, leases, broker };
 }
 
 function waitForSnapshot(hub: TeamHub, teamId: string, predicate: (snapshot: TeamSnapshot) => boolean): Promise<void> {
@@ -85,7 +88,7 @@ function waitForSnapshot(hub: TeamHub, teamId: string, predicate: (snapshot: Tea
 }
 
 test("real RPC team keeps two parent calls pending, wakes B1 from B8, and gives A all eight results before its final summary", { timeout: 90_000 }, async (t) => {
-	const { hub, teamId, history, dispatch, updates, journal, store } = await setup(t, 8);
+	const { hub, teamId, history, journaled, dispatch, updates, journal, store } = await setup(t, 8);
 	let aDone = false;
 	let bDone = false;
 	const dependencyObservations: boolean[] = [];
@@ -110,6 +113,8 @@ test("real RPC team keeps two parent calls pending, wakes B1 from B8, and gives 
 	}
 	assert.equal(hub.get(teamId).phase, "completed");
 	for (const snapshot of history.filter((s) => s.phase === "finalizing" || s.phase === "completed")) assert.ok(snapshot.members.filter((m) => m.role === "worker").every((m) => m.state === "completed"));
+	assert.ok(journaled.length <= 16, `the parent journal records milestones only (${journaled.length} entries)`);
+	assert.equal(journaled.at(-1)?.phase, "completed");
 	assert.ok(updates.some((u) => u.details.results.some((r: any) => r.coordination?.state === "waiting")));
 	assert.doesNotMatch(JSON.stringify([a, b, updates]), /"epoch"|"binding"/u);
 	const instances = await store.list();

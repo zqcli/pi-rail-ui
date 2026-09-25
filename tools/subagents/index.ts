@@ -157,6 +157,14 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		handler: (_args, ctx) => runRailAgentManager(ctx, getRuntime()),
 	});
 
+	// History is display-only; building it must never prevent the runtime from starting.
+	const createTeamRuntime = (ctx: ExtensionContext): TeamRunManager => {
+		const hub = new TeamHub({ onSnapshot: (snapshot) => pi.appendEntry(TEAM_HISTORY_TYPE, snapshot) });
+		try { restoreTeamHistory(hub, ctx.sessionManager.getBranch()); }
+		catch { /* Keep the fresh hub without history. */ }
+		return new TeamRunManager(hub);
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		if (runtime) {
 			const previous = runtime;
@@ -165,6 +173,7 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 			await previous.broker.shutdown();
 		}
 		const store = new FileAgentInstanceStore(stateDir);
+		const team = createTeamRuntime(ctx);
 		const roster = new SessionAgentRoster((customType, data) => pi.appendEntry(customType, data));
 		roster.restore(ctx.sessionManager.getBranch());
 		const broker = new SessionBroker({
@@ -179,21 +188,25 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 			),
 			aliasLeaseManager: new FileSessionLeaseManager(stateDir),
 		});
-		await broker.prewarmFastModes();
-		const manager = new RailAgentManager(broker, store, roster, stateDir);
-		const hub = new TeamHub({ onSnapshot: (snapshot) => pi.appendEntry(TEAM_HISTORY_TYPE, snapshot) });
-		restoreTeamHistory(hub, ctx.sessionManager.getBranch());
-		runtime = { ctx, broker, roster, store, manager, team: new TeamRunManager(hub) };
+		try {
+			await broker.prewarmFastModes();
+			const manager = new RailAgentManager(broker, store, roster, stateDir);
+			runtime = { ctx, broker, roster, store, manager, team };
+		} catch (error) {
+			team.hub.dispose();
+			await broker.shutdown();
+			throw error;
+		}
 		if (ctx.mode === "tui") installAutocomplete(ctx);
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
 		if (!runtime) return;
 		runtime.ctx = ctx;
+		// Build the replacement before retiring the old hub, so no failure leaves a disposed one.
+		const team = createTeamRuntime(ctx);
 		runtime.team.hub.dispose();
-		const hub = new TeamHub({ onSnapshot: (snapshot) => pi.appendEntry(TEAM_HISTORY_TYPE, snapshot) });
-		restoreTeamHistory(hub, ctx.sessionManager.getBranch());
-		runtime.team = new TeamRunManager(hub);
+		runtime.team = team;
 		runtime.roster.restore(ctx.sessionManager.getBranch());
 		await runtime.broker.prewarmFastModes();
 	});

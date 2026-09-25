@@ -395,7 +395,7 @@ test("real Team delivery is visible before a parked tool and native abort flushe
 	await connection.close().catch((error) => assert.match(String(error), /Team extension failed/));
 });
 
-test("real Pi keeps checkpoint deliveries across unrelated tools and native compaction without polling or double writes", { timeout: 20000 }, async (t) => {
+test("real Pi keeps checkpoint deliveries across unrelated tools, and after native compaction re-injects only the compact roster", { timeout: 20000 }, async (t) => {
 	const transport = await local(t, "delivery");
 	const providers: any[] = [];
 	transport.onEvent((event) => {
@@ -434,7 +434,8 @@ test("real Pi keeps checkpoint deliveries across unrelated tools and native comp
 	assert.doesNotMatch(JSON.stringify(await transport.request({ type: "get_messages" })), /READY-fact/, "real compaction removes the original delivery from native context");
 	await prompt("continue unrelated work after compaction");
 	assert.equal(providers.length, 4);
-	assert.match(JSON.stringify(providers[3].messages), /READY-fact/);
+	// Native compaction owns summarized history; bypassing it could overflow the context again.
+	assert.doesNotMatch(JSON.stringify(providers[3].messages), /READY-fact/, "a compacted delivery is not re-injected");
 	assert.match(JSON.stringify(providers[3].messages), /coordinator/);
 	const after = (await readFile(state.sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
 	assert.equal(after.filter((entry) => entry.type === "custom_message" && entry.customType === TEAM_DELIVERY_TYPE).length, 1);
@@ -448,8 +449,8 @@ test("real Pi keeps checkpoint deliveries across unrelated tools and native comp
 	await rebound.bind();
 	await prompt("same binding, another send after native compaction");
 	assert.equal(providers.length, 6);
-	assert.match(JSON.stringify(providers[5].messages), /READY-fact/, "same runtime binding keeps its original history boundary across sends");
-	assert.match(JSON.stringify(providers[5].messages), /coordinator/);
+	assert.doesNotMatch(JSON.stringify(providers[5].messages), /READY-fact/);
+	assert.match(JSON.stringify(providers[5].messages), /coordinator/, "same runtime binding keeps its roster across sends");
 	assert.doesNotMatch(JSON.stringify(providers[5].messages), new RegExp(worker.epoch));
 	await rebound.close();
 	const renewed = new TeamRpcConnection(transport, { binding: { ...worker, epoch: "new-probe-epoch" }, onRequest: async () => ({ ok: true }) });

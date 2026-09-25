@@ -48,12 +48,22 @@ function publicDelivery(content: unknown, details: unknown, timestamp: number, b
 	} catch { return undefined; }
 }
 
-// Select the entire bounded delivery context from this native lifetime, not from
-// visible messages. Visibility neither authenticates origin nor exempts a budget.
+// Select the bounded delivery context from this native lifetime, not from visible
+// messages. Visibility neither authenticates origin nor exempts a budget. Native
+// compaction owns summarized history: only deliveries the native projection should
+// still contain are repaired, plus one compact roster copy of the original assignment.
 function selectDeliveries(ctx: ExtensionContext, binding: TeamBinding, startId: string | undefined, current?: Delivery): Delivery[] {
 	const branch = ctx.sessionManager.getBranch();
 	const start = startId === undefined ? 0 : branch.findIndex((entry) => entry.id === startId) + 1;
 	if (startId !== undefined && start === 0) return current ? [current] : [];
+	let retained = start;
+	for (let i = branch.length - 1; i >= start; i--) {
+		const entry = branch[i]!;
+		if (entry.type !== "compaction") continue;
+		const kept = branch.findIndex((candidate) => candidate.id === entry.firstKeptEntryId);
+		retained = Math.max(start, kept >= 0 && kept < i ? kept : i);
+		break;
+	}
 	const contextEdits = new Map<string, ContextEdit["replacement"]>();
 	for (const entry of branch) if (entry.type === "context_edit") contextEdits.set(entry.targetId, entry.replacement);
 	const read = (entry: (typeof branch)[number]): DeliveryCandidate | undefined => {
@@ -103,7 +113,7 @@ function selectDeliveries(ctx: ExtensionContext, binding: TeamBinding, startId: 
 		} catch { /* Ignore malformed historical extension data. */ }
 	}
 	let recent = 0;
-	for (let i = branch.length - 1; i >= start && recent < TEAM_MAX_EVENTS && added.length < TEAM_MAX_EVENTS; i--) {
+	for (let i = branch.length - 1; i >= retained && recent < TEAM_MAX_EVENTS && added.length < TEAM_MAX_EVENTS; i--) {
 		const candidate = read(branch[i]!);
 		if (!candidate) continue;
 		recent++;

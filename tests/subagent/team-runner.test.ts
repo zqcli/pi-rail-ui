@@ -86,7 +86,7 @@ test("a completed barrier without a receiving checkpoint keeps the one continuat
 		await manager.channel(b!).afterRun!(run("worker result"));
 		await coordinator.onRequest({ requestId: "workers-done", sequence: 1, action: "finish" });
 		const continuation = await coordinator.afterRun!(run("premature natural answer"));
-		assert.match(continuation!, /complete team snapshot/u);
+		assert.match(continuation!, /complete worker outcomes/u);
 		assert.equal(hub.get(team.id).phase, "finalizing");
 		assert.equal(await coordinator.afterRun!(run("final summary")), undefined);
 		assert.equal(hub.get(team.id).phase, "completed");

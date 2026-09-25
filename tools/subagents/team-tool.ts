@@ -130,14 +130,11 @@ function modelSnapshot(snapshot: TeamSnapshot) {
 	};
 }
 
-export function restoreTeamHistory(hub: TeamHub, entries: readonly { type: string; customType?: string; data?: unknown }[]): void {
-	const latest = new Map<string, TeamSnapshot>();
-	for (const entry of entries) {
-		if (entry.type !== "custom" || entry.customType !== TEAM_HISTORY_TYPE) continue;
-		const data = entry.data as TeamSnapshot | undefined;
-		if (data && typeof data.id === "string" && Array.isArray(data.members) && Array.isArray(data.workers) && Array.isArray(data.events)) latest.set(data.id, data);
-	}
-	hub.restore([...latest.values()]);
+/** Display-only history: the Hub keeps the latest valid entry per team and skips the rest. */
+export function restoreTeamHistory(hub: TeamHub, entries: readonly { type: string; customType?: string; data?: unknown }[]): { restored: number; skipped: number } {
+	const snapshots = entries.filter((entry) => entry.type === "custom" && entry.customType === TEAM_HISTORY_TYPE)
+		.map((entry) => entry.data as TeamSnapshot);
+	return hub.restore(snapshots);
 }
 
 export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub): void {

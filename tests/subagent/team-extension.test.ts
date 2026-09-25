@@ -375,6 +375,29 @@ test("recovery retains a compact roster with at most 64 messages and a total fra
 	}
 });
 
+test("after native compaction only retained deliveries are repaired, plus the compact roster", async () => {
+	const h = harness();
+	await h.command("bind");
+	const add = (id: string, data: any) => h.branch.push({ id, type: "custom_message", customType: TEAM_DELIVERY_TYPE, display: false, timestamp: new Date().toISOString(),
+		content: JSON.stringify(data), details: { teamId: "t", memberId: "b", deliveryId: id } });
+	const snapshot = { id: "t", coordinator: "a", workers: ["b"], phase: "running", seq: 1, createdAt: 1, deadline: 100,
+		members: [{ id: "a", role: "coordinator", state: "running" }, { id: "b", role: "worker", state: "running", assignment: { memberId: "b", task: "Inspect" } }], events: [] };
+	add("roster", { ok: true, events: [{ seq: 1, kind: "message", message: "ROSTER-EVENT" }], snapshot });
+	for (let i = 0; i < 5; i++) add(`summarized-${i}`, { ok: true, events: [{ seq: i + 2, kind: "message", message: `SUMMARIZED-${i}` }] });
+	h.branch.push({ id: "kept", type: "message", message: { role: "user", content: "kept" } });
+	add("retained", { ok: true, events: [{ seq: 10, kind: "message", message: "RETAINED" }] });
+	h.branch.push({ id: "compaction", type: "compaction", summary: "summary", firstKeptEntryId: "kept", tokensBefore: 1 });
+	add("after", { ok: true, events: [{ seq: 11, kind: "message", message: "AFTER" }] });
+	const result = h.handlers.get("context")!({ messages: [] }, h.ctx);
+	await h.command("reply", { requestId: h.entries.at(-1).request.requestId, reply: { ok: true } });
+	const text = JSON.stringify((await result).messages);
+	assert.match(text, /RETAINED/);
+	assert.match(text, /AFTER/);
+	assert.doesNotMatch(text, /SUMMARIZED-/, "summarized deliveries stay summarized");
+	assert.match(text, /Inspect/, "the compact roster keeps the assignment");
+	assert.doesNotMatch(text, /ROSTER-EVENT/, "the compact roster drops its original events");
+});
+
 test("visible and missing deliveries share one native selection, byte/count cap and chronological unique IDs", async () => {
 	for (const large of [false, true]) {
 		const h = harness();

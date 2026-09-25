@@ -321,7 +321,9 @@ async function setup(t: TestContext, server: LoopbackResponsesServer, scenario: 
 	process.env["no_proxy"] = "127.0.0.1,localhost,::1";
 
 	const history: TeamSnapshot[] = [];
-	const hub = new TeamHub({ startupTimeoutMs: 10_000, onSnapshot: (snapshot) => { history.push(snapshot); } });
+	const hub = new TeamHub({ startupTimeoutMs: 10_000 });
+	// Observe every live state change; the durable journal records milestones only.
+	hub.subscribe((snapshot) => { history.push(snapshot); });
 	const stateDir = join(agentDir, "stateful-subagents");
 	const store = new FileAgentInstanceStore(stateDir);
 	const leases = new FileSessionLeaseManager(stateDir);

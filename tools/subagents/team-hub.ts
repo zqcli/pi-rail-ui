@@ -16,6 +16,10 @@ const ERROR_BYTES = TEAM_MAX_ERROR_BYTES;
 const EVENT_BATCH_BYTES = 256 * 1024;
 const RESERVED_DIRECTION_EVENT_BYTES = 56 * 1024;
 const DEFAULT_STALL_GRACE_MS = 2000;
+// Wait/control replies enter a model context; keep their status projection small.
+const PREVIEW_BYTES = 512;
+// The durable journal only needs recent routes and the terminal reason for history display.
+const JOURNAL_EVENTS = 16;
 const TRUNCATED = "\n[truncated]";
 
 /** The team cannot progress without the coordinator changing something. */
@@ -81,6 +85,7 @@ interface Team {
 	stallNoticeAt?: number;
 	history: boolean;
 	published?: string;
+	journaled?: string;
 	publishing: boolean;
 	publicationRevision: number;
 	journalError?: string;
@@ -120,7 +125,6 @@ export class TeamHub {
 
 	prepare(input: { coordinator: string; workers: string[]; timeoutSeconds?: number; brief?: TeamBrief }): TeamSnapshot {
 		if (this.disposed) throw new Error("TeamHub disposed");
-		if (this.teams.size >= MAX_TEAMS) throw new Error("Team session capacity exceeded (32, including history)");
 		if (!input || !Array.isArray(input.workers)) throw new Error("Expected one coordinator and 1–8 unique workers");
 		const ids = [input.coordinator, ...input.workers];
 		const seconds = input.timeoutSeconds ?? 3600;
@@ -140,6 +144,13 @@ export class TeamHub {
 		}
 		const createdAt = this.now();
 		if (!Number.isFinite(createdAt) || createdAt < 0) throw new Error("Invalid team clock");
+		// Finished history is display-only: make room by dropping the oldest terminal team.
+		if (this.teams.size >= MAX_TEAMS) {
+			const oldest = [...this.teams.values()].filter((team) => terminal(team.view.phase))
+				.sort((left, right) => left.view.createdAt - right.view.createdAt)[0];
+			if (oldest) this.teams.delete(oldest.view.id);
+		}
+		if (this.teams.size >= MAX_TEAMS) throw new Error("Team session capacity exceeded (32 active teams)");
 		const view: TeamSnapshot = {
 			id: randomUUID(), coordinator: input.coordinator, workers: [...input.workers], phase: "prepared",
 			seq: 0, createdAt, deadline: createdAt + Math.ceil(seconds * 1000), members: [], events: [],
@@ -316,17 +327,31 @@ export class TeamHub {
 		const team = this.team(teamId);
 		if (!terminal(team.view.phase)) this.stop(team, "cancelled", reason);
 	}
-	restore(snapshots: readonly TeamSnapshot[]): void {
+	/**
+	 * Adopt display-only history. Invalid entries are skipped and only the newest teams that fit
+	 * are kept, so damaged or excessive history can never disable the runtime.
+	 */
+	restore(snapshots: readonly TeamSnapshot[]): { restored: number; skipped: number } {
 		if (this.disposed) throw new Error("TeamHub disposed");
-		if (!Array.isArray(snapshots) || snapshots.length > MAX_TEAMS) throw new Error("Invalid history or team session capacity exceeded (32)");
-		// Validate/reconstruct the entire batch before adopting anything; never clone unknown fields.
-		const views = snapshots.map((snapshot: unknown) => this.validateSnapshot(snapshot));
-		const ids = new Set(views.map((view) => view.id));
-		if (ids.size !== views.length) throw new Error("Duplicate historical team id");
-		if (this.teams.size + views.filter((view) => !this.teams.has(view.id)).length > MAX_TEAMS) throw new Error("Team session capacity exceeded (32, including history)");
-		for (const view of views) {
-			if (this.teams.has(view.id)) continue;
+		if (!Array.isArray(snapshots)) throw new Error("Team history must be an array");
+		// Reconstruct each entry from known fields only; the last entry for an id wins.
+		const latest = new Map<string, TeamSnapshot>();
+		let skipped = 0;
+		for (const snapshot of snapshots as readonly unknown[]) {
+			try {
+				const view = this.validateSnapshot(snapshot);
+				latest.delete(view.id);
+				latest.set(view.id, view);
+			} catch { skipped++; }
+		}
+		const candidates = [...latest.values()].filter((view) => !this.teams.has(view.id))
+			.sort((left, right) => right.createdAt - left.createdAt);
+		const room = Math.max(0, MAX_TEAMS - this.teams.size);
+		skipped += Math.max(0, candidates.length - room);
+		for (const view of candidates.slice(0, room)) {
+			let changed = false;
 			if (!terminal(view.phase)) {
+				changed = true;
 				view.phase = "interrupted";
 				for (const member of view.members) if (!terminal(member.state)) {
 					member.state = "cancelled";
@@ -338,9 +363,16 @@ export class TeamHub {
 				startupDeadline: 0, timers: [], progress: 0, history: true, publishing: false, publicationRevision: 0, replies: [] };
 			team.controller.abort("Historical team");
 			this.teams.set(view.id, team);
-			this.publish(team);
-			this.assertJournal(team);
+			// Only a newly interrupted team is new information; terminal history is not re-journaled.
+			if (changed) {
+				try {
+					const result: unknown = this.options.onSnapshot?.(this.journalView(team));
+					if (result && typeof (result as PromiseLike<unknown>).then === "function") void Promise.resolve(result).catch(() => {});
+				} catch { /* History is display-only; a failed write must not block startup. */ }
+			}
+			team.published = this.publicationKey(team);
 		}
+		return { restored: Math.min(candidates.length, room), skipped };
 	}
 	dispose(): void {
 		if (this.disposed) return;
@@ -583,7 +615,7 @@ export class TeamHub {
 					this.finalize(team, target, { status: "cancelled", output: "", error: reason });
 					target.controller.abort(reason);
 					this.pump(team);
-					done({ ok: true, receipt: { status: "applied", recipient: target.view.id, seq: controlEvent.seq }, snapshot: copy(team.view) });
+					done({ ok: true, receipt: { status: "applied", recipient: target.view.id, seq: controlEvent.seq }, snapshot: this.statusView(team) });
 					return;
 				} else if (request.command === "pause") {
 					target.paused = true;
@@ -614,13 +646,13 @@ export class TeamHub {
 					}
 					const controlEvent = events[1]!;
 					this.pump(team);
-					done({ ok: true, receipt: { status: "applied", recipient: target.view.id, seq: controlEvent.seq }, snapshot: copy(team.view) });
+					done({ ok: true, receipt: { status: "applied", recipient: target.view.id, seq: controlEvent.seq }, snapshot: this.statusView(team) });
 					return;
 				}
 				const controlEvent = this.event(team, { kind: "control", message: request.command }, member, target.view.id);
 				// Include immediate safe-point admission/wakeups, not a transient pre-pump state.
 				this.pump(team);
-				done({ ok: true, receipt: { status: "applied", recipient: target.view.id, seq: controlEvent.seq }, snapshot: copy(team.view) });
+				done({ ok: true, receipt: { status: "applied", recipient: target.view.id, seq: controlEvent.seq }, snapshot: this.statusView(team) });
 				return;
 			}
 		}
@@ -739,11 +771,10 @@ export class TeamHub {
 			if (member.view.role === "worker") team.progress++;
 			this.state(team, member, wait.kind === "workers" ? "finalizing" : "waiting");
 			delete member.view.waitingFor;
-			const snapshot = copy(team.view);
-			// Wait replies carry consumed events separately; duplicating the entire history
-			// would waste the shared frame budget without adding current state.
-			snapshot.events = [];
-			this.settle(member, { ok: true, events: copy(events), snapshot });
+			// Wait replies carry consumed events separately. Complete outcomes are included only
+			// where the wait is about them: the awaited member, or every worker at the barrier.
+			const complete = wait.kind === "workers" ? team.view.workers : wait.kind === "member" ? [wait.member!] : [];
+			this.settle(member, { ok: true, events: copy(events), snapshot: this.statusView(team, complete) });
 		}
 		this.watchStall(team);
 	}
@@ -1028,9 +1059,13 @@ export class TeamHub {
 		try {
 			while (team.published !== this.publicationKey(team)) {
 				team.published = this.publicationKey(team);
-				if (!team.journalError) {
+				// Teams never resume after a parent restart, so the durable journal records only
+				// milestones (roster admission, member outcomes, phases). Live observers see everything.
+				const journalKey = this.journalKey(team);
+				if (!team.journalError && team.journaled !== journalKey) {
+					team.journaled = journalKey;
 					try {
-						const result: unknown = this.options.onSnapshot?.(copy(team.view));
+						const result: unknown = this.options.onSnapshot?.(this.journalView(team));
 						// The frozen callback is synchronous. Fail closed on accidental async writers,
 						// and observe their rejection rather than letting it become unhandled.
 						if (result && typeof (result as PromiseLike<unknown>).then === "function") {
@@ -1068,6 +1103,37 @@ export class TeamHub {
 	}
 	private publicationKey(team: Team): string {
 		return `${team.view.seq}:${team.view.phase}:${team.publicationRevision}`;
+	}
+	private journalKey(team: Team): string {
+		return `${team.view.phase}|${team.view.members.map((member) => terminal(member.state) ? member.state
+			: team.members.get(member.id)?.binding ? "joined" : "registered").join(",")}`;
+	}
+	private journalView(team: Team): TeamSnapshot {
+		const view = copy(team.view);
+		view.events = view.events.slice(-JOURNAL_EVENTS);
+		return view;
+	}
+	/**
+	 * Current status for a member's model context: no event history, brief or assignments
+	 * (the first context already announced them). Outputs are included only for `complete` members.
+	 */
+	private statusView(team: Team, complete: readonly string[] = []): TeamSnapshot {
+		const { brief: _brief, ...view } = copy(team.view);
+		return {
+			...view,
+			events: [],
+			members: view.members.map(({ id, role, state, waitingFor, output, error, result, instructionRevision, observedRevision }) => ({
+				id, role, state,
+				...(waitingFor !== undefined ? { waitingFor } : {}),
+				...(complete.includes(id)
+					? { ...(output !== undefined ? { output } : {}), ...(error !== undefined ? { error } : {}), ...(result ? { result } : {}) }
+					: {
+						...(error !== undefined ? { error: boundedText(error, PREVIEW_BYTES) } : {}),
+						...(result ? { result: { status: result.status, summary: boundedText(result.summary, PREVIEW_BYTES) } } : {}),
+					}),
+				...(instructionRevision !== undefined ? { instructionRevision, observedRevision: observedRevision ?? 0 } : {}),
+			})),
+		};
 	}
 	private error(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 }

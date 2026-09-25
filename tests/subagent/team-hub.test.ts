@@ -27,6 +27,8 @@ function fixture(count = 2, options: ConstructorParameters<typeof TeamHub>[0] = 
 }
 const outcome = { status: "completed", output: "native result" } as const;
 const tick = async () => { await Promise.resolve(); await Promise.resolve(); };
+// Control/wait replies carry a compact current status, not the history or full outcomes.
+const states = (snapshot: TeamSnapshot | undefined) => snapshot?.members.map((member) => [member.id, member.state, member.waitingFor]);
 
 test("fractional-second deadlines round up to transport-safe integer milliseconds", async (t) => {
 	const hub = new TeamHub({ now: () => 1_700_000_000_000 }); t.after(() => hub.dispose());
@@ -233,15 +235,16 @@ test("control snapshots distinguish pause_requested from confirmed paused and re
 	await request(b, { action: "checkpoint" });
 	const requested = await request(a, { action: "control", to: b.memberId, command: "pause" });
 	assert.equal(requested.snapshot?.members.find((member) => member.id === b.memberId)?.state, "pause_requested");
-	assert.equal(requested.snapshot?.events.at(-1)?.message, "pause");
-	assert.deepEqual(requested.snapshot, hub.get(id));
+	assert.deepEqual(requested.snapshot?.events, [], "control status replies do not repeat the event history");
+	assert.equal(hub.get(id).events.find((event) => event.seq === requested.receipt?.seq)?.message, "pause");
+	assert.deepEqual(states(requested.snapshot), states(hub.get(id)));
 	const checkpoint = request(b, { action: "checkpoint" });
 	const confirmed = await request(a, { action: "control", to: b.memberId, command: "pause" });
 	assert.equal(confirmed.snapshot?.members.find((member) => member.id === b.memberId)?.state, "paused");
 	const resumed = await request(a, { action: "control", to: b.memberId, command: "resume" });
 	assert.equal((await checkpoint).ok, true);
 	assert.equal(resumed.snapshot?.members.find((member) => member.id === b.memberId)?.state, "running");
-	assert.deepEqual(resumed.snapshot, hub.get(id));
+	assert.deepEqual(states(resumed.snapshot), states(hub.get(id)));
 	for (const reply of [requested, confirmed, resumed]) assert.doesNotThrow(() => publicTeamReply(reply));
 });
 
@@ -260,10 +263,10 @@ test("control snapshots preserve unresolved dependencies and redirect never clea
 	const paused = redirected.snapshot?.members.find((member) => member.id === b.memberId);
 	assert.equal(paused?.state, "paused");
 	assert.equal(paused?.waitingFor, "message");
-	assert.equal(redirected.snapshot?.events.at(-1)?.kind, "control");
-	assert.equal(redirected.snapshot?.events.at(-1)?.message, "redirect");
-	assert.ok(redirected.snapshot?.events.some((event) => event.kind === "message" && event.message === "new direction"));
-	assert.deepEqual(redirected.snapshot, hub.get(id));
+	assert.equal(paused?.instructionRevision, 1);
+	assert.equal(hub.get(id).events.at(-1)?.message, "redirect");
+	assert.ok(hub.get(id).events.some((event) => event.kind === "message" && event.message === "new direction"));
+	assert.deepEqual(states(redirected.snapshot), states(hub.get(id)));
 	await tick(); assert.equal(ready, false);
 	await request(a, { action: "control", to: b.memberId, command: "resume" });
 	assert.deepEqual((await dependency).events, [], "redirect wakes the parked tool without consuming its context-slot direction");
@@ -281,10 +284,12 @@ test("control snapshots are detached from Hub state and the cached duplicate rep
 	for (const binding of [a, ...workers]) assert.ok(!JSON.stringify(reply).includes(binding.epoch));
 	reply.snapshot.members[0]!.state = "failed";
 	reply.snapshot.workers.push("fake");
-	reply.snapshot.events[0]!.message = "mutated";
-	reply.snapshot.events.length = 0;
+	reply.snapshot.events.push({ seq: 999, kind: "message", message: "mutated" });
 	assert.deepEqual(hub.get(id), before);
-	assert.deepEqual((await hub.request(a, command)).snapshot, before);
+	const cached = (await hub.request(a, command)).snapshot;
+	assert.deepEqual(states(cached), states(before));
+	assert.deepEqual(cached?.workers, before.workers);
+	assert.deepEqual(cached?.events, []);
 });
 
 test("rejected controls have no snapshot or state/message side effects", async (t) => {
@@ -685,10 +690,12 @@ test("paused permission gate does not consume redirect; receiving context gets t
 	assert.equal(received.events?.[0]?.message, "redirect before wait");
 });
 
-test("running checkpoint consumes peer messages and redirects without permit churn or redundant journals", async (t) => {
+test("running checkpoint consumes peer messages and redirects without permit churn or journal writes", async (t) => {
 	const journal: TeamSnapshot[] = [];
+	const observed: TeamSnapshot[] = [];
 	const { hub, a, b, workers, request, id } = fixture(5, { onSnapshot: (snapshot) => { journal.push(snapshot); } });
 	t.after(() => hub.dispose());
+	t.after(hub.subscribe((snapshot) => { observed.push(snapshot); }));
 	for (const worker of workers.slice(0, 4)) await request(worker, { action: "checkpoint" });
 	let queuedGranted = false;
 	const queued = request(workers[4]!, { action: "checkpoint" }).then(() => { queuedGranted = true; });
@@ -696,6 +703,7 @@ test("running checkpoint consumes peer messages and redirects without permit chu
 	await request(a, { action: "control", to: "B1", command: "redirect", message: "new direction" });
 	const seq = hub.get(id).seq;
 	const count = journal.length;
+	const live = observed.length;
 	const checkpoint: TeamRequest = { action: "checkpoint", receive: true, sequence: 100, requestId: "running-gate" };
 	const reply = await hub.request(b, checkpoint);
 	assert.deepEqual(reply.events?.map((event) => event.message), ["peer instruction", "new direction"]);
@@ -704,8 +712,9 @@ test("running checkpoint consumes peer messages and redirects without permit chu
 		assert.deepEqual((await hub.request(b, { ...checkpoint, sequence: i, requestId: `gate-${i}` })).events, []);
 	}
 	assert.equal(hub.get(id).seq, seq);
-	assert.equal(journal.length, count + 1, "observing the redirected instruction is durably published once");
-	assert.equal(journal.at(-1)?.members.find((member) => member.id === "B1")?.observedRevision, 1);
+	assert.equal(journal.length, count, "only milestones are journaled; revision observation is live state");
+	assert.equal(observed.length, live + 1, "live observers see the observed revision once");
+	assert.equal(observed.at(-1)?.members.find((member) => member.id === "B1")?.observedRevision, 1);
 	assert.equal(queuedGranted, false);
 	assert.equal(hub.get(id).members.find((member) => member.id === "B1")?.state, "running");
 	hub.cancel(id); await queued;
@@ -773,7 +782,11 @@ for (const mode of ["grant", "barrier", "cancel"] as const) {
 		let pending: Promise<unknown>;
 		if (mode === "grant") {
 			fail = true;
-			pending = request(b, { action: "checkpoint" }).then((reply) => { assert.equal(reply.ok, false); assert.match(reply.error!, /journal failed/); });
+			// Permit grants are live state, not journal milestones; the next outcome is.
+			assert.equal((await request(b, { action: "checkpoint" })).ok, true);
+			assert.equal(failures, 0);
+			assert.throws(() => hub.complete(b, outcome), /journal failed/);
+			pending = Promise.resolve();
 		} else if (mode === "barrier") {
 			fail = true;
 			assert.throws(() => hub.complete(b, outcome), /journal failed/);
@@ -829,39 +842,49 @@ test("admission journal failure releases the previously blocked checkpoint", asy
 
 test("journal reentry cannot leak a successful reply before persistence throws", async (t) => {
 	let reenter: (() => void) | undefined;
-	const { hub, a, b, request, id } = fixture(1, { onSnapshot: () => { reenter?.(); } });
+	const { hub, b, workers, request, id } = fixture(2, { onSnapshot: () => { reenter?.(); } });
 	t.after(() => hub.dispose());
 	let nested: Promise<unknown> | undefined;
 	reenter = () => {
 		reenter = undefined;
-		nested = request(b, { action: "checkpoint" }).then((reply) => assert.equal(reply.ok, false));
+		nested = request(workers[1]!, { action: "checkpoint" }).then((reply) => assert.equal(reply.ok, false));
 		throw new Error("journal failure after nested grant");
 	};
-	assert.equal((await request(a, { action: "send", to: "B1", message: "trigger" })).ok, false);
+	assert.throws(() => hub.complete(b, outcome), /journal failed/);
 	await nested;
 	assert.equal(hub.get(id).phase, "failed");
 });
 
-test("alias rules match host and team/history session capacity is explicitly bounded", (t) => {
-	const hub = new TeamHub(); t.after(() => hub.dispose());
+test("alias rules match host; capacity evicts oldest finished history and bounds only active teams", (t) => {
+	let now = 1000;
+	const hub = new TeamHub({ now: () => now }); t.after(() => hub.dispose());
 	for (const alias of ["has space", "中文", "-leading", "a/b", "a\nb"]) {
 		assert.throws(() => hub.prepare({ coordinator: alias, workers: ["B"] }), /alias/);
 		assert.throws(() => hub.prepare({ coordinator: "A", workers: [alias] }), /alias/);
 	}
-	for (let i = 0; i < 32; i++) hub.cancel(hub.prepare({ coordinator: "A", workers: ["B"] }).id);
+	const ids: string[] = [];
+	for (let i = 0; i < 32; i++) { now++; ids.push(hub.prepare({ coordinator: "A", workers: ["B"] }).id); hub.cancel(ids.at(-1)!); }
 	assert.equal(hub.list().length, 32);
-	assert.throws(() => hub.prepare({ coordinator: "A", workers: ["B"] }), /capacity/);
+	now++;
+	const next = hub.prepare({ coordinator: "A", workers: ["B"] });
+	assert.equal(hub.list().length, 32);
+	assert.throws(() => hub.get(ids[0]!), /Unknown team/, "the oldest finished team is evicted");
+	assert.equal(hub.get(ids[1]!).phase, "cancelled");
 	const restored = new TeamHub(); t.after(() => restored.dispose());
-	restored.restore(hub.list());
+	assert.deepEqual(restored.restore(hub.list()), { restored: 32, skipped: 0 });
 	assert.equal(restored.list().length, 32);
-	assert.throws(() => restored.prepare({ coordinator: "A", workers: ["B"] }), /capacity/);
-	assert.throws(() => restored.restore([{ ...hub.list()[0]!, id: "extra", seq: 0, events: [] }]), /capacity/);
+	assert.equal(restored.get(next.id).phase, "interrupted");
+	assert.deepEqual(restored.restore([{ ...hub.get(ids[1]!), id: "extra", seq: 0, events: [] }]), { restored: 0, skipped: 1 },
+		"history beyond capacity is skipped, not an error");
+	assert.doesNotThrow(() => restored.prepare({ coordinator: "A", workers: ["B"] }));
+	const active = new TeamHub(); t.after(() => active.dispose());
+	for (let i = 0; i < 32; i++) active.prepare({ coordinator: "A", workers: ["B"] });
+	assert.throws(() => active.prepare({ coordinator: "A", workers: ["B"] }), /32 active teams/);
 });
 
-test("restore validates unknown input atomically and bounds known fields without retaining arbitrary properties", (t) => {
+test("restore skips invalid entries individually and bounds known fields without retaining arbitrary properties", (t) => {
 	const source = new TeamHub(); t.after(() => source.dispose());
 	const snapshot = source.prepare({ coordinator: "A", workers: ["B"] });
-	const hub = new TeamHub(); t.after(() => hub.dispose());
 	const invalid: unknown[] = [null, {}, { ...snapshot, workers: ["bad alias"] }, { ...snapshot, workers: ["A"] },
 		{ ...snapshot, phase: "fake" }, { ...snapshot, deadline: NaN }, { ...snapshot, seq: -1 },
 		{ ...snapshot, members: [snapshot.members[0], snapshot.members[0]] },
@@ -869,16 +892,22 @@ test("restore validates unknown input atomically and bounds known fields without
 		{ ...snapshot, seq: 1, events: [{ seq: 1, kind: "message", from: "outsider" }] },
 		{ ...snapshot, members: snapshot.members.map((member) => ({ ...member, output: {} })) }];
 	for (const value of invalid) {
-		assert.throws(() => hub.restore([snapshot, value] as TeamSnapshot[]));
-		assert.equal(hub.list().length, 0);
+		const hub = new TeamHub(); t.after(() => hub.dispose());
+		const other = { ...snapshot, id: "valid-neighbour" };
+		assert.deepEqual(hub.restore([other, value] as TeamSnapshot[]), { restored: 1, skipped: 1 });
+		assert.deepEqual(hub.list().map((team) => team.id), ["valid-neighbour"], "one damaged entry cannot hide valid history");
 	}
+	const hub = new TeamHub(); t.after(() => hub.dispose());
 	assert.throws(() => hub.restore(null as unknown as TeamSnapshot[]));
-	assert.throws(() => hub.restore(Array.from({ length: 33 }, (_, i) => ({ ...snapshot, id: `id${i}` }))), /capacity/);
+	const many = Array.from({ length: 40 }, (_, i) => ({ ...snapshot, id: `id${i}`, createdAt: i, deadline: i + 1000 }));
+	assert.deepEqual(hub.restore(many), { restored: 32, skipped: 8 });
+	assert.ok(hub.list().every((team) => Number(team.id.slice(2)) >= 8), "the newest history is kept");
+	const fresh = new TeamHub(); t.after(() => fresh.dispose());
 	const restored = { ...snapshot, secret: "not persisted", members: snapshot.members.map((member) => ({
 		...member, output: "🙂".repeat(100_000), binding: "not persisted",
 	})) };
-	hub.restore([restored]);
-	const history = hub.get(snapshot.id);
+	fresh.restore([restored]);
+	const history = fresh.get(snapshot.id);
 	assert.equal(history.phase, "interrupted");
 	assert.ok(history.members.every((member) => Buffer.byteLength(member.output!) <= 16 * 1024));
 	assert.doesNotMatch(JSON.stringify(history), /not persisted/);
@@ -896,7 +925,7 @@ test("cancel while native cleanup is pending cannot deliver a successful coordin
 	await assert.rejects(hub.waitForWorkers(a), /terminal/);
 });
 
-test("restore is read-only interrupted history; snapshots and journal observers are isolated", async (t) => {
+test("restore is read-only interrupted history; only newly interrupted teams are journaled again", async (t) => {
 	const journal: TeamSnapshot[] = [];
 	const { hub, a, b, request, id } = fixture(1, { onSnapshot: (snapshot) => journal.push(snapshot) });
 	t.after(() => hub.dispose());
@@ -910,11 +939,16 @@ test("restore is read-only interrupted history; snapshots and journal observers 
 	assert.equal(hub.get(id).phase, "running");
 	const snapshot = hub.get(id); snapshot.workers.push("fake");
 	assert.deepEqual(hub.get(id).workers, ["B1"]);
-	assert.ok(journal.some((s) => s.events.some((e) => e.message === "journal")));
+	assert.ok(journal.every((s) => s.events.every((e) => e.message !== "journal")), "a message is not a journal milestone");
 	assert.ok(journal.every((s) => !JSON.stringify(s).includes(b.epoch)));
-	const restored = new TeamHub(); t.after(() => restored.dispose());
+	const reloaded: TeamSnapshot[] = [];
+	const restored = new TeamHub({ onSnapshot: (value) => reloaded.push(value) }); t.after(() => restored.dispose());
 	restored.restore([hub.get(id)]);
 	assert.equal(restored.get(id).phase, "interrupted");
+	assert.deepEqual(reloaded.map((value) => value.phase), ["interrupted"]);
+	const again = new TeamHub({ onSnapshot: (value) => reloaded.push(value) }); t.after(() => again.dispose());
+	again.restore([restored.get(id)]);
+	assert.equal(reloaded.length, 1, "terminal history is never re-appended on later reloads");
 	assert.throws(() => restored.join(id, ["A"]), /interrupted/);
 	assert.equal((await restored.request(b, { requestId: "old", sequence: 100, action: "checkpoint" })).ok, false);
 	assert.throws(() => restored.complete(b, outcome), /stale/);
@@ -1013,7 +1047,7 @@ test("request replies are routed; messages and controls return accurate receipts
 	const control = await hub.request(a!, { requestId: "pause-1", sequence: 2, action: "control", command: "pause", to: "B1" });
 	assert.equal(control.receipt?.status, "applied");
 	assert.equal(control.receipt?.recipient, "B1");
-	assert.equal(control.receipt?.seq, control.snapshot?.events.at(-1)?.seq);
+	assert.equal(control.receipt?.seq, hub.get(snapshot.id).events.at(-1)?.seq);
 	const before = hub.get(snapshot.id);
 	const selfSend = await hub.request(a!, { requestId: "self-send", sequence: 3, action: "send", to: "A", message: "invalid" });
 	assert.equal(selfSend.ok, false);
@@ -1209,10 +1243,12 @@ test("worker finish stores a nonterminal structured candidate; report remains pr
 	assert.ok(a);
 });
 
-test("finish shorthand is size-checked atomically and replacement candidates are journaled without a state change", async (t) => {
+test("finish shorthand is size-checked atomically; replacement candidates are live state and reach the journal with the outcome", async (t) => {
 	const history: TeamSnapshot[] = [];
+	const observed: TeamSnapshot[] = [];
 	const { hub, id, b, a, request } = fixture(1, { onSnapshot: (snapshot) => history.push(snapshot) });
 	t.after(() => hub.dispose());
+	t.after(hub.subscribe((snapshot) => { observed.push(snapshot); }));
 	const before = hub.get(id);
 	const rejected = await request(b, { action: "finish", message: "\u0000".repeat(TEAM_MAX_MESSAGE_BYTES) });
 	assert.equal(rejected.ok, false);
@@ -1221,12 +1257,19 @@ test("finish shorthand is size-checked atomically and replacement candidates are
 	assert.equal((await request(b, { action: "finish", message: "first candidate" })).ok, true);
 	const seq = hub.get(id).seq;
 	const count = history.length;
+	const live = observed.length;
 	assert.equal((await request(b, { action: "finish", message: "corrected candidate" })).ok, true);
 	assert.equal(hub.get(id).seq, seq, "candidate replacement need not invent a state event");
-	assert.equal(history.length, count + 1);
-	assert.equal(history.at(-1)?.members.find((member) => member.id === "B1")?.result?.summary, "corrected candidate");
+	assert.equal(history.length, count, "a candidate is not a journal milestone");
+	assert.equal(observed.length, live + 1);
+	assert.equal(observed.at(-1)?.members.find((member) => member.id === "B1")?.result?.summary, "corrected candidate");
 	assert.equal((await request(a, { action: "control", to: "B1", command: "redirect", message: "new assignment" })).ok, true);
 	assert.equal(hub.get(id).members.find((member) => member.id === "B1")?.result, undefined, "a redirected member must not reuse an old deliverable candidate");
+	assert.equal((await request(b, { action: "checkpoint", receive: true })).revision, 1);
+	assert.equal((await request(b, { action: "finish", message: "final candidate" })).ok, true);
+	hub.complete(b, outcome);
+	assert.equal(history.at(-1)?.members.find((member) => member.id === "B1")?.result?.summary, "final candidate",
+		"the outcome milestone journals the final candidate");
 });
 
 test("redirect revisions invalidate stale and parked checkpoints without cancelling the team", async (t) => {
@@ -1258,9 +1301,9 @@ test("redirect revisions invalidate stale and parked checkpoints without cancell
 	assert.equal(received.events?.some((event) => event.message === "new direction"), true);
 	member = hub.get(id).members.find((candidate) => candidate.id === "B1")!;
 	assert.equal(member.observedRevision, 1);
-	assert.equal(journal.at(-1)?.members.find((candidate) => candidate.id === "B1")?.observedRevision, 1);
 	hub.complete(b, outcome);
 	assert.equal(hub.get(id).members.find((candidate) => candidate.id === "B1")?.state, "completed");
+	assert.equal(journal.at(-1)?.members.find((candidate) => candidate.id === "B1")?.observedRevision, 1);
 });
 
 test("unobserved redirect blocks successful native completion but still accepts native failure", async (t) => {
@@ -1285,8 +1328,9 @@ test("legacy event history remains readable without fabricated v2 metadata", (t)
 	assert.equal(event.version, undefined);
 	assert.equal(event.messageId, undefined);
 	assert.equal(event.timestamp, undefined);
-	assert.throws(() => hub.restore([{ ...prepared, seq: 1, events: [{ seq: 1, kind: "message", version: 2,
-		messageId: `${prepared.id}:1`, timestamp: 1, from: "@hub", to: "A", message: "forged" }] } as unknown as TeamSnapshot]), /Invalid historical/);
+	const forged = new TeamHub(); t.after(() => forged.dispose());
+	assert.deepEqual(forged.restore([{ ...prepared, seq: 1, events: [{ seq: 1, kind: "message", version: 2,
+		messageId: `${prepared.id}:1`, timestamp: 1, from: "@hub", to: "A", message: "forged" }] } as unknown as TeamSnapshot]), { restored: 0, skipped: 1 });
 });
 
 test("restore validates v2 event IDs, timestamps, authoritative routes, and own supersedes history", async (t) => {
@@ -1314,7 +1358,7 @@ test("restore validates v2 event IDs, timestamps, authoritative routes, and own 
 	}
 	const restored = new TeamHub(); t.after(() => restored.dispose());
 	for (const invalid of invalidSnapshots) {
-		assert.throws(() => restored.restore([invalid]), /Invalid historical/);
+		assert.deepEqual(restored.restore([invalid]), { restored: 0, skipped: 1 });
 		assert.equal(restored.list().length, 0, "a bad v2 event cannot partially adopt history");
 	}
 });
@@ -1359,8 +1403,10 @@ test("worst-case eight-worker snapshots fit public, private-frame, and durable-d
 	});
 	assert.equal(reply.ok, true);
 	assert.equal(reply.snapshot?.events.length, 0, "wait snapshot projects current status; top-level events carry consumed history");
-	assert.ok(reply.snapshot?.members.every((member) => member.assignment));
-	assert.ok(reply.snapshot?.members.filter((member) => member.role === "worker").every((member) => member.result));
+	assert.ok(reply.snapshot?.members.every((member) => !member.assignment && member.output === undefined && !reply.snapshot?.brief),
+		"a message wait carries compact status, not brief, assignments or outputs");
+	assert.ok(reply.snapshot?.members.filter((member) => member.role === "worker").every((member) => member.result
+		&& Buffer.byteLength(member.result.summary) <= 512 && Buffer.byteLength(member.error!) <= 512));
 	const publicReply = publicTeamReply(reply);
 	const replyJson = JSON.stringify(publicReply);
 	const frame = {
@@ -1374,11 +1420,14 @@ test("worst-case eight-worker snapshots fit public, private-frame, and durable-d
 	};
 	const durableDeliveryBytes = Buffer.byteLength(JSON.stringify([delivery]), "utf8");
 	const publicReplyBytes = Buffer.byteLength(replyJson, "utf8");
-	assert.ok(publicReplyBytes > 650 * 1024, `test should exercise a near-cap public reply (${publicReplyBytes} bytes)`);
+	assert.ok(publicReplyBytes > 250 * 1024, `test should exercise a large event batch (${publicReplyBytes} bytes)`);
 	assert.ok(publicReplyBytes <= TEAM_FRAME_BYTES);
 	assert.ok(privateFrameBytes <= TEAM_FRAME_BYTES);
 	assert.ok(durableDeliveryBytes <= TEAM_FRAME_BYTES);
-	await hub.waitForWorkers(coordinator!);
+	const barrier = await hub.waitForWorkers(coordinator!);
+	assert.ok(barrier.members.filter((member) => member.role === "worker").every((member) => member.output && member.result && !member.assignment),
+		"the barrier carries complete worker outcomes once");
+	assert.ok(Buffer.byteLength(JSON.stringify(publicTeamReply({ ok: true, from: "@hub", to: "A", requestId: "barrier", snapshot: barrier }))) <= TEAM_FRAME_BYTES);
 	hub.complete(coordinator!, { status: "completed", output: "\u0000".repeat(100_000), error: "\u0000".repeat(100_000) });
 	const terminalReply = publicTeamReply({ ok: true, from: "@hub", to: "A", requestId: "terminal-snapshot", snapshot: hub.get(team.id) });
 	const terminalFrame = {
@@ -1520,4 +1569,47 @@ test("unread queued messages are reported to the sender and coordinator when the
 	assert.doesNotThrow(() => publicTeamReply(notice));
 	const restored = new TeamHub(); t.after(() => restored.dispose());
 	assert.doesNotThrow(() => restored.restore([hub.get(id)]));
+});
+
+test("coordinator wait/control replies stay compact as worker outputs accumulate; the barrier carries them once", async (t) => {
+	const { hub, a, workers, request } = fixture(8, { stallGraceMs: 60_000 }); t.after(() => hub.dispose());
+	const sizes: number[] = [];
+	for (const [index, worker] of workers.entries()) {
+		await request(worker, { action: "report", message: `report ${index} `.repeat(150) });
+		sizes.push(Buffer.byteLength(JSON.stringify(await request(a, { action: "wait", wait: { kind: "message" } }))));
+		await request(worker, { action: "finish", result: { status: "succeeded", summary: "s".repeat(3000), findings: ["f".repeat(1000)] } });
+		hub.complete(worker, { status: "completed", output: "o".repeat(8000) });
+		if (index === 6) {
+			const control = await request(a, { action: "control", to: "B8", command: "pause" });
+			assert.equal(control.ok, true);
+			assert.ok(Buffer.byteLength(JSON.stringify(control)) < 8 * 1024, "control replies are compact status, not the full team");
+			await request(a, { action: "control", to: "B8", command: "resume" });
+		}
+	}
+	// Each wait consumes one ~2 KB report plus the previous worker's result/state events.
+	assert.ok(Math.max(...sizes) < 12 * 1024, `message wait replies must not grow with finished outputs: ${sizes.join(", ")}`);
+	assert.ok(sizes.at(-1)! - sizes[1]! < 4 * 1024, `reply size is roughly flat: ${sizes.join(", ")}`);
+	const barrier = await request(a, { action: "finish" });
+	assert.ok(barrier.snapshot?.members.filter((member) => member.role === "worker").every((member) => member.output === "o".repeat(8000)));
+});
+
+test("a complete 1+8 run journals only milestones", async (t) => {
+	const journal: TeamSnapshot[] = [];
+	const { hub, a, workers, request, id } = fixture(8, { onSnapshot: (snapshot) => { journal.push(snapshot); } }); t.after(() => hub.dispose());
+	const afterJoin = journal.length;
+	for (const worker of workers) {
+		for (let i = 0; i < 10; i++) await request(worker, { action: "checkpoint", receive: i % 2 === 0 });
+		await request(worker, { action: "report", message: "progress" });
+		await request(a, { action: "wait", wait: { kind: "message" } });
+		await request(worker, { action: "finish", message: "done" });
+		hub.complete(worker, outcome);
+	}
+	await request(a, { action: "finish" });
+	hub.complete(a, { status: "completed", output: "summary" });
+	assert.equal(hub.get(id).phase, "completed");
+	// 8 worker outcomes + finalizing + coordinator outcome/completed phase.
+	assert.ok(journal.length - afterJoin <= 10, `journal entries after admission: ${journal.length - afterJoin}`);
+	assert.ok(journal.every((snapshot) => snapshot.events.length <= 16), "journaled history is trimmed");
+	assert.equal(journal.at(-1)?.phase, "completed");
+	assert.ok(journal.at(-1)?.members.every((member) => member.state === "completed" && member.output !== undefined));
 });

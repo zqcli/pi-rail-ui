@@ -272,6 +272,8 @@ export class SessionBroker {
 	private readonly stoppingAgents = new Set<string>();
 	/** Children that outlived SIGKILL: their session file may still be written until the OS reaps them. */
 	private readonly unreaped = new Map<string, Promise<void>>();
+	/** Stops in progress, so a concurrent cleanup waits for the outcome instead of seeing no worker. */
+	private readonly stopsInFlight = new Map<string, Promise<void>>();
 	private readonly deletingAgents = new Set<string>();
 	private readonly modelChanges = new Map<string, Promise<AgentInstance>>();
 	private readonly fastModeChanges = new Map<string, Promise<AgentInstance>>();
@@ -993,32 +995,42 @@ export class SessionBroker {
 		this.teamActive.get(agentId)?.abort();
 		const starting = this.workerStarts.get(agentId);
 		if (starting) await starting.catch(() => undefined);
+		const inFlight = this.stopsInFlight.get(agentId);
+		if (inFlight) return inFlight;
 		const state = this.workers.get(agentId);
 		if (!state) return;
 		this.stoppingAgents.add(agentId);
-		this.workers.delete(agentId);
-		state.stopping = true;
 		try {
-			await state.worker.stop();
+			await this.stopProcess(agentId, state);
 			await Promise.allSettled([state.tail, state.controlTail]);
 			this.runtimeErrors.delete(agentId);
-		} catch (error) {
-			if (error instanceof RpcProcessExitTimeoutError) {
-				this.unreaped.set(agentId, error.exited);
-				void error.exited.then(() => this.unreaped.delete(agentId), () => this.unreaped.delete(agentId));
-			}
-			throw error;
 		} finally {
 			this.stoppingAgents.delete(agentId);
 			this.emitRuntimeChange();
 		}
 	}
 
+	/** Detaches and stops a worker; a child that outlives SIGKILL is recorded before any waiter resumes. */
+	private stopProcess(agentId: string, state: WorkerState): Promise<void> {
+		this.workers.delete(agentId);
+		state.stopping = true;
+		const stop = state.worker.stop().catch((error: unknown) => {
+			if (error instanceof RpcProcessExitTimeoutError) {
+				this.unreaped.set(agentId, error.exited);
+				void error.exited.then(() => this.unreaped.delete(agentId), () => this.unreaped.delete(agentId));
+			}
+			throw error;
+		}).finally(() => {
+			if (this.stopsInFlight.get(agentId) === stop) this.stopsInFlight.delete(agentId);
+		});
+		this.stopsInFlight.set(agentId, stop);
+		return stop;
+	}
+
 	private async retireFailedWorker(agentId: string): Promise<void> {
 		const state = this.workers.get(agentId);
 		if (!state) return;
-		this.workers.delete(agentId);
-		await state.worker.stop().catch(() => undefined);
+		await this.stopProcess(agentId, state).catch(() => undefined);
 	}
 
 	private async cleanupCreatedInstance(agent: AgentInstance, removeSessionFile: boolean): Promise<void> {

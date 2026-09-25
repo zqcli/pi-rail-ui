@@ -1614,3 +1614,42 @@ test("a child that outlives SIGKILL keeps its session file until it is reaped", 
 		}
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test("a cleanup that races an in-flight stop waits for its outcome before removing the session file", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "rail-stop-race-"));
+	try {
+		const sessionFile = join(dir, "race.jsonl");
+		await writeFile(sessionFile, "{}\n");
+		let reap!: () => void;
+		const exited = new Promise<void>((resolve) => { reap = resolve; });
+		let sendStarted!: () => void;
+		const sending = new Promise<void>((resolve) => { sendStarted = resolve; });
+		let rejectSend!: (error: Error) => void;
+		let timeOut!: () => void;
+		const worker = new FakeWorker("session-race", sessionFile);
+		worker.send = () => new Promise((_resolve, reject) => { rejectSend = reject; sendStarted(); });
+		worker.stop = () => {
+			rejectSend(new Error("Subagent RPC process stopped"));
+			return new Promise((_resolve, reject) => { timeOut = () => reject(new RpcProcessExitTimeoutError("did not exit after SIGKILL", exited)); });
+		};
+		const store = new MemoryInstanceStore();
+		const broker = new SessionBroker({ store, roster: new MemoryRoster(), workerFactory: async () => worker });
+		const team = {
+			binding: { version: 1 as const, teamId: "team", memberId: "B", role: "worker" as const, epoch: "private" },
+			onRequest: async () => ({ ok: true }), started: () => false,
+		};
+		const dispatching = broker.dispatch({ model: reviewerModel(), alias: "B", task: "work", team }).then(() => undefined, (error: Error) => error);
+		await sending;
+		const stopping = broker.stop("B").catch(() => undefined);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		await access(sessionFile);
+		timeOut();
+		assert.match(String(await dispatching), /stopped/u);
+		await stopping;
+		await access(sessionFile);
+		reap();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		await assert.rejects(access(sessionFile), /ENOENT/u);
+		await broker.shutdown();
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});

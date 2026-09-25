@@ -76,14 +76,29 @@ export interface TeamLaunchPlan {
 // Plans are in-memory only: a reload interrupts unfinished teams, so there is nothing to resume.
 const launchPlans = new WeakMap<TeamHub, Map<string, TeamLaunchPlan>>();
 
+/** A plan is only useful until its team is admitted or ends (cancel, deadline, eviction). */
+function launchable(hub: TeamHub, teamId: string): boolean {
+	try {
+		const snapshot = hub.get(teamId);
+		return snapshot.phase === "prepared" && snapshot.members.every((member) => member.state === "registered");
+	} catch {
+		return false;
+	}
+}
+
 export function setTeamLaunchPlan(hub: TeamHub, teamId: string, plan: TeamLaunchPlan): void {
 	let plans = launchPlans.get(hub);
 	if (!plans) launchPlans.set(hub, plans = new Map());
+	for (const id of plans.keys()) if (!launchable(hub, id)) plans.delete(id);
 	plans.set(teamId, plan);
 }
 
 export function teamLaunchPlan(hub: TeamHub, teamId: string): TeamLaunchPlan | undefined {
-	return launchPlans.get(hub)?.get(teamId);
+	const plans = launchPlans.get(hub);
+	if (!plans?.has(teamId)) return undefined;
+	if (launchable(hub, teamId)) return plans.get(teamId);
+	plans.delete(teamId);
+	return undefined;
 }
 
 export function deleteTeamLaunchPlan(hub: TeamHub, teamId: string): void {

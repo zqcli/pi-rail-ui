@@ -242,10 +242,16 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub, getLaun
 				let snapshot: TeamSnapshot;
 				try { snapshot = hub.get(teamId); }
 				catch { throw new Error(`Unknown teamId ${JSON.stringify(teamId.slice(0, 128))}: use the exact teamId returned by prepare (status without teamId lists teams).`); }
+				// Placeholders (null, "", []) are fine; a real value would silently not apply, so reject it.
+				const present = (value: unknown) => value != null && !(Array.isArray(value) && value.length === 0) && !(typeof value === "string" && !value.trim());
+				const extra = (["coordinator", "workers", "brief", "timeoutSeconds"] as const).filter((key) => present(params[key]));
+				if (extra.length) {
+					throw new Error(`launch takes only teamId; ${extra.join(", ")} ${extra.length === 1 ? "was" : "were"} fixed at prepare. Send {"action":"launch","teamId":"${teamId}"}, or cancel this team and prepare again to change the plan. Nothing was started.`);
+				}
 				const plan = teamLaunchPlan(hub, teamId);
 				if (!plan) {
 					if (snapshot.phase !== "prepared" || snapshot.members.some((member) => member.state !== "registered")) {
-						throw new Error(`Team ${teamId} has already been launched (phase ${snapshot.phase}); use status to inspect it.`);
+						throw new Error(`Team ${teamId} is ${snapshot.phase} and cannot be launched again; use status to inspect it, or prepare a new team.`);
 					}
 					throw new Error(`Team ${teamId} was prepared with aliases only and has no launch plan. Cancel it and prepare again with member objects {alias, task, ...}.`);
 				}
@@ -263,7 +269,11 @@ export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub, getLaun
 				const summaries = plan ? await getLauncher?.()?.validate(plan, ctx) : undefined;
 				snapshots = [hub.prepare({ ...aliases, ...(params.timeoutSeconds != null ? { timeoutSeconds: params.timeoutSeconds } : {}), ...(brief ? { brief } : {}) })];
 				if (plan) {
-					setTeamLaunchPlan(hub, snapshots[0]!.id, plan);
+					// Pin what was validated and shown, so a later parent model or cwd change cannot alter the launch.
+					const pin = (member: TeamMemberPlan, index: number): TeamMemberPlan => summaries?.[index]
+						? { ...member, model: summaries[index]!.model, cwd: summaries[index]!.cwd }
+						: member;
+					setTeamLaunchPlan(hub, snapshots[0]!.id, { coordinator: pin(plan.coordinator, 0), workers: plan.workers.map((worker, index) => pin(worker, index + 1)) });
 					prepared = { plan, ...(summaries ? { summaries } : {}) };
 				}
 			} else if (params.action === "cancel") {

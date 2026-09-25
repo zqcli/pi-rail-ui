@@ -20,6 +20,7 @@ import {
 	WorkerControlError,
 } from "../../tools/subagents/session-broker";
 import type { RailModelRef } from "../../tools/subagents/models";
+import { RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 
 test("team continuation reserves the operation, rejects target insertion and sums native usage", async () => {
 	const store = new MemoryInstanceStore();
@@ -1573,4 +1574,43 @@ test("team prepare can reject aliases that a new persistent member could not cla
 		await assert.rejects(broker.assertAliasesAvailable(["free", "taken"]), /alias already exists: taken\. Team members need new aliases/u);
 		await broker.assertAliasesAvailable(["free", "other"]);
 	} finally { await broker.shutdown(); }
+});
+
+test("a child that outlives SIGKILL keeps its session file until it is reaped", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "rail-unreaped-"));
+	try {
+		for (const path of ["cleanup", "delete"] as const) {
+			const sessionFile = join(dir, `${path}.jsonl`);
+			await writeFile(sessionFile, "{}\n");
+			let reap!: () => void;
+			const exited = new Promise<void>((resolve) => { reap = resolve; });
+			const worker = new FakeWorker(`session-${path}`, sessionFile);
+			worker.stop = async () => { throw new RpcProcessExitTimeoutError("did not exit after SIGKILL", exited); };
+			const store = new MemoryInstanceStore();
+			const broker = new SessionBroker({ store, roster: new MemoryRoster(), workerFactory: async () => worker });
+			if (path === "cleanup") {
+				// A team member that never passed a gate is removed, but its file waits for the reap.
+				worker.send = async () => { throw new Error("Startup admission deadline exceeded"); };
+				const team = {
+					binding: { version: 1 as const, teamId: "team", memberId: "B", role: "worker" as const, epoch: "private" },
+					onRequest: async () => ({ ok: true }), started: () => false,
+				};
+				await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "work", team }), /admission/u);
+				assert.equal(store.instances.size, 0, "the descriptor and alias are released");
+			} else {
+				await broker.dispatch({ model: reviewerModel(), alias: "D", task: "work" });
+				await assert.rejects(broker.delete("D"), /did not exit after SIGKILL/u);
+				await assert.rejects(broker.delete("D"), /has not exited yet; retry delete after it is reaped/u);
+			}
+			await access(sessionFile);
+			reap();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			if (path === "cleanup") await assert.rejects(access(sessionFile), /ENOENT/u);
+			else {
+				await broker.delete("D");
+				await assert.rejects(access(sessionFile), /ENOENT/u);
+			}
+			await broker.shutdown();
+		}
+	} finally { await rm(dir, { recursive: true, force: true }); }
 });

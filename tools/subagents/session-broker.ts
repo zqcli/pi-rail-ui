@@ -4,6 +4,7 @@ import { rm } from "node:fs/promises";
 import { ContextProtocolError, ContextWindowValidationError, createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";
 import { assertValidAgentAlias } from "./identity";
 import type { RailModelRef } from "./models";
+import { RpcProcessExitTimeoutError } from "./rpc-transport";
 import { buildSubagentSessionName } from "./session-name";
 import type { SessionLease } from "./session-lease";
 import type { SubagentTranscriptSnapshot } from "./transcript";
@@ -269,6 +270,8 @@ export class SessionBroker {
 	private readonly lifecycleEpochs = new Map<string, number>();
 	private readonly runtimeErrors = new Map<string, string>();
 	private readonly stoppingAgents = new Set<string>();
+	/** Children that outlived SIGKILL: their session file may still be written until the OS reaps them. */
+	private readonly unreaped = new Map<string, Promise<void>>();
 	private readonly deletingAgents = new Set<string>();
 	private readonly modelChanges = new Map<string, Promise<AgentInstance>>();
 	private readonly fastModeChanges = new Map<string, Promise<AgentInstance>>();
@@ -766,6 +769,9 @@ export class SessionBroker {
 			const instance = await this.resolveInstance(target).catch(() => undefined);
 			if (!instance) return undefined;
 			await this.stopWorker(instance.agentId);
+			if (this.unreaped.has(instance.agentId)) {
+				throw new Error(`Subagent ${instance.alias} process has not exited yet; retry delete after it is reaped`);
+			}
 			await rm(instance.sessionFile, { force: true });
 			await this.store.delete(instance.agentId);
 			this.commitDeletedSnapshot(instance.agentId);
@@ -996,6 +1002,12 @@ export class SessionBroker {
 			await state.worker.stop();
 			await Promise.allSettled([state.tail, state.controlTail]);
 			this.runtimeErrors.delete(agentId);
+		} catch (error) {
+			if (error instanceof RpcProcessExitTimeoutError) {
+				this.unreaped.set(agentId, error.exited);
+				void error.exited.then(() => this.unreaped.delete(agentId), () => this.unreaped.delete(agentId));
+			}
+			throw error;
 		} finally {
 			this.stoppingAgents.delete(agentId);
 			this.emitRuntimeChange();
@@ -1018,7 +1030,11 @@ export class SessionBroker {
 		} catch {
 			// Keep the snapshot when descriptor cleanup did not succeed.
 		}
-		if (removeSessionFile) await rm(agent.sessionFile, { force: true }).catch(() => undefined);
+		if (!removeSessionFile) return;
+		const exited = this.unreaped.get(agent.agentId);
+		// Never unlink a file a still-running child may write; remove it once the child is reaped.
+		if (exited) void exited.then(() => rm(agent.sessionFile, { force: true })).catch(() => undefined);
+		else await rm(agent.sessionFile, { force: true }).catch(() => undefined);
 	}
 
 	private emitRuntimeChange(): void {

@@ -2740,7 +2740,7 @@ test("a planned team starts every member from one launch call carrying only the 
 		assert.ok(updates.length > 0, "the launch call streams live member progress");
 		assert.ok(teamTool.renderResult(launched, { expanded: false, isPartial: false }, { fg: (_: string, text: string) => text, bold: (text: string) => text } as any, { toolCallId: "launch" }));
 
-		await assert.rejects(teamTool.execute("again", { action: "launch", teamId }, undefined, undefined, teamContext()), /already been launched/u);
+		await assert.rejects(teamTool.execute("again", { action: "launch", teamId }, undefined, undefined, teamContext()), /is completed and cannot be launched again/u);
 	} finally { hub.dispose(); }
 });
 
@@ -2784,3 +2784,32 @@ test("launch explains unknown, alias-only and runtime-less teams without startin
 		assert.equal(broker.requests.length, 0);
 	} finally { hub.dispose(); }
 });
+
+test("launch pins the validated plan, rejects values it would ignore, and drops plans of ended teams", async () => {
+	const { hub, teamTool, broker } = setupTeamTools();
+	try {
+		cooperativeDispatch(broker);
+		const plan = { coordinator: { alias: "A", task: "coordinate" }, workers: [{ alias: "B", task: "work" }] };
+		const prepared = await teamTool.execute("p", { action: "prepare", ...plan }, undefined, undefined, teamContext());
+		const teamId = prepared.details.response.teamId;
+		await assert.rejects(teamTool.execute("l", { action: "launch", teamId, workers: [{ alias: "B", task: "changed" }], brief: null }, undefined, undefined, teamContext()),
+			/launch takes only teamId; workers was fixed at prepare/u);
+		// The parent switches model and cwd between prepare and launch: the shown plan still runs.
+		const switched = { ...teamContext(), model: nonGptModel, cwd: "/elsewhere" };
+		await teamTool.execute("l", { action: "launch", teamId, coordinator: null, workers: [], brief: null, timeoutSeconds: null }, undefined, undefined, switched);
+		for (const request of broker.requests) {
+			assert.equal(railModelKeyOf(request.model!), "cus-resp/gpt-5.6-sol", `${request.alias} runs the model shown at prepare`);
+			assert.equal(request.cwd, resolve(tmpdir()));
+		}
+
+		const expiring = await teamTool.execute("p2", { action: "prepare", coordinator: { alias: "A2", task: "x" }, workers: [{ alias: "B2", task: "y" }] }, undefined, undefined, teamContext());
+		const expiredId = expiring.details.response.teamId;
+		hub.cancel(expiredId, "Team deadline exceeded");
+		assert.equal(teamLaunchPlan(hub, expiredId), undefined, "an ended team no longer holds its plan");
+		await assert.rejects(teamTool.execute("l2", { action: "launch", teamId: expiredId }, undefined, undefined, teamContext()), /is cancelled and cannot be launched again/u);
+	} finally { hub.dispose(); }
+});
+
+function railModelKeyOf(model: RailModelRef): string {
+	return `${model.provider}/${model.modelId}`;
+}

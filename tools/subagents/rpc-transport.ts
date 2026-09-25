@@ -21,12 +21,23 @@ export class RpcTransportError extends Error {
 	}
 }
 
+/** The child ignored SIGKILL within the bound; `exited` settles once the OS reaps it. */
+export class RpcProcessExitTimeoutError extends RpcTransportError {
+	constructor(message: string, readonly exited: Promise<void>) {
+		super(message);
+		this.name = "RpcProcessExitTimeoutError";
+	}
+}
+
 export interface PiRpcProcessTransportOptions {
 	command: string;
 	args: string[];
 	cwd: string;
 	env?: NodeJS.ProcessEnv;
 	onUiRequest?: (request: RpcEvent) => Promise<Record<string, unknown> | undefined>;
+	/** Grace after SIGTERM before SIGKILL, and the bound after SIGKILL for the exit event. */
+	terminateGraceMs?: number;
+	killGraceMs?: number;
 }
 
 const STDERR_CAP = 50 * 1024;
@@ -110,21 +121,26 @@ export class PiRpcProcessTransport implements RpcTransport {
 		this.rejectPending(stopped);
 		this.emitEvent({ type: "transport_error", error: stopped.message });
 		proc.kill("SIGTERM");
-		await new Promise<void>((resolve) => {
-			if (proc.exitCode !== null) {
-				resolve();
-				return;
-			}
-			const timeout = setTimeout(() => {
-				// Sending SIGKILL is not an exit acknowledgement. The session lease
-				// must stay held until Node has reaped the child below.
-				proc.kill("SIGKILL");
-			}, 1500);
-			proc.once("exit", () => {
-				clearTimeout(timeout);
-				resolve();
-			});
+		const exited = new Promise<void>((resolve) => {
+			if (proc.exitCode !== null || proc.signalCode !== null) resolve();
+			else proc.once("exit", () => resolve());
 		});
+		let terminate: NodeJS.Timeout | undefined;
+		let deadline: NodeJS.Timeout | undefined;
+		try {
+			await Promise.race([exited, new Promise<never>((_resolve, reject) => {
+				terminate = setTimeout(() => {
+					// Sending SIGKILL is not an exit acknowledgement: keep waiting for the reap,
+					// but bounded, so shutdown/delete cannot hang on an unkillable child.
+					proc.kill("SIGKILL");
+					deadline = setTimeout(() => reject(new RpcProcessExitTimeoutError(
+						`Subagent RPC process ${proc.pid ?? "unknown"} did not exit after SIGKILL`, exited)), this.options.killGraceMs ?? 5000);
+				}, this.options.terminateGraceMs ?? 1500);
+			})]);
+		} finally {
+			clearTimeout(terminate);
+			clearTimeout(deadline);
+		}
 		if (this.process === proc) this.process = undefined;
 	}
 

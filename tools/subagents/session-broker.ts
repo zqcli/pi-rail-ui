@@ -363,7 +363,7 @@ export class SessionBroker {
 					if (currentState.activeRunId === undefined) currentState.activeRunId = ++currentState.nextRunId;
 					const nativeRun = await currentState.worker.send(task, {
 						...(request.team ? { team: request.team } : {}),
-						...(request.contextWindow !== undefined ? { contextWindow: request.contextWindow } : {}),
+						...(contextWindow !== undefined ? { contextWindow } : {}),
 						...(signal ? { signal } : {}),
 						onUpdate: (partial) => {
 							const isCompacting = partial.isCompacting === true;

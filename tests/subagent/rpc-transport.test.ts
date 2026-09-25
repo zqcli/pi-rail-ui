@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
+import { PiRpcProcessTransport, RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 
 const fixture = fileURLToPath(new URL("../fixtures/fake-pi-rpc.mjs", import.meta.url));
 
@@ -56,4 +56,26 @@ test("PiRpcProcessTransport rejects requests once shutdown starts", async () => 
 	const stopping = transport.stop();
 	await assert.rejects(() => transport.request({ type: "get_state" }), /not running/);
 	await stopping;
+});
+
+test("PiRpcProcessTransport bounds the wait after SIGKILL and exposes the eventual exit", { timeout: 10_000 }, async () => {
+	const transport = new PiRpcProcessTransport({ command: process.execPath, cwd: process.cwd(), terminateGraceMs: 20, killGraceMs: 50,
+		args: ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000); console.log(JSON.stringify({type:"ready", pid:process.pid}));'] });
+	const ready = new Promise<number>((resolve) => transport.onEvent((event) => { if (event.type === "ready") resolve(event["pid"] as number); }));
+	await transport.start();
+	const pid = await ready;
+	// Simulate a child the OS cannot reap yet: the forced kill is ignored.
+	const child = (transport as unknown as { process: { kill(signal?: string): boolean } }).process;
+	const kill = child.kill.bind(child);
+	child.kill = (signal?: string) => signal === "SIGKILL" ? true : kill(signal);
+	const error = await transport.stop().then(() => undefined, (failure: unknown) => failure);
+	assert.ok(error instanceof RpcProcessExitTimeoutError, String(error));
+	assert.match(error.message, /did not exit after SIGKILL/);
+	let exited = false;
+	void error.exited.then(() => { exited = true; });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(exited, false);
+	process.kill(pid, "SIGKILL");
+	await error.exited;
+	await transport.stop();
 });

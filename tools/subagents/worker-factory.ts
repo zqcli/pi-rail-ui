@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { resolvePiInvocation } from "./pi-invocation";
 import type { RpcEvent } from "./rpc-worker";
 import { buildRpcWorkerArgs, RpcSessionWorker } from "./rpc-worker";
-import { PiRpcProcessTransport } from "./rpc-transport";
+import { PiRpcProcessTransport, RpcProcessExitTimeoutError } from "./rpc-transport";
 import type { SessionLease } from "./session-lease";
 import { FileSessionLeaseManager } from "./session-lease";
 import type { SessionWorker, SessionWorkerFactory, WorkerControlRequest, WorkerSendOptions, WorkerRunResult } from "./session-broker";
@@ -75,9 +75,13 @@ class LeasedSessionWorker implements SessionWorker {
 		this.stopped = true;
 		try {
 			await this.worker.stop();
-		} finally {
-			await this.lease.release();
+		} catch (error) {
+			// A child that may still write its session keeps the lease until it is reaped.
+			if (error instanceof RpcProcessExitTimeoutError) void error.exited.then(() => this.lease.release()).catch(() => undefined);
+			else await this.lease.release();
+			throw error;
 		}
+		await this.lease.release();
 	}
 }
 

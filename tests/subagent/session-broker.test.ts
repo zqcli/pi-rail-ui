@@ -132,6 +132,18 @@ test("team cancellation during startup waits for the new worker's cleanup", asyn
 	assert.equal(worker.stopped, true);
 });
 
+test("direct broker callers get the normalized contextWindow, never a raw null", async () => {
+	const worker = new FakeWorker("normalized", "/tmp/normalized.jsonl");
+	const options: Array<WorkerSendOptions | undefined> = [];
+	const send = worker.send.bind(worker);
+	worker.send = async (task, sendOptions) => { options.push(sendOptions); return send(task, sendOptions); };
+	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => worker });
+	try {
+		await broker.dispatch({ model: reviewerModel(), alias: "normalized", task: "work", contextWindow: null as unknown as number });
+		assert.equal(Object.hasOwn(options[0]!, "contextWindow"), false);
+	} finally { await broker.shutdown(); }
+});
+
 test("a failed team member that never passed a team gate releases its alias; a started member keeps it", async () => {
 	for (const started of [false, true]) {
 		const store = new MemoryInstanceStore();

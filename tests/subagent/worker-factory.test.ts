@@ -6,6 +6,7 @@ import { test } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
 import { createRpcWorkerFactory, sessionLeaseKey } from "../../tools/subagents/worker-factory";
+import { PiRpcProcessTransport, RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
@@ -81,6 +82,30 @@ test("startup preparation failures release the acquired session lease exactly on
 		assert.deepEqual(await leases.inspect(key), { state: "free" });
 	} finally {
 		FileSessionLeaseManager.prototype.acquire = originalAcquire;
+		await rm(stateDir, { recursive: true, force: true });
+	}
+});
+test("a worker whose child outlives SIGKILL keeps its session lease until the child is reaped", async () => {
+	const stateDir = await mkdtemp(join(tmpdir(), "pi-subagent-worker-factory-"));
+	const fixture = resolve("tests/fixtures/fake-pi-rpc.mjs");
+	const factory = createRpcWorkerFactory({ stateDir, resolveInvocation: (args) => ({ command: process.execPath, args: [fixture, ...args] }) });
+	const originalStop = PiRpcProcessTransport.prototype.stop;
+	let reap!: () => void;
+	try {
+		const worker = await factory({ agentId: "agt_stuck", mode: "new", model, alias: "stuck", cwd: process.cwd() });
+		const leases = new FileSessionLeaseManager(stateDir);
+		const key = sessionLeaseKey(worker.sessionFile);
+		PiRpcProcessTransport.prototype.stop = async function (this: PiRpcProcessTransport) {
+			const exited = new Promise<void>((resolveExit) => { reap = () => { void originalStop.call(this).then(resolveExit); }; });
+			throw new RpcProcessExitTimeoutError("did not exit after SIGKILL", exited);
+		};
+		await assert.rejects(worker.stop(), /did not exit after SIGKILL/);
+		assert.equal((await leases.inspect(key)).state, "owned", "a possibly live child keeps the session lease");
+		reap();
+		for (let attempt = 0; attempt < 50 && (await leases.inspect(key)).state !== "free"; attempt++) await new Promise((done) => setTimeout(done, 20));
+		assert.equal((await leases.inspect(key)).state, "free");
+	} finally {
+		PiRpcProcessTransport.prototype.stop = originalStop;
 		await rm(stateDir, { recursive: true, force: true });
 	}
 });

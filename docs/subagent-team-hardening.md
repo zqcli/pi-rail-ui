@@ -2,6 +2,8 @@
 
 日期：2026-09-24。运行时基线：Pi 0.87.1。
 
+> 2026-09-25 的[审查问题修复](subagent-team-review-fixes.md)更新了以下行为，冲突处以该文为准：wait/control 回复改为精简状态；原生压缩后只恢复精简 roster；候选结果随成员终态写入 journal；journal 只记录里程碑；新增死锁检测、`control cancel` 和 `undelivered` 通知；屏障后的多余调用改为工具错误。
+
 本文描述当前分支的实现，不把历史在线会话或旧版测试结果当成本次验证。原架构及限制见 [Team 初始契约](subagent-team-plan.md)，原生运行时整合见 [Pi 0.87.1 Team 报告](subagent-team-pi-0.87.1.md)。
 
 ## 改动目标

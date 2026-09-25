@@ -7,6 +7,7 @@ import type { RailModelRef } from "../../tools/subagents/models";
 import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
 import { createRpcWorkerFactory, sessionLeaseKey } from "../../tools/subagents/worker-factory";
 import { PiRpcProcessTransport, RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
+import { RpcSessionWorker } from "../../tools/subagents/rpc-worker";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
@@ -109,3 +110,40 @@ test("a worker whose child outlives SIGKILL keeps its session lease until the ch
 		await rm(stateDir, { recursive: true, force: true });
 	}
 });
+
+for (const mode of ["open", "new"] as const) {
+	test(`a ${mode} worker whose startup fails keeps its lease while the started child outlives SIGKILL`, async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "pi-subagent-worker-factory-"));
+		const fixture = resolve("tests/fixtures/fake-pi-rpc.mjs");
+		const sessionPath = join(stateDir, "session.jsonl");
+		const key = mode === "open" ? sessionLeaseKey(sessionPath) : "agent:agt_failed";
+		const factory = createRpcWorkerFactory({ stateDir, resolveInvocation: (args) => ({ command: process.execPath, args: [fixture, ...args] }) });
+		const originalConnect = RpcSessionWorker.connect;
+		const originalStop = PiRpcProcessTransport.prototype.stop;
+		let stuck: PiRpcProcessTransport | undefined;
+		let reap!: () => void;
+		RpcSessionWorker.connect = async () => { throw new Error("connect failed after spawn"); };
+		PiRpcProcessTransport.prototype.stop = async function (this: PiRpcProcessTransport) {
+			stuck = this;
+			const exited = new Promise<void>((resolveExit) => { reap = () => { void originalStop.call(this).then(resolveExit); }; });
+			throw new RpcProcessExitTimeoutError("did not exit after SIGKILL", exited);
+		};
+		try {
+			await assert.rejects(
+				factory({ agentId: "agt_failed", mode, model, alias: "failed", cwd: process.cwd(), ...(mode === "open" ? { sessionPath } : {}) }),
+				/connect failed after spawn/u,
+				"the startup error, not the stop error, is reported",
+			);
+			const leases = new FileSessionLeaseManager(stateDir);
+			assert.equal((await leases.inspect(key)).state, "owned", "a possibly live child keeps the lease");
+			reap();
+			for (let attempt = 0; attempt < 50 && (await leases.inspect(key)).state !== "free"; attempt++) await new Promise((done) => setTimeout(done, 20));
+			assert.equal((await leases.inspect(key)).state, "free");
+		} finally {
+			RpcSessionWorker.connect = originalConnect;
+			PiRpcProcessTransport.prototype.stop = originalStop;
+			if (stuck) await originalStop.call(stuck);
+			await rm(stateDir, { recursive: true, force: true });
+		}
+	});
+}

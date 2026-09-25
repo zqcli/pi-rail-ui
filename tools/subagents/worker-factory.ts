@@ -40,6 +40,21 @@ async function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise
 	}
 }
 
+/**
+ * Stops a child and releases its lease only once the child can no longer write the session.
+ * A child that outlives SIGKILL keeps the lease until the OS reaps it; the stop error is rethrown.
+ */
+async function stopThenRelease(stop: () => Promise<void>, lease: SessionLease): Promise<void> {
+	try {
+		await stop();
+	} catch (error) {
+		if (error instanceof RpcProcessExitTimeoutError) void error.exited.then(() => lease.release()).catch(() => undefined);
+		else await lease.release();
+		throw error;
+	}
+	await lease.release();
+}
+
 class LeasedSessionWorker implements SessionWorker {
 	readonly sessionId: string;
 	readonly sessionFile: string;
@@ -73,15 +88,7 @@ class LeasedSessionWorker implements SessionWorker {
 	async stop(): Promise<void> {
 		if (this.stopped) return;
 		this.stopped = true;
-		try {
-			await this.worker.stop();
-		} catch (error) {
-			// A child that may still write its session keeps the lease until it is reaped.
-			if (error instanceof RpcProcessExitTimeoutError) void error.exited.then(() => this.lease.release()).catch(() => undefined);
-			else await this.lease.release();
-			throw error;
-		}
-		await this.lease.release();
+		await stopThenRelease(() => this.worker.stop(), this.lease);
 	}
 }
 
@@ -117,8 +124,9 @@ export function createRpcWorkerFactory(options: RpcWorkerFactoryOptions): Sessio
 			}
 			return new LeasedSessionWorker(worker, lease);
 		} catch (error) {
-			await transport?.stop().catch(() => undefined);
-			await lease.release();
+			// The startup error is the useful one; a stop failure must still not free a live child's lease.
+			const started = transport;
+			await stopThenRelease(() => started?.stop() ?? Promise.resolve(), lease).catch(() => undefined);
 			throw error;
 		}
 	};

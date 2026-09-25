@@ -605,6 +605,7 @@ test("team deadlines remain the outer failure reason after transport stop and aw
 					const text = mode === "single" ? outcome.error?.message : outcome.value.content[0].text;
 					assert.ok(text?.includes(reason), `${mode}/${deadline}/${failure}: ${text}`);
 					assert.match(text!, /Subagent RPC process stopped/);
+					if (mode === "parallel") assert.match(text!, /Retry: prepare a new team\. Members that started keep their persistent aliases/u);
 					const details = mode === "single" ? hook!({ toolName: "subagent", toolCallId: "deadline", isError: true }).details : outcome.value.details;
 					for (const result of details.results) {
 						assert.equal(result.status, "failed");

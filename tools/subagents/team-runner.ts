@@ -5,6 +5,8 @@ import { runErrorMessage, type WorkerRunResult } from "./session-broker";
 
 const STATUS_CAP_BYTES = 8 * 1024;
 const STATUS_MESSAGE_COUNT = 8;
+const FINALIZING_ERROR = "The team is finalizing: every worker is terminal. Write your final answer now; send, report, control and other waits are no longer available.";
+const REDIRECT_CONTINUATION = "Your coordinator changed your direction after your previous answer. Follow the latest team direction now delivered in your context: continue or redo the work as directed, then give your final answer.";
 
 function boundedPlainText(value: string, maxBytes: number): string {
 	const plain = stripTerminalSequences(value).replace(/\s+/gu, " ").trim();
@@ -93,22 +95,26 @@ export class TeamRunManager {
 		let barrierSnapshot: TeamSnapshot | undefined;
 		let receivedAfterBarrier = false;
 		let continuationSent = false;
+		let started = false;
 		let sequenceOffset = 0;
 		let lastSequence = 0;
 		return {
 			binding,
+			started: () => started,
 			onRequest: async (request, signal) => {
-				if ((continuationSent || (barrierSnapshot && receivedAfterBarrier)) && request.action !== "checkpoint") {
-					const error = new Error("Final summary must not wait, control or delegate again");
-					this.fail(binding, error);
-					throw error;
+				const repeatBarrier = request.action === "finish" || (request.action === "wait" && request.wait?.kind === "workers");
+				if ((continuationSent || (barrierSnapshot && receivedAfterBarrier)) && request.action !== "checkpoint" && !repeatBarrier) {
+					// A model mistake after the barrier is a tool error to correct, not a team failure.
+					// A repeated barrier falls through: the Hub answers it again with the same terminal workers.
+					return { ok: false, from: "@hub", to: binding.memberId, requestId: request.requestId, error: FINALIZING_ERROR };
 				}
 				// A native send rebinds the child and restarts its wire sequence at one.
 				const sequence = sequenceOffset + request.sequence;
 				lastSequence = Math.max(lastSequence, sequence);
 				const reply = await this.hub.request(binding, { ...request, sequence }, signal);
+				if (request.action === "checkpoint" && reply.ok) started = true;
 				if (binding.role === "coordinator" && reply.ok && reply.snapshot
-					&& (request.action === "finish" || (request.action === "wait" && request.wait?.kind === "workers"))
+					&& repeatBarrier
 					&& reply.snapshot.workers.every((id) => {
 						const member = reply.snapshot!.members.find((candidate) => candidate.id === id);
 						return member && ["completed", "failed", "cancelled"].includes(member.state);
@@ -133,8 +139,9 @@ export class TeamRunManager {
 				const error = runErrorMessage(run);
 				if (error) { this.fail(binding, error, signal?.aborted); return; }
 				if (binding.role === "worker") {
-					const member = this.hub.get(binding.teamId).members.find((candidate) => candidate.id === binding.memberId);
-					if (!run.output.trim() && !hasStructuredResult(member?.result)) {
+					// A redirect raced with this natural settlement; process it instead of failing.
+					if ((self?.instructionRevision ?? 0) > (self?.observedRevision ?? 0)) return REDIRECT_CONTINUATION;
+					if (!run.output.trim() && !hasStructuredResult(self?.result)) {
 						const empty = new Error("Worker native output is empty and no structured team result was reported");
 						this.fail(binding, empty);
 						return;

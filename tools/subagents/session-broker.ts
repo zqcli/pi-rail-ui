@@ -420,6 +420,14 @@ export class SessionBroker {
 				this.emitRuntimeChange();
 				throw error;
 			}
+			if (request.team && createdInstance && instance && request.team.started?.() === false) {
+				// The member never passed a team gate, so its model never acted. Free the
+				// alias so the team can be retried with the same roster.
+				await this.cleanupCreatedInstance(instance, true);
+				this.runtimeErrors.delete(failedAgentId);
+				this.emitRuntimeChange();
+				throw error;
+			}
 			const mustRetire = error instanceof ContextProtocolError || state?.worker.isReusable?.() === false;
 			if (error instanceof ContextWindowValidationError) {
 				if (createdInstance && instance) {

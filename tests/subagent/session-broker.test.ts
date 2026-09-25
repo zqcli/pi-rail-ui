@@ -132,6 +132,38 @@ test("team cancellation during startup waits for the new worker's cleanup", asyn
 	assert.equal(worker.stopped, true);
 });
 
+test("a failed team member that never passed a team gate releases its alias; a started member keeps it", async () => {
+	for (const started of [false, true]) {
+		const store = new MemoryInstanceStore();
+		const roster = new MemoryRoster();
+		const workers: FakeWorker[] = [];
+		const broker = new SessionBroker({ store, roster, workerFactory: async () => {
+			const worker = new FakeWorker(`session-${workers.length}`, `/tmp/rail-missing-team-${workers.length}.jsonl`);
+			worker.send = async () => { throw new Error("Startup admission deadline exceeded"); };
+			workers.push(worker);
+			return worker;
+		} });
+		try {
+			const team = {
+				binding: { version: 1 as const, teamId: "team", memberId: "B", role: "worker" as const, epoch: "private" },
+				onRequest: async () => ({ ok: true }), started: () => started,
+			};
+			await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "work", team }), /admission/);
+			assert.equal(workers[0]!.stopped, true);
+			if (started) {
+				assert.equal(roster.resolve("B") !== undefined, true, "a started member keeps its session for inspection");
+				assert.equal(store.instances.size, 1);
+				await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "retry", team: { ...team, binding: { ...team.binding, teamId: "retry" } } }), /already exists/);
+			} else {
+				assert.equal(roster.resolve("B"), undefined);
+				assert.equal(store.instances.size, 0);
+				await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "retry", team: { ...team, binding: { ...team.binding, teamId: "retry" } } }), /admission/,
+					"the same alias can be used again; only the fake worker fails");
+			}
+		} finally { await broker.shutdown(); }
+	}
+});
+
 class MemoryInstanceStore implements AgentInstanceStore {
 	readonly instances = new Map<string, AgentInstance>();
 	getDelayMs = 0;

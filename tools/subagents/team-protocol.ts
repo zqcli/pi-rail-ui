@@ -168,6 +168,8 @@ export interface TeamWorkerChannel {
 export interface TeamDispatchChannel extends TeamWorkerChannel {
 	/** Called after real native settlement, within the same broker operation. */
 	afterRun?(run: import("./session-broker").WorkerRunResult, signal?: AbortSignal): Promise<string | undefined>;
+	/** True once the member passed a team gate, i.e. its model may have acted. */
+	started?(): boolean;
 }
 
 export type TeamCommand =

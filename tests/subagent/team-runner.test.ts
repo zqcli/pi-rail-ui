@@ -150,7 +150,7 @@ test("assignment status shows task policy and bounded recent routes without expo
 	} finally { hub.dispose(); }
 });
 
-test("final summary rejects new cooperation, empty output, native error and cancelled completion", async () => {
+test("final summary rejects new cooperation as a tool error, and rejects empty output, native error and cancelled completion", async () => {
 	for (const failure of ["wait", "empty", "error", "cancelled"] as const) {
 		const hub = new TeamHub();
 		try {
@@ -162,7 +162,10 @@ test("final summary rejects new cooperation, empty output, native error and canc
 			await manager.channel(b!).afterRun!(run("worker result"));
 			await channel.afterRun!(run("early answer"));
 			if (failure === "wait") {
-				await assert.rejects(channel.onRequest({ requestId: "late", sequence: 1, action: "wait", wait: { kind: "message" } }), /must not wait/);
+				const late = await channel.onRequest({ requestId: "late", sequence: 1, action: "wait", wait: { kind: "message" } });
+				assert.deepEqual([late.ok, late.from, late.to, late.requestId], [false, "@hub", "A", "late"]);
+				assert.match(late.error!, /finalizing.*Write your final answer now/u);
+				assert.equal(hub.get(team.id).phase, "finalizing", "a post-barrier mistake must not fail the team");
 			} else if (failure === "empty") {
 				await assert.rejects(channel.afterRun!(run("  ")), /summary is empty/);
 			} else if (failure === "error") {
@@ -299,5 +302,77 @@ test("a worker cancelled by the coordinator keeps its authoritative cancelled ou
 		assert.equal(member.error, "Cancelled by coordinator A");
 		assert.equal(hub.get(team.id).phase, "running");
 		assert.equal(hub.signal(team.id).aborted, false);
+	} finally { hub.dispose(); }
+});
+
+test("after an explicit barrier, extra coordinator calls are correctable tool errors and a repeated barrier is idempotent", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const [b] = manager.join(team.id, "parallel", [{ alias: "B", task: "work" }]);
+		const coordinator = manager.channel(a!);
+		await manager.channel(b!).afterRun!(run("worker result"));
+		const barrier = await coordinator.onRequest({ requestId: "barrier", sequence: 1, action: "finish" });
+		assert.equal(barrier.snapshot?.phase, "finalizing");
+		assert.equal((await coordinator.onRequest({ requestId: "context", sequence: 2, action: "checkpoint", receive: true })).ok, true);
+		for (const [index, request] of ([
+			{ action: "send", to: "B", message: "double-check" },
+			{ action: "control", to: "B", command: "pause" },
+			{ action: "wait", wait: { kind: "message" } },
+		] as const).entries()) {
+			const reply = await coordinator.onRequest({ requestId: `late-${index}`, sequence: 3 + index, ...request });
+			assert.equal(reply.ok, false);
+			assert.match(reply.error!, /finalizing/u);
+		}
+		const repeated = await coordinator.onRequest({ requestId: "again", sequence: 6, action: "wait", wait: { kind: "workers" } });
+		assert.equal(repeated.ok, true);
+		assert.equal(repeated.snapshot?.members.find((member) => member.id === "B")?.output, "worker result");
+		assert.equal(hub.get(team.id).phase, "finalizing");
+		assert.equal((await coordinator.onRequest({ requestId: "context-2", sequence: 7, action: "checkpoint", receive: true })).ok, true);
+		assert.equal(await coordinator.afterRun!(run("final summary")), undefined);
+		assert.equal(hub.get(team.id).phase, "completed");
+		assert.equal(hub.get(team.id).members.find((member) => member.id === "A")?.output, "final summary");
+	} finally { hub.dispose(); }
+});
+
+test("a redirect that races a worker's natural settlement continues the worker instead of failing it", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const [b] = manager.join(team.id, "parallel", [{ alias: "B", task: "work" }]);
+		const worker = manager.channel(b!);
+		assert.equal((await worker.onRequest({ requestId: "context", sequence: 1, action: "checkpoint", receive: true })).revision, 0);
+		await manager.channel(a!).onRequest({ requestId: "redirect", sequence: 1, action: "control", to: "B", command: "redirect", message: "use the new API" });
+		const continuation = await worker.afterRun!(run("answer for the old direction"));
+		assert.match(continuation!, /changed your direction/u);
+		assert.equal(hub.get(team.id).members.find((member) => member.id === "B")?.state, "running");
+		// The continuation is a new native send: the child rebinds and restarts its wire sequence.
+		const next = await worker.onRequest({ requestId: "next-context", sequence: 1, action: "checkpoint", receive: true });
+		assert.equal(next.revision, 1);
+		assert.ok(next.events?.some((event) => event.message === "use the new API"));
+		assert.equal(await worker.afterRun!(run("answer for the new direction")), undefined);
+		const member = hub.get(team.id).members.find((candidate) => candidate.id === "B")!;
+		assert.equal(member.state, "completed");
+		assert.equal(member.output, "answer for the new direction");
+	} finally { hub.dispose(); }
+});
+
+test("the dispatch channel reports whether its member passed a team gate", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const coordinator = manager.channel(a!);
+		assert.equal(coordinator.started?.(), false);
+		const gate = coordinator.onRequest({ requestId: "gate", sequence: 1, action: "checkpoint", receive: true });
+		assert.equal(coordinator.started?.(), false, "a gate parked for admission is not a start");
+		hub.cancel(team.id, "admission failed");
+		assert.equal((await gate).ok, false);
+		assert.equal(coordinator.started?.(), false);
 	} finally { hub.dispose(); }
 });

@@ -654,7 +654,10 @@ function finalText(result: StatefulSubagentRunDetails): string {
 
 function appendTeamStatus(text: string, snapshot?: TeamSnapshot): string {
 	if (!snapshot) return truncateParentContent(text);
-	const status = teamStatus(snapshot);
+	const retry = snapshot.phase === "failed" || snapshot.phase === "cancelled"
+		? "\nRetry: prepare a new team. Members that started keep their persistent aliases for inspection, so give them new aliases; aliases of members that never started were released."
+		: "";
+	const status = `${teamStatus(snapshot)}${retry}`;
 	const separator = "\n\n";
 	const remaining = Math.max(0, OUTPUT_CAP - Buffer.byteLength(status, "utf8") - Buffer.byteLength(separator, "utf8"));
 	const bounded = truncateUtf8(text, remaining, "\n\n[team result text truncated; team status retained]").value;

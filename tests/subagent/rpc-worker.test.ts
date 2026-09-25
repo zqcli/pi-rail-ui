@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
-import { teamExtensionPath, TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamWorkerChannel } from "../../tools/subagents/team-protocol";
+import { teamExtensionPath, TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamWorkerChannel } from "../../tools/subagents/team-protocol-v1";
 import { TEAM_COMMAND_DESCRIPTION } from "../../tools/subagents/team-extension";
 import { describe, test } from "node:test";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";

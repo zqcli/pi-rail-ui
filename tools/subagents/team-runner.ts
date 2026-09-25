@@ -1,6 +1,6 @@
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { TeamStalledError, type TeamHub } from "./team-hub";
-import { TEAM_MAX_MESSAGE_BYTES, type TeamAssignment, type TeamBinding, type TeamDispatchChannel, type TeamSnapshot, type TeamTaskResult } from "./team-protocol";
+import { TEAM_MAX_MESSAGE_BYTES, type TeamAssignment, type TeamBinding, type TeamDispatchChannel, type TeamSnapshot, type TeamTaskResult } from "./team-protocol-v1";
 import { runErrorMessage, type WorkerRunResult } from "./session-broker";
 
 const STATUS_CAP_BYTES = 8 * 1024;

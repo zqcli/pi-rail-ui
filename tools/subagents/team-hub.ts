@@ -6,7 +6,7 @@ import {
 	TEAM_MAX_WORKERS, TEAM_MEMBER_STATES, TEAM_PHASES, TEAM_PROTOCOL_VERSION,
 	type TeamAssignment, type TeamBinding, type TeamBrief, type TeamEvent, type TeamMemberSnapshot, type TeamOutcome,
 	type TeamReply, type TeamRequest, type TeamSnapshot, type TeamWait,
-} from "./team-protocol";
+} from "./team-protocol-v1";
 
 const WORKER_PERMITS = 4;
 const REQUEST_CACHE = 128;

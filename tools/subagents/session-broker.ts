@@ -1,4 +1,4 @@
-import type { TeamDispatchChannel, TeamWorkerChannel } from "./team-protocol";
+import type { TeamDispatchChannel, TeamWorkerChannel } from "./team-protocol-v1";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { ContextProtocolError, ContextWindowValidationError, createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";

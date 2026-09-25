@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { TeamRpcConnection } from "../../tools/subagents/team-rpc";
 import { TeamHub } from "../../tools/subagents/team-hub";
 import { TEAM_COMMAND_DESCRIPTION, TEAM_DELIVERY_TYPE } from "../../tools/subagents/team-extension";
-import { TEAM_COMMAND, TEAM_ENTRY_TYPE, teamExtensionPath, type TeamBinding, type TeamReply, type TeamRequest } from "../../tools/subagents/team-protocol";
+import { TEAM_COMMAND, TEAM_ENTRY_TYPE, teamExtensionPath, type TeamBinding, type TeamReply, type TeamRequest } from "../../tools/subagents/team-protocol-v1";
 import type { RpcEvent, RpcTransport } from "../../tools/subagents/rpc-worker";
 import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
 

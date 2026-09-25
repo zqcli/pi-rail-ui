@@ -1,7 +1,7 @@
 import type { Component, MarkdownTheme } from "@earendil-works/pi-tui";
 import { Markdown, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { TeamMemberState } from "./team-protocol";
+import type { TeamMemberState } from "./team-protocol-v1";
 
 const DEFAULT_MAX_ENTRIES = 18;
 const MAX_ENTRY_CHARS = 4000;

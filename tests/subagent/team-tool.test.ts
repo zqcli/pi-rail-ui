@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { TeamHub } from "../../tools/subagents/team-hub";
 import { installTeamTool, restoreTeamHistory } from "../../tools/subagents/team-tool";
-import { TEAM_HISTORY_TYPE } from "../../tools/subagents/team-protocol";
+import { TEAM_HISTORY_TYPE } from "../../tools/subagents/team-protocol-v1";
 
 test("parent prepare/status/cancel handles null defaults and exposes no binding", async () => {
 	const hub = new TeamHub();

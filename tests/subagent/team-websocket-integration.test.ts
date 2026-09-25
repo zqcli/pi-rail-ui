@@ -17,7 +17,7 @@ import { installTeamTool } from "../../tools/subagents/team-tool";
 import { installStatefulSubagentTool } from "../../tools/subagents/tool";
 import { createRpcWorkerFactory } from "../../tools/subagents/worker-factory";
 import { readRailResponsesWebSocketSettings } from "../../openai/responses-websocket/settings";
-import type { TeamSnapshot } from "../../tools/subagents/team-protocol";
+import type { TeamSnapshot } from "../../tools/subagents/team-protocol-v1";
 
 const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const providerFixture = fileURLToPath(new URL("../fixtures/team-websocket-provider.mjs", import.meta.url));

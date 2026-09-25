@@ -15,7 +15,7 @@ import { TeamHub } from "../../tools/subagents/team-hub";
 import { TeamRunManager } from "../../tools/subagents/team-runner";
 import { installTeamTool } from "../../tools/subagents/team-tool";
 import { installStatefulSubagentTool } from "../../tools/subagents/tool";
-import type { TeamBrief, TeamSnapshot } from "../../tools/subagents/team-protocol";
+import type { TeamBrief, TeamSnapshot } from "../../tools/subagents/team-protocol-v1";
 
 const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const fixture = fileURLToPath(new URL("../fixtures/team-coordination-provider.mjs", import.meta.url));

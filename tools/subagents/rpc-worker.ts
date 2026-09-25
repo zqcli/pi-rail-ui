@@ -1,5 +1,5 @@
 import { TeamRpcConnection } from "./team-rpc";
-import { teamExtensionPath } from "./team-protocol";
+import { teamExtensionPath } from "./team-protocol-v1";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { railResponsesWebSocketExtensionPath } from "../../openai/responses-websocket";

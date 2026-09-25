@@ -8,7 +8,7 @@ import {
 	TEAM_PHASES, TEAM_REPLY_CODES,
 	isTeamAssignment, isTeamBinding, isTeamBrief, isTeamMessageReference, isTeamRequest, isTeamTaskResult, sameTeamBinding,
 	type TeamAssignment, type TeamBinding, type TeamBrief, type TeamCommand, type TeamReply, type TeamRequest, type TeamTaskResult,
-} from "./team-protocol";
+} from "./team-protocol-v1";
 
 export const TEAM_COMMAND_DESCRIPTION = "Rail private team protocol v1";
 // Includes the complete bounded worker result snapshot, not just one message.

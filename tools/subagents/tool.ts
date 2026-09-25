@@ -37,7 +37,7 @@ import {
 	type SubagentTranscriptSnapshot,
 } from "./transcript";
 import { emptySubagentUsage } from "./usage";
-import type { TeamAssignment, TeamBinding, TeamSnapshot, TeamTaskResult } from "./team-protocol";
+import type { TeamAssignment, TeamBinding, TeamSnapshot, TeamTaskResult } from "./team-protocol-v1";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CHAIN_TASKS = 8;

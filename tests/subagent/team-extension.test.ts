@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import install, { parseTeamCommand, publicTeamReply, strictTeamRequest, TEAM_DELIVERY_TYPE, TEAM_FRAME_BYTES } from "../../tools/subagents/team-extension";
-import { TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamBinding } from "../../tools/subagents/team-protocol";
+import { TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamBinding } from "../../tools/subagents/team-protocol-v1";
 
 const binding: TeamBinding = { version: 1, teamId: "t", memberId: "b", role: "worker", epoch: "private-epoch" };
 const structuredResult = {

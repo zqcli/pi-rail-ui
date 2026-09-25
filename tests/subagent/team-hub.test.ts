@@ -5,7 +5,7 @@ import { publicTeamReply, TEAM_DELIVERY_TYPE, TEAM_FRAME_BYTES } from "../../too
 import {
 	isTeamAssignment, isTeamBrief, isTeamRequest, isTeamTaskResult,
 	TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, type TeamAssignment, type TeamBinding, type TeamBrief, type TeamRequest, type TeamSnapshot, type TeamTaskResult,
-} from "../../tools/subagents/team-protocol";
+} from "../../tools/subagents/team-protocol-v1";
 
 function fixture(count = 2, options: ConstructorParameters<typeof TeamHub>[0] = {}) {
 	const hub = new TeamHub(options);

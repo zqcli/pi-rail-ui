@@ -6,7 +6,7 @@ import type { TeamHub } from "./team-hub";
 import {
 	isTeamBrief, TEAM_HISTORY_TYPE, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_MEMBERS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_RESULT_ITEMS,
 	TEAM_MAX_TEXT_BYTES, TEAM_MAX_WORKERS, type TeamBrief, type TeamSnapshot,
-} from "./team-protocol";
+} from "./team-protocol-v1";
 import {
 	deleteTeamLaunchPlan, setTeamLaunchPlan, teamDispatchTemplate, teamLaunchPlan, teamStatus,
 	type TeamLaunchPlan, type TeamMemberPlan,

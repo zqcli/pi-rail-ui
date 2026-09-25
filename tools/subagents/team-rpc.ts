@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { RpcEvent, RpcTransport } from "./rpc-worker";
-import { TEAM_COMMAND, TEAM_ENTRY_TYPE, isTeamBinding, sameTeamBinding, type TeamCommand, type TeamWorkerChannel } from "./team-protocol";
+import { TEAM_COMMAND, TEAM_ENTRY_TYPE, isTeamBinding, sameTeamBinding, type TeamCommand, type TeamWorkerChannel } from "./team-protocol-v1";
 import { TEAM_COMMAND_DESCRIPTION, TEAM_FRAME_BYTES, publicTeamReply, strictTeamRequest } from "./team-extension";
 
 const DELIVERY_TIMEOUT_MS = 5000;

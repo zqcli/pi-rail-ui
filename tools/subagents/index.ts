@@ -1,7 +1,7 @@
 import { TeamHub } from "./team-hub";
 import { TeamRunManager } from "./team-runner";
 import { installTeamTool, restoreTeamHistory } from "./team-tool";
-import { TEAM_HISTORY_TYPE } from "./team-protocol";
+import { TEAM_HISTORY_TYPE } from "./team-protocol-v1";
 import * as path from "node:path";
 import {
 	getAgentDir,

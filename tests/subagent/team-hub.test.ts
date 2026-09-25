@@ -1388,3 +1388,136 @@ test("worst-case eight-worker snapshots fit public, private-frame, and durable-d
 	assert.ok(Buffer.byteLength(JSON.stringify(terminalReply), "utf8") <= TEAM_FRAME_BYTES);
 	assert.ok(Buffer.byteLength(JSON.stringify(terminalFrame), "utf8") <= TEAM_FRAME_BYTES);
 });
+
+test("coordinator cannot wait for all workers while one is paused; resume or cancel first", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	await request(a, { action: "control", to: "B1", command: "pause" });
+	hub.complete(workers[1]!, outcome);
+	const before = hub.get(id);
+	for (const fields of [{ action: "finish" }, { action: "wait", wait: { kind: "workers" } }] as const) {
+		const rejected = await request(a, fields);
+		assert.equal(rejected.ok, false);
+		assert.match(rejected.error!, /B1 is paused; resume or cancel it first/u);
+	}
+	assert.equal(hub.get(id).members.find((member) => member.id === "A")?.state, before.members.find((member) => member.id === "A")?.state);
+	await request(a, { action: "control", to: "B1", command: "resume" });
+	const barrier = request(a, { action: "finish" });
+	hub.complete(b, outcome);
+	assert.equal((await barrier).snapshot?.phase, "finalizing");
+});
+
+test("a fully parked team notifies the coordinator once past its sender filter, then fails fast without progress", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { hub, a, b, request, id } = fixture(1, { stallGraceMs: 50 }); t.after(() => hub.dispose());
+	const worker = request(b, { action: "wait", wait: { kind: "message", from: "A" } });
+	const first = request(a, { action: "wait", wait: { kind: "message", from: "B1" } });
+	await tick();
+	t.mock.timers.tick(49);
+	let settled = false; void first.then(() => { settled = true; });
+	await tick(); assert.equal(settled, false, "the grace period absorbs transient all-parked states");
+	t.mock.timers.tick(1);
+	const notice = await first;
+	assert.equal(notice.ok, false);
+	assert.equal(notice.code, "team_stalled");
+	assert.match(notice.error!, /A waits for a message from B1; B1 waits for a message from A/u);
+	assert.doesNotThrow(() => publicTeamReply(notice));
+	assert.equal(hub.get(id).phase, "running", "the first stall is a notice, not a failure");
+	const again = request(a, { action: "wait", wait: { kind: "message", from: "B1" } });
+	await tick();
+	t.mock.timers.tick(50);
+	assert.equal((await again).ok, false);
+	assert.equal(hub.get(id).phase, "failed");
+	assert.match(String(hub.signal(id).reason), /Team stalled: .*No member changed anything/u);
+	assert.equal((await worker).ok, false);
+});
+
+test("acting on a stall notice resets it; a later unrelated stall gets its own notice", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { hub, a, b, request, id } = fixture(1, { stallGraceMs: 10 }); t.after(() => hub.dispose());
+	const worker = request(b, { action: "wait", wait: { kind: "message", from: "A" } });
+	const first = request(a, { action: "wait", wait: { kind: "message", from: "B1" } });
+	await tick(); t.mock.timers.tick(10);
+	assert.equal((await first).code, "team_stalled");
+	await request(a, { action: "send", to: "B1", message: "continue" });
+	assert.equal((await worker).events?.[0]?.message, "continue");
+	const second = request(b, { action: "wait", wait: { kind: "message", from: "A" } });
+	const renewed = request(a, { action: "wait", wait: { kind: "message", from: "B1" } });
+	await tick(); t.mock.timers.tick(10);
+	assert.equal((await renewed).code, "team_stalled", "progress since the first notice earns a new notice");
+	assert.equal(hub.get(id).phase, "running");
+	hub.cancel(id); await second;
+});
+
+test("the host-side barrier with a paused worker receives a stall error instead of waiting for the deadline", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { hub, a, b, request, id } = fixture(1, { stallGraceMs: 10 }); t.after(() => hub.dispose());
+	await request(a, { action: "control", to: "B1", command: "pause" });
+	const gate = request(b, { action: "checkpoint", receive: true });
+	const barrier = hub.waitForWorkers(a);
+	const rejected = assert.rejects(barrier, (error: Error) => error.name === "TeamStalledError" && /B1 is paused/u.test(error.message));
+	await tick(); t.mock.timers.tick(10);
+	await rejected;
+	assert.equal(hub.get(id).phase, "running");
+	await request(a, { action: "control", to: "B1", command: "resume" });
+	assert.equal((await gate).ok, true);
+});
+
+test("members generating or holding a permit never count as stalled", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const { hub, a, workers, request, id } = fixture(2, { stallGraceMs: 10 }); t.after(() => hub.dispose());
+	assert.equal((await request(workers[1]!, { action: "checkpoint" })).ok, true);
+	const wait = request(workers[0]!, { action: "wait", wait: { kind: "member", member: "B2" } });
+	const coordinator = request(a, { action: "wait", wait: { kind: "message", from: "B2" } });
+	await tick(); t.mock.timers.tick(1000);
+	let settled = false; void coordinator.then(() => { settled = true; });
+	await tick(); assert.equal(settled, false, "B2 holds a permit and is still working");
+	hub.complete(workers[1]!, outcome);
+	await wait;
+	hub.cancel(id); await coordinator;
+});
+
+test("coordinator cancel stops one worker immediately, opens the barrier and rejects its late requests", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	const parked = request(b, { action: "wait", wait: { kind: "message", from: "A" } });
+	const barrier = request(a, { action: "finish" });
+	const cancelled = await request(a, { action: "control", to: "B1", command: "cancel", message: "no longer needed" });
+	assert.equal(cancelled.ok, true);
+	assert.equal(cancelled.receipt?.status, "applied");
+	const member = hub.get(id).members.find((candidate) => candidate.id === "B1")!;
+	assert.equal(member.state, "cancelled");
+	assert.equal(member.error, "Cancelled by coordinator A: no longer needed");
+	assert.equal(hub.memberSignal(id, "B1").aborted, true);
+	assert.equal(hub.memberSignal(id, "B2").aborted, false);
+	assert.equal(hub.signal(id).aborted, false, "cancelling one worker never cancels the team");
+	assert.equal((await parked).ok, false);
+	assert.equal((await request(b, { action: "checkpoint" })).ok, false);
+	hub.complete(b, { status: "completed", output: "late success" });
+	assert.equal(hub.get(id).members.find((candidate) => candidate.id === "B1")?.state, "cancelled");
+	hub.complete(workers[1]!, outcome);
+	const final = await barrier;
+	assert.equal(final.snapshot?.phase, "finalizing");
+	assert.equal((await request(a, { action: "control", to: "B1", command: "cancel" })).ok, false);
+	assert.equal(hub.get(id).events.filter((event) => event.kind === "control" && event.message === "cancel").length, 1);
+	const restored = new TeamHub(); t.after(() => restored.dispose());
+	assert.doesNotThrow(() => restored.restore([hub.get(id)]));
+});
+
+test("unread queued messages are reported to the sender and coordinator when the recipient ends", async (t) => {
+	const { hub, a, b, workers, request, id } = fixture(2); t.after(() => hub.dispose());
+	const queued = await request(b, { action: "send", to: "B2", message: "please verify" });
+	await request(a, { action: "send", to: "B2", message: "and report" });
+	hub.complete(workers[1]!, outcome);
+	const notice = await request(b, { action: "checkpoint", receive: true });
+	const undelivered = notice.events?.filter((event) => event.kind === "undelivered");
+	assert.equal(undelivered?.length, 1);
+	assert.equal(undelivered?.[0]?.from, "@hub");
+	assert.equal(undelivered?.[0]?.to, "B1");
+	assert.equal(undelivered?.[0]?.member, "B2");
+	assert.match(undelivered![0]!.message!, new RegExp(`B2 became completed before reading 1 queued message\\(s\\): ${queued.receipt!.messageId}`, "u"));
+	const coordinator = await request(a, { action: "checkpoint", receive: true });
+	const coordinatorNotice = coordinator.events?.find((event) => event.kind === "undelivered");
+	assert.match(coordinatorNotice!.message!, /before reading 1 queued message/u, "the coordinator hears about its own unread message once");
+	assert.doesNotThrow(() => publicTeamReply(notice));
+	const restored = new TeamHub(); t.after(() => restored.dispose());
+	assert.doesNotThrow(() => restored.restore([hub.get(id)]));
+});

@@ -1,5 +1,5 @@
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import type { TeamHub } from "./team-hub";
+import { TeamStalledError, type TeamHub } from "./team-hub";
 import { TEAM_MAX_MESSAGE_BYTES, type TeamAssignment, type TeamBinding, type TeamDispatchChannel, type TeamSnapshot, type TeamTaskResult } from "./team-protocol";
 import { runErrorMessage, type WorkerRunResult } from "./session-broker";
 
@@ -122,7 +122,11 @@ export class TeamRunManager {
 			},
 			afterRun: async (run: WorkerRunResult, signal) => {
 				sequenceOffset = lastSequence;
-				const phase = this.hub.get(binding.teamId).phase;
+				const current = this.hub.get(binding.teamId);
+				const phase = current.phase;
+				const self = current.members.find((member) => member.id === binding.memberId);
+				// The coordinator cancelled this worker; its outcome is already authoritative.
+				if (binding.role === "worker" && self?.state === "cancelled" && ["running", "finalizing"].includes(phase)) return undefined;
 				if (signal?.aborted || !["prepared", "running", "finalizing"].includes(phase)) {
 					throw new Error(`Team is ${phase}; cannot publish a successful member result`);
 				}
@@ -151,7 +155,15 @@ export class TeamRunManager {
 					this.hub.complete(binding, { status: "completed", output: run.output });
 					return;
 				}
-				const snapshot = barrierSnapshot ?? await this.hub.waitForWorkers(binding, signal);
+				let snapshot = barrierSnapshot;
+				if (!snapshot) {
+					try { snapshot = await this.hub.waitForWorkers(binding, signal); }
+					catch (error) {
+						// The coordinator is the only member able to unblock the team; give it a turn.
+						if (!(error instanceof TeamStalledError)) throw error;
+						return `${error.message}\nYour previous answer ended before every worker finished. Resolve the blocker with the team tool, then call team finish without message/result to receive the complete worker results before writing the final summary.`;
+					}
+				}
 				if (signal?.aborted) throw new Error("Team cancelled before final summary");
 				continuationSent = true;
 				// Only public result data, never the dispatch-local epoch/capability.

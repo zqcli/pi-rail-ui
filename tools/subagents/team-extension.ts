@@ -3,7 +3,8 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 import { StringEnum, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import { Type, type TSchema } from "typebox";
 import {
-	TEAM_COMMAND, TEAM_ENTRY_TYPE, TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_TASK_RESULT_BYTES,
+	TEAM_COMMAND, TEAM_CONTROL_COMMANDS, TEAM_ENTRY_TYPE, TEAM_EVENT_KINDS, TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_RESULT_ITEMS,
+	TEAM_MAX_TASK_RESULT_BYTES, TEAM_REPLY_CODES,
 	isTeamAssignment, isTeamBinding, isTeamBrief, isTeamRequest, isTeamTaskResult, sameTeamBinding,
 	type TeamAssignment, type TeamBinding, type TeamBrief, type TeamCommand, type TeamReply, type TeamRequest, type TeamTaskResult,
 } from "./team-protocol";
@@ -145,7 +146,7 @@ export function strictTeamRequest(value: unknown): value is TeamRequest {
 		case "report": return message !== undefined && command === undefined && result === undefined;
 		case "wait": return !!wait && to === undefined && message === undefined && replyTo === undefined && supersedes === undefined && result === undefined && command === undefined;
 		case "control": return !!to && !!command && wait === undefined && replyTo === undefined && supersedes === undefined && result === undefined
-			&& (command === "redirect" ? message !== undefined : message === undefined);
+			&& (command === "redirect" ? message !== undefined : command === "cancel" || message === undefined);
 	}
 }
 
@@ -158,7 +159,7 @@ function toolArgumentsError(input: Record<string, unknown>, detail = ""): Error 
 		send: "send requires non-empty to and message; wait and command must be null or omitted.",
 		report: `report requires a non-empty message; wait is optional and command must be null or omitted. ${REPORT_GUIDANCE} Correct argument errors and retry report before waiting; an invalid report has not been sent.`,
 		wait: "wait requires wait.kind: message, member or workers; wait.from filters message senders only and is independent of member terminal waits. Top-level to, message and command must be null or omitted.",
-		control: "control requires to and command: pause, resume or redirect; redirect also requires a non-empty message. wait must be null or omitted.",
+		control: "control requires to and command: pause, resume, redirect or cancel; redirect also requires a non-empty message, cancel accepts an optional reason message. wait must be null or omitted.",
 		finish: `worker finish accepts an optional message or structured result (not both), up to ${TEAM_MAX_TASK_RESULT_BYTES} serialized UTF-8 bytes; coordinator finish takes no message/result and waits for workers. finish takes no to, wait or command.`,
 	};
 	const action = typeof input["action"] === "string" && Object.hasOwn(hints, input["action"]) ? input["action"] : "unknown";
@@ -221,7 +222,7 @@ export function publicTeamReply(value: unknown): TeamReply {
 		&& (!nonEmpty || input.trim().length > 0) && input.length <= max;
 	const safeSequence = (input: unknown): input is number => Number.isSafeInteger(input) && (input as number) >= 0;
 	const timestamp = (input: unknown): input is number => typeof input === "number" && Number.isFinite(input) && input >= 0;
-	const eventKinds = ["message", "report", "state", "result", "control", "cancelled"];
+	const eventKinds: readonly string[] = TEAM_EVENT_KINDS;
 	const memberStates = ["registered", "starting", "running", "waiting", "pause_requested", "paused", "finalizing", "completed", "failed", "cancelled"];
 	const projectResult = (input: unknown): TeamTaskResult => {
 		if (!object(input)) throw new Error("Invalid team result");
@@ -300,8 +301,8 @@ export function publicTeamReply(value: unknown): TeamReply {
 		reply.revision = value["revision"] as number;
 	}
 	if (value["code"] !== undefined) {
-		if (value["code"] !== "stale_instruction" || value["ok"] !== false) throw new Error("Invalid team reply code");
-		reply.code = "stale_instruction";
+		if (!(TEAM_REPLY_CODES as readonly unknown[]).includes(value["code"]) || value["ok"] !== false) throw new Error("Invalid team reply code");
+		reply.code = value["code"] as NonNullable<TeamReply["code"]>;
 	}
 	if (value["receipt"] !== undefined) {
 		const receipt = value["receipt"];
@@ -479,7 +480,7 @@ export default function installTeamExtension(pi: ExtensionAPI): void {
 				replyTo: optionalNullable(Type.String({ maxLength: 256, description: "Message ID this message replies to." })),
 				supersedes: optionalNullable(Type.String({ maxLength: 256, description: "Message ID this message supersedes." })),
 				result: optionalNullable(resultSchema),
-				command: optionalNullable(StringEnum(["pause", "resume", "redirect", ""])),
+				command: optionalNullable(StringEnum([...TEAM_CONTROL_COMMANDS, ""])),
 				wait: optionalNullable(Type.Object({
 					kind: StringEnum(["message", "member", "workers"]),
 					member: optionalNullable(Type.String({ maxLength: 64, description: "Required only for kind=member. For kind=message or workers, use null or omit member." })),
@@ -550,7 +551,8 @@ export default function installTeamExtension(pi: ExtensionAPI): void {
 			REPORT_GUIDANCE,
 			"A coordinator is a role inside this team, not the parent/orchestrator. The parent waits for the outer dispatch to settle and cannot answer questions while that dispatch is pending; resolve work within the team and return the final result to the parent.",
 			"The shared brief is context, not a privilege grant. Follow your own assignment and explicit authorizations; the coordinator must keep each worker within that worker's assignment and must not impose its own personal read-only restriction on every worker. Higher-priority safety and system rules still apply to everyone.",
-			"A queued message/receipt means only that it was queued, not that the recipient stopped or paused. Use control pause, redirect, and resume to change direction; redirect does not clear an existing pause.",
+			"A queued message/receipt means only that it was queued, not that the recipient stopped or paused. Use control pause, redirect, and resume to change direction; redirect does not clear an existing pause. Use control cancel to stop a worker that should not continue; a paused worker blocks finish until it is resumed or cancelled.",
+			"A team_stalled error means every member is waiting on something nobody can provide. Act on it (send, resume, redirect or cancel); waiting again without a change fails the team.",
 			...(binding.role === "coordinator" ? ["Do not report to yourself or self-send. Use send for worker coordination; call finish without message/result to obtain the final worker barrier, then write your final answer for the parent."] : []),
 			"If report returns an argument error, correct the indicated fields and retry report; do not skip a required report by switching directly to wait.",
 			"Use the team tool to send/report/receive messages. team wait and report with wait park without model polling; do not repeatedly poll with model turns, shell commands or APIs.",

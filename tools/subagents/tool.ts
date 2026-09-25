@@ -1022,6 +1022,9 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				}
 				const model = item.target ? undefined : teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
 				const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
+				// A coordinator cancel aborts only this member; the tool-level signal stays team-wide.
+				const memberSignal = team && bindings?.[slot] ? team.hub.memberSignal(teamId!, bindings[slot]!.memberId) : undefined;
+				const dispatchSignal = memberSignal && signal ? AbortSignal.any([signal, memberSignal]) : signal;
 				const request: DispatchRequest = {
 					...(team && bindings?.[slot] ? { team: team.channel(bindings[slot]!) } : {}),
 					...(model ? { model } : {}),
@@ -1032,7 +1035,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					...(item.session ? { session: item.session } : {}),
 					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
 					...(fastMode !== undefined ? { fastMode } : {}),
-					...(signal ? { signal } : {}),
+					...(dispatchSignal ? { signal: dispatchSignal } : {}),
 					onUpdate: ({ instance, run: partial }) => {
 						setDispatchMetadata(item, slot, { model: instance.model, fastMode: instance.fastMode === true });
 						publishLive(slot, {
@@ -1098,12 +1101,16 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				try {
 					return await dispatch(item, slot, step);
 				} catch (error) {
+					let cancelledByCoordinator = false;
 					if (team && bindings?.[slot]) {
+						const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
+						cancelledByCoordinator = member?.state === "cancelled" && team.hub.memberSignal(teamId!, member.id).aborted;
 						// Resolve the established Hub cause before this failure can cancel peers.
-						error = team.dispatchError(bindings[slot]!, error);
+						error = cancelledByCoordinator ? new Error(member!.error ?? "Cancelled by coordinator", { cause: error })
+							: team.dispatchError(bindings[slot]!, error);
 						team.fail(bindings[slot]!, error, signal?.aborted);
 					}
-					const result = errorResult(item, error, runDuration(slot), signal?.aborted ?? false, step, liveResults.get(slot));
+					const result = errorResult(item, error, runDuration(slot), (signal?.aborted ?? false) || cancelledByCoordinator, step, liveResults.get(slot));
 					publishLive(slot, result);
 					return result;
 				}

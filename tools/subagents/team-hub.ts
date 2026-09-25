@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { assertValidAgentAlias } from "./identity";
 import {
 	isTeamAssignment, isTeamBrief, isTeamRequest, isTeamTaskResult, sameTeamBinding,
-	TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_WORKERS, TEAM_PROTOCOL_VERSION,
+	TEAM_CONTROL_COMMANDS, TEAM_EVENT_KINDS, TEAM_MAX_ERROR_BYTES, TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_OUTPUT_BYTES,
+	TEAM_MAX_WORKERS, TEAM_PROTOCOL_VERSION,
 	type TeamAssignment, type TeamBinding, type TeamBrief, type TeamEvent, type TeamMemberSnapshot, type TeamOutcome,
 	type TeamReply, type TeamRequest, type TeamSnapshot, type TeamWait,
 } from "./team-protocol";
@@ -10,11 +11,17 @@ import {
 const WORKER_PERMITS = 4;
 const REQUEST_CACHE = 128;
 const MAX_TEAMS = 32;
-const OUTPUT_BYTES = 16 * 1024;
-const ERROR_BYTES = 8 * 1024;
+const OUTPUT_BYTES = TEAM_MAX_OUTPUT_BYTES;
+const ERROR_BYTES = TEAM_MAX_ERROR_BYTES;
 const EVENT_BATCH_BYTES = 256 * 1024;
 const RESERVED_DIRECTION_EVENT_BYTES = 56 * 1024;
+const DEFAULT_STALL_GRACE_MS = 2000;
 const TRUNCATED = "\n[truncated]";
+
+/** The team cannot progress without the coordinator changing something. */
+export class TeamStalledError extends Error {
+	override readonly name = "TeamStalledError";
+}
 
 // Bound both UTF-8 text and JSON escaping overhead, without splitting Unicode characters.
 function boundedText(text: string, limit: number): string {
@@ -48,6 +55,8 @@ interface Pending {
 interface Member {
 	view: TeamMemberSnapshot;
 	binding?: TeamBinding;
+	/** Aborted when the coordinator cancels this member; the host stops its native run. */
+	controller: AbortController;
 	paused: boolean;
 	permit: boolean;
 	announced: boolean;
@@ -65,6 +74,11 @@ interface Team {
 	controller: AbortController;
 	startupDeadline?: number;
 	timers: ReturnType<typeof setTimeout>[];
+	/** Counts state changes that can unblock a parked member; coordinator re-parking is not progress. */
+	progress: number;
+	stallTimer?: ReturnType<typeof setTimeout>;
+	stallArmedAt?: number;
+	stallNoticeAt?: number;
 	history: boolean;
 	published?: string;
 	publishing: boolean;
@@ -87,16 +101,21 @@ export class TeamHub {
 	private readonly listeners = new Set<(snapshot: TeamSnapshot) => void>();
 	private readonly now: () => number;
 	private readonly startupTimeoutMs: number;
+	private readonly stallGraceMs: number;
 	private disposed = false;
 
 	constructor(private readonly options: {
 		onSnapshot?: (snapshot: TeamSnapshot) => void;
 		startupTimeoutMs?: number;
+		/** Delay before a fully parked team is treated as stalled. */
+		stallGraceMs?: number;
 		now?: () => number;
 	} = {}) {
 		this.now = options.now ?? Date.now;
 		this.startupTimeoutMs = options.startupTimeoutMs ?? 30_000;
 		if (!Number.isFinite(this.startupTimeoutMs) || this.startupTimeoutMs <= 0) throw new Error("Invalid startup timeout");
+		this.stallGraceMs = options.stallGraceMs ?? DEFAULT_STALL_GRACE_MS;
+		if (!Number.isFinite(this.stallGraceMs) || this.stallGraceMs < 0) throw new Error("Invalid stall grace");
 	}
 
 	prepare(input: { coordinator: string; workers: string[]; timeoutSeconds?: number; brief?: TeamBrief }): TeamSnapshot {
@@ -130,13 +149,13 @@ export class TeamHub {
 		for (const id of ids) {
 			const member: Member = {
 				view: { id, role: id === input.coordinator ? "coordinator" : "worker", state: "registered", instructionRevision: 0, observedRevision: 0 },
-				paused: false, permit: false, announced: false, inbox: [], states: new Map(), sequence: 0, requests: new Map(),
+				controller: new AbortController(), paused: false, permit: false, announced: false, inbox: [], states: new Map(), sequence: 0, requests: new Map(),
 			};
 			members.set(id, member);
 			view.members.push(member.view);
 		}
 		const team: Team = { view, members, controller: new AbortController(),
-			timers: [], history: false, publishing: false, publicationRevision: 0, replies: [] };
+			timers: [], progress: 0, history: false, publishing: false, publicationRevision: 0, replies: [] };
 		this.teams.set(view.id, team);
 		team.timers.push(setTimeout(() => this.cancel(view.id, "Team deadline exceeded"), seconds * 1000));
 		for (const timer of team.timers) timer.unref?.();
@@ -247,22 +266,7 @@ export class TeamHub {
 		if (outcome.status === "completed" && (member.view.observedRevision ?? 0) < (member.view.instructionRevision ?? 0)) {
 			throw new Error("Member cannot complete before observing the latest redirected instruction");
 		}
-		member.permit = false;
-		member.view.output = boundedText(outcome.output, OUTPUT_BYTES);
-		if (outcome.error !== undefined) member.view.error = boundedText(outcome.error, ERROR_BYTES);
-		this.settle(member, { ok: false, error: "Member completed" });
-		member.requests.clear();
-		member.inbox = [];
-		member.states.clear();
-		delete member.latestDirection;
-		team.members.get(team.view.coordinator)!.states.delete(member.view.id);
-		this.state(team, member, outcome.status);
-		const result = this.event(team, { kind: "result", member: member.view.id, state: outcome.status });
-		if (member.view.role === "worker") {
-			// Reserve at most one native result per fixed worker beyond the ordinary inbox limit.
-			// Native settlement must remain authoritative even when reports filled the mailbox.
-			team.members.get(team.view.coordinator)!.inbox.push(result);
-		}
+		this.finalize(team, member, outcome);
 		if (member.view.role === "coordinator") {
 			if (outcome.status !== "completed") {
 				this.stop(team, outcome.status, outcome.error ?? "Coordinator failed");
@@ -289,6 +293,7 @@ export class TeamHub {
 			this.pump(team);
 			this.publish(team);
 		});
+		if (reply.code === "team_stalled") throw new TeamStalledError(reply.error ?? "Team stalled");
 		if (!reply.ok || !reply.snapshot) throw new Error(reply.error ?? "Worker barrier failed");
 		return reply.snapshot;
 	}
@@ -296,6 +301,12 @@ export class TeamHub {
 	get(teamId: string): TeamSnapshot { const team = this.team(teamId); this.expire(team); return copy(team.view); }
 	list(): TeamSnapshot[] { return [...this.teams.keys()].map((id) => this.get(id)); }
 	signal(teamId: string): AbortSignal { const team = this.team(teamId); this.expire(team); return team.controller.signal; }
+	/** Aborted when the coordinator cancels this member (team cancellation uses signal()). */
+	memberSignal(teamId: string, memberId: string): AbortSignal {
+		const member = this.team(teamId).members.get(memberId);
+		if (!member) throw new Error("Unknown team member");
+		return member.controller.signal;
+	}
 	subscribe(listener: (snapshot: TeamSnapshot) => void): () => void {
 		if (this.disposed) throw new Error("TeamHub disposed");
 		this.listeners.add(listener);
@@ -324,7 +335,7 @@ export class TeamHub {
 				}
 			}
 			const team: Team = { view, members: new Map(), controller: new AbortController(),
-				startupDeadline: 0, timers: [], history: true, publishing: false, publicationRevision: 0, replies: [] };
+				startupDeadline: 0, timers: [], progress: 0, history: true, publishing: false, publicationRevision: 0, replies: [] };
 			team.controller.abort("Historical team");
 			this.teams.set(view.id, team);
 			this.publish(team);
@@ -428,7 +439,7 @@ export class TeamHub {
 			if (typeof eventSeq !== "number" || !Number.isSafeInteger(eventSeq) || eventSeq <= previous || eventSeq > seq) return invalid();
 			previous = eventSeq;
 			const kind = text(raw["kind"]) as TeamEvent["kind"];
-			if (!["message", "report", "state", "result", "control", "cancelled"].includes(kind)) return invalid();
+			if (!(TEAM_EVENT_KINDS as readonly string[]).includes(kind)) return invalid();
 			const event: TeamEvent = { seq: eventSeq, kind };
 			const metadataKeys = ["version", "messageId", "timestamp", "replyTo", "supersedes"] as const;
 			const hasMetadata = metadataKeys.some((key) => raw[key] !== undefined);
@@ -470,7 +481,7 @@ export class TeamHub {
 				} else if (kind === "control") {
 					if (!roster.has(event.from) || members.find((member) => member.id === event.from)?.role !== "coordinator"
 						|| !roster.has(event.to) || members.find((member) => member.id === event.to)?.role !== "worker"
-						|| !["pause", "resume", "redirect"].includes(event.message ?? "") || event.member !== undefined || event.state !== undefined) return invalid();
+						|| !(TEAM_CONTROL_COMMANDS as readonly string[]).includes(event.message ?? "") || event.member !== undefined || event.state !== undefined) return invalid();
 				} else {
 					if (event.from !== "@hub") return invalid();
 					if (kind === "result") {
@@ -480,6 +491,9 @@ export class TeamHub {
 						if (event.to !== expectedTo) return invalid();
 					} else if (kind === "state") {
 						if (event.to !== coordinator || !event.member || !roster.has(event.member) || !event.state) return invalid();
+					} else if (kind === "undelivered") {
+						if (!roster.has(event.to) || !event.member || !roster.has(event.member) || typeof event.message !== "string"
+							|| event.state !== undefined) return invalid();
 					} else if (event.to !== coordinator || typeof event.message !== "string" || event.member !== undefined || event.state !== undefined) return invalid();
 				}
 				for (const reference of [event.replyTo, event.supersedes]) if (reference && !reference.startsWith(`${id}:`)) return invalid();
@@ -515,6 +529,7 @@ export class TeamHub {
 			case "finish":
 				if (member.view.role === "coordinator") {
 					if (request.message !== undefined || request.result !== undefined) throw new Error("Coordinator finish cannot include a worker result");
+					this.assertNoPausedWorkers(team);
 					this.park(team, member, "wait", done, { kind: "workers" }, signal);
 				}
 				else {
@@ -526,6 +541,7 @@ export class TeamHub {
 						team.publicationRevision++;
 					}
 					member.permit = false;
+					team.progress++;
 					this.state(team, member, member.paused ? "paused" : "waiting");
 					this.notifyState(team, member);
 					done({ ok: true });
@@ -533,6 +549,7 @@ export class TeamHub {
 				return;
 			case "send": {
 				const event = this.deliver(team, member, request.to, request.message, "message", request.replyTo, request.supersedes);
+				team.progress++;
 				done({ ok: true, receipt: { status: "queued", messageId: event.messageId, recipient: event.to, seq: event.seq } });
 				return;
 			}
@@ -544,6 +561,7 @@ export class TeamHub {
 				if (request.wait) this.validateWait(team, member, request.wait);
 				{
 					const event = this.deliver(team, member, team.view.coordinator, request.message, "report", request.replyTo, request.supersedes);
+					team.progress++;
 					const receipt: NonNullable<TeamReply["receipt"]> = { status: "queued", messageId: event.messageId, recipient: event.to, seq: event.seq };
 					if (request.wait) { this.park(team, member, "wait", done, request.wait, signal, false, undefined, receipt); return; }
 					done({ ok: true, receipt });
@@ -555,8 +573,19 @@ export class TeamHub {
 				if (!target || target.view.role !== "worker") throw new Error("Unknown worker control target");
 				if (terminal(target.view.state)) throw new Error("Cannot control terminal member");
 				if (!request.command) throw new Error("Missing control command");
+				team.progress++;
 				let redirectedMessage: GeneratedTeamEvent | undefined;
-				if (request.command === "pause") {
+				if (request.command === "cancel") {
+					const reason = `Cancelled by coordinator ${member.view.id}${request.message?.trim() ? `: ${request.message.trim()}` : ""}`;
+					const controlEvent = this.event(team, { kind: "control", message: request.command }, member, target.view.id);
+					// Logical cancellation is immediate; the host observes the member signal and
+					// stops the native run. Late child requests are rejected as terminal.
+					this.finalize(team, target, { status: "cancelled", output: "", error: reason });
+					target.controller.abort(reason);
+					this.pump(team);
+					done({ ok: true, receipt: { status: "applied", recipient: target.view.id, seq: controlEvent.seq }, snapshot: copy(team.view) });
+					return;
+				} else if (request.command === "pause") {
 					target.paused = true;
 					this.state(team, target, target.permit ? "pause_requested" : "paused");
 					this.notifyState(team, target);
@@ -630,6 +659,7 @@ export class TeamHub {
 	private validateWait(team: Team, member: Member, wait: TeamWait): void {
 		if (wait.kind === "member" && (!wait.member || !team.members.has(wait.member))) throw new Error("Unknown wait member");
 		if (wait.kind === "workers" && member.view.role !== "coordinator") throw new Error("Worker cannot wait for all workers (self-wait)");
+		if (wait.kind === "workers") this.assertNoPausedWorkers(team);
 		if (wait.from !== undefined) {
 			if (wait.kind !== "message") throw new Error("wait.from is only valid for message waits");
 			if (!team.members.has(wait.from)) throw new Error("Unknown message sender");
@@ -685,7 +715,7 @@ export class TeamHub {
 				if (!this.admitted(team) || (member.view.role === "worker" && permits >= WORKER_PERMITS)) continue;
 				member.permit = true;
 				team.members.get(team.view.coordinator)!.states.delete(member.view.id);
-				if (member.view.role === "worker") permits++;
+				if (member.view.role === "worker") { permits++; team.progress++; }
 				this.state(team, member, member.view.role === "coordinator" && team.view.phase === "finalizing" ? "finalizing" : "running");
 				this.settle(member, this.checkpointReply(team, member, pending.receive));
 				continue;
@@ -706,6 +736,7 @@ export class TeamHub {
 				team.view.phase = "finalizing";
 			}
 			team.members.get(team.view.coordinator)!.states.delete(member.view.id);
+			if (member.view.role === "worker") team.progress++;
 			this.state(team, member, wait.kind === "workers" ? "finalizing" : "waiting");
 			delete member.view.waitingFor;
 			const snapshot = copy(team.view);
@@ -714,6 +745,7 @@ export class TeamHub {
 			snapshot.events = [];
 			this.settle(member, { ok: true, events: copy(events), snapshot });
 		}
+		this.watchStall(team);
 	}
 
 	private checkpointReply(team: Team, member: Member, receive: boolean): TeamReply {
@@ -804,6 +836,109 @@ export class TeamHub {
 			pending.resolve(pending.receipt ? { ...reply, receipt: pending.receipt } : reply);
 		}
 	}
+
+	/** Make a member terminal: shared by native completion and coordinator cancellation. */
+	private finalize(team: Team, member: Member, outcome: TeamOutcome): void {
+		member.permit = false;
+		member.view.output = boundedText(outcome.output, OUTPUT_BYTES);
+		if (outcome.error !== undefined) member.view.error = boundedText(outcome.error, ERROR_BYTES);
+		this.settle(member, { ok: false, error: outcome.status === "cancelled" && outcome.error ? outcome.error : "Member completed" });
+		member.requests.clear();
+		this.notifyUndelivered(team, member, outcome.status);
+		member.inbox = [];
+		member.states.clear();
+		delete member.latestDirection;
+		team.members.get(team.view.coordinator)!.states.delete(member.view.id);
+		this.state(team, member, outcome.status);
+		const result = this.event(team, { kind: "result", member: member.view.id, state: outcome.status });
+		if (member.view.role === "worker") {
+			// Reserve at most one native result per fixed worker beyond the ordinary inbox limit.
+			// Native settlement must remain authoritative even when reports filled the mailbox.
+			team.members.get(team.view.coordinator)!.inbox.push(result);
+		}
+		team.progress++;
+	}
+
+	/** A queued receipt promised nothing; tell senders (and the coordinator) what was never read. */
+	private notifyUndelivered(team: Team, member: Member, status: TeamOutcome["status"]): void {
+		const unread = member.inbox.filter((event) => (event.kind === "message" || event.kind === "report")
+			&& event.from !== undefined && team.members.has(event.from));
+		if (!unread.length) return;
+		const describe = (events: TeamEvent[]) => `${member.view.id} became ${status} before reading ${events.length} queued message(s): `
+			+ events.map((event) => event.messageId ?? `seq ${event.seq}`).join(", ");
+		const recipients = new Map<string, TeamEvent[]>();
+		for (const event of unread) recipients.set(event.from!, [...recipients.get(event.from!) ?? [], event]);
+		if (member.view.id !== team.view.coordinator && !recipients.has(team.view.coordinator)) recipients.set(team.view.coordinator, unread);
+		for (const [id, events] of recipients) {
+			const recipient = team.members.get(id)!;
+			if (terminal(recipient.view.state)) continue;
+			// Reserved like native results: at most one notice per ending member and recipient.
+			recipient.inbox.push(this.event(team, { kind: "undelivered", member: member.view.id, message: describe(events) }, undefined, id));
+		}
+	}
+
+	private assertNoPausedWorkers(team: Team): void {
+		const paused = team.view.workers.filter((id) => {
+			const worker = team.members.get(id)!;
+			return worker.paused && !terminal(worker.view.state);
+		});
+		if (paused.length === 1) throw new Error(`Cannot wait for all workers while ${paused[0]} is paused; resume or cancel it first`);
+		if (paused.length > 1) throw new Error(`Cannot wait for all workers while ${paused.join(", ")} are paused; resume or cancel them first`);
+	}
+
+	/** Describe a team whose every live member is parked on a condition nobody can satisfy. */
+	private stallReason(team: Team): string | undefined {
+		if (!["running", "finalizing"].includes(team.view.phase) || !this.admitted(team)) return undefined;
+		const parts: string[] = [];
+		for (const member of team.members.values()) {
+			if (terminal(member.view.state)) continue;
+			const pending = member.pending;
+			// A member without a pending gate is still generating or executing tools.
+			if (!pending || member.permit) return undefined;
+			if (member.paused) { parts.push(`${member.view.id} is paused`); continue; }
+			// pump() grants every satisfiable gate, so an unpaused checkpoint waits for a busy permit holder.
+			if (pending.kind === "checkpoint") return undefined;
+			const wait = pending.wait!;
+			parts.push(wait.kind === "workers" ? `${member.view.id} waits for all workers`
+				: wait.kind === "member" ? `${member.view.id} waits for ${wait.member} to finish`
+				: `${member.view.id} waits for a message${wait.from ? ` from ${wait.from}` : ""}`);
+		}
+		return parts.length ? parts.join("; ") : undefined;
+	}
+
+	private watchStall(team: Team): void {
+		if (terminal(team.view.phase) || team.history) return;
+		if (!this.stallReason(team)) {
+			if (team.stallTimer) clearTimeout(team.stallTimer);
+			delete team.stallTimer;
+			return;
+		}
+		if (team.stallTimer && team.stallArmedAt === team.progress) return;
+		if (team.stallTimer) clearTimeout(team.stallTimer);
+		team.stallArmedAt = team.progress;
+		team.stallTimer = setTimeout(() => this.resolveStall(team), this.stallGraceMs);
+		team.stallTimer.unref?.();
+	}
+
+	private resolveStall(team: Team): void {
+		delete team.stallTimer;
+		if (terminal(team.view.phase)) return;
+		const reason = this.stallReason(team);
+		if (!reason) return;
+		if (team.stallArmedAt !== team.progress) { this.watchStall(team); return; }
+		const coordinator = team.members.get(team.view.coordinator)!;
+		if (team.stallNoticeAt === team.progress || coordinator.pending?.kind !== "wait") {
+			this.stop(team, "failed", `Team stalled: ${reason}. No member changed anything after the coordinator was notified.`);
+			return;
+		}
+		team.stallNoticeAt = team.progress;
+		// Deliver directly to the coordinator's pending wait, bypassing any sender filter.
+		this.settle(coordinator, { ok: false, code: "team_stalled", error: `Team stalled: ${reason}. `
+			+ "Nobody can proceed until you act: send the awaited message, control resume/redirect/cancel a worker, "
+			+ "or finish once every worker is terminal. Waiting again without a change fails the team." });
+		this.state(team, coordinator, "running");
+		this.publish(team);
+	}
 	private state(team: Team, member: Member, state: TeamMemberSnapshot["state"]): void {
 		if (member.view.state === state) return;
 		member.view.state = state;
@@ -826,7 +961,7 @@ export class TeamHub {
 				to = draft.to;
 			} else {
 				from = "@hub";
-				to = fields.kind === "result" && fields.member === team.view.coordinator ? "@parent" : team.view.coordinator;
+				to = draft.to ?? (fields.kind === "result" && fields.member === team.view.coordinator ? "@parent" : team.view.coordinator);
 			}
 			const seq = team.view.seq + index + 1;
 			return { ...fields, version: 2, messageId: `${team.view.id}:${seq}`, timestamp: timestamps[index]!, seq, from, to };
@@ -860,7 +995,12 @@ export class TeamHub {
 		team.controller.abort(reason);
 		if (!journalFailure) this.publish(team);
 	}
-	private clearTimers(team: Team): void { for (const timer of team.timers) clearTimeout(timer); team.timers = []; }
+	private clearTimers(team: Team): void {
+		for (const timer of team.timers) clearTimeout(timer);
+		team.timers = [];
+		if (team.stallTimer) clearTimeout(team.stallTimer);
+		delete team.stallTimer;
+	}
 	private admitted(team: Team): boolean { return [...team.members.values()].every((member) => member.binding); }
 	private expire(team: Team): void {
 		if (terminal(team.view.phase)) return;

@@ -8,7 +8,9 @@ export const TEAM_MAX_MESSAGE_BYTES = 8 * 1024;
 export const TEAM_MAX_EVENTS = 64;
 export const TEAM_MAX_WORKERS = 8;
 
-const TEAM_MAX_TEXT_BYTES = 8 * 1024;
+export const TEAM_MAX_TEXT_BYTES = 8 * 1024;
+export const TEAM_MAX_OUTPUT_BYTES = 16 * 1024;
+export const TEAM_MAX_ERROR_BYTES = 8 * 1024;
 export const TEAM_MAX_RESULT_ITEMS = 32;
 const TEAM_MAX_BRIEF_AUTHORIZATIONS = TEAM_MAX_WORKERS + 1;
 export const TEAM_MAX_BRIEF_BYTES = 32 * 1024;
@@ -87,8 +89,13 @@ export interface TeamRequest {
 	supersedes?: string;
 	result?: TeamTaskResult;
 	wait?: TeamWait;
-	command?: "pause" | "resume" | "redirect";
+	command?: TeamControlCommand;
 }
+
+export const TEAM_CONTROL_COMMANDS = ["pause", "resume", "redirect", "cancel"] as const;
+export type TeamControlCommand = typeof TEAM_CONTROL_COMMANDS[number];
+export const TEAM_EVENT_KINDS = ["message", "report", "state", "result", "control", "cancelled", "undelivered"] as const;
+export const TEAM_REPLY_CODES = ["stale_instruction", "team_stalled"] as const;
 
 export interface TeamEvent {
 	/** Absent only on legacy persisted events. New public events use v2 routing. */
@@ -98,7 +105,7 @@ export interface TeamEvent {
 	replyTo?: string;
 	supersedes?: string;
 	seq: number;
-	kind: "message" | "report" | "state" | "result" | "control" | "cancelled";
+	kind: typeof TEAM_EVENT_KINDS[number];
 	from?: string;
 	to?: string;
 	message?: string;
@@ -139,7 +146,7 @@ export interface TeamReply {
 	to?: string;
 	requestId?: string;
 	revision?: number;
-	code?: "stale_instruction";
+	code?: typeof TEAM_REPLY_CODES[number];
 	receipt?: { status: "queued" | "applied"; messageId?: string; recipient?: string; seq?: number };
 	events?: TeamEvent[];
 	snapshot?: TeamSnapshot;
@@ -266,7 +273,7 @@ export function isTeamRequest(value: unknown): value is TeamRequest {
 	if (item["revision"] !== undefined && (!Number.isSafeInteger(item["revision"]) || (item["revision"] as number) < 0 || item["action"] !== "checkpoint")) return false;
 	if (item["to"] !== undefined && (typeof item["to"] !== "string" || item["to"].length > 64)) return false;
 	if (item["message"] !== undefined && (typeof item["message"] !== "string" || Buffer.byteLength(item["message"], "utf8") > TEAM_MAX_MESSAGE_BYTES)) return false;
-	if (item["command"] !== undefined && !["pause", "resume", "redirect"].includes(String(item["command"]))) return false;
+	if (item["command"] !== undefined && !(TEAM_CONTROL_COMMANDS as readonly string[]).includes(String(item["command"]))) return false;
 	if (item["replyTo"] !== undefined && (!validMessageReference(item["replyTo"]) || !["send", "report"].includes(String(item["action"])))) return false;
 	if (item["supersedes"] !== undefined && (!validMessageReference(item["supersedes"]) || !["send", "report"].includes(String(item["action"])))) return false;
 	if (item["result"] !== undefined && (item["action"] !== "finish" || !isTeamTaskResult(item["result"]))) return false;
@@ -290,7 +297,8 @@ export function isTeamRequest(value: unknown): value is TeamRequest {
 			&& item["replyTo"] === undefined && item["supersedes"] === undefined && item["result"] === undefined && item["command"] === undefined;
 		case "control": return typeof item["to"] === "string" && !!item["to"] && typeof item["command"] === "string"
 			&& item["wait"] === undefined && item["replyTo"] === undefined && item["supersedes"] === undefined && item["result"] === undefined
-			&& (item["command"] === "redirect" ? typeof item["message"] === "string" : item["message"] === undefined);
+			// redirect requires a direction; cancel accepts an optional reason.
+			&& (item["command"] === "redirect" ? typeof item["message"] === "string" : item["command"] === "cancel" || item["message"] === undefined);
 		case "finish": return item["to"] === undefined && item["wait"] === undefined && item["command"] === undefined
 			&& item["replyTo"] === undefined && item["supersedes"] === undefined;
 	}

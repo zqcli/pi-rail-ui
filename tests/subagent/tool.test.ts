@@ -680,6 +680,40 @@ test("unknown team cleanup does not mask an incompatible-mode validation error",
 	} finally { hub.dispose(); }
 });
 
+test("a coordinator cancel aborts only that worker's dispatch and reports the cancellation reason", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B1", "B2"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const { tool, broker } = setupTool({ team: () => manager });
+		const original = broker.dispatch.bind(broker);
+		const signals = new Map<string, AbortSignal>();
+		broker.dispatch = async (request) => {
+			signals.set(request.alias!, request.signal!);
+			if (request.alias === "B1") {
+				await new Promise<void>((resolve) => request.signal!.addEventListener("abort", () => resolve(), { once: true }));
+				throw new Error("Subagent request was aborted");
+			}
+			const result = await original(request);
+			await request.team!.afterRun!(result.run, request.signal);
+			return result;
+		};
+		const pending = tool.execute("workers", { teamId: team.id, tasks: [{ alias: "B1", task: "one" }, { alias: "B2", task: "two" }] }, undefined, undefined, context());
+		while (signals.size < 2) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal((await manager.channel(a!).onRequest({ requestId: "cancel", sequence: 1, action: "control", to: "B1", command: "cancel", message: "duplicate work" })).ok, true);
+		const result = await pending;
+		const [b1, b2] = result.details.results;
+		assert.equal(b1.status, "failed");
+		assert.equal(b1.stopReason, "aborted");
+		assert.equal(b1.errorMessage, "Cancelled by coordinator A: duplicate work");
+		assert.equal(b2.status, "completed");
+		assert.equal(signals.get("B2")!.aborted, false);
+		assert.equal(hub.signal(team.id).aborted, false, "one cancelled worker must not cancel the team");
+		assert.equal(hub.get(team.id).members.find((member) => member.id === "B1")?.state, "cancelled");
+	} finally { hub.dispose(); }
+});
+
 test("team progress details map coordination by alias and keep explicit sorted slots", async () => {
 	const hub = new TeamHub();
 	try {

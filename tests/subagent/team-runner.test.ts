@@ -254,3 +254,50 @@ test("missing sibling has a finite admission deadline", async () => {
 		await check;
 	} finally { hub.dispose(); }
 });
+
+test("a stall during the host-side barrier becomes one coordinator turn instead of a deadline wait", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const hub = new TeamHub({ stallGraceMs: 10 });
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const [b] = manager.join(team.id, "parallel", [{ alias: "B", task: "work" }]);
+		const coordinator = manager.channel(a!);
+		const worker = manager.channel(b!);
+		const parked = worker.onRequest({ requestId: "wait", sequence: 1, action: "wait", wait: { kind: "message", from: "A" } });
+		const prompt = coordinator.afterRun!(run("premature answer"));
+		await new Promise((resolve) => setImmediate(resolve));
+		t.mock.timers.tick(10);
+		const continuation = await prompt;
+		assert.match(continuation!, /Team stalled: A waits for all workers; B waits for a message from A/u);
+		assert.match(continuation!, /call team finish/u);
+		assert.doesNotMatch(continuation!, /All workers have settled/u);
+		assert.equal((await coordinator.onRequest({ requestId: "unblock", sequence: 1, action: "send", to: "B", message: "go" })).ok, true,
+			"a stall turn may still cooperate; it is not the final-summary continuation");
+		assert.equal((await parked).events?.[0]?.message, "go");
+		await worker.afterRun!(run("worker result"));
+		const summary = await coordinator.afterRun!(run("answer after unblocking"));
+		assert.match(summary!, /All workers have settled/u);
+		assert.equal(await coordinator.afterRun!(run("final summary")), undefined);
+		assert.equal(hub.get(team.id).phase, "completed");
+	} finally { hub.dispose(); }
+});
+
+test("a worker cancelled by the coordinator keeps its authoritative cancelled outcome", async () => {
+	const hub = new TeamHub();
+	try {
+		const manager = new TeamRunManager(hub);
+		const team = hub.prepare({ coordinator: "A", workers: ["B1", "B2"] });
+		const [a] = manager.join(team.id, "single", [{ alias: "A", task: "coordinate" }]);
+		const [b1] = manager.join(team.id, "parallel", [{ alias: "B1", task: "one" }, { alias: "B2", task: "two" }]);
+		assert.equal((await manager.channel(a!).onRequest({ requestId: "cancel", sequence: 1, action: "control", to: "B1", command: "cancel" })).ok, true);
+		const signal = hub.memberSignal(team.id, "B1");
+		assert.equal(await manager.channel(b1!).afterRun!({ ...run("aborted"), stopReason: "aborted" }, signal), undefined);
+		const member = hub.get(team.id).members.find((candidate) => candidate.id === "B1")!;
+		assert.equal(member.state, "cancelled");
+		assert.equal(member.error, "Cancelled by coordinator A");
+		assert.equal(hub.get(team.id).phase, "running");
+		assert.equal(hub.signal(team.id).aborted, false);
+	} finally { hub.dispose(); }
+});

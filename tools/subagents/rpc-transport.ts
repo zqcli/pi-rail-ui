@@ -49,11 +49,13 @@ export class PiRpcProcessTransport implements RpcTransport {
 	private requestId = 0;
 	private stderr = "";
 	private stopping = false;
+	private stopPromise: Promise<void> | undefined;
 
 	constructor(private readonly options: PiRpcProcessTransportOptions) {}
 
 	async start(): Promise<void> {
 		if (this.process) throw new Error("Subagent RPC transport already started");
+		this.stopPromise = undefined;
 		this.stopping = false;
 		const proc = spawn(this.options.command, this.options.args, {
 			cwd: this.options.cwd,
@@ -113,9 +115,27 @@ export class PiRpcProcessTransport implements RpcTransport {
 		});
 	}
 
-	async stop(): Promise<void> {
+	stop(): Promise<void> {
+		if (this.stopPromise) return this.stopPromise;
+		const stopping = this.stopOnce();
+		this.stopPromise = stopping;
+		void stopping.catch((error: unknown) => {
+			if (error instanceof RpcProcessExitTimeoutError) {
+				void error.exited.then(() => {
+					if (this.stopPromise === stopping) this.stopPromise = undefined;
+				}, () => undefined);
+			}
+		});
+		return stopping;
+	}
+
+	private async stopOnce(): Promise<void> {
 		const proc = this.process;
 		if (!proc) return;
+		if (proc.exitCode !== null || proc.signalCode !== null) {
+			if (this.process === proc) this.process = undefined;
+			return;
+		}
 		this.stopping = true;
 		const stopped = new Error("Subagent RPC process stopped");
 		this.rejectPending(stopped);

@@ -17,6 +17,9 @@ import { installTeamTool } from "../../tools/subagents/team-tool";
 import { installStatefulSubagentTool } from "../../tools/subagents/tool";
 import type { TeamBrief, TeamSnapshot } from "../../tools/subagents/team-protocol-v1";
 
+// These end-to-end cases exercise the retired v1 TeamDispatcher/afterRun loop.
+// Stage B native retry/compaction acceptance is in team-member-driver.test.ts;
+// WebSocket and native-abort acceptance is in team-websocket-integration.test.ts.
 const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const fixture = fileURLToPath(new URL("../fixtures/team-coordination-provider.mjs", import.meta.url));
 const nativeModel = { provider: "rail-team-e2e", id: "probe", name: "Team probe", api: "rail-team-e2e-api", contextWindow: 128000 };
@@ -87,7 +90,7 @@ function waitForSnapshot(hub: TeamHub, teamId: string, predicate: (snapshot: Tea
 	});
 }
 
-test("real RPC team keeps two parent calls pending, wakes B1 from B8, and gives A all eight results before its final summary", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: real RPC team keeps two parent calls pending, wakes B1 from B8, and gives A all eight results before its final summary", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, history, journaled, dispatch, updates, journal, store } = await setup(t, 8);
 	let aDone = false;
 	let bDone = false;
@@ -135,7 +138,7 @@ test("real RPC team keeps two parent calls pending, wakes B1 from B8, and gives 
 	}
 });
 
-test("real coordinator pauses a worker, receives safe-point confirmation, redirects it and resumes it", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: real coordinator pauses a worker, receives safe-point confirmation, redirects it and resumes it", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, dispatch, history, updates } = await setup(t, 2, "control");
 	const [a, b] = await Promise.all(dispatch());
 	assert.equal(hub.get(teamId).phase, "completed");
@@ -151,7 +154,7 @@ test("real coordinator pauses a worker, receives safe-point confirmation, redire
 	assert.ok(paused && redirect && paused.seq < redirect.seq);
 });
 
-test("explicit coordinator reports complete the READY/pause/resume/dependency handshake without a message-wait cycle", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: explicit coordinator reports complete the READY/pause/resume/dependency handshake without a message-wait cycle", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, history, dispatch, journal } = await setup(t, 2, "report-handshake");
 	const timeout = setTimeout(() => hub.cancel(teamId, "Handshake regression timed out"), 15_000);
 	t.after(() => clearTimeout(timeout));
@@ -197,7 +200,7 @@ test("explicit coordinator reports complete the READY/pause/resume/dependency ha
 	assert.ok(history.filter((snapshot) => snapshot.phase === "finalizing").every((snapshot) => snapshot.members.filter((member) => member.role === "worker").every((member) => member.state === "completed")));
 });
 
-test("native parent rejects a lone team call without starting members, then corrects full-property RPC siblings", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: native parent rejects a lone team call without starting members, then corrects full-property RPC siblings", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, tools, ctx, store } = await setup(t, 2, "control");
 	// Match the real smoke session's provider-filled optional fields, including
 	// empty session/control objects at the top level and inside grouped tasks.
@@ -251,7 +254,7 @@ test("native parent rejects a lone team call without starting members, then corr
 	assert.deepEqual(args, before);
 });
 
-test("real RPC shares member scope and policies, preserves structured empty-text outcomes, and summarizes only once", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: real RPC shares member scope and policies, preserves structured empty-text outcomes, and summarizes only once", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, dispatch, journal } = await setup(t, 2, "contract", {
 		goal: "Verify shared scope and structured outcomes",
 		target: "offline synthetic fixture",
@@ -284,7 +287,7 @@ test("real RPC shares member scope and policies, preserves structured empty-text
 	}
 });
 
-test("real cancellation wakes both parked calls and awaits native lease cleanup without a final summary", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: real cancellation wakes both parked calls and awaits native lease cleanup without a final summary", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, dispatch, tools, ctx, store, leases, journal } = await setup(t, 1, "cancel");
 	const settled = Promise.allSettled(dispatch());
 	await waitForSnapshot(hub, teamId, (s) => s.members.every((m) => m.state === "waiting" && m.waitingFor === "message"));
@@ -306,7 +309,7 @@ test("real cancellation wakes both parked calls and awaits native lease cleanup 
 	for (const instance of await store.list()) assert.deepEqual(await leases.inspect(instance.sessionFile), { state: "free" });
 });
 
-test("team finalization waits through native automatic retry rather than the first agent_end", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: team finalization waits through native automatic retry rather than the first agent_end", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, dispatch, journal, history } = await setup(t, 1, "retry");
 	const [a, b] = await Promise.all(dispatch());
 	assert.equal(hub.get(teamId).phase, "completed");
@@ -317,7 +320,7 @@ test("team finalization waits through native automatic retry rather than the fir
 	assert.ok(history.filter((snapshot) => snapshot.phase === "finalizing").every((snapshot) => snapshot.members.find((member) => member.id === "B1")?.output === "B1 result"));
 });
 
-test("team preserves native threshold compaction and restores the temporary context window before reuse", { timeout: 90_000 }, async (t) => {
+test.skip("legacy v1: team preserves native threshold compaction and restores the temporary context window before reuse", { timeout: 90_000 }, async (t) => {
 	const { hub, teamId, dispatch, journal, broker, updates } = await setup(t, 1, "compaction");
 	const [a, b] = await Promise.all(dispatch());
 	assert.equal(hub.get(teamId).phase, "completed");

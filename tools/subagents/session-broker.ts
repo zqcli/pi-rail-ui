@@ -1,4 +1,5 @@
 import type { TeamDispatchChannel, TeamWorkerChannel } from "./team-protocol-v1";
+import type { BindingV2, ChildRequestFrame, PrivateReply } from "./team-protocol";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { ContextProtocolError, ContextWindowValidationError, createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";
@@ -9,6 +10,8 @@ import { buildSubagentSessionName } from "./session-name";
 import type { SessionLease } from "./session-lease";
 import type { SubagentTranscriptSnapshot } from "./transcript";
 import { emptySubagentUsage } from "./usage";
+import type { NativeCompletion, RuntimeActivation } from "./team-runtime";
+import { parseBinding, sameBinding } from "./team-codec";
 
 export interface SubagentUsage {
 	input: number;
@@ -47,6 +50,19 @@ export interface WorkerStartSpec {
 	cwd: string;
 	sessionPath?: string;
 	fastMode?: boolean;
+	/** Team actors load only the private v2 extension; ordinary sessions load no live Team protocol. */
+	teamProtocolVersion?: 1 | 2;
+}
+
+export interface TeamMemberProtocolSession {
+	runActivation(
+		activation: RuntimeActivation,
+		onRequest: (frame: ChildRequestFrame, intentId?: string) => Promise<PrivateReply>,
+		contextWindow: number | undefined,
+		onNativeSettled: (completion: NativeCompletion) => Promise<void> | void,
+		signal?: AbortSignal,
+	): Promise<void>;
+	close(): Promise<void>;
 }
 
 export interface WorkerSendOptions {
@@ -82,6 +98,7 @@ export interface SessionWorker {
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult>;
 	control?(request: WorkerControlRequest): Promise<void>;
 	setModel?(model: RailModelRef): Promise<RailModelRef>;
+	openTeamMemberV2?(binding: BindingV2, onFailure: (error: Error) => void): Promise<TeamMemberProtocolSession>;
 	isReusable?(): boolean;
 	stop(): Promise<void>;
 }
@@ -168,6 +185,28 @@ export interface AttachRequest {
 	cwd?: string;
 	session?: SessionSource;
 	fastMode?: boolean | null;
+	/** Internal live actor session mode. Not persisted as ordinary subagent policy. */
+	teamProtocolVersion?: 2;
+}
+
+export interface TeamMemberOpenRequest {
+	binding: BindingV2;
+	model: RailModelRef;
+	cwd?: string;
+	fastMode?: boolean;
+	contextWindow?: number;
+}
+
+export interface BrokeredTeamMemberHandle {
+	readonly instance: AgentInstance;
+	readonly sessionId: string;
+	runActivation(
+		activation: RuntimeActivation,
+		onRequest: (frame: ChildRequestFrame, intentId?: string) => Promise<PrivateReply>,
+		onNativeSettled: (completion: NativeCompletion) => Promise<void> | void,
+		signal?: AbortSignal,
+	): Promise<void>;
+	close(): Promise<void>;
 }
 
 interface WorkerState {
@@ -185,6 +224,11 @@ interface WorkerState {
 	controlErrorMessage: string | undefined;
 	queued: number;
 	isCompacting: boolean;
+}
+
+interface OwnedTeamMember {
+	owner: symbol;
+	alias: string;
 }
 
 /**
@@ -254,8 +298,9 @@ class TeamActiveError extends Error {}
 
 export class SessionBroker {
 	private readonly workers = new Map<string, WorkerState>();
-	private readonly teamActive = new Map<string, AbortController>();
 	private readonly teamAliases = new Set<string>();
+	private readonly teamAliasOwners = new Map<string, symbol>();
+	private readonly teamMemberHandles = new Map<string, OwnedTeamMember>();
 	private readonly workerStarts = new Map<string, Promise<WorkerState>>();
 	private readonly instanceCreations = new Set<Promise<AgentInstance>>();
 	private readonly pendingAliases = new Set<string>();
@@ -291,6 +336,7 @@ export class SessionBroker {
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
+		if (request.team) throw new Error("Legacy v1 Team dispatch is retired; TeamRuntime must schedule Broker-owned v2 member lifetimes");
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
 		const contextWindow = normalizeContextWindow(request.contextWindow);
 		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
@@ -301,9 +347,10 @@ export class SessionBroker {
 			const cwd = await resolveChildContextCwd(request.cwd ?? this.defaultCwd, request.session);
 			this.validateContextWindow(contextWindow, cwd, request.model);
 		}
-		if (request.team && (request.target || !request.alias || request.session)) throw new Error("Team dispatch requires a new persistent session");
 		const requestedAgentId = request.target ? (this.roster.resolve(request.target) ?? request.target) : undefined;
-		if (request.target && (this.teamAliases.has(request.target) || (requestedAgentId && this.teamActive.has(requestedAgentId)))) throw new Error("Subagent target has an active team operation");
+		if (request.target && (this.teamAliases.has(request.target) || (requestedAgentId && this.teamMemberHandles.has(requestedAgentId)))) {
+			throw new Error("Subagent target has an active team operation");
+		}
 		const expectedEpoch = requestedAgentId ? this.lifecycleEpoch(requestedAgentId) : undefined;
 		if (request.target && request.fastMode !== undefined && request.fastMode !== null) {
 			throw new Error("fastMode for an existing target is managed through /rail-agent");
@@ -313,12 +360,7 @@ export class SessionBroker {
 		let instance: AgentInstance | undefined;
 		const createdInstance = Boolean(request.model);
 		let state: WorkerState | undefined;
-		let signal = request.signal;
-		const reservedTeamAlias = request.team ? request.alias!.trim() : undefined;
-		if (reservedTeamAlias !== undefined) {
-			if (this.teamAliases.has(reservedTeamAlias)) throw new TeamActiveError("Subagent alias has an active team operation");
-			this.teamAliases.add(reservedTeamAlias);
-		}
+		const signal = request.signal;
 		try {
 			instance = request.model
 				? await this.attach({
@@ -330,17 +372,12 @@ export class SessionBroker {
 				})
 				: await this.resolveInstance(request.target!);
 			const resolvedInstance = instance;
-			if (request.team) {
-				const operation = new AbortController();
-				this.teamActive.set(resolvedInstance.agentId, operation);
-				signal = signal ? AbortSignal.any([signal, operation.signal]) : operation.signal;
-			}
-			else if (this.teamActive.has(resolvedInstance.agentId) || this.teamAliases.has(resolvedInstance.alias)) throw new TeamActiveError("Subagent target has an active team operation");
+			if (this.teamMemberHandles.has(resolvedInstance.agentId)
+				|| this.teamAliases.has(resolvedInstance.alias)) throw new TeamActiveError("Subagent target has an active team operation");
 			if (this.shuttingDown || this.stoppingAgents.has(resolvedInstance.agentId) || this.deletingAgents.has(resolvedInstance.agentId)
 				|| (expectedEpoch !== undefined && this.lifecycleEpoch(resolvedInstance.agentId) !== expectedEpoch)) {
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 			}
-			if (request.team && signal?.aborted) throw new Error("Team request was aborted during startup");
 			if (request.target && contextWindow !== undefined) await this.validateContextWindowForTarget(request.target, contextWindow);
 			if (request.target && !this.roster.resolve(request.target)) this.roster.link(resolvedInstance.alias, resolvedInstance.agentId);
 			request.onUpdate?.({ instance: resolvedInstance, run: { output: "(starting...)", usage: emptySubagentUsage() } });
@@ -353,54 +390,31 @@ export class SessionBroker {
 					const cwd = await resolveChildContextCwd(currentState.instance.cwd, { mode: "open", path: currentState.worker.sessionFile });
 					this.validateContextWindow(contextWindow, cwd, currentState.instance.model);
 				}
-				let task: string | undefined = request.task;
-				let run!: WorkerRunResult;
-				let usage = emptySubagentUsage();
-				const aggregateUsage = (next: SubagentUsage): SubagentUsage => {
-					const total = { ...next };
-					for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost", "turns"] as const) total[key] += usage[key];
-					const searches = (usage.searches ?? 0) + (next.searches ?? 0);
-					if (searches) total.searches = searches;
-					return total;
-				};
-				while (task !== undefined) {
-					if (signal?.aborted) throw new Error("Subagent request was aborted");
-					if (currentState.activeRunId === undefined) currentState.activeRunId = ++currentState.nextRunId;
-					const nativeRun = await currentState.worker.send(task, {
-						...(request.team ? { team: request.team } : {}),
-						...(contextWindow !== undefined ? { contextWindow } : {}),
-						...(signal ? { signal } : {}),
-						onUpdate: (partial) => {
-							const isCompacting = partial.isCompacting === true;
-							if (currentState.isCompacting !== isCompacting) {
-								currentState.isCompacting = isCompacting;
-								this.emitRuntimeChange();
-							}
-							request.onUpdate?.({ instance: resolvedInstance, run: request.team ? { ...partial, usage: aggregateUsage(partial.usage) } : partial });
-						},
-						onAccepted: () => {
-							if (currentState.activeRunId !== undefined && !currentState.stopping) {
-								currentState.activeRunAccepted = true;
-								this.emitRuntimeChange();
-							}
-						},
-						onSettled: () => {
-							currentState.activeRunId = undefined;
-							currentState.activeRunAccepted = false;
+				if (signal?.aborted) throw new Error("Subagent request was aborted");
+				if (currentState.activeRunId === undefined) currentState.activeRunId = ++currentState.nextRunId;
+				const run = await currentState.worker.send(request.task, {
+					...(contextWindow !== undefined ? { contextWindow } : {}),
+					...(signal ? { signal } : {}),
+					onUpdate: (partial) => {
+						const isCompacting = partial.isCompacting === true;
+						if (currentState.isCompacting !== isCompacting) {
+							currentState.isCompacting = isCompacting;
 							this.emitRuntimeChange();
-						},
-					});
-					currentState.activeRunId = undefined;
-					currentState.activeRunAccepted = false;
-					if (request.team) {
-						usage = aggregateUsage(nativeRun.usage);
-						run = { ...nativeRun, usage };
-						task = await request.team.afterRun?.(nativeRun, signal);
-					} else {
-						run = nativeRun;
-						task = undefined;
-					}
-				}
+						}
+						request.onUpdate?.({ instance: resolvedInstance, run: partial });
+					},
+					onAccepted: () => {
+						if (currentState.activeRunId !== undefined && !currentState.stopping) {
+							currentState.activeRunAccepted = true;
+							this.emitRuntimeChange();
+						}
+					},
+					onSettled: () => {
+						currentState.activeRunId = undefined;
+						currentState.activeRunAccepted = false;
+						this.emitRuntimeChange();
+					},
+				});
 				currentState.activeRunId = undefined;
 				currentState.activeRunAccepted = false;
 				currentState.isCompacting = false;
@@ -425,14 +439,6 @@ export class SessionBroker {
 				this.emitRuntimeChange();
 				throw error;
 			}
-			if (request.team && createdInstance && instance && request.team.started?.() === false) {
-				// The member never passed a team gate, so its model never acted. Free the
-				// alias so the team can be retried with the same roster.
-				await this.cleanupCreatedInstance(instance, true);
-				this.runtimeErrors.delete(failedAgentId);
-				this.emitRuntimeChange();
-				throw error;
-			}
 			const mustRetire = error instanceof ContextProtocolError || state?.worker.isReusable?.() === false;
 			if (error instanceof ContextWindowValidationError) {
 				if (createdInstance && instance) {
@@ -443,7 +449,6 @@ export class SessionBroker {
 				this.runtimeErrors.set(failedAgentId, error instanceof Error ? error.message : String(error));
 				await this.retireFailedWorker(failedAgentId);
 			} else if (this.stoppingAgents.has(failedAgentId) || signal?.aborted) {
-				if (request.team) await this.retireFailedWorker(failedAgentId);
 				this.runtimeErrors.delete(failedAgentId);
 			}
 			else {
@@ -452,9 +457,6 @@ export class SessionBroker {
 			}
 			this.emitRuntimeChange();
 			throw error;
-		} finally {
-			if (request.team && instance) this.teamActive.delete(instance.agentId);
-			if (reservedTeamAlias !== undefined) this.teamAliases.delete(reservedTeamAlias);
 		}
 	}
 
@@ -463,7 +465,7 @@ export class SessionBroker {
 		if (!message) throw new Error("Subagent control message cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent control was aborted before delivery");
 		const agentId = this.roster.resolve(request.target) ?? request.target;
-		if (this.teamActive.has(agentId)) throw new Error("Use team control for an active team member");
+		if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned members accept actions only through TeamRuntime");
 		if (this.shuttingDown || this.stoppingAgents.has(agentId) || this.deletingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
 		if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
 		const state = this.workers.get(agentId);
@@ -520,6 +522,167 @@ export class SessionBroker {
 		}
 	}
 
+	/** Create and exclusively own one native session for a Team v2 member lifetime. */
+	async openTeamMember(request: TeamMemberOpenRequest): Promise<BrokeredTeamMemberHandle> {
+		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
+		const binding = parseBinding(request.binding);
+		const alias = binding.memberId;
+		assertValidAgentAlias(alias);
+		const saved = await this.store.list();
+		if (this.teamAliases.has(alias) || this.roster.resolve(alias) || this.pendingAliases.has(alias)
+			|| saved.some((instance) => instance.alias === alias)) {
+			throw new TeamActiveError(`Team member alias is already owned: ${alias}`);
+		}
+		const contextWindow = normalizeContextWindow(request.contextWindow);
+		const cwd = await resolveChildContextCwd(request.cwd ?? this.defaultCwd, { mode: "new" });
+		if (contextWindow !== undefined) this.validateContextWindow(contextWindow, cwd, request.model);
+		const currentSaved = await this.store.list();
+		if (this.shuttingDown || this.teamAliases.has(alias) || this.roster.resolve(alias) || this.pendingAliases.has(alias)
+			|| currentSaved.some((instance) => instance.alias === alias)) {
+			throw new TeamActiveError(`Team member alias is already owned: ${alias}`);
+		}
+		const owner = Symbol(`team-member:${binding.teamId}:${binding.memberId}`);
+		this.teamAliases.add(alias);
+		this.teamAliasOwners.set(alias, owner);
+		let instance: AgentInstance | undefined;
+		let protocol: TeamMemberProtocolSession | undefined;
+		let state: WorkerState | undefined;
+		let closed = false;
+		let activationInFlight = false;
+		const releaseOwnership = (): void => {
+			if (instance && this.teamMemberHandles.get(instance.agentId)?.owner === owner) this.teamMemberHandles.delete(instance.agentId);
+			if (this.teamAliasOwners.get(alias) === owner) {
+				this.teamAliases.delete(alias);
+				this.teamAliasOwners.delete(alias);
+			}
+		};
+		try {
+			instance = await this.attach({ model: request.model, alias, cwd,
+				...(request.fastMode !== undefined ? { fastMode: request.fastMode } : {}), teamProtocolVersion: 2 });
+			state = this.workers.get(instance.agentId);
+			if (!state || !state.worker.openTeamMemberV2) throw new Error("Team v2 session worker capability is unavailable");
+			this.teamMemberHandles.set(instance.agentId, { owner, alias });
+			protocol = await state.worker.openTeamMemberV2(binding, (error) => {
+				this.runtimeErrors.set(instance!.agentId, error.message);
+				this.emitRuntimeChange();
+			});
+			if (this.shuttingDown) throw new Error("Broker shut down during Team member startup");
+			const ownedProtocol = protocol;
+			const ownedState = state;
+			const ownedInstance = instance;
+			let protocolCloseAttempted = false;
+			let protocolCloseError: unknown;
+			let exitWait: Promise<void> | undefined;
+			let exitStopError: unknown;
+			let exitConfirmed = false;
+			let released = false;
+			let closing: Promise<void> | undefined;
+			const closeHandle = async (): Promise<void> => {
+				if (activationInFlight) throw new Error(`Team member ${alias} still has an activation in flight`);
+				if (closing) return closing;
+				if (released) return;
+				closed = true;
+				closing = (async () => {
+					if (!protocolCloseAttempted) {
+						protocolCloseAttempted = true;
+						try { await this.enqueue(ownedState, () => ownedProtocol.close()); }
+						catch (error) { protocolCloseError = error; }
+					}
+					if (!exitConfirmed && exitWait) {
+						try { await exitWait; exitConfirmed = true; exitStopError = undefined; }
+						catch (error) { exitStopError = error; }
+					} else if (!exitConfirmed && !exitStopError) {
+						try {
+							await this.stopProcess(ownedInstance.agentId, ownedState);
+							await Promise.allSettled([ownedState.tail, ownedState.controlTail]);
+							exitConfirmed = true;
+						} catch (error) {
+							if (error instanceof RpcProcessExitTimeoutError) exitWait = error.exited;
+							exitStopError = error;
+						}
+					}
+					if (!exitConfirmed) {
+						const error = exitStopError ?? protocolCloseError ?? new Error(`Team member ${alias} exit is not confirmed`);
+						this.runtimeErrors.set(ownedInstance.agentId, error instanceof Error ? error.message : String(error));
+						this.emitRuntimeChange();
+						throw error;
+					}
+					if (protocolCloseError) {
+						this.runtimeErrors.set(ownedInstance.agentId, protocolCloseError instanceof Error ? protocolCloseError.message : String(protocolCloseError));
+						this.emitRuntimeChange();
+						throw protocolCloseError;
+					}
+					releaseOwnership();
+					this.runtimeErrors.delete(ownedInstance.agentId);
+					released = true;
+					this.emitRuntimeChange();
+				})();
+				try { await closing; }
+				catch (error) { closing = undefined; throw error; }
+			};
+			const handle: BrokeredTeamMemberHandle = {
+				instance,
+				sessionId: instance.sessionId,
+				runActivation: async (activation, onRequest, onNativeSettled, signal) => {
+					if (closed || this.teamMemberHandles.get(ownedInstance.agentId)?.owner !== owner) throw new Error(`Team member ${alias} lifetime is closed`);
+					if (activationInFlight) throw new Error(`Team member ${alias} received overlapping activations`);
+					if (!sameBinding(activation.binding, binding) || !activation.scope.activationId) {
+						throw new Error("Team activation does not match the Broker-owned member lifetime");
+					}
+					activationInFlight = true;
+					try {
+						await this.enqueue(ownedState, async () => {
+							try { await ownedProtocol.runActivation(activation, onRequest, contextWindow, onNativeSettled, signal); }
+							finally {
+								ownedState.activeRunId = undefined;
+								ownedState.activeRunAccepted = false;
+								ownedState.isCompacting = false;
+								this.emitRuntimeChange();
+							}
+						}, "run");
+					} finally { activationInFlight = false; }
+				},
+				close: closeHandle,
+			};
+			return handle;
+		} catch (error) {
+			// Once a child instance exists, retain its session and ownership on any
+			// uncertain bind/exit failure. A later ordinary writer must not race it.
+			if (instance) {
+				const failedState = state ?? this.workers.get(instance.agentId);
+				if (failedState) {
+					if (!this.shuttingDown) {
+						this.teamMemberHandles.set(instance.agentId, { owner, alias });
+						this.runtimeErrors.set(instance.agentId, error instanceof Error ? error.message : String(error));
+					}
+					try {
+						await this.stopProcess(instance.agentId, failedState);
+						await Promise.allSettled([failedState.tail, failedState.controlTail]);
+						if (!this.shuttingDown) {
+							releaseOwnership();
+							this.runtimeErrors.delete(instance.agentId);
+						}
+					} catch (stopError) {
+						if (stopError instanceof RpcProcessExitTimeoutError) {
+							this.unreaped.set(instance!.agentId, stopError.exited);
+							void stopError.exited.then(() => {
+								this.unreaped.delete(instance!.agentId);
+								if (!this.shuttingDown) {
+									releaseOwnership();
+									this.runtimeErrors.delete(instance!.agentId);
+								}
+								this.emitRuntimeChange();
+							}, () => undefined);
+						}
+						if (!this.shuttingDown) this.runtimeErrors.set(instance!.agentId, stopError instanceof Error ? stopError.message : String(stopError));
+					}
+					this.emitRuntimeChange();
+				}
+			}
+			throw error;
+		}
+	}
+
 	async validateContextWindowForTarget(target: string, contextWindow: number): Promise<void> {
 		let instance = await this.resolveInstance(target);
 		// A queued model change can make persisted target metadata stale. This is
@@ -566,7 +729,7 @@ export class SessionBroker {
 	/** Rejects aliases a new persistent session could not claim: linked, being created, or saved by any parent. */
 	async assertAliasesAvailable(aliases: readonly string[]): Promise<void> {
 		const saved = new Set((await this.store.list()).map((instance) => instance.alias));
-		const taken = aliases.filter((alias) => this.roster.resolve(alias) || this.pendingAliases.has(alias) || saved.has(alias));
+		const taken = aliases.filter((alias) => this.roster.resolve(alias) || this.pendingAliases.has(alias) || this.teamAliases.has(alias) || saved.has(alias));
 		if (taken.length) {
 			throw new Error(`Persistent subagent alias already exists: ${taken.join(", ")}. Team members need new aliases; choose different ones.`);
 		}
@@ -610,6 +773,7 @@ export class SessionBroker {
 
 	async stop(target: string): Promise<AgentInstance | undefined> {
 		const agentId = this.roster.resolve(target) ?? target;
+		if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned members must be released by TeamRuntime");
 		if (this.fastModeChanges.has(agentId) || this.modelChanges.has(agentId)) {
 			throw new Error("Subagent maintenance operation is already pending");
 		}
@@ -629,12 +793,14 @@ export class SessionBroker {
 
 	async setFastMode(target: string, enabled: boolean, options: { sessionLeaseHeld?: boolean } = {}): Promise<AgentInstance> {
 		const requestedAgentId = this.roster.resolve(target) ?? target;
+		if (this.teamMemberHandles.has(requestedAgentId)) throw new Error("Team-owned member policy is pinned for its lifetime");
 		if (this.deletingAgents.has(requestedAgentId)) throw new Error("Subagent is being deleted");
 		if (this.fastModeChanges.has(requestedAgentId)) throw new Error("Subagent fast mode is already changing");
 		const change = (async () => {
 			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 			const instance = await this.resolveInstance(target);
 			const agentId = instance.agentId;
+			if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned member policy is pinned for its lifetime");
 			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 			if (this.deletingAgents.has(agentId)) throw new Error("Subagent is being deleted");
 			if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
@@ -674,6 +840,7 @@ export class SessionBroker {
 
 	async changeModel(target: string, model: RailModelRef): Promise<AgentInstance> {
 		const instance = await this.resolveInstance(target);
+		if (this.teamMemberHandles.has(instance.agentId)) throw new Error("Team-owned member policy is pinned for its lifetime");
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		if (this.deletingAgents.has(instance.agentId)) throw new Error("Subagent is being deleted");
 		if (this.workerStarts.has(instance.agentId)) throw new Error("Subagent worker is still starting");
@@ -727,9 +894,6 @@ export class SessionBroker {
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true;
 		for (const state of this.workers.values()) state.stopping = true;
-		// Cancel in-flight team dispatches so their tails settle instead of parking
-		// between coordinator rounds.
-		for (const operation of this.teamActive.values()) operation.abort();
 		// Stop active sends before awaiting model changes queued behind them.
 		await Promise.allSettled([...this.workerStarts.values(), ...this.instanceCreations, ...this.fastModeChanges.values()]);
 		const states = Array.from(this.workers.values());
@@ -738,12 +902,16 @@ export class SessionBroker {
 		await Promise.allSettled(states.map((state) => state.worker.stop()));
 		await Promise.allSettled(this.modelChanges.values());
 		await Promise.allSettled(states.flatMap((state) => [state.tail, state.controlTail]));
+		this.teamMemberHandles.clear();
+		this.teamAliases.clear();
+		this.teamAliasOwners.clear();
 		this.emitRuntimeChange();
 	}
 
 	async detach(target: string): Promise<AgentInstance | undefined> {
 		const instance = await this.resolveInstance(target).catch(() => undefined);
 		if (!instance) return undefined;
+		if (this.teamMemberHandles.has(instance.agentId)) throw new Error("Team-owned members cannot be detached during their lifetime");
 		const links = this.roster.list();
 		const alias = links.some((link) => link.alias === target)
 			? target
@@ -755,14 +923,12 @@ export class SessionBroker {
 
 	async delete(target: string): Promise<AgentInstance | undefined> {
 		const agentId = this.roster.resolve(target) ?? target;
+		if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned members must be released by TeamRuntime");
 		if (this.deletingAgents.has(agentId)) throw new Error("Subagent is already being deleted");
 		this.deletingAgents.add(agentId);
 		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
 		const state = this.workers.get(agentId);
 		if (state) state.stopping = true;
-		// Cancel an in-flight team dispatch before awaiting maintenance queued behind
-		// it; the coordinator's round barrier would otherwise park delete forever.
-		this.teamActive.get(agentId)?.abort();
 		this.emitRuntimeChange();
 		try {
 			const pending = [this.fastModeChanges.get(agentId), this.modelChanges.get(agentId)]
@@ -792,7 +958,8 @@ export class SessionBroker {
 		const agentId = createAgentId();
 		const alias = request.alias?.trim() || generatedAlias(request.model.modelId, agentId);
 		assertValidAgentAlias(alias);
-		if (this.roster.resolve(alias) || this.pendingAliases.has(alias)) throw new Error(`Subagent alias already exists: ${alias}`);
+		if (this.roster.resolve(alias) || this.pendingAliases.has(alias)
+			|| (this.teamAliases.has(alias) && request.teamProtocolVersion !== 2)) throw new Error(`Subagent alias already exists: ${alias}`);
 		this.pendingAliases.add(alias);
 		let worker: SessionWorker | undefined;
 		let aliasLease: SessionLease | undefined;
@@ -814,6 +981,7 @@ export class SessionBroker {
 				cwd,
 				...(session.path ? { sessionPath: session.path } : {}),
 				fastMode: request.fastMode === true,
+				...(request.teamProtocolVersion === 2 ? { teamProtocolVersion: 2 as const } : {}),
 			});
 			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 			const now = new Date().toISOString();
@@ -992,7 +1160,6 @@ export class SessionBroker {
 	}
 
 	private async stopWorker(agentId: string): Promise<void> {
-		this.teamActive.get(agentId)?.abort();
 		const starting = this.workerStarts.get(agentId);
 		if (starting) await starting.catch(() => undefined);
 		const inFlight = this.stopsInFlight.get(agentId);
@@ -1034,7 +1201,9 @@ export class SessionBroker {
 	}
 
 	private async cleanupCreatedInstance(agent: AgentInstance, removeSessionFile: boolean): Promise<void> {
-		await this.stopWorker(agent.agentId).catch(() => undefined);
+		const unreaped = this.unreaped.get(agent.agentId);
+		if (unreaped) throw new RpcProcessExitTimeoutError(`Subagent ${agent.alias} has not exited; preserving its session`, unreaped);
+		await this.stopWorker(agent.agentId);
 		for (const link of this.roster.list().filter((item) => item.agentId === agent.agentId)) this.roster.unlink(link.alias);
 		try {
 			await this.store.delete(agent.agentId);

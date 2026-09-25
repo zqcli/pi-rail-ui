@@ -3,6 +3,7 @@
  * public projections. Shape and size only — roles, state, ownership, versions and budgets are
  * checked by TeamRuntime. Must not depend on the runtime, RPC transport or extension install code.
  */
+import { Type } from "typebox";
 import { isValidAgentAlias } from "./identity";
 import {
 	TEAM_ERROR_CODES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_ALIAS_LENGTH, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_FRAME_BYTES,
@@ -342,6 +343,84 @@ const CONTROL_FIELDS: Record<TeamControl["command"], readonly string[]> = {
 	close_team: ["resultRefs", "outcome", "reason"],
 };
 export const TEAM_ACTION_FIELDS: readonly string[] = [...new Set(Object.values(ACTION_FIELDS).flat())];
+
+const schemaObject = (properties: Record<string, unknown>, description?: string) => Type.Object(properties as never, {
+	additionalProperties: false,
+	...(description ? { description } : {}),
+});
+const aliasSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ALIAS_LENGTH, description: "Exact alias from the Team roster." });
+const idSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH, description: "Opaque ID returned by Team status or a receipt." });
+const workRefSchema = schemaObject({ workId: idSchema, revision: Type.Integer({ minimum: 1 }) }, "An immutable work version reference.");
+const resultSchema = schemaObject({
+	status: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
+	summary: Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }),
+	findings: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }), { maxItems: TEAM_MAX_RESULT_ITEMS })),
+	evidence: Type.Optional(Type.Array(schemaObject({
+		source: Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }),
+		locator: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES })),
+		basis: Type.Union([Type.Literal("observed"), Type.Literal("verified"), Type.Literal("inferred"), Type.Literal("unverified")]),
+	}), { maxItems: TEAM_MAX_RESULT_ITEMS })),
+	limitations: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }), { maxItems: TEAM_MAX_RESULT_ITEMS })),
+	artifacts: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }), { maxItems: TEAM_MAX_RESULT_ITEMS })),
+}, "Immutable candidate result for the current WorkRef; reply does not create new work.");
+const controlAction = (command: string, properties: Record<string, unknown>, description: string) => schemaObject({
+	action: Type.Literal("control"), command: Type.Literal(command), ...properties,
+}, description);
+
+/** Strict model-facing discriminated union. Runtime normalization remains authoritative. */
+export const TEAM_TOOL_SCHEMA = Type.Union([
+	schemaObject({ action: Type.Literal("request"), to: aliasSchema,
+		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
+		inputRefs: Type.Optional(Type.Array(idSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
+	}, "Accept a child request for an exact recipient. A reply never creates a request."),
+	schemaObject({ action: Type.Literal("reply"), result: resultSchema }, "Stage a result for only the current WorkRef; it commits after native settlement and cleanup."),
+	schemaObject({ action: Type.Literal("yield"), waitingFor: Type.Array(workRefSchema, { minItems: 1, maxItems: TEAM_MAX_WAITING_FOR }),
+		checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
+	}, "End this work activation while waiting for the listed immutable WorkRefs."),
+	schemaObject({ action: Type.Literal("yield"), attention: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
+		checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
+	}, "Hold this work for explicit Manager or host attention."),
+	schemaObject({ action: Type.Literal("yield"), checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })) },
+		"Manager-only idle yield. It does not automatically retry or create a follow-up activation."),
+	schemaObject({ action: Type.Literal("status"), view: Type.Optional(Type.Literal("team")),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
+	"Read the bounded Team summary. Team view does not accept an id or cursor."),
+	...(["work", "result", "incident"] as const).flatMap((view) => [
+		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
+		`Read a bounded ${view} page; status(result) is read-only and does not acknowledge child-result observation.`),
+		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), id: idSchema,
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
+		`Read one exact ${view} id.`),
+		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), cursor: idSchema,
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
+		`Continue a ${view} page from its opaque cursor.`),
+	]),
+	controlAction("pause_member", { memberId: aliasSchema }, "Manager only: pause new activations for a worker."),
+	controlAction("resume_member", { memberId: aliasSchema }, "Manager only: clear a worker's manual pause; dependencies and budget holds remain."),
+	controlAction("revise_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
+		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
+		inputRefs: Type.Optional(Type.Array(idSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
+	}, "Manager only: replace the exact current work revision; preserve its workId and result history."),
+	controlAction("cancel_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
+		reason: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
+	}, "Manager only: cancel the exact current work subtree; cleanup uncertainty remains visible."),
+	controlAction("resume_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
+		incidentId: idSchema, instruction: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
+	}, "Manager only: explicitly resume a held work revision after addressing its incident."),
+	controlAction("accept_result", { work: workRefSchema,
+		disposition: Type.Union([Type.Literal("accepted"), Type.Literal("waived")]),
+		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
+	}, "Manager only: explicitly accept a successful root or waive a terminal outcome with a reason."),
+	controlAction("close_member", { memberId: aliasSchema }, "Manager only: close an idle worker with no unresolved obligations."),
+	controlAction("close_team", { resultRefs: Type.Array(idSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
+		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
+		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
+	}, "Manager only: close the Team after all roots and member resources are explicitly settled."),
+]);
+
+export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or lets the Manager idle; status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result.";
+
 const LEGACY_ACTIONS: Record<string, string> = {
 	send: "send was replaced by request {to, task}; a reply never creates a new request",
 	report: "report was replaced by reply {result} for the current work",
@@ -531,10 +610,9 @@ function parsePrivateAction(value: unknown): PrivateAction {
 	if (!isRecord(value)) return protocol("request must be an object");
 	switch (value["action"]) {
 		case "business": {
-			frameKeys(value, ["action", "args", "toolCallId"], "business request");
+			frameKeys(value, ["action", "args"], "business request");
 			if (!isRecord(value["args"])) return protocol("business request args must be an object");
-			const toolCallId = value["toolCallId"] === undefined ? undefined : frameId(value["toolCallId"], "toolCallId");
-			return { action: "business", args: value["args"], ...(toolCallId !== undefined ? { toolCallId } : {}) };
+			return { action: "business", args: value["args"] };
 		}
 		case "input_ready":
 			frameKeys(value, ["action", "deliveryId"], "input_ready");
@@ -543,9 +621,9 @@ function parsePrivateAction(value: unknown): PrivateAction {
 			frameKeys(value, ["action"], "provider_gate");
 			return { action: "provider_gate" };
 		case "tool_gate":
-			frameKeys(value, ["action", "toolCallId", "toolName"], "tool_gate");
+			frameKeys(value, ["action", "toolName"], "tool_gate");
 			if (typeof value["toolName"] !== "string" || !value["toolName"] || value["toolName"].length > 128) return protocol("tool_gate.toolName is invalid");
-			return { action: "tool_gate", toolCallId: frameId(value["toolCallId"], "toolCallId"), toolName: value["toolName"] };
+			return { action: "tool_gate", toolName: value["toolName"] };
 		case "boundary":
 			frameKeys(value, ["action", "kind"], "boundary");
 			if (value["kind"] !== "turn_end" && value["kind"] !== "agent_end") return protocol("boundary.kind is invalid");

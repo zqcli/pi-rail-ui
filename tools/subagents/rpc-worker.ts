@@ -1,5 +1,7 @@
 import { TeamRpcConnection } from "./team-rpc";
+import { TeamRpcV2Connection } from "./team-rpc-v2";
 import { teamExtensionPath } from "./team-protocol-v1";
+import { fileURLToPath } from "node:url";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { railResponsesWebSocketExtensionPath } from "../../openai/responses-websocket";
@@ -22,12 +24,14 @@ import { railModelKey, type RailModelRef } from "./models";
 import { RpcCommandError } from "./rpc-transport";
 import { WorkerControlError } from "./session-broker";
 import type {
+	TeamMemberProtocolSession,
 	SessionWorker,
 	WorkerRunResult,
 	WorkerSendOptions,
 	WorkerControlRequest,
 	WorkerStartSpec,
 } from "./session-broker";
+import type { BindingV2 } from "./team-protocol";
 import { isSharedImmediateEvent, RunResultCollector, assistantText } from "./run-result";
 
 export interface RpcEvent {
@@ -60,7 +64,8 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	args.push("--model", railModelKey(spec.model));
 	if (spec.model.thinkingLevel) args.push("--thinking", spec.model.thinkingLevel);
 	args.push("--exclude-tools", "subagent,subagent_team");
-	args.push("-e", teamExtensionPath());
+	if (spec.teamProtocolVersion === 1) args.push("-e", teamExtensionPath());
+	if (spec.teamProtocolVersion === 2) args.push("-e", fileURLToPath(new URL("./team-extension-v2.ts", import.meta.url)));
 	if (spec.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
 	args.push("-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live");
 	args.push("-e", railResponsesWebSocketExtensionPath());
@@ -81,6 +86,7 @@ export class RpcSessionWorker implements SessionWorker {
 	private unusable = false;
 	private runInFlight = false;
 	private modelChangeInFlight = false;
+	private teamSession: TeamMemberProtocolSession | undefined;
 
 	static async connect(spec: WorkerStartSpec, transport: RpcTransport): Promise<RpcSessionWorker> {
 		const state = await transport.request({ type: "get_state" }) as RpcState;
@@ -232,6 +238,7 @@ export class RpcSessionWorker implements SessionWorker {
 
 	async send(task: string, options: WorkerSendOptions = {}): Promise<WorkerRunResult> {
 		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
+		if (this.teamSession) throw new ContextProtocolError("Team-owned session cannot receive an ordinary subagent send");
 		if (this.runInFlight) throw new ContextProtocolError("Subagent RPC worker received an overlapping run");
 		if (this.modelChangeInFlight) throw new ContextProtocolError("Subagent model change is in progress");
 		if (options.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
@@ -372,6 +379,7 @@ export class RpcSessionWorker implements SessionWorker {
 	}
 
 	async control(request: WorkerControlRequest): Promise<void> {
+		if (this.teamSession) throw new ContextProtocolError("Team-owned session cannot receive ordinary controls");
 		const message = request.message.trim();
 		if (!message) throw new Error("Subagent control message cannot be empty");
 		try {
@@ -388,6 +396,7 @@ export class RpcSessionWorker implements SessionWorker {
 	}
 
 	async setModel(model: RailModelRef): Promise<RailModelRef> {
+		if (this.teamSession) throw new ContextProtocolError("Team-owned session cannot change model");
 		if (this.runInFlight || this.modelChangeInFlight) throw new ContextProtocolError("Subagent model change requires an idle worker");
 		this.modelChangeInFlight = true;
 		try {
@@ -432,5 +441,59 @@ export class RpcSessionWorker implements SessionWorker {
 
 	async stop(): Promise<void> {
 		await this.transport.stop();
+	}
+
+	async openTeamMemberV2(binding: BindingV2, onFailure: (error: Error) => void): Promise<TeamMemberProtocolSession> {
+		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
+		if (this.teamSession || this.runInFlight || this.modelChangeInFlight) throw new ContextProtocolError("Team lifetime bind requires an idle, unbound RPC worker");
+		const state = await this.state();
+		this.assertModelState(state);
+		if (state.isStreaming === true || state.isCompacting === true) throw new ContextProtocolError("Team lifetime bind requires an idle native session");
+		const connection = new TeamRpcV2Connection(this.transport, binding, (error) => {
+			this.unusable = true;
+			onFailure(error);
+		});
+		await connection.bind();
+		let session!: TeamMemberProtocolSession;
+		session = {
+			runActivation: async (activation, onRequest, contextWindow, onNativeSettled, signal) => {
+				if (this.teamSession !== session || this.unusable) throw new ContextProtocolError("Team lifetime is not reusable");
+				if (this.runInFlight || this.modelChangeInFlight) throw new ContextProtocolError("Team member session received overlapping native sends");
+				this.runInFlight = true;
+				let callbackError: unknown;
+				let cleanupError: unknown;
+				let restoreWindow: number | undefined;
+				try {
+					restoreWindow = await this.prepareContext(normalizeContextWindow(contextWindow));
+					const completion = await connection.sendActivation(activation, onRequest, signal);
+					try { await onNativeSettled(completion); } catch (error) { callbackError = error; }
+					// Reset the child context protocol after every settled send, even when this
+					// activation did not request a non-default contextWindow.
+					try {
+						const settledState = await this.confirmContextWindow();
+						await this.resetContext(restoreWindow ?? settledState.model!.contextWindow);
+					} catch (error) {
+						this.unusable = true;
+						cleanupError = error;
+					}
+					try { await connection.deactivate(activation); }
+					catch (error) { this.unusable = true; cleanupError ??= error; }
+					if (callbackError) throw callbackError;
+					if (cleanupError) throw cleanupError;
+				} catch (error) {
+					if (!cleanupError) this.unusable ||= !(error instanceof ContextWindowValidationError);
+					throw error;
+				} finally {
+					this.runInFlight = false;
+				}
+			},
+			close: async () => {
+				if (this.teamSession !== session) return;
+				try { await connection.close(); }
+				finally { this.teamSession = undefined; }
+			},
+		};
+		this.teamSession = session;
+		return session;
 	}
 }

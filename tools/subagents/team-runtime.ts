@@ -5,7 +5,7 @@ import {
 	workRefKey,
 	type ActivationInput, type ActivationScope, type BindingV2, type DeliveryRecord, type EndIntent,
 	type ManagerEventView, type MemberRecord, type OutcomeView, type ResultRecord,
-	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle,
+	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle, type GateDecision,
 	type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamTeamView,
 	type TeamWorkSummary, type TeamWorkView, type WorkError, type WorkRecord, type WorkRef, type WorkResult, type WorkVersion,
 } from "./team-protocol";
@@ -84,6 +84,7 @@ interface RuntimeMember extends MemberRecord {
 	epoch: string;
 	active?: ActiveActivation;
 	lastActivation?: CompletedActivationTombstone;
+	lastLostActivation?: { activationId: string; error: WorkError; resourceReleased: boolean };
 	closeId?: string;
 }
 
@@ -303,6 +304,48 @@ export class TeamRuntime {
 		return okReply(member.id);
 	}
 
+	/** Permission-only native gate. It never consumes work or changes Team state. */
+	gate(bindingValue: BindingV2, scopeValue: ActivationScope, _phase: "provider_gate" | "tool_gate"): GateDecision {
+		let binding: BindingV2;
+		let scope: ActivationScope;
+		let member: RuntimeMember;
+		let team: TeamState;
+		try {
+			binding = parseBinding(bindingValue);
+			scope = parseActivationScope(scopeValue);
+			member = this.authenticatedMember(binding);
+			team = this.team(binding.teamId);
+		} catch (error) {
+			return { allow: false, reason: "stale_scope", message: error instanceof Error ? error.message : "Unknown Team activation" };
+		}
+		const active = member.active;
+		if (!active || !sameScope(active.scope, scope)) return { allow: false, reason: "stale_scope", message: "This Team activation scope is no longer current" };
+		if (team.lifecycle !== "active") return { allow: false, reason: "team_stopping", message: `Team is ${team.lifecycle}` };
+		if (member.lifecycle !== "open" || member.activity !== "running") {
+			return { allow: false, reason: "stale_scope", message: "This member is not running the exact active scope" };
+		}
+		if (member.pause !== "none") return { allow: false, reason: "paused", message: "This member is paused by TeamRuntime" };
+		const delivery = team.deliveries.get(active.deliveryId);
+		if (!active.inputReady || delivery?.state !== "delivered") {
+			return { allow: false, reason: "delivery_pending", message: "The exact activation input is not acknowledged yet" };
+		}
+		if (active.intent || active.native || active.cleanup) {
+			return { allow: false, reason: "activation_ending", message: "This activation already has an ending intent or native settlement" };
+		}
+		if (scope.kind === "work") {
+			const record = team.ledger.get(scope.work!.workId)?.record;
+			const current = team.ledger.currentRef(scope.work!.workId);
+			const version = team.ledger.version(scope.work!);
+			if (!record || record.assignee !== member.id || !current || !sameWorkRef(current, scope.work!)
+				|| !version || version.state !== "running" || !member.currentWork || !sameWorkRef(member.currentWork, scope.work!)) {
+				return { allow: false, reason: "stale_scope", message: "The active WorkRef is no longer the current assigned revision" };
+			}
+		} else if (!team.eventBatches.has(scope.eventBatchId!)) {
+			return { allow: false, reason: "stale_scope", message: "The active Manager event batch is no longer current" };
+		}
+		return { allow: true };
+	}
+
 	/** Validate identity, activation-local order, idempotency and public action before transition. */
 	handleAction(
 		bindingValue: BindingV2,
@@ -398,6 +441,55 @@ export class TeamRuntime {
 		active.cleanup = copy(cleanup);
 		if (cleanup.ok) member.lastActivation = { activationId, deliveryId: active.deliveryId, native: copy(active.native), cleanup: copy(cleanup) };
 		this.finishActivation(team, member, active);
+		this.check(team);
+		return okReply(member.id);
+	}
+
+	/** Explicit transport/send loss before agent_settled. This is never a native completion. */
+	activationLost(bindingValue: BindingV2, activationId: string, error: WorkError, resourceReleased: boolean): TeamReply {
+		const binding = this.validateBinding(bindingValue);
+		const team = this.team(binding.teamId);
+		const member = this.authenticatedMember(binding);
+		const active = member.active?.scope.activationId === activationId ? member.active : undefined;
+		if (!active) {
+			const lost = member.lastLostActivation;
+			if (lost?.activationId === activationId && canonicalJson(lost.error) === canonicalJson(error)
+				&& lost.resourceReleased === resourceReleased) return okReply(member.id);
+			fail("WORK_NOT_RUNNING", "No matching unsettled activation to isolate");
+		}
+		if (active.native) fail("PROTOCOL_FAILURE", "A settled activation must use nativeSettled and cleanupFinished");
+		const delivery = team.deliveries.get(active.deliveryId);
+		if (delivery) delivery.state = "unknown";
+		const ref = active.scope.kind === "work" ? active.scope.work : undefined;
+		if (ref) {
+			const version = team.ledger.version(ref);
+			if (version && !isTerminalWorkState(version.state)) {
+				version.state = "failed";
+				version.error = { ...copy(error), outcomeUnknown: true };
+				version.updatedAt = this.timestamp();
+			}
+			if (resourceReleased) team.ledger.cleanupPending.delete(workRefKey(ref));
+			else team.ledger.cleanupPending.add(workRefKey(ref));
+		}
+		member.lifecycle = "faulted";
+		member.activity = "idle";
+		member.resourceState = resourceReleased ? "released" : "cleanup_failed";
+		member.error = { code: error.code, message: error.message };
+		member.lastLostActivation = { activationId, error: copy(error), resourceReleased };
+		delete member.active;
+		delete member.currentWork;
+		team.health = "needs_attention";
+		if (team.lifecycle === "closing") {
+			team.lifecycle = "failed";
+			team.reason = "Team member transport failed before native settlement";
+		}
+		if (member.role === "manager") this.holdManagerWork(team);
+		else if (ref) this.failWorkerWork(team, member, ref);
+		this.createIncident(team, resourceReleased ? "NATIVE_OUTCOME_UNKNOWN" : "CLEANUP_FAILED", error.message, ref, member.id);
+		this.addEvent(team, { key: `member-fault:${member.id}:${activationId}`, kind: "MEMBER_FAULTED",
+			message: `${member.id} lost its native activation before settlement`, memberId: member.id, ...(ref ? { work: ref } : {}) });
+		this.changed(team);
+		this.updateQuiescence(team);
 		this.check(team);
 		return okReply(member.id);
 	}

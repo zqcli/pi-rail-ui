@@ -1,10 +1,10 @@
 /**
- * LEGACY v1 live Team protocol (coordinator/member-terminal model).
+ * Historical v1 Team protocol (coordinator/member-terminal model).
  *
- * Kept only so the pre-actor live path (team-hub, team-runner, team-extension, team-rpc,
- * SessionBroker afterRun) keeps working while the v2 actor runtime is built behind pure
- * tests. Scheduled for deletion when stage B/C migrate the driver, extension and tool to
- * `team-protocol.ts` v2; only the read-only history mapping may survive. Do not add features here.
+ * The SessionBroker v1 dispatch path is retired. This module remains only for
+ * legacy history and protocol tests until the Stage D cleanup; live Team work
+ * must be scheduled through TeamRuntime and Broker-owned v2 member lifetimes.
+ * Do not add features here.
  */
 import { fileURLToPath } from "node:url";
 

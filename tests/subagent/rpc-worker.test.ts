@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { teamExtensionPath, TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamWorkerChannel } from "../../tools/subagents/team-protocol-v1";
 import { TEAM_COMMAND_DESCRIPTION } from "../../tools/subagents/team-extension";
+import { TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND as TEAM_COMMAND_V2, TEAM_COMMAND_DESCRIPTION as TEAM_COMMAND_DESCRIPTION_V2, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
+import { TeamRuntime } from "../../tools/subagents/team-runtime";
+import { parseParentCommand } from "../../tools/subagents/team-codec";
 import { describe, test } from "node:test";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
@@ -30,6 +34,8 @@ class FakeTransport implements RpcTransport {
 	failResetCommand = false;
 	includeContextCommand = true;
 	contextWindowAfterReset: number | undefined;
+	retainPreparedContextWindow = false;
+	teamV2Mode = false;
 	clearQueueGate: Promise<void> | undefined;
 
 	constructor(
@@ -42,6 +48,7 @@ class FakeTransport implements RpcTransport {
 	private contextWindow = 128000;
 	private restoreContextWindow = 128000;
 	setContextWindow(value: number): void { this.contextWindow = value; this.restoreContextWindow = value; }
+	get currentContextWindow(): number { return this.contextWindow; }
 	private thinkingLevel = "xhigh";
 
 	onEvent(listener: (event: RpcEvent) => void): () => void {
@@ -85,6 +92,14 @@ class FakeTransport implements RpcTransport {
 			return undefined;
 		}
 		if (command["type"] === "prompt") {
+			if (this.teamV2Mode && command["message"] === TEAM_ACTIVATION_TRIGGER) {
+				this.emit({ type: "agent_start" });
+				queueMicrotask(() => {
+					this.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Team done" }] }, toolResults: [] });
+					this.emit({ type: "agent_settled" });
+				});
+				return undefined;
+			}
 			if (String(command["message"]).startsWith("/rail-context-internal-v1 ")) {
 				if (this.failContextCommand) {
 					this.emit({ type: "extension_error", error: `${CONTEXT_PROTOCOL_ERROR_PREFIX}context command failed` });
@@ -176,7 +191,7 @@ class FakeTransport implements RpcTransport {
 						stopReason: "stop",
 					},
 				});
-				this.contextWindow = this.restoreContextWindow;
+				if (!this.retainPreparedContextWindow) this.contextWindow = this.restoreContextWindow;
 				this.emit({ type: "agent_settled" });
 			});
 		}
@@ -208,6 +223,25 @@ function withTeamAck(transport: FakeTransport): void {
 			transport.commands.push(command);
 			const frame = JSON.parse(String(command["message"]).slice(TEAM_COMMAND.length + 2));
 			transport.emit({ type: "entry_appended", entry: { type: "custom", customType: TEAM_ENTRY_TYPE, data: { version: 1, kind: "ack", commandId: frame.commandId, binding: frame.binding, ok: true } } });
+			return undefined;
+		}
+		return previous(command);
+	};
+}
+
+function withTeamV2Ack(transport: FakeTransport): void {
+	const previous = transport.request.bind(transport);
+	transport.teamV2Mode = true;
+	transport.request = async (command) => {
+		if (command["type"] === "get_commands") {
+			const result = await previous(command) as { commands: unknown[] };
+			return { commands: [...result.commands, { name: TEAM_COMMAND_V2, source: "extension", description: TEAM_COMMAND_DESCRIPTION_V2 }] };
+		}
+		if (command["type"] === "prompt" && String(command["message"]).startsWith(`/${TEAM_COMMAND_V2} `)) {
+			const frame = parseParentCommand(JSON.parse(String(command["message"]).slice(TEAM_COMMAND_V2.length + 2)));
+			const ack = { version: 2, kind: "ack", commandId: frame.commandId, binding: frame.binding,
+				...("activation" in frame ? { activation: frame.activation } : {}), ok: true };
+			transport.emit({ type: "entry_appended", entry: { type: "custom", customType: TEAM_PRIVATE_ENTRY_TYPE, data: ack } });
 			return undefined;
 		}
 		return previous(command);
@@ -292,6 +326,31 @@ test("team bind ACK precedes each native prompt; settled sends restore context a
 	assert.equal(transport.listeners.size, 0);
 });
 
+test("Team v2 restores the pre-activation context window after native compaction keeps the temporary budget", async () => {
+	const transport = new FakeTransport();
+	transport.retainPreparedContextWindow = true;
+	withTeamV2Ack(transport);
+	const runtime = new TeamRuntime();
+	const prepared = runtime.prepare({
+		manager: { alias: "lead", roleDescription: "Manage the Team." },
+		workers: [{ alias: "w1", roleDescription: "Complete assigned work." }],
+		brief: { goal: "Check context restoration after native compaction." }, timeoutSeconds: null,
+	});
+	runtime.launch(prepared.teamId);
+	const activation = runtime.takeNextActivation(prepared.teamId)!;
+	const worker = await RpcSessionWorker.connect(spec("new"), transport);
+	const session = await worker.openTeamMemberV2(activation.binding, () => undefined);
+	let completion: string | undefined;
+	await session.runActivation(activation, async () => ({ kind: "ack" }), 64000, (native) => { completion = native.status; });
+	assert.equal(completion, "success");
+	assert.equal(transport.currentContextWindow, 128000, "the temporary 64000 window is not mistaken for the worker's original 128000 window");
+	assert.deepEqual(transport.commands.filter(isContextPrompt).map((command) => String(command["message"])), [
+		"/rail-context-internal-v1 prepare 64000", "/rail-context-internal-v1 reset",
+	]);
+	await session.close();
+	await worker.stop();
+});
+
 test("missing team helper fails closed without sending an ordinary task", async () => {
 	const transport = new FakeTransport();
 	const worker = await RpcSessionWorker.connect(spec("new"), transport);
@@ -312,12 +371,21 @@ describe("RPC worker arguments", () => {
 			"--model", "cus-resp/gpt-5.6-sol",
 			"--thinking", "xhigh",
 			"--exclude-tools", "subagent,subagent_team",
-			"-e", teamExtensionPath(),
 			"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
 			"-e", railResponsesWebSocketExtensionPath(),
 			"-e", gptCompactionExtensionPath(),
 			"-e", contextExtensionPath(), "--rail-context-protocol", "1",
 		]);
+	});
+
+	test("ordinary sessions have no live Team extension; actor sessions load only the v2 extension", () => {
+		const ordinary = buildRpcWorkerArgs(spec("new"));
+		const v2Extension = fileURLToPath(new URL("../../tools/subagents/team-extension-v2.ts", import.meta.url));
+		const actor = buildRpcWorkerArgs({ ...spec("new"), teamProtocolVersion: 2 });
+		assert.equal(ordinary.includes(teamExtensionPath()), false);
+		assert.equal(ordinary.includes(v2Extension), false);
+		assert.equal(actor.includes(teamExtensionPath()), false);
+		assert.equal(actor.includes(v2Extension), true);
 	});
 
 	test("every persistent worker starts the standalone search extension in live mode", () => {

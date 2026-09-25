@@ -145,6 +145,47 @@ test("P: request admission is activation-idempotent and derives identity/root fr
 	runtime.assertInvariants(teamId);
 });
 
+test("A: provider/tool gates require the exact delivered WorkRef and reject the activation after a staged intent", () => {
+	const { runtime, teamId } = makeRuntime();
+	finishManagerBoot(runtime, teamId);
+	const activation = runtime.takeNextActivation(teamId)!;
+	assert.equal(activation.scope.kind, "work");
+	assert.deepEqual(runtime.gate(activation.binding, activation.scope, "provider_gate"), {
+		allow: false, reason: "delivery_pending", message: "The exact activation input is not acknowledged yet",
+	});
+	inputReady(runtime, activation);
+	assert.deepEqual(runtime.gate(activation.binding, activation.scope, "provider_gate"), { allow: true });
+	assert.deepEqual(runtime.gate(activation.binding, activation.scope, "tool_gate"), { allow: true });
+	const staged = action(runtime, activation, 1, "gate-stage", { action: "reply", result: { status: "succeeded", summary: "done" } });
+	assert.equal(staged.ok, true);
+	assert.equal(runtime.gate(activation.binding, activation.scope, "tool_gate").allow, false);
+	assert.equal(runtime.gate(activation.binding, activation.scope, "provider_gate").allow, false);
+	runtime.assertInvariants(teamId);
+});
+
+test("A: pre-settlement transport loss clears the running slot as outcome-unknown and faults only that member", () => {
+	const { runtime, teamId } = makeRuntime();
+	finishManagerBoot(runtime, teamId);
+	const activation = runtime.takeNextActivation(teamId)!;
+	const ref = workRef(activation);
+	const lost = runtime.activationLost(activation.binding, activation.scope.activationId, {
+		code: "NATIVE_OUTCOME_UNKNOWN", message: "transport stopped before agent_settled", outcomeUnknown: true,
+	}, false);
+	assert.equal(lost.ok, true);
+	const team = runtime.getTeam(teamId);
+	const worker = team.members.find((member) => member.id === "w1")!;
+	assert.equal(worker.lifecycle, "faulted");
+	assert.equal(worker.activity, "idle");
+	assert.equal(worker.resourceState, "cleanup_failed");
+	assert.equal(worker.currentWork, undefined);
+	assert.equal(runtime.getWork(teamId, ref)?.current.state, "failed");
+	assert.equal(runtime.getWork(teamId, ref)?.current.error?.outcomeUnknown, true);
+	assert.equal(runtime.gate(activation.binding, activation.scope, "tool_gate").allow, false);
+	runtime.assertInvariants(teamId);
+	const next = runtime.takeNextActivation(teamId);
+	assert.equal(next?.scope.kind, "management", "the manager can observe the incident; the failed worker is not stuck holding a permit");
+});
+
 test("P: exhausted result slots reject request admission without ledger or budget side effects", () => {
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `slot-${++ids}`, limits: { reservedResultBytes: TEAM_MAX_RESULT_BYTES } });

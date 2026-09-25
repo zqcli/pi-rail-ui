@@ -17,79 +17,28 @@ import {
 	type WorkerSendOptions,
 	type WorkerRunResult,
 	type WorkerStartSpec,
+	type TeamMemberProtocolSession,
 	WorkerControlError,
 } from "../../tools/subagents/session-broker";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
+import type { BindingV2 } from "../../tools/subagents/team-protocol";
 
-test("team continuation reserves the operation, rejects target insertion and sums native usage", async () => {
+test("legacy v1 Team dispatch is rejected before creating or reserving a child", async () => {
 	const store = new MemoryInstanceStore();
 	const roster = new MemoryRoster();
-	const worker = new FakeWorker("team-session", "/tmp/team-session.jsonl");
-	const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
-	let release!: () => void;
-	const barrier = new Promise<void>((resolve) => { release = resolve; });
-	let waiting!: () => void;
-	const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
-	let runs = 0;
-	const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-A", task: "initial", team: {
-		binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
-		onRequest: async () => ({ ok: true }),
-		afterRun: async () => { if (++runs === 1) { waiting(); await barrier; return "summary"; } return undefined; },
-	} });
-	await atBarrier;
-	assert.equal(broker.runtimeStatus(roster.resolve("team-A")!).phase, "queued"); // Native run settled, but its operation is still reserved.
-	await assert.rejects(broker.dispatch({ target: "team-A", task: "intruder" }), /active team/);
-	await assert.rejects(broker.control({ target: "team-A", delivery: "steer", message: "intruder" }), /team control/);
-	assert.deepEqual(worker.tasks, ["initial"]);
-	release();
-	const result = await dispatch;
-	assert.deepEqual(worker.tasks, ["initial", "summary"]);
-	assert.equal(result.run.usage.turns, 2);
-	assert.equal(result.run.output, "done: summary");
-	assert.equal(JSON.stringify(result.instance).includes("epoch"), false);
-	await broker.dispatch({ target: "team-A", task: "ordinary followup" });
-	await broker.shutdown();
-});
-
-test("stopping a team member aborts its between-native-runs barrier without losing the lease reservation", async () => {
-	const worker = new FakeWorker("team-session", "/tmp/team-session.jsonl");
-	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => worker });
-	let waiting!: () => void;
-	const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
-	const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-A", task: "initial", team: {
-		binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
-		onRequest: async () => ({ ok: true }),
-		afterRun: async (_run, signal) => new Promise<undefined>((_resolve, reject) => {
-			signal!.addEventListener("abort", () => reject(new Error("barrier aborted")), { once: true });
-			waiting();
-		}),
-	} });
-	const rejected = assert.rejects(dispatch, /barrier aborted/);
-	await atBarrier;
-	await broker.stop("team-A");
-	await rejected;
-	assert.equal(worker.stopped, true);
-	assert.deepEqual(worker.tasks, ["initial"]);
-	await broker.shutdown();
-});
-
-test("a competing team cannot remove another dispatch's alias reservation", async () => {
-	let release!: () => void;
-	const gate = new Promise<void>((resolve) => { release = resolve; });
-	let starting!: () => void;
-	const started = new Promise<void>((resolve) => { starting = resolve; });
-	const worker = new FakeWorker("reserved", "/tmp/reserved.jsonl");
-	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => { starting(); await gate; return worker; } });
-	const request = { model: reviewerModel(), alias: "shared", task: "work", team: {
-		binding: { version: 1 as const, teamId: "one", memberId: "shared", role: "worker" as const, epoch: "private" }, onRequest: async () => ({ ok: true }),
-	} };
-	const first = broker.dispatch(request);
+	let starts = 0;
+	const broker = new SessionBroker({ store, roster, workerFactory: async () => { starts++; return new FakeWorker("legacy-team", "/tmp/legacy-team.jsonl"); } });
 	try {
-		await started;
-		await assert.rejects(broker.dispatch({ ...request, alias: " shared ", team: { ...request.team, binding: { ...request.team.binding, teamId: "two" } } }), /active team/);
-		await assert.rejects(broker.dispatch({ target: "shared", task: "intruder" }), /active team/);
-	} finally { release(); await first; await broker.shutdown(); }
+		await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "team-A", task: "work", team: {
+			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
+			onRequest: async () => ({ ok: true }),
+			afterRun: async () => "legacy continuation",
+		} }), /Legacy v1 Team dispatch is retired/u);
+		assert.equal(starts, 0);
+		assert.equal(roster.resolve("team-A"), undefined);
+		assert.deepEqual(await store.list(), []);
+	} finally { await broker.shutdown(); }
 });
 
 test("ordinary dispatch preserves the native run and usage objects", async () => {
@@ -104,35 +53,6 @@ test("ordinary dispatch preserves the native run and usage objects", async () =>
 	} finally { await broker.shutdown(); }
 });
 
-test("team cancellation during startup waits for the new worker's cleanup", async () => {
-	let finishStartup!: () => void;
-	const startup = new Promise<void>((resolve) => { finishStartup = resolve; });
-	let finishCleanup!: () => void;
-	const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
-	let notifyStartup!: () => void;
-	const starting = new Promise<void>((resolve) => { notifyStartup = resolve; });
-	let notifyCleanup!: () => void;
-	const cleaning = new Promise<void>((resolve) => { notifyCleanup = resolve; });
-	const worker = new FakeWorker("cancelled", "/tmp/cancelled.jsonl");
-	worker.stop = async () => { notifyCleanup(); await cleanup; worker.stopped = true; };
-	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => { notifyStartup(); await startup; return worker; } });
-	const controller = new AbortController();
-	let settled = false;
-	const result = broker.dispatch({ model: reviewerModel(), alias: "cancelled", task: "work", signal: controller.signal, team: {
-		binding: { version: 1, teamId: "team", memberId: "cancelled", role: "worker", epoch: "private" }, onRequest: async () => ({ ok: true }),
-	} }).finally(() => { settled = true; });
-	const rejected = assert.rejects(result, /aborted during startup/);
-	try {
-		await starting;
-		controller.abort();
-		finishStartup();
-		await cleaning;
-		assert.equal(settled, false);
-		assert.deepEqual(worker.tasks, []);
-	} finally { finishStartup(); finishCleanup(); await rejected; await broker.shutdown(); }
-	assert.equal(worker.stopped, true);
-});
-
 test("direct broker callers get the normalized contextWindow, never a raw null", async () => {
 	const worker = new FakeWorker("normalized", "/tmp/normalized.jsonl");
 	const options: Array<WorkerSendOptions | undefined> = [];
@@ -143,38 +63,6 @@ test("direct broker callers get the normalized contextWindow, never a raw null",
 		await broker.dispatch({ model: reviewerModel(), alias: "normalized", task: "work", contextWindow: null as unknown as number });
 		assert.equal(Object.hasOwn(options[0]!, "contextWindow"), false);
 	} finally { await broker.shutdown(); }
-});
-
-test("a failed team member that never passed a team gate releases its alias; a started member keeps it", async () => {
-	for (const started of [false, true]) {
-		const store = new MemoryInstanceStore();
-		const roster = new MemoryRoster();
-		const workers: FakeWorker[] = [];
-		const broker = new SessionBroker({ store, roster, workerFactory: async () => {
-			const worker = new FakeWorker(`session-${workers.length}`, `/tmp/rail-missing-team-${workers.length}.jsonl`);
-			worker.send = async () => { throw new Error("Startup admission deadline exceeded"); };
-			workers.push(worker);
-			return worker;
-		} });
-		try {
-			const team = {
-				binding: { version: 1 as const, teamId: "team", memberId: "B", role: "worker" as const, epoch: "private" },
-				onRequest: async () => ({ ok: true }), started: () => started,
-			};
-			await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "work", team }), /admission/);
-			assert.equal(workers[0]!.stopped, true);
-			if (started) {
-				assert.equal(roster.resolve("B") !== undefined, true, "a started member keeps its session for inspection");
-				assert.equal(store.instances.size, 1);
-				await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "retry", team: { ...team, binding: { ...team.binding, teamId: "retry" } } }), /already exists/);
-			} else {
-				assert.equal(roster.resolve("B"), undefined);
-				assert.equal(store.instances.size, 0);
-				await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "retry", team: { ...team, binding: { ...team.binding, teamId: "retry" } } }), /admission/,
-					"the same alias can be used again; only the fake worker fails");
-			}
-		} finally { await broker.shutdown(); }
-	}
 });
 
 class MemoryInstanceStore implements AgentInstanceStore {
@@ -331,6 +219,140 @@ function setup() {
 	return { broker, store, roster, starts, workers, workerFactory };
 }
 
+function brokerOwnedV2Worker(sessionId: string, sessionFile: string, close: () => Promise<void> = async () => undefined) {
+	const worker = new FakeWorker(sessionId, sessionFile) as FakeWorker & Required<Pick<SessionWorker, "openTeamMemberV2">>;
+	worker.openTeamMemberV2 = async (_binding, _onFailure): Promise<TeamMemberProtocolSession> => ({
+		runActivation: async () => undefined,
+		close,
+	});
+	return worker;
+}
+
+function teamBinding(memberId: string): BindingV2 {
+	return { version: 2, teamId: "team-v2", memberId, role: "worker", epoch: "epoch-v2" };
+}
+
+test("Team v2 open reserves one alias across startup and competing opens cannot remove the owner's lock", async () => {
+	const root = await mkdtemp(join(tmpdir(), "broker-team-v2-owner-"));
+	const store = new MemoryInstanceStore();
+	const roster = new MemoryRoster();
+	const worker = brokerOwnedV2Worker("team-owner", join(root, "member.jsonl"));
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async () => {
+		started.resolve();
+		await release.promise;
+		return worker;
+	} });
+	try {
+		const opening = broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		await started.promise;
+		await assert.rejects(broker.openTeamMember({ binding: { ...teamBinding("member-a"), teamId: "team-other" }, model: reviewerModel(), cwd: root }), /already owned/u);
+		await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "member-a", task: "intrude" }), /alias already exists/u);
+		release.resolve();
+		const handle = await opening;
+		assert.equal(handle.instance.alias, "member-a");
+		await handle.close();
+		assert.ok(await store.get(handle.instance.agentId));
+	} finally {
+		release.resolve();
+		await broker.shutdown();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("Team v2 startup cancelled by broker shutdown retains the persistent session but never returns a live handle", async () => {
+	const root = await mkdtemp(join(tmpdir(), "broker-team-v2-cancel-"));
+	const store = new MemoryInstanceStore();
+	const roster = new MemoryRoster();
+	const openingProtocol = Promise.withResolvers<void>();
+	const releaseProtocol = Promise.withResolvers<void>();
+	const worker = brokerOwnedV2Worker("team-cancel", join(root, "member.jsonl"));
+	worker.openTeamMemberV2 = async () => {
+		openingProtocol.resolve();
+		await releaseProtocol.promise;
+		return { runActivation: async () => undefined, close: async () => undefined };
+	};
+	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async () => worker });
+	try {
+		const opening = broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		await openingProtocol.promise;
+		await broker.shutdown();
+		releaseProtocol.resolve();
+		await assert.rejects(opening, /shut down during Team member startup/u);
+		const saved = (await store.list()).find((instance) => instance.alias === "member-a");
+		assert.ok(saved, "startup cancellation preserves the persistent descriptor instead of deleting it");
+		assert.equal(worker.stopped, true);
+	} finally {
+		releaseProtocol.resolve();
+		await broker.shutdown();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("Team v2 close preserves descriptor and ownership until an exit timeout's reap promise resolves", async () => {
+	const root = await mkdtemp(join(tmpdir(), "broker-team-v2-exit-"));
+	const store = new MemoryInstanceStore();
+	const roster = new MemoryRoster();
+	const exited = Promise.withResolvers<void>();
+	const worker = brokerOwnedV2Worker("team-exit", join(root, "member.jsonl"));
+	let teamStopCalls = 0;
+	worker.stop = async () => { teamStopCalls++; throw new RpcProcessExitTimeoutError("Team process is not reaped", exited.promise); };
+	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async (spec) => {
+		if (spec.mode === "new") return worker;
+		const saved = await store.get(spec.agentId);
+		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
+	} });
+	try {
+		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		await assert.rejects(handle.close(), /not reaped/u);
+		assert.ok(await store.get(handle.instance.agentId), "uncertain close keeps the descriptor");
+		assert.equal(roster.resolve("member-a"), handle.instance.agentId, "uncertain close keeps the persistent alias");
+		await assert.rejects(broker.dispatch({ target: "member-a", task: "must not reopen" }), /active team operation/u);
+		await assert.rejects(broker.changeModel("member-a", reviewerModel()), /Team-owned/u);
+		exited.resolve();
+		await handle.close();
+		assert.ok(await store.get(handle.instance.agentId), "confirmed close still preserves the persistent descriptor");
+		assert.equal(roster.resolve("member-a"), handle.instance.agentId);
+		const reopened = await broker.dispatch({ target: "member-a", task: "reopen saved Team history" });
+		assert.equal(reopened.instance.sessionId, handle.instance.sessionId);
+		assert.equal(teamStopCalls, 1, "the old Team child was stopped once and only reopened after its exit was confirmed");
+	} finally {
+		exited.resolve();
+		await broker.shutdown();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("failed Team v2 binding keeps ownership until process exit, then permits an ordinary history reopen", async () => {
+	const root = await mkdtemp(join(tmpdir(), "broker-team-v2-bind-failure-"));
+	const store = new MemoryInstanceStore();
+	const roster = new MemoryRoster();
+	const exited = Promise.withResolvers<void>();
+	const worker = brokerOwnedV2Worker("team-bind-failure", join(root, "member.jsonl"));
+	worker.openTeamMemberV2 = async () => { throw new Error("Team v2 bind rejected"); };
+	worker.stop = async () => { throw new RpcProcessExitTimeoutError("Team process exit unknown", exited.promise); };
+	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async (spec) => {
+		if (spec.mode === "new") return worker;
+		const saved = await store.get(spec.agentId);
+		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
+	} });
+	try {
+		await assert.rejects(broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root }), /bind rejected/u);
+		const saved = (await store.list()).find((instance) => instance.alias === "member-a")!;
+		assert.ok(saved, "failed binding never deletes the persistent descriptor");
+		await assert.rejects(broker.dispatch({ target: "member-a", task: "must wait for native exit" }), /active team operation/u);
+		exited.resolve();
+		for (let attempt = 0; attempt < 50 && broker.runtimeStatus(saved.agentId).phase !== "stopped"; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+		const reopened = await broker.dispatch({ target: "member-a", task: "ordinary reopen after confirmed exit" });
+		assert.equal(reopened.instance.sessionId, saved.sessionId);
+	} finally {
+		exited.resolve();
+		await broker.shutdown();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 describe("SessionBroker", () => {
 	test("shutdown stops an active send before draining a queued model change", { timeout: 2000 }, async () => {
 		const { broker, workers, store } = setup();
@@ -362,111 +384,7 @@ describe("SessionBroker", () => {
 		await assert.rejects(broker.changeModel(instance.agentId, reviewerModel()), /shutting down/);
 	});
 
-	test("team continuation serializes a queued model change until the coordinator's rounds settle", async () => {
-		const store = new MemoryInstanceStore();
-		const roster = new MemoryRoster();
-		const worker = new FakeWorker("team-model-session", "/tmp/team-model-session.jsonl");
-		const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
-		let release!: () => void;
-		const barrier = new Promise<void>((resolve) => { release = resolve; });
-		let waiting!: () => void;
-		const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
-		let rounds = 0;
-		const nextModel = { provider: "test", modelId: "queued-after-rounds" };
-		const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-model", task: "round-1", team: {
-			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
-			onRequest: async () => ({ ok: true }),
-			afterRun: async () => { if (++rounds === 1) { waiting(); await barrier; return "round-2"; } return undefined; },
-		} });
-		await atBarrier;
-		let setModelCalls = 0;
-		let sendsAtSetModel = -1;
-		worker.setModel = async (model) => { setModelCalls++; sendsAtSetModel = worker.tasks.length; return model; };
-		const changing = broker.changeModel("team-model", nextModel);
-		release();
-		const result = await dispatch;
-		await changing;
-		assert.equal(setModelCalls, 1);
-		assert.equal(sendsAtSetModel, 2);
-		assert.deepEqual(worker.tasks, ["round-1", "round-2"]);
-		assert.equal(result.run.usage.turns, 2);
-		const agentId = roster.resolve("team-model")!;
-		assert.deepEqual((await store.get(agentId))?.model, nextModel);
-		assert.equal(broker.runtimeStatus(agentId).phase, "idle");
-		await broker.shutdown();
-	});
-
-	test("shutdown cancels a coordinator waiting between rounds before draining a queued model change", { timeout: 2000 }, async () => {
-		const store = new MemoryInstanceStore();
-		const roster = new MemoryRoster();
-		const worker = new FakeWorker("team-halt-session", "/tmp/team-halt-session.jsonl");
-		const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
-		let waiting!: () => void;
-		const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
-		const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-halt", task: "initial", team: {
-			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
-			onRequest: async () => ({ ok: true }),
-			afterRun: async (_run, signal) => new Promise<undefined>((_resolve, reject) => {
-				signal!.addEventListener("abort", () => reject(new Error("coordinator barrier aborted")), { once: true });
-				waiting();
-			}),
-		} });
-		const rejected = assert.rejects(dispatch, /barrier aborted/);
-		await atBarrier;
-		const changing = broker.changeModel("team-halt", { provider: "test", modelId: "never-applied" });
-		const rejectedChange = assert.rejects(changing, /shutting down/);
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		assert.equal(broker.runtimeStatus(roster.resolve("team-halt")!).queued, 1);
-		await broker.shutdown();
-		await rejected;
-		await rejectedChange;
-		assert.equal(worker.stopped, true);
-		assert.deepEqual(worker.tasks, ["initial"]);
-		assert.deepEqual((await store.get(roster.resolve("team-halt")!))?.model, reviewerModel());
-	});
-
-	test("delete cancels a coordinator waiting between rounds before converging a queued model change", { timeout: 2000 }, async (t) => {
-		const root = await mkdtemp(join(tmpdir(), "rail-team-delete-"));
-		t.after(() => rm(root, { recursive: true, force: true }));
-		const sessionFile = join(root, "child.jsonl");
-		await writeFile(sessionFile, "");
-		const store = new MemoryInstanceStore();
-		const roster = new MemoryRoster();
-		const worker = new FakeWorker("team-delete-session", sessionFile);
-		const broker = new SessionBroker({ store, roster, workerFactory: async () => worker });
-		let waiting!: () => void;
-		const atBarrier = new Promise<void>((resolve) => { waiting = resolve; });
-		const dispatch = broker.dispatch({ model: reviewerModel(), alias: "team-delete", task: "initial", team: {
-			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
-			onRequest: async () => ({ ok: true }),
-			afterRun: async (_run, signal) => new Promise<undefined>((_resolve, reject) => {
-				signal!.addEventListener("abort", () => reject(new Error("coordinator barrier aborted")), { once: true });
-				waiting();
-			}),
-		} });
-		const rejected = assert.rejects(dispatch, /barrier aborted/);
-		await atBarrier;
-		const agentId = roster.resolve("team-delete")!;
-		// The change queues behind the parked team operation; delete must cancel the
-		// operation so the maintenance can converge instead of blocking forever.
-		const changing = broker.changeModel("team-delete", { provider: "test", modelId: "queued" });
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		assert.equal(broker.runtimeStatus(agentId).queued, 1);
-		await broker.delete("team-delete");
-		await rejected;
-		await changing;
-		assert.deepEqual(worker.model, { provider: "test", modelId: "queued" });
-		assert.equal(worker.stopped, true);
-		assert.deepEqual(worker.tasks, ["initial"]);
-		assert.equal(await store.get(agentId), undefined);
-		assert.equal(roster.resolve("team-delete"), undefined);
-		await assert.rejects(access(sessionFile), { code: "ENOENT" });
-		assert.equal(broker.hasLocalWorker(agentId), false);
-		assert.equal(broker.runtimeStatus(agentId).phase, "stopped");
-		await broker.shutdown();
-	});
-
-	test("context window budgets follow the actual child model through pending changes and team dispatch", async (t) => {
+	test("context window budgets follow the actual child model through pending changes", async (t) => {
 		const root = await mkdtemp(join(tmpdir(), "broker-budget-086-"));
 		const agentDir = join(root, "agent");
 		const childCwd = join(root, "child");
@@ -495,16 +413,6 @@ describe("SessionBroker", () => {
 			workers.push(worker);
 			return worker;
 		} });
-		// Team dispatch validates the requested child model before any worker exists.
-		await assert.rejects(
-			broker.dispatch({ model: large, alias: "team-budget", task: "must not start", contextWindow: 16_000, team: {
-				binding: { version: 1, teamId: "team", memberId: "budget", role: "worker", epoch: "private" },
-				onRequest: async () => ({ ok: true }),
-			} }),
-			/reserveTokens \(32768\)/u,
-		);
-		assert.equal(workers.length, 0);
-		assert.deepEqual(await store.list(), []);
 		const instance = await broker.attach({ model: small, alias: "budget-target", cwd: childCwd });
 		const worker = workers[0]!;
 		let setModelStarted!: () => void;
@@ -1579,39 +1487,23 @@ test("team prepare can reject aliases that a new persistent member could not cla
 test("a child that outlives SIGKILL keeps its session file until it is reaped", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "rail-unreaped-"));
 	try {
-		for (const path of ["cleanup", "delete"] as const) {
-			const sessionFile = join(dir, `${path}.jsonl`);
-			await writeFile(sessionFile, "{}\n");
-			let reap!: () => void;
-			const exited = new Promise<void>((resolve) => { reap = resolve; });
-			const worker = new FakeWorker(`session-${path}`, sessionFile);
-			worker.stop = async () => { throw new RpcProcessExitTimeoutError("did not exit after SIGKILL", exited); };
-			const store = new MemoryInstanceStore();
-			const broker = new SessionBroker({ store, roster: new MemoryRoster(), workerFactory: async () => worker });
-			if (path === "cleanup") {
-				// A team member that never passed a gate is removed, but its file waits for the reap.
-				worker.send = async () => { throw new Error("Startup admission deadline exceeded"); };
-				const team = {
-					binding: { version: 1 as const, teamId: "team", memberId: "B", role: "worker" as const, epoch: "private" },
-					onRequest: async () => ({ ok: true }), started: () => false,
-				};
-				await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "B", task: "work", team }), /admission/u);
-				assert.equal(store.instances.size, 0, "the descriptor and alias are released");
-			} else {
-				await broker.dispatch({ model: reviewerModel(), alias: "D", task: "work" });
-				await assert.rejects(broker.delete("D"), /did not exit after SIGKILL/u);
-				await assert.rejects(broker.delete("D"), /has not exited yet; retry delete after it is reaped/u);
-			}
-			await access(sessionFile);
-			reap();
-			await new Promise((resolve) => setTimeout(resolve, 20));
-			if (path === "cleanup") await assert.rejects(access(sessionFile), /ENOENT/u);
-			else {
-				await broker.delete("D");
-				await assert.rejects(access(sessionFile), /ENOENT/u);
-			}
-			await broker.shutdown();
-		}
+		const sessionFile = join(dir, "delete.jsonl");
+		await writeFile(sessionFile, "{}\n");
+		let reap!: () => void;
+		const exited = new Promise<void>((resolve) => { reap = resolve; });
+		const worker = new FakeWorker("session-delete", sessionFile);
+		worker.stop = async () => { throw new RpcProcessExitTimeoutError("did not exit after SIGKILL", exited); };
+		const store = new MemoryInstanceStore();
+		const broker = new SessionBroker({ store, roster: new MemoryRoster(), workerFactory: async () => worker });
+		await broker.dispatch({ model: reviewerModel(), alias: "D", task: "work" });
+		await assert.rejects(broker.delete("D"), /did not exit after SIGKILL/u);
+		await assert.rejects(broker.delete("D"), /has not exited yet; retry delete after it is reaped/u);
+		await access(sessionFile);
+		reap();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		await broker.delete("D");
+		await assert.rejects(access(sessionFile), /ENOENT/u);
+		await broker.shutdown();
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -1634,21 +1526,18 @@ test("a cleanup that races an in-flight stop waits for its outcome before removi
 		};
 		const store = new MemoryInstanceStore();
 		const broker = new SessionBroker({ store, roster: new MemoryRoster(), workerFactory: async () => worker });
-		const team = {
-			binding: { version: 1 as const, teamId: "team", memberId: "B", role: "worker" as const, epoch: "private" },
-			onRequest: async () => ({ ok: true }), started: () => false,
-		};
-		const dispatching = broker.dispatch({ model: reviewerModel(), alias: "B", task: "work", team }).then(() => undefined, (error: Error) => error);
+		const dispatching = broker.dispatch({ model: reviewerModel(), alias: "B", task: "work" }).then(() => undefined, (error: Error) => error);
 		await sending;
-		const stopping = broker.stop("B").catch(() => undefined);
+		const deleting = broker.delete("B").then(() => undefined, (error: Error) => error);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		await access(sessionFile);
 		timeOut();
 		assert.match(String(await dispatching), /stopped/u);
-		await stopping;
+		assert.match(String(await deleting), /did not exit after SIGKILL/u);
 		await access(sessionFile);
 		reap();
 		await new Promise((resolve) => setTimeout(resolve, 20));
+		await broker.delete("B");
 		await assert.rejects(access(sessionFile), /ENOENT/u);
 		await broker.shutdown();
 	} finally { await rm(dir, { recursive: true, force: true }); }

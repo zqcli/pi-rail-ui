@@ -6,7 +6,8 @@ import { buildRpcWorkerArgs, RpcSessionWorker } from "./rpc-worker";
 import { PiRpcProcessTransport, RpcProcessExitTimeoutError } from "./rpc-transport";
 import type { SessionLease } from "./session-lease";
 import { FileSessionLeaseManager } from "./session-lease";
-import type { SessionWorker, SessionWorkerFactory, WorkerControlRequest, WorkerSendOptions, WorkerRunResult } from "./session-broker";
+import type { SessionWorker, SessionWorkerFactory, TeamMemberProtocolSession, WorkerControlRequest, WorkerSendOptions, WorkerRunResult } from "./session-broker";
+import type { BindingV2 } from "./team-protocol";
 
 export interface RpcWorkerFactoryOptions {
 	stateDir: string;
@@ -48,8 +49,9 @@ async function stopThenRelease(stop: () => Promise<void>, lease: SessionLease): 
 	try {
 		await stop();
 	} catch (error) {
+		// A stop error is not an exit acknowledgement. Keep the session lease unless
+		// the bounded timeout carries an explicit reap promise.
 		if (error instanceof RpcProcessExitTimeoutError) void error.exited.then(() => lease.release()).catch(() => undefined);
-		else await lease.release();
 		throw error;
 	}
 	await lease.release();
@@ -79,6 +81,11 @@ class LeasedSessionWorker implements SessionWorker {
 
 	setModel(model: Parameters<NonNullable<SessionWorker["setModel"]>>[0]) {
 		return this.worker.setModel(model);
+	}
+
+	openTeamMemberV2(binding: BindingV2, onFailure: (error: Error) => void): Promise<TeamMemberProtocolSession> {
+		if (this.stopped || !this.worker.openTeamMemberV2) return Promise.reject(new Error("Subagent worker does not support Team v2 lifetimes"));
+		return this.worker.openTeamMemberV2(binding, onFailure);
 	}
 
 	isReusable(): boolean {

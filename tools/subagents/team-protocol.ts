@@ -8,6 +8,8 @@ export const TEAM_PROTOCOL_VERSION = 2 as const;
 export const TEAM_COMMAND = "rail-subagent-team-protocol";
 export const TEAM_COMMAND_DESCRIPTION = "Rail private team protocol v2";
 export const TEAM_ACTIVATION_MESSAGE_TYPE = "rail-team-activation";
+export const TEAM_ACTIVATION_TRIGGER = "Process the current Rail Team input.";
+export const TEAM_PRIVATE_ENTRY_TYPE = "rail-subagent-team-protocol-v2";
 
 // Size limits (UTF-8 bytes of the JSON serialization unless noted).
 export const TEAM_MAX_WORKERS = 8;
@@ -272,10 +274,10 @@ export interface ActivationScope {
 
 export type PrivateAction =
 	/** Raw `team` tool arguments: the runtime normalizes them, so a bad argument is a business error for the model. */
-	| { action: "business"; args: Record<string, unknown>; toolCallId?: string }
+	| { action: "business"; args: Record<string, unknown> }
 	| { action: "input_ready"; deliveryId: string }
 	| { action: "provider_gate" }
-	| { action: "tool_gate"; toolCallId: string; toolName: string }
+	| { action: "tool_gate"; toolName: string }
 	| { action: "boundary"; kind: "turn_end" | "agent_end" };
 
 export interface ChildRequestFrame {

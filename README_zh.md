@@ -90,21 +90,19 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 普通 subagent 模式保持不变。Team 固定为 **1 个协调者 A + 1–8 个 worker B**，所有成员都必须使用**全新且唯一的 persistent alias**，并提供具体任务。Team dispatch 不支持 stateless、已有 `target`、session adopt、`chain` 或父级 `control` 模式；child 仍不能递归派发 subagent。
 
-先调用 `subagent_team` 准备名单：
+Team 通过**在相邻两条消息中各调用一次 `subagent_team`** 来运行。第一步 `prepare` 提交完整计划：每个成员是一个对象，包含 `alias` 和 `task`，以及可选的 `model`、`fastMode`、`cwd`（`null` 表示默认值）。不要传 `teamId`，它由 prepare 生成：
 
 ```json
-{"action":"prepare","coordinator":"A","workers":["B1","B2"]}
+{"action":"prepare","coordinator":{"alias":"A","task":"协调 B1/B2 的只读审查。用 team finish 等待全部 worker 结果，再总结发现与失败。"},"workers":[{"alias":"B1","task":"只读审查实现正确性，不修改文件，向 A 报告发现。","model":"cus-resp/gpt-6-luna:max","fastMode":true},{"alias":"B2","task":"只读审查测试覆盖，不修改文件，向 A 报告发现。","model":null,"fastMode":null,"cwd":null}]}
 ```
 
-再用返回的 id 替换 `<teamId>`，在**同一 assistant turn 发出以下两个 sibling `subagent` tool call 并行执行**，不能串行等待，也不能合并为一个 `tasks` 数组。A 使用 single，所有预登记 B 放在一个 grouped call；两边的 `teamId` 都只放顶层。示例省略 `model`，使用当前 Pi 模型；每次建队请换用全新 alias。原生父会话会在启动成员前检查同一消息内是否齐备两侧调用；若因缺侧被拒绝，可沿用该 prepared teamId，在下一条消息中同时重发两侧，不要只补发另一侧。prepare 的返回结果会带上填好真实 teamId 和 alias 的两条调用；即使只有一个 worker，也要放进 `tasks` 数组。`target`、`session`、`control`、`chain` 应省略或设为 `null`（`session`／`control` 接受 `null`），不要填占位值：非空的 `control.message` 会把调用变成 control 模式。被拒绝时，错误信息会指出具体字段并附上正确的调用形状。
-
-```json
-{"teamId":"<teamId>","alias":"A","task":"协调 B1/B2 的只读审查。用 team finish 等待全部 worker 结果，再总结发现与失败。"}
-```
+prepare 不启动任何成员。它会校验每个成员的模型、Fast 是否可用、cwd，以及 alias 是否为新名称，并列出解析后的计划。被拒绝时，错误会指出具体成员和字段，修正后重新 prepare 即可。解析出的模型和 cwd 会被固定，之后父会话切换模型也不会改变实际启动的内容。下一条消息只需带上返回的 id 启动：
 
 ```json
-{"teamId":"<teamId>","tasks":[{"alias":"B1","task":"只读审查实现正确性，不修改文件，向 A 报告发现。"},{"alias":"B2","task":"只读审查测试覆盖，不修改文件，向 A 报告发现。"}]}
+{"action":"launch","teamId":"<teamId>"}
 ```
+
+launch 由宿主同时启动协调者和全部 worker，显示在同一个 Tool Call 面板里，等协调者拿到所有 worker 结果并完成后返回。launch 的其他字段必须为空或 `null`：计划在 prepare 时已经确定，要修改就先 cancel 再重新 prepare。不要用 `subagent` 工具启动 team 成员，带计划的 team 会拒绝这种调用。（为了兼容，`coordinator`/`workers` 仍可写成 alias 字符串，此时沿用旧流程：两个带 `teamId` 的配对 `subagent` 调用。）
 
 Child 使用 `team` tool；发送者和所属 team 由运行时确定，不作为参数传入：
 
@@ -123,7 +121,7 @@ Child 使用 `team` tool；发送者和所属 team 由运行时确定，不作�
 - 调度默认允许 **4 个 active worker permit，A 独立准入**。等待或暂停的 worker 释放 permit，但保留 session；cooperative wait/pause 都不会结束外层父 Tool Call。运行中的成员先显示 `PAUSE REQUESTED`，到安全点后才是 `PAUSED`；已在途的模型请求、工具或 compaction 可能继续完成，不是立即冻结进程，也不回滚操作。`redirect` 的方向在下一个原生 context gate 进入模型；恢复时不会重写已经生成的请求 payload 或工具参数。
 - 自动送达的协作数据会通过 Pi 原生 custom message 保留，不只出现在一次临时 context 中。原生 compaction 负责已总结的历史：压缩后只按当前绑定恢复精简 roster（brief 与 assignments）以及原生上下文本应保留却缺失的 delivery，窗口最多 64 条／1 MiB，不会因此额外触发模型轮次。wait 与 control 回复只带精简的当前状态（状态、指令版本、结果/错误预览）；完整结果只在等待特定成员时给该成员，或在 A 的屏障处给全部 worker。历史快照描述的是其记录 seq 时的状态，应以最新 seq 和 control 返回的权威快照判断。`redirect` 不解除暂停，仍须显式 `resume`。
 - A 必须等每个 worker 都有 native 终态结果（含失败）后才生成最终总结，不能把 `report` 或 `finish` 自述当作完成。屏障之后再调用 `send`／`report`／`control`／其他 wait 会作为可修正的工具错误返回，重复的屏障返回同一份结果。A 提前结束时，父调用仍保持 pending，随后以全部 worker 结果执行最终总结续轮；若此时 team 已卡住，A 先获得一轮来解除阻塞。worker 生成最终回答期间收到 redirect，会获得一次续轮处理新指令，而不是被判失败。单个 worker 失败通常不阻止其余 worker 完成；A 失败或取消会停止 team，不能保证成功总结。
-- Team deadline 默认**从 prepare 起 1 小时**（`timeoutSeconds` 为正数，最多 `86400`）。未指定时使用 `null`／省略，不要为代码审查或高思考级别模型自行设置 120／180 秒限制；它覆盖启动、思考、工具执行、等待及最终总结，不是单次工具超时。显式设置的短期限仍会被尊重。全员须在**首次 join 后 30 秒内**加入；批次检查不能覆盖的外部阻断或串行执行仍由此期限兜底。父调用失败结果及状态会保留真实取消原因，而不只显示 RPC 停止。查看状态：`subagent_team` 参数 `{"action":"status","teamId":"<teamId>"}`，省略 id 列出所有 team；取消：`{"action":"cancel","teamId":"<teamId>","reason":"停止此次审查"}`。中止任一父 dispatch 会取消 team。Reload 后未完成历史标为 `interrupted`，不恢复旧 Promise，也不自动续跑。失败后请重新 prepare：已启动的成员保留 persistent alias 与 session 供排查，需换用新 alias；从未通过 team 门控的成员会被清理，其 alias 可以复用。
+- Team deadline 默认**从 prepare 起 1 小时**（`timeoutSeconds` 为正数，最多 `86400`）。未指定时使用 `null`／省略，不要为代码审查或高思考级别模型自行设置 120／180 秒限制；它覆盖启动、思考、工具执行、等待及最终总结，不是单次工具超时。显式设置的短期限仍会被尊重。launch 会一次性让全员入队；只有旧的配对调用流程才要求全员在**首次 join 后 30 秒内**加入。父调用失败结果及状态会保留真实取消原因，而不只显示 RPC 停止。查看状态：`subagent_team` 参数 `{"action":"status","teamId":"<teamId>"}`，省略 id 列出所有 team；取消：`{"action":"cancel","teamId":"<teamId>","reason":"停止此次审查"}`。中止 launch 调用（旧流程中为任一父 dispatch）会取消 team。Reload 后未完成历史标为 `interrupted`，不恢复旧 Promise，也不自动续跑。失败后请重新 prepare：已启动的成员保留 persistent alias 与 session 供排查，需换用新 alias；从未通过 team 门控的成员会被清理，其 alias 可以复用。
 - 状态显示在既有 Tool Call 输出/面板中，不是新的独立 GUI overlay。Inbox、历史与总结快照都有上限：每个父 session 最多保留 32 个 team（新建时淘汰最旧的已结束 team；32 个活动 team 时拒绝），单条消息最多 8 KiB；收件箱溢出会报错，旧事件历史可能丢弃；父 session 的 journal 只记录里程碑（入队、成员结果、阶段）及最近 16 条事件，reload 时跳过损坏或超额的历史而不影响 subagent 功能；总结快照内每个 worker 输出最多保留 16 KiB 并显式标记截断。大产物写入文件，消息中提供路径与简要结论，不把消息或 summary 当作完整 transcript。死锁检测、上下文成本与 journal 的变更见 [Team 审查问题修复](docs/subagent-team-review-fixes.md)。
 - 本地真实 Pi RPC + 合成 provider 测试用于验证协作和结束行为，**不等于真实外网模型的决策质量验证**。
 

@@ -47,15 +47,38 @@
   - 模式错误写明本次调用设置了哪些字段，例如 `single (task) + control (control.message="start")`。Team 字段错误逐项列出违规字段及路径。未知 teamId 会单独提示。缺侧或形状不对时，列出本条消息中实际找到的调用。
   - `subagent_team prepare` 的返回，以及所有 Team 派发错误，都附带填好真实 teamId 与 alias 的两条调用模板；只有一个 worker 时也使用 `tasks` 数组。
   - `subagent`/`subagent_team` 的描述与 guideline 明确：Team 的 worker 属于“优先用独立 sibling 调用”这条通用建议的例外，并且不存在单独的 `parallel` 字段。
-  - 用该会话中记录的真实参数写了回归测试：旧参数得到可操作的错误，同一 provider 改用 `null` 后即可成功组队。改进后的实际模型成功率尚未经真实模型重测。
+  - 用该会话中记录的真实参数写了回归测试：旧参数得到可操作的错误，同一 provider 改用 `null` 后即可成功组队。后续真实运行结果见下文“追加二”。
+
+## 追加二：prepare 带完整计划，launch 只带 teamId
+
+原来的启动方式需要父模型在同一条消息中写出两个配对的 `subagent` 调用，每个都带着完整的扁平 schema。会把每个字段都填上值的模型，会在这里反复出错。现在改为两步：
+
+- `subagent_team prepare` 中，每个成员写成 `{alias, task, model?, fastMode?, cwd?}`。宿主解析模型，校验 Fast 可用性、cwd 以及 alias 是否可用（新增 `SessionBroker.assertAliasesAvailable`），然后列出计划，但不启动任何成员。解析后的 model 和 cwd 会固定写入计划。计划只保存在内存中；team 进入终态或被淘汰时，计划随之失效。
+- `subagent_team launch {teamId}` 由宿主让 coordinator 和全部 worker 入队，复用原有的派发、实时面板和清理路径。协调者完成后返回，协调者失败即视为调用失败。其他字段为非空值时会被拒绝，避免"以为改了计划，实际没生效"。
+- 带计划的 team 会拒绝配对的 `subagent` 调用。`coordinator`/`workers` 写成 alias 字符串时仍走旧流程，以保持兼容。
+
+**真实运行验证**。每次都新启一个 Pi 会话，只加载本 worktree 的扩展，父模型为 `cus-resp/gpt-6-sol:xhigh`，worker 为 `cus-resp/gpt-6-luna:max` 并开启 Fast，prompt 与此前失败的会话相同。
+
+| 运行 | 父会话 `subagent_team` 调用 | 成员 | 覆盖的协作 | 结果 |
+| --- | --- | --- | --- | --- |
+| 1 | prepare、launch、status，共 3 次，0 错误 | 1 + 2 | report 并等待、pause 到 `paused`、暂停中 redirect、resume、双向消息、`undelivered`、成员等待、finish 屏障 | COMPLETED，约 11.5 分钟 |
+| 2 | prepare、launch，共 2 次，0 错误 | 1 + 3 | report 并等待、pause/resume、`team_stalled` 提示后恢复、`wait(workers)` 屏障 | COMPLETED，约 13 分钟 |
+
+两次运行中，父会话的派发调用都没有被拒绝过；此前失败的会话在派发阶段被拒绝约 50 次。成员内部共出现 3 次 `team` 工具错误，都由模型自行纠正：一次 finish 参数错误；一次 `team_stalled`，是活性检测按设计触发；一次向已结束成员 send。
+
+两次运行的 team 审查还发现了本分支自身的问题，均已修复并补充回归测试：
+
+- launch 会静默忽略非空的计划字段。
+- 预检展示的结果与 launch 时重新解析的结果可能不一致。
+- 已结束 team 的计划会滞留在内存中。
+- 停止超过 SIGKILL 宽限后，清理与 delete 仍会删除活进程可能在写的 session 文件；清理与正在进行的 stop 并发时，也存在同样的时间窗口。
 
 ## 未在本轮完成
 
-- **一次调用启动 team**（在 `subagent_team` 中一次传入 coordinator、workers 和 brief，由宿主内部并行派发）。这能消除“两个配对调用”的误用，但属于公共接口变更，还涉及 grouped 面板渲染和结果合并，需要单独设计与验收。现有的配对派发和 30 秒入队截止时间保持不变。
 - **用一套 typebox schema 统一工具参数、传输解析和历史恢复**。本轮只统一了枚举和上限常量；三处结构校验仍是各自手写。
 
 ## 验证
 
 - 每个问题都有对应的回归测试，覆盖 Hub、runner、工具层、broker、子扩展、传输层和 worker factory。其中，原生 RPC 压缩测试的预期已改为“压缩后不再补回已总结的消息，只补精简 roster”。
-- 隔离 HOME/`PI_CODING_AGENT_DIR`、离线、清除代理变量后运行全量测试：`tsc --noEmit` 通过；全部 `tests/**/*.test.ts` 在 `PI_SUBAGENT_DEPTH=0` 与 `PI_SUBAGENT_DEPTH=1` 下均 **927/927 通过**（含追加修复），没有失败、取消或跳过；`git diff --check` 通过。
+- 隔离 HOME/`PI_CODING_AGENT_DIR`、离线、清除代理变量后运行全量测试：`tsc --noEmit` 通过；全部 `tests/**/*.test.ts` 在 `PI_SUBAGENT_DEPTH=0` 与 `PI_SUBAGENT_DEPTH=1` 下均 **934/934 通过**（含全部追加修复），没有失败、取消或跳过；`git diff --check` 通过。
 - 真实子进程测试使用本地合成 provider 和 loopback WSS，不代表外部模型的协作决策质量，也没有进行交互式 TUI 实测。

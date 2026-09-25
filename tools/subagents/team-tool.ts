@@ -3,31 +3,37 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { TeamHub } from "./team-hub";
-import { TEAM_HISTORY_TYPE, type TeamBrief, type TeamSnapshot } from "./team-protocol";
+import {
+	isTeamBrief, TEAM_HISTORY_TYPE, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_MEMBERS, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_TEXT_BYTES,
+	type TeamBrief, type TeamSnapshot,
+} from "./team-protocol";
 import { teamStatus } from "./team-runner";
 
 function nullable(schema: TSchema) {
 	return Type.Optional(Type.Union([schema, Type.Null()]));
 }
 
+// Character limits match the shared UTF-8 byte validator; byte limits are enforced after normalization.
+const BriefText = (description?: string) => Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_BYTES, ...(description ? { description } : {}) });
+const BriefList = () => Type.Array(BriefText(), { maxItems: TEAM_MAX_RESULT_ITEMS });
 const BriefSchema = Type.Object({
-	goal: Type.String({ minLength: 1, maxLength: 8192, description: "Shared team goal" }),
-	target: nullable(Type.String({ maxLength: 4096, description: "Target URL, repository, system, or business scope" })),
-	acceptanceCriteria: nullable(Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 32 })),
-	constraints: nullable(Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 32 })),
+	goal: BriefText("Shared team goal"),
+	target: nullable(Type.String({ maxLength: TEAM_MAX_TEXT_BYTES, description: "Target URL, repository, system, or business scope" })),
+	acceptanceCriteria: nullable(BriefList()),
+	constraints: nullable(BriefList()),
 	authorizations: nullable(Type.Array(Type.Object({
 		member: Type.String({ minLength: 1, maxLength: 64 }),
-		allowed: Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 32 }),
-		forbidden: nullable(Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 32 })),
-	}, { additionalProperties: false }), { maxItems: 9 })),
-}, { additionalProperties: false });
+		allowed: BriefList(),
+		forbidden: nullable(BriefList()),
+	}, { additionalProperties: false }), { maxItems: TEAM_MAX_MEMBERS })),
+}, { additionalProperties: false, description: `At most ${TEAM_MAX_BRIEF_BYTES} serialized UTF-8 bytes in total.` });
 
 function normalizeList(value: unknown, field: string): string[] | undefined {
 	if (value == null) return undefined;
 	if (!Array.isArray(value)) throw new Error(`brief.${field} must be an array or null`);
-	if (value.length > 32) throw new Error(`brief.${field} supports at most 32 entries`);
+	if (value.length > TEAM_MAX_RESULT_ITEMS) throw new Error(`brief.${field} supports at most ${TEAM_MAX_RESULT_ITEMS} entries`);
 	return value.map((item, index) => {
-		if (typeof item !== "string" || !item.trim() || Buffer.byteLength(item, "utf8") > 8 * 1024) throw new Error(`brief.${field}[${index}] must be a non-empty string no larger than 8192 UTF-8 bytes`);
+		if (typeof item !== "string" || !item.trim() || Buffer.byteLength(item, "utf8") > TEAM_MAX_TEXT_BYTES) throw new Error(`brief.${field}[${index}] must be a non-empty string no larger than ${TEAM_MAX_TEXT_BYTES} UTF-8 bytes`);
 		return item.trim();
 	});
 }
@@ -37,14 +43,14 @@ function normalizeBrief(value: unknown, members: readonly string[]): TeamBrief |
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("brief must be an object or null");
 	const input = value as Record<string, unknown>;
 	if (Object.keys(input).some((key) => !["goal", "target", "acceptanceCriteria", "constraints", "authorizations"].includes(key))) throw new Error("brief contains an unknown field");
-	if (typeof input["goal"] !== "string" || !input["goal"].trim() || Buffer.byteLength(input["goal"], "utf8") > 8 * 1024) throw new Error("brief.goal is required and must be no larger than 8192 UTF-8 bytes");
+	if (typeof input["goal"] !== "string" || !input["goal"].trim() || Buffer.byteLength(input["goal"], "utf8") > TEAM_MAX_TEXT_BYTES) throw new Error(`brief.goal is required and must be no larger than ${TEAM_MAX_TEXT_BYTES} UTF-8 bytes`);
 	const target = input["target"] == null ? undefined : typeof input["target"] === "string" ? input["target"].trim() : undefined;
 	if (input["target"] != null && typeof input["target"] !== "string") throw new Error("brief.target must be a string or null");
-	if (target && Buffer.byteLength(target, "utf8") > 8 * 1024) throw new Error("brief.target exceeds 8192 UTF-8 bytes");
+	if (target && Buffer.byteLength(target, "utf8") > TEAM_MAX_TEXT_BYTES) throw new Error(`brief.target exceeds ${TEAM_MAX_TEXT_BYTES} UTF-8 bytes`);
 	let authorizations: TeamBrief["authorizations"];
 	if (input["authorizations"] != null) {
 		if (!Array.isArray(input["authorizations"])) throw new Error("brief.authorizations must be an array or null");
-		if (input["authorizations"].length > 9) throw new Error("brief.authorizations supports at most 9 members");
+		if (input["authorizations"].length > TEAM_MAX_MEMBERS) throw new Error(`brief.authorizations supports at most ${TEAM_MAX_MEMBERS} members`);
 		const seen = new Set<string>();
 		authorizations = input["authorizations"].map((raw, index) => {
 			if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`brief.authorizations[${index}] must be an object`);
@@ -71,7 +77,8 @@ function normalizeBrief(value: unknown, members: readonly string[]): TeamBrief |
 		...(constraints ? { constraints } : {}),
 		...(authorizations ? { authorizations } : {}),
 	};
-	if (Buffer.byteLength(JSON.stringify(brief), "utf8") > 32 * 1024) throw new Error("brief exceeds 32768 UTF-8 bytes");
+	// The shared validator is authoritative (aggregate JSON size including escaping).
+	if (!isTeamBrief(brief)) throw new Error(`brief exceeds ${TEAM_MAX_BRIEF_BYTES} serialized UTF-8 bytes`);
 	return brief;
 }
 

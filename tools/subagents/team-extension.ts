@@ -3,9 +3,10 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 import { StringEnum, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import { Type, type TSchema } from "typebox";
 import {
-	TEAM_COMMAND, TEAM_CONTROL_COMMANDS, TEAM_ENTRY_TYPE, TEAM_EVENT_KINDS, TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_RESULT_ITEMS,
-	TEAM_MAX_TASK_RESULT_BYTES, TEAM_REPLY_CODES,
-	isTeamAssignment, isTeamBinding, isTeamBrief, isTeamRequest, isTeamTaskResult, sameTeamBinding,
+	TEAM_COMMAND, TEAM_CONTROL_COMMANDS, TEAM_ENTRY_TYPE, TEAM_EVENT_KINDS, TEAM_MAX_ERROR_BYTES, TEAM_MAX_EVENTS, TEAM_MAX_MEMBERS,
+	TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_OUTPUT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_TASK_RESULT_BYTES, TEAM_MAX_WORKERS, TEAM_MEMBER_STATES,
+	TEAM_PHASES, TEAM_REPLY_CODES,
+	isTeamAssignment, isTeamBinding, isTeamBrief, isTeamMessageReference, isTeamRequest, isTeamTaskResult, sameTeamBinding,
 	type TeamAssignment, type TeamBinding, type TeamBrief, type TeamCommand, type TeamReply, type TeamRequest, type TeamTaskResult,
 } from "./team-protocol";
 
@@ -135,14 +136,11 @@ function object(value: unknown): value is Record<string, unknown> {
 function keys(value: Record<string, unknown>, allowed: string[]): boolean {
 	return Object.keys(value).every((key) => allowed.includes(key));
 }
-function teamMessageReference(value: string): boolean {
-	return value.length <= 256 && /^[A-Za-z0-9._-]{1,128}:\d+$/u.test(value);
-}
 export function strictTeamRequest(value: unknown): value is TeamRequest {
 	if (!isTeamRequest(value) || !keys(value as unknown as Record<string, unknown>, ["requestId", "sequence", "action", "receive", "revision", "to", "message", "replyTo", "supersedes", "result", "wait", "command"])) return false;
 	const { action, revision, to, message, replyTo, supersedes, result, wait, command } = value;
 	if (revision !== undefined && (action !== "checkpoint" || !Number.isSafeInteger(revision) || revision < 0)) return false;
-	for (const id of [replyTo, supersedes]) if (id !== undefined && !teamMessageReference(id)) return false;
+	for (const id of [replyTo, supersedes]) if (id !== undefined && !isTeamMessageReference(id)) return false;
 	if (wait && (!keys(wait as unknown as Record<string, unknown>, ["kind", "member", "from", "afterSeq"])
 		|| (wait.kind === "member" ? !wait.member?.trim() : wait.member !== undefined)
 		|| (wait.from !== undefined && (wait.kind !== "message" || !wait.from.trim() || wait.from.length > 64)))) return false;
@@ -233,7 +231,7 @@ export function publicTeamReply(value: unknown): TeamReply {
 	const safeSequence = (input: unknown): input is number => Number.isSafeInteger(input) && (input as number) >= 0;
 	const timestamp = (input: unknown): input is number => typeof input === "number" && Number.isFinite(input) && input >= 0;
 	const eventKinds: readonly string[] = TEAM_EVENT_KINDS;
-	const memberStates = ["registered", "starting", "running", "waiting", "pause_requested", "paused", "finalizing", "completed", "failed", "cancelled"];
+	const memberStates: readonly string[] = TEAM_MEMBER_STATES;
 	const projectResult = (input: unknown): TeamTaskResult => {
 		if (!object(input)) throw new Error("Invalid team result");
 		const clean = publicRecord(input);
@@ -264,7 +262,7 @@ export function publicTeamReply(value: unknown): TeamReply {
 				|| !safeSequence(event["seq"]) || event["seq"] <= previousSeq || !eventKinds.includes(String(event["kind"]))
 				|| (event["version"] !== undefined && event["version"] !== 2)) throw new Error("Invalid team event");
 			previousSeq = event["seq"] as number;
-			for (const key of ["messageId", "replyTo", "supersedes"] as const) if (event[key] !== undefined && (typeof event[key] !== "string" || !teamMessageReference(event[key]))) throw new Error("Invalid team event routing");
+			for (const key of ["messageId", "replyTo", "supersedes"] as const) if (event[key] !== undefined && (typeof event[key] !== "string" || !isTeamMessageReference(event[key]))) throw new Error("Invalid team event routing");
 			if (event["timestamp"] !== undefined && !timestamp(event["timestamp"])) throw new Error("Invalid team event timestamp");
 			for (const key of ["from", "to", "member"] as const) if (event[key] !== undefined && !bounded(event[key], 64)) throw new Error("Invalid team event identity");
 			if (event["message"] !== undefined && (typeof event["message"] !== "string" || Buffer.byteLength(event["message"]) > TEAM_MAX_MESSAGE_BYTES)) throw new Error("Invalid team event message");
@@ -317,7 +315,7 @@ export function publicTeamReply(value: unknown): TeamReply {
 	if (value["receipt"] !== undefined) {
 		const receipt = value["receipt"];
 		if (!object(receipt) || !keys(receipt, ["status", "messageId", "recipient", "seq"]) || !["queued", "applied"].includes(String(receipt["status"]))) throw new Error("Invalid team receipt");
-		if (receipt["messageId"] !== undefined && (typeof receipt["messageId"] !== "string" || !teamMessageReference(receipt["messageId"]))) throw new Error("Invalid team receipt message id");
+		if (receipt["messageId"] !== undefined && (typeof receipt["messageId"] !== "string" || !isTeamMessageReference(receipt["messageId"]))) throw new Error("Invalid team receipt message id");
 		if (receipt["recipient"] !== undefined && !bounded(receipt["recipient"], 64)) throw new Error("Invalid team receipt recipient");
 		if (receipt["seq"] !== undefined && !safeSequence(receipt["seq"])) throw new Error("Invalid team receipt sequence");
 		if (receipt["recipient"] === undefined || receipt["seq"] === undefined
@@ -330,15 +328,15 @@ export function publicTeamReply(value: unknown): TeamReply {
 			...(receipt["seq"] !== undefined ? { seq: receipt["seq"] as number } : {}),
 		};
 	}
-	if (value["error"] !== undefined && (typeof value["error"] !== "string" || Buffer.byteLength(value["error"]) > TEAM_MAX_MESSAGE_BYTES)) throw new Error("Invalid team error");
+	if (value["error"] !== undefined && (typeof value["error"] !== "string" || Buffer.byteLength(value["error"]) > TEAM_MAX_ERROR_BYTES)) throw new Error("Invalid team error");
 	if (value["error"] !== undefined) reply.error = value["error"] as string;
 	if (value["events"] !== undefined) reply.events = events(value["events"])!;
 	if (value["snapshot"] !== undefined) {
 		const s = value["snapshot"];
 		if (!object(s) || !keys(s, ["id", "coordinator", "workers", "phase", "seq", "createdAt", "deadline", "brief", "members", "events", "epoch", "binding"])
-			|| !bounded(s["id"], 128) || !bounded(s["coordinator"], 64) || !Array.isArray(s["workers"]) || s["workers"].length < 1 || s["workers"].length > 8
-			|| !s["workers"].every((w) => bounded(w, 64)) || !Array.isArray(s["members"]) || s["members"].length > 9
-			|| !["prepared", "running", "finalizing", "completed", "failed", "cancelled", "interrupted"].includes(String(s["phase"]))
+			|| !bounded(s["id"], 128) || !bounded(s["coordinator"], 64) || !Array.isArray(s["workers"]) || s["workers"].length < 1 || s["workers"].length > TEAM_MAX_WORKERS
+			|| !s["workers"].every((w) => bounded(w, 64)) || !Array.isArray(s["members"]) || s["members"].length > TEAM_MAX_MEMBERS
+			|| !(TEAM_PHASES as readonly string[]).includes(String(s["phase"]))
 			|| !safeSequence(s["seq"]) || !safeSequence(s["createdAt"]) || !safeSequence(s["deadline"]) || (s["deadline"] as number) < (s["createdAt"] as number)) throw new Error("Invalid team snapshot");
 		const roster = new Set([s["coordinator"] as string, ...(s["workers"] as string[])]);
 		if (roster.size !== (s["workers"] as string[]).length + 1 || s["members"].length !== roster.size) throw new Error("Invalid team snapshot roster");
@@ -356,8 +354,8 @@ export function publicTeamReply(value: unknown): TeamReply {
 				|| m["role"] !== (m["id"] === s["coordinator"] ? "coordinator" : "worker")) throw new Error("Invalid team member identity");
 			seenMembers.add(m["id"] as string);
 			if (m["waitingFor"] !== undefined && !bounded(m["waitingFor"], 64)) throw new Error("Invalid team member waiting state");
-			if (m["output"] !== undefined && (typeof m["output"] !== "string" || Buffer.byteLength(m["output"]) > 16 * 1024)) throw new Error("Invalid team member output");
-			if (m["error"] !== undefined && (typeof m["error"] !== "string" || Buffer.byteLength(m["error"]) > TEAM_MAX_MESSAGE_BYTES)) throw new Error("Invalid team member error");
+			if (m["output"] !== undefined && (typeof m["output"] !== "string" || Buffer.byteLength(m["output"]) > TEAM_MAX_OUTPUT_BYTES)) throw new Error("Invalid team member output");
+			if (m["error"] !== undefined && (typeof m["error"] !== "string" || Buffer.byteLength(m["error"]) > TEAM_MAX_ERROR_BYTES)) throw new Error("Invalid team member error");
 			for (const key of ["instructionRevision", "observedRevision"]) if (m[key] !== undefined && !safeSequence(m[key])) throw new Error("Invalid team member revision");
 			if ((m["instructionRevision"] === undefined) !== (m["observedRevision"] === undefined)
 				|| (m["instructionRevision"] !== undefined && (m["observedRevision"] as number) > (m["instructionRevision"] as number))) throw new Error("Invalid team member revision pair");

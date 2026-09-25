@@ -12,18 +12,21 @@ export const TEAM_MAX_TEXT_BYTES = 8 * 1024;
 export const TEAM_MAX_OUTPUT_BYTES = 16 * 1024;
 export const TEAM_MAX_ERROR_BYTES = 8 * 1024;
 export const TEAM_MAX_RESULT_ITEMS = 32;
-const TEAM_MAX_BRIEF_AUTHORIZATIONS = TEAM_MAX_WORKERS + 1;
+const TEAM_MAX_BRIEF_AUTHORIZATIONS = TEAM_MAX_WORKERS + 1; // one per member
 export const TEAM_MAX_BRIEF_BYTES = 32 * 1024;
 export const TEAM_MAX_ASSIGNMENT_BYTES = 16 * 1024;
 export const TEAM_MAX_TASK_RESULT_BYTES = 12 * 1024;
+export const TEAM_MAX_MEMBERS = TEAM_MAX_WORKERS + 1;
 
 export function teamExtensionPath(): string {
 	return fileURLToPath(new URL("./team-extension.ts", import.meta.url));
 }
 
 export type TeamRole = "coordinator" | "worker";
-export type TeamMemberState = "registered" | "starting" | "running" | "waiting" | "pause_requested" | "paused" | "finalizing" | "completed" | "failed" | "cancelled";
-export type TeamPhase = "prepared" | "running" | "finalizing" | "completed" | "failed" | "cancelled" | "interrupted";
+export const TEAM_MEMBER_STATES = ["registered", "starting", "running", "waiting", "pause_requested", "paused", "finalizing", "completed", "failed", "cancelled"] as const;
+export type TeamMemberState = typeof TEAM_MEMBER_STATES[number];
+export const TEAM_PHASES = ["prepared", "running", "finalizing", "completed", "failed", "cancelled", "interrupted"] as const;
+export type TeamPhase = typeof TEAM_PHASES[number];
 
 /** Dispatch-local capability. Never expose it in tool results or model prompts. */
 export interface TeamBinding {
@@ -261,7 +264,8 @@ export function isTeamAssignment(value: unknown): value is TeamAssignment {
 	return json !== undefined && Buffer.byteLength(json, "utf8") <= TEAM_MAX_ASSIGNMENT_BYTES;
 }
 
-function validMessageReference(value: unknown): value is string {
+/** A public team message id: `<teamId>:<seq>`. */
+export function isTeamMessageReference(value: unknown): value is string {
 	return typeof value === "string" && value.length <= 256 && /^[A-Za-z0-9._-]{1,128}:\d+$/u.test(value);
 }
 
@@ -276,8 +280,8 @@ export function isTeamRequest(value: unknown): value is TeamRequest {
 	if (item["to"] !== undefined && (typeof item["to"] !== "string" || item["to"].length > 64)) return false;
 	if (item["message"] !== undefined && (typeof item["message"] !== "string" || Buffer.byteLength(item["message"], "utf8") > TEAM_MAX_MESSAGE_BYTES)) return false;
 	if (item["command"] !== undefined && !(TEAM_CONTROL_COMMANDS as readonly string[]).includes(String(item["command"]))) return false;
-	if (item["replyTo"] !== undefined && (!validMessageReference(item["replyTo"]) || !["send", "report"].includes(String(item["action"])))) return false;
-	if (item["supersedes"] !== undefined && (!validMessageReference(item["supersedes"]) || !["send", "report"].includes(String(item["action"])))) return false;
+	if (item["replyTo"] !== undefined && (!isTeamMessageReference(item["replyTo"]) || !["send", "report"].includes(String(item["action"])))) return false;
+	if (item["supersedes"] !== undefined && (!isTeamMessageReference(item["supersedes"]) || !["send", "report"].includes(String(item["action"])))) return false;
 	if (item["result"] !== undefined && (item["action"] !== "finish" || !isTeamTaskResult(item["result"]))) return false;
 	if (item["action"] === "finish" && item["message"] !== undefined && item["result"] !== undefined) return false;
 	if (item["message"] !== undefined && (typeof item["message"] !== "string" || !item["message"].trim())) return false;

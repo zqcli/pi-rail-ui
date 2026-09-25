@@ -155,3 +155,20 @@ test("cancel reason is visible but bounded and stripped of terminal control sequ
 	assert.ok(text.length < 2500, "model-visible status JSON keeps cancellation context bounded");
 	assert.match(tool.renderResult(cancelled).render(120).join("\n"), /Reason: Requested stop/u);
 });
+
+test("brief schema limits match the shared validator, which also bounds escaped aggregate size", async (t) => {
+	const hub = new TeamHub(); t.after(() => hub.dispose());
+	let tool: any;
+	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
+	const brief = tool.parameters.properties.brief.anyOf[0];
+	const listItem = (schema: any) => schema.anyOf?.[0]?.items ?? schema.items;
+	for (const schema of [brief.properties.goal, brief.properties.target.anyOf[0], listItem(brief.properties.constraints),
+		listItem(brief.properties.acceptanceCriteria), listItem(brief.properties.authorizations.anyOf[0].items.properties.allowed)]) {
+		assert.equal(schema.maxLength, 8192);
+	}
+	assert.equal(brief.properties.authorizations.anyOf[0].maxItems, 9);
+	const accepted = await tool.execute("long", { action: "prepare", coordinator: "A", workers: ["B"], brief: { goal: "g", constraints: ["c".repeat(5000)] } });
+	assert.equal(accepted.details.snapshots[0].brief.constraints[0].length, 5000, "a 5000-character constraint is valid on both sides");
+	await assert.rejects(tool.execute("escaped", { action: "prepare", coordinator: "A", workers: ["B"], brief: {
+		goal: "g", constraints: Array.from({ length: 6 }, () => "\u0001".repeat(1500)) } }), /exceeds 32768 serialized UTF-8 bytes/u);
+});

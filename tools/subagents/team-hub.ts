@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { assertValidAgentAlias } from "./identity";
 import {
-	isTeamAssignment, isTeamBrief, isTeamRequest, isTeamTaskResult, sameTeamBinding,
+	isTeamAssignment, isTeamBrief, isTeamMessageReference, isTeamRequest, isTeamTaskResult, sameTeamBinding,
 	TEAM_CONTROL_COMMANDS, TEAM_EVENT_KINDS, TEAM_MAX_ERROR_BYTES, TEAM_MAX_EVENTS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_OUTPUT_BYTES,
-	TEAM_MAX_WORKERS, TEAM_PROTOCOL_VERSION,
+	TEAM_MAX_WORKERS, TEAM_MEMBER_STATES, TEAM_PHASES, TEAM_PROTOCOL_VERSION,
 	type TeamAssignment, type TeamBinding, type TeamBrief, type TeamEvent, type TeamMemberSnapshot, type TeamOutcome,
 	type TeamReply, type TeamRequest, type TeamSnapshot, type TeamWait,
 } from "./team-protocol";
@@ -389,9 +389,8 @@ export class TeamHub {
 		};
 		const text = (item: unknown): string => typeof item === "string" ? item : invalid();
 		const alias = (item: unknown): string => { const id = text(item); assertValidAgentAlias(id); return id; };
-		const states = ["registered", "starting", "running", "waiting", "pause_requested", "paused", "finalizing", "completed", "failed", "cancelled"];
 		const memberState = (item: unknown): TeamMemberSnapshot["state"] => {
-			if (!states.includes(text(item))) return invalid();
+			if (!(TEAM_MEMBER_STATES as readonly string[]).includes(text(item))) return invalid();
 			return item as TeamMemberSnapshot["state"];
 		};
 		const source = record(value);
@@ -404,7 +403,7 @@ export class TeamHub {
 		const roster = new Set([coordinator, ...workers]);
 		if (roster.size !== workers.length + 1) return invalid();
 		const phase = text(source["phase"]) as TeamSnapshot["phase"];
-		if (!["prepared", "running", "finalizing", "completed", "failed", "cancelled", "interrupted"].includes(phase)) return invalid();
+		if (!(TEAM_PHASES as readonly string[]).includes(phase)) return invalid();
 		const seq = source["seq"];
 		const createdAt = source["createdAt"];
 		const deadline = source["deadline"];
@@ -498,11 +497,11 @@ export class TeamHub {
 				event.messageId = raw["messageId"] as string;
 				event.timestamp = raw["timestamp"];
 				if (raw["replyTo"] !== undefined) {
-					if (typeof raw["replyTo"] !== "string" || raw["replyTo"].length > 256 || !/^[A-Za-z0-9._-]{1,128}:\d+$/u.test(raw["replyTo"])) return invalid();
+					if (!isTeamMessageReference(raw["replyTo"])) return invalid();
 					event.replyTo = raw["replyTo"];
 				}
 				if (raw["supersedes"] !== undefined) {
-					if (typeof raw["supersedes"] !== "string" || raw["supersedes"].length > 256 || !/^[A-Za-z0-9._-]{1,128}:\d+$/u.test(raw["supersedes"])) return invalid();
+					if (!isTeamMessageReference(raw["supersedes"])) return invalid();
 					event.supersedes = raw["supersedes"];
 				}
 				if (kind !== "message" && kind !== "report" && (event.replyTo !== undefined || event.supersedes !== undefined)) return invalid();

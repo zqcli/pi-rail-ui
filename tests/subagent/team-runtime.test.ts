@@ -145,7 +145,7 @@ test("P: request admission is activation-idempotent and derives identity/root fr
 	runtime.assertInvariants(teamId);
 });
 
-test("A: provider/tool gates require the exact delivered WorkRef and reject the activation after a staged intent", () => {
+test("A/A09: provider/tool gates require the exact delivered WorkRef; a post-intent continuation stays settling and bounded", () => {
 	const { runtime, teamId } = makeRuntime();
 	finishManagerBoot(runtime, teamId);
 	const activation = runtime.takeNextActivation(teamId)!;
@@ -159,7 +159,16 @@ test("A: provider/tool gates require the exact delivered WorkRef and reject the 
 	const staged = action(runtime, activation, 1, "gate-stage", { action: "reply", result: { status: "succeeded", summary: "done" } });
 	assert.equal(staged.ok, true);
 	assert.equal(runtime.gate(activation.binding, activation.scope, "tool_gate").allow, false);
-	assert.equal(runtime.gate(activation.binding, activation.scope, "provider_gate").allow, false);
+	// A09: a third-party continuation after the intent is observed, counted and recorded; it gets no side effects.
+	assert.deepEqual(runtime.gate(activation.binding, activation.scope, "provider_gate"), { allow: true });
+	assert.equal(runtime.gate(activation.binding, activation.scope, "tool_gate", "after-intent-write", "write").allow, false);
+	assert.equal(code(action(runtime, activation, 2, "after-intent-request", { action: "request", to: "w2", task: "new side effect" })), "INTENT_CONFLICT");
+	const team = runtime.getTeam(teamId);
+	const conflict = team.incidents.filter((incident) => incident.code === "POST_INTENT_CONTINUATION");
+	assert.equal(conflict.length, 1);
+	assert.equal(conflict[0]!.state, "resolved");
+	assert.equal(team.health, "ok", "a diagnostic continuation record does not demand attention");
+	assert.equal(team.budget.used.teamModelRequests, 2, "the continuation is a counted provider request");
 	runtime.assertInvariants(teamId);
 });
 
@@ -331,8 +340,9 @@ test("C04: member resume and hold-release APIs cannot bypass an exhausted budget
 	}
 	const held = workStatus.data.items[0];
 	assert.ok(held && "work" in held && "hold" in held && held.hold === "budget");
-	const incident = incidentStatus.data.items.find((item) => "work" in item && item.work.workId === held.work.workId);
-	assert.ok(incident && "id" in incident);
+	const heldIncidentId = runtime.getWork(prepared.teamId, held.work)?.current.hold?.incidentId;
+	const incident = incidentStatus.data.items.find((item) => "id" in item && item.id === heldIncidentId);
+	assert.ok(incident && "code" in incident && incident.code === "BUDGET_HIT", "the hold points at the Team-scope budget incident");
 	action(runtime, manager, 3, "pause-budget-worker", { action: "control", command: "pause_member", memberId: "w1" });
 	action(runtime, manager, 4, "resume-budget-worker", { action: "control", command: "resume_member", memberId: "w1" });
 	assert.equal(runtime.getWork(prepared.teamId, held.work)?.current.hold?.reason, "budget");

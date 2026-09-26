@@ -12,7 +12,7 @@ import {
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS,
 	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_WORKERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
-	TEAM_STATUS_MAX_LIMIT, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey,
+	TEAM_STATUS_MAX_LIMIT, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
 	MANAGER_EVENT_KINDS,
 	type ActivationInput, type ActivationScope, type BindingV2, type ChildFrame, type GateDecision, type ParentCommand,
 	type Health, type HoldReason, type MemberActivity, type MemberLifecycle, type MemberRole, type ManagerEventView, type OutcomeView, type PauseState, type PrivateAction,
@@ -20,8 +20,9 @@ import {
 	type TeamBudgetLimits, type TeamErrorCode, type TeamEvidence, type TeamIncidentView, type TeamMemberPlan,
 	type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReceipt, type TeamReply, type TeamReplyData,
 	type TeamStatusPage, type TeamTeamView, type TeamWorkSummary, type TeamWorkView, type MemberRecord, type ResultRecord,
-	type WorkError, type WorkRef, type WorkResult, type WorkState, type WorkVersion,
+	type WorkError, type WorkRef, type WorkResult, type WorkState, type WorkVersion, type TeamBudgetGrantView, type TeamRootBudgetView,
 } from "./team-protocol";
+import type { SubagentUsage } from "./session-broker";
 
 /** A structured, model-correctable failure. `code` is always one of TEAM_ERROR_CODES. */
 export class TeamProtocolError extends Error {
@@ -862,7 +863,7 @@ function parsePolicy(value: unknown, field: string): TeamMemberPolicy {
 
 function parseTeamTeamView(value: unknown): TeamTeamView {
 	if (!isRecord(value)) return protocol("team view must be an object");
-	frameKeys(value, ["version", "teamId", "lifecycle", "health", "stateVersion", "eventSeq", "manager", "timeoutSeconds", "deadline", "brief", "members", "works", "incidents", "budget", "outcome", "reason"], "team view");
+	frameKeys(value, ["version", "teamId", "lifecycle", "health", "stateVersion", "eventSeq", "manager", "timeoutSeconds", "deadline", "brief", "members", "works", "incidents", "incidentsOmitted", "budget", "usage", "outcome", "reason"], "team view");
 	if (value["version"] !== TEAM_PROTOCOL_VERSION) return protocol("team view version is invalid");
 	const lifecycle = value["lifecycle"];
 	if (!["prepared", "active", "closing", "closed", "failed", "cancelled", "interrupted"].includes(String(lifecycle))) return protocol("team view lifecycle is invalid");
@@ -874,7 +875,7 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 	const members: TeamMemberView[] = rawMembers.map((item, index) => {
 		const field = `team view.members[${index}]`;
 		if (!isRecord(item)) return protocol(`${field} must be an object`);
-		frameKeys(item, ["id", "role", "roleDescription", "lifecycle", "activity", "pause", "currentWork", "resourceState", "error", "queued", "blocked", "held", "policy"], field);
+		frameKeys(item, ["id", "role", "roleDescription", "lifecycle", "activity", "pause", "currentWork", "resourceState", "error", "queued", "blocked", "held", "policy", "usage"], field);
 		const role = item["role"];
 		if (role !== "manager" && role !== "worker") return protocol(`${field}.role is invalid`);
 		const memberLifecycle = item["lifecycle"];
@@ -895,7 +896,7 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 			...(item["currentWork"] !== undefined ? { currentWork: normalizeWorkRef(item["currentWork"], `${field}.currentWork`) } : {}),
 			resourceState: resourceState as ResourceState, ...(error ? { error } : {}),
 			queued: safeInteger(item["queued"], `${field}.queued`, 0), blocked: safeInteger(item["blocked"], `${field}.blocked`, 0), held: safeInteger(item["held"], `${field}.held`, 0),
-			policy: parsePolicy(item["policy"], `${field}.policy`) };
+			policy: parsePolicy(item["policy"], `${field}.policy`), usage: parseUsage(item["usage"], `${field}.usage`) };
 	});
 	const roster = members.map((member) => member.id);
 	if (new Set(roster).size !== roster.length || !roster.includes(manager) || members.filter((member) => member.role === "manager").length !== 1
@@ -911,7 +912,7 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 	if (counts.rootsReviewed > counts.roots) return protocol("team view reviewed root count exceeds root count");
 	const rawBudget = value["budget"];
 	if (!isRecord(rawBudget)) return protocol("team view budget must be an object");
-	frameKeys(rawBudget, ["limits", "used", "exhausted"], "team view budget");
+	frameKeys(rawBudget, ["limits", "used", "exhausted", "roots", "rootsOmitted", "grants", "grantsOmitted"], "team view budget");
 	if (!isRecord(rawBudget["limits"])) return protocol("team view budget.limits must be an object");
 	frameKeys(rawBudget["limits"], Object.keys(DEFAULT_TEAM_BUDGET), "team view budget.limits");
 	const limits = {} as TeamBudgetLimits;
@@ -932,8 +933,63 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 	return { version: TEAM_PROTOCOL_VERSION, teamId: frameId(value["teamId"], "team view.teamId"), lifecycle: lifecycle as TeamTeamView["lifecycle"], health: health as Health,
 		stateVersion: safeInteger(value["stateVersion"], "team view.stateVersion", 0), eventSeq: safeInteger(value["eventSeq"], "team view.eventSeq", 0),
 		manager, timeoutSeconds, deadline, brief, members, works: counts,
-		incidents: array(value["incidents"], "team view.incidents", 512).map((incident, index) => parseIncident(incident, `team view.incidents[${index}]`)),
-		budget: { limits, used, exhausted: rawBudget["exhausted"] }, ...(outcome !== undefined ? { outcome } : {}), ...(reason !== undefined ? { reason } : {}) };
+		incidents: array(value["incidents"], "team view.incidents", TEAM_VIEW_MAX_INCIDENTS).map((incident, index) => parseIncident(incident, `team view.incidents[${index}]`)),
+		incidentsOmitted: safeInteger(value["incidentsOmitted"], "team view.incidentsOmitted", 0),
+		budget: { limits, used, exhausted: rawBudget["exhausted"],
+			roots: array(rawBudget["roots"], "team view budget.roots", TEAM_VIEW_MAX_BUDGET_ROOTS).map((root, index) => parseRootBudget(root, `team view budget.roots[${index}]`)),
+			rootsOmitted: safeInteger(rawBudget["rootsOmitted"], "team view budget.rootsOmitted", 0),
+			grants: array(rawBudget["grants"], "team view budget.grants", TEAM_VIEW_MAX_GRANTS).map((grant, index) => parseGrant(grant, `team view budget.grants[${index}]`)),
+			grantsOmitted: safeInteger(rawBudget["grantsOmitted"], "team view budget.grantsOmitted", 0) },
+		usage: parseUsage(value["usage"], "team view.usage"),
+		...(outcome !== undefined ? { outcome } : {}), ...(reason !== undefined ? { reason } : {}) };
+}
+
+function parseUsage(value: unknown, field: string): SubagentUsage {
+	if (!isRecord(value)) return protocol(`${field} must be an object`);
+	frameKeys(value, ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns", "searches"], field);
+	const number = (key: string): number => {
+		const raw = value[key];
+		if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return protocol(`${field}.${key} must be a finite non-negative number`);
+		return raw;
+	};
+	return { input: number("input"), output: number("output"), cacheRead: number("cacheRead"), cacheWrite: number("cacheWrite"), cost: number("cost"),
+		contextTokens: number("contextTokens"), turns: number("turns"), ...(value["searches"] !== undefined ? { searches: number("searches") } : {}) };
+}
+
+function parseRootBudget(value: unknown, field: string): TeamRootBudgetView {
+	if (!isRecord(value)) return protocol(`${field} must be an object`);
+	frameKeys(value, ["rootId", "used", "limits"], field);
+	const used = value["used"];
+	const limits = value["limits"];
+	if (!isRecord(used) || !isRecord(limits)) return protocol(`${field} used/limits must be objects`);
+	frameKeys(used, ["rootActivations", "rootModelRequests", "rootToolCalls", "rootChildren"], `${field}.used`);
+	frameKeys(limits, ROOT_GRANTABLE_COUNTERS, `${field}.limits`);
+	return { rootId: frameId(value["rootId"], `${field}.rootId`),
+		used: { rootActivations: safeInteger(used["rootActivations"], `${field}.used.rootActivations`, 0),
+			rootModelRequests: safeInteger(used["rootModelRequests"], `${field}.used.rootModelRequests`, 0),
+			rootToolCalls: safeInteger(used["rootToolCalls"], `${field}.used.rootToolCalls`, 0),
+			rootChildren: safeInteger(used["rootChildren"], `${field}.used.rootChildren`, 0) },
+		limits: Object.fromEntries(ROOT_GRANTABLE_COUNTERS.map((key) => [key, safeInteger(limits[key], `${field}.limits.${key}`, 0)])) as TeamRootBudgetView["limits"] };
+}
+
+function parseGrant(value: unknown, field: string): TeamBudgetGrantView {
+	if (!isRecord(value)) return protocol(`${field} must be an object`);
+	frameKeys(value, ["id", "actor", "scope", "increments", "reason", "at"], field);
+	if (value["actor"] !== "@host") return protocol(`${field}.actor must be @host`);
+	const scope = value["scope"];
+	if (!isRecord(scope)) return protocol(`${field}.scope must be an object`);
+	let parsedScope: TeamBudgetGrantView["scope"];
+	if (scope["kind"] === "team") { frameKeys(scope, ["kind"], `${field}.scope`); parsedScope = { kind: "team" }; }
+	else if (scope["kind"] === "root") { frameKeys(scope, ["kind", "rootId"], `${field}.scope`); parsedScope = { kind: "root", rootId: frameId(scope["rootId"], `${field}.scope.rootId`) }; }
+	else return protocol(`${field}.scope.kind is invalid`);
+	const increments = value["increments"];
+	if (!isRecord(increments)) return protocol(`${field}.increments must be an object`);
+	const allowed: readonly string[] = parsedScope.kind === "team" ? TEAM_GRANTABLE_COUNTERS : ROOT_GRANTABLE_COUNTERS;
+	frameKeys(increments, allowed, `${field}.increments`);
+	const parsedIncrements: TeamBudgetGrantView["increments"] = {};
+	for (const [key, raw] of Object.entries(increments)) (parsedIncrements as Record<string, number>)[key] = safeInteger(raw, `${field}.increments.${key}`, 1);
+	return { id: frameId(value["id"], `${field}.id`), actor: "@host", scope: parsedScope, increments: parsedIncrements,
+		reason: text(value["reason"], `${field}.reason`, 512), at: safeInteger(value["at"], `${field}.at`, 0) };
 }
 
 function parseStatusPage(value: unknown): TeamStatusPage {
@@ -1019,7 +1075,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (!isRecord(value) || value["version"] !== TEAM_PROTOCOL_VERSION || value["teamId"] !== binding.teamId || value["deliveryId"] !== deliveryId) {
 		return protocol("activation input does not match its binding/delivery");
 	}
-	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "ownedChildren", "notice"], "activation input");
+	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "ownedChildren", "budget", "notice"], "activation input");
 	const member = value["member"];
 	if (!isRecord(member)) return protocol("activation input member is malformed");
 	frameKeys(member, ["id", "role", "roleDescription"], "activation input member");
@@ -1124,8 +1180,17 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (new Set(ownedChildren.map((child) => workRefKey(child.work))).size !== ownedChildren.length) return protocol("activation ownedChildren contains duplicates");
 	if (scope.kind === "management" && ownedChildren.length) return protocol("management activation cannot have owned children");
 	const omittedOutcomes = safeInteger(value["omittedOutcomes"], "activation input.omittedOutcomes", 0);
+	const rawBudget = value["budget"];
+	if (!isRecord(rawBudget)) return protocol("activation input budget must be an object");
+	frameKeys(rawBudget, ["emergency", "modelRequests", "toolCalls", "activations"], "activation input budget");
+	if (typeof rawBudget["emergency"] !== "boolean" || rawBudget["emergency"] !== (scope.kind === "management" && scope.emergency)) {
+		return protocol("activation input budget emergency must match its scope");
+	}
+	const budget = { emergency: rawBudget["emergency"], modelRequests: safeInteger(rawBudget["modelRequests"], "activation input budget.modelRequests", 0),
+		toolCalls: safeInteger(rawBudget["toolCalls"], "activation input budget.toolCalls", 0),
+		activations: safeInteger(rawBudget["activations"], "activation input budget.activations", 0) };
 	const input: ActivationInput = { version: TEAM_PROTOCOL_VERSION, teamId: binding.teamId, deliveryId,
-		member: { id: binding.memberId, role, roleDescription }, brief, roster, scope, outcomes, omittedOutcomes, ownedChildren,
+		member: { id: binding.memberId, role, roleDescription }, brief, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
 		notice: text(value["notice"], "activation input.notice", TEAM_MAX_NOTE_BYTES) };
 	if (jsonBytes(input) > TEAM_MAX_ACTIVATION_INPUT_BYTES) return protocol("activation input exceeds its size limit");
 	return input;

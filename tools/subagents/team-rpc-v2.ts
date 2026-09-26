@@ -7,12 +7,17 @@ import {
 } from "./team-protocol";
 import type { NativeCompletion, RuntimeActivation } from "./team-runtime";
 import { canonicalJson, parseChildFrame, parseParentCommand, sameBinding, sameScope } from "./team-codec";
+import { RunResultCollector } from "./run-result";
+import type { SubagentUsage } from "./session-broker";
 
 const DELIVERY_TIMEOUT_MS = 5000;
 
 export class TeamActivationFailure extends Error {
-	constructor(message: string, readonly resourceReleased: boolean, options?: ErrorOptions) {
+	/** Native usage observed by this send before it failed; frozen, so it is folded at most once. */
+	readonly usage: SubagentUsage | undefined;
+	constructor(message: string, readonly resourceReleased: boolean, options?: ErrorOptions & { usage?: SubagentUsage }) {
 		super(message, options);
+		this.usage = options?.usage;
 		this.name = "TeamActivationFailure";
 	}
 }
@@ -23,6 +28,8 @@ interface ActiveRun {
 	lastSequence: number;
 	stagedIntent?: { intentId: string; nativeToolCallId: string };
 	policyStopRequested: boolean;
+	/** Native usage of this activation only; frozen by the collector at agent_settled. */
+	usage: RunResultCollector;
 	started: boolean;
 	settled?: NativeCompletion;
 	lastTurn?: { message: unknown; toolResults: unknown[] };
@@ -132,7 +139,8 @@ function completionFor(run: ActiveRun): NativeCompletion {
 		&& intentCalls[0]!.id === nativeToolCallId && intentCalls[0]!.name === "team"
 		&& resultId(intentResults[0]) === nativeToolCallId && record(intentResults[0])
 		&& intentResults[0]["toolName"] === "team" && intentResults[0]["isError"] === false;
-	if (status === "success" && stagedIntent && nativeToolCallId && intentTurnSettled) {
+	// A runtime stop of a post-intent continuation (budget/policy) does not erase an already executed end intent.
+	if ((status === "success" || (status === "aborted" && run.policyStopRequested)) && stagedIntent && nativeToolCallId && intentTurnSettled) {
 		const executed = run.nativeToolCalls.get(nativeToolCallId);
 		if (executed?.toolName === "team" && executed.execution?.isError === false && executed.execution.terminate) {
 			appliedToolCallId = stagedIntent.intentId;
@@ -141,6 +149,7 @@ function completionFor(run: ActiveRun): NativeCompletion {
 	const text = assistantText(message);
 	return {
 		status,
+		usage: run.usage.result("").usage,
 		...(text !== undefined ? { finalAssistantText: text } : {}),
 		...(pendingToolCalls ? { pendingToolCalls: true } : {}),
 		...(appliedToolCallId ? { appliedToolCallId } : {}),
@@ -205,7 +214,7 @@ export class TeamRpcV2Connection {
 		// A transport request can fail before control reaches `await settled`; keep its rejection observed.
 		void settled.catch(() => undefined);
 		const run: ActiveRun = {
-			activation, onRequest, lastSequence: 0, started: false, policyStopRequested: false,
+			activation, onRequest, lastSequence: 0, started: false, policyStopRequested: false, usage: new RunResultCollector("", () => ""),
 			requests: new Map(), requestNativeToolCallIds: new Map(), nativeToolCalls: new Map(),
 			pendingNativeToolCalls: new Set(), claimedNativeToolCalls: new Set(), pendingRequests: 0,
 			resolveSettled, rejectSettled,
@@ -239,12 +248,15 @@ export class TeamRpcV2Connection {
 		} catch (error) {
 			const failure = this.failure ?? (error instanceof Error ? error : new Error(String(error)));
 			this.fail(failure);
+			// Real cost already observed stays attributable; later events cannot change it.
+			run.usage.markSettled();
+			const usage = run.usage.result("").usage;
 			try { await this.stopping; }
 			catch (stopError) {
 				throw new TeamActivationFailure(failure.message, false,
-					{ cause: stopError instanceof Error ? stopError : new Error(String(stopError)) });
+					{ cause: stopError instanceof Error ? stopError : new Error(String(stopError)), usage });
 			}
-			throw new TeamActivationFailure(failure.message, true, { cause: failure });
+			throw new TeamActivationFailure(failure.message, true, { cause: failure, usage });
 		} finally {
 			signal?.removeEventListener("abort", abortNativeRun);
 		}
@@ -334,6 +346,7 @@ export class TeamRpcV2Connection {
 		}
 		const run = this.run;
 		if (run) {
+			if (!run.settled) run.usage.ingest(event);
 			if (event.type === "agent_start") run.started = true;
 			if (event.type === "tool_execution_start" && typeof event["toolCallId"] === "string" && typeof event["toolName"] === "string") {
 				const toolCallId = event["toolCallId"];
@@ -354,7 +367,9 @@ export class TeamRpcV2Connection {
 			if (event.type === "turn_end") {
 				const turn = { message: event["message"], toolResults: Array.isArray(event["toolResults"]) ? event["toolResults"] : [] };
 				run.lastTurn = turn;
-				if (record(turn.message) && turn.message["role"] === "assistant" && toolCalls(turn.message).length > 0) {
+				const intentCall = run.stagedIntent?.nativeToolCallId;
+				const intentTurnKept = intentCall !== undefined && toolCalls(run.candidateEndIntentTurn?.message).some((call) => call.id === intentCall);
+				if (!intentTurnKept && record(turn.message) && turn.message["role"] === "assistant" && toolCalls(turn.message).length > 0) {
 					run.candidateEndIntentTurn = turn;
 				}
 			}
@@ -479,7 +494,7 @@ export class TeamRpcV2Connection {
 			const intentId = frame.request.action === "business" ? `team-intent-${frame.rpcRequestId}` : undefined;
 			const reply = await run.onRequest(frame, intentId);
 			if (frame.request.action === "provider_gate" && reply.kind === "gate" && !reply.decision.allow
-				&& reply.decision.reason === "policy_stop") run.policyStopRequested = true;
+				&& (reply.decision.reason === "policy_stop" || reply.decision.reason === "budget")) run.policyStopRequested = true;
 			const stagedIntentId = isStagedEndIntent(frame, reply, intentId);
 			if (stagedIntentId) {
 				const nativeToolCallId = run.requestNativeToolCallIds.get(frame.rpcRequestId);

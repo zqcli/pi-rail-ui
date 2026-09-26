@@ -38,6 +38,11 @@ function parseSession(text: string): any[] {
 	return text.split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
+function messageText(message: any): string {
+	if (typeof message?.content === "string") return message.content;
+	return Array.isArray(message?.content) ? message.content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("") : "";
+}
+
 function promptInput(entry: any): any | undefined {
 	if (entry.type !== "custom_message" || entry.customType !== TEAM_ACTIVATION_MESSAGE_TYPE) return;
 	const content = typeof entry.content === "string" ? entry.content
@@ -45,7 +50,7 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live",
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop",
 	open: readonly string[] = ["lead", "w1", "w2"], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}) {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
 	await writeFile(join(root, "settings.json"), JSON.stringify({
@@ -931,9 +936,11 @@ test("a pre-settlement native send failure is isolated without inventing native 
 				runActivation: async (_activation: any, _onRequest: any, onNativeSettled: any) => {
 					if (binding.memberId === "w1") {
 						failedWorkRef = _activation.scope.work;
-						throw new TeamActivationFailure("transport failed before agent_settled", true);
+						throw new TeamActivationFailure("transport failed before agent_settled", true,
+							{ usage: { input: 40, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0.25, contextTokens: 900, turns: 1 } });
 					}
-					onNativeSettled({ status: "success", finalAssistantText: "boot complete" });
+					onNativeSettled({ status: "success", finalAssistantText: "boot complete",
+						usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 1 } });
 				},
 				close: async () => ({}),
 			};
@@ -961,6 +968,9 @@ test("a pre-settlement native send failure is isolated without inventing native 
 	const failedWork = runtime.getWork(prepared.teamId, failedWorkRef);
 	assert.equal(failedWork?.current.state, "failed");
 	assert.equal(failedWork?.current.error?.outcomeUnknown, true);
+	assert.deepEqual(worker.usage, { input: 40, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0.25, contextTokens: 900, turns: 1 },
+		"cost observed before the transport loss is kept");
+	assert.deepEqual({ input: team.usage.input, contextTokens: team.usage.contextTokens }, { input: 42, contextTokens: 900 });
 	runtime.assertInvariants(prepared.teamId);
 	await driver.close();
 });
@@ -981,6 +991,157 @@ test("real Pi automatic retry remains inside the Team native run and settles one
 	assert.equal(retryTurns[1].data.retry, false);
 	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.lifecycle, "open");
 	assert.equal(runtime.getTeam(teamId).works.failed, 0);
+	// Every observable provider request, including the failed one Pi retried, is one counted step.
+	const providerEntries = async (memberId: string) => parseSession(await readFile(handles.get(memberId)!.instance.sessionFile, "utf8"))
+		.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider");
+	const workerCalls = (await providerEntries("w1")).length + (await providerEntries("w2")).length;
+	const managerCalls = (await providerEntries("lead")).length;
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.budget.used.teamModelRequests, workerCalls + managerCalls);
+	assert.equal(team.budget.roots.reduce((sum, root) => sum + root.used.rootModelRequests, 0), workerCalls);
+	assert.equal(team.usage.input, workerCalls + managerCalls, "native usage is folded once per real provider message");
+});
+
+test("real Pi budget safe stop: the root model budget stops after the running step, and a host root grant continues the same WorkRef", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "budget-live", ["lead", "w1", "w2"], { limits: { rootModelRequests: 1 } });
+	runtime.launch(teamId);
+	await drain(driver, teamId);
+	let team = runtime.getTeam(teamId);
+	const root = team.budget.roots[0]!;
+	const ref = { workId: root.rootId, revision: 1 };
+	const held = runtime.getWork(teamId, ref)!.current;
+	assert.equal(held.state, "blocked", JSON.stringify(team));
+	assert.equal(held.hold?.reason, "budget");
+	const incident = team.incidents.find((item) => item.id === held.hold?.incidentId)!;
+	assert.equal(incident.code, "BUDGET_HIT");
+	assert.equal(incident.rootId, root.rootId);
+	assert.equal(team.members.find((member) => member.id === "w1")?.lifecycle, "open", "budget stop is not a member fault");
+	assert.equal(team.incidents.some((item) => item.code === "PROTOCOL_FAILURE" || item.code === "NATIVE_FAILURE"), false);
+	const w1Entries = async () => parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	let entries = await w1Entries();
+	assert.ok(entries.some((entry) => entry.type === "message" && entry.message?.role === "toolResult"
+		&& entry.message.toolCallId === "budget-bash" && messageText(entry.message).includes("budget-step")),
+	"the already running step finished before the budget stop");
+	assert.equal(entries.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider").length, 1,
+		"the exhausted second provider request never reached the provider");
+	assert.equal(root.used.rootModelRequests, 1);
+
+	const grant = runtime.hostControl(teamId).grant({ kind: "root", rootId: root.rootId }, { rootModelRequests: 1 }, "let W1 finish");
+	assert.ok(grant.status === "applied" && "released" in grant);
+	assert.deepEqual(grant.released, [ref]);
+	await drain(driver, teamId);
+	team = runtime.getTeam(teamId);
+	const resumed = runtime.getWork(teamId, ref)!.current;
+	assert.equal(resumed.state, "resolved", JSON.stringify(team));
+	assert.equal(runtime.getResult(teamId, resumed.resultRef!)?.result.summary, "Resumed after the host budget grant without repeating the bash step.");
+	entries = await w1Entries();
+	assert.equal(entries.filter((entry) => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolCallId === "budget-bash").length, 1,
+		"the grant resumed the work without replaying its side effect");
+	const rootAfter = team.budget.roots.find((item) => item.rootId === root.rootId)!;
+	assert.deepEqual({ used: rootAfter.used.rootModelRequests, limit: rootAfter.limits.rootModelRequests }, { used: 2, limit: 2 });
+	assert.equal(team.budget.grants.length, 1);
+	assert.equal(team.budget.grants[0]!.actor, "@host");
+	assert.equal(team.incidents.find((item) => item.id === incident.id)?.state, "resolved");
+	assert.ok(team.members.find((member) => member.id === "w1")!.usage.turns >= 2, "worker usage accumulates across both activations");
+});
+
+test("real Pi A09: a third-party continuation after a staged reply stays settling, is refused new side effects, is budget-bounded, and commits the intent once", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "a09-live", ["lead", "w1", "w2"], { limits: { activationModelRequests: 3 } });
+	const snapshots: Array<{ state: string | undefined; activity: string | undefined }> = [];
+	const gate = runtime.gate.bind(runtime);
+	runtime.gate = (binding, scope, phase, ...rest) => {
+		if (phase === "provider_gate" && binding.memberId === "w1" && scope.kind === "work") {
+			snapshots.push({ state: runtime.getWork(teamId, scope.work!)?.current.state,
+				activity: runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.activity });
+		}
+		return gate(binding, scope, phase, ...rest);
+	};
+	runtime.launch(teamId);
+	await drain(driver, teamId);
+	const team = runtime.getTeam(teamId);
+	const root = team.budget.roots[0]!;
+	const work = runtime.getWork(teamId, { workId: root.rootId, revision: 1 })!;
+	assert.equal(work.current.state, "resolved", JSON.stringify(team));
+	assert.equal(runtime.getResult(teamId, work.current.resultRef!)?.result.summary, "A09 staged reply.");
+	assert.equal(team.works.total, 1, "the continuation created no new work");
+	assert.equal(team.members.find((member) => member.id === "w1")?.lifecycle, "open");
+	assert.equal(team.incidents.some((incident) => incident.code === "PROTOCOL_FAILURE" || incident.code === "NATIVE_FAILURE"), false);
+	const conflict = team.incidents.filter((incident) => incident.code === "POST_INTENT_CONTINUATION");
+	assert.equal(conflict.length, 1);
+	assert.equal(conflict[0]!.state, "resolved");
+	// Provider steps: the reply request plus two continuation requests; the fourth was refused by budget.
+	const w1Entries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	const providerCalls = w1Entries.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider");
+	assert.equal(providerCalls.length, 3);
+	assert.equal(root.used.rootModelRequests, 3);
+	assert.equal(snapshots.length, 4, "four provider gates: one normal, three after the staged intent");
+	assert.deepEqual(snapshots[0], { state: "running", activity: "running" });
+	for (const snapshot of snapshots.slice(1)) assert.deepEqual(snapshot, { state: "running", activity: "settling" }, "the staged intent is not committed early");
+	const blocked = w1Entries.filter((entry) => entry.type === "message" && entry.message?.role === "toolResult"
+		&& /^a09-(request|bash)-/u.test(entry.message.toolCallId));
+	assert.ok(blocked.length >= 2 && blocked.every((entry) => entry.message.isError === true), "continuation side effects were blocked");
+	assert.equal(w1Entries.some((entry) => entry.type === "message" && messageText(entry.message).includes("a09-side-effect")
+		&& entry.message?.role === "toolResult" && entry.message.isError !== true), false);
+	const managerInputs = parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8")).map(promptInput).filter(Boolean);
+	const rootReady = managerInputs.flatMap((input) => input.scope.kind === "management" ? input.scope.events : [])
+		.filter((event: any) => event.kind === "ROOT_RESULT_READY" && event.work?.workId === root.rootId);
+	assert.equal(rootReady.length, 1, "the result commits once");
+});
+
+test("real Pi tool budget: invalid end intents are counted native steps and one final legal reply still settles", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "tool-budget", ["lead", "w1", "w2"], { limits: { activationToolCalls: 2 } });
+	runtime.launch(teamId);
+	await drain(driver, teamId);
+	const team = runtime.getTeam(teamId);
+	const root = team.budget.roots[0]!;
+	const work = runtime.getWork(teamId, { workId: root.rootId, revision: 1 })!;
+	assert.equal(work.current.state, "resolved", JSON.stringify(team));
+	const w1Entries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	const teamResults = w1Entries.filter((entry) => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolName === "team");
+	assert.deepEqual(teamResults.map((entry) => [entry.message.toolCallId, entry.message.isError === true]),
+		[["tool-budget-bad-yield", true], ["tool-budget-idle-yield", true], ["tool-budget-reply", false]]);
+	assert.equal(root.used.rootToolCalls, 3, "every real native tool attempt, including the final one past the limit, is charged once");
+	assert.equal(team.budget.used.teamToolCalls, 3);
+});
+
+test("real Pi Manager budget stop mid-activation: the batch is not replayed and the emergency follow-up is bounded", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "manager-midstop", ["lead", "w1", "w2"], { limits: { teamModelRequests: 3 } });
+	runtime.launch(teamId);
+	await drain(driver, teamId);
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.members.find((member) => member.id === "lead")?.lifecycle, "open", "a budget stop is not a Manager fault");
+	assert.equal(team.budget.used.managerActivations, 1);
+	assert.equal(team.budget.used.emergencyManagerActivations, 1, "one emergency activation for the one deduplicated incident");
+	assert.equal(team.incidents.filter((incident) => incident.code === "BUDGET_HIT" && incident.state === "open").length, 1);
+	assert.equal(team.incidents.some((incident) => incident.code === "PROTOCOL_FAILURE" || incident.code === "NATIVE_FAILURE"), false);
+	const leadEntries = parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8"));
+	const inputs = leadEntries.map(promptInput).filter(Boolean);
+	assert.equal(inputs.length, 2);
+	assert.ok(inputs[0].scope.events.some((event: any) => event.kind === "BOOT"));
+	assert.equal(inputs[1].scope.emergency, true);
+	assert.ok(inputs[1].scope.events.every((event: any) => event.kind !== "BOOT"), "the stopped BOOT batch is not replayed");
+	const providerCalls = leadEntries.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider");
+	assert.equal(providerCalls.length, 4, "three counted BOOT requests, the fourth refused, then one emergency request");
+	assert.equal(team.budget.used.teamModelRequests, 4, "the emergency request bypasses the exhausted Team limit but is still recorded as real cost");
+	assert.deepEqual({ total: team.works.total, held: team.works.held, running: team.works.running }, { total: 1, held: 1, running: 0 },
+		"the worker root waits on the Team budget instead of running");
+});
+
+test("real Pi Manager budget: an exhausted Manager gets a restricted emergency activation that can accept and close but not request", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "manager-budget", ["lead", "w1", "w2"], { limits: { managerActivations: 1 } });
+const result = await driver.launch(teamId);
+	assert.equal(result.lifecycle, "closed", JSON.stringify(result));
+	assert.equal(result.outcome, "succeeded");
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.budget.used.managerActivations, 1);
+	assert.equal(team.budget.used.emergencyManagerActivations, 1);
+	assert.equal(team.works.total, 1, "the emergency request created no work");
+	const managerEntries = parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8"));
+	const emergency = managerEntries.map(promptInput).filter(Boolean).find((input) => input.scope.kind === "management" && input.scope.emergency);
+	assert.ok(emergency, "the second Manager activation is marked emergency");
+	const requestResult = managerEntries.find((entry) => entry.type === "message" && entry.message?.role === "toolResult"
+		&& entry.message.toolCallId === "manager-budget-request");
+	assert.match(messageText(requestResult?.message), /BUDGET_BLOCKED/);
 });
 
 test("real Pi threshold compaction occurs inside a Team activation without losing provider/native ownership", { timeout: 90000 }, async (t) => {

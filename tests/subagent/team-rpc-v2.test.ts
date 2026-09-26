@@ -33,6 +33,7 @@ class FakeTransport implements RpcTransport {
 	ignoreAbort = false;
 	private triggerTimer: NodeJS.Timeout | undefined;
 	private triggerDone: (() => void) | undefined;
+	private triggerLost: ((error: Error) => void) | undefined;
 	private nativeByRequest = new Map<string, string>();
 	private stagedNativeToolCallId: string | undefined;
 
@@ -89,8 +90,9 @@ class FakeTransport implements RpcTransport {
 		if (this.triggerFailure) throw this.triggerFailure;
 		this.emit({ type: "agent_start" });
 		this.triggerStarted.resolve();
-		return await new Promise((resolve) => {
+		return await new Promise((resolve, reject) => {
 			this.triggerDone = () => { resolve({}); };
+			this.triggerLost = reject;
 			this.triggerTimer = setTimeout(() => this.finishTrigger("stop"), this.triggerDelayMs);
 		});
 	}
@@ -115,6 +117,12 @@ class FakeTransport implements RpcTransport {
 
 	async stop(): Promise<void> {
 		this.stopCalls++;
+		// A stopped process rejects its still-pending prompt request, as the real RPC transport does.
+		if (this.triggerDone) {
+			clearTimeout(this.triggerTimer);
+			this.triggerDone = undefined;
+			this.triggerLost?.(new Error("fake process stopped"));
+		}
 		if (this.stopFailure) throw this.stopFailure;
 	}
 }
@@ -214,6 +222,36 @@ test("terminate with an unconfirmed exit keeps the send's resource as not releas
 	const { connection, run } = await startConnection(transport, async () => ({ kind: "ack" }));
 	connection.terminate(new Error("scoped stop exceeded its bound"));
 	await assert.rejects(run, (error: unknown) => error instanceof TeamActivationFailure && !error.resourceReleased);
+});
+
+const assistantUsage = (input: number) => ({ role: "assistant", stopReason: "toolUse", content: [],
+	usage: { input, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: input + 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 } } });
+
+test("usage observed before a transport loss is frozen into the activation failure", async () => {
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 60000;
+	const { run } = await startConnection(transport, async () => ({ kind: "ack" }));
+	transport.emit({ type: "message_end", message: assistantUsage(42) });
+	transport.emit({ type: "transport_error", error: "socket closed" });
+	transport.emit({ type: "message_end", message: assistantUsage(1000) });
+	await assert.rejects(run, (error: unknown) => error instanceof TeamActivationFailure && error.resourceReleased
+		&& error.usage?.input === 42 && error.usage.output === 2 && error.usage.turns === 1,
+	"a late event after the loss is not billed");
+});
+
+test("an aborted activation reports the usage it already consumed, and events after agent_settled are not added", async () => {
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 60000;
+	const controller = new AbortController();
+	const { connection, run } = await startConnection(transport, async () => ({ kind: "ack" }), () => undefined, controller.signal);
+	transport.emit({ type: "message_end", message: assistantUsage(17) });
+	controller.abort();
+	const completion = await run;
+	transport.emit({ type: "message_end", message: assistantUsage(500) });
+	assert.equal(completion.status, "aborted");
+	assert.equal(completion.usage?.input, 17);
+	await connection.deactivate(activation());
+	await connection.close();
 });
 
 test("identical child requests are idempotent, stale sequence replies do not execute, and ACK duplicates are diagnosed", async () => {

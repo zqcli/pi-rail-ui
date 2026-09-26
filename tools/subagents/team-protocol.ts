@@ -33,6 +33,13 @@ export const TEAM_MAX_DELIVERED_OUTCOMES = 32;
 export const TEAM_MAX_MANAGER_EVENT_BATCH = 16;
 export const TEAM_STATUS_DEFAULT_LIMIT = 20;
 export const TEAM_STATUS_MAX_LIMIT = 50;
+/**
+ * The team view is a bounded summary inside one private reply frame; complete lists are read
+ * through paginated status(work|result|incident) pages.
+ */
+export const TEAM_VIEW_MAX_INCIDENTS = 32;
+export const TEAM_VIEW_MAX_BUDGET_ROOTS = 32;
+export const TEAM_VIEW_MAX_GRANTS = 16;
 export const TEAM_MAX_UI_EVENTS = 64;
 export const TEAM_MAX_INITIAL_REQUESTS = 8;
 export const TEAM_MAX_LIVE_TEAMS = 32;
@@ -344,6 +351,18 @@ export interface OutcomeView {
 	preview?: { status: WorkResult["status"]; summary: string };
 }
 
+/**
+ * Steps this activation may take and what its scope has left after it (spec 9.4). Values are the
+ * tightest applicable limit; emergency Manager activations are bounded by activation and emergency counts only.
+ */
+export interface ActivationBudgetSummary {
+	emergency: boolean;
+	modelRequests: number;
+	toolCalls: number;
+	/** Further activations this scope may reserve after this one. */
+	activations: number;
+}
+
 export interface ActivationInput {
 	version: 2;
 	teamId: string;
@@ -371,6 +390,7 @@ export interface ActivationInput {
 	/** Outcomes that did not fit this input; they stay undelivered for a later activation. */
 	omittedOutcomes: number;
 	ownedChildren: Array<{ work: WorkRef; state: WorkState }>;
+	budget: ActivationBudgetSummary;
 	notice: string;
 }
 
@@ -434,6 +454,21 @@ export interface TeamMemberView extends MemberRecord {
 	blocked: number;
 	held: number;
 	policy: TeamMemberPolicy;
+	/** Native usage of this member's settled activations, each counted once. */
+	usage: SubagentUsage;
+}
+export interface TeamBudgetGrantView {
+	id: string;
+	actor: "@host";
+	scope: { kind: "team" } | { kind: "root"; rootId: string };
+	increments: Partial<Record<TeamGrantCounter | RootGrantCounter, number>>;
+	reason: string;
+	at: number;
+}
+export interface TeamRootBudgetView {
+	rootId: string;
+	used: { rootActivations: number; rootModelRequests: number; rootToolCalls: number; rootChildren: number };
+	limits: Record<RootGrantCounter, number>;
 }
 export interface TeamBudgetView {
 	limits: TeamBudgetLimits;
@@ -447,6 +482,12 @@ export interface TeamBudgetView {
 		reservedResultBytes: number;
 	};
 	exhausted: boolean;
+	/** Exhausted roots first, then granted or used roots; at most TEAM_VIEW_MAX_BUDGET_ROOTS. */
+	roots: TeamRootBudgetView[];
+	rootsOmitted: number;
+	/** The most recent grants; at most TEAM_VIEW_MAX_GRANTS. */
+	grants: TeamBudgetGrantView[];
+	grantsOmitted: number;
 }
 export interface TeamTeamView {
 	version: 2;
@@ -461,8 +502,12 @@ export interface TeamTeamView {
 	brief: TeamBrief;
 	members: TeamMemberView[];
 	works: { total: number; queued: number; running: number; blocked: number; held: number; resolved: number; failed: number; cancelled: number; roots: number; rootsReviewed: number };
+	/** Open incidents first, then the most recent resolved ones; at most TEAM_VIEW_MAX_INCIDENTS. */
 	incidents: TeamIncidentView[];
+	incidentsOmitted: number;
 	budget: TeamBudgetView;
+	/** Team total of settled native usage (Manager plus workers). */
+	usage: SubagentUsage;
 	outcome?: TeamOutcome;
 	reason?: string;
 }

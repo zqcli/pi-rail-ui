@@ -216,7 +216,7 @@ export class TeamMemberDriver {
 			if (!native) throw new Error("Team member send returned without a real native agent_settled boundary");
 			if (settlementError) {
 				this.runtime.activationLost(activation.binding, activation.scope.activationId,
-					{ code: "PROTOCOL_FAILURE", message: settlementError.message }, true);
+					{ code: "PROTOCOL_FAILURE", message: settlementError.message }, true, native.usage);
 				lostProcessed = true;
 				throw settlementError;
 			}
@@ -230,7 +230,7 @@ export class TeamMemberDriver {
 				const released = error instanceof TeamActivationFailure && error.resourceReleased;
 				this.runtime.activationLost(activation.binding, activation.scope.activationId, {
 					code: "NATIVE_OUTCOME_UNKNOWN", message: errorMessage(error), outcomeUnknown: true,
-				}, released);
+				}, released, error instanceof TeamActivationFailure ? error.usage : undefined);
 				lostProcessed = true;
 				// Runtime now records a confirmed exit; release the Broker owner to match (history is kept).
 				if (released) await this.releaseExitedMember(id, member);

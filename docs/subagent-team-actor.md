@@ -64,7 +64,25 @@ Manager-only 控制还包括 pause/resume、修订、取消、resume_work、验�
 
 修订/取消（含宿主整队取消）先向 native 发送 activation-only abort，再等待 settled 与清理，不等待已获准工具自行结束；超过 `activationStopTimeoutMs` 仍未收敛时，driver 终止该成员的原生进程，由该次 send 以真实退出结果报告（确认退出为 faulted/released，未确认为 cleanup_failed 并保留所有权）。真实 provider error/length 优先于任何控制标志分类为 `native_failure`。close_team 已提交后的宿主取消保持关闭决定，不中止 Manager 的收尾，只为其加上同一停止期限。
 
-宿主另有非模型 HostControl：`cancel_team`、`release_hold`、`message_manager`，不会伪装成 Manager；预算 grant 留待后续阶段。
+宿主另有非模型 HostControl：`cancel_team`、`release_hold`、`message_manager`、`grant`，不会伪装成 Manager。
+
+## 执行预算、usage 与 journal（C2）
+
+`TeamBudget`（`team-budget.ts`）是计数器的唯一归属，WorkLedger 仍是 work 的权威；计数从 launch 起只增不减，revise/yield/新 ID/新 root/idle 都不重置。每次 activation 在预留时计入 Team/Manager/root activation；provider gate 每放行一次（含 Pi 可观察的自动重试、暂停恢复后的放行）计一次模型请求；每个真实 native toolCallId 在 tool gate 放行时计一次工具调用（含随后业务校验失败的 reply/yield/close_team），同一 ID 重复预检不重复计数，被预算拒绝的尝试不计。工具额度耗尽后，每个 activation 仍放行并计入**一次**结束意图尝试，使合法 reply/yield/close_team 能收尾；之后的任何工具尝试被拒，且下一次 provider 请求以 `budget` 停止，重复的无效结束意图无法绕过预算。
+
+每个 ActivationInput 带 `budget` 摘要：`modelRequests`/`toolCalls` 为本 activation 在 activation、root、Team 限额中最紧的剩余值，`activations` 为该作用域在本次之后还可预留的 activation 数（work 取 root/Team，管理取 Manager/Team，紧急取剩余紧急额度），`emergency` 与 scope 一致。
+
+- 运行中命中上限：拒绝下一次 provider/tool，已发出的步骤正常收尾；该 activation 以 `budget_hold` 结束，未暂存意图的 WorkRef 变为 `blocked`/`budget`，成员不 faulted，不是协议错误。暂停与预算互不绕过：恢复停驻的 gate 仍需通过预算。
+- 预留时耗尽：work 直接 hold。incident 按作用域去重：root 耗尽为该 root 一条（`rootId`，无 `work`），Team 耗尽为一条 Team 级。root 耗尽不影响其他 root。
+- Manager/Team 耗尽：最多 `emergencyManagerActivations`（默认 3）次紧急管理 activation，输入 `emergency: true`，只允许 status、cancel_work、accept_result、close_member、close_team、yield，其余返回 `BUDGET_BLOCKED`；紧急 activation 单独计数，仅受单 activation 步数限制。用完后不再自动调用 Manager，仅宿主可 grant/cancel。只阻塞于预算、不持有 work 的 `BUDGET_HIT` 不阻止 succeeded close。
+- `HostControl.grant(scope, increments, reason)`：scope 为 Team 或已知 root（无 parent 的 work）；增量为正安全整数；Team grant 只接受 Team 计数器（teamActivations、managerActivations、teamModelRequests、teamToolCalls、emergencyManagerActivations），root grant 只接受该 root 的计数器（rootChildren、rootActivations、rootModelRequests、rootToolCalls）；reason 必填（≤512 字节）。先完整校验（每个增加后的有效上限不超出安全整数）再写 journal，最后应用，任一字段失败时整体拒绝、无任何副作用；actor 固定 `@host`，root grant 只影响该 root，计数器不重置。之后只重新排队预算不再耗尽的 budget hold，并解除对应 incident；attention/protocol/pause/Manager 故障 hold 不受影响。Team 非 active 时拒绝。
+- A09：已暂存结束意图后若有第三方/原生 continuation 请求 provider，Runtime 保持 settling，放行并计数（受单 activation 模型请求限制），首次记录一条已解决的 `POST_INTENT_CONTINUATION` 诊断 incident（不通知 Manager、不影响 health），工具和业务动作仍被拒绝；预算中止该 continuation 时，已在 transcript 确认的意图照常提交。不会自动 prompt 或重发。
+
+usage 由 `team-rpc-v2` 以 `RunResultCollector` 只收集本次 send 的 native 事件，`agent_settled` 时冻结并随 `NativeCompletion.usage` 上报；send 在 settle 前失败时冻结已观察到的部分 usage，放在 `TeamActivationFailure.usage`，driver 转交 `activationLost(..., usage)`。Runtime 对一个 activation 只累加一次（settle 与 lost 互斥：已 settle 的不能再按 lost 计费，已隔离的迟到 settle 被拒绝；重复报告幂等；格式错误的 lost usage 不计费也不阻止隔离），`contextTokens` 取最近非零值而不求和；取消/中止的 activation 保留其真实成本。
+
+公开 team view 是有界摘要，保证放入一个 1 MiB 私有 reply 帧：`incidents` 最多 32 条（先 open 后最近 resolved，`incidentsOmitted` 计余数），`budget.roots` 最多 32 个（先耗尽、再有 grant、再有使用，`rootsOmitted`），`budget.grants` 为最近 16 条（`grantsOmitted`）。work/result/incident 完整列表通过分页的 status 读取；被截断的 root 预算明细（`rootsOmitted`）目前**没有**查询接口，只有数量，由 D 的宿主 UI inspect 实现，不作为模型动作。incident 消息、成员错误和 Team reason 超过 4 KiB 时截为预览。
+
+`TeamRuntimeOptions.journal` 接收 `TeamJournalGeneration`（`team-journal.ts`）。同步写入的仅为有界历史事实：launched、result（提交前）、revise/cancel 决定、close_decision、grant、terminal；gate/ACK/status/cleanup 不写，也不序列化整个账本。写入失败时 fail closed：launch 保持 prepared；结果版本为 `failed`/`JOURNAL_FAILURE` 且不发布；决定和 grant 不生效；Team 在安全点转为 failed；terminal 写失败时报告 failed 而非 closed。generation 可永久 `deactivate()`，之后写入均失败。D 负责把它接到 session/index 并在切换时停用。
 
 ## 原生输入及提交边界
 
@@ -97,7 +115,8 @@ Broker handle 的 `close()` 只在原生进程退出被确认后才释放 Team �
 
 - D 层需将 Team-owned `stop/delete/shutdown` 路由到 `TeamMemberDriver.stopTeam`；该接口现有，但父级 lifecycle 和 UI 尚未接线。
 
-- Host budget grant API、预算增加/审计策略及全量 root/activation model/tool usage 计数仍未提供。budget hold 不能由 `resume_member`、`resume_work` 或 `release_hold` 隐式清除。
+- budget hold 不能由 `resume_member`、`resume_work` 或 `release_hold` 隐式清除，只能由宿主 grant 或取消处理；grant 尚无 UI/命令入口（D）。
+- journal generation 尚未接到父 session/index（D）；未配置 journal 时 Runtime 不写历史。
 - 旧 C1a validation report 属于此前阶段，不能代替本工作树的全量测试结果或视为剩余项已完成。
 
 ### D：入口及最终验收

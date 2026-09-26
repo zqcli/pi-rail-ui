@@ -52,7 +52,48 @@ function call(id, args) {
 	return { type: "toolCall", id, name: "team", arguments: args };
 }
 
-function actionFor(scenario, input, replies, turn) {
+const A09_CONTINUATION = "third-party boundary continuation";
+
+function actionFor(scenario, input, replies, turn, messages = [], activationIndex = 0) {
+	if (scenario === "a09-live" && input.scope.kind === "work") {
+		const lastUser = [...messages].reverse().find((message) => message?.role === "user");
+		// The continuation a third-party extension forced after the staged reply tries new side effects.
+		if (messageText(lastUser) === A09_CONTINUATION) return [
+			call(`a09-request-${turn}`, { action: "request", to: "w2", task: "side effect after the intent", inputRefs: [] }),
+			{ type: "toolCall", id: `a09-bash-${turn}`, name: "bash", arguments: { command: "printf a09-side-effect" } },
+		];
+		return [call("a09-reply", { action: "reply", result: { status: "succeeded", summary: "A09 staged reply." } })];
+	}
+	if (scenario === "budget-live" && input.scope.kind === "work" && input.scope.task === "W1 root") {
+		// The first activation runs one bash step and is then stopped by the root model budget; after a
+		// host grant the same WorkRef resumes in the same session and sees that earlier real side effect.
+		const priorStep = messages.slice(0, activationIndex).some((message) => message?.role === "toolResult" && message.toolCallId === "budget-bash");
+		if (priorStep) return [call("budget-reply", { action: "reply", result: {
+			status: "succeeded", summary: "Resumed after the host budget grant without repeating the bash step.",
+		} })];
+		return [{ type: "toolCall", id: "budget-bash", name: "bash", arguments: { command: "printf budget-step" } }];
+	}
+	if (scenario === "tool-budget" && input.scope.kind === "work") {
+		// Two invalid end intents (still real, counted tool calls), then a legal final reply past the limit.
+		if (replies.length === 0) return [call("tool-budget-bad-yield", { action: "yield", waitingFor: [{ workId: "missing-work", revision: 1 }] })];
+		if (replies.length === 1) return [call("tool-budget-idle-yield", { action: "yield" })];
+		return [call("tool-budget-reply", { action: "reply", result: { status: "succeeded", summary: "Finished with the final attempt." } })];
+	}
+	if (scenario === "manager-midstop" && input.scope.kind === "management") {
+		// The BOOT batch keeps reading status until the Team model budget stops it mid-activation.
+		if (input.scope.events.some((event) => event.kind === "BOOT")) return [call(`midstop-status-${turn}`, { action: "status", view: "team" })];
+		return [{ type: "text", text: `Emergency checkpoint: ${input.scope.events.map((event) => event.kind).join(",")}` }];
+	}
+	if (scenario === "manager-budget") {
+		if (input.scope.kind === "work") return [call("manager-budget-root-reply", { action: "reply", result: {
+			status: "succeeded", summary: "Root result for the emergency Manager.",
+		} })];
+		const root = input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY");
+		if (!root) return [{ type: "text", text: `Manager checkpoint ${input.notice}` }];
+		if (replies.length === 0) return [call("manager-budget-request", { action: "request", to: "w1", task: "extra work", inputRefs: [] })];
+		if (replies.length === 1) return [call("manager-budget-accept", { action: "control", command: "accept_result", work: root.work, disposition: "accepted" })];
+		return [call("manager-budget-close", { action: "control", command: "close_team", resultRefs: [root.resultRef], outcome: "succeeded" })];
+	}
 	if (["pause-mixed", "revise-live", "cancel-live"].includes(scenario) && input.scope.kind === "management") {
 		const userCommand = input.scope.events.find((event) => event.kind === "USER_COMMAND");
 		if (userCommand) {
@@ -233,6 +274,15 @@ export default function install(pi) {
 			return { content: [{ type: "text", text: "probe complete" }], details: { ok: true } };
 		},
 	});
+	// A third-party extension that queues a follow-up after a staged reply, forcing a native continuation.
+	if (process.env.TEAM_V2_SCENARIO === "a09-live") {
+		let queued = false;
+		pi.on("tool_execution_end", (event) => {
+			if (queued || event.toolName !== "team" || event.result?.terminate !== true || event.result?.details?.receipt?.intent !== "reply") return;
+			queued = true;
+			pi.sendUserMessage(A09_CONTINUATION, { deliverAs: "followUp" });
+		});
+	}
 	if (process.env.TEAM_V2_SCENARIO === "hang-live") pi.registerTool({
 		name: "team_v2_hang", label: "Team v2 hang", description: "Local tool that ignores abort and never returns", parameters: Type.Object({}),
 		async execute() {
@@ -256,7 +306,7 @@ export default function install(pi) {
 			} else {
 				activation = latestActivation(context.messages);
 				const replies = teamReplies(context.messages, activation.index);
-				content = actionFor(scenario, activation.input, replies, turns);
+				content = actionFor(scenario, activation.input, replies, turns, context.messages, activation.index);
 			}
 			const retry = scenario === "retry" && activation?.input.member.id === "w1" && turns === 1;
 			const inputTokens = scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1 ? 60000 : 1;

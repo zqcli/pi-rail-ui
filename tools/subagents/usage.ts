@@ -104,3 +104,19 @@ export function usageWithActiveTurn(completed: SubagentUsage, active: SubagentUs
 	else delete result.searches;
 	return result;
 }
+
+/**
+ * Fold one settled activation's usage into an aggregate exactly once. Consumption fields add;
+ * contextTokens stays the latest observed context size and is never summed.
+ */
+export function addActivationUsage(total: SubagentUsage, activation: SubagentUsage): void {
+	total.input += activation.input;
+	total.output += activation.output;
+	total.cacheRead += activation.cacheRead;
+	total.cacheWrite += activation.cacheWrite;
+	total.cost += activation.cost;
+	total.turns += activation.turns;
+	if (activation.contextTokens) total.contextTokens = activation.contextTokens;
+	const searches = activation.searches ?? 0;
+	if (searches > 0) total.searches = (total.searches ?? 0) + searches;
+}

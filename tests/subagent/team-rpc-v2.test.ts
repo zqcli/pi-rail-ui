@@ -30,6 +30,7 @@ class FakeTransport implements RpcTransport {
 	triggerFailure: Error | undefined;
 	stopFailure: Error | undefined;
 	emitTrailingEmptyTurn = false;
+	ignoreAbort = false;
 	private triggerTimer: NodeJS.Timeout | undefined;
 	private triggerDone: (() => void) | undefined;
 	private nativeByRequest = new Map<string, string>();
@@ -61,7 +62,7 @@ class FakeTransport implements RpcTransport {
 		if (request["type"] === "get_commands") return { commands: [{ name: TEAM_COMMAND, source: "extension", description: TEAM_COMMAND_DESCRIPTION }] };
 		if (request["type"] === "get_state") return { isStreaming: true };
 		if (request["type"] === "clear_queue") return {};
-		if (request["type"] === "abort") { this.finishTrigger("aborted"); return {}; }
+		if (request["type"] === "abort") { if (!this.ignoreAbort) this.finishTrigger("aborted"); return {}; }
 		if (request["type"] !== "prompt") throw new Error(`Unexpected fake RPC request: ${String(request["type"])}`);
 		const message = String(request["message"] ?? "");
 		if (message.startsWith(`/${TEAM_COMMAND} `)) {
@@ -186,6 +187,33 @@ test("an explicit abort requests native cancellation but still waits for Pi agen
 	assert.equal(transport.stopCalls, 0, "an explicit native abort does not stop or fake-reap the persistent child");
 	await connection.deactivate(activation());
 	await connection.close();
+});
+
+test("terminate stops a native run that ignores abort and reports confirmed exit through the pending send", async () => {
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 60000;
+	transport.ignoreAbort = true;
+	const controller = new AbortController();
+	const failures: Error[] = [];
+	const { connection, run } = await startConnection(transport, async () => ({ kind: "ack" }), (error) => failures.push(error), controller.signal);
+	controller.abort();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(transport.stopCalls, 0, "a scoped abort alone never stops the persistent process");
+	connection.terminate(new Error("scoped stop exceeded its bound"));
+	await assert.rejects(run, (error: unknown) => error instanceof TeamActivationFailure && error.resourceReleased
+		&& /scoped stop exceeded its bound/u.test(error.message));
+	assert.equal(transport.stopCalls, 1);
+	assert.equal(failures.length, 1);
+	await assert.rejects(connection.close(), /scoped stop exceeded its bound/u, "a terminated lifetime is not reported as a clean unbind");
+});
+
+test("terminate with an unconfirmed exit keeps the send's resource as not released", async () => {
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 60000;
+	transport.stopFailure = new RpcProcessExitTimeoutError("exit not confirmed", Promise.resolve());
+	const { connection, run } = await startConnection(transport, async () => ({ kind: "ack" }));
+	connection.terminate(new Error("scoped stop exceeded its bound"));
+	await assert.rejects(run, (error: unknown) => error instanceof TeamActivationFailure && !error.resourceReleased);
 });
 
 test("identical child requests are idempotent, stale sequence replies do not execute, and ACK duplicates are diagnosed", async () => {

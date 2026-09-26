@@ -277,7 +277,8 @@ export type PrivateAction =
 	| { action: "business"; args: Record<string, unknown> }
 	| { action: "input_ready"; deliveryId: string }
 	| { action: "provider_gate" }
-	| { action: "tool_gate"; toolName: string }
+	| { action: "tool_gate"; toolCallId: string; toolName: string; endIntent: boolean }
+	| { action: "tool_result"; toolCallId: string; toolName: string }
 	| { action: "boundary"; kind: "turn_end" | "agent_end" };
 
 export interface ChildRequestFrame {
@@ -311,7 +312,7 @@ export interface MemberLoadout { role: MemberRole; teamTool: true }
 
 export type GateDecision =
 	| { allow: true }
-	| { allow: false; reason: "paused" | "stale_scope" | "budget" | "activation_ending" | "delivery_pending" | "team_stopping"; message: string };
+	| { allow: false; reason: "paused" | "stale_scope" | "budget" | "activation_ending" | "delivery_pending" | "team_stopping" | "policy_stop"; message: string };
 
 export type PrivateReply =
 	| { kind: "business"; reply: TeamReply }
@@ -325,6 +326,7 @@ export interface ManagerEventView {
 	id: string;
 	kind: ManagerEventKind;
 	message: string;
+	actor?: "@host";
 	work?: WorkRef;
 	memberId?: string;
 	incidentId?: string;

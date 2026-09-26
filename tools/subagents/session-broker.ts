@@ -62,6 +62,8 @@ export interface TeamMemberProtocolSession {
 		onNativeSettled: (completion: NativeCompletion) => Promise<void> | void,
 		signal?: AbortSignal,
 	): Promise<void>;
+	/** Fail the private connection and stop the native process; the in-flight send reports the exit evidence. */
+	terminate(error: Error): void;
 	close(): Promise<void>;
 }
 
@@ -206,7 +208,18 @@ export interface BrokeredTeamMemberHandle {
 		onNativeSettled: (completion: NativeCompletion) => Promise<void> | void,
 		signal?: AbortSignal,
 	): Promise<void>;
-	close(): Promise<void>;
+	/** Escalate a missed scoped stop by stopping the native process; never releases ownership by itself. */
+	terminate(error: Error): void;
+	/**
+	 * Resolves only after the native exit is confirmed and ownership is released; rejects (keeping
+	 * ownership) while the exit is unknown. `protocolError` reports an unclean private unbind or an
+	 * earlier fault/termination: the resource is released, but this is not a clean member close.
+	 */
+	close(): Promise<TeamMemberCloseResult>;
+}
+
+export interface TeamMemberCloseResult {
+	protocolError?: string;
 }
 
 interface WorkerState {
@@ -575,12 +588,12 @@ export class SessionBroker {
 			let exitWait: Promise<void> | undefined;
 			let exitStopError: unknown;
 			let exitConfirmed = false;
-			let released = false;
-			let closing: Promise<void> | undefined;
-			const closeHandle = async (): Promise<void> => {
+			let released: TeamMemberCloseResult | undefined;
+			let closing: Promise<TeamMemberCloseResult> | undefined;
+			const closeHandle = async (): Promise<TeamMemberCloseResult> => {
 				if (activationInFlight) throw new Error(`Team member ${alias} still has an activation in flight`);
 				if (closing) return closing;
-				if (released) return;
+				if (released) return { ...released };
 				closed = true;
 				closing = (async () => {
 					if (!protocolCloseAttempted) {
@@ -607,17 +620,16 @@ export class SessionBroker {
 						this.emitRuntimeChange();
 						throw error;
 					}
-					if (protocolCloseError) {
-						this.runtimeErrors.set(ownedInstance.agentId, protocolCloseError instanceof Error ? protocolCloseError.message : String(protocolCloseError));
-						this.emitRuntimeChange();
-						throw protocolCloseError;
-					}
+					// A confirmed exit releases ownership even after a failed unbind or an earlier termination;
+					// the protocol failure is returned so the Team never records it as a clean close.
 					releaseOwnership();
 					this.runtimeErrors.delete(ownedInstance.agentId);
-					released = true;
+					released = protocolCloseError === undefined ? {}
+						: { protocolError: protocolCloseError instanceof Error ? protocolCloseError.message : String(protocolCloseError) };
 					this.emitRuntimeChange();
+					return { ...released };
 				})();
-				try { await closing; }
+				try { return await closing; }
 				catch (error) { closing = undefined; throw error; }
 			};
 			const handle: BrokeredTeamMemberHandle = {
@@ -642,6 +654,7 @@ export class SessionBroker {
 						}, "run");
 					} finally { activationInFlight = false; }
 				},
+				terminate: (error) => ownedProtocol.terminate(error),
 				close: closeHandle,
 			};
 			return handle;

@@ -52,7 +52,101 @@ function call(id, args) {
 	return { type: "toolCall", id, name: "team", arguments: args };
 }
 
-function actionFor(scenario, input, replies) {
+function actionFor(scenario, input, replies, turn) {
+	if (["pause-mixed", "revise-live", "cancel-live"].includes(scenario) && input.scope.kind === "management") {
+		const userCommand = input.scope.events.find((event) => event.kind === "USER_COMMAND");
+		if (userCommand) {
+			const completed = replies.some((reply) => reply.receipt?.status === "applied"
+				&& (reply.receipt.command === "pause_member" || reply.receipt.command === "resume_member"
+					|| reply.receipt.command === "revise_work" || reply.receipt.command === "cancel_work"));
+			if (completed) return [{ type: "text", text: `Host command processed: ${userCommand.message}` }];
+			if (scenario === "pause-mixed") {
+				const command = userCommand.message.includes("resume") ? "resume_member" : "pause_member";
+				return [call(`${command}-from-host`, { action: "control", command, memberId: "w1" })];
+			}
+			let hostIntent;
+			try { hostIntent = JSON.parse(userCommand.message); } catch { /* Fall back to a read-only work status lookup. */ }
+			if (scenario === "revise-live" && hostIntent?.command === "revise_work") return [call("revise-live-root", {
+				action: "control", command: "revise_work", workId: hostIntent.workId,
+				expectedRevision: hostIntent.expectedRevision, task: "revised root", inputRefs: [],
+			})];
+			if (scenario === "cancel-live" && hostIntent?.command === "cancel_work") return [call("cancel-live-root", {
+				action: "control", command: "cancel_work", workId: hostIntent.workId,
+				expectedRevision: hostIntent.expectedRevision, reason: "Host selected cancellation during the active tool.",
+			})];
+			const status = replies.find((reply) => reply.data?.view === "work");
+			if (!status) return [call("find-live-root", { action: "status", view: "work" })];
+			const target = status.data.items.find((item) => item.assignee === "w1" && item.state === "running");
+			if (!target) throw new Error(`No running W1 work for host decision: ${JSON.stringify(status.data)}`);
+			if (scenario === "revise-live") return [call("revise-live-root", {
+				action: "control", command: "revise_work", workId: target.work.workId,
+				expectedRevision: target.work.revision, task: "revised root", inputRefs: [],
+			})];
+			return [call("cancel-live-root", {
+				action: "control", command: "cancel_work", workId: target.work.workId,
+				expectedRevision: target.work.revision, reason: "Host selected cancellation during the active tool." ,
+			})];
+		}
+		if (input.scope.events.some((event) => event.kind === "ROOT_RESULT_READY")) {
+			const root = input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY");
+			if (!root?.work || !root.resultRef) throw new Error(`Manager did not receive a root result event: ${JSON.stringify(input.scope.events)}`);
+			if (scenario === "cancel-live") {
+				const status = replies.find((reply) => reply.data?.view === "work");
+				if (!status) return [call("status-roots-after-cancel", { action: "status", view: "work" })];
+				const reviewed = new Set(replies.filter((reply) => reply.receipt?.command === "accept_result"
+					&& (reply.receipt.status === "applied" || reply.receipt.status === "unchanged"))
+					.map((reply) => `${reply.receipt.work.workId}@${reply.receipt.work.revision}`));
+				const unreviewed = status.data.items.find((item) => !item.review
+					&& !reviewed.has(`${item.work.workId}@${item.work.revision}`));
+				if (unreviewed) {
+					const disposition = unreviewed.state === "resolved" ? "accepted" : "waived";
+					return [call(`review-${unreviewed.work.workId}`, {
+						action: "control", command: "accept_result", work: unreviewed.work, disposition,
+						...(disposition === "waived" ? { reason: "The selected root was cancelled." } : {}),
+					})];
+				}
+				return [call("close-after-cancel", {
+					action: "control", command: "close_team", resultRefs: [root.resultRef], outcome: "failed",
+					reason: "One selected root was cancelled; the unrelated root completed.",
+				})];
+			}
+			const accepted = replies.some((reply) => reply.receipt?.status === "applied" && reply.receipt.command === "accept_result");
+			return accepted ? [call("close-after-revision", {
+				action: "control", command: "close_team", resultRefs: [root.resultRef], outcome: "succeeded",
+			})] : [call("accept-after-revision", {
+				action: "control", command: "accept_result", work: root.work, disposition: "accepted",
+			})];
+		}
+		return [{ type: "text", text: `Manager checkpoint ${input.notice}` }];
+	}
+	if (scenario === "pause-mixed" && input.scope.kind === "work" && input.scope.task === "W1 root") {
+		if (turn === 1) return [
+			{ type: "toolCall", id: "pause-approved-bash", name: "bash", arguments: { command: "printf approved-before-pause" } },
+			{ type: "toolCall", id: "pause-blocked-bash", name: "bash", arguments: { command: "printf must-not-run" } },
+		];
+		return [call("reply-after-resume", { action: "reply", result: {
+			status: "succeeded", summary: "Completed after the parked provider gate resumed.",
+		} })];
+	}
+	if (scenario === "revise-live" && input.scope.kind === "work") {
+		if (input.scope.task === "W1 root" && turn === 1) return [
+			{ type: "toolCall", id: "revise-latched-bash", name: "bash", arguments: { command: "sleep 30; printf old-revision-finished" } },
+		];
+		if (input.scope.task === "revised root") return [call("reply-revised-root", { action: "reply", result: {
+			status: "succeeded", summary: "Revision two completed on the same W1 session.",
+		} })];
+	}
+	if (scenario === "hang-live" && input.scope.kind === "work" && input.scope.task === "W1 root" && turn === 1) return [
+		{ type: "toolCall", id: "hang-call", name: "team_v2_hang", arguments: {} },
+	];
+	if (scenario === "cancel-live" && input.scope.kind === "work") {
+		if (input.scope.task === "cancel target" && turn === 1) return [
+			{ type: "toolCall", id: "cancel-latched-bash", name: "bash", arguments: { command: "sleep 30; printf cancelled-tool-finished" } },
+		];
+		if (input.scope.task === "unrelated root") return [call("reply-unrelated-root", { action: "reply", result: {
+			status: "succeeded", summary: "Unrelated same-member root continued after cancellation cleanup.",
+		} })];
+	}
 	if (scenario === "close-mixed" && input.scope.kind === "management") {
 		if (replies.length === 0) return [
 			call("mixed-close-team", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "synthetic mixed batch" }),
@@ -63,6 +157,10 @@ function actionFor(scenario, input, replies) {
 	if (scenario === "close-loop") {
 		if (input.scope.kind === "management") {
 			const events = input.scope.events;
+			const hostPause = events.find((event) => event.kind === "USER_COMMAND" && event.message === "pause w1");
+			if (hostPause) return replies.some((reply) => reply.receipt?.command === "pause_member")
+				? [{ type: "text", text: "Paused w1 as requested by the host." }]
+				: [call("host-pause-w1", { action: "control", command: "pause_member", memberId: "w1" })];
 			if (events.some((event) => event.kind === "BOOT")) {
 				const accepted = replies.some((reply) => reply.receipt?.status === "accepted");
 				return accepted ? [call("boot-yield", { action: "yield" })]
@@ -135,6 +233,13 @@ export default function install(pi) {
 			return { content: [{ type: "text", text: "probe complete" }], details: { ok: true } };
 		},
 	});
+	if (process.env.TEAM_V2_SCENARIO === "hang-live") pi.registerTool({
+		name: "team_v2_hang", label: "Team v2 hang", description: "Local tool that ignores abort and never returns", parameters: Type.Object({}),
+		async execute() {
+			pi.appendEntry("team-v2-hang-started", { ok: true });
+			return await new Promise(() => undefined);
+		},
+	});
 	pi.registerProvider("rail-team-local", {
 		name: "Offline Team v2 probe", baseUrl: "offline://team-v2", apiKey: "synthetic-local-only", api: "rail-team-v2-local-api",
 		models: [{ id: "probe", name: "probe", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 128 }],
@@ -151,7 +256,7 @@ export default function install(pi) {
 			} else {
 				activation = latestActivation(context.messages);
 				const replies = teamReplies(context.messages, activation.index);
-				content = actionFor(scenario, activation.input, replies);
+				content = actionFor(scenario, activation.input, replies, turns);
 			}
 			const retry = scenario === "retry" && activation?.input.member.id === "w1" && turns === 1;
 			const inputTokens = scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1 ? 60000 : 1;

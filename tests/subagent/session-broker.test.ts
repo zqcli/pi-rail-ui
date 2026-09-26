@@ -223,6 +223,7 @@ function brokerOwnedV2Worker(sessionId: string, sessionFile: string, close: () =
 	const worker = new FakeWorker(sessionId, sessionFile) as FakeWorker & Required<Pick<SessionWorker, "openTeamMemberV2">>;
 	worker.openTeamMemberV2 = async (_binding, _onFailure): Promise<TeamMemberProtocolSession> => ({
 		runActivation: async () => undefined,
+		terminate: () => undefined,
 		close,
 	});
 	return worker;
@@ -271,7 +272,7 @@ test("Team v2 startup cancelled by broker shutdown retains the persistent sessio
 	worker.openTeamMemberV2 = async () => {
 		openingProtocol.resolve();
 		await releaseProtocol.promise;
-		return { runActivation: async () => undefined, close: async () => undefined };
+		return { runActivation: async () => undefined, terminate: () => undefined, close: async () => undefined };
 	};
 	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async () => worker });
 	try {
@@ -346,6 +347,66 @@ test("failed Team v2 binding keeps ownership until process exit, then permits an
 		for (let attempt = 0; attempt < 50 && broker.runtimeStatus(saved.agentId).phase !== "stopped"; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
 		const reopened = await broker.dispatch({ target: "member-a", task: "ordinary reopen after confirmed exit" });
 		assert.equal(reopened.instance.sessionId, saved.sessionId);
+	} finally {
+		exited.resolve();
+		await broker.shutdown();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("Team v2 terminated member with a confirmed exit releases ownership once and permits an explicit ordinary reopen", async () => {
+	const root = await mkdtemp(join(tmpdir(), "broker-team-v2-terminated-"));
+	const store = new MemoryInstanceStore();
+	const roster = new MemoryRoster();
+	const worker = brokerOwnedV2Worker("team-terminated", join(root, "member.jsonl"), async () => { throw new Error("Team v2 connection terminated"); });
+	let stopCalls = 0;
+	worker.stop = async () => { stopCalls++; };
+	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async (spec) => {
+		if (spec.mode === "new") return worker;
+		const saved = await store.get(spec.agentId);
+		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
+	} });
+	try {
+		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		await assert.rejects(broker.dispatch({ target: "member-a", task: "must not interleave" }), /active team operation/u);
+		const first = await handle.close();
+		assert.deepEqual(first, { protocolError: "Team v2 connection terminated" }, "released, but never reported as a clean close");
+		assert.deepEqual(await handle.close(), first, "a repeated cleanup returns the same fact");
+		assert.equal(stopCalls, 1, "no second stop or release");
+		assert.ok(await store.get(handle.instance.agentId), "the persistent descriptor/session history is kept");
+		assert.equal(roster.resolve("member-a"), handle.instance.agentId);
+		await assert.rejects(handle.runActivation({} as never, async () => ({ kind: "ack" }), () => undefined), /lifetime is closed/u,
+			"the released Team handle is never reused");
+		const reopened = await broker.dispatch({ target: "member-a", task: "explicit ordinary reopen" });
+		assert.equal(reopened.instance.sessionId, handle.instance.sessionId);
+	} finally {
+		await broker.shutdown();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("Team v2 unclean unbind with an unknown exit keeps ownership; a late exit releases only on an explicit retry", async () => {
+	const root = await mkdtemp(join(tmpdir(), "broker-team-v2-unknown-exit-"));
+	const store = new MemoryInstanceStore();
+	const roster = new MemoryRoster();
+	const exited = Promise.withResolvers<void>();
+	const worker = brokerOwnedV2Worker("team-unknown", join(root, "member.jsonl"), async () => { throw new Error("private unbind failed"); });
+	worker.stop = async () => { throw new RpcProcessExitTimeoutError("Team process exit unknown", exited.promise); };
+	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async (spec) => {
+		if (spec.mode === "new") return worker;
+		const saved = await store.get(spec.agentId);
+		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
+	} });
+	try {
+		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		await assert.rejects(handle.close(), /exit unknown/u);
+		await assert.rejects(broker.dispatch({ target: "member-a", task: "must not reopen" }), /active team operation/u);
+		exited.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		await assert.rejects(broker.dispatch({ target: "member-a", task: "late exit alone does not reopen" }), /active team operation/u);
+		assert.deepEqual(await handle.close(), { protocolError: "private unbind failed" }, "the retry releases on the real exit, still unclean");
+		const reopened = await broker.dispatch({ target: "member-a", task: "explicit ordinary reopen after confirmed exit" });
+		assert.equal(reopened.instance.sessionId, handle.instance.sessionId);
 	} finally {
 		exited.resolve();
 		await broker.shutdown();

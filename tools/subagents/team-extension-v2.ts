@@ -147,6 +147,11 @@ export default function install(pi: ExtensionAPI): void {
 		});
 	};
 
+	const acknowledgeToolResult = async (toolCallId: string, toolName: string, ctx: ExtensionContext): Promise<void> => {
+		const reply = await request({ action: "tool_result", toolCallId, toolName }, ctx);
+		if (reply.kind !== "ack") throw new Error("Team runtime returned an invalid tool-result acknowledgment");
+	};
+
 	const registerTeamTool = (): void => {
 		if (registered) return;
 		if (pi.getAllTools().some((tool) => tool.name === "team")) throw new Error("Conflicting team tool in Team v2 member session");
@@ -328,13 +333,30 @@ export default function install(pi: ExtensionAPI): void {
 		if (!active) return { block: true, reason: "Team tool use requires an active Team activation" };
 		if (event.toolName === "subagent" || event.toolName === "subagent_team") return { block: true, reason: "Team members cannot spawn subagents" };
 		try {
-			const reply = await request({ action: "tool_gate", toolName: event.toolName }, ctx, ctx.signal);
+			const reply = await request({ action: "tool_gate", toolCallId: event.toolCallId, toolName: event.toolName,
+				endIntent: event.toolName === "team" && isRecord(event.input) && isEndIntent(event.input) }, ctx, ctx.signal);
 			if (reply.kind !== "gate") return { block: true, reason: "Team runtime returned an invalid tool gate" };
-			if (!reply.decision.allow) return { block: true, reason: reply.decision.message };
+			if (!reply.decision.allow) {
+				try { await acknowledgeToolResult(event.toolCallId, event.toolName, ctx); }
+				catch (error) {
+					fail(ctx, error);
+					return { block: true, reason: error instanceof Error ? error.message : "Team tool-result acknowledgment failed" };
+				}
+				return { block: true, reason: reply.decision.message };
+			}
 		} catch (error) {
 			return { block: true, reason: error instanceof Error ? error.message : "Team tool gate failed" };
 		}
 		return undefined;
+	});
+
+	pi.on("tool_result", async (event, ctx) => {
+		if (!binding || !active) return;
+		try {
+			await acknowledgeToolResult(event.toolCallId, event.toolName, ctx);
+		} catch (error) {
+			fail(ctx, error);
+		}
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {

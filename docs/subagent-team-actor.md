@@ -1,8 +1,8 @@
 # Team Actor v2：协议与阶段性交接
 
-> **实施未完成，不是可发布的 Team 功能。** 当前代码完成了阶段 A 的纯状态机基础和阶段 B 的原生成员执行基础。阶段 C/D 被实施模型连接故障阻断。旧 `subagent_team` 入口尚未迁移，Broker 已拒绝旧 v1 dispatch，因此不能用旧 prepare/launch 示例运行本分支的 Team。
+> **底层 Runtime/driver 的 C1b 控制与安全结算已落地；Team 用户入口仍未迁移，不是可发布功能。** `TeamMemberDriver.launch` 现驱动完整 Team lifetime；旧 `subagent_team` 入口和 D 层父级 stop/delete/UI 路由尚未迁移，Broker 仍拒绝旧 v1 dispatch。
 >
-> 验证对象：代码提交 `9ccc1e8`；详细证据与 100 项验收映射见 [验证报告](subagent-team-actor-validation.md)。工作区规格 `pi-rail-ui-team-actor-development-spec.md` 是完整目标，本文不替代它，也不缩减其契约。
+> `pi-rail-ui-team-actor-development-spec.md` 是完整目标，本文不替代它，也不缩减其契约；C1b 的离线验证包括 Runtime/fake-latch、真实 Pi 合成 provider 与现有普通 subagent 回归。
 
 ## 对象和权威状态
 
@@ -58,7 +58,13 @@ work 必须有具体依赖，或使用 `attention` 与 checkpoint；不允许无
 {"action":"control","command":"close_team","resultRefs":["宿主返回的resultRef"],"outcome":"succeeded"}
 ```
 
-Manager-only 控制还包括修订、取消、验收、成员关闭。schema 已声明 pause/resume 等完整契约，但当前 Runtime 明确拒绝尚未实现的控制，不能因 schema 存在就声称可用。
+Manager-only 控制还包括 pause/resume、修订、取消、resume_work、验收和成员关闭。暂停只在 provider 安全点确认：已获准工具先完成，未获准工具被拒绝；native activation 停驻期间仍归原 WorkRef 所有并释放 worker permit。恢复先重新取得 permit，再放行同一有效 WorkRef；等待 permit 期间再次 pause 会撤销该恢复。不会解除依赖或预算 hold。已暂存的 reply/yield 在暂停请求下照常提交，不被中止。peer 等待仍必须显式 yield，不能用 pause 停驻。
+
+`resume_work` 与宿主 `release_hold` 只解除当前 WorkRef 上精确 incident 的 `attention`/`protocol` hold；`budget` 返回 `BUDGET_BLOCKED`，`manager_unavailable` 被拒绝；该版本仍有 native activation/settling 或旧清理未确认时拒绝；Manager 不可用时宿主也不能解除任何 hold，以免绕过故障安全暂停。所有拒绝在修改账本前完成。
+
+修订/取消（含宿主整队取消）先向 native 发送 activation-only abort，再等待 settled 与清理，不等待已获准工具自行结束；超过 `activationStopTimeoutMs` 仍未收敛时，driver 终止该成员的原生进程，由该次 send 以真实退出结果报告（确认退出为 faulted/released，未确认为 cleanup_failed 并保留所有权）。真实 provider error/length 优先于任何控制标志分类为 `native_failure`。close_team 已提交后的宿主取消保持关闭决定，不中止 Manager 的收尾，只为其加上同一停止期限。
+
+宿主另有非模型 HostControl：`cancel_team`、`release_hold`、`message_manager`，不会伪装成 Manager；预算 grant 留待后续阶段。
 
 ## 原生输入及提交边界
 
@@ -77,24 +83,22 @@ ACK 超时只约束私有命令，不给正常业务运行附加五秒期限。�
 
 ## 当前只可用于底层开发验证
 
-测试通过 `TeamRuntime.prepare`、`TeamMemberDriver.openMember`、`launch` 和逐次 `runNext` 验证基础协议。**目前 `launch` 不是规格要求的覆盖整个 Team 寿命的 Promise；测试手动 drain 不是事件驱动线上调度。** 不应将这些测试辅助调用包装成已完成的用户 API。
+`TeamMemberDriver.launch` 绑定全部 native member 后启动 Runtime effect drain，并返回等待已确认 Team 关闭/取消的 lifetime Promise；`runNext` 只保留为纯/手动测试 seam。宿主可通过非模型 `HostControl` 发起 `cancel_team`、`release_hold`、`message_manager`；Manager pause/resume、精确 `resume_work`、激活级取消/修订、deadline 和 Manager fault 停驻均由 Runtime 管理。
 
-参阅真实 Pi 合成 provider 测试：`tests/subagent/team-member-driver.test.ts`。测试 provider 从实际 native input 和工具历史生成应答；不需要外部真实模型 API。
+`TeamMemberDriver.stopTeam` 是 D 层可调用的有限停止接口。对已启动 lifetime 发起宿主取消；对尚未 launch 的 prepared Team 直接取消（不启动 provider、初始请求记为 cancelled），只关闭经 `claimNativeLifetime` 实际签发过的成员 lifetime（含仍在打开中的），未签发的成员不持有资源；关闭失败保留为 `cleanup_failed`，不报告虚假释放。取消后的 Team 不能再 launch 或打开新成员，需要新 prepare。成员 alias 对应的 persistent session/descriptor 在关闭后保留为历史，Broker 不允许新 Team 复用已有同名 session（固定新成员约束）；重新 prepare 时应选择新的 alias。
+
+Broker handle 的 `close()` 只在原生进程退出被确认后才释放 Team 所有权，并返回 `{ protocolError? }`：私有 unbind 失败或成员此前已被终止/transport 故障时，资源已释放但结果带 `protocolError`，Runtime 记为 faulted/released（close_team 期间 Team 为 failed），绝不记为正常 closed。退出未知时 `close()` 拒绝并保留所有权；迟到的退出只在下一次明确的清理重试（`TeamMemberDriver.close`/`closeMember`）时按事实释放，不自动重试或重开，driver 随即以 `TeamRuntime.memberExitConfirmed(binding)` 让 Runtime 从 `cleanup_failed` 更新为 `released`；该 API 只接受同一 lifetime 的 faulted 未知退出成员，不改变工作结果或 outcomeUnknown 记录。宿主取消/停止释放 faulted 成员仍持有的资源时，成员保持 `faulted`（资源为 `released`），不会改写为正常 `closed`。已确认退出的故障成员由 driver 立即释放 Broker 所有权（保留 session/descriptor 历史），此后只允许用户明确以普通 subagent 打开其历史，Team 不会复用该 handle；宿主取消不会对它再次执行关闭。`TeamMemberDriver.close()` 会取消仍 active 的已启动 Team 并等待 native cleanup。**目前 SessionBroker/root/UI 的 stop/delete/shutdown 尚未接到该路由**，不得直接操作 Team-owned native member；这是入口迁移剩余工作。
+
+真实 Pi 合成 provider 测试位于 `tests/subagent/team-member-driver.test.ts`，Responses WebSocket 合成测试位于 `tests/subagent/team-websocket-integration.test.ts`。它们使用本地离线 provider/loopback，不需要真实付费模型 API。
 
 ## 后续必须完成
 
-### C1：生命周期调度和控制
+### C1b 剩余边界
 
-- Runtime 唯一合并 effect drain；完整 launch 生命周期；关闭与 fault 清理自动接线。
-- pause/resume、修订与取消的受控停止分类；tool gate 精确绑定 native toolCallId。
-- Manager 事件优先级/批次/语义静止去重，Manager fault 的安全停驻。
-- Host cancel/message/release_hold，N03 八 worker 许可竞争、N10 writer 闭环。
+- D 层需将 Team-owned `stop/delete/shutdown` 路由到 `TeamMemberDriver.stopTeam`；该接口现有，但父级 lifecycle 和 UI 尚未接线。
 
-### C2：预算、结算与宿主边界
-
-- root/Team/activation 模型与工具累计计数、紧急管理额度及 Host grant。
-- 原生 usage 每 activation 累加一次，contextTokens 不作为累计消费。
-- 显式 deadline 执行、关键 result/close journal fail-closed 与 generation 失活。
+- Host budget grant API、预算增加/审计策略及全量 root/activation model/tool usage 计数仍未提供。budget hold 不能由 `resume_member`、`resume_work` 或 `release_hold` 隐式清除。
+- 旧 C1a validation report 属于此前阶段，不能代替本工作树的全量测试结果或视为剩余项已完成。
 
 ### D：入口及最终验收
 

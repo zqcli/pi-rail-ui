@@ -22,6 +22,7 @@ interface ActiveRun {
 	onRequest(frame: ChildRequestFrame, intentId?: string): Promise<PrivateReply>;
 	lastSequence: number;
 	stagedIntent?: { intentId: string; nativeToolCallId: string };
+	policyStopRequested: boolean;
 	started: boolean;
 	settled?: NativeCompletion;
 	lastTurn?: { message: unknown; toolResults: unknown[] };
@@ -108,12 +109,14 @@ function isStagedEndIntent(frame: ChildRequestFrame, reply: PrivateReply, intent
 function completionFor(run: ActiveRun): NativeCompletion {
 	const message = run.lastTurn?.message;
 	const stopReason = record(message) ? message["stopReason"] : undefined;
+	const nativeErrorMessage = record(message) && typeof message["errorMessage"] === "string" ? message["errorMessage"] : undefined;
+	const contextAbortAfterPolicyStop = run.policyStopRequested && stopReason === "error" && nativeErrorMessage === "This operation was aborted";
 	const finalCalls = toolCalls(message);
 	const finalResults = run.lastTurn?.toolResults ?? [];
 	const finalResultIds = new Set(finalResults.map(resultId).filter((id): id is string => id !== undefined));
 	const pendingToolCalls = finalCalls.some((call) => !finalResultIds.has(call.id));
 	let status: NativeCompletion["status"];
-	if (stopReason === "aborted") status = "aborted";
+	if (stopReason === "aborted" || contextAbortAfterPolicyStop) status = "aborted";
 	else if (stopReason === "error") status = "error";
 	else if (stopReason === "length") status = "length";
 	else if (stopReason === "stop" || stopReason === "toolUse") status = "success";
@@ -202,7 +205,7 @@ export class TeamRpcV2Connection {
 		// A transport request can fail before control reaches `await settled`; keep its rejection observed.
 		void settled.catch(() => undefined);
 		const run: ActiveRun = {
-			activation, onRequest, lastSequence: 0, started: false,
+			activation, onRequest, lastSequence: 0, started: false, policyStopRequested: false,
 			requests: new Map(), requestNativeToolCallIds: new Map(), nativeToolCalls: new Map(),
 			pendingNativeToolCalls: new Set(), claimedNativeToolCalls: new Set(), pendingRequests: 0,
 			resolveSettled, rejectSettled,
@@ -254,6 +257,11 @@ export class TeamRpcV2Connection {
 		await this.command({ version: 2, commandId: randomUUID(), operation: "deactivate", binding: this.binding, activation: activation.scope });
 		this.lastClosedScope = activation.scope;
 		this.run = undefined;
+	}
+
+	/** Fail closed and stop the process; a pending send rejects with the real stop/exit outcome. */
+	terminate(error: Error): void {
+		this.fail(error);
 	}
 
 	close(): Promise<void> {
@@ -470,6 +478,8 @@ export class TeamRpcV2Connection {
 		try {
 			const intentId = frame.request.action === "business" ? `team-intent-${frame.rpcRequestId}` : undefined;
 			const reply = await run.onRequest(frame, intentId);
+			if (frame.request.action === "provider_gate" && reply.kind === "gate" && !reply.decision.allow
+				&& reply.decision.reason === "policy_stop") run.policyStopRequested = true;
 			const stagedIntentId = isStagedEndIntent(frame, reply, intentId);
 			if (stagedIntentId) {
 				const nativeToolCallId = run.requestNativeToolCallIds.get(frame.rpcRequestId);

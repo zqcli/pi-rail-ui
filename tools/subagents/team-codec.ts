@@ -163,6 +163,15 @@ export function normalizeId(value: unknown, field: string): string {
 	return value;
 }
 
+/** Native provider tool-call IDs are opaque: preserve their exact text, with only bounded UTF-8 validation. */
+export function normalizeNativeToolCallId(value: unknown, field: string): string {
+	if (typeof value !== "string" || value.length === 0 || !value.isWellFormed()
+		|| Buffer.byteLength(value, "utf8") > TEAM_MAX_ID_LENGTH || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+		return protocol(`${field} is not a valid opaque native tool-call id`);
+	}
+	return value;
+}
+
 function safeInteger(value: unknown, field: string, min: number, max = Number.MAX_SAFE_INTEGER): number {
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
 		return invalid(`${field} must be an integer from ${min} to ${max}`);
@@ -396,8 +405,8 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
 		`Continue a ${view} page from its opaque cursor.`),
 	]),
-	controlAction("pause_member", { memberId: aliasSchema }, "Manager only: pause new activations for a worker."),
-	controlAction("resume_member", { memberId: aliasSchema }, "Manager only: clear a worker's manual pause; dependencies and budget holds remain."),
+	controlAction("pause_member", { memberId: aliasSchema }, "Manager only: prevent new worker side effects and park at the next provider-safe point; already approved tools and valid end intents may finish."),
+	controlAction("resume_member", { memberId: aliasSchema }, "Manager only: resume the same parked WorkRef after it reacquires a worker permit; dependencies and budget holds remain."),
 	controlAction("revise_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
 		inputRefs: Type.Optional(Type.Array(idSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
@@ -419,7 +428,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Manager only: close the Team after all roots and member resources are explicitly settled."),
 ]);
 
-export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or lets the Manager idle; status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result.";
+export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or lets the Manager idle; status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and Manager messages are separate host APIs, not model actions.";
 
 const LEGACY_ACTIONS: Record<string, string> = {
 	send: "send was replaced by request {to, task}; a reply never creates a new request",
@@ -621,9 +630,15 @@ function parsePrivateAction(value: unknown): PrivateAction {
 			frameKeys(value, ["action"], "provider_gate");
 			return { action: "provider_gate" };
 		case "tool_gate":
-			frameKeys(value, ["action", "toolName"], "tool_gate");
+			frameKeys(value, ["action", "toolCallId", "toolName", "endIntent"], "tool_gate");
+			if (typeof value["toolCallId"] !== "string") return protocol("tool_gate.toolCallId is invalid");
 			if (typeof value["toolName"] !== "string" || !value["toolName"] || value["toolName"].length > 128) return protocol("tool_gate.toolName is invalid");
-			return { action: "tool_gate", toolName: value["toolName"] };
+			if (typeof value["endIntent"] !== "boolean") return protocol("tool_gate.endIntent must be boolean");
+			return { action: "tool_gate", toolCallId: normalizeNativeToolCallId(value["toolCallId"], "tool_gate.toolCallId"), toolName: value["toolName"], endIntent: value["endIntent"] };
+		case "tool_result":
+			frameKeys(value, ["action", "toolCallId", "toolName"], "tool_result");
+			if (typeof value["toolName"] !== "string" || !value["toolName"] || value["toolName"].length > 128) return protocol("tool_result.toolName is invalid");
+			return { action: "tool_result", toolCallId: normalizeNativeToolCallId(value["toolCallId"], "tool_result.toolCallId"), toolName: value["toolName"] };
 		case "boundary":
 			frameKeys(value, ["action", "kind"], "boundary");
 			if (value["kind"] !== "turn_end" && value["kind"] !== "agent_end") return protocol("boundary.kind is invalid");
@@ -677,7 +692,7 @@ function parseGateDecision(value: unknown): GateDecision {
 	if (value["allow"]) { frameKeys(value, ["allow"], "gate decision"); return { allow: true }; }
 	frameKeys(value, ["allow", "reason", "message"], "gate decision");
 	const reason = value["reason"];
-	if (!["paused", "stale_scope", "budget", "activation_ending", "delivery_pending", "team_stopping"].includes(String(reason))) return protocol("gate reason is invalid");
+	if (!["paused", "stale_scope", "budget", "activation_ending", "delivery_pending", "team_stopping", "policy_stop"].includes(String(reason))) return protocol("gate reason is invalid");
 	let message: string;
 	try { message = text(value["message"], "gate.message", TEAM_MAX_NOTE_BYTES); }
 	catch { return protocol("gate message is invalid"); }
@@ -1062,10 +1077,12 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 		const events = array(rawScope["events"], "activation input events", TEAM_MAX_MANAGER_EVENT_BATCH).map((raw, index): ManagerEventView => {
 			const field = `activation input events[${index}]`;
 			if (!isRecord(raw)) return protocol(`${field} must be an object`);
-			frameKeys(raw, ["id", "kind", "message", "work", "memberId", "incidentId", "resultRef"], field);
+			frameKeys(raw, ["id", "kind", "message", "actor", "work", "memberId", "incidentId", "resultRef"], field);
 			if (!(MANAGER_EVENT_KINDS as readonly unknown[]).includes(raw["kind"])) return protocol(`${field}.kind is invalid`);
+			if (raw["actor"] !== undefined && (raw["actor"] !== "@host" || raw["kind"] !== "USER_COMMAND")) return protocol(`${field}.actor is only valid as @host on USER_COMMAND`);
 			return { id: frameId(raw["id"], `${field}.id`), kind: raw["kind"] as ManagerEventView["kind"],
 				message: text(raw["message"], `${field}.message`, TEAM_MAX_NOTE_BYTES),
+				...(raw["actor"] === "@host" ? { actor: "@host" as const } : {}),
 				...(raw["work"] !== undefined ? { work: normalizeWorkRef(raw["work"], `${field}.work`) } : {}),
 				...(raw["memberId"] !== undefined ? { memberId: normalizeAlias(raw["memberId"], `${field}.memberId`) } : {}),
 				...(raw["incidentId"] !== undefined ? { incidentId: frameId(raw["incidentId"], `${field}.incidentId`) } : {}),

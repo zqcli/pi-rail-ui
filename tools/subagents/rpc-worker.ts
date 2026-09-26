@@ -487,6 +487,7 @@ export class RpcSessionWorker implements SessionWorker {
 					this.runInFlight = false;
 				}
 			},
+			terminate: (error) => connection.terminate(error),
 			close: async () => {
 				if (this.teamSession !== session) return;
 				try { await connection.close(); }

@@ -367,6 +367,12 @@ export class SessionBroker {
 		this.aliasLeaseManager = options.aliasLeaseManager;
 	}
 
+	/** Diagnostic: Team-owned member aliases (owners are released only after a confirmed native exit). */
+	teamOwnedAliases(teamId?: string): string[] {
+		return [...this.teamMemberHandles.values()].filter((owned) => teamId === undefined || owned.teamId === teamId)
+			.map((owned) => owned.alias).sort();
+	}
+
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");

@@ -49,6 +49,7 @@ const EXPECTED_COMMANDS = [
 	"rail-ui",
 ];
 const TEAM_COMMAND = "rail-subagent-team-protocol";
+const TEAM_PRIVATE_ENTRY_TYPE = "rail-subagent-team-protocol-v2";
 const OBSERVE_COMMAND = "pi087-observe-registrations";
 
 interface ObservedRegistrations {
@@ -121,9 +122,10 @@ function assertBoundTeamHelper(observed: ObservedRegistrations): void {
 	assert.equal(observed.activeTools.includes("subagent"), false);
 	assert.equal(observed.activeTools.includes("subagent_team"), false);
 	const team = observedTool(observed, "team");
-	assert.deepEqual(observedEnum(team, "action"), ["send", "report", "wait", "control", "finish"]);
-	assert.match(team.description, /sole tool call/u);
-	assert.match(team.description, /finish is intent, not a terminal result/u);
+	const actions = (team.parameters["anyOf"] as any[] | undefined)?.map((branch) => branch?.properties?.action?.const);
+	assert.deepEqual([...new Set(actions)].sort(), ["control", "reply", "request", "status", "yield"], "the child helper registers only the v2 action union");
+	assert.match(team.description, /reply, yield, and close_team must be the only tool call in their finalized assistant batch/u);
+	assert.match(team.description, /Team v2 work ledger/u);
 }
 
 function assertUnboundTeamHelper(observed: ObservedRegistrations): void {
@@ -143,13 +145,15 @@ async function runTeamHelperProbe(
 	cli: string,
 	label: string,
 ): Promise<void> {
-	const helperPath = join(cases.installation, "tools/subagents/team-extension.ts");
+	const helperPath = join(cases.installation, "tools/subagents/team-extension-v2.ts");
 	const observerPath = join(cases.installation, "tests/fixtures/pi087-registration-observer.ts");
 	const startupPath = join(cases.root, `team-helper-${label}-startup.json`);
 	const boundPath = join(cases.root, `team-helper-${label}-bound.json`);
 	const unboundPath = join(cases.root, `team-helper-${label}-unbound.json`);
-	const binding = { version: 1, teamId: "native-loader-team", memberId: "B1", role: "worker", epoch: "native-loader-epoch" };
-	const command = (operation: "bind" | "unbind", commandId: string) => `/${TEAM_COMMAND} ${JSON.stringify({ version: 1, commandId, operation, binding })}`;
+	const binding = { version: 2, teamId: "native-loader-team", memberId: "B1", role: "worker", epoch: "native-loader-epoch" };
+	const command = (operation: "bind" | "unbind", commandId: string) => `/${TEAM_COMMAND} ${JSON.stringify({
+		version: 2, commandId, operation, binding, ...(operation === "bind" ? { loadout: { role: "worker", teamTool: true } } : {}),
+	})}`;
 	const result = await runRpcSequence(process.execPath, [cli, ...extensionArgs(helperPath, observerPath)], {
 		HOME: cases.home,
 		PI_CODING_AGENT_DIR: cases.agentDir,
@@ -170,7 +174,7 @@ async function runTeamHelperProbe(
 	const initialCommands = (((result.responses[0]!["data"] as { commands?: any[] } | undefined)?.commands) ?? []);
 	const protocolCommand = initialCommands.find((candidate: any) => candidate.name === TEAM_COMMAND);
 	assert.equal(protocolCommand?.source, "extension", `${label} helper must register the private native command`);
-	assert.equal(protocolCommand?.description, "Rail private team protocol v1");
+	assert.equal(protocolCommand?.description, "Rail private team protocol v2");
 	const startup = await readJson<ObservedRegistrations>(startupPath);
 	assert.equal(startup.phase, "session_start");
 	assert.equal(startup.tools.includes("team"), false, `${label} helper must remain inert before binding`);
@@ -179,7 +183,7 @@ async function runTeamHelperProbe(
 	const boundEntries = ackEntries(result.responses[3]!);
 	const unboundEntries = ackEntries(result.responses[6]!);
 	for (const entries of [boundEntries, unboundEntries]) {
-		assert.ok(entries.some((entry) => entry.type === "custom" && entry.customType === TEAM_COMMAND
+		assert.ok(entries.some((entry) => entry.type === "custom" && entry.customType === TEAM_PRIVATE_ENTRY_TYPE
 			&& entry.data?.kind === "ack" && entry.data?.ok === true), `${label} helper must persist an application ACK in native entries`);
 	}
 }
@@ -288,7 +292,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	const sdkHelperOutputPath = join(cases.root, "sdk-team-helper.json");
 	const sdkHelper = await runChild(process.execPath, [join(cases.installation, "tests/fixtures/pi087-sdk-loader.mjs")], {
 		...baseEnv,
-		PI_RAIL_SDK_INDEX: join(cases.installation, "tools/subagents/team-extension.ts"),
+		PI_RAIL_SDK_INDEX: join(cases.installation, "tools/subagents/team-extension-v2.ts"),
 		PI_RAIL_SDK_RUNTIME_ENTRY: runtimeEntry(runtime),
 		PI_RAIL_SDK_CWD: cases.root,
 		PI_RAIL_SDK_AGENT_DIR: cases.agentDir,

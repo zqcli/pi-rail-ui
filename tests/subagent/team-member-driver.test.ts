@@ -50,9 +50,10 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete",
-	open: readonly string[] = ["lead", "w1", "w2"], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}) {
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer",
+	open?: readonly string[], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}, workerCount = 2, childTeamExtension?: string) {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
+	const workerIds = Array.from({ length: workerCount }, (_value, index) => `w${index + 1}`);
 	await writeFile(join(root, "settings.json"), JSON.stringify({
 		compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 1 },
 		retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 },
@@ -65,6 +66,11 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 		const modelIndex = args.indexOf("--model");
 		if (modelIndex < 0) throw new Error("Worker args omitted the model");
 		args.splice(modelIndex, 0, "-e", PROVIDER);
+		if (childTeamExtension) {
+			const teamExtension = args.findIndex((arg) => arg.endsWith("team-extension-v2.ts"));
+			if (teamExtension < 0) throw new Error("Team worker args omitted the v2 extension");
+			args[teamExtension] = childTeamExtension;
+		}
 		const transport = new PiRpcProcessTransport({
 			command: process.execPath,
 			args: [CLI, "--offline", "--no-extensions", "--session-dir", sessionDir, ...args],
@@ -86,13 +92,11 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 	const runtime = new TeamRuntime(runtimeOptions);
 	const prepared = runtime.prepare({
 		manager: { alias: "lead", roleDescription: "Review Team outcomes.", model: "rail-team-local/probe", cwd: root, fastMode: false },
-		workers: [
-			{ alias: "w1", roleDescription: "Handle W1's assigned work and answer peer questions.", model: "rail-team-local/probe", cwd: root, fastMode: false,
-				...(scenario === "compaction" ? { contextWindow: 64000 } : {}) },
-			{ alias: "w2", roleDescription: "Handle W2's assigned work and ask W1 for independent facts.", model: "rail-team-local/probe", cwd: root, fastMode: false },
-		],
+		workers: workerIds.map((alias) => ({ alias, roleDescription: `Handle ${alias}'s assigned work and answer peer questions.`, model: "rail-team-local/probe", cwd: root, fastMode: false,
+			...((scenario === "compaction" || scenario === "n06-context-edit") && alias === "w1" ? { contextWindow: 64000 } : {}) })),
 		brief: { goal: "Verify same-session Team v2 activation and result settlement." },
 		initialRequests: scenario === "close-loop" || scenario === "close-mixed" ? []
+			: scenario === "n01-role-only" ? [{ to: "w1", task: "N01 initial review", inputRefs: [] }]
 			: scenario === "cancel-live" ? [
 				{ to: "w1", task: "cancel target", inputRefs: [] },
 				{ to: "w1", task: "unrelated root", inputRefs: [] },
@@ -101,7 +105,10 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 				{ to: "w1", task: "stop target", inputRefs: [] },
 				{ to: "w2", task: "unrelated root", inputRefs: [] },
 			]
-			: [{ to: "w1", task: scenario === "mixed-end" ? "N04 mixed end" : "W1 root", inputRefs: [] }],
+			// Four roots take every worker permit before the eighth worker's root is queued behind them.
+			: scenario === "n03-eight" ? ["w1", "w2", "w3", "w4", "w8"].map((to) => ({ to, task: to === "w8" ? "N03 root 8 barrier" : `N03 root ${to}`, inputRefs: [] }))
+			: scenario === "n10-writer" ? [{ to: "w1", task: "N10 initial reviewer", inputRefs: [] }]
+			: [{ to: "w1", task: scenario === "mixed-end" ? "N04 mixed end" : scenario === "n06-context-edit" ? "N06 root" : "W1 root", inputRefs: [] }],
 		timeoutSeconds: null,
 	});
 	const driver = new TeamMemberDriver(runtime, broker);
@@ -113,7 +120,7 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 		try { await rm(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
 		if (failures.length) throw new AggregateError(failures, "Team driver harness cleanup failed");
 	});
-	for (const memberId of open) {
+	for (const memberId of open ?? ["lead", ...workerIds]) {
 		handles.set(memberId, await driver.openMember({ teamId: prepared.teamId, memberId, model: MODEL, cwd: root }));
 	}
 	return { root, runtime, teamId: prepared.teamId, driver, handles, broker, store, plan: prepared };
@@ -135,6 +142,24 @@ async function waitUntil(predicate: () => boolean, description: string): Promise
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`Timed out waiting for ${description}`);
+}
+
+/** Record every Runtime state change of one Team and check the full invariant set at each one. */
+function observeTeam(t: { after(fn: () => void): void }, runtime: TeamRuntime, teamId: string, onView: (view: ReturnType<TeamRuntime["getTeam"]>) => void = () => undefined) {
+	const failures: unknown[] = [];
+	const unsubscribe = runtime.onChange((changedTeamId) => {
+		if (changedTeamId !== teamId) return;
+		try {
+			runtime.assertInvariants(teamId);
+			onView(runtime.getTeam(teamId));
+		} catch (error) { failures.push(error); }
+	});
+	t.after(unsubscribe);
+	return { failures, unsubscribe };
+}
+
+function providerCalls(entries: any[]): any[] {
+	return entries.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider");
 }
 
 function routeBrokerMemberLifecycle(broker: SessionBroker, driver: TeamMemberDriver): void {
@@ -1302,4 +1327,204 @@ test("normal Team close preserves the native session and descriptor for ordinary
 	const provider = after.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider").at(-1)!;
 	assert.equal(provider.data.teamCalls, 0, "ordinary reopen has no live Team tool loadout");
 	assert.equal(runtime.getTeam(teamId).lifecycle, "active", "Stage B resource close does not invent a Team close decision");
+});
+const V1_CHILD = fileURLToPath(new URL("../fixtures/team-v1-child.mjs", import.meta.url));
+
+/** Event-driven wait on Runtime changes; the outer bound only turns a hang into a diagnosable failure. */
+function waitForTeam(runtime: TeamRuntime, teamId: string, predicate: () => boolean, description: string, timeoutMs = 60000): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		let unsubscribe: () => void = () => undefined;
+		const timer = setTimeout(() => {
+			unsubscribe();
+			reject(new Error(`Timed out waiting for ${description}: ${JSON.stringify(runtime.getTeam(teamId).works)}`));
+		}, timeoutMs);
+		const check = () => {
+			if (!predicate()) return;
+			clearTimeout(timer);
+			unsubscribe();
+			resolve();
+		};
+		unsubscribe = runtime.onChange((changedTeamId) => { if (changedTeamId === teamId) check(); });
+		check();
+	});
+}
+
+/** Nothing is running, reserved, queued, or waiting as an undelivered Manager event. */
+function quiescent(runtime: TeamRuntime, teamId: string): boolean {
+	const effects = runtime.liveEffects(teamId);
+	return runtime.getTeam(teamId).members.every((member) => member.activity === "idle")
+		&& effects.activeActivations === 0 && effects.ready === 0 && effects.unprocessedManagerEvents === 0;
+}
+
+async function sessionEntries(handle: { instance: AgentInstance }): Promise<any[]> {
+	try { return parseSession(await readFile(handle.instance.sessionFile, "utf8")); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+}
+
+/** U10: after the Team lifetime settles, no Runtime effect, driver lifetime or Broker owner remains. */
+function assertConverged(runtime: TeamRuntime, driver: TeamMemberDriver, broker: SessionBroker, teamId: string): void {
+	assert.deepEqual(runtime.liveEffects(teamId), {
+		executor: false, scheduledDrain: false, closingEffects: 0, completionWaiters: 0, deadlineTimer: false,
+		activeActivations: 0, stopTimers: 0, ready: 0, unprocessedManagerEvents: runtime.liveEffects(teamId).unprocessedManagerEvents,
+	});
+	assert.deepEqual(driver.liveLifetimes(teamId), [], "the driver holds no member lifetime, open or activation");
+	assert.deepEqual(broker.teamOwnedAliases(teamId), [], "every Broker owner was released after a confirmed exit");
+	assert.ok(runtime.getTeam(teamId).members.every((member) => member.resourceState === "released" && member.activity === "idle"));
+}
+
+test("N01 real Pi: BOOT and initial work run while a role-only writer receives no placeholder provider request", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n01-role-only");
+	const observed = observeTeam(t, runtime, teamId);
+	const lifetime = driver.launch(teamId);
+	await waitForTeam(runtime, teamId, () => runtime.getTeam(teamId).works.resolved === 1 && quiescent(runtime, teamId), "N01 quiescence");
+
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.lifecycle, "active", "all-idle is not completion or failure");
+	const writer = team.members.find((member) => member.id === "w2")!;
+	assert.deepEqual([writer.lifecycle, writer.activity, writer.resourceState, writer.usage.turns], ["open", "idle", "owned", 0]);
+	const writerEntries = await sessionEntries(handles.get("w2")!);
+	assert.equal(providerCalls(writerEntries).length, 0, "the role-only writer had no placeholder provider call");
+	assert.equal(writerEntries.map(promptInput).filter(Boolean).length, 0, "the role-only writer received no activation input");
+	const reviewer = runtime.getWork(teamId, runtime.listWorks(teamId)[0]!.work)!;
+	assert.equal(reviewer.current.state, "resolved");
+	assert.equal(runtime.getResult(teamId, reviewer.current.resultRef!)?.source, "explicit_reply");
+	const managerInputs = (await sessionEntries(handles.get("lead")!)).map(promptInput).filter(Boolean);
+	assert.equal(managerInputs[0]?.scope.kind, "management");
+	assert.ok(managerInputs[0].scope.events.some((event: any) => event.kind === "BOOT"), "the Manager's first input is the BOOT event from the shared brief");
+	assert.ok(managerInputs[0].roster.some((member: any) => member.id === "w2"), "the fixed roster including the role-only writer is visible at BOOT");
+
+	runtime.hostControl(teamId).cancel_team("N01 verified");
+	const result = await lifetime;
+	assert.equal(result.lifecycle, "cancelled");
+	assert.deepEqual(observed.failures, []);
+	assertConverged(runtime, driver, broker, teamId);
+});
+
+test("N03 real Pi: four workers yielding for the eighth free their permits, the eighth runs, and the Manager never uses a worker permit", { timeout: 180000 }, async (t) => {
+	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n03-eight", undefined, {}, 8);
+	let maxRunningWorkers = 0;
+	let maxWorkersBesideManager = 0;
+	let blockedWhenEighthStarted: number | undefined;
+	const observed = observeTeam(t, runtime, teamId, (view) => {
+		const running = view.members.filter((member) => member.role === "worker" && member.activity !== "idle").length;
+		maxRunningWorkers = Math.max(maxRunningWorkers, running);
+		if (view.members.find((member) => member.role === "manager")!.activity !== "idle") maxWorkersBesideManager = Math.max(maxWorkersBesideManager, running);
+		if (blockedWhenEighthStarted === undefined && view.members.find((member) => member.id === "w8")!.activity !== "idle") blockedWhenEighthStarted = view.works.blocked;
+	});
+	const lifetime = driver.launch(teamId);
+	await waitForTeam(runtime, teamId, () => runtime.getTeam(teamId).works.resolved === 5 && quiescent(runtime, teamId), "N03 completion", 150000);
+
+	assert.equal(maxRunningWorkers, 4, "all four worker permits were used and never exceeded");
+	assert.equal(maxWorkersBesideManager, 4, "the Manager ran on its own permit while four workers held theirs");
+	assert.ok((blockedWhenEighthStarted ?? 0) >= 1, "the eighth worker started only after a yielded worker released its permit");
+	const eighthInputs = (await sessionEntries(handles.get("w8")!)).map(promptInput).filter(Boolean);
+	assert.equal(eighthInputs.length, 1);
+	for (const memberId of ["w1", "w2", "w3", "w4"]) {
+		const inputs = (await sessionEntries(handles.get(memberId)!)).map(promptInput).filter(Boolean);
+		assert.equal(inputs.length, 2, `${memberId} yielded, then resumed in the same native session`);
+		assert.equal(inputs[1].scope.work.workId, inputs[0].scope.work.workId);
+		assert.equal(inputs[1].scope.checkpoint, "Waiting for the eighth worker's explicit result.");
+		assert.equal(inputs[1].outcomes[0]?.state, "resolved");
+	}
+	for (const memberId of ["w5", "w6", "w7"]) assert.equal(providerCalls(await sessionEntries(handles.get(memberId)!)).length, 0);
+
+	runtime.hostControl(teamId).cancel_team("N03 verified");
+	await lifetime;
+	assert.deepEqual(observed.failures, []);
+	assertConverged(runtime, driver, broker, teamId);
+});
+
+test("N06 real Pi: after a canonical context_edit and threshold compaction the current WorkRef, checkpoint and resultRef continue without reviving the deleted input", { timeout: 120000 }, async (t) => {
+	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n06-context-edit");
+	const observed = observeTeam(t, runtime, teamId);
+	const lifetime = driver.launch(teamId);
+	await waitForTeam(runtime, teamId, () => runtime.getTeam(teamId).works.resolved === 2 && quiescent(runtime, teamId), "N06 completion");
+
+	const entries = await sessionEntries(handles.get("w1")!);
+	const activationEntries = entries.filter((entry) => promptInput(entry)?.scope.kind === "work");
+	assert.equal(activationEntries.length, 2);
+	const [firstEntry, secondEntry] = activationEntries;
+	const first = promptInput(firstEntry);
+	const second = promptInput(secondEntry);
+	const editIndex = entries.findIndex((entry) => entry.type === "context_edit" && entry.targetId === firstEntry.id && entry.replacement === null);
+	assert.ok(editIndex > entries.indexOf(firstEntry), "the first activation input was explicitly removed by a canonical context_edit");
+	assert.ok(editIndex < entries.indexOf(secondEntry));
+	const compactionIndex = entries.findIndex((entry, index) => index > editIndex && entry.type === "compaction");
+	assert.ok(compactionIndex > entries.indexOf(secondEntry), "native threshold compaction ran inside the resumed activation");
+	const compactionRecord = entries.find((entry, index) => index > editIndex && entry.type === "custom" && entry.customType === "team-v2-compaction");
+	assert.equal(compactionRecord.data.summarizedDeliveryIds.includes(first.deliveryId), false, "compaction never received the removed input");
+	assert.ok(compactionRecord.data.summarizedDeliveryIds.includes(second.deliveryId), "the current input itself was compacted away from the verbatim context");
+	const laterCalls = providerCalls(entries).filter((entry) => entries.indexOf(entry) > editIndex);
+	assert.ok(laterCalls.some((entry) => entries.indexOf(entry) > compactionIndex), "the activation continued after compaction");
+	for (const call of laterCalls) assert.equal(JSON.stringify(call.data.messages).includes(first.deliveryId), false, "no later provider input revives the removed body");
+	assert.ok(entries.includes(firstEntry), "explicit context removal does not delete the raw session history");
+
+	assert.equal(second.scope.work.workId, first.scope.work.workId);
+	assert.equal(second.scope.checkpoint, "Waiting for the peer verification result.");
+	const child = runtime.getWork(teamId, second.outcomes[0].work)!;
+	assert.equal(second.outcomes[0].resultRef, child.current.resultRef);
+	const root = runtime.getWork(teamId, second.scope.work)!;
+	assert.equal(root.current.state, "resolved");
+	const rootResult = runtime.getResult(teamId, root.current.resultRef!)!;
+	assert.equal(rootResult.source, "explicit_reply");
+	assert.match(rootResult.result.summary, /Canonical peer result: the requested verification passed/u);
+
+	runtime.hostControl(teamId).cancel_team("N06 verified");
+	await lifetime;
+	assert.deepEqual(observed.failures, []);
+	assertConverged(runtime, driver, broker, teamId);
+});
+
+test("N10/U10 real Pi: the writer asks an idle reviewer in its same session, the Manager closes on the writer's result without a summary, and all resources converge", { timeout: 120000 }, async (t) => {
+	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n10-writer");
+	const observed = observeTeam(t, runtime, teamId);
+	const reviewerSession = handles.get("w1")!.instance.sessionId;
+	const result = await driver.launch(teamId);
+
+	assert.equal(result.lifecycle, "closed", JSON.stringify(result));
+	assert.equal(result.outcome, "succeeded");
+	assert.equal(result.finalResultRefs.length, 1);
+	const report = runtime.getResult(teamId, result.finalResultRefs[0]!)!;
+	assert.equal(report.author, "w2", "the final artifact is the writer's committed result");
+	assert.match(report.result.summary, /^Writer report incorporates the review and idle-reviewer confirmation /u);
+	assert.equal(result.roots.length, 2);
+	assert.ok(result.roots.every((root) => root.state === "resolved" && root.review?.disposition === "accepted"));
+
+	const followUp = runtime.listWorks(teamId).find((work) => work.taskPreview === "N10 idle reviewer follow-up")!;
+	assert.equal(followUp.assignee, "w1");
+	assert.equal(runtime.getWork(teamId, followUp.work)!.parent?.workId, report.work.workId, "the follow-up is an owned child of the writer's work");
+	const reviewerInputs = (await sessionEntries(handles.get("w1")!)).map(promptInput).filter(Boolean);
+	assert.deepEqual(reviewerInputs.map((input) => input.scope.task), ["N10 initial reviewer", "N10 idle reviewer follow-up"]);
+	assert.equal(handles.get("w1")!.instance.sessionId, reviewerSession, "the idle reviewer answered in its original native session");
+
+	const managerEntries = await sessionEntries(handles.get("lead")!);
+	const closeResult = managerEntries.findIndex((entry) => entry.type === "message" && entry.message?.role === "toolResult"
+		&& entry.message.toolCallId === "n10-close-from-writer" && entry.message.isError !== true);
+	assert.ok(closeResult > 0, "the Manager's close_team was a successful native tool result");
+	assert.equal(providerCalls(managerEntries).filter((entry) => managerEntries.indexOf(entry) > closeResult).length, 0,
+		"no provider request follows close_team, so the Manager never writes a second summary");
+	const managerTexts = managerEntries.filter((entry) => entry.type === "message" && entry.message?.role === "assistant")
+		.map((entry) => messageText(entry.message)).filter((text) => text.trim());
+	assert.ok(managerTexts.every((text) => text === "Manager is waiting for a root result."), `Manager wrote no report: ${JSON.stringify(managerTexts)}`);
+	const lastManagerAssistant = managerEntries.filter((entry) => entry.type === "message" && entry.message?.role === "assistant").at(-1)!;
+	assert.deepEqual(lastManagerAssistant.message.content.map((part: any) => part.type === "toolCall" ? part.arguments.command : part.type), ["close_team"]);
+
+	assert.deepEqual(observed.failures, []);
+	assertConverged(runtime, driver, broker, teamId);
+});
+
+test("P01 real Pi: a v2 parent refuses a child exposing only the v1 Team command before any command, prompt or provider call", { timeout: 60000 }, async (t) => {
+	const { runtime, teamId, driver, broker, root } = await createHarness(t, "n02", [], {}, 2, V1_CHILD);
+	await assert.rejects(driver.openMember({ teamId, memberId: "w1", model: MODEL, cwd: root }), /Missing, conflicting or incompatible Team v2 command/u);
+	await assert.rejects(readFile(join(root, "p01-v1-child-activity.log"), "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+		"the v1 child never received a Team command, native prompt or provider request");
+	assert.deepEqual(driver.liveLifetimes(teamId), []);
+	assert.deepEqual(broker.teamOwnedAliases(teamId), [], "a refused handshake keeps no Team owner");
+	assert.equal(runtime.getTeam(teamId).lifecycle, "prepared", "no Team is launched past a refused member handshake");
+	const cancelled = await driver.stopTeam(teamId, "P01 handshake refused");
+	assert.equal(cancelled.lifecycle, "cancelled");
+	assert.equal(cancelled.usage.turns, 0);
 });

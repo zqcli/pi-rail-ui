@@ -12,6 +12,8 @@ import {
 export const LEGACY_TEAM_HISTORY_TYPE = "rail-subagent-team";
 
 const LEGACY_TERMINAL = ["completed", "failed", "cancelled", "interrupted"] as const;
+/** Retired v1 phases that had no terminal record; they are displayed as interrupted, never resumed. */
+const LEGACY_UNFINISHED = ["prepared", "running", "finalizing"] as const;
 const MAX_HISTORY_RESULTS = 16_384;
 
 /**
@@ -265,7 +267,7 @@ function applyLegacySnapshot(teams: Map<string, TeamHistoryEntry>, data: unknown
 	if (!teamId || !manager || !Array.isArray(rawWorkers) || typeof phase !== "string") return false;
 	const existing = teams.get(teamId);
 	if (existing && existing.version !== 1) return false;
-	if (!(LEGACY_TERMINAL as readonly string[]).includes(phase) && phase !== "prepared" && phase !== "active" && phase !== "closing") return false;
+	if (!(LEGACY_TERMINAL as readonly string[]).includes(phase) && !(LEGACY_UNFINISHED as readonly string[]).includes(phase)) return false;
 	const workers = rawWorkers.map((item, index) => normalizeAlias(item, `legacy.workers[${index}]`));
 	if (workers.length < 1 || workers.length > TEAM_MAX_WORKERS || new Set([manager, ...workers]).size !== workers.length + 1) return false;
 	teams.set(teamId, {

@@ -205,6 +205,13 @@ export class TeamMemberDriver {
 		return this.trackLifetime(this.preparedStops, teamId, detach);
 	}
 
+	/** Diagnostic: member lifetimes of one Team this driver still holds, is opening, or is running. */
+	liveLifetimes(teamId: string): string[] {
+		const prefix = key(teamId, "");
+		return [...new Set([...this.members.keys(), ...this.opening.keys(), ...this.runningMembers])]
+			.filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length)).sort();
+	}
+
 	/** Runtime alone selects the next activation; this driver only performs the native effect. */
 	async runNext(teamId: string, options: { signal?: AbortSignal } = {}): Promise<TeamActivationRun | undefined> {
 		if (options.signal?.aborted) return undefined;

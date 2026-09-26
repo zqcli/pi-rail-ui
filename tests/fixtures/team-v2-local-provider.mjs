@@ -14,11 +14,16 @@ function latestActivation(messages) {
 		const message = messages[index];
 		const text = messageText(message);
 		let input;
+		let compacted = false;
 		try { input = JSON.parse(text); } catch {
-			const compacted = text.match(/TEAM_V2_ACTIVATION_INPUT:(\{[^\n]+\})/u)?.[1];
-			if (!compacted) continue;
-			input = JSON.parse(compacted);
+			// A native compaction summary (written by this fixture's deterministic summarizer from the
+			// actual messages Pi selected for summarization) is ordinary provider input text.
+			const summarized = text.match(/TEAM_V2_ACTIVATION_INPUT:(\{[^\n]+\})/u)?.[1];
+			if (!summarized) continue;
+			input = JSON.parse(summarized);
+			compacted = true;
 		}
+		if (compacted) return { input, index, triggerIndex: undefined, compacted };
 		if (input?.version !== 2 || typeof input.deliveryId !== "string" || !input.scope) continue;
 		if (message?.role === "user" && messageText(message) === JSON.stringify(input)) {
 			const trigger = messages[index - 1];
@@ -33,19 +38,32 @@ function latestActivation(messages) {
 }
 
 function teamReplies(messages, activationIndex) {
-	const replies = messages.slice(activationIndex + 1).filter((message) => message?.role === "toolResult" && message.toolName === "team").map((message) => {
+	const summarized = messageText(messages[activationIndex]).match(/TEAM_V2_TOOL_REPLIES:(\[[^\n]*\])/u)?.[1];
+	const replies = summarized ? JSON.parse(summarized) : [];
+	return [...replies, ...messages.slice(activationIndex + 1).filter((message) => message?.role === "toolResult" && message.toolName === "team").map((message) => {
 		const text = messageText(message);
 		if (!text) return undefined;
 		try { return JSON.parse(text); } catch { return { toolError: text }; }
-	}).filter(Boolean);
-	for (const message of messages) {
-		const text = messageText(message);
-		const compacted = text.match(/TEAM_V2_TOOL_REPLIES:(\[[^\n]*\])/u)?.[1];
-		if (compacted) {
-			try { replies.push(...JSON.parse(compacted)); } catch { /* Leave malformed native summary for the test assertion. */ }
-		}
+	}).filter(Boolean)];
+}
+
+/** Deterministic stand-in for an LLM summarizer: it keeps only what Pi handed it for summarization. */
+function compactionSummary(preparation) {
+	const messages = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+	let index = -1;
+	let input;
+	for (let candidate = messages.length - 1; candidate >= 0 && !input; candidate--) {
+		try {
+			const value = JSON.parse(messageText(messages[candidate]));
+			if (value?.version === 2 && value.scope) { input = value; index = candidate; }
+		} catch { /* Not an activation input. */ }
 	}
-	return replies;
+	const replies = messages.slice(index + 1).filter((message) => message?.role === "toolResult" && message.toolName === "team").map((message) => {
+		try { return JSON.parse(messageText(message)); } catch { return undefined; }
+	}).filter(Boolean);
+	return input
+		? `Team v2 native compaction checkpoint.\nTEAM_V2_ACTIVATION_INPUT:${JSON.stringify(input)}\nTEAM_V2_TOOL_REPLIES:${JSON.stringify(replies)}`
+		: "Team v2 native compaction checkpoint without an activation input.";
 }
 
 function call(id, args) {
@@ -55,6 +73,86 @@ function call(id, args) {
 const A09_CONTINUATION = "third-party boundary continuation";
 
 function actionFor(scenario, input, replies, turn, messages = [], activationIndex = 0) {
+	if (scenario === "n01-role-only") {
+		// The Manager never assigns the role-only writer; any writer activation is a failure of N01.
+		if (input.scope.kind === "management") return [call(`n01-manager-yield-${turn}`, { action: "yield" })];
+		if (input.member.id !== "w1") throw new Error(`N01 role-only member ${input.member.id} received a provider request`);
+		return [call("n01-initial-reply", { action: "reply", result: {
+			status: "succeeded", summary: "The initial review completed while the role-only writer stayed idle.",
+		} })];
+	}
+	if (scenario === "n03-eight" && input.scope.kind === "work") {
+		if (input.scope.task === "N03 root 8 barrier") return [call("n03-eighth-reply", { action: "reply", result: {
+			status: "succeeded", summary: "The eighth worker received a Runtime permit and executed its assigned work.",
+		} })];
+		if (input.outcomes.length > 0) return [call(`n03-resumed-reply-${input.member.id}`, { action: "reply", result: {
+			status: "succeeded", summary: `${input.member.id} resumed after observing ${input.outcomes[0].state} ${input.outcomes[0].resultRef}.`,
+		} })];
+		const status = replies.find((reply) => reply.data?.view === "work");
+		if (!status) return [call(`n03-status-${input.member.id}`, { action: "status", view: "work", limit: 20 })];
+		const eighth = status.data.items.find((item) => item.taskPreview === "N03 root 8 barrier");
+		if (!eighth) throw new Error(`N03 worker could not read the eighth WorkRef: ${JSON.stringify(status.data)}`);
+		return [call(`n03-yield-${input.member.id}`, { action: "yield", waitingFor: [eighth.work], checkpoint: "Waiting for the eighth worker's explicit result." })];
+	}
+	if (scenario === "n03-eight" && input.scope.kind === "management") return [call(`n03-manager-yield-${turn}`, { action: "yield" })];
+	if (scenario === "n06-context-edit" && input.scope.kind === "work") {
+		if (input.scope.task === "N06 peer verification") return [call("n06-peer-reply", { action: "reply", result: {
+			status: "succeeded", summary: "Canonical peer result: the requested verification passed.",
+		} })];
+		if (input.scope.task !== "N06 root") throw new Error(`Unexpected N06 work: ${input.scope.task}`);
+		if (input.outcomes.length === 0) {
+			if (replies.length === 0) return [call("n06-request-peer", { action: "request", to: "w2", task: "N06 peer verification", inputRefs: [] })];
+			const accepted = replies.map((reply) => reply.receipt).find((receipt) => receipt?.status === "accepted");
+			if (!accepted) throw new Error(`N06 peer request was not accepted: ${JSON.stringify(replies)}`);
+			return [call("n06-yield-peer", { action: "yield", waitingFor: [accepted.work], checkpoint: "Waiting for the peer verification result." })];
+		}
+		const outcome = input.outcomes[0];
+		if (!outcome?.resultRef) throw new Error(`N06 resumed input omitted its delivered result reference: ${JSON.stringify(input.outcomes)}`);
+		const result = replies.find((reply) => reply.data?.id === outcome.resultRef);
+		if (!result) return [call("n06-read-canonical-result", { action: "status", view: "result", id: outcome.resultRef })];
+		return [call("n06-root-reply", { action: "reply", result: {
+			status: "succeeded", summary: `N06 verified the canonical dependency result: ${result.data.result.summary}`,
+		} })];
+	}
+	if (scenario === "n10-writer") {
+		if (input.scope.kind === "management") {
+			const root = input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY");
+			if (!root?.work || !root.resultRef) return [{ type: "text", text: "Manager is waiting for a root result." }];
+			const result = replies.find((reply) => reply.data?.id === root.resultRef);
+			if (!result) return [call(`n10-read-${root.resultRef}`, { action: "status", view: "result", id: root.resultRef })];
+			const accepted = replies.some((reply) => reply.receipt?.command === "accept_result"
+				&& reply.receipt.work?.workId === root.work.workId && reply.receipt.status === "applied");
+			if (result.data.author === "w1") {
+				if (!accepted) return [
+					call("n10-accept-review", { action: "control", command: "accept_result", work: root.work, disposition: "accepted" }),
+					call("n10-request-writer", { action: "request", to: "w2", task: `Compose the report using ${root.resultRef}`, inputRefs: [root.resultRef] }),
+				];
+				return [call("n10-manager-yield", { action: "yield" })];
+			}
+			if (result.data.author === "w2") return accepted ? [call("n10-close-from-writer", {
+				action: "control", command: "close_team", resultRefs: [root.resultRef], outcome: "succeeded",
+			})] : [call("n10-accept-writer", { action: "control", command: "accept_result", work: root.work, disposition: "accepted" })];
+			throw new Error(`N10 Manager received an unexpected root author: ${result.data.author}`);
+		}
+		if (input.scope.task === "N10 initial reviewer") return [call("n10-review-reply", { action: "reply", result: {
+			status: "succeeded", summary: "Reviewer evidence: the implementation behavior was verified.",
+		} })];
+		if (input.scope.task === "N10 idle reviewer follow-up") return [call("n10-reviewer-followup", { action: "reply", result: {
+			status: "succeeded", summary: "Idle reviewer follow-up: the original evidence is confirmed.",
+		} })];
+		if (input.scope.kind === "work" && input.scope.task.startsWith("Compose the report using ")) {
+			const resultRef = input.scope.inputRefs[0];
+			if (!resultRef) throw new Error("N10 writer did not receive the review resultRef as an explicit input");
+			if (input.outcomes.length > 0) return [call("n10-writer-reply", { action: "reply", result: {
+				status: "succeeded", summary: `Writer report incorporates the review and idle-reviewer confirmation ${input.outcomes[0]?.resultRef}.`,
+			} })];
+			const result = replies.find((reply) => reply.data?.id === resultRef);
+			if (!result) return [call("n10-writer-read-review", { action: "status", view: "result", id: resultRef })];
+			const accepted = replies.map((reply) => reply.receipt).find((receipt) => receipt?.status === "accepted");
+			if (!accepted) return [call("n10-writer-ask-reviewer", { action: "request", to: "w1", task: "N10 idle reviewer follow-up", inputRefs: [resultRef] })];
+			return [call("n10-writer-yield", { action: "yield", waitingFor: [accepted.work], checkpoint: "Waiting for the idle reviewer follow-up." })];
+		}
+	}
 	if (scenario === "a09-live" && input.scope.kind === "work") {
 		const lastUser = [...messages].reverse().find((message) => message?.role === "user");
 		// The continuation a third-party extension forced after the staged reply tries new side effects.
@@ -263,16 +361,26 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 
 export default function install(pi) {
 	let turns = 0;
-	if (process.env.TEAM_V2_SCENARIO === "compaction") pi.on("session_before_compact", (event, ctx) => {
-		pi.appendEntry("team-v2-compaction", { contextWindow: ctx.model?.contextWindow });
-		const messages = [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages];
-		const input = messages.map((message) => {
-			try { const value = JSON.parse(messageText(message)); return value?.version === 2 && value.scope ? value : undefined; } catch { return undefined; }
-		}).find(Boolean);
-		const replies = messages.filter((message) => message?.role === "toolResult" && message.toolName === "team").map((message) => {
-			try { return JSON.parse(messageText(message)); } catch { return undefined; }
-		}).filter(Boolean);
-		return { compaction: { summary: `Team v2 native activation remains authoritative across compaction.\nTEAM_V2_ACTIVATION_INPUT:${JSON.stringify(input)}\nTEAM_V2_TOOL_REPLIES:${JSON.stringify(replies)}`,
+	let n06ContextEditWritten = false;
+	if (process.env.TEAM_V2_SCENARIO === "n06-context-edit") pi.on("agent_before_settle", (_event, ctx) => {
+		if (n06ContextEditWritten) return;
+		const activation = [...ctx.sessionManager.getBranch()].reverse().find((entry) => {
+			if (entry.type !== "custom_message" || entry.customType !== "rail-team-activation") return false;
+			try {
+				const input = JSON.parse(typeof entry.content === "string" ? entry.content : messageText({ content: entry.content }));
+				return input.scope?.kind === "work" && input.scope.task === "N06 root";
+			} catch { return false; }
+		});
+		if (!activation) return;
+		n06ContextEditWritten = true;
+		return { entries: [{ type: "context_edit", targetId: activation.id, replacement: null }] };
+	});
+	if (["compaction", "n06-context-edit"].includes(process.env.TEAM_V2_SCENARIO)) pi.on("session_before_compact", (event, ctx) => {
+		const summarizedDeliveryIds = [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages].flatMap((message) => {
+			try { const value = JSON.parse(messageText(message)); return value?.version === 2 && value.scope ? [value.deliveryId] : []; } catch { return []; }
+		});
+		pi.appendEntry("team-v2-compaction", { contextWindow: ctx.model?.contextWindow, summarizedDeliveryIds });
+		return { compaction: { summary: compactionSummary(event.preparation),
 			firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
 	});
 	pi.registerTool({
@@ -307,17 +415,20 @@ export default function install(pi) {
 			const lastUser = [...context.messages].reverse().find((message) => message?.role === "user");
 			let activation;
 			let content;
+			let replies = [];
 			if (messageText(lastUser) === "verify restored context window") {
 				content = [{ type: "text", text: `window=${model.contextWindow}` }];
 			} else if (messageText(lastUser) === "ordinary reopen marker") {
 				content = [{ type: "text", text: "Ordinary session reopened with its previous Team history." }];
 			} else {
 				activation = latestActivation(context.messages);
-				const replies = teamReplies(context.messages, activation.index);
+				replies = teamReplies(context.messages, activation.index);
 				content = actionFor(scenario, activation.input, replies, turns, context.messages, activation.index);
 			}
 			const retry = scenario === "retry" && activation?.input.member.id === "w1" && turns === 1;
-			const inputTokens = scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1 ? 60000 : 1;
+			const inputTokens = (scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1)
+				|| (scenario === "n06-context-edit" && activation?.input.member.id === "w1" && activation.input.scope.kind === "work"
+					&& activation.input.scope.task === "N06 root" && activation.input.outcomes.length > 0 && replies.length === 0) ? 60000 : 1;
 			if (retry) content = [];
 			pi.appendEntry("team-v2-provider", {
 				turn: turns,

@@ -205,6 +205,11 @@ interface TeamState {
 	events: InternalEvent[];
 	eventBatches: Map<string, EventBatch>;
 	incidents: TeamIncidentView[];
+	/**
+	 * `${consumer WorkRef}>${dependency WorkRef}` pairs whose outcome-unknown dependency was explicitly
+	 * acknowledged by resume_work/release_hold; only these may be delivered to that consumer version.
+	 */
+	unknownAcknowledged: Set<string>;
 	/** Same object as budget.limits: grants raise effective limits in place. */
 	limits: TeamBudgetLimits;
 	budget: TeamBudget;
@@ -317,7 +322,7 @@ export class TeamRuntime {
 		const team: TeamState = {
 			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt,
 			deadline: null,
-			plan: copy(plan), manager: plan.manager.alias, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(),
+			plan: copy(plan), manager: plan.manager.alias, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(),
 		};
@@ -462,7 +467,7 @@ export class TeamRuntime {
 		this.addEvent(team, { key: `host-member-stopped:${member.id}`, kind: "MEMBER_FAULTED",
 			message: `${member.id} was stopped by the host; the Team remains host-managed`, memberId: member.id });
 		this.changed(team);
-		this.updateQuiescence(team);
+		this.wakeWaiters(team);
 		this.check(team);
 		this.requestDrain(team.id);
 		this.settleCompletion(team);
@@ -595,6 +600,7 @@ export class TeamRuntime {
 				version.state = lifecycle;
 				version.error = copy(error);
 				version.waitingFor = [];
+				delete version.hold;
 				version.updatedAt = this.timestamp();
 				delete entry.stagedWait;
 			}
@@ -854,6 +860,7 @@ export class TeamRuntime {
 				}
 			}
 		}
+		this.holdUnknownDependencies(team);
 		const workerPermits = this.usedWorkerPermits(team);
 		for (let index = 0; index < team.ready.length; index++) {
 			const ref = team.ready[index]!;
@@ -1373,6 +1380,8 @@ export class TeamRuntime {
 				version.error = { ...copy(error), outcomeUnknown: true };
 				version.updatedAt = this.timestamp();
 			}
+			// A staged wait edge belongs to the lost activation's intent; it must not outlive it.
+			delete team.ledger.get(ref.workId)!.stagedWait;
 			if (resourceReleased) team.ledger.cleanupPending.delete(workRefKey(ref));
 			else team.ledger.cleanupPending.add(workRefKey(ref));
 		}
@@ -1397,7 +1406,8 @@ export class TeamRuntime {
 		this.addEvent(team, { key: `member-fault:${member.id}:${activationId}`, kind: "MEMBER_FAULTED",
 			message: `${member.id} lost its native activation before settlement`, memberId: member.id, ...(ref ? { work: ref } : {}) });
 		this.changed(team);
-		this.updateQuiescence(team);
+		// Known failures (e.g. unstarted MEMBER_UNAVAILABLE work) wake their waiters; outcome-unknown work holds them.
+		this.wakeWaiters(team);
 		this.check(team);
 		this.requestDrain(team.id);
 		this.settleCompletion(team);
@@ -1462,11 +1472,19 @@ export class TeamRuntime {
 			fail("INVALID_ARGUMENT", `Member ${member.id} has no unconfirmed exit to reconcile`);
 		}
 		member.resourceState = "released";
+		// The process can no longer act, so its terminal work's cleanup is confirmed; outcomeUnknown stays recorded.
+		for (const id of team.ledger.order) {
+			if (team.ledger.get(id)!.record.assignee !== member.id) continue;
+			for (const version of team.ledger.get(id)!.record.versions) {
+				if (isTerminalWorkState(version.state)) team.ledger.cleanupPending.delete(workRefKey({ workId: id, revision: version.revision }));
+			}
+		}
 		// A retained unknown activation cannot outlive the confirmed process exit; its work/delivery evidence is unchanged.
 		delete member.active;
 		delete member.currentWork;
 		member.activity = "idle";
 		this.changed(team);
+		this.wakeWaiters(team);
 		this.check(team);
 		this.settleCompletion(team);
 		return okReply(member.id);
@@ -1555,6 +1573,20 @@ export class TeamRuntime {
 
 	/** Test-only invariant entry point; production callers may use it for diagnostics as well. */
 	assertInvariants(teamId: string): void { this.check(this.team(teamId)); }
+
+	/** Diagnostic count of Runtime-held effects for one Team; a converged terminal Team holds none. */
+	liveEffects(teamId: string): { executor: boolean; scheduledDrain: boolean; closingEffects: number; completionWaiters: number;
+		deadlineTimer: boolean; activeActivations: number; stopTimers: number; ready: number; unprocessedManagerEvents: number } {
+		const team = this.team(teamId);
+		const active = [...team.members.values()].flatMap((member) => member.active ? [member.active] : []);
+		return {
+			executor: this.executors.has(teamId), scheduledDrain: this.scheduledDrains.has(teamId),
+			closingEffects: [...this.closingEffects].filter((key) => key.startsWith(`${teamId}\0`)).length,
+			completionWaiters: this.completionWaiters.get(teamId)?.size ?? 0, deadlineTimer: this.deadlineTimers.has(teamId),
+			activeActivations: active.length, stopTimers: active.filter((activation) => activation.stopTimer).length, ready: team.ready.length,
+			unprocessedManagerEvents: team.events.filter((event) => !event.processed).length,
+		};
+	}
 
 	private applyAction(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: TeamAction, toolCallId: string): TeamReply {
 		// Emergency Manager activations may only diagnose, cancel, review/waive, close or yield.
@@ -1765,14 +1797,29 @@ export class TeamRuntime {
 			fail("INVALID_ARGUMENT", "The held WorkRef still has a native activation running or settling");
 		}
 		if (team.ledger.cleanupPending.has(workRefKey(ref))) fail("CLEANUP_FAILED", "Work cannot resume before its prior native cleanup is confirmed");
+		// Only releasing the dependency incident itself is a decision about the unknown outcomes it names.
+		const releasesDependency = team.incidents.find((item) => item.id === incidentId)?.code === "DEPENDENCY_UNAVAILABLE";
+		const unknown = releasesDependency ? this.unknownDependencies(team, ref, version) : [];
+		const unconfirmed = unknown.filter((dependency) => team.ledger.cleanupPending.has(workRefKey(dependency)));
+		if (unconfirmed.length) fail("CLEANUP_FAILED", "An outcome-unknown dependency has no confirmed native exit yet",
+			unconfirmed.map((dependency) => ({ kind: "dependency", id: workRefKey(dependency), reason: "native exit is not confirmed" })));
+		// The explicit decision acknowledges each unknown outcome; its failure and outcomeUnknown evidence stay unchanged.
+		for (const dependency of unknown) team.unknownAcknowledged.add(`${workRefKey(ref)}>${workRefKey(dependency)}`);
 		delete version.hold;
 		version.resumeInstruction = instruction;
-		version.state = "queued";
 		version.updatedAt = this.timestamp();
-		if (!team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
+		// Releasing a hold never satisfies an AND wait: unmet dependencies keep the work blocked.
+		if (version.waitingFor.length && !version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency))) {
+			version.state = "blocked";
+		} else {
+			version.state = "queued";
+			if (!team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
+		}
 		const incident = team.incidents.find((item) => item.id === incidentId);
 		if (incident) incident.state = "resolved";
 		this.changed(team);
+		// Releasing any other hold never acknowledges an unknown dependency: it is held again for that decision.
+		this.holdUnknownDependencies(team);
 	}
 
 	private reviseWork(team: TeamState, manager: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "revise_work" }>): TeamReply {
@@ -1799,6 +1846,7 @@ export class TeamRuntime {
 			this.cancelDescendants(team, currentRef, "superseded");
 			current.state = "superseded";
 			current.waitingFor = [];
+			delete current.hold;
 			current.updatedAt = this.timestamp();
 		}
 		delete entry.stagedWait;
@@ -1833,6 +1881,7 @@ export class TeamRuntime {
 			version.state = "cancelled";
 			version.error = { code: "CANCELLED", message: control.reason };
 			version.waitingFor = [];
+			delete version.hold;
 			version.updatedAt = this.timestamp();
 			delete team.ledger.get(work.workId)!.stagedWait;
 			const assignee = team.members.get(team.ledger.get(work.workId)!.record.assignee)!;
@@ -2070,7 +2119,8 @@ export class TeamRuntime {
 			const seen = new Set<string>();
 			for (const ref of candidates) {
 				const key = workRefKey(ref);
-				if (seen.has(key) || version.observedOutcomes.some((old) => workRefKey(old) === key) || !team.ledger.outcomeReady(ref)) continue;
+				if (seen.has(key) || version.observedOutcomes.some((old) => workRefKey(old) === key) || !team.ledger.outcomeReady(ref)
+					|| (this.isUnknownOutcome(team, ref) && !team.unknownAcknowledged.has(`${workRefKey(scope.work)}>${key}`))) continue;
 				seen.add(key);
 				const outcome = team.ledger.outcome(ref)!;
 				const record = outcome.resultRef ? team.ledger.results.get(outcome.resultRef) : undefined;
@@ -2140,6 +2190,7 @@ export class TeamRuntime {
 					version.updatedAt = this.timestamp();
 					team.ledger.cleanupPending.add(workRefKey(scope.work!));
 				}
+				delete team.ledger.get(scope.work!.workId)!.stagedWait;
 			}
 			if (member.role === "manager") {
 				this.holdManagerWork(team);
@@ -2150,6 +2201,7 @@ export class TeamRuntime {
 			this.addEvent(team, { key: `member-fault:${member.id}:${scope.activationId}`, kind: "MEMBER_FAULTED", message: `${member.id} could not confirm activation cleanup`, memberId: member.id });
 			member.activity = "settling";
 			this.changed(team);
+			this.wakeWaiters(team);
 			return;
 		}
 		if (delivery.state === "in_flight") delivery.state = active.inputReady ? "delivered" : "unknown";
@@ -2366,7 +2418,49 @@ export class TeamRuntime {
 			&& version.observedOutcomes.some((observed) => sameWorkRef(observed, child)));
 	}
 
+	/** A terminal dependency whose external side effects are not known to have ended (spec 13.3/13.5). */
+	private isUnknownOutcome(team: TeamState, ref: WorkRef): boolean {
+		const version = team.ledger.version(ref);
+		return !!version && isTerminalWorkState(version.state) && version.error?.outcomeUnknown === true;
+	}
+
+	/** Unobserved, unacknowledged outcome-unknown waits and owned children of one consumer version. */
+	private unknownDependencies(team: TeamState, ref: WorkRef, version: WorkVersion): WorkRef[] {
+		const seen = new Set<string>();
+		return [...version.waitingFor, ...team.ledger.ownedChildren(ref)].filter((dependency) => {
+			const key = workRefKey(dependency);
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return this.isUnknownOutcome(team, dependency) && !version.observedOutcomes.some((observed) => sameWorkRef(observed, dependency))
+				&& !team.unknownAcknowledged.has(`${workRefKey(ref)}>${key}`);
+		});
+	}
+
+	/**
+	 * An outcome-unknown dependency never wakes its consumer automatically: every waiting consumer or
+	 * owned-child parent that is not running gets one stable DEPENDENCY_UNAVAILABLE incident and an
+	 * attention hold that only an explicit resume_work/release_hold can lift.
+	 */
+	private holdUnknownDependencies(team: TeamState): void {
+		for (const id of team.ledger.order) {
+			const ref = team.ledger.currentRef(id)!;
+			const version = team.ledger.version(ref)!;
+			if ((version.state !== "queued" && version.state !== "blocked") || version.hold) continue;
+			const unknown = this.unknownDependencies(team, ref, version);
+			if (!unknown.length) continue;
+			const incident = this.createIncident(team, "DEPENDENCY_UNAVAILABLE",
+				`Dependency outcome is unknown (${unknown.map(workRefKey).join(", ")}); an explicit resume or cancel decision is required`,
+				ref, team.ledger.get(id)!.record.assignee);
+			version.state = "blocked";
+			version.hold = { reason: "attention", incidentId: incident.id };
+			version.updatedAt = this.timestamp();
+			team.ready = team.ready.filter((item) => !sameWorkRef(item, ref));
+			this.changed(team);
+		}
+	}
+
 	private wakeWaiters(team: TeamState): void {
+		this.holdUnknownDependencies(team);
 		for (const id of team.ledger.order) {
 			const ref = team.ledger.currentRef(id)!;
 			const version = team.ledger.version(ref)!;
@@ -2398,6 +2492,7 @@ export class TeamRuntime {
 			const active = member.active?.scope.kind === "work" && sameWorkRef(member.active.scope.work!, child);
 			version.state = state;
 			version.waitingFor = [];
+			delete version.hold;
 			version.updatedAt = this.timestamp();
 			version.error = { code: state.toUpperCase(), message: `Parent work ${workRefKey(ref)} was ${state}`,
 				...(unknownActiveOutcome && active ? { outcomeUnknown: true } : {}) };
@@ -2449,6 +2544,7 @@ export class TeamRuntime {
 			if (isTerminalWorkState(version.state)) continue;
 			version.state = "failed";
 			version.waitingFor = [];
+			delete version.hold;
 			version.error = { code: "MEMBER_UNAVAILABLE", message: `${member.id} faulted before this work could finish` };
 			version.updatedAt = this.timestamp();
 			delete entry.stagedWait;
@@ -3065,10 +3161,13 @@ export class TeamRuntime {
 				versionCount++;
 				const ref = { workId: id, revision: version.revision };
 				if (version.revision < 1 || version.revision > record.versions.length) throw new Error(`Invariant I02: invalid WorkRef revision ${workRefKey(ref)}`);
+				if (version.hold && isTerminalWorkState(version.state)) throw new Error(`Invariant I15: terminal ${workRefKey(ref)} still carries a scheduling hold`);
 				if (new Set(version.waitingFor.map(workRefKey)).size !== version.waitingFor.length
 					|| new Set(version.observedOutcomes.map(workRefKey)).size !== version.observedOutcomes.length) throw new Error(`Invariant I14: duplicate dependency observation on ${workRefKey(ref)}`);
 				if (version.waitingFor.some((dependency) => !team.ledger.version(dependency))) throw new Error(`Invariant I11: unknown dependency on ${workRefKey(ref)}`);
 				if (version.state === "queued" && !ready.has(workRefKey(ref))) throw new Error(`Invariant I14: queued work ${workRefKey(ref)} has no ready item`);
+				if (version.revision === record.currentRevision && (version.state === "queued" || (version.state === "blocked" && !version.hold))
+					&& this.unknownDependencies(team, ref, version).length) throw new Error(`Invariant 13.5: ${workRefKey(ref)} may run on an unacknowledged outcome-unknown dependency`);
 				if (version.state === "blocked" && !version.hold && version.waitingFor.length > 0
 					&& version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency))) throw new Error(`Invariant I13: ready dependency was not scheduled for ${workRefKey(ref)}`);
 				if (entry.stagedWait?.revision === version.revision) {

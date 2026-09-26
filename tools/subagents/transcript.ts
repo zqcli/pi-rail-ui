@@ -1,7 +1,6 @@
 import type { Component, MarkdownTheme } from "@earendil-works/pi-tui";
 import { Markdown, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { TeamMemberState } from "./team-protocol-v1";
 
 const DEFAULT_MAX_ENTRIES = 18;
 const MAX_ENTRY_CHARS = 4000;
@@ -59,7 +58,6 @@ export interface SubagentTranscriptRun {
 	contextWindowText?: string;
 	fastModeText?: "on" | "off";
 	searchModeText?: "on" | "off";
-	coordination?: { state: TeamMemberState; waitingFor?: string };
 }
 
 export interface SubagentTranscriptRenderOptions {
@@ -766,22 +764,8 @@ function runtimeText(run: SubagentTranscriptRun): string {
 	return parts.join(" · ");
 }
 
-function coordinationText(run: SubagentTranscriptRun): string {
-	if (run.status !== "running" || !run.coordination) return "";
-	const { state, waitingFor } = run.coordination;
-	if (state === "waiting") return `WAITING${waitingFor ? ` (${waitingFor})` : ""}`;
-	if (state === "paused") return "PAUSED";
-	if (state === "pause_requested") return "PAUSE REQUESTED";
-	if (state === "finalizing") return "FINALIZING";
-	// A logical cancellation does not claim the native process has stopped yet.
-	if (state === "cancelled" || state === "failed") return "CANCELLING";
-	return "";
-}
-
 function statusText(run: SubagentTranscriptRun): string {
 	if (run.status === "failed") return "Failed";
-	const cooperation = coordinationText(run);
-	if (cooperation) return `${cooperation}${run.isCompacting ? " · Compacting" : ""}`;
 	if (run.status === "running" && run.isCompacting) return "Compacting";
 	if (run.status === "running") return "Running";
 	if (run.status === "accepted") return "Accepted";
@@ -815,8 +799,7 @@ function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control",
 	const contextWindow = ` · ContextWindow ${run.contextWindowText ?? "Default"}`;
 	const fast = ` · FAST ${run.fastModeText ?? "off"}`;
 	const search = ` · SEARCH ${run.searchModeText ?? "off"}`;
-	const cooperation = coordinationText(run);
-	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}${search}${cooperation ? ` · ${cooperation}` : ""}`;
+	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}${search}`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {

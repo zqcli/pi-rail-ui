@@ -24,7 +24,7 @@
 | `tools/subagents/team-extension-v2.ts` | 原生 custom input、Team 工具、sole batch 核验、gate、禁止预热 |
 | `tools/subagents/session-broker.ts` | 独占 member handle，阻止普通调用插入 lifetime |
 
-`team-protocol-v1.ts` 与旧 hub/runner/extension/RPC 仍是迁移遗留，**并非已经实现“历史只读兼容”**。最终入口迁移后必须删除旧实时机制，不能同时运行两套调度器。
+旧 v1 实时机制（`team-hub.ts`、`team-runner.ts`、`team-extension.ts`、`team-rpc.ts`、`team-protocol-v1.ts` 及其专属测试/fixture）已在 D2 删除；只有 `team-history.ts` 把旧 `rail-subagent-team` 快照只读映射为 legacy（未完成者显示 interrupted），不恢复任何 live 状态。
 
 ## v2 公开动作
 

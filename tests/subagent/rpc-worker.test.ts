@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { teamExtensionPath } from "../../tools/subagents/team-protocol-v1";
 import { TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND as TEAM_COMMAND_V2, TEAM_COMMAND_DESCRIPTION as TEAM_COMMAND_DESCRIPTION_V2, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import { parseParentCommand } from "../../tools/subagents/team-codec";
@@ -308,9 +307,10 @@ describe("RPC worker arguments", () => {
 		const ordinary = buildRpcWorkerArgs(spec("new"));
 		const v2Extension = fileURLToPath(new URL("../../tools/subagents/team-extension-v2.ts", import.meta.url));
 		const actor = buildRpcWorkerArgs({ ...spec("new"), teamProtocolVersion: 2 });
-		assert.equal(ordinary.includes(teamExtensionPath()), false);
+		const retiredV1 = (args: readonly string[]) => args.some((arg) => /team-extension\.ts$/u.test(arg));
+		assert.equal(retiredV1(ordinary), false);
 		assert.equal(ordinary.includes(v2Extension), false);
-		assert.equal(actor.includes(teamExtensionPath()), false);
+		assert.equal(retiredV1(actor), false);
 		assert.equal(actor.includes(v2Extension), true);
 	});
 

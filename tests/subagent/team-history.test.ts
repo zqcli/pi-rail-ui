@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { restoreTeamHistory } from "../../tools/subagents/team-history";
+import { LEGACY_TEAM_HISTORY_TYPE, restoreTeamHistory } from "../../tools/subagents/team-history";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
 import type { ResultRecord, TeamResult } from "../../tools/subagents/team-protocol";
 
@@ -56,6 +56,35 @@ test("a close decision with a mismatched terminal closeId remains interrupted", 
 	assert.equal(restored.teams[0]?.lifecycle, "interrupted");
 	assert.equal(restored.teams[0]?.results.length, 1);
 	assert.ok(restored.skipped >= 1);
+});
+
+test("U08: retired v1 snapshots and launched v2 Teams without a terminal are read-only interrupted; damaged records are skipped", () => {
+	const legacy = (id: string, phase: string) => ({ type: "custom", customType: LEGACY_TEAM_HISTORY_TYPE, data: {
+		id, coordinator: "coord", workers: ["B1", "B2"], phase, seq: 9, createdAt: 5, deadline: 0, members: [], events: [],
+	} });
+	const restored = restoreTeamHistory([
+		legacy("v1-running", "running"),
+		legacy("v1-finalizing", "finalizing"),
+		legacy("v1-prepared", "prepared"),
+		legacy("v1-done", "completed"),
+		legacy("v1-unknown-phase", "resumable"),
+		{ type: "custom", customType: LEGACY_TEAM_HISTORY_TYPE, data: { id: "v1-damaged", coordinator: 7, workers: "B1", phase: "running" } },
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: "not a record" },
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "launched", teamId: "v2-open", at: 1,
+			roster: { manager: "lead", workers: ["idle-writer"] }, goal: "An open/idle v2 Team before a parent restart" } },
+	]);
+	const byId = new Map(restored.teams.map((team) => [team.teamId, team]));
+	for (const id of ["v1-running", "v1-finalizing", "v1-prepared"]) {
+		assert.equal(byId.get(id)?.lifecycle, "interrupted", `${id} is never shown as live or resumable`);
+		assert.equal(byId.get(id)?.version, 1);
+		assert.equal(byId.get(id)?.manager, "coord", "the retired coordinator is displayed as the manager");
+	}
+	assert.equal(byId.get("v1-done")?.lifecycle, "completed");
+	assert.equal(byId.get("v2-open")?.lifecycle, "interrupted", "a v2 Team without a terminal record is interrupted, not closed success");
+	assert.equal(byId.get("v2-open")?.outcome, undefined);
+	assert.equal(byId.has("v1-unknown-phase"), false);
+	assert.equal(byId.has("v1-damaged"), false);
+	assert.equal(restored.skipped, 3, "unknown phase, damaged v1 and non-record v2 entries are skipped individually");
 });
 
 test("interrupted history never accepts a later terminal or malformed grant", () => {

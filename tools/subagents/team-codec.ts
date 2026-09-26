@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { isValidAgentAlias } from "./identity";
 import {
 	TEAM_ERROR_CODES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_ALIAS_LENGTH, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_FRAME_BYTES,
+	TEAM_MAX_ACTION_BYTES, TEAM_MAX_PUBLIC_CHILDREN, TEAM_MAX_OWNED_CHILD_PREVIEWS,
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_INPUT_REFS, TEAM_MAX_MEMBERS, TEAM_MAX_NOTE_BYTES,
 	TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
@@ -136,6 +137,29 @@ export function truncateText(value: string, maxBytes: number): { text: string; t
 		result += character;
 	}
 	return { text: result + marker, truncated: true };
+}
+
+/** Host/provider diagnostics are output, not model arguments. Repair Unicode and mark truncation. */
+export function projectErrorText(value: string, maxBytes = TEAM_MAX_NOTE_BYTES): string {
+	const wellFormed = value.toWellFormed();
+	return truncateText(wellFormed.trim() ? wellFormed : "Unspecified error", maxBytes).text;
+}
+
+/** Keep the classification and uncertainty flag while bounding public diagnostic text. */
+export function projectWorkError(error: WorkError): WorkError {
+	return { code: projectErrorText(error.code, 128), message: projectErrorText(error.message),
+		...(error.outcomeUnknown !== undefined ? { outcomeUnknown: error.outcomeUnknown } : {}) };
+}
+
+/** A projection only: callers must continue using the ledger for all child obligations. */
+export function projectOwnedChildren(children: ActivationInput["ownedChildren"]): Pick<ActivationInput, "ownedChildren" | "ownedChildrenOmitted"> {
+	return { ownedChildren: children.slice(0, TEAM_MAX_OWNED_CHILD_PREVIEWS).map(({ work, state }) => ({ work: { ...work }, state })),
+		ownedChildrenOmitted: Math.max(0, children.length - TEAM_MAX_OWNED_CHILD_PREVIEWS) };
+}
+
+export function projectWorkChildren(children: readonly WorkRef[]): Pick<TeamWorkView, "children" | "childrenOmitted"> {
+	return { children: children.slice(0, TEAM_MAX_PUBLIC_CHILDREN).map((work) => ({ ...work })),
+		childrenOmitted: Math.max(0, children.length - TEAM_MAX_PUBLIC_CHILDREN) };
 }
 
 function text(value: unknown, field: string, maxBytes: number): string {
@@ -450,7 +474,7 @@ const LEGACY_FIELDS: Record<string, string> = {
 const present = (value: unknown): boolean => value !== undefined && value !== null;
 
 export function normalizeTeamAction(value: unknown): TeamAction {
-	assertJsonValue(value, new Set());
+	if (jsonBytes(value) > TEAM_MAX_ACTION_BYTES) return invalid(`team arguments exceed ${TEAM_MAX_ACTION_BYTES} serialized UTF-8 bytes`);
 	if (!isRecord(value)) return invalid("team arguments must be an object with an action");
 	for (const [key, message] of Object.entries(LEGACY_FIELDS)) if (present(value[key])) invalid(message);
 	const action = value["action"];
@@ -886,14 +910,16 @@ function parseTerminalMembers(value: unknown, field: string): TeamResult["member
 
 function parseWorkSummary(value: unknown): TeamWorkSummary {
 	if (!isRecord(value)) return protocol("work summary must be an object");
-	frameKeys(value, ["work", "requester", "assignee", "state", "taskPreview", "hold", "resultRef", "review"], "work summary");
+	frameKeys(value, ["work", "parent", "requester", "assignee", "state", "taskPreview", "hold", "resultRef", "review"], "work summary");
 	const state = value["state"];
 	if (!(WORK_STATES as readonly unknown[]).includes(state)) return protocol("work summary state is invalid");
 	const hold = value["hold"];
 	if (hold !== undefined && !["attention", "budget", "protocol", "manager_unavailable"].includes(String(hold))) return protocol("work summary hold is invalid");
 	const review = value["review"];
 	if (review !== undefined && review !== "accepted" && review !== "waived") return protocol("work summary review is invalid");
-	return { work: normalizeWorkRef(value["work"], "work summary.work"), requester: normalizeAlias(value["requester"], "work summary.requester"),
+	return { work: normalizeWorkRef(value["work"], "work summary.work"),
+		...(value["parent"] !== undefined ? { parent: normalizeWorkRef(value["parent"], "work summary.parent") } : {}),
+		requester: normalizeAlias(value["requester"], "work summary.requester"),
 		assignee: normalizeAlias(value["assignee"], "work summary.assignee"), state: state as WorkState,
 		taskPreview: text(value["taskPreview"], "work summary.taskPreview", TEAM_MAX_TASK_BYTES),
 		...(hold !== undefined ? { hold: hold as HoldReason } : {}),
@@ -903,8 +929,9 @@ function parseWorkSummary(value: unknown): TeamWorkSummary {
 
 function parseTeamWorkView(value: unknown): TeamWorkView {
 	if (!isRecord(value)) return protocol("work view must be an object");
-	frameKeys(value, ["id", "requester", "assignee", "rootId", "parent", "depth", "currentRevision", "current", "children", "revisions", "rejectedCandidates"], "work view");
-	const children = array(value["children"], "work view.children", 64).map((item, index) => normalizeWorkRef(item, `work view.children[${index}]`));
+	frameKeys(value, ["id", "requester", "assignee", "rootId", "parent", "depth", "currentRevision", "current", "children", "childrenOmitted", "revisions", "rejectedCandidates"], "work view");
+	const childrenOmitted = value["childrenOmitted"] === undefined ? undefined : safeInteger(value["childrenOmitted"], "work view.childrenOmitted", 0);
+	const children = array(value["children"], "work view.children", TEAM_MAX_PUBLIC_CHILDREN).map((item, index) => normalizeWorkRef(item, `work view.children[${index}]`));
 	const revisions = array(value["revisions"], "work view.revisions", 32).map((item, index) => {
 		const field = `work view.revisions[${index}]`;
 		if (!isRecord(item)) return protocol(`${field} must be an object`);
@@ -927,6 +954,7 @@ function parseTeamWorkView(value: unknown): TeamWorkView {
 		assignee: normalizeAlias(value["assignee"], "work view.assignee"), rootId: frameId(value["rootId"], "work view.rootId"),
 		...(value["parent"] !== undefined ? { parent: normalizeWorkRef(value["parent"], "work view.parent") } : {}),
 		depth: safeInteger(value["depth"], "work view.depth", 0), currentRevision, current, children, revisions,
+		...(childrenOmitted !== undefined ? { childrenOmitted } : {}),
 		...(rejectedCandidates ? { rejectedCandidates } : {}) };
 }
 
@@ -1163,7 +1191,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (!isRecord(value) || value["version"] !== TEAM_PROTOCOL_VERSION || value["teamId"] !== binding.teamId || value["deliveryId"] !== deliveryId) {
 		return protocol("activation input does not match its binding/delivery");
 	}
-	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "ownedChildren", "budget", "notice"], "activation input");
+	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
 	const member = value["member"];
 	if (!isRecord(member)) return protocol("activation input member is malformed");
 	frameKeys(member, ["id", "role", "roleDescription"], "activation input member");
@@ -1258,7 +1286,8 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (new Set(outcomes.map((outcome) => workRefKey(outcome.work))).size !== outcomes.length) return protocol("activation input outcomes contain duplicates");
 	const previews = outcomes.filter((outcome) => outcome.preview);
 	if (previews.length > TEAM_MAX_DEPENDENCY_PREVIEWS || jsonBytes(previews) > TEAM_MAX_DEPENDENCY_PREVIEW_BYTES) return protocol("activation dependency previews exceed their limit");
-	const ownedChildren = array(value["ownedChildren"], "activation input.ownedChildren", 64).map((raw, index) => {
+	const ownedChildrenOmitted = value["ownedChildrenOmitted"] === undefined ? undefined : safeInteger(value["ownedChildrenOmitted"], "activation input.ownedChildrenOmitted", 0);
+	const ownedChildren = array(value["ownedChildren"], "activation input.ownedChildren", TEAM_MAX_PUBLIC_CHILDREN).map((raw, index) => {
 		const field = `activation input.ownedChildren[${index}]`;
 		if (!isRecord(raw)) return protocol(`${field} must be an object`);
 		frameKeys(raw, ["work", "state"], field);
@@ -1266,7 +1295,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 		return { work: normalizeWorkRef(raw["work"], `${field}.work`), state: raw["state"] as WorkState };
 	});
 	if (new Set(ownedChildren.map((child) => workRefKey(child.work))).size !== ownedChildren.length) return protocol("activation ownedChildren contains duplicates");
-	if (scope.kind === "management" && ownedChildren.length) return protocol("management activation cannot have owned children");
+	if (scope.kind === "management" && (ownedChildren.length || ownedChildrenOmitted)) return protocol("management activation cannot have owned children");
 	const omittedOutcomes = safeInteger(value["omittedOutcomes"], "activation input.omittedOutcomes", 0);
 	const rawBudget = value["budget"];
 	if (!isRecord(rawBudget)) return protocol("activation input budget must be an object");
@@ -1279,6 +1308,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 		activations: safeInteger(rawBudget["activations"], "activation input budget.activations", 0) };
 	const input: ActivationInput = { version: TEAM_PROTOCOL_VERSION, teamId: binding.teamId, deliveryId,
 		member: { id: binding.memberId, role, roleDescription }, brief, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
+		...(ownedChildrenOmitted !== undefined ? { ownedChildrenOmitted } : {}),
 		notice: text(value["notice"], "activation input.notice", TEAM_MAX_NOTE_BYTES) };
 	if (jsonBytes(input) > TEAM_MAX_ACTIVATION_INPUT_BYTES) return protocol("activation input exceeds its size limit");
 	return input;
@@ -1337,6 +1367,56 @@ export function parseParentCommand(value: unknown): ParentCommand {
 	return privateBoundary(() => parseParentCommandInternal(value), "Parent command");
 }
 
+/**
+ * Project optional activation context without dropping the current task or permissions. Runtime
+ * must record delivery from the returned outcomes, not from the unprojected candidate list.
+ */
+export function projectActivationInput(input: ActivationInput): ActivationInput {
+	const projected = structuredClone(input);
+	const children = projectOwnedChildren(input.ownedChildren);
+	projected.ownedChildren = children.ownedChildren;
+	projected.ownedChildrenOmitted = (input.ownedChildrenOmitted ?? 0) + children.ownedChildrenOmitted!;
+	if (projected.scope.kind === "work" && projected.scope.previous?.error) {
+		projected.scope.previous.error = projectWorkError(projected.scope.previous.error);
+	}
+	if (projected.scope.kind === "management") {
+		for (const event of projected.scope.events) event.message = projectErrorText(event.message);
+	}
+	for (const outcome of projected.outcomes) if (outcome.error) outcome.error = projectWorkError(outcome.error);
+	projected.omittedOutcomes += Math.max(0, projected.outcomes.length - TEAM_MAX_DELIVERED_OUTCOMES);
+	projected.outcomes = projected.outcomes.slice(0, TEAM_MAX_DELIVERED_OUTCOMES);
+	// The preview budget includes its outcome metadata (including any failure diagnostic).
+	const previews = projected.outcomes.filter((outcome) => outcome.preview);
+	while (previews.length > TEAM_MAX_DEPENDENCY_PREVIEWS) delete previews.pop()!.preview;
+	while (jsonBytes(previews) > TEAM_MAX_DEPENDENCY_PREVIEW_BYTES) {
+		const longest = previews.reduce((left, right) => jsonTextBytes(left.preview!.summary) >= jsonTextBytes(right.preview!.summary) ? left : right);
+		const size = jsonTextBytes(longest.preview!.summary);
+		if (size > 64) {
+			// Keep the preview count when a shorter summary can leave room for exact refs/metadata.
+			longest.preview!.summary = previewText(longest.preview!.summary,
+				Math.max(64, size - (jsonBytes(previews) - TEAM_MAX_DEPENDENCY_PREVIEW_BYTES)));
+		} else delete previews.pop()!.preview;
+	}
+	// Optional previews/child listings yield space before actual dependency outcomes do.
+	while (jsonBytes(projected) > TEAM_MAX_ACTIVATION_INPUT_BYTES) {
+		const preview = projected.outcomes.findLast((outcome) => outcome.preview);
+		if (preview) { delete preview.preview; continue; }
+		if (projected.ownedChildren.length) {
+			projected.ownedChildren.pop();
+			projected.ownedChildrenOmitted++;
+			continue;
+		}
+		if (projected.outcomes.length) {
+			projected.outcomes.pop();
+			projected.omittedOutcomes++;
+			continue;
+		}
+		break;
+	}
+	encodeActivationInput(projected); // Mandatory scope/brief/task overflow remains an explicit rejection.
+	return projected;
+}
+
 /** Serialize an activation input, enforcing its transport limit. */
 export function encodeActivationInput(input: ActivationInput): string {
 	const bytes = jsonBytes(input);
@@ -1351,16 +1431,16 @@ export function okReply(to: string, fields: { receipt?: Extract<TeamReply, { ok:
 	return { ok: true, from: "@hub", to, ...(fields.receipt ? { receipt: fields.receipt } : {}), ...(fields.data ? { data: fields.data } : {}) };
 }
 
-export function errorReply(to: string, error: unknown): TeamReply {
+export function errorReply(to: string, error: unknown): Extract<TeamReply, { ok: false }> {
 	const source = error instanceof TeamProtocolError ? error.toTeamError()
 		: { code: "PROTOCOL_FAILURE" as const, message: error instanceof Error ? error.message : String(error) };
 	const teamError: TeamError = {
 		code: source.code,
-		message: previewText(source.message, TEAM_MAX_NOTE_BYTES),
+		message: projectErrorText(source.message),
 		...(source.blockers?.length ? { blockers: source.blockers.slice(0, 32).map((blocker) => ({
-			kind: previewText(blocker.kind, 128),
+			kind: projectErrorText(blocker.kind, 128),
 			...(blocker.id !== undefined ? { id: blocker.id } : {}),
-			reason: previewText(blocker.reason, TEAM_MAX_NOTE_BYTES),
+			reason: projectErrorText(blocker.reason),
 		})) } : {}),
 	};
 	return { ok: false, from: "@hub", to, error: teamError };

@@ -27,6 +27,11 @@ export const TEAM_MAX_INPUT_REFS = 32;
 export const TEAM_MAX_WAITING_FOR = 32;
 export const TEAM_MAX_ACTIVATION_INPUT_BYTES = 64 * 1024;
 export const TEAM_MAX_FRAME_BYTES = 1024 * 1024;
+/** Complete raw model arguments, before normalization or private framing. */
+export const TEAM_MAX_ACTION_BYTES = 64 * 1024;
+/** Public previews are independent of host-grantable ledger capacity. */
+export const TEAM_MAX_PUBLIC_CHILDREN = 64;
+export const TEAM_MAX_OWNED_CHILD_PREVIEWS = 8;
 export const TEAM_MAX_DEPENDENCY_PREVIEW_BYTES = 4 * 1024;
 export const TEAM_MAX_DEPENDENCY_PREVIEWS = 8;
 export const TEAM_MAX_DELIVERED_OUTCOMES = 32;
@@ -281,7 +286,7 @@ export interface ActivationScope {
 }
 
 export type PrivateAction =
-	/** Raw `team` tool arguments: the runtime normalizes them, so a bad argument is a business error for the model. */
+	/** Raw public arguments, codec-validated before child framing and independently revalidated by Runtime. */
 	| { action: "business"; args: Record<string, unknown> }
 	| { action: "input_ready"; deliveryId: string }
 	| { action: "provider_gate" }
@@ -390,7 +395,10 @@ export interface ActivationInput {
 	outcomes: OutcomeView[];
 	/** Outcomes that did not fit this input; they stay undelivered for a later activation. */
 	omittedOutcomes: number;
+	/** Bounded preview, not the authoritative set of completion obligations. */
 	ownedChildren: Array<{ work: WorkRef; state: WorkState }>;
+	/** Remaining children are discoverable via status(work) pages and their exact parent WorkRef. */
+	ownedChildrenOmitted?: number;
 	budget: ActivationBudgetSummary;
 	notice: string;
 }
@@ -435,13 +443,17 @@ export interface TeamWorkView {
 	depth: number;
 	currentRevision: number;
 	current: WorkVersion;
+	/** Bounded preview; enumerate status(work) pages matching parent for the complete set. */
 	children: WorkRef[];
+	childrenOmitted?: number;
 	revisions: Array<{ revision: number; state: WorkState; resultRef?: string }>;
 	/** Results that arrived for a version that could no longer accept them; evidence only. */
 	rejectedCandidates?: Array<{ revision: number; reason: string; summary: string }>;
 }
 export interface TeamWorkSummary {
 	work: WorkRef;
+	/** Exact owning version; lets paginated work summaries enumerate all children after host grants. */
+	parent?: WorkRef;
 	requester: string;
 	assignee: string;
 	state: WorkState;

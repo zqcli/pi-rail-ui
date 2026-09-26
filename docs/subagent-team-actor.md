@@ -59,7 +59,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 - 等待具体依赖或请求 attention 时 checkpoint 必填；`waitingFor` 与 `attention` 互斥。
 - 空 `yield` 只允许用在 Manager 的管理 activation。
 - 成功的 yield 会结束本次原生运行，不占住成员。
-- 结果早于 yield 到达也不会丢，下一次 activation 一次性交付。
+- 结果早于 yield 到达也不会丢；下一次 activation 交付可容纳的 outcome 批次，超出部分保持未交付，后续 yield 可继续观察。
 - 对已交付且没有变化的 outcome 再次 yield，返回 `NO_NEW_DEPENDENCY`。
 - 依赖环（包括 parent 对 child 的完成约束边）返回 `DEPENDENCY_CYCLE`。
 
@@ -68,6 +68,8 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 ```
 
 `status` 是只读查询：`view` 省略或为 `team` 时只接受 `limit`；`work`/`result`/`incident` 可以带精确 `id`，或带不透明的 `cursor` 翻页（二者只能选一）；`limit` 默认 20、最多 50。它不推进状态，也不代表 child 结果已被 parent 观察。
+
+从属 children 的公开列表是预览，不是完成义务的完整集合：activation 的 `ownedChildren` 最多 8 项，`ownedChildrenOmitted` 表示未展示数量；work 详情的 `children` 最多 64 个 WorkRef，`childrenOmitted` 表示其余数量。宿主 grant 可以增加 root 的 child 创建预算，但不会扩大这些展示上限。需要完整枚举时，调用 `status {view:"work", limit:50}`，随后按返回的 `cursor` 翻至 `hasMore:false`，筛选摘要中 `parent.workId` **和** `parent.revision` 都等于目标父 WorkRef 的条目，读取其 `work`。不要只按 workId 匹配，也不要把预览当作完整 children；Runtime 的完整父子义务仍只在 ledger 中。
 
 `control` 只限 Manager，字段是扁平的：
 
@@ -95,6 +97,10 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 
 `INVALID_ARGUMENT, UNSUPPORTED_PROTOCOL, UNKNOWN_MEMBER, FORBIDDEN_ACTION, SELF_REQUEST, RECIPIENT_CLOSING, RECIPIENT_CLOSED, MEMBER_UNAVAILABLE, TEAM_OWNED, STALE_REVISION, UNKNOWN_WORK, UNKNOWN_RESULT, WRONG_WORK_OWNER, REQUEST_QUEUE_FULL, TEAM_CAPACITY, INPUT_BUDGET_EXCEEDED, BUDGET_BLOCKED, DEPENDENCY_CYCLE, NO_NEW_DEPENDENCY, UNRESOLVED_CHILDREN, UNOBSERVED_CHILD_RESULTS, INTENT_CONFLICT, ACTIVATION_ENDING, WORK_NOT_RUNNING, CLOSE_BLOCKED, INVALID_TEAM_OUTCOME, CLEANUP_FAILED, DELIVERY_UNKNOWN, PROTOCOL_FAILURE`。
 
+子端 `team.execute` 不仅依赖按字符计数的工具 schema：在分配业务请求 sequence、写入私有 frame 之前，独立 codec 校验**原始公开参数**的形状、Unicode、UTF-8/JSON 转义大小、完整 JSON 总量及 WorkResult 上限。非法参数以结构化 `INVALID_ARGUMENT` 工具错误返回，不产生业务 mutation、不发送业务 frame，也不因此断开连接；模型可在同一 scope 纠正后重试。父 Runtime 仍独立 normalize/revalidate 并检查权限、版本、状态和预算。原生工具尝试的既有 gate/预算计步不因此取消。
+
+host/provider 的诊断是输出，不是模型参数：公开 work/previous/outcome、member/incident、终态原因和错误回执统一做有界投影。错误 `message` 按 JSON 转义后的 UTF-8 内容限 4 KiB，过长带 `[truncated]`，非法 Unicode 在公开文本中修复，保留合法 `code` 和适用的 `outcomeUnknown`。原始 ledger、native/cleanup/transport 证据不因公开投影而截断；内部幂等比较仍能区分原始错误的不同尾部。合法的业务 `result.status="failed"` 即使 summary 为 8 KiB，也只缩短其错误诊断投影，**完整 WorkResult 仍通过 resultRef 原样读取**，不会被转成协议故障。
+
 ## 4. 状态
 
 - Team：`prepared → active → closing → closed`，或 `failed`/`cancelled`/`interrupted`；health 为 `ok`/`needs_attention`；业务 outcome（`succeeded`/`partial`/`failed`）与生命周期分开记录。
@@ -112,7 +118,9 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 5. 结束意图以成功工具结果返回，并带 `terminate:true`。
 6. 等待 `agent_settled`、context reset、`deactivate` 和本次 send 清理全部完成后，才提交结果或等待；最后一条真实 assistant 消息是自然结束的唯一依据：内容为空时不会回退到更早的文本。
 
-`ActivationInput`（≤64 KiB）包含：成员职责、shared brief、精简 roster、当前 WorkRef/任务/checkpoint/恢复说明（或管理事件批次）、相关 dependency outcome（最多 32 条，其中前 8 条带预览，预览合计 ≤4 KiB，其余只给不可变 resultRef；超出部分记入 `omittedOutcomes`，保持未交付）、从属 child 摘要和预算剩余量。其他排队工作不会在运行中途注入。mid-activation 原生 compaction 与 `context_edit` 按 Pi canonical projection 处理：被显式删除的输入不会复活，下一次 activation 会重新提供当前工作事实。
+`ActivationInput`（≤64 KiB）包含：成员职责、shared brief、精简 roster、当前 WorkRef/任务/checkpoint/恢复说明（或管理事件批次）、相关 dependency outcome、从属 child 摘要和预算剩余量。outcome 最多 32 条，至多 8 条带结果摘要预览；带预览条目的完整 JSON（包括引用和错误元数据）合计 ≤4 KiB。其余条目保留 WorkRef、终态及适用的 resultRef/错误诊断，完整结果按 resultRef 查询。总量不足时先收敛可选预览/child 展示，再减少本批 outcomes；`omittedOutcomes` 精确记录未发送数量，必要 task/brief/role 不会为此删除。投影重复应用不重复累加 omitted。
+
+Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把这些引用加入 observedOutcomes，不另从 ledger 重算“前 32 个”。未选 outcomes 保持未观察，可经后续 yield 逐批交付，所有必要 child outcome 均已观察后才允许 parent reply。结果未知的 outcome 仍受 Manager/宿主显式放行约束，不因分页或裁剪被自动确认。其他排队工作不会在运行中途注入。mid-activation 原生 compaction 与 `context_edit` 按 Pi canonical projection 处理：被显式删除的输入不会复活，下一次 activation 会重新提供当前工作事实。
 
 私有协议统一为 v2（`/rail-subagent-team-protocol`，描述 `Rail private team protocol v2`）。遇到 v1、命令缺失或冲突时，在任何 provider 请求之前拒绝。ACK 超时（5 秒）只约束私有命令，正常运行没有期限。重复请求在有界缓存（每个成员连接保留 128 条已完成记录，pending 请求不淘汰）内幂等；过期帧会被拒绝，不会重新执行。没有自动重发、重连或重放。
 
@@ -120,7 +128,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 
 - Runtime 通过唯一的 effect drain 调度：worker 最多 4 个执行许可，Manager 有独立的 1 个；ready 队列为 FIFO，每个 WorkRef 最多一个 ready 项。
 - yield 完整结束后释放许可，排在后面的成员（例如第 8 个 worker）因此有机会运行。
-- Manager 事件：`BOOT, USER_COMMAND, ROOT_RESULT_READY, DECISION_REQUEST, WORK_HELD, MEMBER_FAULTED, MEMBER_CLOSED, DEPENDENCY_UNAVAILABLE, BUDGET_HIT, TEAM_QUIESCENT`，按语义键去重；批次一旦封存，最多 16 项。新事件进入下一批；已处理的批次即使 Manager 什么都没做也不会重新入队。
+- Manager 事件：`BOOT, USER_COMMAND, ROOT_RESULT_READY, DECISION_REQUEST, WORK_HELD, MEMBER_FAULTED, MEMBER_CLOSED, DEPENDENCY_UNAVAILABLE, BUDGET_HIT, TEAM_QUIESCENT`，按语义键去重；批次一旦封存，最多 16 项，且必须与 brief/role 等共同满足 64 KiB 输入上限。长错误先做公开投影，仍放不下时缩小事件批次；未选事件不被封存或确认，留待后续批次。新事件进入下一批；已处理的批次即使 Manager 什么都没做也不会重新入队。
 - status 查询、no-op 控制和 ACK 不产生事件。全员 idle 时 Team 保持 active；只在语义版本变化时发出一次 `TEAM_QUIESCENT`。
 - Manager 故障时：Team 进入 needs_attention，worker 在安全点暂停，账本保留；没有自动接任，也没有自唤醒。
 
@@ -138,6 +146,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
   - `partial`：需要 reason 和至少一个 resultRef。
   - `failed`：需要 reason。
 - close_team 提交后入口立即关闭（原子）。Manager 在本次 activation 正常收尾后才停止；所有成员退出确认后 Team 才是 `closed`。清理失败或关闭后出错时 Team 为 `failed`，不会报告为 closed success。
+- 成员资源关闭等待 Broker/transport 自身的有界退出结果；Runtime 不再套用 activation-stop 的独立 5 秒超时抢先宣告 close 失败。资源确实未退出时仍保留 ownership，晚到退出确认只结清一次。这不放宽私有命令的 5 秒 ACK 上限。
 
 ## 9. 预算与 HostControl
 
@@ -164,14 +173,17 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 | shared brief | 32 KiB 完整 JSON |
 | checkpoint / attention / 恢复说明 / reason | 各 4 KiB，并计入输入总量 |
 | WorkResult | 12 KiB 完整 JSON，每类数组最多 32 项 |
-| ActivationInput | 64 KiB |
-| 私有帧 | 1 MiB |
+| 原始成员工具参数 | 64 KiB 完整 JSON；各 action/字段另有更小上限 |
+| ActivationInput | 64 KiB 完整 JSON |
+| 私有帧 | 1 MiB 完整 JSON，含 native tool-call evidence |
+| activation `ownedChildren` / work 详情 `children` | 最多 8 / 64 项，另给 omitted 计数；完整 refs 通过 work 分页的 parent 关系枚举 |
+| 公开错误 message | 4 KiB JSON 转义后 UTF-8 内容，截断带提示 |
 | inputRefs / waitingFor | 各 32 项 |
 | status 分页 | 默认 20，最多 50 |
 | Team 视图 | incident 32、root 预算 32、grant 16 条（其余计数为 omitted） |
 | live/prepared Team | 32 个 |
 
-必需内容在接受请求或修订时就校验能否放进输入，不会出现“已接受但无法发送”。当前实现没有 UI 事件环：状态展示直接读取有界的 public snapshot，义务只存在于账本中，因此早期请求不会因为事件过多而丢失。
+请求/修订的必需输入在接受前做组合大小校验；可选 outcomes 和 children 展示独立有界，不能因 host grant 扩大 ledger 就把完整 children 塞进 activation。相关最大输入、65 children 和多批确认回归见验证报告；这些检查并不构成对所有组合无缺陷的证明。当前实现没有 UI 事件环：状态展示直接读取有界的 public snapshot，义务只存在于账本中，因此早期请求不会因为事件过多而丢失。
 
 ## 11. 状态展示、TeamResult 与历史
 

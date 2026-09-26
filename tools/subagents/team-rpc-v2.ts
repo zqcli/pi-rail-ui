@@ -6,7 +6,7 @@ import {
 	type BindingV2, type ChildRequestFrame, type ParentCommand, type PrivateReply, type TeamErrorCode,
 } from "./team-protocol";
 import type { NativeCompletion, RuntimeActivation } from "./team-runtime";
-import { canonicalJson, parseChildFrame, parseParentCommand, sameBinding, sameScope } from "./team-codec";
+import { canonicalJson, jsonBytes, parseChildFrame, parseParentCommand, sameBinding, sameScope } from "./team-codec";
 import { RunResultCollector } from "./run-result";
 import type { SubagentUsage } from "./session-broker";
 
@@ -153,7 +153,8 @@ function completionFor(run: ActiveRun): NativeCompletion {
 		...(text !== undefined ? { finalAssistantText: text } : {}),
 		...(pendingToolCalls ? { pendingToolCalls: true } : {}),
 		...(appliedToolCallId ? { appliedToolCallId } : {}),
-		...(status === "error" ? { error: { code: "NATIVE_FAILURE", message: record(message) && typeof message["errorMessage"] === "string" ? message["errorMessage"] : "Pi assistant turn failed" } } : {}),
+		// Completion is private evidence. Runtime projects its public views without changing duplicate detection.
+		...(status === "error" ? { error: { code: "NATIVE_FAILURE", message: nativeErrorMessage ?? "Pi assistant turn failed" } } : {}),
 	};
 }
 
@@ -397,6 +398,8 @@ export class TeamRpcV2Connection {
 		const entry = event["entry"] as { type?: string; customType?: string; data?: unknown } | undefined;
 		if (entry?.type !== "custom" || entry.customType !== TEAM_PRIVATE_ENTRY_TYPE) return;
 		try {
+			// Check the complete wire object, including native evidence removed for core parsing.
+			if (jsonBytes(entry.data) > TEAM_MAX_FRAME_BYTES) throw new Error("Team v2 child frame exceeds its frame limit");
 			let nativeToolCallId: string | undefined;
 			let parseValue = entry.data;
 			if (record(entry.data) && record(entry.data["request"]) && entry.data["request"]["action"] === "business") {

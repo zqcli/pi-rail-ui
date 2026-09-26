@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_MANAGER_EVENT_BATCH,
+	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_PROTOCOL_VERSION,
 	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, DEFAULT_TEAM_BUDGET, isTerminalWorkState, sameWorkRef,
@@ -13,7 +13,7 @@ import {
 } from "./team-protocol";
 import {
 	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, normalizeNativeToolCallId, normalizeTeamAction, normalizeTeamPlan, parseActivationScope, parseBinding, sameScope,
-	okReply, previewText,
+	okReply, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
 import { WorkLedger } from "./team-work-ledger";
 import { addActivationUsage, emptySubagentUsage } from "./usage";
@@ -21,9 +21,20 @@ import type { SubagentUsage } from "./session-broker";
 import { TeamBudget, type ActivationBudget, type BudgetExhaustion, type BudgetScope } from "./team-budget";
 import type { TeamJournalGeneration, TeamJournalRecord } from "./team-journal";
 
-/** Keep text exact when it fits its protocol limit; otherwise use a bounded preview. */
-function boundedText(value: string, maxBytes: number): string {
-	return Buffer.byteLength(JSON.stringify(value), "utf8") - 2 <= maxBytes ? value : previewText(value, maxBytes);
+/** Internal evidence keeps every code unit, including malformed Unicode; never compare public truncations. */
+function errorFingerprint(error: WorkError): string {
+	return canonicalJson({ ...error, code: JSON.stringify(error.code), message: JSON.stringify(error.message) });
+}
+
+function completionFingerprint(completion: NativeCompletion | CleanupCompletion): string {
+	return canonicalJson({ ...completion,
+		...(completion.error ? { error: errorFingerprint(completion.error) } : {}),
+		...("finalAssistantText" in completion ? { finalAssistantText: JSON.stringify(completion.finalAssistantText) } : {}),
+	});
+}
+
+function incidentView(incident: TeamIncidentView): TeamIncidentView {
+	return { ...structuredClone(incident), ...projectWorkError(incident) };
 }
 
 /** Grant reasons are retained in the bounded Team view; keep them short. */
@@ -508,14 +519,14 @@ export class TeamRuntime {
 			if (team.lifecycle !== "closed") {
 				for (const member of team.members.values()) if (member.active) this.scheduleActivationStopExpiry(team, member, member.active);
 			}
-			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: team.reason } : {}) };
+			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: projectErrorText(team.reason) } : {}) };
 		}
 		if (["closed", "cancelled", "interrupted"].includes(team.lifecycle) || team.cancelRequested) {
-			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: team.reason } : {}) };
+			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: projectErrorText(team.reason) } : {}) };
 		}
 		if (team.lifecycle === "prepared") return this.stopPrepared(team, reason, "cancelled");
 		this.stopTeamExecution(team, "cancelled", reason, { code: "CANCELLED", message: reason });
-		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: team.reason ?? reason };
+		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: projectErrorText(team.reason ?? reason) };
 	}
 
 	/**
@@ -528,18 +539,20 @@ export class TeamRuntime {
 		if (team.closeDecision || TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle) || team.cancelRequested) return this.cancelTeam(teamId, reason);
 		if (team.lifecycle === "prepared") return this.stopPrepared(team, reason, "interrupted");
 		this.stopTeamExecution(team, "interrupted", reason, { code: "INTERRUPTED", message: reason });
-		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: team.reason ?? reason };
+		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: projectErrorText(team.reason ?? reason) };
 	}
 
 	/** Driver-only admission failure: consume the prepared attempt, without impersonating a user cancel. */
 	failStartup(teamId: string, reasonValue: string): HostControlReceipt {
 		const team = this.team(teamId);
 		if (team.closeDecision || TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle) || team.cancelRequested) {
-			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: team.reason } : {}) };
+			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: projectErrorText(team.reason) } : {}) };
 		}
 		if (team.lifecycle !== "prepared") fail("INVALID_ARGUMENT", "Startup failure requires a never-launched Team");
-		const reason = this.hostText(reasonValue, "startup failure");
-		return this.stopPrepared(team, reason, "failed");
+		// Driver diagnostics are evidence, not bounded host commands. Preserve the original cause;
+		// public projections bound it without preventing this failed attempt's resource cleanup.
+		if (typeof reasonValue !== "string") fail("INVALID_ARGUMENT", "startup failure must be a string");
+		return this.stopPrepared(team, reasonValue, "failed");
 	}
 
 	/** Shared terminal stop for host cancellation and fail-closed journal loss; the first terminal lifecycle wins. */
@@ -601,7 +614,7 @@ export class TeamRuntime {
 		this.check(team);
 		this.requestDrain(team.id);
 		this.settleCompletion(team);
-		return { actor: "@host", status: "applied", teamId: team.id, lifecycle: team.lifecycle, reason };
+		return { actor: "@host", status: "applied", teamId: team.id, lifecycle: team.lifecycle, reason: projectErrorText(reason) };
 	}
 
 	private cancelAllWork(team: TeamState, lifecycle: "cancelled" | "failed", error: WorkError): void {
@@ -719,7 +732,7 @@ export class TeamRuntime {
 			if (!version.hold) return [];
 			const incident = team.incidents.find((item) => item.id === version.hold!.incidentId);
 			return [{ work: { workId: id, revision: entry.record.currentRevision }, assignee: entry.record.assignee, rootId: entry.record.rootId,
-				reason: version.hold.reason, incidentId: version.hold.incidentId, message: incident?.message ?? "", task: previewText(version.task, 512) }];
+				reason: version.hold.reason, incidentId: version.hold.incidentId, message: incident ? projectErrorText(incident.message) : "", task: previewText(version.task, 512) }];
 		});
 	}
 
@@ -1283,11 +1296,11 @@ export class TeamRuntime {
 		const active = member.active?.scope.activationId === activationId ? member.active : undefined;
 		if (!active) {
 			if (member.lastActivation?.activationId === activationId
-				&& canonicalJson(member.lastActivation.native) === canonicalJson(completion)) return okReply(member.id);
+				&& completionFingerprint(member.lastActivation.native) === completionFingerprint(completion)) return okReply(member.id);
 			fail("WORK_NOT_RUNNING", "No matching active activation");
 		}
 		if (active.native) {
-			if (canonicalJson(active.native) !== canonicalJson(completion)) fail("PROTOCOL_FAILURE", "Conflicting native settlement evidence");
+			if (completionFingerprint(active.native) !== completionFingerprint(completion)) fail("PROTOCOL_FAILURE", "Conflicting native settlement evidence");
 			return okReply(member.id);
 		}
 		if (completion.status === "success" && completion.pendingToolCalls) fail("PROTOCOL_FAILURE", "Native success cannot retain pending tool calls");
@@ -1343,12 +1356,12 @@ export class TeamRuntime {
 		const active = member.active?.scope.activationId === activationId ? member.active : undefined;
 		if (!active) {
 			if (member.lastActivation?.activationId === activationId
-				&& canonicalJson(member.lastActivation.cleanup) === canonicalJson(cleanup)) return okReply(member.id);
+				&& completionFingerprint(member.lastActivation.cleanup) === completionFingerprint(cleanup)) return okReply(member.id);
 			fail("WORK_NOT_RUNNING", "No matching active activation");
 		}
 		if (!active.native) fail("PROTOCOL_FAILURE", "Cleanup cannot complete before native settlement");
 		if (active.cleanup) {
-			if (canonicalJson(active.cleanup) !== canonicalJson(cleanup)) fail("PROTOCOL_FAILURE", "Conflicting cleanup evidence");
+			if (completionFingerprint(active.cleanup) !== completionFingerprint(cleanup)) fail("PROTOCOL_FAILURE", "Conflicting cleanup evidence");
 			return okReply(member.id);
 		}
 		active.cleanup = copy(cleanup);
@@ -1375,7 +1388,7 @@ export class TeamRuntime {
 		const active = member.active?.scope.activationId === activationId ? member.active : undefined;
 		if (!active) {
 			const lost = member.lastLostActivation;
-			if (lost?.activationId === activationId && canonicalJson(lost.error) === canonicalJson(error)
+			if (lost?.activationId === activationId && errorFingerprint(lost.error) === errorFingerprint(error)
 				&& lost.resourceReleased === resourceReleased) return okReply(member.id);
 			fail("WORK_NOT_RUNNING", "No matching unsettled activation to isolate");
 		}
@@ -1535,7 +1548,8 @@ export class TeamRuntime {
 		return {
 			id: entry.record.id, requester: entry.record.requester, assignee: entry.record.assignee, rootId: entry.record.rootId,
 			...(entry.record.parent ? { parent: copy(entry.record.parent) } : {}), depth: entry.record.depth,
-			currentRevision: entry.record.currentRevision, current: copy(current), children: this.team(teamId).ledger.ownedChildren(ref),
+			currentRevision: entry.record.currentRevision, current: { ...copy(current), ...(current.error ? { error: projectWorkError(current.error) } : {}) },
+			...projectWorkChildren(this.team(teamId).ledger.ownedChildren(ref)),
 			revisions: entry.record.versions.map((version) => ({ revision: version.revision, state: version.state, ...(version.resultRef ? { resultRef: version.resultRef } : {}) })),
 			...(entry.rejectedCandidates.length ? { rejectedCandidates: copy(entry.rejectedCandidates) } : {}),
 		};
@@ -1569,7 +1583,7 @@ export class TeamRuntime {
 			teamId: team.id,
 			lifecycle: team.lifecycle as TeamResult["lifecycle"],
 			...(team.outcome ? { outcome: team.outcome } : {}),
-			...(team.reason ? { reason: team.reason } : {}),
+			...(team.reason ? { reason: projectErrorText(team.reason) } : {}),
 			finalResultRefs: copy(team.closeDecision?.resultRefs ?? []),
 			roots: team.closeDecision ? copy(team.closeDecision.roots) : roots.map((record) => {
 				const version = currentVersion(record);
@@ -1578,7 +1592,7 @@ export class TeamRuntime {
 			}),
 			members: [...team.members.values()].map(({ id, role, lifecycle, resourceState }) => ({ id, role, lifecycle, resourceState })),
 			usage: copy(team.usage),
-			unresolvedIncidents: unresolvedIncidents.slice(-TEAM_MAX_TERMINAL_INCIDENTS).map(({ id, code, message }) => ({ id, code, message })),
+			unresolvedIncidents: unresolvedIncidents.slice(-TEAM_MAX_TERMINAL_INCIDENTS).map(({ id, code, message }) => ({ id, ...projectWorkError({ code, message }) })),
 			...(unresolvedIncidents.length > TEAM_MAX_TERMINAL_INCIDENTS
 				? { unresolvedIncidentsOmitted: unresolvedIncidents.length - TEAM_MAX_TERMINAL_INCIDENTS }
 				: {}),
@@ -2063,12 +2077,12 @@ export class TeamRuntime {
 			}
 			const incident = team.incidents.find((item) => item.id === action.id);
 			if (!incident) fail("UNKNOWN_WORK", `Unknown incident ${action.id}`);
-			return okReply(member.id, { data: copy(incident) });
+			return okReply(member.id, { data: incidentView(incident) });
 		}
 		const offset = action.cursor ? this.cursorOffset(action.cursor) : 0;
 		const items = action.view === "work" ? this.workSummaries(team)
 			: action.view === "result" ? this.resultSummaries(team)
-			: team.incidents.map((incident) => copy(incident));
+			: team.incidents.map(incidentView);
 		const pageItems = items.slice(offset, offset + action.limit);
 		const next = offset + pageItems.length;
 		return okReply(member.id, { data: { view: action.view, items: pageItems, ...(next < items.length ? { cursor: `page:${next}` } : {}), hasMore: next < items.length } });
@@ -2078,18 +2092,29 @@ export class TeamRuntime {
 		const batchId = this.id("batch");
 		const scope: ActivationScope = { activationId: this.id("activation"), kind: "management", eventBatchId: batchId };
 		const deliveryId = this.id("delivery");
-		const input = this.activationInput(team, member, deliveryId, { kind: "management", eventBatchId: batchId,
-			events: events.map(({ key: _key, processed: _processed, batchId: _batchId, ...view }) => view), emergency },
-		team.budget.inputSummary(undefined, true, emergency));
-		const eventBatch: EventBatch = { id: batchId, eventIds: events.map((event) => event.id) };
-		for (const event of events) event.batchId = batchId;
+		let selected = events;
+		let input: ActivationInput;
+		for (;;) {
+			try {
+				input = this.activationInput(team, member, deliveryId, { kind: "management", eventBatchId: batchId,
+					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, ...view }) => view), emergency },
+				team.budget.inputSummary(undefined, true, emergency));
+				break;
+			} catch (error) {
+				if (!(error instanceof TeamProtocolError) || error.code !== "INPUT_BUDGET_EXCEEDED" || selected.length <= 1) throw error;
+				// Preserve the brief and event contents; unselected notices stay pending for the next batch.
+				selected = selected.slice(0, -1);
+			}
+		}
+		const eventBatch: EventBatch = { id: batchId, eventIds: selected.map((event) => event.id) };
+		for (const event of selected) event.batchId = batchId;
 		team.eventBatches.set(batchId, eventBatch);
 		const activation: ActiveActivation = { scope, deliveryId, inputReady: false, workerPermitHeld: false, parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(undefined, true, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
 		member.activity = "running";
-		this.addDelivery(team, member, scope, deliveryId, eventBatch.eventIds);
+		this.addDelivery(team, member, scope, input, eventBatch.eventIds);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
 	}
@@ -2115,7 +2140,7 @@ export class TeamRuntime {
 			budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.currentWork = copy(ref);
 		member.activity = "running";
-		this.addDelivery(team, member, scope, deliveryId);
+		this.addDelivery(team, member, scope, input);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
 	}
@@ -2127,7 +2152,6 @@ export class TeamRuntime {
 		let ownedChildren: Array<{ work: WorkRef; state: WorkVersion["state"] }> = [];
 		if (scope.kind === "work") {
 			const version = team.ledger.version(scope.work)!;
-			const entry = team.ledger.get(scope.work.workId)!;
 			candidates = [...version.waitingFor, ...team.ledger.ownedChildren(scope.work)];
 			ownedChildren = team.ledger.ownedChildren(scope.work).map((work) => ({ work, state: team.ledger.version(work)!.state }));
 			const seen = new Set<string>();
@@ -2145,41 +2169,25 @@ export class TeamRuntime {
 						summary: previewText(record.result.summary, Math.floor(TEAM_MAX_DEPENDENCY_PREVIEW_BYTES / TEAM_MAX_DEPENDENCY_PREVIEWS) - 96),
 					} } : {}) });
 			}
-			void entry;
 		}
-		const selected = outcomes.slice(0, TEAM_MAX_DELIVERED_OUTCOMES);
 		const result: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
 			member: { id: member.id, role: member.role, roleDescription: member.roleDescription },
 			brief: copy(team.plan.brief),
 			roster: [...team.members.values()].map((item) => ({ id: item.id, role: item.role, lifecycle: item.lifecycle,
 				rolePreview: previewText(item.roleDescription, 512) })),
-			scope: copy(scope), outcomes: selected, omittedOutcomes: Math.max(0, outcomes.length - selected.length),
+			scope: copy(scope), outcomes, omittedOutcomes: 0,
 			ownedChildren, budget, notice: "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work.",
 		};
-		encodeActivationInput(result);
-		return result;
+		return projectActivationInput(result);
 	}
 
-	private addDelivery(team: TeamState, member: RuntimeMember, scope: ActivationScope, deliveryId: string, eventIds?: string[]): void {
-		const dependencyOutcomes = scope.kind === "work" ? this.previewOutcomeRefs(team, scope.work!) : [];
-		team.deliveries.set(deliveryId, { id: deliveryId, memberId: member.id, activationId: scope.activationId,
+	private addDelivery(team: TeamState, member: RuntimeMember, scope: ActivationScope, input: ActivationInput, eventIds?: string[]): void {
+		// Only these outcomes survived size projection and the per-consumer unknown-outcome gate.
+		const dependencyOutcomes = input.outcomes.map((outcome) => copy(outcome.work));
+		team.deliveries.set(input.deliveryId, { id: input.deliveryId, memberId: member.id, activationId: scope.activationId,
 			...(scope.kind === "work" ? { work: copy(scope.work!) } : {}), ...(eventIds ? { eventIds: copy(eventIds) } : {}),
 			state: "in_flight", dependencyOutcomes });
-	}
-
-	private previewOutcomeRefs(team: TeamState, ref: WorkRef): WorkRef[] {
-		const version = team.ledger.version(ref)!;
-		const seen = new Set<string>();
-		const refs: WorkRef[] = [];
-		for (const candidate of [...version.waitingFor, ...team.ledger.ownedChildren(ref)]) {
-			const key = workRefKey(candidate);
-			if (seen.has(key) || version.observedOutcomes.some((old) => workRefKey(old) === key) || !team.ledger.outcomeReady(candidate)) continue;
-			seen.add(key);
-			refs.push(copy(candidate));
-			if (refs.length >= TEAM_MAX_DELIVERED_OUTCOMES) break;
-		}
-		return refs;
 	}
 
 	private finishActivation(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
@@ -2607,7 +2615,7 @@ export class TeamRuntime {
 		const current = team.incidents.find((incident) => incident.state === "open" && incident.code === code
 			&& incident.memberId === memberId && incident.rootId === rootId && (incident.work ? work && sameWorkRef(incident.work, work) : !work));
 		if (current) return current;
-		const incident: TeamIncidentView = { id: this.id("incident"), code, message: boundedText(message, TEAM_MAX_NOTE_BYTES), state: "open", createdAt: this.timestamp(),
+		const incident: TeamIncidentView = { id: this.id("incident"), code, message, state: "open", createdAt: this.timestamp(),
 			...(work ? { work: copy(work) } : {}), ...(rootId ? { rootId } : {}), ...(memberId ? { memberId } : {}) };
 		team.incidents.push(incident);
 		this.addEvent(team, { key: `incident:${incident.id}`, kind: code === "BUDGET_HIT" ? "BUDGET_HIT" : code === "WORK_HELD" ? "WORK_HELD" : "DEPENDENCY_UNAVAILABLE",
@@ -2900,7 +2908,7 @@ export class TeamRuntime {
 	private previousVersion(team: TeamState, ref: WorkRef): NonNullable<Extract<ActivationInput["scope"], { kind: "work" }> ["previous"]> {
 		const previous = team.ledger.version({ workId: ref.workId, revision: ref.revision - 1 })!;
 		return { revision: previous.revision, state: previous.state, ...(previous.checkpoint ? { checkpoint: previous.checkpoint } : {}),
-			...(previous.resultRef ? { resultRef: previous.resultRef } : {}), ...(previous.error ? { error: copy(previous.error) } : {}) };
+			...(previous.resultRef ? { resultRef: previous.resultRef } : {}), ...(previous.error ? { error: projectWorkError(previous.error) } : {}) };
 	}
 
 	private workSummaries(team: TeamState): TeamWorkSummary[] {
@@ -2908,6 +2916,7 @@ export class TeamRuntime {
 			const record = team.ledger.get(id)!.record;
 			const version = currentVersion(record);
 			return { work: { workId: id, revision: record.currentRevision }, requester: record.requester, assignee: record.assignee,
+				...(record.parent ? { parent: copy(record.parent) } : {}),
 				state: version.state, taskPreview: previewText(version.task, 512), ...(version.hold ? { hold: version.hold.reason } : {}),
 				...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: version.review.disposition } : {}) };
 		});
@@ -2972,7 +2981,7 @@ export class TeamRuntime {
 			id: member.id, role: member.role, roleDescription: member.roleDescription, lifecycle: member.lifecycle,
 			activity: member.activity, pause: member.pause, ...(member.currentWork ? { currentWork: copy(member.currentWork) } : {}),
 			resourceState: member.resourceState,
-			...(member.error ? { error: { code: member.error.code, message: boundedText(member.error.message, TEAM_MAX_NOTE_BYTES) } } : {}),
+			...(member.error ? { error: projectWorkError(member.error) } : {}),
 			queued: current.filter((version, index) => version.state === "queued" && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
 			blocked: current.filter((version, index) => version.state === "blocked" && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
 			held: current.filter((version, index) => !!version.hold && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
@@ -3007,14 +3016,14 @@ export class TeamRuntime {
 				failed: current.filter((version) => version.state === "failed").length,
 				cancelled: current.filter((version) => version.state === "cancelled" || version.state === "superseded").length,
 				roots: roots.length, rootsReviewed: roots.filter((record) => !!currentVersion(record).review).length },
-			incidents: copy(incidents), incidentsOmitted: team.incidents.length - incidents.length,
+			incidents: incidents.map(incidentView), incidentsOmitted: team.incidents.length - incidents.length,
 			budget: { limits: copy(team.limits), used,
 				exhausted: team.budget.teamExhausted(false) !== undefined || team.ledger.order.length >= team.limits.teamWorks
 					|| team.reservedResultBytes >= team.limits.reservedResultBytes,
 				roots: shownRoots, rootsOmitted: budgetRoots.length - shownRoots.length,
 				grants: copy(team.budget.grants.slice(-TEAM_VIEW_MAX_GRANTS)), grantsOmitted: Math.max(0, team.budget.grants.length - TEAM_VIEW_MAX_GRANTS) },
 			usage: copy(team.usage),
-			...(team.outcome ? { outcome: team.outcome } : {}), ...(team.reason ? { reason: boundedText(team.reason, TEAM_MAX_NOTE_BYTES) } : {}),
+			...(team.outcome ? { outcome: team.outcome } : {}), ...(team.reason ? { reason: projectErrorText(team.reason) } : {}),
 		};
 	}
 

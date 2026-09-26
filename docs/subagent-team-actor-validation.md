@@ -2,9 +2,9 @@
 
 ## 1. 结论
 
-规格 §24 的 100 项全部映射到具体测试（§5）。每条引用都是 §4 词典中的稳定编号，编号对应完整文件路径和 `test("…")` 的完整原文。生成本报告时已用脚本校验：100 个场景 ID 无重复、无缺漏；每个引用编号都在词典中定义；每个词典条目的名称都在所在文件中逐字存在；N 组每项至少引用一条 native 测试。
+本报告保留规格 §24 的 100 项映射及原测试编号，作为可追溯的覆盖索引（§4–§5），**不把“100 项都有映射”或测试全绿当作无缺陷证明**。上一版 900/900 全绿之后，父 review 仍发现六类缺陷：长错误输出、grant 后 children 展示、子端超大业务参数、关闭退出时限、被取消的导航、启动准入失败清理。本轮逐类修复并补回归（§7.1）；旧测试没有覆盖这些触发条件，不能用旧成绩替代新证据。
 
-父审查者在最终工作树上亲自重跑了全量检查，结果无失败、取消或跳过（§3）。
+父审查者在 repair 代码/测试工作树上亲自执行两次全量验证，均为 **938 passed，0 failed/cancelled/skipped**（§3）。验证后冻结代码与测试，本次只更新文档。词典以实际源码声明和两份父审查日志核对；参数化测试明确列出模板及展开条件，不冒充静态顶层 `test("…")` 声明。
 
 本轮**未验证**的范围：
 
@@ -20,7 +20,9 @@
 | 项 | 值 |
 | --- | --- |
 | 原始基线 | `acb612bd5a44bb89c838d35b7d0ae0f1df2413d2`（Team v2 开发开始前） |
-| 本轮代码 | `1c38b7a`（D2a）之上的 D2b 工作树。`1c38b7a` **不**包含 D2b 的代码、测试和文档；包含本报告的那次提交固定了本报告所验证的工作树 |
+| 上一版报告 | `5368b05`（D2b；其开发基线为 D2a `1c38b7a`），记录 900/900，现作为历史成绩保留 |
+| 本轮 repair 基线 | `3717416`，包含启动、关闭退出边界和导航修复；本轮验证对象为它加上待提交的 codec/protocol/extension/RPC/Runtime 及相关回归工作树，**不是单独的 `3717416`** |
+| 报告固定版本 | 本文编辑时 HEAD 为 `3717416`，源码与测试已冻结，仅补文档；父随后包含 wire 修复、回归与本报告的 Git 提交固定本轮交付版本。不预填尚未产生的提交 hash |
 | Node | v24.15.0 |
 | Pi | `@earendil-works/pi-coding-agent`、`pi-ai`、`pi-agent-core`、`pi-tui` 均为 0.87.1 |
 
@@ -49,26 +51,31 @@ run_isolated env PI_SUBAGENT_DEPTH=1 npm test     # 与嵌套 subagent 深度并
 git diff --check
 ```
 
-`npm run check` 即 `npm run typecheck && npm test`，其中 `npm test` = `tsx --test "tests/**/*.test.ts"`。开发时用的 `/tmp/rail-d2/env.sh` 与上面的片段等价，但它不是仓库文件。
+`npm run check` 即 `npm run typecheck && npm test`，其中 `npm test` = `tsx --test "tests/**/*.test.ts"`。父审查使用仓库外的 `/tmp/rail-d2/env.sh`（清空继承环境、创建临时 HOME/agent、支持 `EXTRA_ENV`）；上面的片段可在不依赖该临时脚本时复现同等隔离。父记录的 check 命令为：
 
-**父审查者重跑（最终工作树，此后代码未再修改）：**
+```bash
+EXTRA_ENV='npm_config_offline=true npm_config_update_notifier=false' /tmp/rail-d2/env.sh npm run check
+```
+
+另一轮在同样离线隔离中设置 `PI_SUBAGENT_DEPTH=1` 执行 `npm test`。**以下为父实际全量结果，不是文档更新者重跑或估算的结果；此后仅文档变化，代码/测试未再修改。** exit 来自父执行记录，计数与耗时已核对日志末尾（耗时四舍五入到毫秒）。
 
 | 命令 | exit | tests | pass | fail | cancelled | skipped | todo | duration_ms | 日志 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 隔离环境 `npm run check` | 0 | 900 | 900 | 0 | 0 | 0 | 0 | 69179 | `/tmp/pi-rail-final-check.log` |
-| 隔离环境 `PI_SUBAGENT_DEPTH=1 npm test` | 0 | 900 | 900 | 0 | 0 | 0 | 0 | 68976 | `/tmp/pi-rail-final-depth.log` |
+| 隔离环境 `npm run check`（含 typecheck） | 0 | 938 | 938 | 0 | 0 | 0 | 0 | 69752 | `/tmp/pi-rail-review-fixes-check.log` |
+| depth 隔离 `PI_SUBAGENT_DEPTH=1 npm test` | 0 | 938 | 938 | 0 | 0 | 0 | 0 | 69335 | `/tmp/pi-rail-review-fixes-depth.log` |
 
-实现者先前在同一代码上的运行结果与此一致：typecheck exit 0；两条 `npm test` 都是 exit 0、900/900；`git diff --check` exit 0。最终的 `git diff --check` 由父审查者在提交前执行。
+上一版 900 结果移至 §8，不再作为本轮成绩。本次文档交付另做只读词典/矩阵核对和 `git diff --check`，不重新执行测试或改动代码。
 
-Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 文件中。
+本轮 `tests/subagent/team-*.test.ts` 共 17 个文件、219 个展开后用例：208 个字面量名称声明，另有 5 个参数化声明分别展开为 2、2、3、2、2 个用例（11 个）。名称逐项与源码及两份全量日志核对；这不是“新增 219 条”，上一版为 181 条，本轮增加 38 条。
 
 ## 4. 测试编号词典
 
-编号规则：文件代码加上该文件中顶层 `test("…")` 的序号，只在本报告内有效。层级按测试体判定：
+编号规则：文件代码加稳定编号，只在本报告内有效。保留上一版编号及引用；本轮插入源码中的新测试追加新编号，不因文件内位置变化而重排旧编号。字面量名称必须匹配源码，参数化条目则列出源码模板、参数取值和日志中的精确展开名。层级按测试体判定，而不是按标题是否含 `native` 判定：
 
 - **pure**：纯 `TeamRuntime`、scheduler 或 codec。
 - **fake**：fake transport、extension host、broker、UI、Pi API 或 fake worker。
 - **native**：真实 Pi 0.87.1 子进程加隔离的本地合成 provider。`team-member-driver.test.ts` 中，测试体调用 `createHarness(` 或 `runScopedStopScenario(` 的为 native，其余为 fake；WS 通过真实 Pi CLI 连接 loopback WebSocket。
+- **pi-method/fake**：进程内调用真实 Pi `ExtensionRunner`、`AgentSession.navigateTree`/分支摘要、`AgentSessionRuntime.switchSession`/`fork` 方法，但 session 周边上下文、Broker member handle 和摘要 stream 是 fake。导航回归属于此层；既不是纯模拟方法实现，也不是上面的 native provider/CLI 端到端测试。
 
 词典列出全部 Team 测试，以及被引用的非 Team 测试。
 
@@ -246,6 +253,9 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 - `RV12` · fake · `flattened close_team control is recognized as a terminating native intent`
 - `RV13` · fake · `pending private requests are never evicted and requests older than the bounded completed cache are not re-executed`
 - `RV14` · fake · `a stop/exit failure propagates from send and close instead of reporting a released resource`
+- `RV15` · fake · `native 6 KiB proxy failures retain private evidence and project bounded public diagnostics without protocol faults`
+- `RV16` · fake · `private frame size includes the native tool-call evidence stripped before core codec parsing`
+- `RV17` · fake · `parent Runtime revalidates business input independently, with no business state change or connection fault`
 
 **`tests/subagent/team-extension-v2.test.ts`**
 
@@ -254,6 +264,10 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 - `EX03` · fake · `native custom activation is persisted and verified before input_ready/provider_gate; repeats are idempotent`
 - `EX04` · fake · `wrong native context aborts before private readiness or provider continuation`
 - `EX05` · fake · `business tool errors retain the structured TeamError JSON including its code`
+- `EX06` · fake · `execute rejects malformed and oversized business arguments locally, and the same activation accepts a corrected call`
+- `EX07` · fake · `child validation keeps flat control wire arguments for independent parent normalization`
+- `EX08` · fake · `host API exceptions produce bounded valid negative command ACKs`
+- `EX09` · fake · `oversized local reply can be corrected in the same connected scope and committed through Runtime`
 
 **`tests/subagent/team-tool.test.ts`**
 
@@ -293,6 +307,55 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 - `WS01` · native · `Stage B Team v2 actors use the configured Responses WebSocket for native input and tool settlement`
 - `WS02` · native · `Stage B Team v2 cancellation aborts a held native WebSocket run without another provider request`
 
+**`tests/subagent/team-codec-bounds.test.ts`**
+
+- `CB01` · pure · `6 KiB provider/host errors need bounded output projection, not relaxed private validation`
+- `CB02` · pure · `error replies and ACK diagnostics remain valid for empty, malformed-Unicode and escaped host errors`
+- `CB03` · pure · `65 and 512 owned children project to bounded previews, with complete refs in parent-labelled work pages`
+- `CB04` · pure · `activation projection budgets combined errors and previews, without dropping mandatory task/brief or claiming omitted delivery`
+- `CB05` · pure · `schema-valid ~1.32 MB result is INVALID_ARGUMENT before a private frame can be built`
+- `CB06` · pure · `business normalization rejects UTF-8, escaped-content and combined-result overflows independently of schema`
+- `CB07` · pure · `omission metadata is strict, and projection retains detached copies of child references`
+
+**`tests/subagent/team-runtime-bounds.test.ts`**
+
+BD03/BD04 来自同一个循环内的模板声明 `Runtime: ${maximal ? "maximal inputs and 40 failure outcomes" : "host grant and 65 children"} paginate and observe every outcome before reply`，循环参数为 `[false, true]`。下列两条名称是日志中的实际展开名，不是源码中的两个静态顶层声明。
+
+- `BD01` · pure · `Runtime: 6 KiB native failure automatically wakes its parent; all public views remain parseable and evidence stays exact`
+- `BD02` · pure · `Runtime: legal failed business result keeps its full 8 KiB summary, with bounded status/work/outcome diagnostics`
+- `BD03` · pure · `Runtime: host grant and 65 children paginate and observe every outcome before reply`（参数展开：`maximal=false`）
+- `BD04` · pure · `Runtime: maximal inputs and 40 failure outcomes paginate and observe every outcome before reply`（参数展开：`maximal=true`）
+- `BD05` · pure · `Runtime: malformed-Unicode transport diagnostics preserve exact evidence; unknown outcomes still require Manager release`
+- `BD06` · pure · `Runtime: cleanup errors and journal reasons are bounded only at public exits`
+- `BD07` · pure · `Runtime: revised work projects its prior failure without changing the immutable result`
+- `BD08` · pure · `Runtime: long malformed-Unicode driver startup errors still consume the failed attempt and retain first-wins cleanup`
+- `BD09` · pure · `Runtime: many cleanup-failure notices with maximal brief/roles are sealed into bounded exact Manager batches`
+
+**`tests/subagent/team-lifecycle-regressions.test.ts`**
+
+LC04/LC05 是模板 `host ${mode} during member startup wins a later bind failure and drains every opening handle` 在 `mode ∈ ["cancel", "interrupt"]` 下的展开；LC07/LC08 是模板 `all opened handles are cleaned when ${rejection} rejects final launch admission` 在 `rejection ∈ ["journal", "inactive journal"]` 下的展开。其余为字面量声明；LC06 使用 fake worker 和 mock timers，不等待真实 Pi 进程退出。
+
+- `LC01` · pure · `a pure prepared startup failure needs no native executor, fails its work, and preserves the first terminal decision`
+- `LC02` · pure · `a startup failure report cannot overwrite an already committed Manager close decision`
+- `LC03` · fake · `member bind failure fails startup, retains its original cause, and records confirmed cleanup without a phantom owner`
+- `LC04` · fake · `host cancel during member startup wins a later bind failure and drains every opening handle`（参数展开：`mode="cancel"`）
+- `LC05` · fake · `host interrupt during member startup wins a later bind failure and drains every opening handle`（参数展开：`mode="interrupt"`）
+- `LC06` · fake · `Runtime waits past 5s for the Broker's bounded transport exit and releases each owner once`
+- `LC07` · fake · `all opened handles are cleaned when journal rejects final launch admission`（参数展开：`rejection="journal"`）
+- `LC08` · fake · `all opened handles are cleaned when inactive journal rejects final launch admission`（参数展开：`rejection="inactive journal"`）
+- `LC09` · fake · `launch admission failure retains an unknown exit and reconciles a later confirmed exit without restarting or double release`
+
+**`tests/subagent/team-navigation-regressions.test.ts`**
+
+NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cancellation leaves a fresh current-branch Team host` 在 `kind ∈ ["tree", "switch", "fork"]` 下的展开；NV04/NV05 是模板 `native tree summary ${outcome} without session_tree leaves the current branch ready for a new Team` 在 `outcome ∈ ["aborted", "error"]` 下的展开。测试调用真实 Pi 方法，但使用 fake 上下文、member handle 和合成摘要 stream，**不是 native provider/CLI 测试**。
+
+- `NV01` · pi-method/fake · `native ExtensionRunner later session_before_tree cancellation leaves a fresh current-branch Team host`（参数展开：`kind="tree"`）
+- `NV02` · pi-method/fake · `native ExtensionRunner later session_before_switch cancellation leaves a fresh current-branch Team host`（参数展开：`kind="switch"`）
+- `NV03` · pi-method/fake · `native ExtensionRunner later session_before_fork cancellation leaves a fresh current-branch Team host`（参数展开：`kind="fork"`）
+- `NV04` · pi-method/fake · `native tree summary aborted without session_tree leaves the current branch ready for a new Team`（参数展开：`outcome="aborted"`）
+- `NV05` · pi-method/fake · `native tree summary error without session_tree leaves the current branch ready for a new Team`（参数展开：`outcome="error"`）
+- `NV06` · pi-method/fake · `native repeated navigation cannot skip a sealed host with unknown exits; only confirmed cleanup admits a fresh generation`
+
 **`tests/subagent/session-broker.test.ts`**
 
 - `SB01` · fake · `ordinary dispatch preserves the native run and usage objects`
@@ -311,19 +374,19 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 
 ## 5. 100 项映射
 
-“层”列由所引用测试的层级自动汇总，只表示“至少一条引用属于该层”，不表示每个断言步骤都在该层完成。N09 的分层另见行内说明。
+保留上一版全部 100 个场景 ID、原引用及其断言范围，在相关行追加本轮 repair 引用。“层”列按引用测试分层标注，只表示“至少一条引用属于该层”，不表示每个断言步骤都在该层完成。N09 的分层另见行内说明。映射完整性只是索引检查，不能证明输入组合、异常路径或真实运行无缺陷；本轮六类反例见 §7.1。
 
 ### P. 协议与身份
 
 | ID | 层 | 测试编号 | 实际断言 |
 | --- | --- | --- | --- |
-| P01 | native | `DR37` | 握手在任何 command、prompt 或 provider 调用之前明确失败；v1 子端活动日志为空；业务 provider 调用 0 次 |
+| P01 | fake + native | `DR37`, `LC03` | DR37：v1 握手在任何 command、prompt 或 provider 调用之前明确失败，子端活动日志为空。LC03 补充 fake v2 bind 失败的启动清理，保留原错且 provider=0；不把它当 v1 原生握手证据 |
 | P02 | pure | `RP14`, `RT03` | 伪造的 role、epoch、跨 Team binding 被拒；Team 快照逐字节不变；requester/root 只来自 binding |
 | P03 | pure + fake | `RT03`, `RV08` | 相同 rpcId 返回同一个 receipt，只有一份 WorkRecord 和一个 accepted 事实 |
-| P04 | pure + fake | `RT03`, `EX03` | 相同 ID、不同内容返回 `PROTOCOL_FAILURE`，业务快照不变；同一 commandId、不同 canonical 内容的 bind 被拒 |
+| P04 | pure + fake | `RT03`, `EX03`, `BD01`, `BD05` | 相同 ID、不同内容返回 `PROTOCOL_FAILURE`，业务快照不变；同一 commandId、不同 canonical 内容的 bind 被拒。补充长错误原始尾部不同不能因公开截断相同而被当作重复证据 |
 | P05 | pure + fake | `RP27`, `RP14`, `RV09`, `RT11` | 旧 activation 晚到的 reply 被拒；当前工作保持 running，没有 resultRef；过期 epoch 被拒；快照不变 |
-| P06 | pure + fake | `RP27`, `EX03`, `RV08` | 重复的 bind/activate/input_ready/settle/cleanup/deactivate 都只结清一次；重复 ACK 有诊断；结果只有一份 |
-| P07 | pure | `RT01`, `RT17`, `RP14` | 未知字段、非 JSON 值、互斥字段被拒；声明为可选的字段接受 null |
+| P06 | pure + fake | `RP27`, `EX03`, `RV08`, `BD01`, `BD05`, `LC09` | 重复的 bind/activate/input_ready/settle/cleanup/deactivate 都只结清一次；重复 ACK 有诊断；结果只有一份。补充长/非法 Unicode 错误证据重复及启动失败后的晚到退出无双释放 |
+| P07 | pure + fake | `RT01`, `RT17`, `RP14`, `CB05`, `CB06`, `EX06`, `EX07`, `EX09`, `RV17` | 未知字段、非 JSON 值、互斥字段被拒；声明为可选的字段接受 null。补充字符 schema 可放行的超大 reply、Unicode/转义/总量校验：子端在 append 前返回结构化业务错误，同 scope 可纠正并提交，连接不 stop，父仍独立校验 |
 | P08 | pure | `RP30`, `RT01` | send/report/wait/finish 以及 afterSeq/supersedes/replyTo 各自返回迁移说明（`INVALID_ARGUMENT`）；成员不 fault；快照不变 |
 | P09 | pure | `RP15` | 跨 Team 引用返回 `UNKNOWN_WORK`/`UNKNOWN_RESULT`；另一个同 alias 的 Team 快照不变 |
 | P10 | fake | `RV13` | pending 请求不被淘汰；超出有界缓存的旧请求不会被重新执行 |
@@ -339,8 +402,8 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 | W05 | pure | `RT21` | parent 的完成约束边参与环检测 |
 | W06 | pure | `RT20` | 结果早于 yield 到达时只交付一次，产生一个 ready activation |
 | W07 | pure | `RP25` | `NO_NEW_DEPENDENCY`；快照不变；之后没有新 activation |
-| W08 | pure | `RP16` | failed、cancelled、superseded 三种 child outcome 都交付给 parent |
-| W09 | pure | `RP16`, `RT25` | 分别返回 `UNRESOLVED_CHILDREN`/`UNOBSERVED_CHILD_RESULTS`，blockers 精确列出 child |
+| W08 | pure | `RP16`, `BD01`, `BD02`, `BD05` | failed、cancelled、superseded 三种 child outcome 都交付给 parent；补充长已知 provider/业务失败自动交付且不级联 fault，unknown 仍须 Manager 放行 |
+| W09 | pure | `RP16`, `RT25`, `BD03`, `BD04` | 分别返回 `UNRESOLVED_CHILDREN`/`UNOBSERVED_CHILD_RESULTS`，blockers 精确列出 child；65 children 或按字节裁剪成多批时，未全部观察前拒绝 parent reply，最后一批 ACK 后可提交 |
 | W10 | pure | `RP17` | `INVALID_ARGUMENT`，消息建议新建独立 work；快照不变 |
 
 ### D. 交付与容量
@@ -353,8 +416,8 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 | D04 | pure | `RP19` | R1 settling 期间入箱的 R2 保持 queued，R1 不变 |
 | D05 | pure | `RP19` | idle 判定前后到达的请求两种顺序都只唤醒一次 |
 | D06 | pure | `RP19`, `RB09` | 接收方队列满时新请求返回 `REQUEST_QUEUE_FULL`；已暂存的 reply 照常结算 |
-| D07 | pure | `RP04` | 多字节、重转义的组合大小在接受前检查；多一个字节即拒绝 |
-| D08 | pure | `RP02` | 未选中的 outcome 保持未交付；完整 resultRef 可查；预览不是完整结果 |
+| D07 | pure + fake | `RP04`, `CB01`, `CB04`, `CB05`, `CB06`, `BD01`, `BD02`, `BD04`, `BD06`, `BD07`, `BD09`, `RV15`, `RV16`, `EX08`, `EX09` | 保留多字节/重转义输入接受前校验；补充长错误和 8 KiB failed summary 的公开投影、完整 frame 大小、schema 可放行的约 1.32 MB reply、最大必需输入与失败 outcomes/Manager 事件的组合预算。完整结果与必要 task/brief/role 不删除 |
+| D08 | pure | `RP02`, `CB03`, `CB04`, `CB07`, `BD03`, `BD04`, `BD05` | 未选中的 outcome 保持未交付；完整 resultRef 可查；预览不是完整结果。补充 grant 后 65 children、精确 parent WorkRef 分页枚举、幂等 omitted 和按字节裁剪；input_ready 只观察实际 input.outcomes，多批全部观察后 parent 才能 reply，unknown 放行约束保留 |
 | D09 | pure + fake | `RV02`, `RV14`, `RT13`, `RP08` | ACK 超时明确失败；stop/exit 失败不报告已释放；传输丢失标记 outcomeUnknown；不自动重放 |
 | D10 | pure + fake | `RP29`, `TT03` | 作者 closed 后原结果可读、可 accept，不唤醒作者；历史 status 可读取单条完整结果 |
 
@@ -400,8 +463,8 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 | L06 | pure | `RP21` | Manager 以 close_member 关闭自己返回 `FORBIDDEN_ACTION`；close_team 不要求 Manager 事先 idle |
 | L07 | pure | `RP21` | 已 accepted 的未决请求使 close_team 返回 `CLOSE_BLOCKED`；close_team 提交后同一 activation 的新请求和宿主消息被拒，work 数不变；close_team 要求 worker 无 activation，因此 peer 无法在其后发起请求 |
 | L08 | pure | `RP21` | root 未验收或结果为 partial 时，succeeded 关闭返回 `INVALID_TEAM_OUTCOME` |
-| L09 | pure + fake + native | `RT34`, `RS08`, `DR15`, `DR22` | 退出确认前不报告 closed；未确认的退出为 cleanup_failed 并保留 lease；真实 Pi 中失败的 close 保留句柄供确认重试 |
-| L10 | pure + fake | `RT39`, `RT35`, `DR18`, `RB20` | 无自动 reopen、无重复 release、无错误的 closed success |
+| L09 | pure + fake + native | `RT34`, `RS08`, `DR15`, `DR22`, `LC06`, `LC09` | 退出确认前不报告 closed；未知退出保留 lease；真实 Pi 中失败的 close 保留句柄供确认重试。LC06 用 fake timers 证明 Runtime 不在 5 秒抢先结束仍在进行的 Broker close，6000 ms 确认后释放一次；LC09 验证未知退出后确认结清 |
+| L10 | pure + fake | `RT39`, `RT35`, `DR18`, `RB20`, `LC01`, `LC02`, `LC04`, `LC05`, `LC09`, `BD08` | 无自动 reopen、无重复 release、无错误的 closed success；启动失败不能覆盖先前 host cancel/interrupt 或已提交 Manager close，长诊断不阻断失败清理 |
 
 ### G. Manager、预算与循环
 
@@ -439,11 +502,11 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 | --- | --- | --- | --- |
 | U01 | fake | `TL05`, `TL10`, `TL22`, `TL24`, `TL30`, `TL36`, `SB01` | 普通 stateless/persistent/grouped/parallel/chain/control 的公开行为不变（另有全量非 Team 套件全部通过） |
 | U02 | fake + native | `DR02`, `SB03`, `SB06` | Team 成员拒绝普通修改；ownership 覆盖 startup 与 unbind；非 Team 目标照常 |
-| U03 | fake + native | `DR07`, `DR17`, `DR05`, `TI01`, `SB04` | 先打断再等待；无死锁；删除后 descriptor 不复活；shutdown 不返回 live handle |
+| U03 | fake + native + pi-method/fake | `DR07`, `DR17`, `DR05`, `TI01`, `SB04`, `LC03`, `LC04`, `LC05`, `LC07`, `LC08`, `LC09`, `NV06` | 原回归检查先打断再等待、删除后 descriptor 不复活、shutdown 不返回 live handle；补充 bind/最终准入失败清理所有已打开资源及导航未知退出不能绕过。所测路径无悬挂，不宣称一般无死锁 |
 | U04 | pure | `RP20`, `RP24` | activity 不变时 waiting/hold 变化仍推进 stateVersion，读取不推进；状态文本显示原因 |
-| U05 | pure + fake | `RP20`, `TT03`, `RB22` | 预览有界；游标稳定；完整 resultRef 可读；最大视图不超出私有帧 |
+| U05 | pure + fake | `RP20`, `TT03`, `RB22`, `CB03`, `BD02`, `BD03`, `BD04`, `BD06` | 预览有界；游标稳定；完整 resultRef 可读；最大视图不超出私有帧；grant 后 children 通过带 parent 的 work 分页查全，错误截断不损坏完整业务结果 |
 | U06 | pure + fake | `RB11`, `RB17`, `RV06`, `RV07` | usage 每次 activation 只累加一次；contextTokens 取最新值而不相加 |
-| U07 | pure + fake | `TI01`, `TG01`, `TG03`, `RB12` | 旧 journal generation 永久失活；不写入新分支 |
+| U07 | pure + fake + pi-method/fake | `TI01`, `TG01`, `TG03`, `RB12`, `NV01`, `NV02`, `NV03`, `NV04`, `NV05`, `NV06` | 旧 journal generation 永久失活、不写入新分支；追加后续扩展取消 tree/switch/fork、摘要 aborted/error 无 session_tree、重复导航未知退出。清理确认后当前分支可新建 host；NV 使用真实 Pi 方法＋fake 上下文，不是 native provider 验收 |
 | U08 | pure | `TH03`, `TH04` | 旧 v1 与没有 terminal 的 v2 记录只读显示为 interrupted/legacy；损坏条目跳过；不恢复 live |
 | U09 | native | `DR32` | 普通 reopen 的 provider 看到 `teamCalls = 0`，不带 live Team 工具或旧 activation 权限 |
 | U10 | fake + native | `DR36`, `DR19` | listener/timer/native owner 全部收敛；退出未知时明确保留 owner |
@@ -455,10 +518,10 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 | X01 | pure | `RP12`, `RP01` | 关键 latch 的所有排列下，每一步都通过动态不变量检查（覆盖范围见 §6） |
 | X02 | pure | `RT09`, `RT11`, `RP01` | 旧 scope 永不提交当前版本；暂停意图不丢 |
 | X03 | pure | `RP01`, `RT21`, `RP16` | 可满足的依赖只唤醒一次，环被拒。环拒绝由确定性测试 RT21 断言，随机游走只断言不变量 |
-| X04 | pure | `RP04` | 最大 roster 与最大合法输入/结果下，私有帧与公开输入都不越界 |
+| X04 | pure | `RP04`, `CB04`, `BD04`, `BD09` | 最大 roster 与最大合法输入/结果下，私有帧与公开输入都不越界；补充最大 brief/role/task 与大量失败 outcomes/错误事件组合，必要内容保留，分批交付 |
 | X05 | pure | `RB09`, `RT14`, `RT15`, `RP19` | 容量耗尽时在接受前拒绝；已接受的合法结果仍可结算 |
 | X06 | pure + fake | `RV08`, `RV09`, `EX03`, `RP27` | 重复和晚到的 ACK/帧不错投、不双提交、不自发生成新 work |
-| X07 | pure | `RP13` | 封存、交付、settling 各边界到达的事件进入下一批，下一批不丢、本批不重复 |
+| X07 | pure | `RP13`, `BD09` | 封存、交付、settling 各边界到达的事件进入下一批，下一批不丢、本批不重复；追加大错误事件按 64 KiB 预算缩小实际封存批次 |
 | X08 | pure | `RS06`, `RB10`, `RT39` | deadline、预算、用户 cancel 同时触发时原因与作用域可解释；cleanup 幂等 |
 | X09 | pure + fake + native | `DR12`, `RS07`, `RV04` | 有界 cancel、终止并给出诊断。**不**声称一般死锁已被证明不存在 |
 | X10 | pure | `RP01`, `RP05`, `RP06` | 固定 seed（60×160 步 + 15×400 步），每步检查不变量；trace 重放一致；断言 outcome-unknown 路径被覆盖；不依赖 LLM |
@@ -479,12 +542,29 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 | I19 | `RP22` |
 | I21 | `RB03` |
 | I22 | `RP21` |
-| I23 | `RP14`, `RP15`, `RP17`, `RP30`, `RP25`, `RB09`, `RT14` |
+| I23 | `RP14`, `RP15`, `RP17`, `RP30`, `RP25`, `RB09`, `RT14`, `EX06`, `EX09`, `RV17` |
 | I25 | `DR35`, `DR30` |
 | I29 | `TL05`, `TL22`, `TL24`, `TL30`, `TL36`, `SB01` |
 | I30 | `RV13`, `RV02`, `RT13` |
 
-## 7. 本轮修复、观察与已知差异
+## 7. Repair 修复、历史观察与已知差异
+
+### 7.1 父 review 发现并修复的六类问题
+
+以下问题均未被上一版 900 green 覆盖；100 项映射当时已存在，仍不足以发现这些具体触发条件。本轮不删除旧成绩或改写旧测试的证明范围，而是保留 §5 索引并追加具体回归。表内编号对应 §4 的精确测试名称；参数展开条目不计作新增静态声明。
+
+| 类别 | 旧覆盖缺口与修复后的实际断言 | 回归编号／层 | 相关 §24 场景 |
+| --- | --- | --- | --- |
+| R1 长 host/provider 错误输出 | 6 KiB provider error、合法 failed result 的 8 KiB summary，以及 Unicode/转义膨胀可能令合法失败的 activate/status 回包变成协议故障。公开 WorkError、previous/member/incident/终态原因和负 ACK 统一有界，保留分类、unknown 与截断提示；完整业务结果和内部证据保留。不同原始错误尾部不被公开截断合并为同一幂等证据。大量错误通知按实际可容纳批次封存。 | `CB01`, `CB02`, `BD01`, `BD02`, `BD05`, `BD06`, `BD07`, `BD08`, `BD09`（pure）；`RV15`, `EX08`（fake） | D07、W08、P04、P06、U05 |
+| R2 grant 后 children 展示与交付 | 默认 rootChildren=64 的场景没有覆盖合法 grant 后第 65 个 child。activation 预览 8、详情 refs 64＋omitted；分页摘要 parent 保留精确 WorkRef，完整 ledger 不截断。65 children 和最大输入＋40 个失败 outcomes 均可逐批观察后 reply；ACK 只确认实际 input.outcomes，未知结果仍须明确放行，重复投影不重复累计 omitted。 | `CB03`, `CB04`, `CB07`, `BD03`, `BD04`, `BD05`（pure，BD03/04 为参数展开） | D07、D08、W09、G08、U05、X04 |
+| R3 子端原始业务参数校验 | 字符级 schema 可放过约 1.32 MB reply；旧子端直接 append 私有 frame，导致父端按超大协议帧断连接。现在 append 前 codec 验证原始参数的形状、UTF-8/转义与完整 JSON 总量；以结构化 INVALID_ARGUMENT 返回，业务状态不变，同 scope 纠正 reply 后可正常提交，abort/stop=0。父仍独立 revalidate，完整 frame 仍限 1 MiB。 | `CB05`, `CB06`（pure）；`EX06`, `EX07`, `EX09`, `RV16`, `RV17`（fake；EX09 为 extension→fake RPC→Runtime 桥接） | P07、P02、D07、I23 |
+| R4 关闭退出时限错配 | Runtime 曾用 activation-stop 的独立 5 秒界限抢先判定 Broker 资源关闭失败。回归在 fake timer 5001 ms 时仍观察 stopping/ownership，transport 6000 ms 确认退出后仅释放一次；未知 exit 仍保留并可在真实确认后结清。不是放宽 ACK 超时。 | `LC06`, `LC09`（fake）；保留 `RV02` 的 ACK 上限回归 | L09、L10、U10 |
+| R5 导航未提交后的失活 host | 原覆盖主要检查成功导航/旧 generation 隔离，未覆盖后续扩展取消 tree/switch/fork、摘要 aborted/error 不产生 session_tree，及重复导航遇到未知退出。现在已结束的旧 Team 不复活；确认清理后当前分支可新建 host；未确认退出不因 host 已 sealed 而绕过。 | `NV01`–`NV06`（pi-method/fake；前五项为参数展开） | U07、U03、U10 |
+| R6 启动准入失败清理与分类 | 成员 bind 或最终 launch admission 的 journal/失活 writer 失败时，不能遗漏已打开资源、保留可重试 prepared 假象或把基础设施失败伪装用户取消。回归确认 provider=0、原始 cause 与 cleanup failure 分开、失败 attempt 被消费、未知退出保留 ownership；先前 host cancel/interrupt 或 Manager close 决定优先，晚到退出无重启/双释放。driver-only 长诊断也不阻断失败清理。 | `LC01`, `LC02`, `BD08`（pure）；`LC03`, `LC04`, `LC05`, `LC07`, `LC08`, `LC09`（fake；部分参数展开）；`RB16` 保留编号并使用当前源码名称 | P01（启动前拒绝补充）、P06、U03、L10 |
+
+上述新增回归的层级不能替代真实在线模型或完整 TUI 用户流程验证。特别是 NV 标题中的 `native` 表示调用真实 Pi 方法，不表示启动了真实 provider 子进程。
+
+### 7.2 上一版已有修复与继续适用的观察
 
 - **状态展示（规格 19.1）：** 成员行原先只显示当前 WorkRef，不显示任务。现在 live 视图附带每个成员当前 work 的有界任务预览（`tools/subagents/team-tool.ts` 的 `liveView`/`formatTeamView`），由 `RP24` 覆盖。
 - **删除 `TEAM_MAX_UI_EVENTS` 与 `TeamUiEvent`：** 二者从未被使用。状态展示直接读取有界的 public snapshot，义务只存在于账本中；`RP03`（W02）证明早期请求不会被事件量挤掉。
@@ -498,8 +578,18 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 - **分层差异：**
   - N09 的真实 Pi 部分是 driver 在打开前拒绝和合法策略的真实打开；prepare 阶段的策略固定与漂移拒绝只有 fake 覆盖（`TT02`）。
   - U01 使用 fake broker/worker 的回归套件。
+  - NV01–NV06 使用真实 Pi 导航/ExtensionRunner 方法与 fake 上下文；即使标题含 `native`，也不计入 native provider/CLI 层。LC06 使用 mock timers 验证 5 秒与 6 秒边界，不是一次真实进程 6 秒退出测量。
   - `team-member-driver.test.ts` 中的 fake 条目为 `DR15`, `DR16`, `DR17`, `DR18`, `DR19`, `DR20`, `DR21`, `DR23`，其余 DR 条目均为 native。L09、L10、U10 引用的 `DR15`、`DR18`、`DR19` 属于 fake。
 
 ## 8. 历史阶段结果（非本轮成绩）
 
-D1 阶段曾报告 1033 条测试通过，D2a 报告 881/877 条通过（后者为 `PI_SUBAGENT_DEPTH=1`）。这些数字包含已删除的 v1 测试，或早于本轮新增的测试，只作历史参考。v1 时期的在线验收与测试数量见各 legacy 文档（`docs/subagent-team-plan.md` 等），同样不是当前结果。
+上一版 D2b／`5368b05` 的父全量记录为：
+
+| 历史命令 | exit | tests/pass | fail/cancelled/skipped/todo | duration_ms | 历史日志 |
+| --- | --- | --- | --- | --- | --- |
+| 隔离 `npm run check` | 0 | 900/900 | 0/0/0/0 | 69179 | `/tmp/pi-rail-final-check.log` |
+| 隔离 `PI_SUBAGENT_DEPTH=1 npm test` | 0 | 900/900 | 0/0/0/0 | 68976 | `/tmp/pi-rail-final-depth.log` |
+
+这些 900 green 成绩保留为历史证据，**没有覆盖 §7.1 的六类 review 反例**，不再代表当前工作树。当前成绩仅采用 §3 的两次 938/938。`RB16` 在修复启动失败行为后保留编号，名称从旧版的 `launch failure keeps the Team prepared` 改为当前的 `launch failure ends the Team as failed`；词典使用当前实际存在的完整测试名。
+
+更早的 D1 曾报告 1033 条通过，D2a 为 881/877（后者为 `PI_SUBAGENT_DEPTH=1`）；它们包含已删除的 v1 测试，或早于后续新增回归，仅作历史参考。v1 时期的在线验收与测试数量见各 legacy 文档（`docs/subagent-team-plan.md` 等），同样不是当前结果。

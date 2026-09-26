@@ -7,7 +7,7 @@ import {
 	type PrivateAction, type PrivateReply, type TeamReply,
 } from "./team-protocol";
 import { TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "./team-codec";
-import { canonicalJson, isRecord, parseParentCommand, sameBinding, sameScope } from "./team-codec";
+import { canonicalJson, errorReply, isRecord, normalizeTeamAction, parseParentCommand, projectErrorText, sameBinding, sameScope, TeamProtocolError } from "./team-codec";
 
 interface ActiveActivation {
 	scope: ActivationScope;
@@ -33,7 +33,7 @@ function commandAck(command: ParentCommand, ok: boolean, error?: string) {
 	const activation = command.operation === "activate" || command.operation === "deactivate" || command.operation === "reply"
 		? command.activation : undefined;
 	return { version: 2 as const, kind: "ack" as const, commandId: command.commandId, binding: command.binding,
-		...(activation ? { activation } : {}), ok, ...(!ok ? { error: error ?? "Team v2 command rejected" } : {}) };
+		...(activation ? { activation } : {}), ok, ...(!ok ? { error: projectErrorText(error ?? "Team v2 command rejected") } : {}) };
 }
 
 function contentText(content: unknown): string {
@@ -163,6 +163,14 @@ export default function install(pi: ExtensionAPI): void {
 			executionMode: "sequential",
 			async execute(toolCallId, params, signal, _update, ctx) {
 				if (!binding || !active) throw new Error("Team tool is unavailable outside an active Team activation");
+				// JSON-schema lengths count characters, not UTF-8/escaped bytes or the whole result.
+				// Validate before allocating a private sequence/request; keep the flat public wire shape
+				// so Runtime still independently normalizes it and applies all authorization checks.
+				try { normalizeTeamAction(params); }
+				catch (error) {
+					if (!(error instanceof TeamProtocolError)) throw error;
+					throw new Error(JSON.stringify(errorReply(binding.memberId, error).error));
+				}
 				if (isEndIntent(params) && !finalAssistantIsSoleToolCall(ctx, toolCallId)) {
 					throw new Error("Team reply/yield/close_team must be the only tool call in the finalized assistant batch");
 				}

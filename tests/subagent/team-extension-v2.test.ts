@@ -2,30 +2,34 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import install from "../../tools/subagents/team-extension-v2";
-import { TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
+import { TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_DESCRIPTION, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
 import type { BindingV2, ParentCommand, PrivateReply } from "../../tools/subagents/team-protocol";
-import { TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "../../tools/subagents/team-codec";
+import { jsonBytes, parseChildFrame, TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "../../tools/subagents/team-codec";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
+import { TeamRpcV2Connection } from "../../tools/subagents/team-rpc-v2";
+import type { RpcEvent, RpcTransport } from "../../tools/subagents/rpc-worker";
 
-function nativeManagerActivation() {
+function nativeActivation(role: BindingV2["role"]) {
 	const runtime = new TeamRuntime();
 	const prepared = runtime.prepare({
 		manager: { alias: "lead", roleDescription: "Manage the Team." },
 		workers: [{ alias: "w1", roleDescription: "Do assigned work." }],
 		brief: { goal: "Verify the private activation bridge." }, timeoutSeconds: null,
+		initialRequests: role === "worker" ? [{ to: "w1", task: "Return a valid result." }] : [],
 	});
 	runtime.launch(prepared.teamId);
-	return runtime.takeNextActivation(prepared.teamId)!;
+	const manager = runtime.takeNextActivation(prepared.teamId)!;
+	return { runtime, activation: role === "manager" ? manager : runtime.takeNextActivation(prepared.teamId)! };
 }
 
 function harness(role: BindingV2["role"] = "manager") {
-	const activation = nativeManagerActivation();
-	const binding: BindingV2 = role === "manager" ? activation.binding
-		: { version: 2, teamId: activation.binding.teamId, memberId: "w1", role: "worker", epoch: "worker-epoch" };
+	const { runtime, activation } = nativeActivation(role);
+	const binding = activation.binding;
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const commands = new Map<string, any>();
 	const tools = new Map<string, any>();
 	const entries: any[] = [];
+	const entryListeners = new Set<(entry: { type: "custom"; customType: string; data: unknown }) => void>();
 	const branch: any[] = [];
 	const activeToolUpdates: string[][] = [];
 	let activeTools = ["read", "bash", "subagent", "subagent_team"];
@@ -44,13 +48,17 @@ function harness(role: BindingV2["role"] = "manager") {
 		getAllTools: () => [...tools.values()],
 		getActiveTools: () => [...activeTools],
 		setActiveTools: (names: string[]) => { activeTools = [...names]; activeToolUpdates.push([...names]); },
-		appendEntry: (customType: string, data: any) => entries.push({ type: "custom", customType, data }),
+		appendEntry: (customType: string, data: unknown) => {
+			const entry = { type: "custom" as const, customType, data };
+			entries.push(entry);
+			for (const listener of entryListeners) listener(entry);
+		},
 	};
 	install(pi as unknown as ExtensionAPI);
 	const command = async (frame: ParentCommand) => commands.get(TEAM_COMMAND).handler(JSON.stringify(frame), ctx);
 	const lastPrivate = () => [...entries].reverse().find((entry) => entry.customType === TEAM_PRIVATE_ENTRY_TYPE)?.data;
 	const privateFrames = () => entries.filter((entry) => entry.customType === TEAM_PRIVATE_ENTRY_TYPE).map((entry) => entry.data);
-	return { activation, binding, handlers, commands, tools, entries, branch, ctx, command, lastPrivate, privateFrames,
+	return { runtime, activation, binding, handlers, commands, tools, entries, branch, ctx, command, lastPrivate, privateFrames, entryListeners,
 		activeTools: () => activeTools, activeToolUpdates, aborts: () => aborts };
 }
 
@@ -209,4 +217,136 @@ test("business tool errors retain the structured TeamError JSON including its co
 		assert.equal(error.message, JSON.stringify({ code: "TEAM_CAPACITY", message: "No more active Teams." }));
 		return true;
 	});
+});
+
+test("execute rejects malformed and oversized business arguments locally, and the same activation accepts a corrected call", async () => {
+	const text = "x".repeat(8192);
+	const list = Array.from({ length: 32 }, () => text);
+	const oversizedReply = { action: "reply", result: { status: "failed", summary: text, findings: list, limitations: list, artifacts: list,
+		evidence: list.map((source) => ({ source, locator: source, basis: "observed" })) } };
+	assert.ok(jsonBytes(oversizedReply) > 1024 * 1024);
+	const h = harness();
+	await h.command(bindCommand(h));
+	await h.command(activateCommand(h));
+	const before = h.privateFrames().length;
+	const tool = h.tools.get("team");
+	for (const args of [oversizedReply,
+		{ action: "reply", result: { status: "succeeded", summary: "x".repeat(8000), findings: ["y".repeat(8000)] } },
+		{ action: "request", to: "w1", task: "中".repeat(3000) },
+		{ action: "request", to: "w1", task: "\n".repeat(5000) },
+		{ action: "request", to: "w1", task: "\ud800" },
+		{ action: "status", sender: "forged" },
+		{ action: "status", limit: Number.NaN }, [], null,
+	]) {
+		await assert.rejects(tool.execute("bad-call", args, h.ctx.signal, () => undefined, h.ctx), (error: Error) => {
+			const structured = JSON.parse(error.message);
+			assert.equal(structured.code, "INVALID_ARGUMENT");
+			assert.ok(structured.message);
+			return true;
+		});
+		assert.equal(h.privateFrames().length, before, "rejection does not append any frame or reach Runtime");
+		assert.equal(h.aborts(), 0, "model-correctable arguments must not abort the connection");
+	}
+	const execution = tool.execute("corrected-call", { action: "status" }, h.ctx.signal, () => undefined, h.ctx);
+	const request = await waitForRequest(h, "business");
+	assert.equal(request.sequence, 1, "rejected business input must not consume a private sequence");
+	await replyToRequest(h, request, { kind: "business", reply: { ok: true, from: "@hub", to: h.binding.memberId } }, "corrected-reply");
+	const result = await execution;
+	assert.equal(result.details.ok, true);
+	assert.equal(result.terminate, undefined);
+	assert.equal(h.aborts(), 0);
+});
+
+test("child validation keeps flat control wire arguments for independent parent normalization", async () => {
+	const h = harness();
+	await h.command(bindCommand(h));
+	await h.command(activateCommand(h));
+	const args = { action: "control", command: "pause_member", memberId: "w1" };
+	const execution = h.tools.get("team").execute("pause-call", args, h.ctx.signal, () => undefined, h.ctx);
+	const request = await waitForRequest(h, "business");
+	assert.deepEqual(request.request.args, args);
+	await replyToRequest(h, request, { kind: "business", reply: { ok: false, from: "@hub", to: h.binding.memberId,
+		error: { code: "FORBIDDEN_ACTION", message: "Parent authorization still applies." } } }, "pause-reply");
+	await assert.rejects(execution, (error: Error) => JSON.parse(error.message).code === "FORBIDDEN_ACTION");
+	assert.equal(h.aborts(), 0);
+});
+
+test("host API exceptions produce bounded valid negative command ACKs", async () => {
+	const h = harness();
+	h.tools.set("team", { get name() { throw new Error("proxy failure: " + "中\n".repeat(6000)); } });
+	await h.command(bindCommand(h));
+	const ack = h.lastPrivate();
+	assert.equal(ack.ok, false);
+	assert.match(ack.error, /\[truncated\]$/u);
+	assert.deepEqual(parseChildFrame(ack), ack);
+	assert.equal(h.aborts(), 0);
+});
+
+test("oversized local reply can be corrected in the same connected scope and committed through Runtime", async () => {
+	const h = harness("worker");
+	const listeners = new Set<(event: RpcEvent) => void>();
+	const emit = (event: RpcEvent) => { for (const listener of listeners) listener(event); };
+	h.entryListeners.add((entry) => emit({ type: "entry_appended", entry }));
+	const started = Promise.withResolvers<void>();
+	const promptDone = Promise.withResolvers<unknown>();
+	let stops = 0;
+	const failures: Error[] = [];
+	const transport: RpcTransport = {
+		onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+		async request(request) {
+			if (request["type"] === "get_commands") return { commands: [{ name: TEAM_COMMAND, source: "extension", description: TEAM_COMMAND_DESCRIPTION }] };
+			if (request["type"] === "clear_queue") return {};
+			if (request["type"] === "prompt" && typeof request["message"] === "string" && request["message"].startsWith(`/${TEAM_COMMAND} `)) {
+				await h.commands.get(TEAM_COMMAND).handler(request["message"].slice(TEAM_COMMAND.length + 2), h.ctx);
+				return {};
+			}
+			if (request["type"] === "prompt" && request["message"] === TEAM_ACTIVATION_TRIGGER) {
+				emit({ type: "agent_start" });
+				started.resolve();
+				return promptDone.promise;
+			}
+			throw new Error(`Unexpected synthetic RPC request: ${String(request["type"])}`);
+		},
+		async stop() { stops++; promptDone.reject(new Error("synthetic transport stopped")); },
+	};
+	const connection = new TeamRpcV2Connection(transport, h.binding, (error) => failures.push(error));
+	const running = connection.sendActivation(h.activation, async (frame, intentId) => {
+		assert.equal(frame.request.action, "business");
+		if (frame.request.action !== "business") throw new Error("Expected business request");
+		return { kind: "business", reply: h.runtime.handleAction(frame.binding, frame.activation, frame.sequence,
+			frame.rpcRequestId, frame.request.args, intentId!) };
+	});
+	await started.promise;
+	assert.equal(h.runtime.inputReady(h.binding, h.activation.scope.activationId, h.activation.deliveryId).ok, true);
+	const before = h.runtime.getTeam(h.binding.teamId);
+	const text = "x".repeat(8192);
+	const list = Array.from({ length: 32 }, () => text);
+	const oversized = { action: "reply", result: { status: "failed", summary: text, findings: list, limitations: list, artifacts: list,
+		evidence: list.map((source) => ({ source, locator: source, basis: "observed" })) } };
+	const tool = h.tools.get("team");
+	emit({ type: "tool_execution_start", toolCallId: "bad", toolName: "team" });
+	await assert.rejects(tool.execute("bad", oversized, h.ctx.signal, () => undefined, h.ctx),
+		(error: Error) => JSON.parse(error.message).code === "INVALID_ARGUMENT");
+	emit({ type: "tool_execution_end", toolCallId: "bad", toolName: "team", isError: true, result: {} });
+	assert.deepEqual(h.runtime.getTeam(h.binding.teamId), before);
+	assert.equal(h.privateFrames().filter((frame) => frame.kind === "request").length, 0);
+	const assistant = { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "corrected", name: "team" }] };
+	h.branch.push({ type: "message", message: assistant });
+	emit({ type: "tool_execution_start", toolCallId: "corrected", toolName: "team" });
+	const result = await tool.execute("corrected", { action: "reply", result: { status: "succeeded", summary: "Corrected reply." } }, h.ctx.signal, () => undefined, h.ctx);
+	assert.equal(result.terminate, true);
+	emit({ type: "tool_execution_end", toolCallId: "corrected", toolName: "team", isError: false, result });
+	emit({ type: "turn_end", message: assistant, toolResults: [{ toolCallId: "corrected", toolName: "team", isError: false }] });
+	emit({ type: "agent_settled" });
+	promptDone.resolve({});
+	const completion = await running;
+	assert.ok(completion.appliedToolCallId);
+	assert.equal(h.runtime.nativeSettled(h.binding, h.activation.scope.activationId, completion).ok, true);
+	await connection.deactivate(h.activation);
+	assert.equal(h.runtime.cleanupFinished(h.binding, h.activation.scope.activationId, { ok: true }).ok, true);
+	assert.equal(h.runtime.getWork(h.binding.teamId, h.activation.scope.work!)?.current.state, "resolved");
+	assert.deepEqual(failures, []);
+	assert.equal(stops, 0);
+	assert.equal(h.aborts(), 0);
+	await connection.close();
 });

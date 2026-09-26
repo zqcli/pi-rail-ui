@@ -6,7 +6,7 @@ import { TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_DESCRIPTION, TEAM_P
 import type { BindingV2, ChildRequestFrame, ParentCommand, PrivateReply } from "../../tools/subagents/team-protocol";
 import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 import { TeamActivationFailure, TeamRpcV2Connection } from "../../tools/subagents/team-rpc-v2";
-import { parseParentCommand } from "../../tools/subagents/team-codec";
+import { jsonBytes, jsonTextBytes, parseParentCommand, parseTeamReply, projectActivationInput } from "../../tools/subagents/team-codec";
 
 const runtime = new TeamRuntime();
 const prepared = runtime.prepare({
@@ -30,6 +30,7 @@ class FakeTransport implements RpcTransport {
 	triggerFailure: Error | undefined;
 	stopFailure: Error | undefined;
 	emitTrailingEmptyTurn = false;
+	nativeErrorMessage: string | undefined;
 	ignoreAbort = false;
 	private triggerTimer: NodeJS.Timeout | undefined;
 	private triggerDone: (() => void) | undefined;
@@ -104,7 +105,8 @@ class FakeTransport implements RpcTransport {
 		const done = this.triggerDone;
 		this.triggerDone = undefined;
 		const staged = stopReason === "stop" && this.stagedNativeToolCallId !== undefined;
-		this.emit({ type: "turn_end", message: { role: "assistant", stopReason: staged ? "toolUse" : stopReason,
+		this.emit({ type: "turn_end", message: { role: "assistant", stopReason: this.nativeErrorMessage !== undefined ? "error" : staged ? "toolUse" : stopReason,
+			...(this.nativeErrorMessage !== undefined ? { errorMessage: this.nativeErrorMessage } : {}),
 			content: staged ? [{ type: "toolCall", id: this.stagedNativeToolCallId, name: "team" }]
 				: stopReason === "stop" ? [{ type: "text", text: "native done" }] : [] },
 		toolResults: staged ? [{ toolCallId: this.stagedNativeToolCallId, toolName: "team", isError: false }] : [] });
@@ -174,6 +176,88 @@ test("native Team run may exceed the five-second ACK bound and still waits for r
 	await connection.deactivate(activation());
 	await connection.close();
 	assert.equal(transport.stopCalls, 0);
+});
+
+test("native 6 KiB proxy failures retain private evidence and project bounded public diagnostics without protocol faults", async () => {
+	const transport = new FakeTransport();
+	transport.nativeErrorMessage = "proxy upstream failure: " + "x".repeat(6000);
+	const failures: Error[] = [];
+	const { connection, run } = await startConnection(transport, async () => ({ kind: "ack" }), (error) => failures.push(error));
+	const completion = await run;
+	assert.equal(completion.status, "error");
+	assert.equal(completion.error?.code, "NATIVE_FAILURE");
+	assert.equal(completion.error!.message, transport.nativeErrorMessage, "private completion must retain the full evidence for Runtime comparisons");
+	const dependentInput = structuredClone(activation().input);
+	dependentInput.outcomes = [{ work: { workId: "failed-child", revision: 1 }, state: "failed", error: completion.error! }];
+	const projected = projectActivationInput(dependentInput);
+	assert.ok(jsonTextBytes(projected.outcomes[0]!.error!.message) <= 4096);
+	assert.match(projected.outcomes[0]!.error!.message, /\[truncated\]$/u);
+	assert.doesNotThrow(() => parseParentCommand({ version: 2, commandId: "dependent-input", operation: "activate", binding,
+		activation: activation().scope, deliveryId: activation().deliveryId, input: projected }));
+	assert.deepEqual(failures, []);
+	assert.equal(transport.stopCalls, 0);
+	await connection.deactivate(activation());
+	await connection.close();
+});
+
+test("private frame size includes the native tool-call evidence stripped before core codec parsing", async () => {
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 60000;
+	let handled = 0;
+	const { run } = await startConnection(transport, async () => { handled++; return { kind: "ack" }; });
+	const frame = makeRequest(1, "wire-limit");
+	const args = { action: "request", to: "w1", task: "" };
+	frame.request = { action: "business", args };
+	args.task = "x".repeat(1024 * 1024 - jsonBytes(frame));
+	assert.equal(jsonBytes(frame), 1024 * 1024, "the core frame fits exactly before native evidence is attached");
+	transport.emitChild(frame);
+	await assert.rejects(run, /child frame exceeds its frame limit/u);
+	assert.equal(handled, 0);
+	assert.equal(transport.stopCalls, 1, "an oversized forged private frame remains a protocol boundary failure");
+});
+
+test("parent Runtime revalidates business input independently, with no business state change or connection fault", async () => {
+	const local = new TeamRuntime();
+	const prepared = local.prepare({ manager: { alias: "lead", roleDescription: "Manage." },
+		workers: [{ alias: "w1", roleDescription: "Work." }], brief: { goal: "Validate locally." } });
+	local.launch(prepared.teamId);
+	const current = local.takeNextActivation(prepared.teamId)!;
+	local.inputReady(current.binding, current.scope.activationId, current.deliveryId);
+	const before = local.getTeam(prepared.teamId);
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 60000;
+	const failures: Error[] = [];
+	const controller = new AbortController();
+	const { connection, run } = await startConnection(transport, async (frame) => {
+		assert.equal(frame.request.action, "business");
+		if (frame.request.action !== "business") throw new Error("Expected business request");
+		return { kind: "business", reply: local.handleAction(current.binding, current.scope,
+			frame.sequence, frame.rpcRequestId, frame.request.args, `intent-${frame.sequence}`) };
+	}, (error) => failures.push(error), controller.signal);
+	const malformed = makeRequest(1, "invalid-business");
+	malformed.request = { action: "business", args: { action: "request", to: "w1", task: "中".repeat(3000) } };
+	transport.emitChild(malformed);
+	await waitFor(() => replyCount(transport) === 1);
+	const reply = transport.commands.find((command) => command.operation === "reply");
+	assert.ok(reply?.operation === "reply" && reply.reply.kind === "business");
+	if (reply.operation !== "reply" || reply.reply.kind !== "business") return;
+	assert.equal(reply.reply.reply.ok, false);
+	if (!reply.reply.reply.ok) assert.equal(reply.reply.reply.error.code, "INVALID_ARGUMENT");
+	assert.deepEqual(local.getTeam(prepared.teamId), before, "rejected arguments do not change the business state");
+	transport.emitChild(makeRequest(2, "corrected-status"));
+	await waitFor(() => replyCount(transport) === 2);
+	const corrected = transport.commands.filter((command) => command.operation === "reply")[1]!;
+	assert.ok(corrected.operation === "reply" && corrected.reply.kind === "business" && corrected.reply.reply.ok);
+	if (corrected.operation === "reply" && corrected.reply.kind === "business") {
+		const businessReply = corrected.reply.reply;
+		assert.doesNotThrow(() => parseTeamReply(businessReply));
+	}
+	assert.deepEqual(failures, []);
+	assert.equal(transport.stopCalls, 0);
+	controller.abort();
+	await run;
+	await connection.deactivate(activation());
+	await connection.close();
 });
 
 test("Team command application ACK still fails closed at the independent five-second timeout", { timeout: 10000 }, async () => {

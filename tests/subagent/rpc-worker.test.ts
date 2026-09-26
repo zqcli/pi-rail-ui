@@ -1,11 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
-import { teamExtensionPath, TEAM_COMMAND, TEAM_ENTRY_TYPE, type TeamWorkerChannel } from "../../tools/subagents/team-protocol-v1";
-import { TEAM_COMMAND_DESCRIPTION } from "../../tools/subagents/team-extension";
+import { teamExtensionPath } from "../../tools/subagents/team-protocol-v1";
 import { TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND as TEAM_COMMAND_V2, TEAM_COMMAND_DESCRIPTION as TEAM_COMMAND_DESCRIPTION_V2, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import { parseParentCommand } from "../../tools/subagents/team-codec";
@@ -211,24 +206,6 @@ function isContextPrompt(command: Record<string, unknown>): boolean {
 	return command["type"] === "prompt" && String(command["message"] ?? "").startsWith("/rail-context-internal-v1 ");
 }
 
-/** Acknowledge team wire commands so TeamRpcConnection can bind/unbind without real child events. */
-function withTeamAck(transport: FakeTransport): void {
-	const previous = transport.request.bind(transport);
-	transport.request = async (command) => {
-		if (command["type"] === "get_commands") {
-			const result = await previous(command) as { commands: unknown[] };
-			return { commands: [...result.commands, { name: TEAM_COMMAND, source: "extension", description: TEAM_COMMAND_DESCRIPTION }] };
-		}
-		if (command["type"] === "prompt" && String(command["message"]).startsWith(`/${TEAM_COMMAND} `)) {
-			transport.commands.push(command);
-			const frame = JSON.parse(String(command["message"]).slice(TEAM_COMMAND.length + 2));
-			transport.emit({ type: "entry_appended", entry: { type: "custom", customType: TEAM_ENTRY_TYPE, data: { version: 1, kind: "ack", commandId: frame.commandId, binding: frame.binding, ok: true } } });
-			return undefined;
-		}
-		return previous(command);
-	};
-}
-
 function withTeamV2Ack(transport: FakeTransport): void {
 	const previous = transport.request.bind(transport);
 	transport.teamV2Mode = true;
@@ -286,46 +263,6 @@ function hostedSearchEntryEvent(id: string, callIds: string[]): RpcEvent {
 	};
 }
 
-test("team bind ACK precedes each native prompt; settled sends restore context and unbind", async () => {
-	const transport = new FakeTransport();
-	const request = transport.request.bind(transport);
-	transport.request = async (command) => {
-		if (command["type"] === "get_commands") {
-			const result = await request(command) as { commands: unknown[] };
-			return { commands: [...result.commands, { name: TEAM_COMMAND, source: "extension", description: TEAM_COMMAND_DESCRIPTION }] };
-		}
-		if (command["type"] === "prompt" && String(command["message"]).startsWith(`/${TEAM_COMMAND} `)) {
-			transport.commands.push(command);
-			const frame = JSON.parse(String(command["message"]).slice(TEAM_COMMAND.length + 2));
-			transport.emit({ type: "entry_appended", entry: { type: "custom", customType: TEAM_ENTRY_TYPE, data: { version: 1, kind: "ack", commandId: frame.commandId, binding: frame.binding, ok: true } } });
-			return undefined;
-		}
-		if (command["type"] === "prompt" && command["message"] === "empty") {
-			transport.commands.push(command);
-			transport.emit({ type: "agent_start" });
-			transport.emit({ type: "agent_settled" });
-			return undefined;
-		}
-		return request(command);
-	};
-	const worker = await RpcSessionWorker.connect(spec("new"), transport);
-	const team: TeamWorkerChannel = { binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }) };
-	await worker.send("initial", { contextWindow: 64000, team });
-	await worker.send("summary", { contextWindow: 64000, team });
-	const prompts = transport.commands.filter((command) => command["type"] === "prompt").map((command) => String(command["message"]));
-	assert.equal(prompts.length, 10);
-	for (const start of [0, 5]) {
-		assert.match(prompts[start]!, /"operation":"bind"/);
-		assert.match(prompts[start + 1]!, /prepare 64000/);
-		assert.equal(prompts[start + 2], start === 0 ? "initial" : "summary");
-		assert.match(prompts[start + 3]!, / reset$/);
-		assert.match(prompts[start + 4]!, /"operation":"unbind"/);
-	}
-	assert.equal((await worker.send("empty", { team })).output, "");
-	assert.equal((await worker.send("empty")).output, "(no output)");
-	assert.equal(transport.listeners.size, 0);
-});
-
 test("Team v2 restores the pre-activation context window after native compaction keeps the temporary budget", async () => {
 	const transport = new FakeTransport();
 	transport.retainPreparedContextWindow = true;
@@ -349,17 +286,6 @@ test("Team v2 restores the pre-activation context window after native compaction
 	]);
 	await session.close();
 	await worker.stop();
-});
-
-test("missing team helper fails closed without sending an ordinary task", async () => {
-	const transport = new FakeTransport();
-	const worker = await RpcSessionWorker.connect(spec("new"), transport);
-	await assert.rejects(worker.send("must not run", { team: {
-		binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }),
-	} }), /team command/);
-	assert.equal(transport.commands.some((command) => command["message"] === "must not run"), false);
-	assert.equal(worker.isReusable(), false);
-	assert.equal(transport.listeners.size, 0);
 });
 
 describe("RPC worker arguments", () => {
@@ -910,57 +836,6 @@ describe("RpcSessionWorker", () => {
 		phaseUnsubscribe();
 	});
 
-	test("binds a team channel before preparing a budget that fits only the switched model", async (t) => {
-		const root = await mkdtemp(join(tmpdir(), "rail-rpc-worker-"));
-		const agentDir = join(root, "agent");
-		const project = join(root, "project");
-		const sessionFile = join(root, "child.jsonl");
-		const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
-		process.env["PI_CODING_AGENT_DIR"] = agentDir;
-		t.after(async () => {
-			if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
-			else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
-			await rm(root, { recursive: true, force: true });
-		});
-		await mkdir(agentDir, { recursive: true });
-		await mkdir(join(project, ".pi"), { recursive: true });
-		await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { reserveTokens: 16_384 } }));
-		await writeFile(join(project, ".pi/settings.json"), JSON.stringify({ compaction: { modelOverrides: {
-			"cus-resp/gpt-5.6-sol": { reserveTokens: 60_000 },
-			"deepseek/deepseek-v4-flash": { reserveTokens: 8_192 },
-		} } }));
-		new ProjectTrustStore(agentDir).set(project, true);
-
-		const transport = new FakeTransport();
-		const request = transport.request.bind(transport);
-		transport.request = async (command) => {
-			if (command["type"] === "get_state") return { ...(await request(command)) as any, sessionFile };
-			return request(command);
-		};
-		withTeamAck(transport);
-		const worker = await RpcSessionWorker.connect(spec("new", undefined, project), transport);
-
-		// The same budget is rejected while the current model reserves 60000 tokens,
-		// so the prepare/team flow proves the reserve follows the actual child model.
-		await assert.rejects(() => worker.send("early task", { contextWindow: 30_000 }), /reserveTokens \(60000\)/);
-		assert.equal(worker.isReusable(), true);
-		assert.equal(transport.commands.some((command) => command["type"] === "prompt"), false);
-
-		await worker.setModel({ provider: "deepseek", modelId: "deepseek-v4-flash" });
-		const team: TeamWorkerChannel = { binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }) };
-		const result = await worker.send("team task", { contextWindow: 30_000, team });
-		assert.equal(result.output, "review complete");
-		const prompts = transport.commands.filter((command) => command["type"] === "prompt").map((command) => String(command["message"]));
-		assert.equal(prompts.length, 5);
-		assert.match(prompts[0]!, /"operation":"bind"/);
-		assert.match(prompts[1]!, /prepare 30000/);
-		assert.equal(prompts[2], "team task");
-		assert.match(prompts[3]!, / reset$/);
-		assert.match(prompts[4]!, /"operation":"unbind"/);
-		assert.equal(worker.isReusable(), true);
-		assert.equal(transport.listeners.size, 0);
-	});
-
 	test("serializes model changes against child runs in both directions", async () => {
 		const transport = new FakeTransport();
 		const request = transport.request.bind(transport);
@@ -1018,23 +893,5 @@ describe("RpcSessionWorker", () => {
 		// The guard is cleared and the worker is retired: the next run fails fast, not as "in progress".
 		await assert.rejects(() => worker.send("after failed switch", { contextWindow: 64000 }), /not reusable/);
 		assert.equal(transport.commands.some((command) => command["type"] === "prompt"), false);
-	});
-
-	test("closes a team channel and stays retired when its context command fails", async () => {
-		const transport = new FakeTransport();
-		transport.failContextCommand = true;
-		withTeamAck(transport);
-		const worker = await RpcSessionWorker.connect(spec("new"), transport);
-		const team: TeamWorkerChannel = { binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" }, onRequest: async () => ({ ok: true }) };
-
-		await assert.rejects(() => worker.send("must not run", { contextWindow: 64000, team }), /context command failed/);
-		const prompts = transport.commands.filter((command) => command["type"] === "prompt").map((command) => String(command["message"]));
-		assert.equal(prompts.some((message) => message === "must not run"), false);
-		assert.equal(prompts.some((message) => / reset$/.test(message)), false);
-		assert.equal(prompts.filter((message) => message.includes('"operation":"unbind"')).length, 1);
-		assert.equal(worker.isReusable(), false);
-		// runInFlight was cleared: the second attempt fails as retired, not as overlapping.
-		await assert.rejects(() => worker.send("again"), /not reusable/);
-		assert.equal(transport.listeners.size, 0);
 	});
 });

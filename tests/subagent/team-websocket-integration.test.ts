@@ -11,15 +11,10 @@ import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
 import { SessionBroker } from "../../tools/subagents/session-broker";
 import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
 import { SessionAgentRoster } from "../../tools/subagents/session-links";
-import { TeamHub } from "../../tools/subagents/team-hub";
-import { TeamRunManager } from "../../tools/subagents/team-runner";
-import { installTeamTool } from "../../tools/subagents/team-tool";
-import { installStatefulSubagentTool } from "../../tools/subagents/tool";
 import { createRpcWorkerFactory } from "../../tools/subagents/worker-factory";
 import { TeamMemberDriver } from "../../tools/subagents/team-member-driver";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import { readRailResponsesWebSocketSettings } from "../../openai/responses-websocket/settings";
-import type { TeamSnapshot } from "../../tools/subagents/team-protocol-v1";
 
 const cli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const providerFixture = fileURLToPath(new URL("../fixtures/team-websocket-provider.mjs", import.meta.url));
@@ -62,20 +57,6 @@ interface LoopbackResponsesServer {
 	releaseFirstB2Response(): void;
 	releaseFirstV2WorkerResponse(): void;
 	close(): Promise<void>;
-}
-
-interface Harness {
-	hub: TeamHub;
-	teamId: string;
-	history: TeamSnapshot[];
-	tools: Map<string, any>;
-	ctx: any;
-	dispatch(): [Promise<any>, Promise<any>];
-	journal(alias: string): Promise<any[]>;
-	store: FileAgentInstanceStore;
-	leases: FileSessionLeaseManager;
-	broker: SessionBroker;
-	agentDir: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -301,119 +282,8 @@ function waitForServer(server: LoopbackResponsesServer, predicate: () => boolean
 	});
 }
 
-function waitForSnapshot(hub: TeamHub, teamId: string, predicate: (snapshot: TeamSnapshot) => boolean, message: string, timeoutMs = 15_000): Promise<void> {
-	if (predicate(hub.get(teamId))) return Promise.resolve();
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => { off(); reject(new Error(message)); }, timeoutMs);
-		const off = hub.subscribe((snapshot) => {
-			if (snapshot.id !== teamId || !predicate(snapshot)) return;
-			clearTimeout(timer);
-			off();
-			resolve();
-		});
-	});
-}
-
 function waitForDelay(milliseconds: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function setup(t: TestContext, server: LoopbackResponsesServer, scenario: Scenario): Promise<Harness> {
-	const sandbox = await mkdtemp(join(tmpdir(), "rail-team-websocket-"));
-	const agentDir = join(sandbox, "agent");
-	await mkdir(join(agentDir, "rail-openai-responses-ws"), { recursive: true });
-	await writeFile(join(agentDir, "settings.json"), JSON.stringify({
-		transport: "websocket",
-		websocketConnectTimeoutMs: 2000,
-		httpIdleTimeoutMs: 5000,
-		retry: { enabled: false },
-	}));
-	await writeFile(join(agentDir, "rail-openai-responses-ws", "settings.json"), JSON.stringify({
-		version: 1,
-		routes: [{ provider: nativeModel.provider, endpoint: server.endpoint, models: [nativeModel.id] }],
-	}));
-
-	const environmentKeys = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_TELEMETRY", "PI_SKIP_VERSION_CHECK", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "NO_PROXY", "no_proxy"] as const;
-	const previousEnvironment = new Map<string, string | undefined>(environmentKeys.map((key) => [key, process.env[key]]));
-	process.env["HOME"] = sandbox;
-	process.env["XDG_CONFIG_HOME"] = join(sandbox, "config");
-	process.env["XDG_DATA_HOME"] = join(sandbox, "data");
-	process.env["PI_CODING_AGENT_DIR"] = agentDir;
-	process.env["PI_OFFLINE"] = "1";
-	process.env["PI_TELEMETRY"] = "0";
-	process.env["PI_SKIP_VERSION_CHECK"] = "1";
-	process.env["NODE_EXTRA_CA_CERTS"] = certificate;
-	for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "http_proxy", "https_proxy", "all_proxy", "ftp_proxy"]) delete process.env[key];
-	process.env["NO_PROXY"] = "127.0.0.1,localhost,::1";
-	process.env["no_proxy"] = "127.0.0.1,localhost,::1";
-
-	const history: TeamSnapshot[] = [];
-	const hub = new TeamHub({ startupTimeoutMs: 10_000 });
-	// Observe every live state change; the durable journal records milestones only.
-	hub.subscribe((snapshot) => { history.push(snapshot); });
-	const stateDir = join(agentDir, "stateful-subagents");
-	const store = new FileAgentInstanceStore(stateDir);
-	const leases = new FileSessionLeaseManager(stateDir);
-	const broker = new SessionBroker({
-		store,
-		roster: new SessionAgentRoster(),
-		defaultCwd: sandbox,
-		aliasLeaseManager: leases,
-		workerFactory: createRpcWorkerFactory({
-			stateDir,
-			startupTimeoutMs: 15_000,
-			resolveInvocation: (args) => ({ command: process.execPath, args: [cli, "--no-extensions", "--offline", ...args, "-e", providerFixture] }),
-		}),
-	});
-	t.after(async () => {
-		hub.dispose();
-		await broker.shutdown();
-		for (const key of environmentKeys) {
-			const value = previousEnvironment.get(key);
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-		await rm(sandbox, { recursive: true, force: true });
-	});
-
-	const tools = new Map<string, any>();
-	const pi: any = { registerTool: (tool: any) => tools.set(tool.name, tool), on: () => undefined };
-	const ctx: any = {
-		cwd: sandbox,
-		hasUI: false,
-		model: nativeModel,
-		scopedModels: [],
-		modelRegistry: {
-			find: (provider: string, id: string) => provider === nativeModel.provider && id === nativeModel.id ? nativeModel : undefined,
-			getAvailable: () => [nativeModel],
-		},
-	};
-	const manager = new TeamRunManager(hub);
-	installTeamTool(pi, () => hub);
-	installStatefulSubagentTool(pi, { broker, team: () => manager, renderContext: () => ctx });
-	const prepared = await tools.get("subagent_team").execute("prepare", {
-		action: "prepare",
-		coordinator: "A",
-		workers: ["B1", "B2"],
-		timeoutSeconds: 45,
-	}, undefined, undefined, ctx);
-	const teamId = prepared.details.snapshots[0].id;
-	const updates: any[] = [];
-	const subagent = tools.get("subagent");
-	const dispatch = () => [
-		subagent.execute("ws-call-A", { teamId, alias: "A", model: "rail-team-ws/probe", task: `WS_${scenario.toUpperCase()} TEAM_MEMBER_A coordinate the workers` }, undefined, (value: any) => updates.push(value), ctx),
-		subagent.execute("ws-call-workers", { teamId, tasks: [
-			{ alias: "B1", model: "rail-team-ws/probe", task: `WS_${scenario.toUpperCase()} TEAM_MEMBER_B1 complete the assigned work` },
-			{ alias: "B2", model: "rail-team-ws/probe", task: `WS_${scenario.toUpperCase()} TEAM_MEMBER_B2 complete the assigned work` },
-		] }, undefined, (value: any) => updates.push(value), ctx),
-	] as [Promise<any>, Promise<any>];
-	const journal = async (alias: string) => {
-		const instance = (await store.list()).find((item) => item.alias === alias);
-		assert.ok(instance, `missing native session for ${alias}`);
-		const content = await readFile(instance.sessionFile, "utf8");
-		return content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
-	};
-	return { hub, teamId, history, tools, ctx, dispatch, journal, store, leases, broker, agentDir };
 }
 
 async function setupV2(t: TestContext, server: LoopbackResponsesServer, scenario: "v2" | "v2-cancel") {
@@ -524,89 +394,4 @@ test("Stage B Team v2 cancellation aborts a held native WebSocket run without an
 	assert.equal(server.errors.length, 0, server.errors.join("; "));
 	await harness.driver.close();
 	await waitForServer(server, () => server.openSockets.size === 0, "aborted Team v2 session left a WebSocket open", 10000);
-});
-
-test.skip("legacy v1: real Team RPC children use the configured loopback Responses WebSocket for native context, event-driven pause/wait/resume, and finalization", { timeout: 90_000 }, async (t) => {
-	const server = await startLoopbackResponsesServer("normal");
-	t.after(async () => { await server.close(); });
-	const harness = await setup(t, server, "normal");
-	const settled = Promise.all(harness.dispatch());
-
-	try {
-		await waitForServer(server, () => server.firstB2Request !== undefined, "B2 never reached the loopback WebSocket");
-	} catch (error) {
-		const dispatchStatus = await Promise.race([
-			settled.then(() => "settled", (dispatchError) => `rejected: ${dispatchError instanceof Error ? dispatchError.message : String(dispatchError)}`),
-			waitForDelay(100).then(() => "still pending"),
-		]);
-		throw new Error(`${error instanceof Error ? error.message : String(error)}; dispatch=${dispatchStatus}; handshakes=${server.handshakes.length}; errors=${server.errors.join(" | ")}; requests=${server.requests.length}; members=${server.requests.map((request) => memberFromPayload(request)).join(",")}; markers=${server.requests.map((request) => payloadText(request).match(/WS_[A-Z]+|TEAM_MEMBER_[A-Za-z0-9]+/gu)?.join(",") ?? "none").join(" || ")}; payloads=${server.requests.map((request) => payloadText(request).slice(0, 240)).join(" || ")}`);
-	}
-	await waitForSnapshot(harness.hub, harness.teamId, (snapshot) => {
-		const coordinator = snapshot.members.find((member) => member.id === "A");
-		const paused = snapshot.members.find((member) => member.id === "B1");
-		return coordinator?.state === "waiting" && coordinator.waitingFor === "B2" && paused?.state === "paused";
-	}, "Team did not reach the coordinator-waiting / worker-paused safe point");
-	assert.equal(memberFromPayload(server.firstB2Request!), "B2", "the held response must belong to B2's first recorded request");
-	assert.ok(server.requests.some((request) => memberFromPayload(request) === "A"
-		&& hasCompletedCall(completedTeamCalls(request), (arguments_) => arguments_.action === "control" && arguments_.to === "B1" && arguments_.command === "redirect")),
-	"B1's redirect must be in the coordinator's native context before B2 is released");
-	const parkedRequestCount = server.requests.length;
-	await waitForDelay(100);
-	assert.equal(server.requests.length, parkedRequestCount, "waiting/paused members must not poll the WebSocket provider");
-	server.releaseFirstB2Response();
-
-	const [coordinator, workers] = await settled;
-	assert.equal(harness.hub.get(harness.teamId).phase, "completed");
-	assert.equal(coordinator.details.results[0].status, "completed");
-	assert.match(coordinator.details.results[0].output, /WS_FINAL: B1_NATIVE_RESULT and B2_NATIVE_RESULT/u);
-	assert.equal(workers.details.results.length, 2);
-	assert.deepEqual(workers.details.results.map((result: any) => result.output).sort(), ["B1_NATIVE_RESULT", "B2_NATIVE_RESULT"]);
-	assert.ok(harness.history.some((snapshot) => snapshot.members.some((member) => member.id === "B1" && member.state === "paused")));
-	const events = [...new Map(harness.history.flatMap((snapshot) => snapshot.events.map((event) => [event.seq, event] as const))).values()];
-	assert.deepEqual(events.filter((event) => event.kind === "control" && event.to === "B1").map((event) => event.message), ["pause", "redirect", "resume"]);
-
-	const routeSettings = readRailResponsesWebSocketSettings(harness.agentDir);
-	assert.deepEqual(routeSettings.routes, [{ provider: nativeModel.provider, endpoint: server.endpoint, models: [nativeModel.id] }]);
-	assert.equal(server.errors.length, 0, server.errors.join("; "));
-	assert.ok(server.handshakes.length >= 1);
-	assert.ok(server.handshakes.every((handshake) => handshake.url === "/v1/responses" && handshake.authorization === "Bearer team-websocket-test-key"));
-	assert.ok(server.requests.length >= 8);
-	assert.ok(server.requests.every((request) => request["type"] === "response.create"));
-	assert.ok(server.requests.every((request) => request["previous_response_id"] === undefined), "transport=websocket must send full native context, not a hidden server continuation");
-	assert.ok(server.requests.some((request) => Array.isArray(request.input) && request.input.some((item) => isRecord(item) && item["type"] === "function_call_output")));
-	const b1Requests = server.requests.filter((request) => memberFromPayload(request) === "B1");
-	assert.ok(b1Requests.length >= 1 && b1Requests.length <= 2, `B1 must have only its initial/resumed native turns, got ${b1Requests.length}`);
-	assert.equal(b1Requests.filter((request) => payloadText(request).includes("B1_RESUMED")).length, 1, "resume must wake B1 once from the native Team delivery, not by polling");
-	assert.ok(server.requests.some((request) => payloadText(request).includes("B1_RESUMED")), "the resumed worker must receive the native Team direction in its request payload");
-	const summaryRequests = server.requests.filter((request) => memberFromPayload(request) === "A"
-		&& hasCompletedCall(completedTeamCalls(request), (args) => args.action === "wait" && args.wait?.kind === "workers"));
-	assert.equal(summaryRequests.length, 1, "the complete worker barrier must cause exactly one native summary request");
-	assert.ok(payloadText(summaryRequests[0]!).includes("B1_NATIVE_RESULT") && payloadText(summaryRequests[0]!).includes("B2_NATIVE_RESULT"), "the summary payload must contain both native worker results");
-	assert.ok(server.requests.every((request) => !payloadText(request).includes("All workers have settled.")), "an explicitly observed barrier must not trigger a redundant host continuation");
-
-	const coordinatorJournal = await harness.journal("A");
-	const finalEntries = coordinatorJournal.filter((entry) => entry.message?.role === "assistant" && entry.message.stopReason === "stop");
-	assert.equal(finalEntries.length, 1, "the coordinator must generate its final answer only once");
-	assert.ok((await harness.journal("B1")).some((entry) => JSON.stringify(entry).includes("B1_RESUMED")));
-	await waitForServer(server, () => server.openSockets.size === 0, "normal Team shutdown left a WebSocket open", 10_000);
-});
-
-test.skip("legacy v1: real Team RPC cancellation wakes parked WebSocket children without another provider request and frees sessions", { timeout: 60_000 }, async (t) => {
-	const server = await startLoopbackResponsesServer("cancel");
-	t.after(async () => { await server.close(); });
-	const harness = await setup(t, server, "cancel");
-	const settled = Promise.allSettled(harness.dispatch());
-	await waitForSnapshot(harness.hub, harness.teamId, (snapshot) => snapshot.phase === "running" && snapshot.members.every((member) => member.state === "waiting"), "cancel scenario did not park all Team members");
-	const parkedRequestCount = server.requests.length;
-	await waitForDelay(100);
-	assert.equal(server.requests.length, parkedRequestCount, "parked cancellation members must not poll the WebSocket provider");
-	await harness.tools.get("subagent_team").execute("cancel", { action: "cancel", teamId: harness.teamId, reason: "WebSocket Team cancellation" }, undefined, undefined, harness.ctx);
-	const results = await settled;
-	assert.equal(harness.hub.get(harness.teamId).phase, "cancelled");
-	assert.ok(results.some((result) => result.status === "rejected") || results.some((result) => result.status === "fulfilled" && result.value.details.results.some((run: any) => run.status !== "completed")));
-	assert.equal(server.requests.length, parkedRequestCount, "cancellation must not create a provider polling turn");
-	assert.equal(server.errors.length, 0, server.errors.join("; "));
-	await waitForServer(server, () => server.openSockets.size === 0, "cancelled Team left a WebSocket open", 10_000);
-	for (const instance of await harness.store.list()) assert.deepEqual(await harness.leases.inspect(instance.sessionFile), { state: "free" });
-	assert.doesNotMatch(JSON.stringify(results), /WS_FINAL/u);
 });

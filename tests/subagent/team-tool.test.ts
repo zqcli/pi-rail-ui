@@ -1,176 +1,267 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { test } from "node:test";
-import { TeamHub } from "../../tools/subagents/team-hub";
-import { installTeamTool, restoreTeamHistory } from "../../tools/subagents/team-tool";
-import { TEAM_HISTORY_TYPE } from "../../tools/subagents/team-protocol-v1";
+import { installTeamTool, TeamLaunchWaitAbortedError } from "../../tools/subagents/team-tool";
+import { TeamSessionHost } from "../../tools/subagents/team-host";
+import type { SessionBroker } from "../../tools/subagents/session-broker";
+import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
+import type { ResultRecord, TeamResult } from "../../tools/subagents/team-protocol";
 
-test("parent prepare/status/cancel handles null defaults and exposes no binding", async () => {
-	const hub = new TeamHub();
+const nativeModel: any = {
+	provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol", api: "openai-responses",
+	contextWindow: 128_000, maxTokens: 4096, reasoning: true, input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
+
+function context(cwd = process.cwd()) {
+	return {
+		cwd, hasUI: true, model: nativeModel, thinkingLevel: "medium", scopedModels: [{ model: nativeModel, thinkingLevel: "medium" }],
+		modelRegistry: {
+			find: (provider: string, id: string) => provider === nativeModel.provider && id === nativeModel.id ? nativeModel : undefined,
+			getAvailable: () => [nativeModel],
+		},
+	};
+}
+
+function setup(branch: any[] = []) {
+	const broker = { assertAliasesAvailable: async () => undefined } as unknown as SessionBroker;
+	const host = new TeamSessionHost(broker, () => undefined, branch);
 	let tool: any;
-	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
+	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, { host: () => host, broker: () => broker });
+	return { host, broker, tool };
+}
+
+const prepareArgs = {
+	action: "prepare",
+	manager: { alias: "lead", roleDescription: "Coordinate the review.", model: null, cwd: null, fastMode: null, contextWindow: null },
+	workers: [{ alias: "worker", roleDescription: "Inspect the assigned scope.", model: null, cwd: null, fastMode: null, contextWindow: null }],
+	brief: { goal: "Review the requested change.", acceptanceCriteria: ["Report evidence and limitations."], constraints: null },
+	initialRequests: [{ to: "worker", task: "Inspect the changed files.", inputRefs: null }],
+	timeoutSeconds: null,
+};
+
+function terminal(teamId: string): TeamResult {
+	return {
+		version: 2, teamId, lifecycle: "closed", outcome: "succeeded", finalResultRefs: [], roots: [],
+		members: [
+			{ id: "lead", role: "manager", lifecycle: "closed", resourceState: "released" },
+			{ id: "worker", role: "worker", lifecycle: "closed", resourceState: "released" },
+		],
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		unresolvedIncidents: [],
+	};
+}
+
+test("prepare validates and pins the complete member policy without starting a provider", async () => {
+	const { host, broker, tool } = setup();
+	assert.equal(tool.parameters.additionalProperties, false);
+	assert.equal(Object.hasOwn(tool.parameters.properties, "searchMode"), false, "Search is derived by host policy, never a tool argument");
+
+	const raw = { ...prepareArgs, unrelated: "must not be projected away" };
+	assert.throws(() => tool.prepareArguments(raw), /unsupported field.*unrelated/u);
+	await assert.rejects(tool.execute("bad", raw, undefined, undefined, context()), /unsupported field.*unrelated/u);
+	assert.equal(host.runtime.listTeams().length, 0);
+
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	const view = host.runtime.getTeam(teamId);
+	assert.equal(view.lifecycle, "prepared");
+	assert.equal(view.members.length, 2);
+	assert.ok(view.members.every((member) => member.policy.cwd === process.cwd()));
+	assert.ok(view.members.every((member) => member.policy.searchMode !== undefined));
+	assert.equal(view.works.total, 1);
+	assert.match(prepared.content[0].text, /nothing has started: no provider, no tool/u);
+	assert.equal((broker as any).requests, undefined);
+
+	const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
+	assert.match(status.content[0].text, /IDLE · no assigned work/u);
+	assert.doesNotMatch(status.content[0].text, /IDLE[^\n]*done/u);
+	assert.throws(() => tool.prepareArguments({ action: "launch", teamId, reason: "ignored" }), /does not accept field.*reason/u);
+	assert.throws(() => tool.prepareArguments({ action: "status", teamId, brief: { goal: "extra" } }), /does not accept field.*brief/u);
+	assert.equal(host.pinnedPolicies(teamId)?.size, 2, "invalid launch/status payloads do not consume the prepared policy");
+});
+
+test("N09 resolves native/default and trust-aware context reserves, pins policy, and refuses drift before opening", async () => {
+	const root = await mkdtemp(join(tmpdir(), "rail-team-policy-"));
+	const agentDir = join(root, "agent");
+	const project = join(root, "project");
+	const oldAgentDir = process.env["PI_CODING_AGENT_DIR"];
 	try {
-		assert.equal(tool.parameters.properties.action.type, "string");
-		assert.deepEqual(tool.parameters.properties.action.enum, ["prepare", "launch", "status", "cancel"]);
-		assert.equal(tool.parameters.properties.action.anyOf, undefined);
-		await assert.rejects(tool.execute("bad-prepare", { action: "prepare", teamId: "ignored-id", coordinator: "A", workers: ["B"] }), /does not accept teamId/u);
-		assert.equal(hub.list().length, 0, "a rejected prepare must not create a team");
-		const prepared = await tool.execute("prepare", {
-			action: "prepare", coordinator: "A", workers: ["B"], timeoutSeconds: null,
-			brief: {
-				goal: "Review the target service",
-				target: "https://example.invalid/service",
-				acceptanceCriteria: null,
-				constraints: ["Do not modify production"],
-				authorizations: [{ member: "B", allowed: ["Read repository files"], forbidden: null }],
-			},
-		});
-		const snapshot = prepared.details.snapshots[0];
-		assert.equal(snapshot.deadline - snapshot.createdAt, 3600000);
-		assert.deepEqual(snapshot.brief, {
-			goal: "Review the target service",
-			target: "https://example.invalid/service",
-			constraints: ["Do not modify production"],
-			authorizations: [{ member: "B", allowed: ["Read repository files"] }],
-		});
-		assert.match(prepared.content[0].text, /Budget: 3600s total from prepare/u);
-		assert.match(prepared.content[0].text, /exactly these two subagent calls, as siblings in ONE assistant message/u);
-		assert.ok(prepared.content[0].text.includes(`{"teamId":"${snapshot.id}","alias":"A","task":"<coordinator task>"}`), "the coordinator call is copyable");
-		assert.ok(prepared.content[0].text.includes(`{"teamId":"${snapshot.id}","tasks":[{"alias":"B","task":"<B task>"}]}`), "a single worker still uses a tasks array");
-		const payload = JSON.parse(prepared.content[0].text.split("JSON:\n")[1]!);
-		assert.equal(payload.action, "prepare");
-		assert.equal(payload.teamId, snapshot.id);
-		assert.equal(payload.from, "@hub");
-		assert.equal(payload.to, "@parent");
-		assert.equal(payload.snapshot.brief.goal, "Review the target service");
-		assert.match(payload.next, /do not wake or interrupt/u);
-		const status = await tool.execute("status", { action: "status", teamId: snapshot.id });
-		assert.match(status.content[0].text, /REGISTERED/);
-		assert.equal(JSON.parse(status.content[0].text.split("JSON:\n")[1]!).action, "status");
-		assert.equal(JSON.stringify(status).includes("epoch"), false);
-		hub.join(snapshot.id, ["A"], [{ memberId: "A", task: "Coordinate", model: "provider/model", fastMode: false, searchMode: "on" }]);
-		const [worker] = hub.join(snapshot.id, ["B"], [{ memberId: "B", task: "Inspect the service", cwd: "/tmp/service", model: "provider/model", fastMode: true, searchMode: "on" }]);
-		await hub.request(worker!, { requestId: "blocked", sequence: 1, action: "finish", result: { status: "blocked", summary: "Need approved credentials" } });
-		const assignedStatus = await tool.execute("assigned-status", { action: "status", teamId: snapshot.id });
-		const modelSnapshot = JSON.parse(assignedStatus.content[0].text.split("JSON:\n")[1]!).snapshot;
-		const assignedWorker = modelSnapshot.members.find((member: any) => member.id === "B");
-		assert.equal(assignedWorker.assignment.taskPreview, "Inspect the service");
-		assert.equal(assignedWorker.assignment.fastMode, true);
-		assert.equal(assignedWorker.result.status, "blocked");
-		assert.equal(assignedWorker.result.summaryPreview, "Need approved credentials");
-		assert.equal(JSON.stringify(modelSnapshot).includes("epoch"), false);
-		const cancelled = await tool.execute("cancel", { action: "cancel", teamId: snapshot.id, reason: null });
-		assert.equal(cancelled.details.snapshots[0].phase, "cancelled");
-		assert.equal((await tool.execute("list", { action: "status", teamId: null })).details.snapshots.length, 1);
-	} finally { hub.dispose(); }
+		await mkdir(agentDir, { recursive: true });
+		await mkdir(join(project, ".pi"), { recursive: true });
+		await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 16_384 } }));
+		await writeFile(join(project, ".pi/settings.json"), JSON.stringify({ compaction: { enabled: true, modelOverrides: {
+			"cus-resp/gpt-5.6-sol": { reserveTokens: 60_000 },
+		} } }));
+		process.env["PI_CODING_AGENT_DIR"] = agentDir;
+		const trust = new ProjectTrustStore(agentDir);
+		const { host, tool } = setup();
+		const args = { ...prepareArgs, workers: [{ ...prepareArgs.workers[0], contextWindow: 32_000 }] };
+		trust.set(root, true);
+		await assert.rejects(tool.execute("prepare-trusted", args, undefined, undefined, context(project)), /contextWindow.*reserve|reserve.*contextWindow/u);
+		assert.equal(host.runtime.listTeams().length, 0, "trusted project reserve rejects the plan before reserving a Team");
+
+		trust.set(root, false);
+		const prepared = await tool.execute("prepare", args, undefined, undefined, context(project));
+		const teamId = prepared.details.view.teamId;
+		assert.match(prepared.content[0].text, /native default 128000/u, "unspecified contextWindow uses the native model default");
+		assert.match(prepared.content[0].text, /32000 \(explicit\).*reserve 16384/u);
+		assert.equal(host.pinnedPolicies(teamId)?.get("worker")?.nativeContextWindow, 128_000);
+		assert.equal(host.pinnedPolicies(teamId)?.get("worker")?.contextWindow, 32_000);
+		let starts = 0;
+		const opened: Array<{ memberId: string; contextWindow?: number }> = [];
+		host.driver.openAndLaunch = async (_id, requests) => {
+			starts++;
+			opened.push(...requests.map((request: any) => ({ memberId: request.memberId, ...(request.contextWindow !== undefined ? { contextWindow: request.contextWindow } : {}) })));
+			host.runtime.launch(teamId);
+			return { lifetime: Promise.resolve(terminal(teamId)) };
+		};
+
+		trust.set(root, true);
+		await assert.rejects(tool.execute("launch-trust-drift", { action: "launch", teamId }, undefined, undefined, context(project)), /project trust\/compaction policy changed/u);
+		assert.equal(starts, 0);
+		assert.equal(host.pinnedPolicies(teamId)?.size, 2, "failed preflight leaves the Team prepared and retryable");
+		assert.equal(host.runtime.getTeam(teamId).lifecycle, "prepared");
+
+		trust.set(root, false);
+		nativeModel.contextWindow = 64_000;
+		await assert.rejects(tool.execute("launch-model-drift", { action: "launch", teamId }, undefined, undefined, context(project)), /native model\/contextWindow changed/u);
+		assert.equal(starts, 0);
+		assert.equal(host.pinnedPolicies(teamId)?.size, 2);
+		nativeModel.contextWindow = 128_000;
+
+		await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context(project));
+		assert.equal(starts, 1);
+		assert.deepEqual(opened, [{ memberId: "lead" }, { memberId: "worker", contextWindow: 32_000 }]);
+	} finally {
+		if (oldAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = oldAgentDir;
+		nativeModel.contextWindow = 128_000;
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
-test("prepare explains an explicit short total deadline without silently extending it", async (t) => {
-	const hub = new TeamHub(); t.after(() => hub.dispose());
-	let tool: any;
-	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
-	assert.match(tool.parameters.properties.timeoutSeconds.description, /Default null = 3600 seconds/u);
-	assert.match(tool.promptGuidelines.join("\n"), /default timeoutSeconds to null/u);
-	const result = await tool.execute("short", { action: "prepare", coordinator: "A", workers: ["B"], timeoutSeconds: 120 });
-	const snapshot = result.details.snapshots[0];
-	assert.equal(snapshot.deadline - snapshot.createdAt, 120000);
-	assert.match(result.content[0].text, /Budget: 120s total from prepare, including reasoning, tools, waiting and final summary/u);
-	assert.equal(snapshot.phase, "prepared");
-});
-
-test("status previews and a full 32-team listing stay bounded without discarding stored outcomes", async (t) => {
-	const source = new TeamHub();
-	const hub = new TeamHub();
-	t.after(() => { source.dispose(); hub.dispose(); });
-	const ids = Array.from({ length: 8 }, (_, index) => `B${index + 1}`);
-	const snapshot = source.prepare({ coordinator: "A", workers: ids, brief: {
-		goal: "g".repeat(8192), target: "t".repeat(8192), constraints: ["c".repeat(8192)],
+test("historical status pages result refs, keeps full records out of details, and fetches one explicit result", async () => {
+	const teamId = "history-page-team";
+	const branch: Array<{ type: string; customType?: string; data?: unknown }> = [{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: {
+		version: 2, kind: "launched", teamId, at: 1, roster: { manager: "lead", workers: ["worker"] }, goal: "Read a bounded historical result index.",
+	} }];
+	const records: ResultRecord[] = Array.from({ length: 48 }, (_, index) => ({
+		id: `result-${index}`, work: { workId: `work-${index}`, revision: 1 }, author: "worker",
+		result: { status: "succeeded", summary: `Worker result ${index}` }, committedAt: index + 2, source: "explicit_reply",
+	}));
+	for (const record of records) branch.push({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: {
+		version: 2, kind: "result", teamId, at: record.committedAt, result: record,
 	} });
-	const assignment = (memberId: string) => ({ memberId, task: "\u0000".repeat(1200), cwd: "\u0000".repeat(1200), model: "provider/model", fastMode: false });
-	const [coordinator] = source.join(snapshot.id, ["A"], [assignment("A")]);
-	const workers = source.join(snapshot.id, ids, ids.map(assignment));
-	for (const worker of workers) {
-		assert.equal((await source.request(worker, { requestId: "result", sequence: 1, action: "finish", result: {
-			status: "partial", summary: "\u0000".repeat(1200), findings: ["\u0000".repeat(700)],
-		} })).ok, true);
-		source.complete(worker, { status: "completed", output: "native result" });
-	}
-	await source.waitForWorkers(coordinator!);
-	source.complete(coordinator!, { status: "completed", output: "final summary" });
-	const completed = source.get(snapshot.id);
-	hub.restore(Array.from({ length: 32 }, (_, index) => ({ ...completed, id: `history-${index}`, events: [] })));
-	let tool: any;
-	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
-	const listed = await tool.execute("list", { action: "status" });
-	assert.equal(listed.details.response.snapshots.length, 32);
-	assert.ok(Buffer.byteLength(listed.content[0].text) < 32 * 1024, "listing must not repeat every team's full brief, assignments and results");
-	const status = await tool.execute("status", { action: "status", teamId: "history-0" });
-	assert.ok(Buffer.byteLength(status.content[0].text) < 64 * 1024, "single-team previews count JSON escaping overhead");
-	const worker = status.details.response.snapshot.members.find((member: any) => member.id === "B1");
-	assert.match(worker.result.summaryPreview, /…$/u);
-	assert.equal(worker.result.findingsCount, 1);
-	assert.equal(status.details.snapshots[0].members.find((member: any) => member.id === "B1").result.summary, "\u0000".repeat(1200), "stored outcome is complete; only status previews are bounded");
+	const { host, tool } = setup(branch);
+	const first = await tool.execute("history", { action: "status", teamId }, undefined, undefined, context());
+	assert.match(first.content[0].text, /20 results|page:20/u);
+	assert.match(first.content[0].text, /result-0/u);
+	assert.doesNotMatch(first.content[0].text, /result-47/u);
+	assert.deepEqual(Object.keys(first.details), [], "a page summary does not return the retained history result array in tool details");
+
+	const next = await tool.execute("history-next", { action: "status", teamId, cursor: "page:20" }, undefined, undefined, context());
+	assert.match(next.content[0].text, /result-20/u);
+	assert.doesNotMatch(next.content[0].text, /result-0 ·/u);
+	assert.deepEqual(Object.keys(next.details), []);
+
+	const full = await tool.execute("history-result", { action: "status", teamId, resultRef: "result-47" }, undefined, undefined, context());
+	assert.match(full.content[0].text, /Worker result 47/u);
+	assert.deepEqual(full.details.resultRecord, records[47]);
+	assert.equal("history" in full.details, false);
+	assert.equal(host.history.teams[0]?.results.length, 48, "all refs remain host-readable despite paginated model output");
 });
 
-test("history restores latest journal snapshot per team as interrupted, rejecting old bindings", () => {
-	const source = new TeamHub();
-	const restored = new TeamHub();
-	try {
-		const prepared = source.prepare({ coordinator: "A", workers: ["B"] });
-		const [old] = source.join(prepared.id, ["A"]);
-		const latest = source.get(prepared.id);
-		restoreTeamHistory(restored, [
-			{ type: "custom", customType: TEAM_HISTORY_TYPE, data: prepared },
-			{ type: "custom", customType: "unrelated", data: {} },
-			{ type: "custom", customType: TEAM_HISTORY_TYPE, data: latest },
-		]);
-		assert.equal(restored.get(prepared.id).phase, "interrupted");
-		assert.throws(() => restored.complete(old!, { status: "completed", output: "stale" }), /binding/);
-	} finally { source.dispose(); restored.dispose(); }
+test("pre-aborted launch performs no opens, retains prepared policy, and can be retried", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	let starts = 0;
+	host.driver.openAndLaunch = async () => {
+		starts++;
+		host.runtime.launch(teamId);
+		return { lifetime: Promise.resolve(terminal(teamId)) };
+	};
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(tool.execute("launch", { action: "launch", teamId }, controller.signal, undefined, context()), /aborted before opening/u);
+	assert.equal(starts, 0, "an already-aborted call never opens a member or provider");
+	assert.equal(host.runtime.getTeam(teamId).lifecycle, "prepared");
+	assert.equal(host.pinnedPolicies(teamId)?.size, 2, "preflight abort retains the policy for retry/cancel");
+
+	const retried = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
+	assert.equal(starts, 1);
+	assert.match(retried.content[0].text, /CLOSED · outcome succeeded/u);
 });
 
-test("status explains deadline and admission cancellation in model-visible text", async (t) => {
-	let now = 1000;
-	const hub = new TeamHub({ now: () => now, startupTimeoutMs: 30_000 });
-	t.after(() => hub.dispose());
-	let tool: any;
-	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
-	const expired = hub.prepare({ coordinator: "A", workers: ["B"], timeoutSeconds: 120 });
-	now += 120_000;
-	const deadline = await tool.execute("deadline", { action: "status", teamId: expired.id });
-	assert.match(deadline.content[0].text, /Reason: Team deadline exceeded/u);
-	const missingPeer = hub.prepare({ coordinator: "A2", workers: ["B2"] });
-	hub.join(missingPeer.id, ["A2"]);
-	now += 30_000;
-	const admission = await tool.execute("admission", { action: "status", teamId: missingPeer.id });
-	assert.match(admission.content[0].text, /Reason: Startup admission deadline exceeded/u);
+test("launch waits for the full Team lifetime and passes only the prepared member requests", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	let resolveLifetime!: (result: TeamResult) => void;
+	const lifetime = new Promise<TeamResult>((resolve) => { resolveLifetime = resolve; });
+	let requests: unknown;
+	host.driver.openAndLaunch = async (id, values) => {
+		assert.equal(id, teamId);
+		requests = values;
+		host.runtime.launch(teamId);
+		return { lifetime };
+	};
+	const updates: any[] = [];
+	let settled = false;
+	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context())
+		.finally(() => { settled = true; });
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(settled, false, "launch remains pending until the Team lifetime settles");
+	assert.equal((requests as any[]).length, 2);
+	assert.ok((requests as any[]).every((request) => request.teamId === teamId));
+	assert.ok((requests as any[]).every((request) => !Object.hasOwn(request, "searchMode")));
+	assert.equal(host.pinnedPolicies(teamId), undefined, "the validated policy is consumed synchronously at launch admission");
+
+	resolveLifetime(terminal(teamId));
+	const result = await pending;
+	assert.equal(settled, true);
+	assert.ok(updates.length > 0);
+	assert.match(result.content[0].text, new RegExp(`Team ${teamId} CLOSED · outcome succeeded`, "u"));
+	assert.match(result.content[0].text, /Roots: none/u);
+	assert.doesNotMatch(result.content[0].text, /fresh final summary|coordinator summary/u);
 });
 
-test("cancel reason is visible but bounded and stripped of terminal control sequences", async (t) => {
-	const hub = new TeamHub(); t.after(() => hub.dispose());
-	let tool: any;
-	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
-	const team = hub.prepare({ coordinator: "A", workers: ["B"] });
-	const cancelled = await tool.execute("cancel", { action: "cancel", teamId: team.id, reason: "\u001b[31mRequested stop\u001b[0m\n" + "more context ".repeat(80) });
-	const text = cancelled.content[0].text;
-	assert.match(text, /Reason: Requested stop more context/u);
-	assert.doesNotMatch(text, /\u001b/u);
-	assert.ok(text.length < 2500, "model-visible status JSON keeps cancellation context bounded");
-	assert.match(tool.renderResult(cancelled).render(120).join("\n"), /Reason: Requested stop/u);
-});
-
-test("brief schema limits match the shared validator, which also bounds escaped aggregate size", async (t) => {
-	const hub = new TeamHub(); t.after(() => hub.dispose());
-	let tool: any;
-	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, () => hub);
-	const brief = tool.parameters.properties.brief.anyOf[0];
-	const listItem = (schema: any) => schema.anyOf?.[0]?.items ?? schema.items;
-	for (const schema of [brief.properties.goal, brief.properties.target.anyOf[0], listItem(brief.properties.constraints),
-		listItem(brief.properties.acceptanceCriteria), listItem(brief.properties.authorizations.anyOf[0].items.properties.allowed)]) {
-		assert.equal(schema.maxLength, 8192);
-	}
-	assert.equal(brief.properties.authorizations.anyOf[0].maxItems, 9);
-	const accepted = await tool.execute("long", { action: "prepare", coordinator: "A", workers: ["B"], brief: { goal: "g", constraints: ["c".repeat(5000)] } });
-	assert.equal(accepted.details.snapshots[0].brief.constraints[0].length, 5000, "a 5000-character constraint is valid on both sides");
-	await assert.rejects(tool.execute("escaped", { action: "prepare", coordinator: "A", workers: ["B"], brief: {
-		goal: "g", constraints: Array.from({ length: 6 }, () => "\u0001".repeat(1500)) } }), /exceeds 32768 serialized UTF-8 bytes/u);
+test("runtime launch abort is a structured tool error, preserves host control, and cannot update a retired generation", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	let rejectLifetime!: (error: Error) => void;
+	const lifetime = new Promise<TeamResult>((_resolve, reject) => { rejectLifetime = reject; });
+	host.driver.openAndLaunch = async (id) => {
+		assert.equal(id, teamId);
+		host.runtime.launch(teamId);
+		return { lifetime };
+	};
+	const controller = new AbortController();
+	const updates: any[] = [];
+	const notifications: string[] = [];
+	const ctx = { ...context(), ui: { notify: (message: string) => notifications.push(message) } };
+	const waiting = tool.execute("launch", { action: "launch", teamId }, controller.signal, (update: any) => updates.push(update), ctx);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	controller.abort();
+	await assert.rejects(waiting, (error: unknown) => {
+		assert.ok(error instanceof TeamLaunchWaitAbortedError);
+		assert.equal(error.code, "TEAM_LAUNCH_WAIT_ABORTED");
+		assert.equal(error.lifecycle, "active");
+		return true;
+	});
+	assert.equal(host.runtime.getTeam(teamId).lifecycle, "active", "unknown abort cause does not cancel the Team");
+	assert.equal(host.pinnedPolicies(teamId), undefined, "runtime abort occurs only after launch admission");
+	const initialUpdateCount = updates.length;
+	host.runtime.messageManager(teamId, "late host observation");
+	await new Promise((resolve) => setTimeout(resolve, 275));
+	assert.equal(updates.length, initialUpdateCount, "a settled launch call receives no late progress callback");
+	await host.close("Retire after launch detaches");
+	rejectLifetime(new Error("late lifetime failure"));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(notifications, [], "a detached lifetime cannot notify through its retired generation");
 });

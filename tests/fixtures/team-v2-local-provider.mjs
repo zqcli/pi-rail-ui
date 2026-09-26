@@ -64,6 +64,14 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 		];
 		return [call("a09-reply", { action: "reply", result: { status: "succeeded", summary: "A09 staged reply." } })];
 	}
+	if ((scenario === "broker-stop" || scenario === "broker-delete") && input.scope.kind === "work") {
+		if (input.scope.task === "stop target") return [{ type: "toolCall", id: "broker-stop-latched", name: "bash", arguments: { command: "sleep 30; printf must-not-finish" } }];
+		if (input.scope.task === "unrelated root") {
+			const delayFinished = messages.some((message) => message?.role === "toolResult" && message.toolCallId === "broker-unrelated-delay");
+			if (!delayFinished) return [{ type: "toolCall", id: "broker-unrelated-delay", name: "bash", arguments: { command: "sleep 1; printf unrelated-root-still-ran" } }];
+			return [call("broker-unrelated-reply", { action: "reply", result: { status: "succeeded", summary: "The unrelated worker root completed after a sibling member was stopped." } })];
+		}
+	}
 	if (scenario === "budget-live" && input.scope.kind === "work" && input.scope.task === "W1 root") {
 		// The first activation runs one bash step and is then stopped by the root model budget; after a
 		// host grant the same WorkRef resumes in the same session and sees that earlier real side effect.

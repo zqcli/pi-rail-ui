@@ -37,12 +37,23 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** A launch whose member lifetimes could not all be opened; the prepared Team was stopped before any provider ran. */
+export class TeamLaunchError extends Error {
+	constructor(message: string, readonly cleanup: TeamResult | undefined, readonly cleanupError: unknown) {
+		super(message);
+		this.name = "TeamLaunchError";
+	}
+}
+
 /** Drives Runtime-reserved activations through Broker-owned, single-writer native sessions. */
 export class TeamMemberDriver {
 	private readonly members = new Map<string, ManagedMember>();
 	private readonly runningMembers = new Set<string>();
+	private readonly activationRuns = new Map<string, Promise<TeamActivationRun>>();
 	private readonly activationControllers = new Map<string, { activationId: string; controller: AbortController }>();
 	private readonly pendingStops = new Map<string, { activationId: string; reason: ActivationCompletionReason }>();
+	private readonly settledLifetimes = new Set<string>();
+	private closeBatchAttempts: Set<string> | undefined;
 	private readonly launched = new Map<string, Promise<TeamResult>>();
 	private readonly preparedStops = new Map<string, Promise<TeamResult>>();
 	private readonly opening = new Map<string, Promise<unknown>>();
@@ -59,14 +70,14 @@ export class TeamMemberDriver {
 		if (planned.policy.cwd && cwd && resolve(planned.policy.cwd) !== resolve(cwd)) {
 			throw new Error(`Team member ${request.memberId} cwd does not match its prepared policy`);
 		}
-		if (planned.policy.fastMode !== undefined && request.fastMode !== undefined && planned.policy.fastMode !== request.fastMode) {
+		if (request.fastMode !== undefined && planned.policy.fastMode !== request.fastMode) {
 			throw new Error(`Team member ${request.memberId} fastMode does not match its prepared policy`);
 		}
-		if (planned.policy.contextWindow !== undefined && request.contextWindow !== undefined && planned.policy.contextWindow !== request.contextWindow) {
+		if (request.contextWindow !== undefined && planned.policy.contextWindow !== request.contextWindow) {
 			throw new Error(`Team member ${request.memberId} contextWindow does not match its prepared policy`);
 		}
-		const fastMode = request.fastMode ?? planned.policy.fastMode;
-		const contextWindow = request.contextWindow ?? planned.policy.contextWindow;
+		const fastMode = planned.policy.fastMode;
+		const contextWindow = planned.policy.contextWindow;
 		const id = key(request.teamId, request.memberId);
 		if (this.members.has(id)) throw new Error(`Team member ${request.memberId} already has a native lifetime`);
 		// The claim fails once the Team is no longer prepared, so a cancelled Team never gains a new lifetime.
@@ -86,6 +97,27 @@ export class TeamMemberDriver {
 		} finally {
 			this.opening.delete(id);
 		}
+	}
+
+	/**
+	 * Open every member lifetime (each bind verifies the child's Team v2 capability), then launch.
+	 * If any open fails no provider is started: the prepared Team is stopped and every lifetime that
+	 * was opened is closed; an unconfirmed exit keeps its Broker ownership. The lifetime is wrapped so
+	 * callers can observe launch admission separately from Team completion.
+	 */
+	async openAndLaunch(teamId: string, requests: readonly OpenTeamMemberRequest[]): Promise<{ lifetime: Promise<TeamResult> }> {
+		const opened = await Promise.allSettled(requests.map((request) => this.openMember(request)));
+		const failures = opened.flatMap((result, index) => result.status === "rejected" ? [`${requests[index]!.memberId}: ${errorMessage(result.reason)}`] : []);
+		// A host stop during startup already owns the prepared Team's cleanup; never launch past it.
+		if (failures.length || this.preparedStops.has(teamId)) {
+			const message = failures.length ? `Team launch stopped before any provider ran; member startup failed (${failures.join("; ")})`
+				: "Team launch was stopped by the host before any provider ran";
+			let cleanup: TeamResult | undefined;
+			let cleanupError: unknown;
+			try { cleanup = await this.stopTeam(teamId, message); } catch (error) { cleanupError = error; }
+			throw new TeamLaunchError(message, cleanup, cleanupError);
+		}
+		return { lifetime: this.launch(teamId) };
 	}
 
 	/** Native resources must all be bound before Runtime admits any activation. */
@@ -111,6 +143,7 @@ export class TeamMemberDriver {
 
 	private trackLifetime(lifetimes: Map<string, Promise<TeamResult>>, teamId: string, detach: () => void): Promise<TeamResult> {
 		const lifetime = this.runtime.waitForCompletion(teamId).then((result) => {
+			this.settledLifetimes.add(teamId);
 			if (result.members.every((member) => member.resourceState === "released")) detach();
 			return result;
 		});
@@ -120,7 +153,7 @@ export class TeamMemberDriver {
 
 	private executor(): TeamRuntimeExecutor {
 		return {
-			runActivation: (activation) => this.executeActivation(activation),
+			runActivation: (activation) => this.trackActivation(activation),
 			stopActivation: (binding, activationId, reason) => this.stopActivation(binding, activationId, reason),
 			terminateActivation: (binding, activationId, error) => this.terminateActivation(binding, activationId, error.message),
 			closeMember: async (binding) => {
@@ -131,6 +164,7 @@ export class TeamMemberDriver {
 				if (!member) return { ok: false, error: { code: "CLEANUP_FAILED", message: `No native lifetime remains for ${binding.memberId}`, outcomeUnknown: true } };
 				if (this.runningMembers.has(id)) return { ok: false, error: { code: "CLEANUP_FAILED", message: `${binding.memberId} still has a native activation in flight`, outcomeUnknown: true } };
 				try {
+					this.closeBatchAttempts?.add(id);
 					const closed = await member.handle.close();
 					this.members.delete(id);
 					// Exit confirmed, but a failed private unbind is never reported as a clean close.
@@ -147,20 +181,23 @@ export class TeamMemberDriver {
 	 * Lifecycle routers (stop/delete/shutdown) use this instead of waiting for a Manager turn. A prepared
 	 * Team is cancelled without launching any provider; only native lifetimes actually claimed are closed.
 	 */
-	stopTeam(teamId: string, reason: string): Promise<TeamResult> {
+	stopTeam(teamId: string, reason: string, mode: "cancel" | "interrupt" = "cancel"): Promise<TeamResult> {
+		const stop = () => mode === "cancel" ? this.runtime.cancelTeam(teamId, reason) : this.runtime.interruptTeam(teamId, reason);
 		const lifetime = this.launched.get(teamId);
 		if (lifetime) {
-			this.runtime.hostControl(teamId).cancel_team(reason);
+			if (!this.settledLifetimes.has(teamId)) stop();
 			return lifetime;
 		}
 		const preparedStop = this.preparedStops.get(teamId);
 		if (preparedStop) return preparedStop;
 		const completed = this.runtime.getTeamResult(teamId);
-		if (completed) return Promise.resolve(completed);
-		if (this.runtime.getTeam(teamId).lifecycle !== "prepared") throw new Error("Team lifecycle stop has no driver-owned lifetime");
-		const detach = this.runtime.attachExecutor(teamId, this.executor());
+		if (completed && completed.members.every((member) => member.resourceState === "released")) return Promise.resolve(completed);
+		const lifecycle = this.runtime.getTeam(teamId).lifecycle;
+		const detach = lifecycle === "prepared"
+			? this.runtime.attachExecutor(teamId, this.executor())
+			: this.runtime.attachCleanupExecutor(teamId, this.executor());
 		try {
-			this.runtime.hostControl(teamId).cancel_team(reason);
+			stop();
 		} catch (error) {
 			detach();
 			throw error;
@@ -177,7 +214,15 @@ export class TeamMemberDriver {
 		if (missing.length) throw new Error(`Team members lack Broker-owned native lifetimes: ${missing.join(", ")}`);
 		const activation = this.runtime.takeNextActivation(teamId);
 		if (!activation) return undefined;
-		return this.executeActivation(activation, options);
+		return this.trackActivation(activation, options);
+	}
+
+	private trackActivation(activation: RuntimeActivation, options: { signal?: AbortSignal } = {}): Promise<TeamActivationRun> {
+		const id = key(activation.binding.teamId, activation.binding.memberId);
+		const run = this.executeActivation(activation, options);
+		this.activationRuns.set(id, run);
+		void run.finally(() => { if (this.activationRuns.get(id) === run) this.activationRuns.delete(id); }).catch(() => undefined);
+		return run;
 	}
 
 	private async executeActivation(activation: RuntimeActivation, options: { signal?: AbortSignal } = {}): Promise<TeamActivationRun> {
@@ -274,6 +319,51 @@ export class TeamMemberDriver {
 		} catch { /* Exit is not confirmed by the Broker; keep the handle and ownership. */ }
 	}
 
+	/** Stop one host-selected Broker member while preserving every unrelated Team member/root. */
+	async stopMember(teamId: string, memberId: string, reason: string): Promise<void> {
+		const binding = this.runtime.hostStopMember(teamId, memberId, reason);
+		const id = key(teamId, memberId);
+		await this.opening.get(id)?.catch(() => undefined);
+		await this.waitForMemberIdle(teamId, memberId);
+		await this.activationRuns.get(id)?.catch(() => undefined);
+		const state = this.runtime.getTeam(teamId).members.find((candidate) => candidate.id === memberId);
+		if (state?.resourceState === "released") return;
+		const member = this.members.get(id);
+		if (!member) throw new Error(`Team member ${memberId} has no driver handle to confirm its exit`);
+		try {
+			const closed = await member.handle.close();
+			this.members.delete(id);
+			const reply = this.runtime.memberStopExit(binding, closed.protocolError === undefined ? { ok: true } : {
+				ok: false, resourceReleased: true, error: { code: "PROTOCOL_FAILURE", message: closed.protocolError },
+			});
+			if (!reply.ok && closed.protocolError === undefined) throw new Error(reply.error.message);
+		} catch (error) {
+			if (this.members.get(id) === member) {
+				try { this.runtime.memberStopExit(binding, { ok: false, error: { code: "CLEANUP_FAILED", message: errorMessage(error), outcomeUnknown: true } }); }
+				catch (reportError) { throw new AggregateError([error, reportError], `Team member ${memberId} stop and cleanup reporting both failed`); }
+			}
+			throw error;
+		}
+	}
+
+	private waitForMemberIdle(teamId: string, memberId: string): Promise<void> {
+		const isIdle = (): boolean => this.runtime.getTeam(teamId).members.find((member) => member.id === memberId)?.activity === "idle";
+		if (isIdle()) return Promise.resolve();
+		return new Promise((resolve, reject) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const unsubscribe = this.runtime.onChange((changed) => {
+				if (changed !== teamId || !isIdle()) return;
+				unsubscribe();
+				if (timer) clearTimeout(timer);
+				resolve();
+			});
+			timer = setTimeout(() => {
+				unsubscribe();
+				reject(new Error(`Team member ${memberId} activation did not settle after host stop`));
+			}, 20_000);
+		});
+	}
+
 	async closeMember(teamId: string, memberId: string): Promise<void> {
 		const id = key(teamId, memberId);
 		const member = this.members.get(id);
@@ -287,17 +377,30 @@ export class TeamMemberDriver {
 
 	async close(): Promise<void> {
 		const failures: unknown[] = [];
-		for (const lifetime of this.preparedStops.values()) {
-			try { await lifetime; } catch (error) { failures.push(error); }
+		const closeBatchAttempts = new Set<string>();
+		this.closeBatchAttempts = closeBatchAttempts;
+		// Host lifecycle end: every unfinished Team (prepared or live) is interrupted, not user-cancelled,
+		// and its member exits are awaited before remaining handles are closed.
+		const stops = new Map<string, Promise<TeamResult>>([...this.preparedStops, ...this.launched]);
+		for (const team of this.runtime.listTeams()) {
+			const managedLifetime = this.launched.has(team.teamId);
+			if (team.lifecycle !== "prepared" && !(managedLifetime && (team.lifecycle === "active" || team.lifecycle === "closing"))) continue;
+			try { stops.set(team.teamId, this.stopTeam(team.teamId, "Host session runtime ended", "interrupt")); }
+			catch (error) { failures.push(error); }
 		}
-		for (const [teamId, lifetime] of this.launched) {
+		for (const [teamId, lifetime] of stops) {
 			try {
-				if (this.runtime.getTeam(teamId).lifecycle === "active") this.runtime.hostControl(teamId).cancel_team("TeamMemberDriver shutdown");
-				await lifetime;
+				const result = await lifetime;
+				for (const member of result.members) if (member.resourceState !== "released") {
+					const id = key(teamId, member.id);
+					if (closeBatchAttempts.has(id)) failures.push(new Error(`Team member ${member.id} exit is unconfirmed (${member.resourceState})`));
+				}
 			} catch (error) { failures.push(error); }
 		}
 		for (const [id, member] of [...this.members.entries()]) {
+			if (closeBatchAttempts.has(id)) continue;
 			try {
+				closeBatchAttempts.add(id);
 				const closed = await member.handle.close();
 				this.members.delete(id);
 				this.reconcileRuntimeExit(member.binding);
@@ -310,6 +413,7 @@ export class TeamMemberDriver {
 				failures.push(error);
 			}
 		}
+		if (this.closeBatchAttempts === closeBatchAttempts) this.closeBatchAttempts = undefined;
 		if (failures.length) throw new AggregateError(failures, "One or more Team member exits are unconfirmed");
 	}
 

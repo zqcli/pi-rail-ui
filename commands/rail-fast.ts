@@ -16,6 +16,7 @@ export type NativeFastModel = {
 	api: string;
 	id: string;
 	name?: string;
+	contextWindow?: number;
 	samplingParams?: Record<string, unknown>;
 };
 

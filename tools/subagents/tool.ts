@@ -1,7 +1,3 @@
-import {
-	deleteTeamLaunchPlan, TeamRunManager, teamCallSignal, teamDispatchTemplate, teamLaunchPlan, teamStatus,
-	type TeamLaunchPlan, type TeamMemberPlan,
-} from "./team-runner";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentToolResult, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type Theme,
@@ -37,7 +33,6 @@ import {
 	type SubagentTranscriptSnapshot,
 } from "./transcript";
 import { emptySubagentUsage } from "./usage";
-import type { TeamAssignment, TeamBinding, TeamSnapshot, TeamTaskResult } from "./team-protocol-v1";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CHAIN_TASKS = 8;
@@ -110,7 +105,7 @@ const ChainItem = Type.Object({
 });
 
 const SubagentParams = Type.Object({
-	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Omit or null. Teams are started with subagent_team launch. Only a team prepared with alias strings (no member plan) is launched by two sibling subagent calls carrying its teamId." })),
+	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Retired. Omit or null; Teams run only through subagent_team." })),
 	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. In single mode, model+task without alias/session is stateless; model+alias+task creates persistent." })),
 	target: Type.Optional(Type.String({ description: "Continue the exact linked persistent alias or agentId and its existing conversation memory; do not also set model" })),
 	alias: Type.Optional(Type.String({ description: "Create a new persistent long-term helper expected to receive future follow-ups; omit for one-off stateless work" })),
@@ -136,8 +131,6 @@ export interface StatefulSubagentRunDetails extends SubagentTranscriptRun {
 	task: string;
 	usage: SubagentUsage;
 	durationMs: number;
-	teamAssignment?: TeamAssignment;
-	teamResult?: TeamTaskResult;
 }
 
 export interface StatefulSubagentDetails {
@@ -147,7 +140,6 @@ export interface StatefulSubagentDetails {
 }
 
 export interface StatefulSubagentToolOptions {
-	team?: () => TeamRunManager;
 	broker: SessionBroker | (() => SessionBroker);
 	readonly knownFastMode?: (target: string) => boolean | undefined;
 	readonly knownModel?: (target: string) => RailModelRef | undefined;
@@ -357,31 +349,13 @@ function validateFastModePlacement(item: TaskParams): void {
 }
 
 function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
-	const teamId = nonEmpty(params.teamId ?? undefined);
-	if (teamId) {
-		// Providers may fill optional fields with no-op placeholders. Apply the
-		// same task normalization used for dispatch before checking team lifecycle.
-		const items = [normalizeTask({ ...params, task: params.task! }), ...(params.tasks ?? []).map(normalizeTask)];
-		const label = (index: number) => index === 0 ? "" : `tasks[${index - 1}].`;
-		const found = [
-			...(mode === "chain" || params.chain?.length ? ["chain"] : []),
-			...(mode === "control" || nonEmpty(params.control?.message) ? [`control.message=${JSON.stringify(params.control?.message?.slice(0, 80) ?? "")}`] : []),
-			...items.flatMap((item, index) => [
-				...(item.target !== undefined ? [`${label(index)}target=${JSON.stringify(item.target.slice(0, 80))}`] : []),
-				...(item.session ? [`${label(index)}session.path=${JSON.stringify(item.session.path.slice(0, 120))}`] : []),
-			]),
-		];
-		if (found.length) {
-			throw new Error(`Team does not support target/session/chain/control: members are new persistent aliases. This call sets ${found.join(", ")}; omit these fields or set them to null.`);
-		}
+	if (nonEmpty(params.teamId ?? undefined)) {
+		throw new Error("subagent no longer starts Team members: teamId is retired. Run a Team with subagent_team prepare (manager, workers, brief, initialRequests) and then launch with the returned teamId.");
 	}
 	if (mode !== "single" && normalizeContextWindow(params.contextWindow) !== undefined) {
 		throw new Error("contextWindow is only supported on the single task or on each parallel/chain item");
 	}
-	const confirmSessionAttach = {
-		...(typeof params.confirmSessionAttach === "boolean" ? { confirmSessionAttach: params.confirmSessionAttach } : {}),
-		...(teamId ? { teamId } : {}),
-	};
+	const confirmSessionAttach = typeof params.confirmSessionAttach === "boolean" ? { confirmSessionAttach: params.confirmSessionAttach } : {};
 	if (mode === "parallel") {
 		if (params.fastMode !== undefined && params.fastMode !== null) {
 			throw new Error("fastMode is only supported on the single task or on each parallel/chain item");
@@ -410,49 +384,6 @@ function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): S
 	const normalized = normalizeTask({ ...params, task: params.task! });
 	validateFastModePlacement(normalized);
 	return { ...normalized, ...confirmSessionAttach };
-}
-
-function preparedTeam(team: TeamRunManager, teamId: string): TeamSnapshot {
-	try {
-		return team.hub.get(teamId);
-	} catch {
-		throw new Error(`Unknown teamId ${JSON.stringify(teamId.slice(0, 128))}: use the exact teamId returned by subagent_team prepare (subagent_team status without teamId lists teams). Nothing was started.`);
-	}
-}
-
-function describeTeamCall(raw: SubagentParamsValue): string {
-	const tasks = raw.tasks?.length ? `tasks aliases ${JSON.stringify(raw.tasks.map((item) => nonEmpty(item.alias) ?? ""))}` : undefined;
-	const single = nonEmpty(raw.task) ? `single alias ${JSON.stringify(nonEmpty(raw.alias) ?? "")}` : undefined;
-	return [single, tasks].filter(Boolean).join(" + ") || "no task";
-}
-
-function assertTeamDispatchBatch(toolCallId: string, snapshot: TeamSnapshot, ctx: ExtensionContext): void {
-	const teamId = snapshot.id;
-	// Native tool execution sees the finalized assistant message in memory. SDK
-	// callers without that matching context keep the existing admission deadline.
-	const branch = ctx.sessionManager?.getBranch?.();
-	const entry = branch?.findLast((item) => item.type === "message" && item.message.role === "assistant");
-	if (entry?.type !== "message" || entry.message.role !== "assistant") return;
-	const calls = entry.message.content.filter((part) => part.type === "toolCall")
-		.filter((call) => call.name === "subagent" && typeof call.arguments?.["teamId"] === "string" && nonEmpty(call.arguments["teamId"]) === teamId);
-	if (!calls.some((call) => call.id === toolCallId)) return;
-	const found = `This assistant message has ${calls.length} subagent call${calls.length === 1 ? "" : "s"} with this teamId: ${calls.map((call) => describeTeamCall(call.arguments as SubagentParamsValue)).join("; ")}.`;
-	const error = new Error(`Team dispatch requires one new-alias single call and one grouped parallel call. This dispatch has not joined/started; retry BOTH calls in same assistant message with same teamId, do not wait between them. ${found}\n${teamDispatchTemplate(snapshot)}`);
-	if (calls.length !== 2) throw error;
-	let singles = 0;
-	let parallels = 0;
-	try {
-		for (const call of calls) {
-			const raw = call.arguments as SubagentParamsValue;
-			const mode = modeFor(raw);
-			const normalized = filterParamsForMode(raw, mode);
-			if (mode === "single" && normalized.alias) singles++;
-			if (mode === "parallel" && normalized.tasks?.length
-				&& normalized.tasks.every((item) => item.alias && nonEmpty(item.task))
-				&& new Set(normalized.tasks.map((item) => item.alias)).size === normalized.tasks.length) parallels++;
-		}
-	} catch { throw error; }
-	if (singles !== 1 || parallels !== 1) throw error;
 }
 
 type RenderModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "scopedModels" | "thinkingLevel">;
@@ -700,38 +631,20 @@ function finalText(result: StatefulSubagentRunDetails): string {
 	].join("\n"));
 }
 
-function appendTeamStatus(text: string, snapshot?: TeamSnapshot): string {
-	if (!snapshot) return truncateParentContent(text);
-	const retry = snapshot.phase === "failed" || snapshot.phase === "cancelled"
-		? "\nRetry: prepare a new team. Members that started keep their persistent aliases for inspection, so give them new aliases; aliases of members that never started were released."
-		: "";
-	const status = `${teamStatus(snapshot)}${retry}`;
-	const separator = "\n\n";
-	const remaining = Math.max(0, OUTPUT_CAP - Buffer.byteLength(status, "utf8") - Buffer.byteLength(separator, "utf8"));
-	const bounded = truncateUtf8(text, remaining, "\n\n[team result text truncated; team status retained]").value;
-	return `${bounded}${separator}${status}`;
-}
-
-function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunDetails[], label?: string): string {
+function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunDetails[]): string {
 	const succeeded = results.filter((result) => result.status === "completed").length;
-	const completionLabel = results.some((result) => result.teamResult) ? "runtime completions" : "succeeded";
 	const summary = [
-		`${label ?? (mode === "parallel" ? "Parallel" : "Chain")}: ${succeeded}/${results.length} ${completionLabel}`,
+		`${mode === "parallel" ? "Parallel" : "Chain"}: ${succeeded}/${results.length} succeeded`,
 		...results.map((result) => {
 			const error = result.errorMessage?.replace(/\s+/gu, " ").trim();
-			const assignment = result.teamAssignment;
-			const outcome = result.teamResult;
-			const policy = assignment ? ` · FAST ${assignment.fastMode ? "on" : "off"} · SEARCH ${assignment.searchMode ?? "off"}` : "";
-			const structured = outcome ? ` · task ${outcome.status}${outcome.summary ? `: ${truncateUtf8(outcome.summary, 500, "…").value}` : ""}` : "";
-			return `- ${result.alias} · ${result.status} · ${result.model ?? "model unavailable"}${policy}${structured}${error ? ` · ${error.slice(0, 300)}` : ""}`;
+			return `- ${result.alias} · ${result.status} · ${result.model ?? "model unavailable"}${error ? ` · ${error.slice(0, 300)}` : ""}`;
 		}),
 	].join("\n");
 	const remaining = Math.max(1024, OUTPUT_CAP - Buffer.byteLength(summary, "utf8") - 512);
 	const perRun = Math.max(512, Math.floor(remaining / Math.max(1, results.length)));
 	const outputs = results.map((result) => {
 		const snippet = truncateUtf8(result.output, perRun, "\n[answer snippet truncated]").value;
-		const outcome = result.teamResult;
-		return `### ${result.alias} [${result.status}${outcome ? `; task ${outcome.status}` : ""}]\n\n${snippet}`;
+		return `### ${result.alias} [${result.status}]\n\n${snippet}`;
 	}).join("\n\n---\n\n");
 	return truncateParentContent(`${summary}\n\n${outputs}`);
 }
@@ -760,36 +673,68 @@ function nestedToolUsage(results: readonly StatefulSubagentRunDetails[]): Usage 
 	};
 }
 
-export interface TeamPlanSummary {
-	alias: string;
-	role: "coordinator" | "worker";
-	model: string;
-	fastMode: boolean;
-	searchMode: "on" | "off";
+/** A Team member's effective native policy, resolved once at prepare and pinned until launch. */
+export interface ResolvedTeamMemberPolicy {
+	model: RailModelRef;
+	modelReference: string;
 	cwd: string;
+	fastMode: boolean;
+	searchMode: SearchModeDisplay;
+	nativeContextWindow: number;
+	compactionReserveTokens: number;
+	compactionEnabled: boolean;
+	contextWindow?: number;
 }
 
-/** Starts a planned team through the same dispatch, rendering and cleanup path as subagent calls. */
-export interface TeamLauncher {
-	/** Resolves models, Fast eligibility, cwd and alias availability without starting anything. */
-	validate(plan: TeamLaunchPlan, ctx: ExtensionContext): Promise<TeamPlanSummary[]>;
-	launch(
-		toolCallId: string,
-		teamId: string,
-		plan: TeamLaunchPlan,
-		signal: AbortSignal | undefined,
-		onUpdate: AgentToolUpdateCallback<StatefulSubagentDetails> | undefined,
-		ctx: ExtensionContext,
-	): Promise<AgentToolResult<StatefulSubagentDetails>>;
-	renderResult(
-		result: AgentToolResult<unknown>,
-		options: ToolRenderResultOptions,
-		theme: Theme,
-		context: { readonly toolCallId?: string } | undefined,
-	): Component;
+/**
+ * Resolve a new Team member's model, cwd, effective Fast/Search and contextWindow with the same rules
+ * as a new persistent subagent: the real model, a real directory, and a context reserve checked
+ * against the child's project-trust-aware compaction settings. Nothing is started.
+ */
+export async function resolveTeamMemberPolicy(
+	input: { model?: string; cwd?: string; fastMode?: boolean; contextWindow?: number },
+	ctx: RenderModelContext & Pick<ExtensionContext, "cwd">,
+): Promise<ResolvedTeamMemberPolicy> {
+	const model = resolveRailModel(input.model, ctx);
+	const native = nativeModelForRailRef(model, ctx);
+	const fastRequest = effectiveFastModeRequest({ task: "", ...(input.fastMode !== undefined ? { fastMode: input.fastMode } : {}) }, native);
+	const cwd = resolvePath(ctx.cwd, input.cwd ?? ".");
+	if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
+	const contextWindow = normalizeContextWindow(input.contextWindow);
+	if (input.contextWindow !== undefined && contextWindow === undefined) throw new Error("contextWindow must be a positive safe integer or null");
+	const nativeContextWindow = native?.contextWindow;
+	if (typeof nativeContextWindow !== "number" || !Number.isSafeInteger(nativeContextWindow) || nativeContextWindow <= 0) {
+		throw new Error(`model ${railModelReference(model)} does not expose a verifiable native contextWindow`);
+	}
+	const compaction = createChildContextSettings(cwd).getCompactionSettings({ provider: model.provider, id: model.modelId });
+	validateContextWindowReserve(contextWindow ?? nativeContextWindow, compaction.reserveTokens, compaction.enabled);
+	return {
+		model, modelReference: railModelReference(model), cwd,
+		fastMode: effectiveFastModeText(fastRequest, native) === "on", searchMode: effectiveSearchModeText(native),
+		nativeContextWindow, compactionReserveTokens: compaction.reserveTokens, compactionEnabled: compaction.enabled,
+		...(contextWindow !== undefined ? { contextWindow } : {}),
+	};
 }
 
-export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulSubagentToolOptions): TeamLauncher {
+/** Re-check the pinned N09 policy immediately before launch; changed model or project trust requires prepare again. */
+export function verifyPinnedTeamMemberPolicy(policy: ResolvedTeamMemberPolicy, ctx: RenderModelContext): void {
+	const native = nativeModelForRailRef(policy.model, ctx);
+	if (!native || native.contextWindow !== policy.nativeContextWindow) {
+		throw new Error(`${policy.modelReference}: native model/contextWindow changed after prepare; prepare the Team again`);
+	}
+	const compaction = createChildContextSettings(policy.cwd).getCompactionSettings({ provider: policy.model.provider, id: policy.model.modelId });
+	if (compaction.reserveTokens !== policy.compactionReserveTokens || compaction.enabled !== policy.compactionEnabled) {
+		throw new Error(`${policy.modelReference}: project trust/compaction policy changed after prepare; prepare the Team again`);
+	}
+	validateContextWindowReserve(policy.contextWindow ?? policy.nativeContextWindow, policy.compactionReserveTokens, policy.compactionEnabled);
+	const fastRequest = effectiveFastModeRequest({ task: "", fastMode: policy.fastMode }, native);
+	if ((effectiveFastModeText(fastRequest, native) === "on") !== policy.fastMode
+		|| effectiveSearchModeText(native) !== policy.searchMode) {
+		throw new Error(`${policy.modelReference}: Fast/Search policy changed after prepare; prepare the Team again`);
+	}
+}
+
+export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulSubagentToolOptions): void {
 	const latestDetails = new Map<string, StatefulSubagentDetails>();
 	const actualTasksByCall = new Map<string, Map<number, string>>();
 	const actualTasksByDetails = new WeakMap<StatefulSubagentDetails, Map<number, string>>();
@@ -798,7 +743,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	const callHeaderInvalidators = new Map<string, () => void>();
 	const eventApi = pi as Partial<Pick<ExtensionAPI, "on">>;
 	eventApi.on?.("tool_result", (event) => {
-		if (event.toolName !== "subagent" && event.toolName !== "subagent_team") return;
+		if (event.toolName !== "subagent") return;
 		const details = latestDetails.get(event.toolCallId);
 		latestDetails.delete(event.toolCallId);
 		actualTasksByCall.delete(event.toolCallId);
@@ -827,34 +772,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		signal: AbortSignal | undefined,
 		onUpdate: AgentToolUpdateCallback<StatefulSubagentDetails> | undefined,
 		ctx: ExtensionContext,
-		launch?: { readonly plan: TeamLaunchPlan },
 	): Promise<AgentToolResult<StatefulSubagentDetails>> => {
 		let toolStartedAt = performance.now();
-		const teamId = nonEmpty(params.teamId ?? undefined);
-		const team = teamId !== undefined ? options.team?.() : undefined;
-		let teamScope: ReturnType<typeof teamCallSignal> | undefined;
-		let unsubscribeTeam: (() => void) | undefined;
-		let joinedTeam = false;
-		try {
-		if (teamId !== undefined && !team) throw new Error("Team runtime is not ready");
-		let mode: SubagentMode;
-		try {
-			mode = modeFor(params);
-			params = filterParamsForMode(params, mode);
-		} catch (error) {
-			// Show a team caller the exact call shape instead of only the rejected field.
-			let known: TeamSnapshot | undefined;
-			try { known = team && teamId !== undefined ? team.hub.get(teamId) : undefined; } catch { known = undefined; }
-			if (known && error instanceof Error) throw new Error(`${error.message}\n${teamDispatchTemplate(known)}`);
-			throw error;
-		}
-		const preparedSnapshot = team && teamId !== undefined ? preparedTeam(team, teamId) : undefined;
-		if (preparedSnapshot && !launch) {
-			if (teamLaunchPlan(team!.hub, preparedSnapshot.id)) {
-				throw new Error(`Team ${preparedSnapshot.id} was prepared with a launch plan. Start it with subagent_team {"action":"launch","teamId":"${preparedSnapshot.id}"} instead of subagent calls.`);
-			}
-			assertTeamDispatchBatch(toolCallId, preparedSnapshot, ctx);
-		}
+		const mode = modeFor(params);
+		params = filterParamsForMode(params, mode);
 		const actualTasks = new Map<number, string>();
 		actualTasksByCall.set(toolCallId, actualTasks);
 		const dispatchMetadata = new Map<number, DispatchDisplayMetadata>();
@@ -884,18 +805,6 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			callHeaderInvalidators.get(toolCallId)?.();
 		};
 		const resultDetails = (results: StatefulSubagentRunDetails[]): StatefulSubagentDetails => {
-			if (team && teamId !== undefined) {
-				const members = new Map(team.hub.get(teamId).members.map((member) => [member.id, member]));
-				results = results.map((result) => {
-					const member = members.get(result.alias);
-					return member ? {
-						...result,
-						coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
-						...(member.assignment ? { teamAssignment: member.assignment } : {}),
-						...(member.result ? { teamResult: member.result } : {}),
-					} : result;
-				});
-			}
 			const details: StatefulSubagentDetails = {
 				mode,
 				results: boundDetailOutputs(boundSubagentRunTranscripts(results)),
@@ -955,7 +864,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const details = resultDetails(orderedLiveResults());
 			latestDetails.set(toolCallId, details);
 			onUpdate?.({
-				content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") + (team && teamId ? `\n${teamStatus(team.hub.get(teamId))}` : "") }],
+				content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") }],
 				details,
 			});
 		};
@@ -963,16 +872,14 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			? [{ ...params, task: params.task! } as TaskParams]
 			: (mode === "parallel" ? params.tasks! : params.chain!) as TaskParams[];
 		requestedItems.forEach((item, index) => setDispatchMetadata(item, index));
-		if (mode === "parallel" && !launch && requestedItems.length > MAX_PARALLEL_TASKS) {
+		if (mode === "parallel" && requestedItems.length > MAX_PARALLEL_TASKS) {
 			throw new Error(`Too many parallel tasks (${requestedItems.length}); max is ${MAX_PARALLEL_TASKS}`);
 		}
 		if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 			throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 		}
-		const teamModels = team ? requestedItems.map((item) => resolveRailModel(item.model, ctx)) : undefined;
-		for (const [index, item] of requestedItems.entries()) {
-			const model = teamModels?.[index];
-			if (item.fastMode === true) effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : modelForFastMode(item, ctx));
+		for (const item of requestedItems) {
+			if (item.fastMode === true) effectiveFastModeRequest(item, modelForFastMode(item, ctx));
 		}
 		const contextTargetItems = requestedItems.filter((item) => item.target && item.contextWindow != null);
 		const broker = contextTargetItems.length > 0
@@ -980,7 +887,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			: undefined;
 		// Pin budgeted selections before asynchronous preflight/confirmation so a parent
 		// model switch cannot change the child after its reserve was validated.
-		const budgetModels = requestedItems.map((item, index) => !item.target && item.contextWindow != null ? teamModels?.[index] ?? resolveRailModel(item.model, ctx) : undefined);
+		const budgetModels = requestedItems.map((item) => !item.target && item.contextWindow != null ? resolveRailModel(item.model, ctx) : undefined);
 		await validateTaskContextWindows(requestedItems, budgetModels, broker, ctx.cwd);
 		const sessionAttachments = requestedItems.filter((item) => item.session != null);
 		if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
@@ -993,46 +900,6 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			);
 			if (!approved) throw new Error("Existing session attachment was not approved");
 		}
-		const teamCwds = team
-			? await Promise.all(requestedItems.map(async (item) => resolvePath(await resolveChildContextCwd(item.cwd ?? ctx.cwd, item.session ?? undefined))))
-			: undefined;
-		const teamAssignments = team && teamModels && teamCwds
-			? requestedItems.map((item, index) => {
-				const model = teamModels[index]!;
-				const native = nativeModelForRailRef(model, ctx);
-				const fastRequest = effectiveFastModeRequest(item, native);
-				return {
-					...(item.alias ? { alias: item.alias } : {}),
-					task: item.task,
-					cwd: teamCwds[index]!,
-					model: railModelReference(model),
-					fastMode: effectiveFastModeText(fastRequest, native) === "on",
-					searchMode: effectiveSearchModeText(native),
-				};
-			})
-			: undefined;
-		let bindings: TeamBinding[] | undefined;
-		if (team && teamId !== undefined && teamAssignments) {
-			if (launch) {
-				// The host admits both sides of a planned team itself; there is no second model-authored call to pair.
-				const [coordinator, ...workers] = teamAssignments;
-				bindings = team.join(teamId, "single", [coordinator!]);
-				joinedTeam = true;
-				bindings = [...bindings, ...team.join(teamId, "parallel", workers)];
-				deleteTeamLaunchPlan(team.hub, teamId);
-			} else bindings = team.join(teamId, mode, teamAssignments);
-		}
-		joinedTeam = bindings !== undefined;
-		if (team && teamId !== undefined) {
-			teamScope = teamCallSignal(team.hub, teamId, signal);
-			signal = teamScope.signal;
-			unsubscribeTeam = team.hub.subscribe((snapshot) => {
-				if (snapshot.id !== teamId) return;
-				const details = resultDetails(orderedLiveResults());
-				latestDetails.set(toolCallId, details);
-				onUpdate?.({ content: [{ type: "text", text: teamStatus(snapshot) }], details });
-			});
-		}
 		toolStartedAt = performance.now();
 
 		const dispatch = async (item: TaskParams, slot: number, step?: number): Promise<StatefulSubagentRunDetails> => {
@@ -1044,7 +911,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const persistent = isPersistentTask(item);
 			if (!persistent) {
 				if (!options.runStateless) throw new Error("Stateless model-session runner is not configured");
-				const model = teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
+				const model = budgetModels[slot] ?? resolveRailModel(item.model, ctx);
 				const fastMode = effectiveFastModeRequest(item, nativeModelForRailRef(model, ctx));
 				setDispatchMetadata(item, slot, { model, fastMode });
 				const alias = mode === "single" ? railModelKey(model) : `${railModelKey(model)} #${slot + 1}`;
@@ -1084,22 +951,18 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				publishLive(slot, result);
 				return result;
 			}
-			const model = item.target ? undefined : teamModels?.[slot] ?? budgetModels[slot] ?? resolveRailModel(item.model, ctx);
+			const model = item.target ? undefined : budgetModels[slot] ?? resolveRailModel(item.model, ctx);
 			const fastMode = effectiveFastModeRequest(item, model ? nativeModelForRailRef(model, ctx) : undefined);
-			// A coordinator cancel aborts only this member; the tool-level signal stays team-wide.
-			const memberSignal = team && bindings?.[slot] ? team.hub.memberSignal(teamId!, bindings[slot]!.memberId) : undefined;
-			const dispatchSignal = memberSignal && signal ? AbortSignal.any([signal, memberSignal]) : signal;
 			const request: DispatchRequest = {
-				...(team && bindings?.[slot] ? { team: team.channel(bindings[slot]!) } : {}),
 				...(model ? { model } : {}),
 				...(item.target ? { target: item.target } : {}),
 				...(item.alias ? { alias: item.alias } : {}),
 				task: item.task,
-				...(team ? { cwd: teamCwds?.[slot] ?? resolvePath(item.cwd ?? ctx.cwd) } : item.cwd ? { cwd: item.cwd } : {}),
+				...(item.cwd ? { cwd: item.cwd } : {}),
 				...(item.session ? { session: item.session } : {}),
 				...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
 				...(fastMode !== undefined ? { fastMode } : {}),
-				...(dispatchSignal ? { signal: dispatchSignal } : {}),
+				...(signal ? { signal } : {}),
 				onUpdate: ({ instance, run: partial }) => {
 					setDispatchMetadata(item, slot, { model: instance.model, fastMode: instance.fastMode === true });
 					publishLive(slot, {
@@ -1119,44 +982,10 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 					});
 				},
 			};
-			if (request.team && model) {
-				// A member may pause at its very first native gate, before any
-				// transcript update exists. Keep its slot visible during startup.
-				publishLive(slot, {
-					alias: item.alias!, model: railModelReference(model), task: item.task,
-					status: "running", output: "(starting...)", usage: emptySubagentUsage(),
-					durationMs: duration(), persistent: true,
-				});
-			}
 			const broker = typeof options.broker === "function" ? options.broker() : options.broker;
 			const dispatched = await broker.dispatch(request);
 			setDispatchMetadata(item, slot, { model: dispatched.instance.model, fastMode: dispatched.instance.fastMode === true });
-			let result = compactPersistentResult(dispatched, item.task, duration(), step);
-			if (team && bindings?.[slot]) {
-				const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
-				if (member) {
-					result = {
-						...result,
-						coordination: { state: member.state, ...(member.waitingFor !== undefined ? { waitingFor: member.waitingFor } : {}) },
-						...(member.assignment ? { teamAssignment: member.assignment } : {}),
-						...(member.result ? { teamResult: member.result } : {}),
-					};
-				}
-				if (member && ["failed", "cancelled"].includes(member.state) && result.status !== "failed") {
-					result = {
-						...result,
-						status: "failed",
-						output: member.output ?? result.output,
-						...(member.error ? { errorMessage: truncateParentContent(member.error), stopReason: member.state === "cancelled" ? "aborted" : "error" } : {}),
-					};
-				}
-			}
-			const nativeErrorMessage = runErrorMessage(dispatched.run);
-			if (team && bindings?.[slot] && result.status === "failed" && nativeErrorMessage) {
-				const nativeError = new Error(nativeErrorMessage);
-				const error = team.dispatchError(bindings[slot]!, nativeError);
-				if (error !== nativeError) result = errorResult(item, error, duration(), signal?.aborted ?? false, step, result);
-			}
+			const result = compactPersistentResult(dispatched, item.task, duration(), step);
 			publishLive(slot, result);
 			return result;
 		};
@@ -1165,16 +994,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			try {
 				return await dispatch(item, slot, step);
 			} catch (error) {
-				let cancelledByCoordinator = false;
-				if (team && bindings?.[slot]) {
-					const member = team.hub.get(teamId!).members.find((candidate) => candidate.id === bindings[slot]!.memberId);
-					cancelledByCoordinator = member?.state === "cancelled" && team.hub.memberSignal(teamId!, member.id).aborted;
-					// Resolve the established Hub cause before this failure can cancel peers.
-					error = cancelledByCoordinator ? new Error(member!.error ?? "Cancelled by coordinator", { cause: error })
-						: team.dispatchError(bindings[slot]!, error);
-					team.fail(bindings[slot]!, error, signal?.aborted);
-				}
-				const result = errorResult(item, error, runDuration(slot), (signal?.aborted ?? false) || cancelledByCoordinator, step, liveResults.get(slot));
+				const result = errorResult(item, error, runDuration(slot), signal?.aborted ?? false, step, liveResults.get(slot));
 				publishLive(slot, result);
 				return result;
 			}
@@ -1186,23 +1006,14 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			const details = resultDetails([result]);
 			latestDetails.set(toolCallId, details);
 			const usage = nestedToolUsage(details.results);
-			return { content: [{ type: "text", text: appendTeamStatus(finalText(result), team && teamId ? team.hub.get(teamId) : undefined) }], details, ...(usage ? { usage } : {}) };
+			return { content: [{ type: "text", text: finalText(result) }], details, ...(usage ? { usage } : {}) };
 		}
 		if (mode === "parallel") {
-			let results: StatefulSubagentRunDetails[];
-			if (bindings) {
-				// Even an unexpected progress/finalization failure must not release the
-				// grouped call while another member is starting or cleaning its lease.
-				const settled = await Promise.allSettled(requestedItems.map((item, index) => runTask(item, index)));
-				results = settled.map((result) => { if (result.status === "rejected") throw result.reason; return result.value; });
-			} else results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
+			const results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
 			const details = resultDetails(results);
 			latestDetails.set(toolCallId, details);
 			const usage = nestedToolUsage(details.results);
-			const text = appendTeamStatus(aggregateText(mode, results, launch ? "Team" : undefined), team && teamId ? team.hub.get(teamId) : undefined);
-			// A planned team succeeds or fails with its coordinator, like the coordinator's own single call.
-			if (launch && results[0]?.status === "failed") throw new Error(text);
-			return { content: [{ type: "text", text }], details, ...(usage ? { usage } : {}) };
+			return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
 		}
 		const results: StatefulSubagentRunDetails[] = [];
 		let previous = "";
@@ -1218,13 +1029,6 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		latestDetails.set(toolCallId, details);
 		const usage = nestedToolUsage(details.results);
 		return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
-		} catch (error) {
-			if (joinedTeam && team && teamId !== undefined) {
-				try { team.hub.cancel(teamId, error instanceof Error ? error.message : String(error)); }
-				catch { /* An unknown team must not replace the original validation error. */ }
-			}
-			throw error;
-		} finally { unsubscribeTeam?.(); teamScope?.dispose(); }
 	};
 
 	const renderDispatchResult = (
@@ -1283,7 +1087,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
 			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
 			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Parallel and chain calls may set fastMode independently on each eligible item; do not set a grouped top-level fastMode or put it on an existing target or control call. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Grouped child panels show each item's effective FAST and SEARCH state.\n"
-			+ "Team dispatch: the host is not a team member or coordinator. Run teams with the subagent_team tool, not with subagent: prepare with the complete member plan (coordinator and workers, each with alias and task) plus shared brief, then launch with only the returned teamId in the next message. Ordinary team send queues work for a recipient checkpoint; it does not immediately stop an active turn or wake the hosting parent model. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
+			+ "Teams: never start Team members with subagent. Use the subagent_team tool: prepare (manager, workers, brief, initialRequests), then launch with only the returned teamId. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
 		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
 		executionMode: "parallel",
 		promptGuidelines: [
@@ -1360,37 +1164,4 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 
 		renderResult: (result, renderOptions, theme, context) => renderDispatchResult(result, renderOptions, theme, context),
 	});
-	const planItems = (plan: TeamLaunchPlan): TaskParams[] => [plan.coordinator, ...plan.workers].map((member: TeamMemberPlan) => ({
-		alias: member.alias,
-		task: member.task,
-		...(member.model ? { model: member.model } : {}),
-		...(member.fastMode !== undefined ? { fastMode: member.fastMode } : {}),
-		...(member.cwd ? { cwd: member.cwd } : {}),
-	}));
-	return {
-		async validate(plan, ctx) {
-			const items = planItems(plan);
-			const summaries = items.map((item, index): TeamPlanSummary => {
-				try {
-					const model = resolveRailModel(item.model, ctx);
-					const native = nativeModelForRailRef(model, ctx);
-					const fastMode = effectiveFastModeRequest(item, native);
-					const cwd = resolvePath(item.cwd ?? ctx.cwd);
-					if (!statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`cwd is not a directory: ${cwd}`);
-					return {
-						alias: item.alias!, role: index === 0 ? "coordinator" : "worker", model: railModelReference(model), cwd,
-						fastMode: effectiveFastModeText(fastMode, native) === "on", searchMode: effectiveSearchModeText(native),
-					};
-				} catch (error) {
-					throw new Error(`${item.alias}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-			});
-			const broker = typeof options.broker === "function" ? options.broker() : options.broker;
-			if (typeof broker.assertAliasesAvailable === "function") await broker.assertAliasesAvailable(items.map((item) => item.alias!));
-			return summaries;
-		},
-		launch: (toolCallId, teamId, plan, signal, onUpdate, ctx) => runDispatch(
-			toolCallId, { teamId, tasks: planItems(plan) } as SubagentParamsValue, signal, onUpdate, ctx, { plan }),
-		renderResult: renderDispatchResult,
-	};
 }

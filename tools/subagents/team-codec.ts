@@ -9,7 +9,7 @@ import {
 	TEAM_ERROR_CODES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_ALIAS_LENGTH, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_FRAME_BYTES,
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_INPUT_REFS, TEAM_MAX_MEMBERS, TEAM_MAX_NOTE_BYTES,
 	TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
-	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS,
+	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_WORKERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
 	TEAM_STATUS_MAX_LIMIT, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
@@ -21,6 +21,7 @@ import {
 	type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReceipt, type TeamReply, type TeamReplyData,
 	type TeamStatusPage, type TeamTeamView, type TeamWorkSummary, type TeamWorkView, type MemberRecord, type ResultRecord,
 	type WorkError, type WorkRef, type WorkResult, type WorkState, type WorkVersion, type TeamBudgetGrantView, type TeamRootBudgetView,
+	type TeamResult,
 } from "./team-protocol";
 import type { SubagentUsage } from "./session-broker";
 
@@ -789,7 +790,7 @@ function parseIncident(value: unknown, field = "incident"): TeamIncidentView {
 	};
 }
 
-function parseResultRecord(value: unknown, field = "result record"): ResultRecord {
+export function normalizeResultRecord(value: unknown, field = "result record"): ResultRecord {
 	if (!isRecord(value)) return protocol(`${field} must be an object`);
 	frameKeys(value, ["id", "work", "author", "result", "committedAt", "source"], field);
 	const committedAt = value["committedAt"];
@@ -798,6 +799,89 @@ function parseResultRecord(value: unknown, field = "result record"): ResultRecor
 	if (source !== "explicit_reply" && source !== "natural_final") return protocol(`${field}.source is invalid`);
 	return { id: frameId(value["id"], `${field}.id`), work: normalizeWorkRef(value["work"], `${field}.work`),
 		author: normalizeAlias(value["author"], `${field}.author`), result: normalizeWorkResult(value["result"], `${field}.result`), committedAt, source };
+}
+
+/** Strict shared decoder for the terminal result written to the v2 history journal. */
+export function normalizeTeamResult(value: unknown, field = "terminal.result"): TeamResult {
+	if (!isRecord(value)) return protocol(`${field} must be an object`);
+	frameKeys(value, ["version", "teamId", "lifecycle", "outcome", "reason", "finalResultRefs", "roots", "members", "usage", "unresolvedIncidents", "unresolvedIncidentsOmitted"], field);
+	if (value["version"] !== TEAM_PROTOCOL_VERSION) return protocol(`${field}.version is invalid`);
+	const lifecycle = value["lifecycle"];
+	if (!( ["closed", "failed", "cancelled", "interrupted"] as readonly unknown[]).includes(lifecycle)) return protocol(`${field}.lifecycle is invalid`);
+	const outcome = value["outcome"];
+	if (outcome !== undefined && outcome !== "succeeded" && outcome !== "partial" && outcome !== "failed") return protocol(`${field}.outcome is invalid`);
+	const reason = value["reason"] === undefined ? undefined : text(value["reason"], `${field}.reason`, 4096);
+	const unresolvedIncidents = array(value["unresolvedIncidents"], `${field}.unresolvedIncidents`, TEAM_MAX_TERMINAL_INCIDENTS).map((raw, index) => {
+		const incidentField = `${field}.unresolvedIncidents[${index}]`;
+		if (!isRecord(raw)) return protocol(`${incidentField} must be an object`);
+		frameKeys(raw, ["id", "code", "message"], incidentField);
+		return { id: frameId(raw["id"], `${incidentField}.id`), code: text(raw["code"], `${incidentField}.code`, 128),
+			message: text(raw["message"], `${incidentField}.message`, TEAM_MAX_NOTE_BYTES) };
+	});
+	const result: TeamResult = {
+		version: TEAM_PROTOCOL_VERSION,
+		teamId: frameId(value["teamId"], `${field}.teamId`),
+		lifecycle: lifecycle as TeamResult["lifecycle"],
+		finalResultRefs: idList(value["finalResultRefs"], `${field}.finalResultRefs`, 16_384),
+		roots: normalizeTeamResultRoots(value["roots"], `${field}.roots`),
+		members: parseTerminalMembers(value["members"], `${field}.members`),
+		usage: parseUsage(value["usage"], `${field}.usage`),
+		unresolvedIncidents,
+	};
+	if (outcome !== undefined) result.outcome = outcome;
+	if (reason !== undefined) result.reason = reason;
+	if (value["unresolvedIncidentsOmitted"] !== undefined) {
+		result.unresolvedIncidentsOmitted = safeInteger(value["unresolvedIncidentsOmitted"], `${field}.unresolvedIncidentsOmitted`, 0);
+	}
+	if (result.lifecycle === "closed" && result.outcome === undefined) return protocol(`${field} closed lifecycle must include an outcome`);
+	if (result.lifecycle !== "closed" && !result.reason) return protocol(`${field} non-closed lifecycle must include a reason`);
+	return result;
+}
+
+export function normalizeTeamResultRoots(value: unknown, field = "roots"): TeamResult["roots"] {
+	if (!Array.isArray(value) || value.length > 512) return protocol(`${field} is invalid or exceeds capacity`);
+	return value.map((raw, index) => {
+		const rootField = `${field}[${index}]`;
+		if (!isRecord(raw)) return protocol(`${rootField} must be an object`);
+		frameKeys(raw, ["work", "state", "resultRef", "review"], rootField);
+		const state = raw["state"];
+		if (!(WORK_STATES as readonly unknown[]).includes(state) || !["resolved", "failed", "cancelled", "superseded"].includes(String(state))) {
+			return protocol(`${rootField}.state must be terminal`);
+		}
+		let review: TeamResult["roots"][number]["review"];
+		if (raw["review"] !== undefined) {
+			if (!isRecord(raw["review"])) return protocol(`${rootField}.review must be an object`);
+			frameKeys(raw["review"], ["disposition", "reason"], `${rootField}.review`);
+			const disposition = raw["review"]["disposition"];
+			if (disposition !== "accepted" && disposition !== "waived") return protocol(`${rootField}.review.disposition is invalid`);
+			const reviewReason = raw["review"]["reason"] === undefined ? undefined : text(raw["review"]["reason"], `${rootField}.review.reason`, 4096);
+			review = { disposition, ...(reviewReason !== undefined ? { reason: reviewReason } : {}) };
+		}
+		return { work: normalizeWorkRef(raw["work"], `${rootField}.work`), state: state as WorkState,
+			...(raw["resultRef"] !== undefined ? { resultRef: frameId(raw["resultRef"], `${rootField}.resultRef`) } : {}),
+			...(review ? { review } : {}) };
+	});
+}
+
+function parseTerminalMembers(value: unknown, field: string): TeamResult["members"] {
+	const members = array(value, field, TEAM_MAX_MEMBERS);
+	if (members.length < 2) return protocol(`${field} roster is invalid`);
+	const parsed = members.map((raw, index) => {
+		const memberField = `${field}[${index}]`;
+		if (!isRecord(raw)) return protocol(`${memberField} must be an object`);
+		frameKeys(raw, ["id", "role", "lifecycle", "resourceState"], memberField);
+		const role = raw["role"];
+		const lifecycle = raw["lifecycle"];
+		const resourceState = raw["resourceState"];
+		if (role !== "manager" && role !== "worker") return protocol(`${memberField}.role is invalid`);
+		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(lifecycle))) return protocol(`${memberField}.lifecycle is invalid`);
+		if (!["starting", "owned", "stopping", "released", "cleanup_failed"].includes(String(resourceState))) return protocol(`${memberField}.resourceState is invalid`);
+		return { id: normalizeAlias(raw["id"], `${memberField}.id`), role: role as MemberRole, lifecycle: lifecycle as MemberLifecycle, resourceState: resourceState as ResourceState };
+	});
+	if (new Set(parsed.map((member) => member.id)).size !== parsed.length || parsed.filter((member) => member.role === "manager").length !== 1) {
+		return protocol(`${field} must contain unique IDs and exactly one Manager`);
+	}
+	return parsed;
 }
 
 function parseWorkSummary(value: unknown): TeamWorkSummary {
@@ -972,6 +1056,10 @@ function parseRootBudget(value: unknown, field: string): TeamRootBudgetView {
 		limits: Object.fromEntries(ROOT_GRANTABLE_COUNTERS.map((key) => [key, safeInteger(limits[key], `${field}.limits.${key}`, 0)])) as TeamRootBudgetView["limits"] };
 }
 
+export function normalizeTeamBudgetGrantRecord(value: unknown, field = "journal grant"): TeamBudgetGrantView {
+	return parseGrant(value, field);
+}
+
 function parseGrant(value: unknown, field: string): TeamBudgetGrantView {
 	if (!isRecord(value)) return protocol(`${field} must be an object`);
 	frameKeys(value, ["id", "actor", "scope", "increments", "reason", "at"], field);
@@ -1045,7 +1133,7 @@ function parseReplyData(value: unknown): TeamReplyData {
 	if (!isRecord(value)) return protocol("team reply data must be an object");
 	if (value["version"] === TEAM_PROTOCOL_VERSION && value["teamId"] !== undefined) return parseTeamTeamView(value);
 	if (value["view"] !== undefined && value["items"] !== undefined) return parseStatusPage(value);
-	if (value["author"] !== undefined && value["result"] !== undefined) return parseResultRecord(value);
+	if (value["author"] !== undefined && value["result"] !== undefined) return normalizeResultRecord(value);
 	if (value["current"] !== undefined && value["currentRevision"] !== undefined) return parseTeamWorkView(value);
 	if (value["code"] !== undefined && value["createdAt"] !== undefined) return parseIncident(value);
 	return protocol("team reply data does not match a public Team data type");

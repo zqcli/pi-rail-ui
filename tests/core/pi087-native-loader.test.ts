@@ -39,6 +39,7 @@ import {
 
 const EXPECTED_TOOLS = ["apply-patch", "subagent_team", "subagent"];
 const EXPECTED_COMMANDS = [
+	"rail-team",
 	"rail-agent",
 	"rail-duplicate",
 	"rail-oai-compaction",
@@ -103,10 +104,14 @@ function assertParentTeamRegistration(observed: ObservedRegistrations): void {
 	assert.ok(observed.activeTools.includes("subagent_team"), "the Team parent tool must be active");
 	const team = observedTool(observed, "subagent_team");
 	assert.deepEqual(observedEnum(team, "action"), ["prepare", "launch", "status", "cancel"]);
-	assert.ok(Object.hasOwn(team.parameters["properties"], "coordinator"));
-	assert.ok(Object.hasOwn(team.parameters["properties"], "workers"));
+	for (const property of ["teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds", "reason"]) {
+		assert.ok(Object.hasOwn(team.parameters["properties"], property), `subagent_team.${property} must be registered`);
+	}
+	assert.equal(Object.hasOwn(team.parameters["properties"], "coordinator"), false, "the retired v1 coordinator field is absent");
+	assert.equal(Object.hasOwn(team.parameters["properties"], "searchMode"), false, "Search remains host policy");
+	assert.equal(team.parameters["additionalProperties"], false, "Team actions reject unknown fields before projection");
 	assert.match(team.description, /\{"action":"launch","teamId":"<teamId>"\}/u);
-	assert.match(team.description, /Do not use the subagent tool for team members/u);
+	assert.match(team.description, /Manager assigns, reviews and closes; it does not write a final summary/u);
 }
 
 function assertBoundTeamHelper(observed: ObservedRegistrations): void {

@@ -6,12 +6,16 @@ import type { ResultRecord, TeamResult, WorkRef } from "./team-protocol";
  * history, not a recovery log: it never contains the whole ledger, gates, ACKs or private frames.
  */
 export type TeamJournalRecord =
-	| { version: 2; kind: "launched"; teamId: string; at: number }
+	| { version: 2; kind: "launched"; teamId: string; at: number; roster: { manager: string; workers: string[] }; goal: string }
+	| { version: 2; kind: "interrupted"; teamId: string; at: number; reason: string }
 	| { version: 2; kind: "result"; teamId: string; at: number; result: ResultRecord }
 	| { version: 2; kind: "decision"; teamId: string; at: number; decision: "revise_work" | "cancel_work"; work: WorkRef; reason?: string }
-	| { version: 2; kind: "close_decision"; teamId: string; at: number; closeId: string; outcome: "succeeded" | "partial" | "failed"; resultRefs: string[]; reason?: string }
+	| { version: 2; kind: "close_decision"; teamId: string; at: number; closeId: string; outcome: "succeeded" | "partial" | "failed"; resultRefs: string[]; roots: TeamResult["roots"]; reason?: string }
 	| { version: 2; kind: "grant"; teamId: string; at: number; grant: BudgetGrantRecord }
-	| { version: 2; kind: "terminal"; teamId: string; at: number; result: TeamResult };
+	| { version: 2; kind: "terminal"; teamId: string; at: number; closeId?: string; result: TeamResult };
+
+/** Session custom-entry type of v2 Team journal records (display-only history, never replayed). */
+export const TEAM_JOURNAL_ENTRY_TYPE = "rail-subagent-team-v2";
 
 /** A synchronous history writer (for example, the owning session's appendEntry). */
 export type TeamJournalSink = (record: TeamJournalRecord) => void;

@@ -180,6 +180,16 @@ export class TeamBudget {
 		return checked;
 	}
 
+	/** Independent copy for host previews; never shares counters with this budget. */
+	clone(): TeamBudget {
+		const copy = new TeamBudget({ ...this.limits });
+		Object.assign(copy.used, this.used);
+		copy.grants.push(...this.grants.map((grant) => structuredClone(grant)));
+		for (const [rootId, counters] of this.roots) copy.roots.set(rootId, { ...counters });
+		for (const [rootId, grants] of this.rootGrants) copy.rootGrants.set(rootId, { ...grants });
+		return copy;
+	}
+
 	rootView(rootId: string, rootChildren: number): TeamRootBudgetView {
 		return {
 			rootId,

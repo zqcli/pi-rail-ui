@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { TeamProtocolError, normalizeTeamAction, parseParentCommand } from "../../tools/subagents/team-codec";
 import { TEAM_MAX_BUDGET_GRANTS } from "../../tools/subagents/team-budget";
-import { TeamJournalGeneration, type TeamJournalRecord } from "../../tools/subagents/team-journal";
+import { TEAM_JOURNAL_ENTRY_TYPE, TeamJournalGeneration, type TeamJournalRecord } from "../../tools/subagents/team-journal";
+import { restoreTeamHistory } from "../../tools/subagents/team-history";
 import { TeamRuntime, type NativeCompletion, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 import {
 	TEAM_MAX_FRAME_BYTES, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_MAX_WORKERS, TEAM_STATUS_MAX_LIMIT,
@@ -461,8 +462,23 @@ test("journal: bounded critical facts only, written before publish, terminal wri
 	assert.equal(terminal.kind === "terminal" && terminal.result.lifecycle, "closed");
 	generation.deactivate();
 	assert.equal(generation.active, false);
-	assert.throws(() => generation.write({ version: 2, kind: "launched", teamId, at: 0 }), /inactive/);
+	assert.throws(() => generation.write({ version: 2, kind: "launched", teamId, at: 0,
+		roster: { manager: "lead", workers: ["w1", "w2"] }, goal: "journaled" }), /inactive/);
 	runtime.assertInvariants(teamId);
+});
+
+test("actual Runtime terminal journal records round-trip through the strict history codec", () => {
+	const { records, generation } = journal();
+	const { runtime, teamId } = makeRuntime({ initialRequests: [{ to: "w1", task: "journaled round trip" }], journal: generation });
+	closeSucceeded(runtime, teamId);
+	const restored = restoreTeamHistory(records.map((record) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: record })));
+	assert.equal(restored.skipped, 0);
+	assert.equal(restored.teams.length, 1);
+	const [entry] = restored.teams;
+	assert.equal(entry?.lifecycle, "closed");
+	assert.equal(entry?.outcome, "succeeded");
+	assert.equal(entry?.results.length, 1);
+	assert.deepEqual(entry?.results[0], runtime.getResult(teamId, runtime.getTeamResult(teamId)!.finalResultRefs[0]!));
 });
 
 test("journal: a lost terminal write reports the Team as failed, never as a clean close", () => {

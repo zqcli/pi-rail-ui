@@ -88,42 +88,25 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 #### 协作 Team（按需启用）
 
-普通 subagent 模式保持不变。Team 固定为 **1 个协调者 A + 1–8 个 worker B**，所有成员都必须使用**全新且唯一的 persistent alias**，并提供具体任务。Team dispatch 不支持 stateless、已有 `target`、session adopt、`chain` 或父级 `control` 模式；child 仍不能递归派发 subagent。
-
-Team 通过**在相邻两条消息中各调用一次 `subagent_team`** 来运行。第一步 `prepare` 提交完整计划：每个成员是一个对象，包含 `alias` 和 `task`，以及可选的 `model`、`fastMode`、`cwd`（`null` 表示默认值）。不要传 `teamId`，它由 prepare 生成：
+当前入口是 `subagent_team` 的 **prepare → launch**：一个 Manager 加 1–8 个 worker，成员使用全新且唯一的 persistent alias。`prepare` 接收 Manager/worker 的 `alias` 与 `roleDescription`、共享 `brief.goal`，以及可选的 `initialRequests`；只验证并固定模型、cwd、Fast/Search 和 contextWindow/compaction reserve 策略，不启动 provider 或工具。策略在 launch 前会再次核对；模型、项目 trust 或 compaction 设置发生变化时，launch 会拒绝并保留 prepared Team，需重新检查后重试。
 
 ```json
-{"action":"prepare","coordinator":{"alias":"A","task":"协调 B1/B2 的只读审查。用 team finish 等待全部 worker 结果，再总结发现与失败。"},"workers":[{"alias":"B1","task":"只读审查实现正确性，不修改文件，向 A 报告发现。","model":"cus-resp/gpt-6-luna:max","fastMode":true},{"alias":"B2","task":"只读审查测试覆盖，不修改文件，向 A 报告发现。","model":null,"fastMode":null,"cwd":null}]}
+{"action":"prepare","manager":{"alias":"lead","roleDescription":"协调审查并验收结果"},"workers":[{"alias":"impl-review","roleDescription":"审查实现正确性，不修改文件"},{"alias":"test-review","roleDescription":"审查回归覆盖，不修改文件"}],"brief":{"goal":"审查当前变更","acceptanceCriteria":["报告证据与限制"]},"initialRequests":[{"to":"impl-review","task":"检查实现与调用方"}],"timeoutSeconds":null}
 ```
 
-prepare 不启动任何成员。它会校验每个成员的模型、Fast 是否可用、cwd，以及 alias 是否为新名称，并列出解析后的计划。被拒绝时，错误会指出具体成员和字段，修正后重新 prepare 即可。解析出的模型和 cwd 会被固定，之后父会话切换模型也不会改变实际启动的内容。下一条消息只需带上返回的 id 启动：
+然后以返回的 `teamId` 启动，launch 持有整个 Team lifetime，直到 Manager 结束 Team 才返回：
 
 ```json
 {"action":"launch","teamId":"<teamId>"}
 ```
 
-launch 由宿主同时启动协调者和全部 worker，显示在同一个 Tool Call 面板里，等协调者拿到所有 worker 结果并完成后返回。launch 的其他字段必须为空或 `null`：计划在 prepare 时已经确定，要修改就先 cancel 再重新 prepare。不要用 `subagent` 工具启动 team 成员，带计划的 team 会拒绝这种调用。（为了兼容，`coordinator`/`workers` 仍可写成 alias 字符串，此时沿用旧流程：两个带 `teamId` 的配对 `subagent` 调用。）
+中止 launch 的等待不会暗示取消 Team：工具返回明确错误，Team 仍由宿主管理，可用 `/rail-team <teamId> status` 检查或显式 cancel。不要用普通 `subagent` 工具启动 Team 成员。
 
-Child 使用 `team` tool；发送者和所属 team 由运行时确定，不作为参数传入：
+`/rail-team` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、resume、grant 和 cancel。模型工具 `subagent_team status` 也以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。完整历史只读，跨 session branch 不恢复旧 Promise 或继续运行。
 
-| Action | 参数示例 / 含义 |
-| --- | --- |
-| `send` | `{"action":"send","to":"B2","message":"请检查错误路径。"}`：向队友发消息。 |
-| `report` | `{"action":"report","to":null,"message":"遇到阻碍，需要明确范围。","wait":{"kind":"message"}}`：向 A 报告并原子地等待回复；省略 `wait` 则只报告。`to` 默认省略/null，也可显式填写当前协调者的实际 alias，但不能指向其他成员。 |
-| `wait` | `{"action":"wait","wait":{"kind":"member","member":"B2"}}`：等指定成员的终态结果。`{"kind":"message"}` 等 inbox 消息；仅 A 可用 `{"kind":"workers"}` 等全部 worker 结果。 |
-| `control` | 仅 A：`{"action":"control","to":"B1","command":"pause"}`；`resume` 解除暂停。`redirect` 还必须提供 `message`，用新指令替换 pending wait，但不会解除显式暂停或撤销已有操作。`cancel`（`message` 可选，作为原因）只以 `cancelled` 结束该 worker，不取消整个 team。 |
-| `finish` | `{"action":"finish"}`：表达完成意图，不等于终态结果。A 会等全部 worker；worker 仍需输出最终答复。 |
+在 `/rail-agent` 面板选中成员后按 `s` 停止、按 `x` 删除。对 Team worker，Stop 只停止该成员，并将其运行中 work 记录为 outcome unknown；同 Team 其他 worker/root 与无关 Team 不会被一并取消。停止 Manager 会标记 `MANAGER_UNAVAILABLE` 并暂停 worker，Team 保持可由宿主管理。Delete 只有在成员原生进程实际退出得到确认后才删除 session 与 descriptor；退出未知时保留资源所有权并拒绝删除。
 
-**`wait`、带 `wait` 的 `report`、`finish` 都必须是该 assistant 批次唯一的 tool call**，不能与其他工具并发发出。使用事件等待，不要轮询；自等待、未知成员和依赖环会被拒绝；有 worker 处于暂停时，A 不能 `finish` 或等待全部 worker，须先 resume 或 cancel。`report` 返回参数错误表示报告尚未发出，应根据错误修正并重试，不能跳过必需报告直接 `wait`，否则协调者可能还在等待你的报告。
-
-- 如果所有未结束成员都在等待一件没人能提供的事（例如互相按发送者过滤等待），Hub 会在短暂宽限后向 A 发出一次 `team_stalled` 错误，且不受发送者过滤限制；A 在没有任何变化的情况下再次等待，team 会以该原因失败，而不是空等到截止时间。收件人结束时仍有未读的排队消息，发送方和 A 会收到 `undelivered` 通知。
-
-- 调度默认允许 **4 个 active worker permit，A 独立准入**。等待或暂停的 worker 释放 permit，但保留 session；cooperative wait/pause 都不会结束外层父 Tool Call。运行中的成员先显示 `PAUSE REQUESTED`，到安全点后才是 `PAUSED`；已在途的模型请求、工具或 compaction 可能继续完成，不是立即冻结进程，也不回滚操作。`redirect` 的方向在下一个原生 context gate 进入模型；恢复时不会重写已经生成的请求 payload 或工具参数。
-- 自动送达的协作数据会通过 Pi 原生 custom message 保留，不只出现在一次临时 context 中。原生 compaction 负责已总结的历史：压缩后只按当前绑定恢复精简 roster（brief 与 assignments）以及原生上下文本应保留却缺失的 delivery，窗口最多 64 条／1 MiB，不会因此额外触发模型轮次。wait 与 control 回复只带精简的当前状态（状态、指令版本、结果/错误预览）；完整结果只在等待特定成员时给该成员，或在 A 的屏障处给全部 worker。历史快照描述的是其记录 seq 时的状态，应以最新 seq 和 control 返回的权威快照判断。`redirect` 不解除暂停，仍须显式 `resume`。
-- A 必须等每个 worker 都有 native 终态结果（含失败）后才生成最终总结，不能把 `report` 或 `finish` 自述当作完成。屏障之后再调用 `send`／`report`／`control`／其他 wait 会作为可修正的工具错误返回，重复的屏障返回同一份结果。A 提前结束时，父调用仍保持 pending，随后以全部 worker 结果执行最终总结续轮；若此时 team 已卡住，A 先获得一轮来解除阻塞。worker 生成最终回答期间收到 redirect，会获得一次续轮处理新指令，而不是被判失败。单个 worker 失败通常不阻止其余 worker 完成；A 失败或取消会停止 team，不能保证成功总结。
-- Team deadline 默认**从 prepare 起 1 小时**（`timeoutSeconds` 为正数，最多 `86400`）。未指定时使用 `null`／省略，不要为代码审查或高思考级别模型自行设置 120／180 秒限制；它覆盖启动、思考、工具执行、等待及最终总结，不是单次工具超时。显式设置的短期限仍会被尊重。launch 会一次性让全员入队；只有旧的配对调用流程才要求全员在**首次 join 后 30 秒内**加入。父调用失败结果及状态会保留真实取消原因，而不只显示 RPC 停止。查看状态：`subagent_team` 参数 `{"action":"status","teamId":"<teamId>"}`，省略 id 列出所有 team；取消：`{"action":"cancel","teamId":"<teamId>","reason":"停止此次审查"}`。中止 launch 调用（旧流程中为任一父 dispatch）会取消 team。Reload 后未完成历史标为 `interrupted`，不恢复旧 Promise，也不自动续跑。失败后请重新 prepare：已启动的成员保留 persistent alias 与 session 供排查，需换用新 alias；从未通过 team 门控的成员会被清理，其 alias 可以复用。
-- 状态显示在既有 Tool Call 输出/面板中，不是新的独立 GUI overlay。Inbox、历史与总结快照都有上限：每个父 session 最多保留 32 个 team（新建时淘汰最旧的已结束 team；32 个活动 team 时拒绝），单条消息最多 8 KiB；收件箱溢出会报错，旧事件历史可能丢弃；父 session 的 journal 只记录里程碑（入队、成员结果、阶段）及最近 16 条事件，reload 时跳过损坏或超额的历史而不影响 subagent 功能；总结快照内每个 worker 输出最多保留 16 KiB 并显式标记截断。大产物写入文件，消息中提供路径与简要结论，不把消息或 summary 当作完整 transcript。死锁检测、上下文成本与 journal 的变更见 [Team 审查问题修复](docs/subagent-team-review-fixes.md)。
-- 本地真实 Pi RPC + 合成 provider 测试用于验证协作和结束行为，**不等于真实外网模型的决策质量验证**。
+Team v2 的本地 Runtime、真实 Pi RPC 合成 provider、Broker lifecycle 与 branch-hook 定向用例位于 `tests/subagent/team-*.test.ts`。这些检查不代表文档中旧 v1 inbox/wait 行为仍受支持，也不构成完整 100 场景发布验收；真实外网模型的决策质量未由合成测试验证。
 
 ## 测试
 
@@ -144,7 +127,7 @@ agent_dir=$(mktemp -d)
 PI_CODING_AGENT_DIR="$agent_dir" PI_OFFLINE=1 PI_TELEMETRY=0 npm run check
 ```
 
-测试使用本地 mock provider 和仓库内的 Pi bundle，不调用付费模型。共享运行时当前版本见 [Pi 0.87.1 兼容报告](docs/pi-0.87.1-compatibility.md)与 [Pi 0.87.0 迁移记录](docs/pi-0.87.0-migration.md)。当前 Team 专属验收见 [Team Pi 0.87.1 适配报告](docs/subagent-team-pi-0.87.1.md)；[Team Pi 0.86.0 报告](docs/subagent-team-pi-0.86.0.md)保留为历史记录。
+测试使用本地 mock provider 和仓库内的 Pi bundle，不调用付费模型。共享运行时当前版本见 [Pi 0.87.1 兼容报告](docs/pi-0.87.1-compatibility.md)与 [Pi 0.87.0 迁移记录](docs/pi-0.87.0-migration.md)。[Team Pi 0.87.1](docs/subagent-team-pi-0.87.1.md) 和 [Team Pi 0.86.0](docs/subagent-team-pi-0.86.0.md) 报告是对应历史阶段的记录，不代表当前 Team 已完成 100 场景/I01–I30 整体验收。
 
 ## 命令
 

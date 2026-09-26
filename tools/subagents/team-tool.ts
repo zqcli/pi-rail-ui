@@ -1,333 +1,474 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, Text } from "@earendil-works/pi-tui";
+import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
-import type { TeamHub } from "./team-hub";
+import type { SessionBroker } from "./session-broker";
+import { normalizeTeamPlan, previewText } from "./team-codec";
+import type { TeamHistoryEntry } from "./team-history";
+import type { TeamSessionHost } from "./team-host";
+import { TeamLaunchError } from "./team-member-driver";
 import {
-	isTeamBrief, TEAM_HISTORY_TYPE, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_MEMBERS, TEAM_MAX_MESSAGE_BYTES, TEAM_MAX_RESULT_ITEMS,
-	TEAM_MAX_TEXT_BYTES, TEAM_MAX_WORKERS, type TeamBrief, type TeamSnapshot,
-} from "./team-protocol-v1";
-import {
-	deleteTeamLaunchPlan, setTeamLaunchPlan, teamDispatchTemplate, teamLaunchPlan, teamStatus,
-	type TeamLaunchPlan, type TeamMemberPlan,
-} from "./team-runner";
-import type { TeamLauncher, TeamPlanSummary } from "./tool";
+	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
+	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary,
+} from "./team-protocol";
+import { resolveTeamMemberPolicy, verifyPinnedTeamMemberPolicy, type ResolvedTeamMemberPolicy } from "./tool";
+
+const MAX_RESULT_SUMMARY_BYTES = 2 * 1024;
+const MAX_FINAL_TEXT_BYTES = 48 * 1024;
+const UPDATE_INTERVAL_MS = 250;
+const LIVE_LIFECYCLES = ["prepared", "active", "closing"];
 
 function nullable(schema: TSchema) {
 	return Type.Optional(Type.Union([schema, Type.Null()]));
 }
 
-// Character limits match the shared UTF-8 byte validator; byte limits are enforced after normalization.
-const BriefText = (description?: string) => Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_BYTES, ...(description ? { description } : {}) });
-const BriefList = () => Type.Array(BriefText(), { maxItems: TEAM_MAX_RESULT_ITEMS });
-const BriefSchema = Type.Object({
-	goal: BriefText("Shared team goal"),
-	target: nullable(Type.String({ maxLength: TEAM_MAX_TEXT_BYTES, description: "Target URL, repository, system, or business scope" })),
-	acceptanceCriteria: nullable(BriefList()),
-	constraints: nullable(BriefList()),
-	authorizations: nullable(Type.Array(Type.Object({
-		member: Type.String({ minLength: 1, maxLength: 64 }),
-		allowed: BriefList(),
-		forbidden: nullable(BriefList()),
-	}, { additionalProperties: false }), { maxItems: TEAM_MAX_MEMBERS })),
-}, { additionalProperties: false, description: `At most ${TEAM_MAX_BRIEF_BYTES} serialized UTF-8 bytes in total.` });
-
-// A member is fully described at prepare, so launch needs nothing but the teamId.
-const MemberPlanSchema = Type.Object({
+const MemberSchema = Type.Object({
 	alias: Type.String({ minLength: 1, maxLength: 64, description: "New persistent alias for this member" }),
-	task: Type.String({ minLength: 1, description: "Concrete self-contained task for this member" }),
+	roleDescription: Type.String({ minLength: 1, maxLength: TEAM_MAX_ROLE_BYTES, description: "Standing role and responsibilities; not a task" }),
 	model: nullable(Type.String({ description: "Pi model reference such as provider/model:thinking; null uses the current model" })),
-	fastMode: nullable(Type.Boolean({ description: "true enables native Fast for an eligible GPT model; null means off" })),
 	cwd: nullable(Type.String({ description: "Working directory; null uses the parent cwd" })),
+	fastMode: nullable(Type.Boolean({ description: "true enables native Fast for an eligible GPT model; null means off" })),
+	contextWindow: nullable(Type.Number({ description: "Child context budget; null uses the model default. Only when the user asks for one." })),
 }, { additionalProperties: false });
 
-function normalizeMember(value: unknown, field: string): TeamMemberPlan {
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} must be an object {alias, task, model?, fastMode?, cwd?}`);
-	const input = value as Record<string, unknown>;
-	const unknown = Object.keys(input).filter((key) => !["alias", "task", "model", "fastMode", "cwd"].includes(key));
-	if (unknown.length) throw new Error(`${field} has unsupported field(s) ${unknown.join(", ")}; a member plan only has alias, task, model, fastMode and cwd`);
-	const text = (key: string): string | undefined => {
-		const raw = input[key];
-		if (raw == null) return undefined;
-		if (typeof raw !== "string") throw new Error(`${field}.${key} must be a string or null`);
-		return raw.trim() || undefined;
-	};
-	const alias = text("alias");
-	const task = text("task");
-	if (!alias) throw new Error(`${field}.alias is required`);
-	if (!task) throw new Error(`${field}.task is required: give ${alias} a concrete self-contained task`);
-	if (Buffer.byteLength(task, "utf8") > TEAM_MAX_MESSAGE_BYTES) throw new Error(`${field}.task exceeds ${TEAM_MAX_MESSAGE_BYTES} UTF-8 bytes`);
-	if (input["fastMode"] != null && typeof input["fastMode"] !== "boolean") throw new Error(`${field}.fastMode must be a boolean or null`);
-	const model = text("model");
-	const cwd = text("cwd");
-	return {
-		alias, task,
-		...(model ? { model } : {}),
-		...(typeof input["fastMode"] === "boolean" ? { fastMode: input["fastMode"] } : {}),
-		...(cwd ? { cwd } : {}),
-	};
+const TextList = () => nullable(Type.Array(Type.String({ minLength: 1 }), { maxItems: 32 }));
+const BriefSchema = Type.Object({
+	goal: Type.String({ minLength: 1, description: "Shared Team goal" }),
+	target: nullable(Type.String({ description: "Target URL, repository, system, or business scope" })),
+	acceptanceCriteria: TextList(),
+	constraints: TextList(),
+	authorizations: nullable(Type.Array(Type.Object({
+		member: Type.String({ minLength: 1, maxLength: 64 }),
+		allowed: Type.Array(Type.String({ minLength: 1 }), { maxItems: 32 }),
+		forbidden: TextList(),
+	}, { additionalProperties: false }), { maxItems: TEAM_MAX_WORKERS + 1 })),
+}, { additionalProperties: false });
+
+const InitialRequestSchema = Type.Object({
+	to: Type.String({ minLength: 1, maxLength: 64, description: "A worker alias" }),
+	task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES, description: "Self-contained initial work for that worker" }),
+	inputRefs: nullable(Type.Array(Type.String(), { maxItems: 0 })),
+}, { additionalProperties: false });
+
+type Params = {
+	action: "prepare" | "launch" | "status" | "cancel";
+	teamId?: string | null;
+	manager?: unknown;
+	workers?: unknown;
+	brief?: unknown;
+	initialRequests?: unknown;
+	timeoutSeconds?: number | null;
+	reason?: string | null;
+	cursor?: string | null;
+	resultRef?: string | null;
+};
+
+type TeamResultRefSummary = { id: string; work: { workId: string; revision: number }; author: string; status: "succeeded" | "partial" | "failed"; summaryPreview: string };
+type TeamResultRefPage = { items: TeamResultRefSummary[]; cursor?: string; hasMore: boolean; total: number };
+
+export interface TeamToolDetails {
+	view?: TeamTeamView;
+	works?: TeamWorkSummary[];
+	resultRecord?: ResultRecord;
+	resultPage?: TeamResultRefPage;
+	holdsTotal?: number;
 }
 
-/** Returns the launch plan, or undefined for the legacy alias-only form that is dispatched with paired subagent calls. */
-function normalizePlan(coordinator: unknown, workers: unknown): { aliases: { coordinator: string; workers: string[] }; plan?: TeamLaunchPlan } {
-	if (!Array.isArray(workers)) throw new Error("prepare requires coordinator and workers");
-	if (typeof coordinator === "string" && workers.every((worker) => typeof worker === "string")) {
-		return { aliases: { coordinator, workers: workers as string[] } };
+export class TeamLaunchWaitAbortedError extends Error {
+	readonly code = "TEAM_LAUNCH_WAIT_ABORTED";
+	constructor(readonly teamId: string, readonly lifecycle: TeamTeamView["lifecycle"]) {
+		super(`Launch stopped waiting for Team ${teamId} after an abort signal. The Team was not cancelled; current lifecycle is ${lifecycle}. It remains host-managed: inspect or cancel it with /rail-team ${teamId} status|cancel.`);
+		this.name = "TeamLaunchWaitAbortedError";
 	}
-	if (typeof coordinator === "string" || workers.some((worker) => typeof worker === "string")) {
-		throw new Error("Give every member as an object {alias, task, model?, fastMode?, cwd?}; do not mix alias strings and member objects");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bounded text views shared by the tool panel, tool results and /rail-team.
+
+const upper = (value: string) => value.replaceAll("_", " ").toUpperCase();
+const limit = (used: number, max: number) => `${used}/${max}`;
+
+export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSummary[] = [], totalHolds = works.filter((work) => work.hold).length): string[] {
+	const openIncidents = view.incidents.filter((incident) => incident.state === "open");
+	const health = view.health === "needs_attention" ? `needs attention ${openIncidents.length}` : "ok";
+	const lines = [
+		`Team ${view.teamId} · ${upper(view.lifecycle)} · ${health}${view.outcome ? ` · outcome ${view.outcome}` : ""}`,
+		`Goal: ${previewText(view.brief.goal, 240)}`,
+	];
+	if (view.reason) lines.push(`Reason: ${previewText(view.reason, 400)}`);
+	const w = view.works;
+	lines.push(`Works: ${w.total} total · queued ${w.queued} · running ${w.running} · blocked ${w.blocked} · held ${w.held} · resolved ${w.resolved} · failed ${w.failed} · cancelled ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`);
+	const width = Math.max(...view.members.map((member) => member.id.length));
+	for (const member of view.members) {
+		// Idle is a live state, never "done": say what the member is waiting on instead.
+		const activity = member.activity === "idle" && !member.currentWork && member.queued + member.blocked + member.held === 0
+			? "IDLE · no assigned work"
+			: `${upper(member.activity)}${member.currentWork ? ` ${workRefKey(member.currentWork)}` : ""} · queued ${member.queued} · blocked ${member.blocked} · held ${member.held}`;
+		const pause = member.pause === "none" ? "" : ` · pause ${member.pause}`;
+		const policy = `${member.policy.model ?? "model ?"} · FAST ${member.policy.fastMode ? "on" : "off"} · SEARCH ${member.policy.searchMode ?? "off"}`;
+		const error = member.error ? ` · ${member.error.code}: ${previewText(member.error.message, 160)}` : "";
+		lines.push(`${member.id.padEnd(width)} ${member.role === "manager" ? "manager" : "worker "} · ${upper(member.lifecycle)} · ${activity}${pause} · ${policy}${error}`);
 	}
-	if (workers.length < 1 || workers.length > TEAM_MAX_WORKERS) throw new Error(`workers must list 1–${TEAM_MAX_WORKERS} members`);
-	const plan: TeamLaunchPlan = {
-		coordinator: normalizeMember(coordinator, "coordinator"),
-		workers: workers.map((worker, index) => normalizeMember(worker, `workers[${index}]`)),
+	const holds = works.filter((work) => work.hold);
+	if (holds.length) {
+		lines.push(`Holds: ${holds.slice(0, 8).map((work) => `${workRefKey(work.work)} ${work.hold} (${work.assignee})`).join(" · ")}${totalHolds > holds.length ? ` · +${totalHolds - holds.length} more` : ""}`);
+	}
+	for (const incident of openIncidents.slice(0, 5)) {
+		lines.push(`Incident ${incident.id} [${incident.code}]${incident.work ? ` ${workRefKey(incident.work)}` : ""}: ${previewText(incident.message, 200)}`);
+	}
+	if (openIncidents.length > 5) lines.push(`+${openIncidents.length - 5} more open incidents`);
+	const { limits, used } = view.budget;
+	lines.push(`Budget${view.budget.exhausted ? " EXHAUSTED" : ""}: activations ${limit(used.teamActivations, limits.teamActivations)} · manager ${limit(used.managerActivations, limits.managerActivations)} · model requests ${limit(used.teamModelRequests, limits.teamModelRequests)} · tool calls ${limit(used.teamToolCalls, limits.teamToolCalls)} · works ${limit(used.teamWorks, limits.teamWorks)}${view.budget.rootsOmitted ? ` · ${view.budget.rootsOmitted} roots omitted (see /rail-team ${view.teamId} budget)` : ""}`);
+	const usage = view.usage;
+	lines.push(`Usage: ${usage.turns} turns · input ${usage.input} · output ${usage.output} · cache ${usage.cacheRead}/${usage.cacheWrite} · cost ${usage.cost.toFixed(4)}`);
+	return lines;
+}
+
+export function formatHistorySummary(entry: TeamHistoryEntry): string {
+	const roster = entry.manager ? ` · manager ${entry.manager} · workers ${entry.workers.join(", ") || "none"}` : "";
+	return `${entry.teamId} · ${upper(entry.lifecycle)}${entry.outcome ? ` · outcome ${entry.outcome}` : ""}${entry.version === 1 ? " · legacy v1 (read-only)" : " · history (read-only)"}${roster} · ${entry.results.length} results`;
+}
+
+export function formatHistoryEntry(entry: TeamHistoryEntry, cursor?: string): string {
+	const offset = resultPageOffset(cursor);
+	const items = entry.results.slice(offset, offset + 20);
+	const lines = [formatHistorySummary(entry)];
+	for (const record of items) lines.push(`  ${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}: ${previewText(record.result.summary, 512)}`);
+	const next = offset + items.length;
+	if (next < entry.results.length) lines.push(`Next result refs: /rail-team ${entry.teamId} results page:${next}`);
+	if (offset > 0 && items.length === 0) throw new Error(`Result page ${cursor} is past the end for Team ${entry.teamId}`);
+	return lines.join("\n");
+}
+
+function resultPageOffset(cursor?: string | null): number {
+	if (!cursor) return 0;
+	const match = /^page:(0|[1-9][0-9]*)$/u.exec(cursor);
+	const offset = match ? Number(match[1]) : NaN;
+	if (!Number.isSafeInteger(offset)) throw new Error(`Invalid result page cursor ${cursor}`);
+	return offset;
+}
+
+function formatResultRecord(record: ResultRecord): string {
+	return [
+		`${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`,
+		record.result.summary,
+		...(record.result.findings?.length ? ["Findings:", ...record.result.findings.map((item) => `- ${item}`)] : []),
+		...(record.result.evidence?.length ? ["Evidence:", ...record.result.evidence.map((item) => `- ${item.basis}: ${item.source}${item.locator ? ` (${item.locator})` : ""}`)] : []),
+		...(record.result.limitations?.length ? ["Limitations:", ...record.result.limitations.map((item) => `- ${item}`)] : []),
+		...(record.result.artifacts?.length ? ["Artifacts:", ...record.result.artifacts.map((item) => `- ${item}`)] : []),
+	].join("\n");
+}
+
+function formatResultRefPage(page: TeamResultRefPage): string[] {
+	const lines = [`Result refs ${page.items.length ? `${page.items[0]!.id}…${page.items.at(-1)!.id}` : "(empty)"} · ${page.total} total`];
+	for (const item of page.items) lines.push(`  ${item.id} · ${item.author} · ${workRefKey(item.work)} · ${item.status}: ${previewText(item.summaryPreview, 240)}`);
+	if (page.cursor) lines.push(`Next page cursor: ${page.cursor}`);
+	return lines;
+}
+
+function hasPayload(value: unknown): boolean {
+	return value !== undefined && value !== null && !(Array.isArray(value) && value.length === 0)
+		&& !(typeof value === "string" && value.trim() === "");
+}
+
+/** Enforce the action whitelist before projecting parameters into the shared plan codec. */
+function assertActionParams(params: Params, action: Params["action"]): void {
+	const known = ["action", "teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds", "reason", "cursor", "resultRef"];
+	const unknown = Object.keys(params).filter((key) => !known.includes(key));
+	if (unknown.length) throw new Error(`${action} contains unsupported field(s): ${unknown.join(", ")}`);
+	const allowed: Record<Params["action"], readonly string[]> = {
+		prepare: ["action", "teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds"],
+		launch: ["action", "teamId"],
+		status: ["action", "teamId", "cursor", "resultRef"],
+		cancel: ["action", "teamId", "reason"],
 	};
-	return { aliases: { coordinator: plan.coordinator.alias, workers: plan.workers.map((worker) => worker.alias) }, plan };
+	const extra = Object.keys(params).filter((key) => !allowed[action].includes(key) && hasPayload((params as Record<string, unknown>)[key]));
+	if (extra.length) throw new Error(`${action} does not accept field(s): ${extra.join(", ")}`);
 }
 
-function planLines(summaries: readonly TeamPlanSummary[] | undefined, plan: TeamLaunchPlan): string[] {
-	return [plan.coordinator, ...plan.workers].map((member, index) => {
-		const summary = summaries?.[index];
-		const policy = summary ? ` · ${summary.model} · FAST ${summary.fastMode ? "on" : "off"} · SEARCH ${summary.searchMode}` : member.model ? ` · ${member.model}` : "";
-		return `- ${member.alias} (${index === 0 ? "coordinator" : "worker"})${policy} · task: ${previewText(member.task, 200)}`;
-	});
+/** Bounded final text: TeamResult facts plus the Manager-selected results, attributed to author and WorkRef. */
+function finalTeamText(host: TeamSessionHost, result: TeamResult): string {
+	const lines = [
+		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""}${result.reason ? ` · ${previewText(result.reason, 400)}` : ""}`,
+		`Roots: ${result.roots.map((root) => `${workRefKey(root.work)} ${root.state}${root.review ? ` (${root.review.disposition})` : ""}`).join(" · ") || "none"}`,
+		`Members: ${result.members.map((member) => `${member.id} ${member.lifecycle}/${member.resourceState}`).join(" · ")}`,
+		`Usage: ${result.usage.turns} turns · input ${result.usage.input} · output ${result.usage.output} · cost ${result.usage.cost.toFixed(4)}`,
+	];
+	for (const incident of result.unresolvedIncidents.slice(0, 5)) lines.push(`Unresolved ${incident.code}: ${previewText(incident.message, 200)}`);
+	if (result.unresolvedIncidentsOmitted) lines.push(`${result.unresolvedIncidentsOmitted} additional unresolved incidents omitted from the bounded terminal snapshot.`);
+	if (result.finalResultRefs.length) lines.push("", "Selected results (worker-authored; the Manager does not rewrite them):");
+	let bytes = Buffer.byteLength(lines.join("\n"), "utf8");
+	for (const ref of result.finalResultRefs) {
+		let record;
+		try { record = host.runtime.getResult(result.teamId, ref); } catch { record = undefined; }
+		const block = record
+			? [`### ${ref} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`,
+				previewText(record.result.summary, MAX_RESULT_SUMMARY_BYTES),
+				...(record.result.artifacts?.length ? [`Artifacts: ${record.result.artifacts.slice(0, 8).map((item) => previewText(item, 200)).join(" · ")}`] : []),
+				...(record.result.limitations?.length ? [`Limitations: ${record.result.limitations.length}`] : [])].join("\n")
+			: `### ${ref} · result not retained in this runtime`;
+		const size = Buffer.byteLength(block, "utf8") + 2;
+		if (bytes + size > MAX_FINAL_TEXT_BYTES) {
+			lines.push(`[${result.finalResultRefs.length - result.finalResultRefs.indexOf(ref)} selected results omitted for size; use subagent_team status]`);
+			break;
+		}
+		lines.push("", block);
+		bytes += size;
+	}
+	return lines.join("\n");
 }
 
-function normalizeList(value: unknown, field: string): string[] | undefined {
-	if (value == null) return undefined;
-	if (!Array.isArray(value)) throw new Error(`brief.${field} must be an array or null`);
-	if (value.length > TEAM_MAX_RESULT_ITEMS) throw new Error(`brief.${field} supports at most ${TEAM_MAX_RESULT_ITEMS} entries`);
-	return value.map((item, index) => {
-		if (typeof item !== "string" || !item.trim() || Buffer.byteLength(item, "utf8") > TEAM_MAX_TEXT_BYTES) throw new Error(`brief.${field}[${index}] must be a non-empty string no larger than ${TEAM_MAX_TEXT_BYTES} UTF-8 bytes`);
-		return item.trim();
-	});
+function textResult(text: string, details: TeamToolDetails): AgentToolResult<TeamToolDetails> {
+	return { content: [{ type: "text", text }], details };
 }
 
-function normalizeBrief(value: unknown, members: readonly string[]): TeamBrief | undefined {
-	if (value == null) return undefined;
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("brief must be an object or null");
-	const input = value as Record<string, unknown>;
-	if (Object.keys(input).some((key) => !["goal", "target", "acceptanceCriteria", "constraints", "authorizations"].includes(key))) throw new Error("brief contains an unknown field");
-	if (typeof input["goal"] !== "string" || !input["goal"].trim() || Buffer.byteLength(input["goal"], "utf8") > TEAM_MAX_TEXT_BYTES) throw new Error(`brief.goal is required and must be no larger than ${TEAM_MAX_TEXT_BYTES} UTF-8 bytes`);
-	const target = input["target"] == null ? undefined : typeof input["target"] === "string" ? input["target"].trim() : undefined;
-	if (input["target"] != null && typeof input["target"] !== "string") throw new Error("brief.target must be a string or null");
-	if (target && Buffer.byteLength(target, "utf8") > TEAM_MAX_TEXT_BYTES) throw new Error(`brief.target exceeds ${TEAM_MAX_TEXT_BYTES} UTF-8 bytes`);
-	let authorizations: TeamBrief["authorizations"];
-	if (input["authorizations"] != null) {
-		if (!Array.isArray(input["authorizations"])) throw new Error("brief.authorizations must be an array or null");
-		if (input["authorizations"].length > TEAM_MAX_MEMBERS) throw new Error(`brief.authorizations supports at most ${TEAM_MAX_MEMBERS} members`);
-		const seen = new Set<string>();
-		authorizations = input["authorizations"].map((raw, index) => {
-			if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`brief.authorizations[${index}] must be an object`);
-			const item = raw as Record<string, unknown>;
-			if (Object.keys(item).some((key) => !["member", "allowed", "forbidden"].includes(key))) throw new Error(`brief.authorizations[${index}] contains an unknown field`);
-			if (typeof item["member"] !== "string" || !item["member"].trim() || !members.includes(item["member"].trim())) {
-				throw new Error(`brief.authorizations[${index}].member must name a team member`);
-			}
-			const member = item["member"].trim();
-			if (seen.has(member)) throw new Error(`brief.authorizations contains duplicate member ${member}`);
-			seen.add(member);
-			const allowed = normalizeList(item["allowed"], `authorizations[${index}].allowed`);
-			if (!allowed) throw new Error(`brief.authorizations[${index}].allowed is required`);
-			const forbidden = normalizeList(item["forbidden"], `authorizations[${index}].forbidden`);
-			return { member, allowed, ...(forbidden ? { forbidden } : {}) };
+function liveView(host: TeamSessionHost, teamId: string): { view: TeamTeamView; works: TeamWorkSummary[]; holdsTotal: number } {
+	const held = host.runtime.listWorks(teamId).filter((work) => work.hold);
+	return { view: host.runtime.getTeam(teamId), works: held.slice(0, 8), holdsTotal: held.length };
+}
+
+// ---------------------------------------------------------------------------------------------
+
+export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessionHost; broker: () => SessionBroker }): void {
+	const prepare = async (params: Params, ctx: ExtensionContext): Promise<AgentToolResult<TeamToolDetails>> => {
+		assertActionParams(params, "prepare");
+		const host = deps.host();
+		if (!host.active) throw new Error("The Team runtime for this session branch has ended; nothing was prepared");
+		if (params.teamId?.trim()) throw new Error("prepare creates a new Team and does not accept teamId");
+		const raw: Record<string, unknown> = {};
+		for (const key of ["manager", "workers", "brief", "initialRequests", "timeoutSeconds"] as const) {
+			if (params[key] !== undefined) raw[key] = params[key];
+		}
+		const plan = normalizeTeamPlan(raw);
+		const members = [plan.manager, ...plan.workers];
+		const resolved = new Map<string, ResolvedTeamMemberPolicy>();
+		for (const member of members) {
+			try { resolved.set(member.alias, await resolveTeamMemberPolicy(member.policy, ctx)); }
+			catch (error) { throw new Error(`${member.alias}: ${error instanceof Error ? error.message : String(error)}`); }
+		}
+		const aliases = members.map((member) => member.alias);
+		const liveOwners = host.runtime.listTeams().filter((team) => LIVE_LIFECYCLES.includes(team.lifecycle));
+		const taken = aliases.filter((alias) => liveOwners.some((team) => team.members.some((member) => member.id === alias)));
+		if (taken.length) throw new Error(`Alias already belongs to an unfinished Team: ${taken.join(", ")}. Choose new aliases.`);
+		await deps.broker().assertAliasesAvailable(aliases);
+		if (!host.active) throw new Error("The Team runtime for this session branch has ended; nothing was prepared");
+		const policies = new Map<string, TeamMemberPolicy>([...resolved].map(([alias, policy]) => [alias, {
+			model: policy.modelReference, cwd: policy.cwd, fastMode: policy.fastMode, searchMode: policy.searchMode,
+			...(policy.contextWindow !== undefined ? { contextWindow: policy.contextWindow } : {}),
+		}]));
+		const view = host.runtime.prepare(raw, policies);
+		host.pin(view.teamId, resolved);
+		const works = host.runtime.listWorks(view.teamId);
+		const lines = [
+			`Prepared Team ${view.teamId} (nothing has started: no provider, no tool).`,
+			...members.map((member, index) => {
+				const policy = resolved.get(member.alias)!;
+				const contextWindow = policy.contextWindow === undefined ? `native default ${policy.nativeContextWindow}` : `${policy.contextWindow} (explicit)`;
+				return `- ${member.alias} (${index === 0 ? "manager" : "worker"}) · ${policy.modelReference} · FAST ${policy.fastMode ? "on" : "off"} · SEARCH ${policy.searchMode} · ContextWindow ${contextWindow} · reserve ${policy.compactionReserveTokens} · cwd ${policy.cwd} · role: ${previewText(member.roleDescription, 200)}`;
+			}),
+			`Initial work: ${works.map((work) => `${workRefKey(work.work)} → ${work.assignee}`).join(" · ") || "none (workers start idle; the Manager assigns work)"}`,
+			`Deadline: ${plan.timeoutSeconds === null ? "no Team deadline" : `${plan.timeoutSeconds}s from launch`}`,
+			`Budget: activations ${view.budget.limits.teamActivations} · manager ${view.budget.limits.managerActivations} · model requests ${view.budget.limits.teamModelRequests} · tool calls ${view.budget.limits.teamToolCalls} · works ${view.budget.limits.teamWorks}; the host can grant more with /rail-team.`,
+			`Next: in your next message call subagent_team {"action":"launch","teamId":"${view.teamId}"}. It returns when the whole Team has ended. Do not start members with the subagent tool.`,
+		];
+		return textResult(lines.join("\n"), { view, works });
+	};
+
+	const launch = async (params: Params, signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TeamToolDetails> | undefined, ctx: ExtensionContext): Promise<AgentToolResult<TeamToolDetails>> => {
+		assertActionParams(params, "launch");
+		const host = deps.host();
+		const teamId = params.teamId?.trim();
+		if (!teamId) throw new Error("launch requires the teamId returned by prepare");
+		let view: TeamTeamView;
+		try { view = host.runtime.getTeam(teamId); }
+		catch { throw new Error(`Unknown teamId ${JSON.stringify(teamId.slice(0, 128))}: use the exact teamId returned by prepare in this session.`); }
+		if (view.lifecycle !== "prepared") throw new Error(`Team ${teamId} is ${view.lifecycle} and cannot be launched again; use status, or prepare a new Team.`);
+		const pinned = host.pinnedPolicies(teamId);
+		if (!pinned) throw new Error(`Team ${teamId} is already launching.`);
+		if (!host.active) throw new Error("The Team runtime for this session branch has ended; nothing was started");
+		if (signal?.aborted) throw new Error(`Launch was aborted before opening Team ${teamId}; no member resources or providers were started. The Team remains prepared and can be retried or cancelled.`);
+		for (const policy of pinned.values()) verifyPinnedTeamMemberPolicy(policy, ctx);
+		// Consumed synchronously, so a concurrent second launch cannot pass this point.
+		host.unpin(teamId);
+		const requests = view.members.map((member) => {
+			const policy = pinned.get(member.id)!;
+			return { teamId, memberId: member.id, model: policy.model, cwd: policy.cwd, fastMode: policy.fastMode,
+				...(policy.contextWindow !== undefined ? { contextWindow: policy.contextWindow } : {}) };
 		});
-	}
-	const acceptanceCriteria = normalizeList(input["acceptanceCriteria"], "acceptanceCriteria");
-	const constraints = normalizeList(input["constraints"], "constraints");
-	const brief: TeamBrief = {
-		goal: input["goal"].trim(),
-		...(target ? { target } : {}),
-		...(acceptanceCriteria ? { acceptanceCriteria } : {}),
-		...(constraints ? { constraints } : {}),
-		...(authorizations ? { authorizations } : {}),
+
+		let finished = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const publish = () => {
+			timer = undefined;
+			// No update after the call settled, or from a generation whose branch has ended.
+			if (finished || !host.active || !onUpdate) return;
+			const current = liveView(host, teamId);
+			onUpdate(textResult(formatTeamView(current.view, current.works, current.holdsTotal).join("\n"), current));
+		};
+		const unsubscribe = host.runtime.onChange((changed) => {
+			if (changed === teamId && !timer && !finished) timer = setTimeout(publish, UPDATE_INTERVAL_MS);
+		});
+		publish();
+		let detach: (() => void) | undefined;
+		const detached = new Promise<{ kind: "detached" }>((resolve) => {
+			if (!signal) return;
+			const onAbort = () => resolve({ kind: "detached" });
+			if (signal.aborted) { onAbort(); return; }
+			signal.addEventListener("abort", onAbort, { once: true });
+			detach = () => signal.removeEventListener("abort", onAbort);
+		});
+		const lifetime = host.driver.openAndLaunch(teamId, requests).then(({ lifetime: completion }) => completion);
+		try {
+			const outcome = await Promise.race([
+				lifetime.then((result) => ({ kind: "result" as const, result }), (error: unknown) => ({ kind: "error" as const, error })),
+				detached,
+			]);
+			if (outcome.kind === "detached") {
+				// This call has no authority to infer a user cancellation. Keep the Team host-managed,
+				// but report the aborted launch as a tool error rather than a successful active result.
+				void lifetime.catch((error: unknown) => {
+					if (ctx.hasUI && host.active && deps.host() === host) {
+						ctx.ui.notify(`Team ${teamId} lifecycle failed after launch stopped waiting: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				});
+				throw new TeamLaunchWaitAbortedError(teamId, host.runtime.getTeam(teamId).lifecycle);
+			}
+			if (outcome.kind === "error") {
+				const error = outcome.error;
+				if (error instanceof TeamLaunchError) {
+					const members = error.cleanup?.members.map((member) => `${member.id} ${member.resourceState}`).join(" · ");
+					throw new Error(`${error.message}${members ? `\nMember resources: ${members}` : ""}${error.cleanupError ? `\nCleanup is incomplete: ${error.cleanupError instanceof Error ? error.cleanupError.message : String(error.cleanupError)}` : ""}\nPrepare a new Team with new aliases for members that started.`);
+				}
+				throw error;
+			}
+			const text = finalTeamText(host, outcome.result);
+			if (outcome.result.lifecycle !== "closed") throw new Error(text);
+			return textResult(text, {});
+		} finally {
+			finished = true;
+			if (timer) clearTimeout(timer);
+			unsubscribe();
+			detach?.();
+		}
 	};
-	// The shared validator is authoritative (aggregate JSON size including escaping).
-	if (!isTeamBrief(brief)) throw new Error(`brief exceeds ${TEAM_MAX_BRIEF_BYTES} serialized UTF-8 bytes`);
-	return brief;
-}
 
-function previewText(value: string, maxBytes: number): string {
-	const plain = stripTerminalSequences(value).replace(/\s+/gu, " ").trim();
-	if (Buffer.byteLength(JSON.stringify(plain), "utf8") - 2 <= maxBytes) return plain;
-	let result = "";
-	for (const character of plain) {
-		if (Buffer.byteLength(JSON.stringify(`${result}${character}…`), "utf8") - 2 > maxBytes) break;
-		result += character;
-	}
-	return `${result}…`;
-}
-
-function modelSnapshot(snapshot: TeamSnapshot) {
-	return {
-		id: snapshot.id,
-		coordinator: snapshot.coordinator,
-		workers: snapshot.workers,
-		phase: snapshot.phase,
-		seq: snapshot.seq,
-		createdAt: snapshot.createdAt,
-		deadline: snapshot.deadline,
-		...(snapshot.brief ? { brief: snapshot.brief } : {}),
-		members: snapshot.members.map((member) => ({
-			id: member.id,
-			role: member.role,
-			state: member.state,
-			...(member.waitingFor ? { waitingFor: member.waitingFor } : {}),
-			...(member.assignment ? { assignment: {
-				memberId: member.assignment.memberId,
-				taskPreview: previewText(member.assignment.task, 512),
-				...(member.assignment.cwd ? { cwdPreview: previewText(member.assignment.cwd, 256) } : {}),
-				...(member.assignment.model ? { modelPreview: previewText(member.assignment.model, 128) } : {}),
-				fastMode: member.assignment.fastMode === true,
-				searchMode: previewText(member.assignment.searchMode ?? "off", 32),
-			} } : {}),
-			...(member.result ? { result: {
-				status: member.result.status,
-				summaryPreview: previewText(member.result.summary, 1024),
-				findingsCount: member.result.findings?.length ?? 0,
-				evidenceCount: member.result.evidence?.length ?? 0,
-				limitationsCount: member.result.limitations?.length ?? 0,
-				artifactsCount: member.result.artifacts?.length ?? 0,
-			} } : {}),
-			...(member.error ? { errorPreview: previewText(member.error, 300) } : {}),
-		})),
-		events: snapshot.events
-			.filter((event) => (event.kind === "message" || event.kind === "report") && event.from && event.to && event.message)
-			.slice(-8)
-			.map((event) => ({ seq: event.seq, kind: event.kind, from: event.from, to: event.to,
-				...(event.messageId ? { messageId: event.messageId, timestamp: event.timestamp } : {}),
-				...(event.replyTo ? { replyTo: event.replyTo } : {}),
-				...(event.supersedes ? { supersedes: event.supersedes } : {}),
-				messagePreview: previewText(event.message!, 240) })),
+	const status = (params: Params): AgentToolResult<TeamToolDetails> => {
+		assertActionParams(params, "status");
+		const host = deps.host();
+		const teamId = params.teamId?.trim();
+		const resultRef = params.resultRef?.trim();
+		if (resultRef && !teamId) throw new Error("status resultRef requires teamId");
+		if (resultRef && params.cursor?.trim()) throw new Error("status accepts either resultRef or cursor, not both");
+		if (teamId) {
+			const live = host.runtime.listTeams().find((team) => team.teamId === teamId);
+			if (resultRef) {
+				const record = live ? host.runtime.getResult(teamId, resultRef) : host.history.teams.find((team) => team.teamId === teamId)?.results.find((item) => item.id === resultRef);
+				if (!record) throw new Error(`Unknown resultRef ${resultRef} for Team ${teamId}`);
+				return textResult(formatResultRecord(record), { resultRecord: record });
+			}
+			if (live) {
+				const current = liveView(host, teamId);
+				const page = host.runtime.listResultRefsPage(teamId, params.cursor?.trim() || undefined);
+				const lines = [...formatTeamView(current.view, current.works, current.holdsTotal), ...formatResultRefPage(page)];
+				return textResult(lines.join("\n"), { ...current, resultPage: page });
+			}
+			const entry = host.history.teams.find((team) => team.teamId === teamId);
+			if (entry) return textResult(formatHistoryEntry(entry, params.cursor?.trim() || undefined), {});
+			throw new Error(`Unknown teamId ${JSON.stringify(teamId.slice(0, 128))}`);
+		}
+		if (params.cursor?.trim()) throw new Error("status cursor requires teamId");
+		const teams = host.runtime.listTeams();
+		const liveIds = new Set(teams.map((team) => team.teamId));
+		const history = host.history.teams.filter((entry) => !liveIds.has(entry.teamId));
+		const lines = [
+			...teams.map((team) => `${team.teamId} · ${upper(team.lifecycle)} · ${team.health === "ok" ? "ok" : "needs attention"} · manager ${team.manager} · ${team.members.length - 1} workers · works ${team.works.total}`),
+			...history.map(formatHistorySummary),
+			...(host.history.skipped ? [`${host.history.skipped} malformed history entries skipped`] : []),
+		];
+		return textResult(lines.join("\n") || "No teams", {});
 	};
-}
 
-/** Display-only history: the Hub keeps the latest valid entry per team and skips the rest. */
-export function restoreTeamHistory(hub: TeamHub, entries: readonly { type: string; customType?: string; data?: unknown }[]): { restored: number; skipped: number } {
-	const snapshots = entries.filter((entry) => entry.type === "custom" && entry.customType === TEAM_HISTORY_TYPE)
-		.map((entry) => entry.data as TeamSnapshot);
-	return hub.restore(snapshots);
-}
+	const cancel = async (params: Params): Promise<AgentToolResult<TeamToolDetails>> => {
+		assertActionParams(params, "cancel");
+		const host = deps.host();
+		const teamId = params.teamId?.trim();
+		if (!teamId) throw new Error("cancel requires teamId");
+		const reason = params.reason?.trim() || "Cancelled by the parent";
+		host.runtime.getTeam(teamId);
+		host.unpin(teamId);
+		const result = await host.driver.stopTeam(teamId, reason);
+		const failures: unknown[] = [];
+		for (const member of result.members.filter((item) => item.resourceState !== "released")) {
+			try { await host.driver.closeMember(teamId, member.id); }
+			catch (error) { failures.push(error); }
+		}
+		const unreleased = host.runtime.getTeam(teamId).members.filter((member) => member.resourceState !== "released");
+		if (unreleased.length || failures.length) {
+			const details = unreleased.map((member) => `${member.id}=${member.resourceState}`);
+			details.push(...failures.map((error) => error instanceof Error ? error.message : String(error)));
+			throw new Error(`Team ${teamId} cancellation is incomplete; member exits are not all confirmed: ${details.join("; ")}`);
+		}
+		const current = liveView(host, teamId);
+		return textResult(formatTeamView(current.view, current.works, current.holdsTotal).join("\n"), current);
+	};
 
-export function installTeamTool(pi: ExtensionAPI, getHub: () => TeamHub, getLauncher?: () => TeamLauncher | undefined): void {
 	pi.registerTool({
 		name: "subagent_team",
 		label: "Subagent Team",
-		description: "Run a fixed team: one child coordinator plus 1–8 workers, all new persistent aliases. Two steps, one call each: "
-			+ "(1) {\"action\":\"prepare\",\"coordinator\":{\"alias\":\"<A>\",\"task\":\"...\",\"model\":null,\"fastMode\":null,\"cwd\":null},\"workers\":[{\"alias\":\"<B1>\",\"task\":\"...\",\"model\":null,\"fastMode\":null,\"cwd\":null}, ...],\"brief\":{...}} "
-			+ "validates the whole plan and returns the teamId without starting anything; "
-			+ "(2) in your next message {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts every member and returns when the coordinator has finished with all worker outcomes. "
-			+ "Do not use the subagent tool for team members. status and cancel take a teamId. "
-			+ "Give every member a self-contained task and put shared goal, target/URL, acceptance criteria, constraints and per-member authorization in brief. The hosting parent is not a team member/coordinator. Team messages are queued for a recipient's receiving context checkpoint; ordinary send does not interrupt an active turn or wake the parent model. Keep timeoutSeconds null (default 3600s) unless the user requests a deadline; it covers the whole team including reasoning, tools, waiting and the final summary. Pause is cooperative at safe points. Reload interrupts unfinished teams.",
+		description: "Run a Team: one Manager plus 1-8 workers, all new persistent aliases, coordinated through a shared work ledger. "
+			+ "(1) prepare {\"action\":\"prepare\",\"manager\":{\"alias\":\"lead\",\"roleDescription\":\"...\"},\"workers\":[{\"alias\":\"review\",\"roleDescription\":\"...\"}],\"brief\":{\"goal\":\"...\"},\"initialRequests\":[{\"to\":\"review\",\"task\":\"...\"}],\"timeoutSeconds\":null} "
+			+ "validates and pins every member's model, cwd, Fast/Search and context budget, and returns the plan, initial WorkRefs and budget without starting anything. "
+			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with the TeamResult and the worker results the Manager selected. "
+			+ "status (teamId optional) lists Teams; status with teamId pages resultRefs using cursor, or fetches one full worker ResultRecord with resultRef. cancel (teamId, reason) inspects or stops a Team. The Manager assigns, reviews and closes; it does not write a final summary. "
+			+ "The parent model is not woken while launch waits; budget grants and hold releases are host-only (/rail-team).",
 		promptGuidelines: [
-			"Team prepare: default timeoutSeconds to null. Do not invent short 120/180-second limits for code review or max-thinking models; explicit deadlines bound the entire workflow, not one tool call.",
-			"Make each worker task self-contained: include the necessary target/URL, expected inputs, acceptance criteria, relevant constraints, and its own allowed/forbidden operations. Put shared goal and per-member authorization in brief so all assignments and policy are present before any child receives its first context.",
-			"Run a team with two subagent_team calls in consecutive messages: prepare with the complete member plan (coordinator object and workers array, each with alias, task and optional model/fastMode/cwd), then launch with only the returned teamId. Never start team members with the subagent tool. If prepare is rejected, fix the named field and prepare again; nothing was started. The hosting parent is not the team's coordinator and should not claim it receives a live wakeup. After a team fails or is cancelled, prepare a new team; started members keep their aliases, so use new aliases for them.",
+			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool.",
+			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
+			"Role-only workers are valid: they stay idle until the Manager assigns work. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
+			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",
 		],
 		executionMode: "parallel",
 		parameters: Type.Object({
 			action: StringEnum(["prepare", "launch", "status", "cancel"]),
-			teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "launch/status/cancel: the teamId returned by prepare (status without it lists teams). prepare: null." })),
-			coordinator: Type.Optional(Type.Union([MemberPlanSchema, Type.String(), Type.Null()], { description: "prepare: the child coordinator as {alias, task, model, fastMode, cwd}. Other actions: null." })),
-			workers: Type.Optional(Type.Union([Type.Array(Type.Union([MemberPlanSchema, Type.String()]), { minItems: 1, maxItems: TEAM_MAX_WORKERS }), Type.Null()], { description: "prepare: 1–8 workers, each {alias, task, model, fastMode, cwd}. Other actions: null." })),
-			timeoutSeconds: Type.Optional(Type.Union([Type.Number({ exclusiveMinimum: 0, maximum: 86400 }), Type.Null()], { description: "Default null = 3600 seconds. Set only for a user-requested deadline. Total team budget from prepare, including startup, all model/tool work, waits and final summary; not a per-call timeout." })),
-			reason: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-			brief: Type.Optional(Type.Union([BriefSchema, Type.Null()], { description: "Shared goal, target, acceptance criteria, constraints and member-specific authorization. Null optional fields are normalized away." })),
-		}),
-		async execute(toolCallId, params, signal, onUpdate, ctx: ExtensionContext) {
-			const hub = getHub();
-			if (params.action === "launch") {
-				const teamId = params.teamId?.trim();
-				if (!teamId) throw new Error("launch requires the teamId returned by prepare");
-				let snapshot: TeamSnapshot;
-				try { snapshot = hub.get(teamId); }
-				catch { throw new Error(`Unknown teamId ${JSON.stringify(teamId.slice(0, 128))}: use the exact teamId returned by prepare (status without teamId lists teams).`); }
-				// Placeholders (null, "", []) are fine; a real value would silently not apply, so reject it.
-				const present = (value: unknown) => value != null && !(Array.isArray(value) && value.length === 0) && !(typeof value === "string" && !value.trim());
-				const extra = (["coordinator", "workers", "brief", "timeoutSeconds"] as const).filter((key) => present(params[key]));
-				if (extra.length) {
-					throw new Error(`launch takes only teamId; ${extra.join(", ")} ${extra.length === 1 ? "was" : "were"} fixed at prepare. Send {"action":"launch","teamId":"${teamId}"}, or cancel this team and prepare again to change the plan. Nothing was started.`);
-				}
-				const plan = teamLaunchPlan(hub, teamId);
-				if (!plan) {
-					if (snapshot.phase !== "prepared" || snapshot.members.some((member) => member.state !== "registered")) {
-						throw new Error(`Team ${teamId} is ${snapshot.phase} and cannot be launched again; use status to inspect it, or prepare a new team.`);
-					}
-					throw new Error(`Team ${teamId} was prepared with aliases only and has no launch plan. Cancel it and prepare again with member objects {alias, task, ...}.`);
-				}
-				const launcher = getLauncher?.();
-				if (!launcher) throw new Error("Team launch is not available in this runtime");
-				return launcher.launch(toolCallId, teamId, plan, signal, onUpdate as never, ctx) as never;
+			teamId: nullable(Type.String({ description: "launch/status/cancel: the teamId returned by prepare (status without it lists Teams). For a resultRef lookup, provide the owning teamId." })),
+			cursor: nullable(Type.String({ description: "status: next result-ref page cursor returned by the prior status page; requires teamId" })),
+			resultRef: nullable(Type.String({ description: "status: fetch exactly one complete worker ResultRecord by its resultRef; requires teamId and cannot be combined with cursor" })),
+			manager: nullable(MemberSchema),
+			workers: nullable(Type.Array(MemberSchema, { minItems: 1, maxItems: TEAM_MAX_WORKERS })),
+			brief: nullable(BriefSchema),
+			initialRequests: nullable(Type.Array(InitialRequestSchema, { maxItems: TEAM_MAX_INITIAL_REQUESTS })),
+			timeoutSeconds: nullable(Type.Number({ exclusiveMinimum: 0, maximum: TEAM_MAX_TIMEOUT_SECONDS, description: "null = no Team deadline. Only for a user-requested deadline, counted from launch." })),
+			reason: nullable(Type.String({ description: "cancel: why the Team is cancelled" })),
+		}, { additionalProperties: false }),
+		prepareArguments(raw) {
+			if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+				const action = (raw as Record<string, unknown>)["action"];
+				if (action === "prepare" || action === "launch" || action === "status" || action === "cancel") assertActionParams(raw as Params, action);
 			}
-			let snapshots: TeamSnapshot[];
-			let prepared: { plan: TeamLaunchPlan; summaries?: TeamPlanSummary[] } | undefined;
-			if (params.action === "prepare") {
-				if (params.teamId?.trim()) throw new Error("prepare creates a new team and does not accept teamId");
-				if (params.coordinator == null || params.workers == null) throw new Error("prepare requires coordinator and workers");
-				const { aliases, plan } = normalizePlan(params.coordinator, params.workers);
-				const brief = normalizeBrief(params.brief, [aliases.coordinator, ...aliases.workers]);
-				const summaries = plan ? await getLauncher?.()?.validate(plan, ctx) : undefined;
-				snapshots = [hub.prepare({ ...aliases, ...(params.timeoutSeconds != null ? { timeoutSeconds: params.timeoutSeconds } : {}), ...(brief ? { brief } : {}) })];
-				if (plan) {
-					// Pin what was validated and shown, so a later parent model or cwd change cannot alter the launch.
-					const pin = (member: TeamMemberPlan, index: number): TeamMemberPlan => summaries?.[index]
-						? { ...member, model: summaries[index]!.model, cwd: summaries[index]!.cwd }
-						: member;
-					setTeamLaunchPlan(hub, snapshots[0]!.id, { coordinator: pin(plan.coordinator, 0), workers: plan.workers.map((worker, index) => pin(worker, index + 1)) });
-					prepared = { plan, ...(summaries ? { summaries } : {}) };
-				}
-			} else if (params.action === "cancel") {
-				if (!params.teamId) throw new Error("cancel requires teamId");
-				hub.cancel(params.teamId, params.reason ?? undefined);
-				deleteTeamLaunchPlan(hub, params.teamId);
-				snapshots = [hub.get(params.teamId)];
-			} else snapshots = params.teamId ? [hub.get(params.teamId)] : hub.list();
-			const listing = params.action === "status" && !params.teamId;
-			const readable = snapshots.map((snapshot) => {
-				if (listing) return `${snapshot.id} · ${snapshot.phase.toUpperCase()} · coordinator ${snapshot.coordinator} · ${snapshot.workers.length} workers`;
-				const status = `${snapshot.id}\n${teamStatus(snapshot)}`;
-				if (params.action !== "prepare") return status;
-				const budget = `Budget: ${(snapshot.deadline - snapshot.createdAt) / 1000}s total from prepare, including reasoning, tools, waiting and final summary.`;
-				if (!prepared) return `${status}\n${budget}\nNext: ${teamDispatchTemplate(snapshot)}`;
-				return [status, "Plan (validated; nothing has started):", ...planLines(prepared.summaries, prepared.plan), budget,
-					`Next: in your next message call subagent_team {"action":"launch","teamId":"${snapshot.id}"}. It starts every member and returns when the coordinator has finished. Do not start members with the subagent tool.`].join("\n");
-			}).join("\n") || "No teams";
-			const next = params.action === "prepare"
-				? prepared
-					? `Call subagent_team {"action":"launch","teamId":"${snapshots[0]!.id}"} in your next message. Messages are queued for receiving checkpoints; they do not wake or interrupt the hosting parent model.`
-					: "Emit the two launch calls shown above as sibling subagent calls in the same assistant message; do not wait between them. Messages are queued for receiving checkpoints; they do not wake or interrupt the hosting parent model."
-				: "Use status with a specific teamId to inspect assignment/result previews and recent message routes. Previews are not full deliverables; structured results are retained in the native subagent result details and team journal. Listing teams returns summaries only. This response does not provide a live wakeup channel to the hosting parent model.";
-			const response = {
-				action: params.action,
-				teamId: snapshots.length === 1 ? snapshots[0]!.id : params.teamId?.trim() || null,
-				from: "@hub",
-				to: "@parent",
-				...(listing ? { snapshots: snapshots.map((snapshot) => ({
-					id: snapshot.id, coordinator: snapshot.coordinator, phase: snapshot.phase,
-					workerCount: snapshot.workers.length,
-					completed: snapshot.members.filter((member) => member.state === "completed").length,
-					failed: snapshot.members.filter((member) => member.state === "failed").length,
-					blocked: snapshot.members.filter((member) => member.result?.status === "blocked").length,
-				})) } : snapshots.length === 1 ? { snapshot: modelSnapshot(snapshots[0]!) } : { snapshots: [] }),
-				...(prepared ? { plan: [prepared.plan.coordinator, ...prepared.plan.workers].map((member, index) => ({
-					alias: member.alias, role: index === 0 ? "coordinator" : "worker", taskPreview: previewText(member.task, 512),
-					...(prepared!.summaries?.[index] ? { model: prepared!.summaries[index]!.model, fastMode: prepared!.summaries[index]!.fastMode, searchMode: prepared!.summaries[index]!.searchMode } : {}),
-				})) } : {}),
-				next,
-			};
-			return { content: [{ type: "text", text: `${readable}\nJSON:\n${JSON.stringify(response)}` }], details: { snapshots, response } };
+			return raw as Params;
+		},
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const input = params as Params;
+			if (input.action === "prepare") return prepare(input, ctx);
+			if (input.action === "launch") return launch(input, signal, onUpdate, ctx);
+			if (input.action === "cancel") return cancel(input);
+			return status(input);
 		},
 		renderCall(args, theme) {
 			const action = String(args.action ?? "");
-			const team = typeof args.teamId === "string" && args.teamId.trim() ? ` · ${args.teamId.trim().slice(0, 8)}` : "";
-			const members = action === "prepare" && Array.isArray(args.workers) ? ` · 1 coordinator + ${args.workers.length} workers` : "";
+			const team = typeof args.teamId === "string" && args.teamId.trim() ? ` · ${args.teamId.trim().slice(0, 12)}` : "";
+			const members = action === "prepare" && Array.isArray(args.workers) ? ` · 1 manager + ${args.workers.length} workers` : "";
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_team "))}${theme.fg("accent", `${action}${team}${members}`)}`, 0, 0);
 		},
-		renderResult(result, renderOptions, theme, context) {
-			const details = result.details as { results?: unknown[] } | undefined;
-			const launcher = getLauncher?.();
-			if (launcher && Array.isArray(details?.results)) return launcher.renderResult(result, renderOptions, theme, context);
-			return new Text(result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n"), 0, 0);
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as TeamToolDetails | undefined;
+			const text = details?.resultRecord ? formatResultRecord(details.resultRecord).split("\n")
+				: details?.view ? [...formatTeamView(details.view, details.works, details.holdsTotal), ...(details.resultPage ? formatResultRefPage(details.resultPage) : [])]
+					: result.content.flatMap((item) => item.type === "text" ? item.text.split("\n") : []);
+			const shown = expanded ? text : text.slice(0, 16);
+			const [header, ...rest] = shown;
+			return new Text([theme.fg("accent", header ?? ""), ...rest, ...(shown.length < text.length ? [theme.fg("dim", `… ${text.length - shown.length} more lines`)] : [])].join("\n"), 0, 0);
 		},
 	});
 }

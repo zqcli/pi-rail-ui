@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import {
 	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_MANAGER_EVENT_BATCH,
-	TEAM_MAX_PENDING_OPERATIONS,
-	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_PROTOCOL_VERSION, DEFAULT_TEAM_BUDGET, isTerminalWorkState, sameWorkRef,
+	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
+	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_PROTOCOL_VERSION,
+	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, DEFAULT_TEAM_BUDGET, isTerminalWorkState, sameWorkRef,
 	workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
-	type ActivationInput, type ActivationScope, type BindingV2, type DeliveryRecord, type EndIntent,
+	type ActivationInput, type ActivationScope, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
 	type ManagerEventView, type MemberRecord, type OutcomeView, type ResultRecord,
 	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle, type GateDecision,
 	type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamTeamView,
@@ -60,6 +61,23 @@ export interface CleanupCompletion {
 	error?: WorkError;
 	/** Member close only: the exit was confirmed although the close was not clean (ownership may be released). */
 	resourceReleased?: boolean;
+}
+
+export interface GrantPreview {
+	scope: BudgetScope;
+	changes: Array<{ counter: string; used: number; limit: number; proposed: number }>;
+	/** Budget-held work that this grant alone would requeue. */
+	released: WorkRef[];
+}
+
+export interface HostHoldView {
+	work: WorkRef;
+	assignee: string;
+	rootId: string;
+	reason: HoldReason;
+	incidentId: string;
+	message: string;
+	task: string;
 }
 
 export interface TeamRuntimeOptions {
@@ -165,6 +183,7 @@ interface CloseDecision {
 	outcome: "succeeded" | "partial" | "failed";
 	reason?: string;
 	resultRefs: string[];
+	roots: TeamResult["roots"];
 }
 
 interface TeamState {
@@ -213,6 +232,8 @@ function fail(code: TeamErrorCode, message: string, blockers?: TeamProtocolError
  */
 export class TeamRuntime {
 	private readonly teams = new Map<string, TeamState>();
+	private readonly changeListeners = new Set<(teamId: string) => void>();
+	private readonly pendingNotifications = new Set<string>();
 	private readonly executors = new Map<string, TeamRuntimeExecutor>();
 	private readonly scheduledDrains = new Set<string>();
 	private readonly closingEffects = new Set<string>();
@@ -223,6 +244,7 @@ export class TeamRuntime {
 	private readonly limits: TeamBudgetLimits;
 	private readonly activationStopTimeoutMs: number;
 	private readonly journalGeneration: TeamJournalGeneration | undefined;
+	private journalRetiredForHostTransition = false;
 
 	constructor(options: TeamRuntimeOptions = {}) {
 		this.journalGeneration = options.journal;
@@ -236,9 +258,26 @@ export class TeamRuntime {
 		}
 	}
 
+	/** A branch/session transition intentionally seals history before asynchronous native cleanup. */
+	retireJournalForHostTransition(): void {
+		this.journalRetiredForHostTransition = true;
+	}
+
 	/** Validate and reserve the complete plan/initial ledger without starting any member. */
-	prepare(rawPlan: unknown): TeamTeamView {
+	/**
+	 * `resolvedPolicies`, when given, is the host launcher's pinned policy per alias (real model,
+	 * cwd, effective Fast/Search, contextWindow). It replaces the model-supplied policy wholesale;
+	 * the model itself can never provide searchMode.
+	 */
+	prepare(rawPlan: unknown, resolvedPolicies?: ReadonlyMap<string, TeamMemberPolicy>): TeamTeamView {
 		const plan = normalizeTeamPlan(rawPlan);
+		if (resolvedPolicies) {
+			for (const member of [plan.manager, ...plan.workers]) {
+				const policy = resolvedPolicies.get(member.alias);
+				if (!policy) fail("INVALID_ARGUMENT", `No resolved policy for member ${member.alias}`);
+				member.policy = copy(policy);
+			}
+		}
 		const liveCount = [...this.teams.values()].filter((team) => !TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle)).length;
 		if (liveCount >= TEAM_MAX_LIVE_TEAMS) fail("TEAM_CAPACITY", `At most ${TEAM_MAX_LIVE_TEAMS} live Teams are allowed`);
 		const terminalTeams = [...this.teams.values()].filter((team) => TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle));
@@ -298,9 +337,13 @@ export class TeamRuntime {
 	launch(teamId: string): TeamTeamView {
 		const team = this.team(teamId);
 		if (team.lifecycle !== "prepared") fail("INVALID_ARGUMENT", `Cannot launch Team in ${team.lifecycle}`);
+		if ([...team.members.values()].some((member) => member.lifecycle !== "starting")) {
+			fail("MEMBER_UNAVAILABLE", "A Team member was stopped before launch; cancel this prepared Team and prepare with new aliases");
+		}
 		const launchAt = this.timestamp();
 		// History must record the admission before any provider can run; a failed write keeps it prepared.
-		if (!this.tryJournal(team, { version: 2, kind: "launched", teamId, at: launchAt })) {
+		if (!this.tryJournal(team, { version: 2, kind: "launched", teamId, at: launchAt,
+			roster: { manager: team.manager, workers: team.plan.workers.map((worker) => worker.alias) }, goal: previewText(team.plan.brief.goal, 512) })) {
 			const reason = team.journalFailure;
 			delete team.journalFailure;
 			fail("PROTOCOL_FAILURE", `Team launch could not be journaled: ${reason}`);
@@ -353,6 +396,16 @@ export class TeamRuntime {
 		};
 	}
 
+	/** Attach an effect executor only for host-driven stop/close after manual Runtime test runs. */
+	attachCleanupExecutor(teamId: string, executor: TeamRuntimeExecutor): () => void {
+		const team = this.team(teamId);
+		if (team.lifecycle === "prepared") fail("INVALID_ARGUMENT", "Use attachExecutor before launch for a prepared Team");
+		if (this.executors.has(teamId)) fail("TEAM_OWNED", "This Team already has an effect executor");
+		this.executors.set(teamId, executor);
+		this.requestDrain(teamId);
+		return () => { if (this.executors.get(teamId) === executor) this.executors.delete(teamId); };
+	}
+
 	/** Resolves only after Runtime observes a terminal Team lifecycle and its required exit evidence. */
 	waitForCompletion(teamId: string): Promise<TeamResult> {
 		const team = this.team(teamId);
@@ -376,6 +429,70 @@ export class TeamRuntime {
 		});
 	}
 
+	/**
+	 * Stop one Broker-owned member without widening the action to the Team. Workers lose only their
+	 * own work and descendants; an unavailable Manager holds Manager work and pauses workers.
+	 */
+	hostStopMember(teamId: string, memberId: string, reasonValue: string): BindingV2 {
+		const team = this.team(teamId);
+		const member = team.members.get(memberId);
+		if (!member) fail("UNKNOWN_MEMBER", `Unknown Team member ${memberId}`);
+		const reason = this.hostText(reasonValue, "member stop reason");
+		if (member.lifecycle === "faulted" || (member.lifecycle === "closed" && member.resourceState === "released")) return this.binding(team, member);
+		if (team.lifecycle !== "active" && team.lifecycle !== "prepared") {
+			fail("RECIPIENT_CLOSING", `Cannot stop ${memberId} independently while Team is ${team.lifecycle}`);
+		}
+		if (!member.nativeClaimed) fail("TEAM_OWNED", `Team member ${memberId} has no Broker-owned native lifetime to stop`);
+		member.lifecycle = "faulted";
+		member.resourceState = member.resourceState === "starting" ? "owned" : member.resourceState;
+		member.error = { code: "HOST_MEMBER_STOPPED", message: reason };
+		member.pause = "none";
+		team.health = "needs_attention";
+		if (member.role === "manager") {
+			this.holdManagerWork(team);
+			this.pauseWorkersForManagerFault(team);
+			this.createIncident(team, "MANAGER_UNAVAILABLE", reason, undefined, member.id);
+		} else {
+			this.stopMemberWork(team, member, reason);
+		}
+		if (member.active) {
+			member.active.stopReason = "cancelled";
+			this.requestActivationStop(team, member, "policy_cancelled");
+		}
+		this.addEvent(team, { key: `host-member-stopped:${member.id}`, kind: "MEMBER_FAULTED",
+			message: `${member.id} was stopped by the host; the Team remains host-managed`, memberId: member.id });
+		this.changed(team);
+		this.updateQuiescence(team);
+		this.check(team);
+		this.requestDrain(team.id);
+		this.settleCompletion(team);
+		return this.binding(team, member);
+	}
+
+	/** Report the single member's actual Broker exit; an unknown exit retains ownership for retry. */
+	memberStopExit(bindingValue: BindingV2, result: CleanupCompletion): TeamReply {
+		const binding = this.validateBinding(bindingValue);
+		const team = this.team(binding.teamId);
+		const member = this.authenticatedMember(binding);
+		if (member.lifecycle !== "faulted" || member.active) fail("CLEANUP_FAILED", "Only an inactive faulted member can report a host stop exit");
+		if (member.resourceState === "released" && (result.ok || result.resourceReleased)) return okReply(member.id);
+		if (result.ok) {
+			member.resourceState = "released";
+		} else if (result.resourceReleased) {
+			member.resourceState = "released";
+			member.error = { code: result.error?.code ?? "PROTOCOL_FAILURE", message: result.error?.message ?? "Member protocol cleanup failed after confirmed exit" };
+			this.createIncident(team, member.error.code, member.error.message, undefined, member.id);
+		} else {
+			member.resourceState = "cleanup_failed";
+			member.error = { code: result.error?.code ?? "CLEANUP_FAILED", message: result.error?.message ?? "Member exit is not confirmed" };
+			this.createIncident(team, member.error.code, member.error.message, undefined, member.id);
+		}
+		this.changed(team);
+		this.check(team);
+		this.settleCompletion(team);
+		return result.ok ? okReply(member.id) : errorReply(member.id, new TeamProtocolError("CLEANUP_FAILED", member.error?.message ?? "Member exit is not confirmed"));
+	}
+
 	/** Terminal host cancellation never asks the Manager model for permission. */
 	cancelTeam(teamId: string, reasonValue: string): HostControlReceipt {
 		const team = this.team(teamId);
@@ -391,13 +508,26 @@ export class TeamRuntime {
 		if (["closed", "cancelled", "interrupted"].includes(team.lifecycle) || team.cancelRequested) {
 			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: team.reason } : {}) };
 		}
-		if (team.lifecycle === "prepared") return this.cancelPrepared(team, reason);
+		if (team.lifecycle === "prepared") return this.cancelPrepared(team, reason, "cancelled");
 		this.stopTeamExecution(team, "cancelled", reason, { code: "CANCELLED", message: reason });
 		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: team.reason ?? reason };
 	}
 
+	/**
+	 * Host lifecycle end (reload, session switch, tree navigation, shutdown): the same bounded stop
+	 * as cancellation, recorded as `interrupted` because no user decided it. Not a model action.
+	 */
+	interruptTeam(teamId: string, reasonValue: string): HostControlReceipt {
+		const team = this.team(teamId);
+		const reason = this.hostText(reasonValue, "interrupt reason");
+		if (team.closeDecision || TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle) || team.cancelRequested) return this.cancelTeam(teamId, reason);
+		if (team.lifecycle === "prepared") return this.cancelPrepared(team, reason, "interrupted");
+		this.stopTeamExecution(team, "interrupted", reason, { code: "INTERRUPTED", message: reason });
+		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: team.reason ?? reason };
+	}
+
 	/** Shared terminal stop for host cancellation and fail-closed journal loss; the first terminal lifecycle wins. */
-	private stopTeamExecution(team: TeamState, lifecycle: "cancelled" | "failed", reason: string, workError: WorkError): void {
+	private stopTeamExecution(team: TeamState, lifecycle: "cancelled" | "failed" | "interrupted", reason: string, workError: WorkError): void {
 		if (team.lifecycle === "failed") {
 			team.reason = `${team.reason ?? "Team failed"}; ${lifecycle === "cancelled" ? "host cancellation requested" : "additional failure"}: ${reason}`;
 		} else {
@@ -405,7 +535,7 @@ export class TeamRuntime {
 			team.reason = reason;
 		}
 		team.cancelRequested = true;
-		this.cancelAllWork(team, lifecycle, workError);
+		this.cancelAllWork(team, lifecycle === "failed" ? "failed" : "cancelled", workError);
 		for (const member of team.members.values()) {
 			if (member.resourceState === "cleanup_failed" || member.lifecycle === "closed") continue;
 			// A faulted member whose exit was already confirmed has nothing left to close.
@@ -434,11 +564,11 @@ export class TeamRuntime {
 	 * A never-launched Team is cancelled without any provider/tool effect. Members whose binding was
 	 * never issued hold nothing; a claimed member stays stopping until its driver reports the exit.
 	 */
-	private cancelPrepared(team: TeamState, reason: string): HostControlReceipt {
-		team.lifecycle = "cancelled";
+	private cancelPrepared(team: TeamState, reason: string, lifecycle: "cancelled" | "interrupted"): HostControlReceipt {
+		team.lifecycle = lifecycle;
 		team.reason = reason;
 		team.cancelRequested = true;
-		this.cancelAllWork(team, "cancelled", { code: "CANCELLED", message: reason });
+		this.cancelAllWork(team, "cancelled", { code: lifecycle === "cancelled" ? "CANCELLED" : "INTERRUPTED", message: reason });
 		for (const member of team.members.values()) {
 			member.closeId = this.id("host-close");
 			if (member.nativeClaimed) {
@@ -514,23 +644,10 @@ export class TeamRuntime {
 		const team = this.team(teamId);
 		const reason = this.hostText(reasonValue, "grant reason");
 		if (Buffer.byteLength(reason, "utf8") > TEAM_MAX_GRANT_REASON_BYTES) fail("INVALID_ARGUMENT", `grant reason exceeds ${TEAM_MAX_GRANT_REASON_BYTES} bytes`);
-		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
-		let scope: BudgetScope;
-		if (scopeValue?.kind === "team") scope = { kind: "team" };
-		else if (scopeValue?.kind === "root") {
-			const rootId = this.hostId(scopeValue.rootId, "rootId");
-			if (team.ledger.get(rootId)?.record.parent !== undefined || !team.ledger.get(rootId)) fail("UNKNOWN_WORK", `Unknown root ${rootId}`);
-			scope = { kind: "root", rootId };
-		} else fail("INVALID_ARGUMENT", "Grant scope must be the Team or a known root");
-		if (!incrementsValue || typeof incrementsValue !== "object" || Array.isArray(incrementsValue)) fail("INVALID_ARGUMENT", "Grant increments must be an object");
 		const at = this.timestamp();
 		const id = this.id("grant");
-		// Validate the whole grant against a scratch copy first, so journal and apply are atomic.
-		try {
-			team.budget.validateGrant({ id, scope, increments: copy(incrementsValue), reason, at });
-		} catch (error) {
-			fail("INVALID_ARGUMENT", error instanceof Error ? error.message : String(error));
-		}
+		// Validate the whole grant first, so journal and apply are atomic.
+		const scope = this.validateHostGrant(team, scopeValue, incrementsValue, { id, reason, at });
 		const grant = { id, actor: "@host" as const, scope, increments: copy(incrementsValue), reason, at };
 		if (!this.tryJournal(team, { version: 2, kind: "grant", teamId, at, grant })) {
 			this.applyJournalFailure(team);
@@ -544,6 +661,98 @@ export class TeamRuntime {
 		this.check(team);
 		this.requestDrain(teamId);
 		return { actor: "@host", status: "applied", teamId, grantId: id, released };
+	}
+
+	/**
+	 * Host preview for an explicit grant: the counters it raises and the budget-held work it would
+	 * requeue. Nothing is applied or journaled; attention/protocol/pause holds are never listed.
+	 */
+	previewGrant(teamId: string, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>): GrantPreview {
+		const team = this.team(teamId);
+		const record = { id: "preview", reason: "preview", at: this.timestamp() };
+		const scope = this.validateHostGrant(team, scopeValue, incrementsValue, record);
+		const proposed = team.budget.clone();
+		proposed.grant({ ...record, scope, increments: copy(incrementsValue) });
+		const rootUsed = scope.kind === "root" ? { ...team.budget.rootUsed(scope.rootId), rootChildren: this.rootChildCount(team, scope.rootId) } : undefined;
+		const changes = Object.keys(incrementsValue).map((counter) => scope.kind === "team"
+			? { counter, used: counter in team.budget.used ? team.budget.used[counter as keyof typeof team.budget.used] : 0,
+				limit: team.limits[counter as keyof TeamBudgetLimits], proposed: proposed.limits[counter as keyof TeamBudgetLimits] }
+			: { counter, used: rootUsed![counter as keyof typeof rootUsed & string] ?? 0,
+				limit: team.budget.rootLimit(scope.rootId, counter as RootGrantCounter), proposed: proposed.rootLimit(scope.rootId, counter as RootGrantCounter) });
+		const released = this.budgetHeld(team).filter(({ rootId, manager }) => !proposed.exhausted(rootId, manager)).map(({ work }) => work);
+		return { scope, changes, released };
+	}
+
+	/** Host inspection of every root budget (the Team view is a bounded summary). */
+	inspectBudget(teamId: string): { limits: TeamBudgetLimits; used: TeamBudgetView["used"]; roots: TeamRootBudgetView[]; grants: TeamBudgetGrantView[] } {
+		const team = this.team(teamId);
+		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
+		return { limits: copy(team.limits), used: { teamWorks: team.ledger.order.length, ...copy(team.budget.used), reservedResultBytes: team.reservedResultBytes },
+			roots: roots.map((record) => team.budget.rootView(record.id, this.rootChildCount(team, record.id))), grants: copy(team.budget.grants) };
+	}
+
+	/** Host view of every current hold with its reason and incident, for explicit release or grant decisions. */
+	listHolds(teamId: string): HostHoldView[] {
+		const team = this.team(teamId);
+		return team.ledger.order.flatMap((id) => {
+			const entry = team.ledger.get(id)!;
+			const version = currentVersion(entry.record);
+			if (!version.hold) return [];
+			const incident = team.incidents.find((item) => item.id === version.hold!.incidentId);
+			return [{ work: { workId: id, revision: entry.record.currentRevision }, assignee: entry.record.assignee, rootId: entry.record.rootId,
+				reason: version.hold.reason, incidentId: version.hold.incidentId, message: incident?.message ?? "", task: previewText(version.task, 512) }];
+		});
+	}
+
+	/** Host view of every work item's current revision (the model-facing status is paginated). */
+	listWorks(teamId: string): TeamWorkSummary[] {
+		return this.workSummaries(this.team(teamId));
+	}
+
+	/** Every Team this runtime generation still retains (live and recent terminal). */
+	listTeams(): TeamTeamView[] {
+		return [...this.teams.values()].map((team) => this.view(team));
+	}
+
+	/** Host observation, coalesced to one call per Team per microtask; listeners must only read. */
+	onChange(listener: (teamId: string) => void): () => void {
+		this.changeListeners.add(listener);
+		return () => { this.changeListeners.delete(listener); };
+	}
+
+	private validateHostGrant(team: TeamState, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>,
+		record: { id: string; reason: string; at: number }): BudgetScope {
+		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
+		let scope: BudgetScope;
+		if (scopeValue?.kind === "team") scope = { kind: "team" };
+		else if (scopeValue?.kind === "root") {
+			const rootId = this.hostId(scopeValue.rootId, "rootId");
+			if (team.ledger.get(rootId)?.record.parent !== undefined || !team.ledger.get(rootId)) fail("UNKNOWN_WORK", `Unknown root ${rootId}`);
+			scope = { kind: "root", rootId };
+		} else fail("INVALID_ARGUMENT", "Grant scope must be the Team or a known root");
+		if (!incrementsValue || typeof incrementsValue !== "object" || Array.isArray(incrementsValue)) fail("INVALID_ARGUMENT", "Grant increments must be an object");
+		try {
+			team.budget.validateGrant({ ...record, scope, increments: copy(incrementsValue) });
+		} catch (error) {
+			fail("INVALID_ARGUMENT", error instanceof Error ? error.message : String(error));
+		}
+		return scope;
+	}
+
+	private budgetHeld(team: TeamState): Array<{ work: WorkRef; rootId: string; manager: boolean }> {
+		return team.ledger.order.flatMap((id) => {
+			const entry = team.ledger.get(id)!;
+			const version = currentVersion(entry.record);
+			return version.state === "blocked" && version.hold?.reason === "budget"
+				? [{ work: { workId: id, revision: entry.record.currentRevision }, rootId: entry.record.rootId, manager: entry.record.assignee === team.manager }] : [];
+		});
+	}
+
+	private rootChildCount(team: TeamState, rootId: string): number {
+		return team.ledger.order.filter((id) => {
+			const record = team.ledger.get(id)!.record;
+			return record.rootId === rootId && record.parent !== undefined;
+		}).length;
 	}
 
 	/** Requeue budget-held work whose Team/root budget now allows execution; resolve lifted budget incidents. */
@@ -582,6 +791,7 @@ export class TeamRuntime {
 
 	/** Critical history write. Returns false (and records the failure) instead of publishing an unjournaled fact. */
 	private tryJournal(team: TeamState, record: TeamJournalRecord): boolean {
+		if (this.journalRetiredForHostTransition) return true;
 		if (!this.journalGeneration) return true;
 		try {
 			this.journalGeneration.write(record);
@@ -1304,10 +1514,24 @@ export class TeamRuntime {
 		return result ? copy(result) : undefined;
 	}
 
+	listResultRefsPage(teamId: string, cursor?: string, limit = TEAM_STATUS_DEFAULT_LIMIT): {
+		items: Array<{ id: string; work: WorkRef; author: string; status: WorkResult["status"]; summaryPreview: string }>;
+		cursor?: string; hasMore: boolean; total: number;
+	} {
+		const team = this.team(teamId);
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > TEAM_STATUS_MAX_LIMIT) fail("INVALID_ARGUMENT", `Result page limit must be 1-${TEAM_STATUS_MAX_LIMIT}`);
+		const offset = cursor ? this.cursorOffset(cursor) : 0;
+		const summaries = this.resultSummaries(team);
+		const items = summaries.slice(offset, offset + limit);
+		const next = offset + items.length;
+		return { items, ...(next < summaries.length ? { cursor: `page:${next}` } : {}), hasMore: next < summaries.length, total: summaries.length };
+	}
+
 	getTeamResult(teamId: string): TeamResult | undefined {
 		const team = this.team(teamId);
 		if (["prepared", "active", "closing"].includes(team.lifecycle)) return undefined;
 		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
+		const unresolvedIncidents = team.incidents.filter((incident) => incident.state === "open");
 		return {
 			version: TEAM_PROTOCOL_VERSION,
 			teamId: team.id,
@@ -1315,14 +1539,17 @@ export class TeamRuntime {
 			...(team.outcome ? { outcome: team.outcome } : {}),
 			...(team.reason ? { reason: team.reason } : {}),
 			finalResultRefs: copy(team.closeDecision?.resultRefs ?? []),
-			roots: roots.map((record) => {
+			roots: team.closeDecision ? copy(team.closeDecision.roots) : roots.map((record) => {
 				const version = currentVersion(record);
 				return { work: { workId: record.id, revision: record.currentRevision }, state: version.state,
 					...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: copy(version.review) } : {}) };
 			}),
 			members: [...team.members.values()].map(({ id, role, lifecycle, resourceState }) => ({ id, role, lifecycle, resourceState })),
 			usage: copy(team.usage),
-			unresolvedIncidents: team.incidents.filter((incident) => incident.state === "open").map(({ id, code, message }) => ({ id, code, message })),
+			unresolvedIncidents: unresolvedIncidents.slice(-TEAM_MAX_TERMINAL_INCIDENTS).map(({ id, code, message }) => ({ id, code, message })),
+			...(unresolvedIncidents.length > TEAM_MAX_TERMINAL_INCIDENTS
+				? { unresolvedIncidentsOmitted: unresolvedIncidents.length - TEAM_MAX_TERMINAL_INCIDENTS }
+				: {}),
 		};
 	}
 
@@ -1719,9 +1946,14 @@ export class TeamRuntime {
 		if (active.intent) fail("ACTIVATION_ENDING", "Manager activation already staged another intent");
 		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
 		const closeId = this.id("close");
+		const rootSnapshot: TeamResult["roots"] = roots.map((root) => {
+			const version = currentVersion(root);
+			return { work: { workId: root.id, revision: root.currentRevision }, state: version.state,
+				...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: copy(version.review) } : {}) };
+		});
 		this.writeJournal(team, { version: 2, kind: "close_decision", teamId: team.id, at: this.timestamp(), closeId, outcome,
-			resultRefs: copy(resultRefs), ...(reason ? { reason } : {}) });
-		team.closeDecision = { id: closeId, outcome, ...(reason ? { reason } : {}), resultRefs: copy(resultRefs) };
+			resultRefs: copy(resultRefs), roots: copy(rootSnapshot), ...(reason ? { reason } : {}) });
+		team.closeDecision = { id: closeId, outcome, ...(reason ? { reason } : {}), resultRefs: copy(resultRefs), roots: copy(rootSnapshot) };
 		team.lifecycle = "closing";
 		team.outcome = outcome;
 		if (reason) team.reason = reason;
@@ -2159,21 +2391,51 @@ export class TeamRuntime {
 		this.addEvent(team, { key: `quiescent:${signature}`, kind: "TEAM_QUIESCENT", message: "No work is runnable; review blocked work or decide whether to close", });
 	}
 
-	private cancelDescendants(team: TeamState, ref: WorkRef, state: "cancelled" | "superseded"): void {
+	private cancelDescendants(team: TeamState, ref: WorkRef, state: "cancelled" | "superseded", unknownActiveOutcome = false): void {
 		for (const child of team.ledger.openSubtree(ref)) {
 			const version = team.ledger.version(child)!;
+			const member = team.members.get(team.ledger.get(child.workId)!.record.assignee)!;
+			const active = member.active?.scope.kind === "work" && sameWorkRef(member.active.scope.work!, child);
 			version.state = state;
 			version.waitingFor = [];
 			version.updatedAt = this.timestamp();
-			version.error = { code: state.toUpperCase(), message: `Parent work ${workRefKey(ref)} was ${state}` };
+			version.error = { code: state.toUpperCase(), message: `Parent work ${workRefKey(ref)} was ${state}`,
+				...(unknownActiveOutcome && active ? { outcomeUnknown: true } : {}) };
 			delete team.ledger.get(child.workId)!.stagedWait;
-			const member = team.members.get(team.ledger.get(child.workId)!.record.assignee)!;
-			if (member.active?.scope.kind === "work" && sameWorkRef(member.active.scope.work!, child)) {
-				member.active.stopReason = state;
+			if (active) {
+				member.active!.stopReason = state;
 				team.ledger.cleanupPending.add(workRefKey(child));
 				this.requestActivationStop(team, member, state === "superseded" ? "policy_superseded" : "policy_cancelled");
 			}
 			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, child));
+		}
+	}
+
+	private stopMemberWork(team: TeamState, member: RuntimeMember, reason: string): void {
+		for (const id of team.ledger.order) {
+			const entry = team.ledger.get(id)!;
+			const record = entry.record;
+			if (record.assignee !== member.id && record.requester !== member.id) continue;
+			const ref = team.ledger.currentRef(id)!;
+			const version = team.ledger.version(ref)!;
+			if (isTerminalWorkState(version.state)) continue;
+			const activeMember = team.members.get(record.assignee)!;
+			const active = activeMember.active?.scope.kind === "work" && sameWorkRef(activeMember.active.scope.work!, ref);
+			const assignedToStoppedMember = record.assignee === member.id;
+			version.state = assignedToStoppedMember ? "failed" : "cancelled";
+			version.error = { code: "MEMBER_UNAVAILABLE", message: `${member.id} stopped by the host: ${reason}`,
+				...(active ? { outcomeUnknown: true } : {}) };
+			version.waitingFor = [];
+			delete version.hold;
+			version.updatedAt = this.timestamp();
+			delete entry.stagedWait;
+			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+			if (active) {
+				activeMember.active!.stopReason = "cancelled";
+				team.ledger.cleanupPending.add(workRefKey(ref));
+				this.requestActivationStop(team, activeMember, "policy_cancelled");
+			}
+			this.cancelDescendants(team, ref, "cancelled", true);
 		}
 	}
 
@@ -2443,7 +2705,8 @@ export class TeamRuntime {
 			team.terminalJournaled = true;
 			const terminal = this.getTeamResult(team.id);
 			// A closed success is only reported once its terminal history is written.
-			if (terminal && !this.tryJournal(team, { version: 2, kind: "terminal", teamId: team.id, at: this.timestamp(), result: terminal })) {
+			if (terminal && !this.tryJournal(team, { version: 2, kind: "terminal", teamId: team.id, at: this.timestamp(),
+				...(team.closeDecision ? { closeId: team.closeDecision.id } : {}), result: terminal })) {
 				this.applyJournalFailure(team);
 			}
 		}
@@ -2622,10 +2885,7 @@ export class TeamRuntime {
 		}));
 		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
 		const used: TeamBudgetView["used"] = { teamWorks: team.ledger.order.length, ...team.budget.used, reservedResultBytes: team.reservedResultBytes };
-		const rootChildren = (rootId: string) => team.ledger.order.filter((id) => {
-			const record = team.ledger.get(id)!.record;
-			return record.rootId === rootId && record.parent !== undefined;
-		}).length;
+		const rootChildren = (rootId: string) => this.rootChildCount(team, rootId);
 		// Bounded summaries (one private reply frame): exhausted, then granted, then used roots; untouched
 		// roots show the Team-wide default limits. Open incidents first, then the newest resolved ones.
 		const budgetRoots = roots.map((record) => team.budget.rootView(record.id, rootChildren(record.id)))
@@ -2713,7 +2973,23 @@ export class TeamRuntime {
 		if (!team) fail("UNKNOWN_WORK", `Unknown Team ${id}`);
 		return team;
 	}
-	private changed(team: TeamState): void { team.stateVersion++; }
+	private changed(team: TeamState): void {
+		team.stateVersion++;
+		if (!this.changeListeners.size) return;
+		const first = this.pendingNotifications.size === 0;
+		this.pendingNotifications.add(team.id);
+		if (first) queueMicrotask(() => this.flushChanges());
+	}
+
+	private flushChanges(): void {
+		const teamIds = [...this.pendingNotifications];
+		this.pendingNotifications.clear();
+		for (const teamId of teamIds) {
+			for (const listener of [...this.changeListeners]) {
+				try { listener(teamId); } catch { /* An observer failure never affects Team state. */ }
+			}
+		}
+	}
 
 	private check(team: TeamState): void {
 		const ready = new Set<string>();

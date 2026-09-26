@@ -24,23 +24,6 @@ import type { RailModelRef } from "../../tools/subagents/models";
 import { RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 import type { BindingV2 } from "../../tools/subagents/team-protocol";
 
-test("legacy v1 Team dispatch is rejected before creating or reserving a child", async () => {
-	const store = new MemoryInstanceStore();
-	const roster = new MemoryRoster();
-	let starts = 0;
-	const broker = new SessionBroker({ store, roster, workerFactory: async () => { starts++; return new FakeWorker("legacy-team", "/tmp/legacy-team.jsonl"); } });
-	try {
-		await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "team-A", task: "work", team: {
-			binding: { version: 1, teamId: "team", memberId: "A", role: "coordinator", epoch: "epoch" },
-			onRequest: async () => ({ ok: true }),
-			afterRun: async () => "legacy continuation",
-		} }), /Legacy v1 Team dispatch is retired/u);
-		assert.equal(starts, 0);
-		assert.equal(roster.resolve("team-A"), undefined);
-		assert.deepEqual(await store.list(), []);
-	} finally { await broker.shutdown(); }
-});
-
 test("ordinary dispatch preserves the native run and usage objects", async () => {
 	const worker = new FakeWorker("ordinary", "/tmp/ordinary.jsonl");
 	const native = { output: "unchanged", usage: emptyUsage() };

@@ -1,4 +1,3 @@
-import type { TeamDispatchChannel, TeamWorkerChannel } from "./team-protocol-v1";
 import type { BindingV2, ChildRequestFrame, PrivateReply } from "./team-protocol";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
@@ -51,7 +50,7 @@ export interface WorkerStartSpec {
 	sessionPath?: string;
 	fastMode?: boolean;
 	/** Team actors load only the private v2 extension; ordinary sessions load no live Team protocol. */
-	teamProtocolVersion?: 1 | 2;
+	teamProtocolVersion?: 2;
 }
 
 export interface TeamMemberProtocolSession {
@@ -68,7 +67,6 @@ export interface TeamMemberProtocolSession {
 }
 
 export interface WorkerSendOptions {
-	team?: TeamWorkerChannel;
 	contextWindow?: number;
 	signal?: AbortSignal;
 	onUpdate?: (result: WorkerRunResult) => void;
@@ -148,7 +146,6 @@ export interface SessionSource {
 }
 
 export interface DispatchRequest {
-	team?: TeamDispatchChannel;
 	model?: RailModelRef;
 	target?: string;
 	alias?: string;
@@ -242,7 +239,26 @@ interface WorkerState {
 interface OwnedTeamMember {
 	owner: symbol;
 	alias: string;
+	teamId: string;
+	memberId: string;
+	close?: () => Promise<TeamMemberCloseResult>;
 }
+
+/** Thrown when an ordinary lifecycle/policy path touches a member whose lifetime a Team owns. */
+export class TeamOwnedError extends Error {
+	readonly code = "TEAM_OWNED";
+	constructor(message: string) {
+		super(message);
+		this.name = "TeamOwnedError";
+	}
+}
+
+export type TeamLifecycleRequest =
+	| { scope: "member"; teamId: string; memberId: string; action: "stop" | "delete" }
+	| { scope: "team"; teamId: string; reason: string; mode: "interrupt" };
+
+/** Team member stop/delete is scoped; only session lifecycle shutdown interrupts a whole Team. */
+export type TeamLifecycleRouter = (request: TeamLifecycleRequest) => Promise<void>;
 
 /**
  * Fast policy and model must always be read and written as one descriptor:
@@ -307,6 +323,8 @@ function freshWorkerState(instance: AgentInstance, worker: SessionWorker): Worke
 	};
 }
 
+const TEAM_EXIT_RECHECK_TIMEOUT_MS = 5_000;
+
 class TeamActiveError extends Error {}
 
 export class SessionBroker {
@@ -325,6 +343,8 @@ export class SessionBroker {
 	private readonly aliasLeaseManager: { acquire(key: string): Promise<SessionLease> } | undefined;
 	private readonly runtimeListeners = new Set<() => void>();
 	private shuttingDown = false;
+	private teamRouter: TeamLifecycleRouter | undefined;
+	private shutdownTask: Promise<void> | undefined;
 	private readonly lifecycleEpochs = new Map<string, number>();
 	private readonly runtimeErrors = new Map<string, string>();
 	private readonly stoppingAgents = new Set<string>();
@@ -349,7 +369,6 @@ export class SessionBroker {
 
 	async dispatch(request: DispatchRequest): Promise<DispatchResult> {
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
-		if (request.team) throw new Error("Legacy v1 Team dispatch is retired; TeamRuntime must schedule Broker-owned v2 member lifetimes");
 		if (!request.task.trim()) throw new Error("Subagent task cannot be empty");
 		const contextWindow = normalizeContextWindow(request.contextWindow);
 		if (request.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
@@ -362,7 +381,7 @@ export class SessionBroker {
 		}
 		const requestedAgentId = request.target ? (this.roster.resolve(request.target) ?? request.target) : undefined;
 		if (request.target && (this.teamAliases.has(request.target) || (requestedAgentId && this.teamMemberHandles.has(requestedAgentId)))) {
-			throw new Error("Subagent target has an active team operation");
+			throw new TeamOwnedError("Subagent target has an active team operation; Team-owned members accept actions only through TeamRuntime");
 		}
 		const expectedEpoch = requestedAgentId ? this.lifecycleEpoch(requestedAgentId) : undefined;
 		if (request.target && request.fastMode !== undefined && request.fastMode !== null) {
@@ -386,7 +405,7 @@ export class SessionBroker {
 				: await this.resolveInstance(request.target!);
 			const resolvedInstance = instance;
 			if (this.teamMemberHandles.has(resolvedInstance.agentId)
-				|| this.teamAliases.has(resolvedInstance.alias)) throw new TeamActiveError("Subagent target has an active team operation");
+				|| this.teamAliases.has(resolvedInstance.alias)) throw new TeamOwnedError("Subagent target has an active team operation; Team-owned members accept actions only through TeamRuntime");
 			if (this.shuttingDown || this.stoppingAgents.has(resolvedInstance.agentId) || this.deletingAgents.has(resolvedInstance.agentId)
 				|| (expectedEpoch !== undefined && this.lifecycleEpoch(resolvedInstance.agentId) !== expectedEpoch)) {
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
@@ -478,7 +497,7 @@ export class SessionBroker {
 		if (!message) throw new Error("Subagent control message cannot be empty");
 		if (request.signal?.aborted) throw new Error("Subagent control was aborted before delivery");
 		const agentId = this.roster.resolve(request.target) ?? request.target;
-		if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned members accept actions only through TeamRuntime");
+		if (this.teamMemberHandles.has(agentId)) throw new TeamOwnedError("Team-owned members accept actions only through TeamRuntime");
 		if (this.shuttingDown || this.stoppingAgents.has(agentId) || this.deletingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
 		if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
 		const state = this.workers.get(agentId);
@@ -574,7 +593,7 @@ export class SessionBroker {
 				...(request.fastMode !== undefined ? { fastMode: request.fastMode } : {}), teamProtocolVersion: 2 });
 			state = this.workers.get(instance.agentId);
 			if (!state || !state.worker.openTeamMemberV2) throw new Error("Team v2 session worker capability is unavailable");
-			this.teamMemberHandles.set(instance.agentId, { owner, alias });
+			this.teamMemberHandles.set(instance.agentId, { owner, alias, teamId: binding.teamId, memberId: binding.memberId });
 			protocol = await state.worker.openTeamMemberV2(binding, (error) => {
 				this.runtimeErrors.set(instance!.agentId, error.message);
 				this.emitRuntimeChange();
@@ -598,12 +617,19 @@ export class SessionBroker {
 				closing = (async () => {
 					if (!protocolCloseAttempted) {
 						protocolCloseAttempted = true;
-						try { await this.enqueue(ownedState, () => ownedProtocol.close()); }
+						try { await this.enqueue(ownedState, () => ownedProtocol.close(), "maintenance", true); }
 						catch (error) { protocolCloseError = error; }
 					}
 					if (!exitConfirmed && exitWait) {
-						try { await exitWait; exitConfirmed = true; exitStopError = undefined; }
-						catch (error) { exitStopError = error; }
+						let timer: ReturnType<typeof setTimeout> | undefined;
+						try {
+							await Promise.race([exitWait, new Promise<never>((_resolve, reject) => {
+								timer = setTimeout(() => reject(new RpcProcessExitTimeoutError(`Team member ${alias} exit remains unconfirmed`, exitWait!)), TEAM_EXIT_RECHECK_TIMEOUT_MS);
+							})]);
+							exitConfirmed = true;
+							exitStopError = undefined;
+						} catch (error) { exitStopError = error; }
+						finally { if (timer) clearTimeout(timer); }
 					} else if (!exitConfirmed && !exitStopError) {
 						try {
 							await this.stopProcess(ownedInstance.agentId, ownedState);
@@ -657,6 +683,8 @@ export class SessionBroker {
 				terminate: (error) => ownedProtocol.terminate(error),
 				close: closeHandle,
 			};
+			const owned = this.teamMemberHandles.get(instance.agentId);
+			if (owned?.owner === owner) owned.close = closeHandle;
 			return handle;
 		} catch (error) {
 			// Once a child instance exists, retain its session and ownership on any
@@ -665,25 +693,21 @@ export class SessionBroker {
 				const failedState = state ?? this.workers.get(instance.agentId);
 				if (failedState) {
 					if (!this.shuttingDown) {
-						this.teamMemberHandles.set(instance.agentId, { owner, alias });
+						this.teamMemberHandles.set(instance.agentId, { owner, alias, teamId: binding.teamId, memberId: binding.memberId });
 						this.runtimeErrors.set(instance.agentId, error instanceof Error ? error.message : String(error));
 					}
 					try {
 						await this.stopProcess(instance.agentId, failedState);
 						await Promise.allSettled([failedState.tail, failedState.controlTail]);
-						if (!this.shuttingDown) {
-							releaseOwnership();
-							this.runtimeErrors.delete(instance.agentId);
-						}
+						releaseOwnership();
+						this.runtimeErrors.delete(instance.agentId);
 					} catch (stopError) {
 						if (stopError instanceof RpcProcessExitTimeoutError) {
 							this.unreaped.set(instance!.agentId, stopError.exited);
 							void stopError.exited.then(() => {
 								this.unreaped.delete(instance!.agentId);
-								if (!this.shuttingDown) {
-									releaseOwnership();
-									this.runtimeErrors.delete(instance!.agentId);
-								}
+								releaseOwnership();
+								this.runtimeErrors.delete(instance!.agentId);
 								this.emitRuntimeChange();
 							}, () => undefined);
 						}
@@ -691,6 +715,9 @@ export class SessionBroker {
 					}
 					this.emitRuntimeChange();
 				}
+			} else if (this.teamAliasOwners.get(alias) === owner) {
+				this.teamAliases.delete(alias);
+				this.teamAliasOwners.delete(alias);
 			}
 			throw error;
 		}
@@ -784,17 +811,37 @@ export class SessionBroker {
 		return this.workers.has(agentId) || this.workerStarts.has(agentId);
 	}
 
+	/** Install the host's Team route used by stop/delete; without one, Team-owned members are refused. */
+	setTeamLifecycleRouter(router: TeamLifecycleRouter | undefined): void {
+		this.teamRouter = router;
+	}
+
+	/**
+	 * Stop/delete of a Team-owned member stops its Team first and waits for the member's exit. Only a
+	 * confirmed release lets the ordinary path continue, so no late callback can revive a deleted member.
+	 */
+	private async releaseTeamOwnership(agentId: string, action: "stop" | "delete"): Promise<void> {
+		const owned = this.teamMemberHandles.get(agentId);
+		if (!owned) return;
+		if (!this.teamRouter) throw new TeamOwnedError("Team-owned members must be released by TeamRuntime");
+		await this.teamRouter({ scope: "member", teamId: owned.teamId, memberId: owned.memberId, action });
+		if (this.teamMemberHandles.get(agentId)?.owner === owned.owner) {
+			throw new TeamOwnedError(`Team member ${owned.memberId} exit is not confirmed; its Team ownership is retained`);
+		}
+	}
+
 	async stop(target: string): Promise<AgentInstance | undefined> {
 		const agentId = this.roster.resolve(target) ?? target;
-		if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned members must be released by TeamRuntime");
 		if (this.fastModeChanges.has(agentId) || this.modelChanges.has(agentId)) {
 			throw new Error("Subagent maintenance operation is already pending");
 		}
+		if (this.stoppingAgents.has(agentId) || this.deletingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
 		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
 		this.stoppingAgents.add(agentId);
 		const state = this.workers.get(agentId);
 		if (state) state.stopping = true;
 		try {
+			await this.releaseTeamOwnership(agentId, "stop");
 			const instance = await this.resolveInstance(target).catch(() => undefined);
 			if (!instance) return undefined;
 			await this.stopWorker(instance.agentId);
@@ -806,14 +853,14 @@ export class SessionBroker {
 
 	async setFastMode(target: string, enabled: boolean, options: { sessionLeaseHeld?: boolean } = {}): Promise<AgentInstance> {
 		const requestedAgentId = this.roster.resolve(target) ?? target;
-		if (this.teamMemberHandles.has(requestedAgentId)) throw new Error("Team-owned member policy is pinned for its lifetime");
+		if (this.teamMemberHandles.has(requestedAgentId)) throw new TeamOwnedError("Team-owned member policy is pinned for its lifetime");
 		if (this.deletingAgents.has(requestedAgentId)) throw new Error("Subagent is being deleted");
 		if (this.fastModeChanges.has(requestedAgentId)) throw new Error("Subagent fast mode is already changing");
 		const change = (async () => {
 			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 			const instance = await this.resolveInstance(target);
 			const agentId = instance.agentId;
-			if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned member policy is pinned for its lifetime");
+			if (this.teamMemberHandles.has(agentId)) throw new TeamOwnedError("Team-owned member policy is pinned for its lifetime");
 			if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 			if (this.deletingAgents.has(agentId)) throw new Error("Subagent is being deleted");
 			if (this.workerStarts.has(agentId)) throw new Error("Subagent worker is still starting");
@@ -853,7 +900,7 @@ export class SessionBroker {
 
 	async changeModel(target: string, model: RailModelRef): Promise<AgentInstance> {
 		const instance = await this.resolveInstance(target);
-		if (this.teamMemberHandles.has(instance.agentId)) throw new Error("Team-owned member policy is pinned for its lifetime");
+		if (this.teamMemberHandles.has(instance.agentId)) throw new TeamOwnedError("Team-owned member policy is pinned for its lifetime");
 		if (this.shuttingDown) throw new Error("Subagent broker is shutting down");
 		if (this.deletingAgents.has(instance.agentId)) throw new Error("Subagent is being deleted");
 		if (this.workerStarts.has(instance.agentId)) throw new Error("Subagent worker is still starting");
@@ -904,27 +951,80 @@ export class SessionBroker {
 		}
 	}
 
-	async shutdown(): Promise<void> {
+	shutdown(): Promise<void> {
+		if (this.shutdownTask) return this.shutdownTask;
+		const task = this.shutdownOwnedResources();
+		this.shutdownTask = task;
+		void task.catch(() => { if (this.shutdownTask === task) this.shutdownTask = undefined; });
+		return task;
+	}
+
+	private async shutdownOwnedResources(): Promise<void> {
 		this.shuttingDown = true;
 		for (const state of this.workers.values()) state.stopping = true;
-		// Stop active sends before awaiting model changes queued behind them.
+		const failures: unknown[] = [];
+		const routedTeams = new Set<string>();
+		const routeOwnedTeams = async (): Promise<void> => {
+			const teamOwners = new Map<string, OwnedTeamMember>();
+			for (const owned of this.teamMemberHandles.values()) teamOwners.set(owned.teamId, owned);
+			for (const owned of teamOwners.values()) {
+				if (routedTeams.has(owned.teamId)) continue;
+				routedTeams.add(owned.teamId);
+				if (this.teamRouter) {
+					try { await this.teamRouter({ scope: "team", teamId: owned.teamId, reason: "Subagent broker shutdown", mode: "interrupt" }); }
+					catch (error) { failures.push(error); }
+					continue;
+				}
+				// Standalone Broker users may own native Team handles without a host Runtime. In that
+				// case still confirm process exits directly; production installs the Runtime router above.
+				for (const [agentId, member] of [...this.teamMemberHandles]) {
+					if (member.teamId !== owned.teamId) continue;
+					try {
+						if (member.close) {
+							const closed = await member.close();
+						if (closed.protocolError) failures.push(new Error(`Team member ${member.memberId} exited with a protocol cleanup error: ${closed.protocolError}`));
+						continue;
+					}
+						if (!this.workers.has(agentId)) throw new TeamOwnedError(`Team member ${member.memberId} has no Broker worker state to confirm its exit`);
+						await this.stopWorker(agentId);
+						if (this.unreaped.has(agentId)) throw new TeamOwnedError(`Team member ${member.memberId} exit remains unconfirmed`);
+						if (this.teamMemberHandles.get(agentId)?.owner === member.owner) this.teamMemberHandles.delete(agentId);
+						if (this.teamAliasOwners.get(member.alias) === member.owner) {
+							this.teamAliases.delete(member.alias);
+							this.teamAliasOwners.delete(member.alias);
+						}
+					} catch (error) { failures.push(error); }
+				}
+			}
+		};
+		await routeOwnedTeams();
+		// Team stop routes revoke scopes and confirm exits first. Only then may ordinary workers be
+		// stopped directly; an unknown Team exit keeps its exact lease and descriptor owner intact.
 		await Promise.allSettled([...this.workerStarts.values(), ...this.instanceCreations, ...this.fastModeChanges.values()]);
-		const states = Array.from(this.workers.values());
-		this.workers.clear();
-		for (const state of states) state.stopping = true;
-		await Promise.allSettled(states.map((state) => state.worker.stop()));
+		// A Team lifetime may have acquired its Broker lease while the first route was waiting for
+		// startup; route only previously unseen Teams here, never auto-retry an uncertain first close.
+		await routeOwnedTeams();
+		const teamOwnedAgentIds = new Set(this.teamMemberHandles.keys());
+		for (const state of this.workers.values()) if (this.teamAliases.has(state.instance.alias)) teamOwnedAgentIds.add(state.instance.agentId);
+		const ordinaryStates = [...this.workers.entries()].filter(([agentId]) => !teamOwnedAgentIds.has(agentId));
+		for (const [agentId] of ordinaryStates) this.workers.delete(agentId);
+		for (const [, state] of ordinaryStates) state.stopping = true;
+		const ordinary = ordinaryStates.map(([, state]) => state);
+		const stopped = await Promise.allSettled(ordinary.map((state) => state.worker.stop()));
+		for (const outcome of stopped) if (outcome.status === "rejected") failures.push(outcome.reason);
 		await Promise.allSettled(this.modelChanges.values());
-		await Promise.allSettled(states.flatMap((state) => [state.tail, state.controlTail]));
-		this.teamMemberHandles.clear();
-		this.teamAliases.clear();
-		this.teamAliasOwners.clear();
+		await Promise.allSettled(ordinary.flatMap((state) => [state.tail, state.controlTail]));
+		if (this.teamMemberHandles.size) {
+			failures.push(new TeamOwnedError(`Broker shutdown retains ${this.teamMemberHandles.size} Team-owned member lease(s) because their exits are unconfirmed`));
+		}
 		this.emitRuntimeChange();
+		if (failures.length) throw new AggregateError(failures, "Broker shutdown could not confirm every Team-owned exit");
 	}
 
 	async detach(target: string): Promise<AgentInstance | undefined> {
 		const instance = await this.resolveInstance(target).catch(() => undefined);
 		if (!instance) return undefined;
-		if (this.teamMemberHandles.has(instance.agentId)) throw new Error("Team-owned members cannot be detached during their lifetime");
+		if (this.teamMemberHandles.has(instance.agentId)) throw new TeamOwnedError("Team-owned members cannot be detached during their lifetime");
 		const links = this.roster.list();
 		const alias = links.some((link) => link.alias === target)
 			? target
@@ -936,7 +1036,6 @@ export class SessionBroker {
 
 	async delete(target: string): Promise<AgentInstance | undefined> {
 		const agentId = this.roster.resolve(target) ?? target;
-		if (this.teamMemberHandles.has(agentId)) throw new Error("Team-owned members must be released by TeamRuntime");
 		if (this.deletingAgents.has(agentId)) throw new Error("Subagent is already being deleted");
 		this.deletingAgents.add(agentId);
 		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
@@ -944,6 +1043,7 @@ export class SessionBroker {
 		if (state) state.stopping = true;
 		this.emitRuntimeChange();
 		try {
+			await this.releaseTeamOwnership(agentId, "delete");
 			const pending = [this.fastModeChanges.get(agentId), this.modelChanges.get(agentId)]
 				.filter((operation): operation is Promise<AgentInstance> => operation !== undefined);
 			if (pending.length > 0) await Promise.allSettled(pending);
@@ -1132,7 +1232,7 @@ export class SessionBroker {
 		return true;
 	}
 
-	private async enqueue<T>(state: WorkerState, operation: () => Promise<T>, kind: "run" | "maintenance" = "maintenance"): Promise<T> {
+	private async enqueue<T>(state: WorkerState, operation: () => Promise<T>, kind: "run" | "maintenance" = "maintenance", allowDuringShutdown = false): Promise<T> {
 		state.queued++;
 		this.emitRuntimeChange();
 		const run = async () => {
@@ -1147,7 +1247,7 @@ export class SessionBroker {
 				}
 			}
 			state.queued--;
-			if (this.shuttingDown) {
+			if (this.shuttingDown && !allowDuringShutdown) {
 				this.emitRuntimeChange();
 				throw new Error("Subagent broker is shutting down");
 			}

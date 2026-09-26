@@ -1,8 +1,8 @@
 # Team Actor v2：协议与阶段性交接
 
-> **底层 Runtime/driver 的 C1b 控制与安全结算已落地；Team 用户入口仍未迁移，不是可发布功能。** `TeamMemberDriver.launch` 现驱动完整 Team lifetime；旧 `subagent_team` 入口和 D 层父级 stop/delete/UI 路由尚未迁移，Broker 仍拒绝旧 v1 dispatch。
+> **D1 Team 父层入口、session lifecycle 接线、结果分页和成员级 Broker 路由已进入当前实现；仍处于父级审查，不应据此视为发布验收完成。** `subagent_team` 使用 Manager/worker prepare→launch；Team 专属 100 场景/I01–I30 矩阵并未在本轮宣称通过。
 >
-> `pi-rail-ui-team-actor-development-spec.md` 是完整目标，本文不替代它，也不缩减其契约；C1b 的离线验证包括 Runtime/fake-latch、真实 Pi 合成 provider 与现有普通 subagent 回归。
+> `pi-rail-ui-team-actor-development-spec.md` 是完整目标，本文不替代它，也不缩减其契约。当前离线证据包括 Runtime、真实 Pi 合成 provider、实际 SessionBroker/TeamMemberDriver 成员 stop/delete、index 注册 lifecycle hooks、历史 round-trip 及普通 subagent 回归。
 
 ## 对象和权威状态
 
@@ -80,9 +80,9 @@ Manager-only 控制还包括 pause/resume、修订、取消、resume_work、验�
 
 usage 由 `team-rpc-v2` 以 `RunResultCollector` 只收集本次 send 的 native 事件，`agent_settled` 时冻结并随 `NativeCompletion.usage` 上报；send 在 settle 前失败时冻结已观察到的部分 usage，放在 `TeamActivationFailure.usage`，driver 转交 `activationLost(..., usage)`。Runtime 对一个 activation 只累加一次（settle 与 lost 互斥：已 settle 的不能再按 lost 计费，已隔离的迟到 settle 被拒绝；重复报告幂等；格式错误的 lost usage 不计费也不阻止隔离），`contextTokens` 取最近非零值而不求和；取消/中止的 activation 保留其真实成本。
 
-公开 team view 是有界摘要，保证放入一个 1 MiB 私有 reply 帧：`incidents` 最多 32 条（先 open 后最近 resolved，`incidentsOmitted` 计余数），`budget.roots` 最多 32 个（先耗尽、再有 grant、再有使用，`rootsOmitted`），`budget.grants` 为最近 16 条（`grantsOmitted`）。work/result/incident 完整列表通过分页的 status 读取；被截断的 root 预算明细（`rootsOmitted`）目前**没有**查询接口，只有数量，由 D 的宿主 UI inspect 实现，不作为模型动作。incident 消息、成员错误和 Team reason 超过 4 KiB 时截为预览。
+公开 team view 是有界摘要，保证放入一个 1 MiB 私有 reply 帧：`incidents` 最多 32 条（先 open 后最近 resolved，`incidentsOmitted` 计余数），`budget.roots` 最多 32 个（先耗尽、再有 grant、再有使用，`rootsOmitted`），`budget.grants` 为最近 16 条（`grantsOmitted`）。Manager 的 work/result/incident 查询使用分页 status；完整 ResultRecord 通过显式 resultRef 获取。父层 `subagent_team status` 只返回有界 resultRef 页，`/rail-team budget` 可检查全部 root 预算。Team view 中被截断的 root 预算明细由该宿主命令读取，不作为模型动作。incident 消息、成员错误和 Team reason 超过 4 KiB 时截为预览。
 
-`TeamRuntimeOptions.journal` 接收 `TeamJournalGeneration`（`team-journal.ts`）。同步写入的仅为有界历史事实：launched、result（提交前）、revise/cancel 决定、close_decision、grant、terminal；gate/ACK/status/cleanup 不写，也不序列化整个账本。写入失败时 fail closed：launch 保持 prepared；结果版本为 `failed`/`JOURNAL_FAILURE` 且不发布；决定和 grant 不生效；Team 在安全点转为 failed；terminal 写失败时报告 failed 而非 closed。generation 可永久 `deactivate()`，之后写入均失败。D 负责把它接到 session/index 并在切换时停用。
+`TeamRuntimeOptions.journal` 接收 `TeamJournalGeneration`（`team-journal.ts`）。同步写入的仅为有界历史事实：launched、result（提交前）、revise/cancel 决定、close_decision、grant、terminal；gate/ACK/status/cleanup 不写，也不序列化整个账本。写入失败时 fail closed：launch 保持 prepared；结果版本为 `failed`/`JOURNAL_FAILURE` 且不发布；决定和 grant 不生效；Team 在安全点转为 failed；terminal 写失败时报告 failed 而非 closed。generation 可永久 `deactivate()`，之后写入均失败。`TeamSessionHost` 将 generation 接入当前 session branch；tree/switch/shutdown 会先尝试写 interruption marker，再封存 writer，并等待原生资源清理。marker 写失败会记录可见的 host diagnostic，不伪装为 durable success。
 
 ## 原生输入及提交边界
 
@@ -99,31 +99,22 @@ ACK 超时只约束私有命令，不给正常业务运行附加五秒期限。�
 
 正常资源关闭保留 persistent session 和 descriptor。未知 exit 不能作为 ownership 释放证据。Manager 只装载 Team 工具；worker 保留已有允许的基础工具但禁用递归 subagent；绑定期间停用 cache warming，不修改全局设置。
 
-## 当前只可用于底层开发验证
+## D1 当前入口与行为边界
 
-`TeamMemberDriver.launch` 绑定全部 native member 后启动 Runtime effect drain，并返回等待已确认 Team 关闭/取消的 lifetime Promise；`runNext` 只保留为纯/手动测试 seam。宿主可通过非模型 `HostControl` 发起 `cancel_team`、`release_hold`、`message_manager`；Manager pause/resume、精确 `resume_work`、激活级取消/修订、deadline 和 Manager fault 停驻均由 Runtime 管理。
+`subagent_team.prepare` 校验 Manager/worker、brief、initialRequests 和所有固定策略；通过后不启动 native member/provider。`launch` 由 `TeamMemberDriver` 打开每个持久成员的原生 lifetime，再启动 Runtime effect drain，并等待整个 Team 终止；`runNext` 只保留为纯/手动测试 seam。宿主可通过非模型 `HostControl` 与 `/rail-team` 发起 `cancel_team`、`release_hold`、`message_manager`、grant/resume 等操作；Manager pause/resume、精确 `resume_work`、激活级取消/修订、deadline 和 Manager fault 停驻均由 Runtime 管理。
 
-`TeamMemberDriver.stopTeam` 是 D 层可调用的有限停止接口。对已启动 lifetime 发起宿主取消；对尚未 launch 的 prepared Team 直接取消（不启动 provider、初始请求记为 cancelled），只关闭经 `claimNativeLifetime` 实际签发过的成员 lifetime（含仍在打开中的），未签发的成员不持有资源；关闭失败保留为 `cleanup_failed`，不报告虚假释放。取消后的 Team 不能再 launch 或打开新成员，需要新 prepare。成员 alias 对应的 persistent session/descriptor 在关闭后保留为历史，Broker 不允许新 Team 复用已有同名 session（固定新成员约束）；重新 prepare 时应选择新的 alias。
+`TeamMemberDriver.stopTeam` 是 Team host 使用的有限停止接口。对已启动 lifetime 发起宿主取消；对尚未 launch 的 prepared Team 直接取消（不启动 provider、初始请求记为 cancelled），只关闭经 `claimNativeLifetime` 实际签发过的成员 lifetime（含仍在打开中的），未签发的成员不持有资源；关闭失败保留为 `cleanup_failed`，不报告虚假释放。取消后的 Team 不能再 launch 或打开新成员，需要新 prepare。成员 alias 对应的 persistent session/descriptor 在关闭后保留为历史，Broker 不允许新 Team 复用已有同名 session（固定新成员约束）；重新 prepare 时应选择新的 alias。
 
-Broker handle 的 `close()` 只在原生进程退出被确认后才释放 Team 所有权，并返回 `{ protocolError? }`：私有 unbind 失败或成员此前已被终止/transport 故障时，资源已释放但结果带 `protocolError`，Runtime 记为 faulted/released（close_team 期间 Team 为 failed），绝不记为正常 closed。退出未知时 `close()` 拒绝并保留所有权；迟到的退出只在下一次明确的清理重试（`TeamMemberDriver.close`/`closeMember`）时按事实释放，不自动重试或重开，driver 随即以 `TeamRuntime.memberExitConfirmed(binding)` 让 Runtime 从 `cleanup_failed` 更新为 `released`；该 API 只接受同一 lifetime 的 faulted 未知退出成员，不改变工作结果或 outcomeUnknown 记录。宿主取消/停止释放 faulted 成员仍持有的资源时，成员保持 `faulted`（资源为 `released`），不会改写为正常 `closed`。已确认退出的故障成员由 driver 立即释放 Broker 所有权（保留 session/descriptor 历史），此后只允许用户明确以普通 subagent 打开其历史，Team 不会复用该 handle；宿主取消不会对它再次执行关闭。`TeamMemberDriver.close()` 会取消仍 active 的已启动 Team 并等待 native cleanup。**目前 SessionBroker/root/UI 的 stop/delete/shutdown 尚未接到该路由**，不得直接操作 Team-owned native member；这是入口迁移剩余工作。
+Broker handle 的 `close()` 只在原生进程退出被确认后才释放 Team 所有权，并返回 `{ protocolError? }`：私有 unbind 失败或成员此前已被终止/transport 故障时，资源已释放但结果带 `protocolError`，Runtime 记为 faulted/released（close_team 期间 Team 为 failed），绝不记为正常 closed。退出未知时 `close()` 拒绝并保留所有权；迟到的退出只在下一次明确的清理重试（`TeamMemberDriver.close`/`closeMember`）时按事实释放，不自动重试或重开，driver 随即以 `TeamRuntime.memberExitConfirmed(binding)` 让 Runtime 从 `cleanup_failed` 更新为 `released`；该 API 只接受同一 lifetime 的 faulted 未知退出成员，不改变工作结果或 outcomeUnknown 记录。宿主取消/停止释放 faulted 成员仍持有的资源时，成员保持 `faulted`（资源为 `released`），不会改写为正常 `closed`。已确认退出的故障成员由 driver 立即释放 Broker 所有权（保留 session/descriptor 历史），此后只允许用户明确以普通 subagent 打开其历史，Team 不会复用该 handle；宿主取消不会对它再次执行关闭。`TeamMemberDriver.close()` 会取消仍 active 的已启动 Team 并等待 native cleanup。
+
+`/rail-agent` 面板的 Stop/Delete 操作经 `SessionBroker` lifecycle route 进入对应 Team host：worker stop 只结束其自身 assigned work/owned children（active work 记 `outcomeUnknown`），siblings 和其它 Team 保持运行；Manager stop 记录 `MANAGER_UNAVAILABLE`、hold Manager work 并暂停 worker，而非隐式 cancel Team。delete 必须等 member exit 明确确认并释放 ownership 后才可删除 session/descriptor。whole-Team shutdown/branch transition 使用独立 Team scope，不能复用 member stop 语义。
 
 真实 Pi 合成 provider 测试位于 `tests/subagent/team-member-driver.test.ts`，Responses WebSocket 合成测试位于 `tests/subagent/team-websocket-integration.test.ts`。它们使用本地离线 provider/loopback，不需要真实付费模型 API。
 
-## 后续必须完成
+## 当前剩余与验证边界
 
-### C1b 剩余边界
+- 当前 focused tests 覆盖本次父审查列出的 abort 时序、成员 stop/delete 隔离、Manager unavailable、index 生命周期 hook、journal codec round-trip、结果分页和 N09 策略 drift；这不等同于完整 Team 验收矩阵。
+- **100 场景及 I01–I30、seed/trace 性质测试、原生 context_edit 和完整取消竞态尚未在本轮作为整体验收执行或宣称通过。** 历史 C1a/C1b 报告也不能替代当前工作树的验证结果。
+- v1 Team inbox/wait/finish 操作已退役；历史记录只读，不能恢复旧 Promise 或复用旧实时调度器。
 
-- D 层需将 Team-owned `stop/delete/shutdown` 路由到 `TeamMemberDriver.stopTeam`；该接口现有，但父级 lifecycle 和 UI 尚未接线。
-
-- budget hold 不能由 `resume_member`、`resume_work` 或 `release_hold` 隐式清除，只能由宿主 grant 或取消处理；grant 尚无 UI/命令入口（D）。
-- journal generation 尚未接到父 session/index（D）；未配置 journal 时 Runtime 不写历史。
-- 旧 C1a validation report 属于此前阶段，不能代替本工作树的全量测试结果或视为剩余项已完成。
-
-### D：入口及最终验收
-
-- 新 manager/roleDescription/initialRequests prepare，固定并验证真实策略；launch 入口替换。
-- `/rail-team`、成员 stop/delete 路由、UI、历史只读兼容、session tree/reload。
-- 删除旧总结 continuation、finish/afterSeq/parked peer wait/stall 路径，更新旧文档和 README。
-- 完成 100 场景及 I01–I30 的对应测试，包括 seed/trace 性质测试、原生 context_edit 和完整取消竞态。
-
-测试清理仍有需要改进的地方：部分 harness teardown 捕获并忽略清理异常，不能据此宣称全部资源都已验证收敛。具体限制见验证报告。
+测试清理仍需持续检查：定向测试通过不代表所有真实 provider 决策质量、所有外部进程故障模式或完整验收矩阵都已验证。

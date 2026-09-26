@@ -50,7 +50,7 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop",
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete",
 	open: readonly string[] = ["lead", "w1", "w2"], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}) {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
 	await writeFile(join(root, "settings.json"), JSON.stringify({
@@ -97,6 +97,10 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 				{ to: "w1", task: "cancel target", inputRefs: [] },
 				{ to: "w1", task: "unrelated root", inputRefs: [] },
 			]
+			: scenario === "broker-stop" || scenario === "broker-delete" ? [
+				{ to: "w1", task: "stop target", inputRefs: [] },
+				{ to: "w2", task: "unrelated root", inputRefs: [] },
+			]
 			: [{ to: "w1", task: scenario === "mixed-end" ? "N04 mixed end" : "W1 root", inputRefs: [] }],
 		timeoutSeconds: null,
 	});
@@ -131,6 +135,13 @@ async function waitUntil(predicate: () => boolean, description: string): Promise
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`Timed out waiting for ${description}`);
+}
+
+function routeBrokerMemberLifecycle(broker: SessionBroker, driver: TeamMemberDriver): void {
+	broker.setTeamLifecycleRouter(async (request) => {
+		if (request.scope !== "member") throw new Error("Unexpected whole-Team lifecycle route in a member-scope test");
+		await driver.stopMember(request.teamId, request.memberId, `Host ${request.action} test`);
+	});
 }
 
 async function waitForGateOrCancel(gate: Promise<void>, lifetime: Promise<unknown>, runtime: TeamRuntime, teamId: string,
@@ -181,6 +192,21 @@ async function awaitLifetimeOrCancel<T>(lifetime: Promise<T>, runtime: TeamRunti
 	if (cleanupTimer) clearTimeout(cleanupTimer);
 	throw new Error(`Team lifetime did not finish ${description}; cleanup=${cleanupSettled}; before=${JSON.stringify(teamBeforeCancel)}; after=${JSON.stringify(runtime.getTeam(teamId))}; providers=${JSON.stringify(diagnostics)}`);
 }
+
+test("N09 driver policy mismatch is rejected before claiming or opening a native member lifetime", async (t) => {
+	const { runtime, teamId, driver, broker, root } = await createHarness(t, "compaction", ["lead"]);
+	let opens = 0;
+	const open = broker.openTeamMember.bind(broker);
+	broker.openTeamMember = async (request) => { opens++; return open(request); };
+	const before = runtime.getTeam(teamId).members.find((member) => member.id === "w1")!;
+	await assert.rejects(driver.openMember({ teamId, memberId: "w1", model: { provider: "wrong", modelId: "wrong" }, cwd: root, contextWindow: 64000 }), /model does not match its prepared policy/u);
+	await assert.rejects(driver.openMember({ teamId, memberId: "w1", model: MODEL, cwd: root, contextWindow: 64001 }), /contextWindow does not match its prepared policy/u);
+	assert.equal(opens, 0, "rejected activation policy never reaches SessionBroker.openTeamMember");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.resourceState, before.resourceState,
+		"policy validation runs before claimNativeLifetime changes resource ownership");
+	await driver.openMember({ teamId, memberId: "w1", model: MODEL, cwd: root, contextWindow: 64000 });
+	assert.equal(opens, 1);
+});
 
 test("real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n02");
@@ -353,6 +379,78 @@ test("TeamMemberDriver.stopTeam cancels a launched native lifetime directly", { 
 	assert.equal(stopped.reason, "parent shutdown requested Team cancellation");
 	assert.ok(stopped.members.every((member) => member.lifecycle === "closed" && member.resourceState === "released"));
 	assert.deepEqual(await lifetime, stopped);
+});
+
+test("Rail stop of one live Team worker fails only its work while an unrelated worker root continues", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, broker, store } = await createHarness(t, "broker-stop");
+	routeBrokerMemberLifecycle(broker, driver);
+	const lifetime = driver.launch(teamId);
+	await waitUntil(() => {
+		const members = runtime.getTeam(teamId).members;
+		return members.some((member) => member.id === "w1" && member.activity === "running" && !!member.currentWork)
+			&& members.some((member) => member.id === "w2" && member.activity === "running" && !!member.currentWork);
+	}, "both independent worker roots to be active");
+
+	const stopped = await broker.stop("w1");
+	assert.equal(stopped?.alias, "w1");
+	await waitUntil(() => runtime.listWorks(teamId).some((work) => work.taskPreview === "unrelated root" && work.state === "resolved"),
+		"unrelated W2 root to finish after W1 stop");
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.lifecycle, "active", "a member stop never cancels or closes the Team");
+	assert.equal(team.members.find((member) => member.id === "w1")?.lifecycle, "faulted");
+	assert.equal(team.members.find((member) => member.id === "w1")?.resourceState, "released");
+	assert.equal(team.members.find((member) => member.id === "w2")?.lifecycle, "open");
+	const target = runtime.listWorks(teamId).find((work) => work.taskPreview === "stop target")!;
+	assert.equal(runtime.getWork(teamId, target.work)?.current.state, "failed");
+	assert.equal(runtime.getWork(teamId, target.work)?.current.error?.outcomeUnknown, true, "aborted active work preserves uncertain side-effect evidence");
+	assert.ok((await store.list()).some((instance) => instance.alias === "w1"), "stop retains the persistent descriptor");
+	await driver.stopTeam(teamId, "explicit test cleanup");
+	await lifetime;
+});
+
+test("Rail delete confirms the stopped Team member exit before removing its descriptor/session, with no late resurrection", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, broker, store, handles } = await createHarness(t, "broker-delete");
+	routeBrokerMemberLifecycle(broker, driver);
+	const lifetime = driver.launch(teamId);
+	await waitUntil(() => {
+		const members = runtime.getTeam(teamId).members;
+		return members.some((member) => member.id === "w1" && member.activity === "running" && !!member.currentWork)
+			&& members.some((member) => member.id === "w2" && member.activity === "running" && !!member.currentWork);
+	}, "both independent worker roots to be active");
+	const instance = handles.get("w1")!.instance;
+	const sessionFile = instance.sessionFile;
+	const deleted = await broker.delete("w1");
+	assert.equal(deleted?.agentId, instance.agentId);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "active");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w2")?.lifecycle, "open");
+	assert.equal((await store.list()).some((item) => item.agentId === instance.agentId), false);
+	await assert.rejects(readFile(sessionFile), { code: "ENOENT" }, "delete removes the session only after the Broker confirms process exit");
+	await waitUntil(() => runtime.listWorks(teamId).some((work) => work.taskPreview === "unrelated root" && work.state === "resolved"),
+		"unrelated W2 root to finish after W1 delete");
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.equal((await store.list()).some((item) => item.agentId === instance.agentId), false, "no late descriptor write resurrects the deleted member");
+	await assert.rejects(readFile(sessionFile), { code: "ENOENT" });
+	await driver.stopTeam(teamId, "explicit test cleanup");
+	await lifetime;
+});
+
+test("Rail stop of the Manager marks ManagerUnavailable and pauses workers without ending the Team", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, broker } = await createHarness(t, "hang-live");
+	routeBrokerMemberLifecycle(broker, driver);
+	const lifetime = driver.launch(teamId);
+	await waitUntil(() => runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.currentWork !== undefined,
+		"worker activation after Team launch");
+	const stopped = await broker.stop("lead");
+	assert.equal(stopped?.alias, "lead");
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.lifecycle, "active", "Manager stop does not silently cancel the whole Team");
+	assert.equal(team.members.find((member) => member.id === "lead")?.lifecycle, "faulted");
+	assert.equal(team.members.find((member) => member.id === "lead")?.resourceState, "released");
+	assert.ok(["requested", "confirmed"].includes(team.members.find((member) => member.id === "w1")?.pause ?? "none"),
+		"workers enter ManagerUnavailable pause rather than starting new work");
+	assert.ok(team.incidents.some((incident) => incident.code === "MANAGER_UNAVAILABLE"));
+	await driver.stopTeam(teamId, "explicit test cleanup");
+	await lifetime;
 });
 
 test("real Pi rejects flat close_team when another tool shares the finalized assistant batch", { timeout: 60000 }, async (t) => {

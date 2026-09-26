@@ -38,6 +38,8 @@ export const TEAM_STATUS_MAX_LIMIT = 50;
  * through paginated status(work|result|incident) pages.
  */
 export const TEAM_VIEW_MAX_INCIDENTS = 32;
+/** Terminal journal records retain only the newest open incidents; live status remains fully paginated. */
+export const TEAM_MAX_TERMINAL_INCIDENTS = 512;
 export const TEAM_VIEW_MAX_BUDGET_ROOTS = 32;
 export const TEAM_VIEW_MAX_GRANTS = 16;
 export const TEAM_MAX_UI_EVENTS = 64;
@@ -543,6 +545,7 @@ export interface TeamResult {
 	members: Array<{ id: string; role: MemberRole; lifecycle: MemberLifecycle; resourceState: ResourceState }>;
 	usage: SubagentUsage;
 	unresolvedIncidents: Array<{ id: string; code: string; message: string }>;
+	unresolvedIncidentsOmitted?: number;
 }
 
 export const sameWorkRef = (left: WorkRef, right: WorkRef): boolean => left.workId === right.workId && left.revision === right.revision;

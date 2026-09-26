@@ -265,8 +265,13 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 
 	const sealBeforeSessionReplacement = async (reason: string, ctx: ExtensionContext): Promise<{ cancel: true } | undefined> => {
 		const active = runtime;
-		if (!active || !active.host.active) return undefined;
-		try { await active.host.close(reason); }
+		if (!active) return undefined;
+		// A sealed generation may still own an unknown writer. Every navigation attempt must
+		// await cleanup again; inactivity alone is not permission to leave the branch.
+		try {
+			await active.host.close(reason);
+			if (active.host.hasUnreleasedResources()) throw new Error("Team member exits remain unconfirmed");
+		}
 		catch (error) {
 			notifyHostDiagnostics(active.host, ctx);
 			if (ctx.hasUI && runtime?.host === active.host) {
@@ -275,6 +280,13 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 			return { cancel: true };
 		}
 		notifyHostDiagnostics(active.host, ctx);
+		if (runtime === active) {
+			teamHosts.delete(active.host);
+			// A before hook is not a committed navigation: a later extension can cancel, and
+			// tree summarization can abort or throw without emitting any success event. Keep
+			// the current branch usable with a NEW empty generation, never revive the old writer.
+			runtime = { ...active, ctx, host: createTeamHost(ctx, active.broker) };
+		}
 		return undefined;
 	};
 
@@ -290,13 +302,16 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		if (!previous) return;
 		// session_before_tree normally seals the old journal before Pi changes the leaf. This fallback
 		// permanently revokes it now, so a late cleanup callback cannot append into the selected branch.
-		if (previous.host.active) {
-			try { await previous.host.closeAfterBranchChange("Session branch changed before Team shutdown completed"); }
-			catch (error) {
-				console.error(`Team cleanup remains incomplete after session navigation: ${error instanceof Error ? error.message : String(error)}`);
-			}
+		try {
+			await previous.host.closeAfterBranchChange("Session branch changed before Team shutdown completed");
+			if (previous.host.hasUnreleasedResources()) throw new Error("Team member exits remain unconfirmed");
+		} catch (error) {
+			console.error(`Team cleanup remains incomplete after session navigation: ${error instanceof Error ? error.message : String(error)}`);
+			// Even an unexpected post-commit event cannot bypass unresolved ownership.
+			runtime = { ...previous, ctx };
+			return;
 		}
-		if (!previous.host.hasUnreleasedResources()) teamHosts.delete(previous.host);
+		teamHosts.delete(previous.host);
 		const host = createTeamHost(ctx, previous.broker);
 		runtime = { ...previous, ctx, host };
 		previous.roster.restore(ctx.sessionManager.getBranch());

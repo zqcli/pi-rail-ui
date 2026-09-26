@@ -66,6 +66,14 @@ export interface TeamMemberProtocolSession {
 	close(): Promise<void>;
 }
 
+/** Startup failed before a handle could be returned; exit evidence is separate from the original cause. */
+export class TeamMemberOpenError extends Error {
+	constructor(cause: unknown, readonly resourceReleased: boolean, readonly cleanupError?: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause });
+		this.name = "TeamMemberOpenError";
+	}
+}
+
 export interface WorkerSendOptions {
 	contextWindow?: number;
 	signal?: AbortSignal;
@@ -693,6 +701,8 @@ export class SessionBroker {
 			if (owned?.owner === owner) owned.close = closeHandle;
 			return handle;
 		} catch (error) {
+			let resourceReleased = false;
+			let cleanupError: unknown;
 			// Once a child instance exists, retain its session and ownership on any
 			// uncertain bind/exit failure. A later ordinary writer must not race it.
 			if (instance) {
@@ -706,8 +716,10 @@ export class SessionBroker {
 						await this.stopProcess(instance.agentId, failedState);
 						await Promise.allSettled([failedState.tail, failedState.controlTail]);
 						releaseOwnership();
+						resourceReleased = true;
 						this.runtimeErrors.delete(instance.agentId);
 					} catch (stopError) {
+						cleanupError = stopError;
 						if (stopError instanceof RpcProcessExitTimeoutError) {
 							this.unreaped.set(instance!.agentId, stopError.exited);
 							void stopError.exited.then(() => {
@@ -725,7 +737,7 @@ export class SessionBroker {
 				this.teamAliases.delete(alias);
 				this.teamAliasOwners.delete(alias);
 			}
-			throw error;
+			throw new TeamMemberOpenError(error, resourceReleased, cleanupError);
 		}
 	}
 

@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import type { RailModelRef } from "./models";
 import { railModelReference } from "./models";
-import type { BrokeredTeamMemberHandle, SessionBroker } from "./session-broker";
+import { TeamMemberOpenError, type BrokeredTeamMemberHandle, type SessionBroker } from "./session-broker";
 import type { ChildRequestFrame, PrivateReply, TeamResult } from "./team-protocol";
 import { sameBinding, sameScope } from "./team-codec";
 import { TeamRuntime, type ActivationCompletionReason, type NativeCompletion, type RuntimeActivation, type TeamRuntimeExecutor } from "./team-runtime";
@@ -37,10 +37,10 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-/** A launch whose member lifetimes could not all be opened; the prepared Team was stopped before any provider ran. */
+/** A startup/admission failure; the prepared Team was stopped before any provider ran. */
 export class TeamLaunchError extends Error {
-	constructor(message: string, readonly cleanup: TeamResult | undefined, readonly cleanupError: unknown) {
-		super(message);
+	constructor(message: string, readonly cleanup: TeamResult | undefined, readonly cleanupError: unknown, cause?: unknown) {
+		super(message, { cause });
 		this.name = "TeamLaunchError";
 	}
 }
@@ -57,6 +57,7 @@ export class TeamMemberDriver {
 	private readonly launched = new Map<string, Promise<TeamResult>>();
 	private readonly preparedStops = new Map<string, Promise<TeamResult>>();
 	private readonly opening = new Map<string, Promise<unknown>>();
+	private readonly failedOpenings = new Map<string, TeamMemberOpenError>();
 
 	constructor(private readonly runtime: TeamRuntime, private readonly broker: SessionBroker) {}
 
@@ -94,6 +95,9 @@ export class TeamMemberDriver {
 			const handle = await opened;
 			this.members.set(id, { binding, handle, ...(contextWindow !== undefined ? { contextWindow } : {}) });
 			return handle;
+		} catch (error) {
+			if (error instanceof TeamMemberOpenError) this.failedOpenings.set(id, error);
+			throw error;
 		} finally {
 			this.opening.delete(id);
 		}
@@ -107,17 +111,27 @@ export class TeamMemberDriver {
 	 */
 	async openAndLaunch(teamId: string, requests: readonly OpenTeamMemberRequest[]): Promise<{ lifetime: Promise<TeamResult> }> {
 		const opened = await Promise.allSettled(requests.map((request) => this.openMember(request)));
-		const failures = opened.flatMap((result, index) => result.status === "rejected" ? [`${requests[index]!.memberId}: ${errorMessage(result.reason)}`] : []);
+		const failures = opened.flatMap((result, index) => result.status === "rejected" ? [{ memberId: requests[index]!.memberId, error: result.reason }] : []);
 		// A host stop during startup already owns the prepared Team's cleanup; never launch past it.
-		if (failures.length || this.preparedStops.has(teamId)) {
-			const message = failures.length ? `Team launch stopped before any provider ran; member startup failed (${failures.join("; ")})`
-				: "Team launch was stopped by the host before any provider ran";
-			let cleanup: TeamResult | undefined;
-			let cleanupError: unknown;
-			try { cleanup = await this.stopTeam(teamId, message); } catch (error) { cleanupError = error; }
-			throw new TeamLaunchError(message, cleanup, cleanupError);
+		let message = failures.length ? `Team launch stopped before any provider ran; member startup failed (${failures.map(({ memberId, error }) => `${memberId}: ${errorMessage(error)}`).join("; ")})`
+			: this.preparedStops.has(teamId) ? "Team launch was stopped by the host before any provider ran" : undefined;
+		let admissionError: unknown = failures.length === 1 ? failures[0]!.error
+			: failures.length ? new AggregateError(failures.map(({ error }) => error), "Team member startup failed") : undefined;
+		if (!message) {
+			try { return { lifetime: this.launch(teamId) }; }
+			catch (error) {
+				admissionError = error;
+				message = `Team launch admission failed before any provider ran: ${errorMessage(error)}`;
+			}
 		}
-		return { lifetime: this.launch(teamId) };
+		// Opening all handles is not admission: journal/scope checks can still reject launch.
+		// Consume this failed attempt and clean up every claimed lifetime, never implicitly retry it.
+		let cleanup: TeamResult | undefined;
+		let cleanupError: unknown;
+		const failureReason = message;
+		try { cleanup = await this.stopLifetime(teamId, () => this.runtime.failStartup(teamId, failureReason)); }
+		catch (error) { cleanupError = error; }
+		throw new TeamLaunchError(message, cleanup, cleanupError, admissionError);
 	}
 
 	/** Native resources must all be bound before Runtime admits any activation. */
@@ -161,7 +175,15 @@ export class TeamMemberDriver {
 				// A prepared-cancel may race an in-flight open; its outcome decides whether a handle exists.
 				await this.opening.get(id)?.catch(() => undefined);
 				const member = this.members.get(id);
-				if (!member) return { ok: false, error: { code: "CLEANUP_FAILED", message: `No native lifetime remains for ${binding.memberId}`, outcomeUnknown: true } };
+				if (!member) {
+					const failure = this.failedOpenings.get(id);
+					if (failure?.resourceReleased) {
+						this.failedOpenings.delete(id);
+						return { ok: false, resourceReleased: true, error: { code: "STARTUP_FAILURE", message: failure.message } };
+					}
+					return { ok: false, error: { code: "CLEANUP_FAILED", message: failure?.cleanupError !== undefined
+						? errorMessage(failure.cleanupError) : `No confirmed native exit for ${binding.memberId}`, outcomeUnknown: true } };
+				}
 				if (this.runningMembers.has(id)) return { ok: false, error: { code: "CLEANUP_FAILED", message: `${binding.memberId} still has a native activation in flight`, outcomeUnknown: true } };
 				try {
 					this.closeBatchAttempts?.add(id);
@@ -182,7 +204,11 @@ export class TeamMemberDriver {
 	 * Team is cancelled without launching any provider; only native lifetimes actually claimed are closed.
 	 */
 	stopTeam(teamId: string, reason: string, mode: "cancel" | "interrupt" = "cancel"): Promise<TeamResult> {
-		const stop = () => mode === "cancel" ? this.runtime.cancelTeam(teamId, reason) : this.runtime.interruptTeam(teamId, reason);
+		return this.stopLifetime(teamId, () => mode === "cancel" ? this.runtime.cancelTeam(teamId, reason) : this.runtime.interruptTeam(teamId, reason));
+	}
+
+	/** Share only resource cleanup/waiting; the caller supplies the correctly classified terminal decision. */
+	private stopLifetime(teamId: string, stop: () => void): Promise<TeamResult> {
 		const lifetime = this.launched.get(teamId);
 		if (lifetime) {
 			if (!this.settledLifetimes.has(teamId)) stop();

@@ -346,11 +346,11 @@ export class TeamRuntime {
 			fail("MEMBER_UNAVAILABLE", "A Team member was stopped before launch; cancel this prepared Team and prepare with new aliases");
 		}
 		const launchAt = this.timestamp();
-		// History must record the admission before any provider can run; a failed write keeps it prepared.
+		// History must record admission before any provider can run; a failed write fails startup closed.
 		if (!this.tryJournal(team, { version: 2, kind: "launched", teamId, at: launchAt,
 			roster: { manager: team.manager, workers: team.plan.workers.map((worker) => worker.alias) }, goal: previewText(team.plan.brief.goal, 512) })) {
 			const reason = team.journalFailure;
-			delete team.journalFailure;
+			this.applyJournalFailure(team);
 			fail("PROTOCOL_FAILURE", `Team launch could not be journaled: ${reason}`);
 		}
 		team.deadline = team.plan.timeoutSeconds === null ? null : launchAt + Math.ceil(team.plan.timeoutSeconds * 1000);
@@ -513,7 +513,7 @@ export class TeamRuntime {
 		if (["closed", "cancelled", "interrupted"].includes(team.lifecycle) || team.cancelRequested) {
 			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: team.reason } : {}) };
 		}
-		if (team.lifecycle === "prepared") return this.cancelPrepared(team, reason, "cancelled");
+		if (team.lifecycle === "prepared") return this.stopPrepared(team, reason, "cancelled");
 		this.stopTeamExecution(team, "cancelled", reason, { code: "CANCELLED", message: reason });
 		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: team.reason ?? reason };
 	}
@@ -526,9 +526,20 @@ export class TeamRuntime {
 		const team = this.team(teamId);
 		const reason = this.hostText(reasonValue, "interrupt reason");
 		if (team.closeDecision || TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle) || team.cancelRequested) return this.cancelTeam(teamId, reason);
-		if (team.lifecycle === "prepared") return this.cancelPrepared(team, reason, "interrupted");
+		if (team.lifecycle === "prepared") return this.stopPrepared(team, reason, "interrupted");
 		this.stopTeamExecution(team, "interrupted", reason, { code: "INTERRUPTED", message: reason });
 		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle, reason: team.reason ?? reason };
+	}
+
+	/** Driver-only admission failure: consume the prepared attempt, without impersonating a user cancel. */
+	failStartup(teamId: string, reasonValue: string): HostControlReceipt {
+		const team = this.team(teamId);
+		if (team.closeDecision || TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle) || team.cancelRequested) {
+			return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle, ...(team.reason ? { reason: team.reason } : {}) };
+		}
+		if (team.lifecycle !== "prepared") fail("INVALID_ARGUMENT", "Startup failure requires a never-launched Team");
+		const reason = this.hostText(reasonValue, "startup failure");
+		return this.stopPrepared(team, reason, "failed");
 	}
 
 	/** Shared terminal stop for host cancellation and fail-closed journal loss; the first terminal lifecycle wins. */
@@ -566,14 +577,16 @@ export class TeamRuntime {
 	}
 
 	/**
-	 * A never-launched Team is cancelled without any provider/tool effect. Members whose binding was
-	 * never issued hold nothing; a claimed member stays stopping until its driver reports the exit.
+	 * End a never-launched Team without any provider/tool effect. Members whose binding was never
+	 * issued hold nothing; a claimed member stays stopping until its driver reports the exit.
 	 */
-	private cancelPrepared(team: TeamState, reason: string, lifecycle: "cancelled" | "interrupted"): HostControlReceipt {
+	private stopPrepared(team: TeamState, reason: string, lifecycle: "cancelled" | "interrupted" | "failed",
+		workError: WorkError = { code: lifecycle === "failed" ? "STARTUP_FAILURE" : lifecycle === "cancelled" ? "CANCELLED" : "INTERRUPTED", message: reason }): HostControlReceipt {
 		team.lifecycle = lifecycle;
 		team.reason = reason;
 		team.cancelRequested = true;
-		this.cancelAllWork(team, "cancelled", { code: lifecycle === "cancelled" ? "CANCELLED" : "INTERRUPTED", message: reason });
+		if (lifecycle === "failed") team.health = "needs_attention";
+		this.cancelAllWork(team, lifecycle === "failed" ? "failed" : "cancelled", workError);
 		for (const member of team.members.values()) {
 			member.closeId = this.id("host-close");
 			if (member.nativeClaimed) {
@@ -824,7 +837,8 @@ export class TeamRuntime {
 			this.changed(team);
 			return;
 		}
-		this.stopTeamExecution(team, "failed", reason, { code: "JOURNAL_FAILURE", message: reason });
+		if (team.lifecycle === "prepared") this.stopPrepared(team, reason, "failed", { code: "JOURNAL_FAILURE", message: reason });
+		else this.stopTeamExecution(team, "failed", reason, { code: "JOURNAL_FAILURE", message: reason });
 	}
 
 	/**
@@ -2694,7 +2708,9 @@ export class TeamRuntime {
 		try {
 			let result: CleanupCompletion;
 			try {
-				result = await this.closeMemberWithTimeout(executor, binding, closeId);
+				// The transport owns bounded stop/exit confirmation. An outer activation-stop timer
+				// can discard a later confirmed exit after the driver has already released its handle.
+				result = await executor.closeMember(binding, closeId);
 			} catch (error) {
 				result = { ok: false, error: { code: "CLEANUP_FAILED", message: error instanceof Error ? error.message : String(error), outcomeUnknown: true } };
 			}
@@ -2711,22 +2727,6 @@ export class TeamRuntime {
 			this.requestDrain(binding.teamId);
 			const team = this.teams.get(binding.teamId);
 			if (team) this.settleCompletion(team);
-		}
-	}
-
-	private async closeMemberWithTimeout(executor: TeamRuntimeExecutor, binding: BindingV2, closeId: string): Promise<CleanupCompletion> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			return await Promise.race([
-				executor.closeMember(binding, closeId),
-				new Promise<CleanupCompletion>((resolve) => {
-					timer = setTimeout(() => resolve({ ok: false, error: { code: "CLEANUP_TIMEOUT",
-						message: `Member ${binding.memberId} exit was not confirmed within ${this.activationStopTimeoutMs}ms`, outcomeUnknown: true } }),
-					this.activationStopTimeoutMs);
-				}),
-			]);
-		} finally {
-			if (timer) clearTimeout(timer);
 		}
 	}
 

@@ -147,7 +147,7 @@ Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 
 - `RB13` · pure · `actual Runtime terminal journal records round-trip through the strict history codec`
 - `RB14` · pure · `journal: a lost terminal write reports the Team as failed, never as a clean close`
 - `RB15` · pure · `journal: a failed result write never publishes the result and fails the Team closed`
-- `RB16` · pure · `journal: close decision and grant failures refuse the mutation; launch failure keeps the Team prepared`
+- `RB16` · pure · `journal: close decision and grant failures refuse the mutation; launch failure ends the Team as failed`
 - `RB17` · pure · `usage: loss keeps observed cost once; settle/lost races and repeats never double-bill; cancellation keeps its cost`
 - `RB18` · pure · `9.4: activation input carries the tightest current scope budget summary`
 - `RB19` · pure · `grant validation rejects a safe-integer overflow of any raised limit atomically, before the journal`

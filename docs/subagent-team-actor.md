@@ -26,7 +26,7 @@
 - `brief.goal` 必填；可选 `target`、`acceptanceCriteria`、`constraints`、`authorizations`。authorizations 只声明任务范围，不授予操作系统权限。
 - `initialRequests` 最多 8 条，只能指向 worker，`inputRefs` 必须为空或省略（新 Team 还没有结果可引用）；runtime 把 requester 设为 Manager，`rootId` 设为 `workId`。只有角色描述、没有初始工作的 worker 合法，在被分配工作前不会产生 provider 调用。
 - `timeoutSeconds` 为 `null` 或省略表示没有总截止；取值为 (0, 86400] 内的有限数字，从 launch 开始计时，到期按 `DEADLINE` 走取消流程，不会报告为成功。
-- prepare 固定真实的 model、cwd、Fast/Search 和 contextWindow/compaction reserve，不启动 provider 或工具。launch 前再次核对，策略漂移时拒绝并保留 prepared Team。
+- prepare 固定真实的 model、cwd、Fast/Search 和 contextWindow/compaction reserve，不启动 provider 或工具。launch 前再次核对，策略漂移时拒绝并保留 prepared Team。开始创建成员后，bind 或启动准入失败（包括 launched journal 写入失败）会将本次 Team 标为 failed 并清理已认领资源，不自动重试；已有的用户取消、宿主中断或 Manager 关闭决定优先保留。启动原错与资源退出失败分别诊断，未知 exit 继续保留 ownership。
 
 ```json
 {"action":"launch","teamId":"<teamId>"}
@@ -178,7 +178,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 - Tool 面板和 `/rail-team status` 显示：Team lifecycle/health/outcome、各工作计数与根验收数；每个成员的 lifecycle、activity、pause、当前 WorkRef 与任务预览、queued/blocked/held、model/FAST/SEARCH 和错误；hold、未决 incident、预算与 usage。idle 不会显示为“已完成”。
 - `TeamResult`（version 2）：`lifecycle`、`outcome`、`reason`、`finalResultRefs`，各 root 的 WorkRef/状态/resultRef/review，各成员的 lifecycle/resourceState、usage 和未决 incident。最终内容引用 worker 撰写的结果，不再调用 Manager 重写。
 - journal 只同步写入有界事实：launched、result（发布前写入）、revise/cancel 决定、close decision、grant、terminal。写入失败时 fail closed。
-- session tree 切换、reload 或 shutdown 时，先写 interrupted 标记，再永久封存该 generation 的 writer，晚到的回调无法写入新分支。
+- session tree/switch/fork 的导航尝试进入 before hook 时就结束旧 generation：对已启动 Team 尝试写 interrupted 标记，再永久封存旧 writer 并等待资源清理。即使后续扩展取消导航，或分支摘要 abort/error 导致导航未提交，旧 Team 也不会恢复；清理确认后，当前分支可在新的空 generation 中重新 prepare。未知 exit 会阻止本次及后续导航尝试，不能因旧 host 已 inactive 绕过检查。导航实际提交后再按目标分支重建只读历史，旧回调无法写入新分支。reload/shutdown 同样永久撤销旧 writer；标记写入失败会明确诊断，不声称已持久化。
 - 历史只读：没有 terminal 记录的 v2 Team 显示为 interrupted；旧 v1 快照（`rail-subagent-team`）映射为 legacy，未完成的同样显示 interrupted；损坏条目逐条跳过。关闭后保留 persistent session/descriptor，之后可以作为普通 subagent 打开，但不带 Team 工具或旧权限。
 
 ## 12. 不支持的能力与限制

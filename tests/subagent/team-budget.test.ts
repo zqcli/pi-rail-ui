@@ -506,12 +506,13 @@ test("journal: a failed result write never publishes the result and fails the Te
 	runtime.assertInvariants(teamId);
 });
 
-test("journal: close decision and grant failures refuse the mutation; launch failure keeps the Team prepared", () => {
+test("journal: close decision and grant failures refuse the mutation; launch failure ends the Team as failed", () => {
 	{
 		const { generation } = journal((record) => record.kind === "launched");
 		const { runtime, teamId } = makeRuntime({ journal: generation, launch: false });
 		assert.throws(() => runtime.launch(teamId), (error: unknown) => error instanceof TeamProtocolError && error.code === "PROTOCOL_FAILURE");
-		assert.equal(runtime.getTeam(teamId).lifecycle, "prepared");
+		assert.equal(runtime.getTeam(teamId).lifecycle, "failed");
+		assert.ok(runtime.getTeamResult(teamId)?.members.every((member) => member.resourceState === "released"), "unclaimed pure-runtime members need no native cleanup");
 		assert.equal(runtime.takeNextActivation(teamId), undefined);
 	}
 	{

@@ -1,5 +1,7 @@
 # Team 自动投递上下文丢失：修复与验收
 
+> **Legacy（v1 Team，已退役）。** 本文记录旧 coordinator/finish/inbox/wait 实时机制时期的设计与验收，对应代码已删除，其中的测试数量与在线流程不是当前成绩。当前协议见 [Team Actor v2](subagent-team-actor.md)，当前验证见 [Team Actor v2 验证报告](subagent-team-actor-validation.md)。
+
 > 本文记录 Pi 0.85.1 时期的问题、修复及在线验收。当前 Pi 0.86.0 已重新通过原生消息持久化与记忆回归测试，见 [Team 适配报告](subagent-team-pi-0.86.0.md)；下述历史在线流程不冒充新版在线验收。
 
 ## 已确认的问题

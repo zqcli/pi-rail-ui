@@ -1,5 +1,7 @@
 # Subagent Team v1 — development plan and acceptance contract
 
+> **Legacy（v1 Team，已退役）。** 本文记录旧 coordinator/finish/inbox/wait 实时机制时期的设计与验收，对应代码已删除，其中的测试数量与在线流程不是当前成绩。当前协议见 [Team Actor v2](subagent-team-actor.md)，当前验证见 [Team Actor v2 验证报告](subagent-team-actor-validation.md)。
+
 > Historical initial implementation contract and Pi 0.85.1 acceptance record. The current Pi 0.86.0 integration and its 832-test gates are documented in [the Team migration report](subagent-team-pi-0.86.0.md); the original results below are not presented as current-version validation.
 
 ## Workspace and execution rules

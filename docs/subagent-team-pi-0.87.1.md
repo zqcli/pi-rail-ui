@@ -1,5 +1,7 @@
 # Team 与最新 dev：Pi 0.87.1 整合
 
+> **Legacy（v1 Team，已退役）。** 本文记录旧 coordinator/finish/inbox/wait 实时机制时期的设计与验收，对应代码已删除，其中的测试数量与在线流程不是当前成绩。当前协议见 [Team Actor v2](subagent-team-actor.md)，当前验证见 [Team Actor v2 验证报告](subagent-team-actor-validation.md)。
+
 Team 分支先合入 `dev@8bb5470` 的 Responses WebSocket 与 pi-ai loader 修复，再合入最新 `dev@21981b3`：WebSocket 代理、grouped per-item Fast、Pi 0.87 canonical session history/compaction 和 0.87.1 依赖。此文记录 Team 交叉行为；[共享迁移说明](pi-0.87.0-migration.md)及[0.87.1 核查](pi-0.87.1-compatibility.md)仍按原始 dev 范围解释。[旧 Team 0.86 报告](subagent-team-pi-0.86.0.md)是历史证据，不代表此次验收。
 
 ## 适配要点

@@ -1,5 +1,7 @@
 # Team 协作契约加固
 
+> **Legacy（v1 Team，已退役）。** 本文记录旧 coordinator/finish/inbox/wait 实时机制时期的设计与验收，对应代码已删除，其中的测试数量与在线流程不是当前成绩。当前协议见 [Team Actor v2](subagent-team-actor.md)，当前验证见 [Team Actor v2 验证报告](subagent-team-actor-validation.md)。
+
 日期：2026-09-24。运行时基线：Pi 0.87.1。
 
 > 2026-09-25 的[审查问题修复](subagent-team-review-fixes.md)更新了以下行为，冲突处以该文为准：wait/control 回复改为精简状态；原生压缩后只恢复精简 roster；候选结果随成员终态写入 journal；journal 只记录里程碑；新增死锁检测、`control cancel` 和 `undelivered` 通知；屏障后的多余调用改为工具错误。

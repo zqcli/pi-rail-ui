@@ -50,13 +50,14 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer",
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer" | "n08-cache-warming",
 	open?: readonly string[], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}, workerCount = 2, childTeamExtension?: string) {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
 	const workerIds = Array.from({ length: workerCount }, (_value, index) => `w${index + 1}`);
 	await writeFile(join(root, "settings.json"), JSON.stringify({
 		compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 1 },
 		retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 },
+		...(scenario === "n08-cache-warming" ? { cacheWarming: "idle" } : {}),
 	}));
 	const sessionDir = join(root, "sessions");
 	const store = new MemoryStore();
@@ -1527,4 +1528,38 @@ test("P01 real Pi: a v2 parent refuses a child exposing only the v1 Team command
 	const cancelled = await driver.stopTeam(teamId, "P01 handshake refused");
 	assert.equal(cancelled.lifecycle, "cancelled");
 	assert.equal(cancelled.usage.turns, 0);
+});
+
+/** Bounded wait for a positive, persisted native fact in a member session file. */
+async function waitForSessionEntry(handle: { instance: AgentInstance }, predicate: (entry: any) => boolean, description: string): Promise<any> {
+	for (let attempt = 0; attempt < 400; attempt++) {
+		const found = (await sessionEntries(handle)).find(predicate);
+		if (found) return found;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	throw new Error(`Timed out waiting for ${description}`);
+}
+
+test("N08 real Pi: with cache warming configured and worthwhile, a Team binding stops the in-run warm refresh without touching settings; the same session warms once ordinary", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles, broker, root } = await createHarness(t, "n08-cache-warming");
+	const settingsBefore = await readFile(join(root, "settings.json"), "utf8");
+	const lifetime = driver.launch(teamId);
+	await waitForTeam(runtime, teamId, () => runtime.getTeam(teamId).works.resolved === 1 && quiescent(runtime, teamId), "N08 work");
+	const worker = handles.get("w1")!;
+	const decision = await waitForSessionEntry(worker, (entry) => entry.type === "custom" && entry.customType === "team-v2-warm-decision",
+		"Pi's own idle cache-warming decision inside the Team binding");
+	assert.equal(decision.data.action, "warm", "Pi itself judged the idle refresh worthwhile, so only the Team binding can stop it");
+	runtime.hostControl(teamId).cancel_team("N08 verified");
+	await lifetime;
+	const teamEntries = await sessionEntries(worker);
+	assert.equal(teamEntries.filter((entry) => entry.type === "usage" && entry.kind === "cache_warm").length, 0, "no refresh was sent while bound");
+	assert.equal(providerCalls(teamEntries).filter((entry) => entry.data.maxTokens === 1).length, 0, "no one-token warm request reached the provider");
+	assert.equal(await readFile(join(root, "settings.json"), "utf8"), settingsBefore, "the global warming setting is untouched");
+
+	// Control: the same persisted session, reopened as an ordinary subagent, does warm under the same settings.
+	const reopened = await broker.dispatch({ target: "w1", task: "ordinary reopen marker" });
+	assert.equal(reopened.run.output, "Ordinary session reopened with its previous Team history.");
+	const warmed = await waitForSessionEntry(worker, (entry) => entry.type === "usage" && entry.kind === "cache_warm", "an ordinary idle cache refresh");
+	assert.equal(warmed.provider, "rail-team-local");
+	assert.equal(await readFile(join(root, "settings.json"), "utf8"), settingsBefore);
 });

@@ -788,3 +788,559 @@ test("X07: a Manager event arriving at any latch of a management activation join
 		runtime.assertInvariants(teamId);
 	}
 });
+
+// ---- Acceptance-matrix gaps (spec 24) that need explicit deterministic assertions ----
+
+const snapshot = (runtime: TeamRuntime, teamId: string) => canonicalJson({ team: runtime.getTeam(teamId), works: runtime.listWorks(teamId) });
+const errorCode = (run: () => TeamReply): string => refusedAction(run);
+let calls = 100;
+
+test("P02/P07: forged identity fields and illegal combinations are refused before state changes; declared optionals accept null", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "root" }]);
+	bootIdle(runtime, teamId);
+	const worker = start(runtime, teamId);
+	const before = snapshot(runtime, teamId);
+	for (const forged of [
+		{ action: "request", to: "w2", task: "t", from: "lead" },
+		{ action: "request", to: "w2", task: "t", requester: "lead" },
+		{ action: "request", to: "w2", task: "t", rootId: "other-root" },
+		{ action: "request", to: "w2", task: "t", role: "manager" },
+		{ action: "reply", result: { status: "succeeded", summary: "x" }, work: worker.scope.work },
+		{ action: "yield", waitingFor: [worker.scope.work], attention: "both", checkpoint: "c" },
+		{ action: "yield", waitingFor: [worker.scope.work] },
+		{ action: "status", view: "team", limit: 51 },
+		{ action: "request", to: "w2", task: "t", surprise: "real value" },
+	]) {
+		const code = errorCode(() => call(runtime, worker, 1, `forged-${JSON.stringify(forged)}`, forged));
+		assert.ok(["INVALID_ARGUMENT", "PROTOCOL_FAILURE", "THROWN"].includes(code), `${JSON.stringify(forged)} -> ${code}`);
+		assert.equal(snapshot(runtime, teamId), before, `${JSON.stringify(forged)} changed state`);
+	}
+	assert.equal(errorCode(() => call(runtime, worker, 2, "worker-control", { action: "control", command: "pause_member", memberId: "w2" })), "FORBIDDEN_ACTION");
+	assert.equal(errorCode(() => call(runtime, worker, 3, "self", { action: "request", to: "w1", task: "self" })), "SELF_REQUEST");
+	assert.equal(errorCode(() => call(runtime, worker, 4, "unknown", { action: "request", to: "nobody", task: "x" })), "UNKNOWN_MEMBER");
+	const forgedRole = { ...worker.binding, role: "manager" as const };
+	assert.ok(errorCode(() => runtime.handleAction(forgedRole, worker.scope, 5, "forged-role", { action: "control", command: "pause_member", memberId: "w2" }, "forged-role")));
+	const staleEpoch = { ...worker.binding, epoch: "not-the-lifetime-epoch" };
+	assert.ok(errorCode(() => runtime.handleAction(staleEpoch, worker.scope, 5, "stale-epoch", { action: "request", to: "w2", task: "t" }, "stale-epoch")));
+	assert.equal(snapshot(runtime, teamId), before, "forged role/epoch frames never mutate the Team");
+	const nullable = call(runtime, worker, 6, "null-optional", { action: "request", to: "w2", task: "declared optional null", inputRefs: null });
+	assert.ok(nullable.ok && nullable.receipt?.status === "accepted", JSON.stringify(nullable));
+	const child = runtime.getWork(teamId, nullable.receipt.work)!;
+	assert.deepEqual([child.requester, child.parent, child.rootId, child.depth], ["w1", worker.scope.work, runtime.getWork(teamId, worker.scope.work!)!.rootId, 1],
+		"requester, parent, root and depth come from the binding, never from model fields");
+	runtime.assertInvariants(teamId);
+});
+
+test("P09: two Teams with the same aliases cannot reference each other's work or results; the other Team is unchanged", () => {
+	let ids = 0;
+	const runtime = new TeamRuntime({ createId: () => `x${++ids}` });
+	const plan = (goal: string) => ({ manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		brief: { goal }, initialRequests: [{ to: "w1", task: goal }], timeoutSeconds: null });
+	const a = runtime.prepare(plan("Team A")).teamId;
+	const b = runtime.prepare(plan("Team B")).teamId;
+	runtime.launch(a);
+	runtime.launch(b);
+	bootIdle(runtime, a);
+	const aWork = start(runtime, a);
+	assert.equal(call(runtime, aWork, 1, "a-reply", { action: "reply", result: { status: "succeeded", summary: "A result" } }).ok, true);
+	settleClean(runtime, aWork, "a-reply");
+	const aResult = runtime.getWork(a, aWork.scope.work!)!.current.resultRef!;
+	const aBefore = snapshot(runtime, a);
+	bootIdle(runtime, b);
+	const bWork = start(runtime, b);
+	const bBefore = snapshot(runtime, b);
+	assert.equal(errorCode(() => call(runtime, bWork, 1, "cross-wait", { action: "yield", waitingFor: [aWork.scope.work], checkpoint: "cross" })), "UNKNOWN_WORK");
+	assert.equal(errorCode(() => call(runtime, bWork, 2, "cross-input", { action: "request", to: "lead", task: "use A", inputRefs: [aResult] })), "UNKNOWN_RESULT");
+	assert.equal(errorCode(() => call(runtime, bWork, 3, "cross-read", { action: "status", view: "result", id: aResult })), "UNKNOWN_RESULT");
+	const crossBinding = { ...bWork.binding, teamId: a };
+	assert.ok(errorCode(() => runtime.handleAction(crossBinding, bWork.scope, 4, "cross-binding", { action: "request", to: "lead", task: "x" }, "cross-binding")));
+	assert.equal(snapshot(runtime, b), bBefore);
+	assert.equal(snapshot(runtime, a), aBefore, "Team A is completely unchanged by Team B's attempts");
+	runtime.assertInvariants(a);
+	runtime.assertInvariants(b);
+});
+
+test("W08/W09: failed, cancelled and superseded children are each delivered to the parent; unresolved children block reply with exact blockers", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2", "w3"], [{ to: "w1", task: "parent" }]);
+	bootIdle(runtime, teamId);
+	const parent = start(runtime, teamId);
+	const refs = ["fail", "cancel", "supersede"].map((name, index) => {
+		const accepted = call(runtime, parent, index + 1, `child-${name}`, { action: "request", to: name === "fail" ? "w2" : "w3", task: `child ${name}` });
+		assert.ok(accepted.ok && accepted.receipt?.status === "accepted");
+		return accepted.receipt.work;
+	});
+	const early = call(runtime, parent, 4, "early", { action: "reply", result: { status: "succeeded", summary: "too early" } });
+	assert.equal(!early.ok && early.error.code, "UNRESOLVED_CHILDREN");
+	assert.deepEqual(!early.ok && early.error.blockers?.map((blocker) => blocker.id).sort(), refs.map(refKey).sort());
+	assert.equal(call(runtime, parent, 5, "wait", { action: "yield", waitingFor: refs, checkpoint: "collect" }).ok, true);
+	settleClean(runtime, parent, "wait");
+	const failing = runtime.takeNextActivation(teamId)!;
+	assert.deepEqual(failing.scope.work, refs[0]);
+	assert.equal(runtime.inputReady(failing.binding, failing.scope.activationId, failing.deliveryId).ok, true);
+	assert.equal(runtime.nativeSettled(failing.binding, failing.scope.activationId, { status: "error", error: { code: "PROVIDER_ERROR", message: "provider failed" } }).ok, true);
+	assert.equal(runtime.cleanupFinished(failing.binding, failing.scope.activationId, { ok: true }).ok, true);
+	const [cancelled, revised] = managerStep(runtime, teamId, [
+		{ action: "control", command: "cancel_work", workId: refs[1]!.workId, expectedRevision: 1, reason: "not needed" },
+		{ action: "control", command: "revise_work", workId: refs[2]!.workId, expectedRevision: 1, task: "child supersede, revised" },
+	]);
+	assert.equal(cancelled?.ok, true);
+	assert.equal(revised?.ok, true);
+	// The revised child now has a queued revision 2 on w3; the parent is woken by the three terminal outcomes of the refs it waited for.
+	let resumed = takeWork(runtime, teamId)!;
+	while (resumed.binding.memberId !== "w1") {
+		assert.equal(runtime.inputReady(resumed.binding, resumed.scope.activationId, resumed.deliveryId).ok, true);
+		assert.equal(call(runtime, resumed, 1, `other-${resumed.scope.activationId}`, { action: "reply", result: { status: "succeeded", summary: "revision 2" } }).ok, true);
+		settleClean(runtime, resumed, `other-${resumed.scope.activationId}`);
+		resumed = takeWork(runtime, teamId)!;
+	}
+	const states = new Map(resumed.input.outcomes.map((outcome) => [refKey(outcome.work), outcome.state]));
+	assert.equal(states.get(refKey(refs[0]!)), "failed");
+	assert.equal(states.get(refKey(refs[1]!)), "cancelled");
+	assert.equal(states.get(refKey(refs[2]!)), "superseded", "the parent's fixed WorkRef gets superseded, never the new revision's result");
+	runtime.assertInvariants(teamId);
+});
+
+test("W10: a child of a terminal parent cannot be revised into a new obligation; state is unchanged", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "parent" }]);
+	bootIdle(runtime, teamId);
+	const parent = start(runtime, teamId);
+	const child = call(runtime, parent, 1, "child", { action: "request", to: "w2", task: "child" });
+	assert.ok(child.ok && child.receipt?.status === "accepted");
+	assert.equal(call(runtime, parent, 2, "wait", { action: "yield", waitingFor: [child.receipt.work], checkpoint: "c" }).ok, true);
+	settleClean(runtime, parent, "wait");
+	const running = takeWork(runtime, teamId)!;
+	assert.equal(runtime.inputReady(running.binding, running.scope.activationId, running.deliveryId).ok, true);
+	assert.equal(call(runtime, running, 1, "child-reply", { action: "reply", result: { status: "succeeded", summary: "child" } }).ok, true);
+	settleClean(runtime, running, "child-reply");
+	const again = takeWork(runtime, teamId)!;
+	assert.equal(runtime.inputReady(again.binding, again.scope.activationId, again.deliveryId).ok, true);
+	assert.equal(call(runtime, again, 1, "parent-reply", { action: "reply", result: { status: "succeeded", summary: "parent" } }).ok, true);
+	settleClean(runtime, again, "parent-reply");
+	const before = snapshot(runtime, teamId);
+	const [revise] = managerStep(runtime, teamId, [{ action: "control", command: "revise_work", workId: child.receipt.work.workId, expectedRevision: 1, task: "resurrect" }]);
+	assert.equal(!revise!.ok && revise!.error.code, "INVALID_ARGUMENT");
+	assert.match(!revise!.ok ? revise!.error.message : "", /independent work/u);
+	assert.deepEqual(JSON.parse(snapshot(runtime, teamId)).works, JSON.parse(before).works, "no work or revision was created");
+	runtime.assertInvariants(teamId);
+});
+
+test("A04/A07: after a staged intent new business is ACTIVATION_ENDING; an empty last answer never falls back to earlier text", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "a" }, { to: "w2", task: "b" }]);
+	bootIdle(runtime, teamId);
+	const first = start(runtime, teamId);
+	assert.equal(call(runtime, first, 1, "staged", { action: "reply", result: { status: "succeeded", summary: "staged" } }).ok, true);
+	const before = snapshot(runtime, teamId);
+	for (const [id, args] of [["after", { action: "request", to: "w2", task: "late side effect" }],
+		["second-intent", { action: "reply", result: { status: "failed", summary: "conflict" } }]] as const) {
+		assert.ok(["ACTIVATION_ENDING", "INTENT_CONFLICT"].includes(errorCode(() => call(runtime, first, calls++, id, args))), id);
+	}
+	assert.equal(snapshot(runtime, teamId), before);
+	settleClean(runtime, first, "staged");
+	const second = takeWork(runtime, teamId)!;
+	assert.equal(runtime.inputReady(second.binding, second.scope.activationId, second.deliveryId).ok, true);
+	// The last native assistant message is empty (an earlier turn had text): no natural_final result.
+	assert.equal(runtime.nativeSettled(second.binding, second.scope.activationId, { status: "success", finalAssistantText: "" }).ok, true);
+	assert.equal(runtime.cleanupFinished(second.binding, second.scope.activationId, { ok: true }).ok, true);
+	const work = runtime.getWork(teamId, second.scope.work!)!.current;
+	assert.deepEqual([work.state, work.hold?.reason, work.resultRef], ["blocked", "protocol", undefined]);
+	runtime.assertInvariants(teamId);
+});
+
+test("D04/D05/D06: requests arriving during settling or after idle wake once; a full recipient queue refuses new work but a staged reply still settles", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "r1" }], { memberUnresolvedWork: 2 });
+	const manager = start(runtime, teamId);
+	const r1 = runtime.takeNextActivation(teamId)!;
+	assert.equal(runtime.inputReady(r1.binding, r1.scope.activationId, r1.deliveryId).ok, true);
+	assert.equal(call(runtime, r1, 1, "r1-reply", { action: "reply", result: { status: "succeeded", summary: "r1" } }).ok, true);
+	assert.equal(runtime.nativeSettled(r1.binding, r1.scope.activationId, { status: "success", appliedToolCallId: "r1-reply" }).ok, true);
+	// R2 arrives while R1 is settling; the queue for w1 is now full (R1 unresolved + R2).
+	const r2 = call(runtime, manager, 1, "r2", { action: "request", to: "w1", task: "r2" });
+	assert.ok(r2.ok && r2.receipt?.status === "accepted");
+	const full = snapshot(runtime, teamId);
+	assert.equal(errorCode(() => call(runtime, manager, 2, "r3", { action: "request", to: "w1", task: "r3" })), "REQUEST_QUEUE_FULL");
+	assert.equal(snapshot(runtime, teamId), full, "the refused request allocates nothing");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "R2 never starts beside the settling R1");
+	assert.deepEqual(r1.scope.work, runtime.getTeam(teamId).members.find((member) => member.id === "w1")!.currentWork, "R1 stays the current work");
+	assert.equal(runtime.cleanupFinished(r1.binding, r1.scope.activationId, { ok: true }).ok, true);
+	assert.equal(runtime.getWork(teamId, r1.scope.work!)!.current.state, "resolved", "the staged reply settles despite the full queue");
+	const next = runtime.takeNextActivation(teamId)!;
+	assert.deepEqual(next.scope.work, r2.receipt.work);
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "exactly one activation for R2");
+	assert.equal(runtime.inputReady(next.binding, next.scope.activationId, next.deliveryId).ok, true);
+	assert.equal(call(runtime, next, 1, "r2-reply", { action: "reply", result: { status: "succeeded", summary: "r2" } }).ok, true);
+	settleClean(runtime, next, "r2-reply");
+	// After idle, a new arrival wakes w1 once.
+	const r4 = call(runtime, manager, 3, "r4", { action: "request", to: "w1", task: "r4" });
+	assert.ok(r4.ok && r4.receipt?.status === "accepted");
+	const woken = runtime.takeNextActivation(teamId)!;
+	assert.deepEqual(woken.scope.work, r4.receipt.work);
+	assert.equal(runtime.takeNextActivation(teamId), undefined);
+	runtime.assertInvariants(teamId);
+});
+
+test("U04/U05: waiting and hold changes advance stateVersion while activity stays idle; reads do not; status pages are bounded with stable cursors", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "parent" }]);
+	bootIdle(runtime, teamId);
+	const parent = start(runtime, teamId);
+	const children = Array.from({ length: 7 }, (_value, index) => {
+		const accepted = call(runtime, parent, index + 1, `c${index}`, { action: "request", to: "w2", task: `child ${index}` });
+		assert.ok(accepted.ok && accepted.receipt?.status === "accepted");
+		return accepted.receipt.work;
+	});
+	assert.equal(call(runtime, parent, 8, "wait", { action: "yield", waitingFor: children, checkpoint: "wait" }).ok, true);
+	settleClean(runtime, parent, "wait");
+	const idleVersion = runtime.getTeam(teamId).stateVersion;
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")!.activity, "idle");
+	assert.equal(runtime.getWork(teamId, parent.scope.work!)!.current.waitingFor.length, 7, "the public view exposes the wait");
+	const big = `${"界".repeat(1500)}TAIL`;
+	for (let index = 0; index < 7; index++) {
+		const child = takeWork(runtime, teamId)!;
+		assert.equal(runtime.inputReady(child.binding, child.scope.activationId, child.deliveryId).ok, true);
+		assert.equal(call(runtime, child, 1, `r${index}`, { action: "reply", result: { status: "succeeded", summary: `${index}${big}`, artifacts: [`artifact-${index}`] } }).ok, true);
+		settleClean(runtime, child, `r${index}`);
+	}
+	assert.ok(runtime.getTeam(teamId).stateVersion > idleVersion, "the waiter's state change is visible while w1 stayed idle");
+	const manager = start(runtime, teamId);
+	const readVersion = runtime.getTeam(teamId).stateVersion;
+	const pages: string[] = [];
+	let cursor: string | undefined;
+	for (let sequence = 1; ; sequence++) {
+		const page = call(runtime, manager, sequence, `page-${sequence}`, { action: "status", view: "result", limit: 3, ...(cursor ? { cursor } : {}) });
+		assert.ok(page.ok, JSON.stringify(page));
+		const data = page.data as { items: Array<{ id: string; summaryPreview: string }>; cursor?: string; hasMore: boolean };
+		assert.ok(data.items.length <= 3);
+		for (const item of data.items) {
+			assert.ok(!item.summaryPreview.endsWith("TAIL"), "list items carry a bounded preview, never the full result");
+			pages.push(item.id);
+		}
+		if (!data.hasMore) break;
+		cursor = data.cursor;
+	}
+	assert.equal(pages.length, 7);
+	assert.equal(new Set(pages).size, 7, "cursor pages are stable and non-overlapping");
+	const full = call(runtime, manager, 20, "full", { action: "status", view: "result", id: pages[0] });
+	assert.ok(full.ok && (full.data as { result: { summary: string } }).result.summary.endsWith("TAIL"), "the full result is readable by resultRef");
+	assert.equal(runtime.getTeam(teamId).stateVersion, readVersion, "status reads never advance stateVersion");
+	runtime.assertInvariants(teamId);
+});
+
+test("L04/L06/L07/L08: outgoing obligations block close_member, the Manager cannot close itself, close_team linearizes against requests, and succeeded needs accepted succeeded roots", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "root" }]);
+	bootIdle(runtime, teamId);
+	const root = start(runtime, teamId);
+	const child = call(runtime, root, 1, "outgoing", { action: "request", to: "w2", task: "outgoing child" });
+	assert.ok(child.ok && child.receipt?.status === "accepted");
+	assert.equal(call(runtime, root, 2, "wait", { action: "yield", waitingFor: [child.receipt.work], checkpoint: "c" }).ok, true);
+	settleClean(runtime, root, "wait");
+	assert.equal(runtime.messageManager(teamId, "try closing").status, "applied");
+	const manager = start(runtime, teamId);
+	const w1Close = call(runtime, manager, 1, "close-w1", { action: "control", command: "close_member", memberId: "w1" });
+	assert.equal(!w1Close.ok && w1Close.error.code, "CLOSE_BLOCKED", "w1 still owns work and awaits its outgoing child");
+	assert.equal(errorCode(() => call(runtime, manager, 2, "close-self", { action: "control", command: "close_member", memberId: "lead" })), "FORBIDDEN_ACTION");
+	const blockedTeam = call(runtime, manager, 3, "close-team-early", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "early" });
+	assert.equal(!blockedTeam.ok && blockedTeam.error.code, "CLOSE_BLOCKED", "accepted unresolved requests block close_team");
+	assert.equal(runtime.getTeam(teamId).lifecycle, "active");
+	assert.equal(call(runtime, manager, 4, "m-yield", { action: "yield" }).ok, true);
+	settleClean(runtime, manager, "m-yield");
+	for (let index = 0; index < 2; index++) {
+		const next = takeWork(runtime, teamId)!;
+		assert.equal(runtime.inputReady(next.binding, next.scope.activationId, next.deliveryId).ok, true);
+		const status = next.binding.memberId === "w1" ? "partial" : "succeeded";
+		assert.equal(call(runtime, next, 1, `done-${index}`, { action: "reply", result: { status, summary: `${status} work` } }).ok, true);
+		settleClean(runtime, next, `done-${index}`);
+	}
+	const rootWork = runtime.getWork(teamId, root.scope.work!)!.current;
+	const final = start(runtime, teamId);
+	assert.equal(errorCode(() => call(runtime, final, 1, "accept-partial", { action: "control", command: "accept_result", work: root.scope.work, disposition: "accepted" })), "INVALID_TEAM_OUTCOME");
+	const unaccepted = call(runtime, final, 2, "close-succeeded", { action: "control", command: "close_team", resultRefs: [rootWork.resultRef], outcome: "succeeded" });
+	assert.equal(unaccepted.ok, false, "succeeded close is refused while the root is unreviewed/partial");
+	assert.equal(call(runtime, final, 3, "waive", { action: "control", command: "accept_result", work: root.scope.work, disposition: "waived", reason: "partial is acceptable" }).ok, true);
+	assert.equal(errorCode(() => call(runtime, final, 4, "close-succeeded-2", { action: "control", command: "close_team", resultRefs: [rootWork.resultRef], outcome: "succeeded" })), "INVALID_TEAM_OUTCOME");
+	const closing = call(runtime, final, 5, "close-partial", { action: "control", command: "close_team", resultRefs: [rootWork.resultRef], outcome: "partial", reason: "root waived as partial" });
+	assert.ok(closing.ok && closing.receipt?.status === "closing");
+	const worksBefore = runtime.listWorks(teamId).length;
+	assert.ok(["ACTIVATION_ENDING", "INTENT_CONFLICT"].includes(errorCode(() => call(runtime, final, 6, "after-close", { action: "request", to: "w2", task: "after close" }))));
+	assert.throws(() => runtime.messageManager(teamId, "after close"), /current lifecycle/u, "no new Manager work after the close decision");
+	assert.equal(runtime.listWorks(teamId).length, worksBefore, "no work is accepted after the linearized close_team");
+	runtime.assertInvariants(teamId);
+});
+
+test("G02/G03/G04: duplicate result/incident facts raise one Manager event; status, no-op controls and an inactive Manager yield create no new activation", () => {
+	const { runtime, teamId } = runtimeFor(["w1"], [{ to: "w1", task: "root" }]);
+	bootIdle(runtime, teamId);
+	const worker = start(runtime, teamId);
+	assert.equal(call(runtime, worker, 1, "reply", { action: "reply", result: { status: "succeeded", summary: "r" } }).ok, true);
+	settleClean(runtime, worker, "reply");
+	// Late duplicate evidence of the same commit is idempotent and cannot produce a second ROOT_RESULT_READY.
+	assert.equal(runtime.cleanupFinished(worker.binding, worker.scope.activationId, { ok: true }).ok, true);
+	const manager = start(runtime, teamId);
+	const events = manager.input.scope.kind === "management" ? manager.input.scope.events : [];
+	assert.equal(events.filter((event) => event.kind === "ROOT_RESULT_READY").length, 1);
+	const noops = [
+		{ action: "status", view: "team" },
+		{ action: "status", view: "work" },
+		{ action: "control", command: "resume_member", memberId: "w1" },
+	];
+	noops.forEach((args, index) => {
+		const reply = call(runtime, manager, index + 1, `noop-${index}`, args);
+		assert.equal(reply.ok, true, JSON.stringify(reply));
+	});
+	assert.equal(call(runtime, manager, 9, "idle", { action: "yield" }).ok, true);
+	settleClean(runtime, manager, "idle");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "the handled batch is not requeued and no-op actions made no new event");
+	assert.equal(runtime.liveEffects(teamId).unprocessedManagerEvents, 0);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "active", "an idle, unclosed Team stays active without polling or failure");
+	runtime.assertInvariants(teamId);
+});
+
+test("A05: a staged worker reply followed by a native error is never published as a clean result and isolates only that member", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "root" }, { to: "w2", task: "unrelated" }]);
+	bootIdle(runtime, teamId);
+	const worker = start(runtime, teamId);
+	assert.equal(call(runtime, worker, 1, "staged", { action: "reply", result: { status: "succeeded", summary: "looks done" } }).ok, true);
+	assert.equal(runtime.nativeSettled(worker.binding, worker.scope.activationId, { status: "error", appliedToolCallId: "staged",
+		error: { code: "PROVIDER_ERROR", message: "stream failed after the tool result" } }).ok, true);
+	assert.equal(runtime.cleanupFinished(worker.binding, worker.scope.activationId, { ok: true }).ok, true);
+	const work = runtime.getWork(teamId, worker.scope.work!)!;
+	assert.equal(work.current.state, "failed");
+	assert.equal(work.current.resultRef, undefined, "no ResultRecord was committed");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")!.lifecycle, "faulted");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w2")!.lifecycle, "open", "only the failing member is isolated");
+	runtime.assertInvariants(teamId);
+});
+
+test("19.1: the Team status text shows lifecycle, health, member activity/pause, current WorkRef and task, queue/hold counts, policy, incidents and budget", async () => {
+	const { formatTeamView } = await import("../../tools/subagents/team-tool");
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "Review the protocol codec" }, { to: "w2", task: "second" }]);
+	bootIdle(runtime, teamId);
+	const running = start(runtime, teamId);
+	const other = takeWork(runtime, teamId)!;
+	assert.equal(runtime.inputReady(other.binding, other.scope.activationId, other.deliveryId).ok, true);
+	assert.equal(call(runtime, other, 1, "attention", { action: "yield", attention: "need a decision", checkpoint: "c" }).ok, true);
+	settleClean(runtime, other, "attention");
+	const text = formatTeamView(runtime.getTeam(teamId), runtime.listWorks(teamId)).join("\n");
+	assert.match(text, /ACTIVE · needs attention 1/u);
+	assert.match(text, new RegExp(`w1 +worker +· OPEN · RUNNING ${running.scope.work!.workId}@1 "Review the protocol codec" · queued 0 · blocked 0 · held 0`, "u"));
+	assert.match(text, /w2 +worker +· OPEN · IDLE · queued 0 · blocked 1 · held 1/u);
+	assert.match(text, /lead +manager +· OPEN/u);
+	assert.match(text, /FAST off · SEARCH off/u);
+	assert.match(text, /Holds: .*attention \(w2\)/u);
+	assert.match(text, /Incident .*\[WORK_HELD\]|Incident .*\[ATTENTION/u);
+	assert.match(text, /Budget: activations \d+\/512/u);
+	assert.doesNotMatch(text, /completed|workers completed/iu, "idle is never presented as a finished Team");
+});
+
+test("W07: re-yielding on an already delivered, unchanged outcome is NO_NEW_DEPENDENCY and schedules nothing", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "parent" }]);
+	bootIdle(runtime, teamId);
+	const parent = start(runtime, teamId);
+	const child = call(runtime, parent, 1, "child", { action: "request", to: "w2", task: "child" });
+	assert.ok(child.ok && child.receipt?.status === "accepted");
+	const childRef = child.receipt.work;
+	assert.equal(call(runtime, parent, 2, "wait", { action: "yield", waitingFor: [childRef], checkpoint: "c" }).ok, true);
+	settleClean(runtime, parent, "wait");
+	const running = takeWork(runtime, teamId)!;
+	assert.equal(runtime.inputReady(running.binding, running.scope.activationId, running.deliveryId).ok, true);
+	assert.equal(call(runtime, running, 1, "child-reply", { action: "reply", result: { status: "succeeded", summary: "child" } }).ok, true);
+	settleClean(runtime, running, "child-reply");
+	const resumed = takeWork(runtime, teamId)!;
+	assert.equal(runtime.inputReady(resumed.binding, resumed.scope.activationId, resumed.deliveryId).ok, true);
+	assert.equal(resumed.input.outcomes.length, 1);
+	const before = snapshot(runtime, teamId);
+	assert.equal(errorCode(() => call(runtime, resumed, 1, "again", { action: "yield", waitingFor: [childRef], checkpoint: "again" })), "NO_NEW_DEPENDENCY");
+	assert.equal(snapshot(runtime, teamId), before);
+	assert.equal(call(runtime, resumed, 2, "done", { action: "reply", result: { status: "succeeded", summary: "parent" } }).ok, true);
+	settleClean(runtime, resumed, "done");
+	assert.equal(takeWork(runtime, teamId), undefined, "no extra activation was created by the refused yield");
+	runtime.assertInvariants(teamId);
+});
+
+test("W01/W03/D01: identities come from the binding; a legal R1→R2→R3 chain back to the first member is accepted; an outcome is not delivered before input_ready", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2", "w3"], [{ to: "w1", task: "R1" }]);
+	bootIdle(runtime, teamId);
+	const r1 = start(runtime, teamId);
+	const r1Ref = r1.scope.work!;
+	assert.deepEqual((({ requester, assignee, rootId, parent, depth }) => ({ requester, assignee, rootId, parent, depth }))(runtime.getWork(teamId, r1Ref)!),
+		{ requester: "lead", assignee: "w1", rootId: r1Ref.workId, parent: undefined, depth: 0 });
+	const r2 = call(runtime, r1, 1, "r2", { action: "request", to: "w2", task: "R2" });
+	assert.ok(r2.ok && r2.receipt?.status === "accepted");
+	assert.equal(call(runtime, r1, 2, "r1-wait", { action: "yield", waitingFor: [r2.receipt.work], checkpoint: "wait R2" }).ok, true);
+	settleClean(runtime, r1, "r1-wait");
+	const r2Run = start(runtime, teamId);
+	const r3 = call(runtime, r2Run, 1, "r3", { action: "request", to: "w3", task: "R3" });
+	assert.ok(r3.ok && r3.receipt?.status === "accepted");
+	assert.equal(call(runtime, r2Run, 2, "r2-wait", { action: "yield", waitingFor: [r3.receipt.work], checkpoint: "wait R3" }).ok, true);
+	settleClean(runtime, r2Run, "r2-wait");
+	const r3Run = start(runtime, teamId);
+	// A member-level loop (w1 → w2 → w3 → w1) is legal: only work-graph cycles are refused.
+	const r4 = call(runtime, r3Run, 1, "r4", { action: "request", to: "w1", task: "R4 back to w1" });
+	assert.ok(r4.ok && r4.receipt?.status === "accepted", JSON.stringify(r4));
+	for (const [ref, requester, assignee, parent, depth] of [
+		[r2.receipt.work, "w1", "w2", r1Ref, 1], [r3.receipt.work, "w2", "w3", r2.receipt.work, 2], [r4.receipt.work, "w3", "w1", r3.receipt.work, 3],
+	] as const) {
+		const work = runtime.getWork(teamId, ref)!;
+		assert.deepEqual({ requester: work.requester, assignee: work.assignee, rootId: work.rootId, parent: work.parent, depth: work.depth },
+			{ requester, assignee, rootId: r1Ref.workId, parent, depth }, "requester/root/parent/depth are derived by the Runtime");
+	}
+	assert.equal(runtime.getTeam(teamId).works.total, 4);
+	assert.equal(runtime.getTeam(teamId).works.roots, 1);
+	assert.equal(call(runtime, r3Run, 2, "r3-wait", { action: "yield", waitingFor: [r4.receipt.work], checkpoint: "wait R4" }).ok, true);
+	settleClean(runtime, r3Run, "r3-wait");
+	const r4Run = start(runtime, teamId);
+	assert.equal(r4Run.binding.memberId, "w1", "the parked R1 owner runs R4 in its own lifetime");
+	assert.equal(call(runtime, r4Run, 1, "r4-reply", { action: "reply", result: { status: "succeeded", summary: "R4" } }).ok, true);
+	settleClean(runtime, r4Run, "r4-reply");
+	// D01: the outcome is reserved into R3's next input but is not delivered until input_ready.
+	const resumed = runtime.takeNextActivation(teamId)!;
+	assert.deepEqual(resumed.scope.work, r3.receipt.work);
+	assert.deepEqual(resumed.input.outcomes.map((outcome) => outcome.work), [r4.receipt.work]);
+	const r3Before = runtime.getWork(teamId, r3.receipt.work)!.current;
+	assert.deepEqual(r3Before.observedOutcomes, [], "reserved is not delivered");
+	assert.deepEqual(r3Before.waitingFor, [r4.receipt.work]);
+	assert.equal(runtime.gate(resumed.binding, resumed.scope, "provider_gate").allow, false);
+	assert.equal(runtime.inputReady(resumed.binding, resumed.scope.activationId, resumed.deliveryId).ok, true);
+	assert.deepEqual(runtime.getWork(teamId, r3.receipt.work)!.current.observedOutcomes, [r4.receipt.work]);
+	assert.deepEqual(runtime.getWork(teamId, r3.receipt.work)!.current.waitingFor, []);
+	runtime.assertInvariants(teamId);
+});
+
+test("P05/P06: late frames from a finished activation never touch the current work; duplicate input_ready/settle/cleanup settle once", () => {
+	const { runtime, teamId } = runtimeFor(["w1"], [{ to: "w1", task: "first" }, { to: "w1", task: "second" }]);
+	bootIdle(runtime, teamId);
+	const first = start(runtime, teamId);
+	assert.equal(call(runtime, first, 1, "first-reply", { action: "reply", result: { status: "succeeded", summary: "first" } }).ok, true);
+	settleClean(runtime, first, "first-reply");
+	const second = takeWork(runtime, teamId)!;
+	assert.equal(second.binding.memberId, "w1");
+	assert.equal(runtime.inputReady(second.binding, second.scope.activationId, second.deliveryId).ok, true);
+	const once = snapshot(runtime, teamId);
+	assert.equal(runtime.inputReady(second.binding, second.scope.activationId, second.deliveryId).ok, true, "a duplicate input_ready is acknowledged");
+	assert.equal(snapshot(runtime, teamId), once, "a duplicate input_ready changes nothing");
+	assert.equal(second.input.outcomes.length, 0);
+	// Late reply/yield frames of the finished first activation, including its old scope and sequence.
+	assert.equal(call(runtime, first, 2, "late-first-reply", { action: "reply", result: { status: "succeeded", summary: "late" } }).ok, false);
+	// A duplicate input_ready of the just-closed, already delivered activation is re-acknowledged from its tombstone only.
+	assert.equal(runtime.inputReady(first.binding, first.scope.activationId, first.deliveryId).ok, true);
+	assert.throws(() => runtime.inputReady(first.binding, first.scope.activationId, second.deliveryId), (error: unknown) => (error as { code?: string }).code === "WORK_NOT_RUNNING");
+	assert.equal(snapshot(runtime, teamId), once, "late frames from the old activation change nothing");
+	assert.equal(runtime.getWork(teamId, second.scope.work!)!.current.state, "running");
+	assert.equal(runtime.getWork(teamId, second.scope.work!)!.current.resultRef, undefined);
+	assert.equal(call(runtime, second, 1, "second-reply", { action: "reply", result: { status: "succeeded", summary: "second" } }).ok, true);
+	assert.equal(runtime.nativeSettled(second.binding, second.scope.activationId, { status: "success", appliedToolCallId: "second-reply" }).ok, true);
+	const settledOnce = snapshot(runtime, teamId);
+	runtime.nativeSettled(second.binding, second.scope.activationId, { status: "success", appliedToolCallId: "second-reply" });
+	assert.equal(snapshot(runtime, teamId), settledOnce, "a duplicate agent_settled does not settle twice");
+	assert.equal(runtime.cleanupFinished(second.binding, second.scope.activationId, { ok: true }).ok, true);
+	const committed = snapshot(runtime, teamId);
+	runtime.cleanupFinished(second.binding, second.scope.activationId, { ok: true });
+	assert.equal(snapshot(runtime, teamId), committed, "a duplicate deactivate/cleanup commits nothing twice");
+	assert.equal(runtime.listResultRefsPage(teamId).total, 2, "exactly one result per work");
+	runtime.assertInvariants(teamId);
+});
+
+test("A08/G01: a Manager natural answer leaves the Team active with an idle Manager, no summary, no close and no polling activation", () => {
+	const { runtime, teamId } = runtimeFor(["w1"], []);
+	const boot = start(runtime, teamId);
+	assert.equal(boot.scope.kind, "management");
+	assert.equal(runtime.nativeSettled(boot.binding, boot.scope.activationId, { status: "success", finalAssistantText: "Everything looks done; here is my summary." }).ok, true);
+	assert.equal(runtime.cleanupFinished(boot.binding, boot.scope.activationId, { ok: true }).ok, true);
+	// At most one semantic TEAM_QUIESCENT batch for this state version; then nothing, however often the drain runs.
+	const quiescent = runtime.takeNextActivation(teamId);
+	if (quiescent) {
+		assert.deepEqual(quiescent.input.scope.kind === "management" && quiescent.input.scope.events.map((event) => event.kind), ["TEAM_QUIESCENT"]);
+		assert.equal(runtime.inputReady(quiescent.binding, quiescent.scope.activationId, quiescent.deliveryId).ok, true);
+		assert.equal(runtime.nativeSettled(quiescent.binding, quiescent.scope.activationId, { status: "success", finalAssistantText: "Still nothing to do." }).ok, true);
+		assert.equal(runtime.cleanupFinished(quiescent.binding, quiescent.scope.activationId, { ok: true }).ok, true);
+	}
+	const settled = snapshot(runtime, teamId);
+	for (let index = 0; index < 3; index++) assert.equal(runtime.takeNextActivation(teamId), undefined, "no polling or self-wakeup activation");
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.lifecycle, "active");
+	assert.equal(team.outcome, undefined);
+	for (const member of team.members) assert.deepEqual([member.lifecycle, member.activity], ["open", "idle"]);
+	assert.equal(runtime.listResultRefsPage(teamId).total, 0, "a Manager natural answer is not a Team result or summary");
+	assert.equal(runtime.getTeamResult(teamId), undefined);
+	assert.equal(snapshot(runtime, teamId), settled, "reads and empty drains change nothing");
+	runtime.assertInvariants(teamId);
+});
+
+test("D10/L05: after its author is closed and released, a resultRef stays readable and acceptable without waking the author", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "authored" }]);
+	bootIdle(runtime, teamId);
+	const worker = start(runtime, teamId);
+	assert.equal(call(runtime, worker, 1, "authored", { action: "reply", result: { status: "succeeded", summary: "historical result" } }).ok, true);
+	settleClean(runtime, worker, "authored");
+	const manager = start(runtime, teamId);
+	const closing = call(runtime, manager, 1, "close-author", { action: "control", command: "close_member", memberId: "w1" });
+	assert.ok(closing.ok && closing.receipt?.status === "closing", "an author with only committed results can close");
+	assert.equal(runtime.memberReleased(runtime.bindingForDriver(teamId, "w1"), closing.receipt.closeId, { ok: true }).ok, true);
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")!.lifecycle, "closed");
+	const work = runtime.getWork(teamId, worker.scope.work!)!;
+	const record = runtime.getResult(teamId, work.current.resultRef!)!;
+	assert.equal(record.author, "w1");
+	assert.equal(record.result.summary, "historical result");
+	const read = call(runtime, manager, 2, "read-result", { action: "status", view: "result", id: record.id });
+	assert.ok(read.ok, JSON.stringify(read));
+	assert.equal(call(runtime, manager, 3, "accept", { action: "control", command: "accept_result", work: worker.scope.work, disposition: "accepted" }).ok, true);
+	assert.equal(call(runtime, manager, 4, "yield", { action: "yield" }).ok, true);
+	settleClean(runtime, manager, "yield");
+	for (let next = runtime.takeNextActivation(teamId); next; next = runtime.takeNextActivation(teamId)) {
+		assert.notEqual(next.binding.memberId, "w1", "reading or accepting a closed author's result never wakes it");
+		assert.equal(runtime.inputReady(next.binding, next.scope.activationId, next.deliveryId).ok, true);
+		assert.equal(call(runtime, next, 1, `drain-${next.scope.activationId}`, { action: "yield" }).ok, true);
+		settleClean(runtime, next, `drain-${next.scope.activationId}`);
+	}
+	assert.equal(runtime.getWork(teamId, worker.scope.work!)!.current.review?.disposition, "accepted");
+	runtime.assertInvariants(teamId);
+});
+
+test("P08: every retired v1 action and field returns its migration error from the Runtime and changes nothing", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "work" }]);
+	bootIdle(runtime, teamId);
+	const worker = start(runtime, teamId);
+	const before = snapshot(runtime, teamId);
+	const cases: Array<[Record<string, unknown>, RegExp]> = [
+		[{ action: "send", to: "w2", message: "hi" }, /message was removed|send was replaced by request/u],
+		[{ action: "send", to: "w2" }, /send was replaced by request \{to, task\}/u],
+		[{ action: "report", result: { status: "succeeded", summary: "x" } }, /report was replaced by reply/u],
+		[{ action: "wait" }, /wait was replaced by yield \{waitingFor/u],
+		[{ action: "finish" }, /finish was replaced by reply \{result\} \(worker\) or control close_team/u],
+		[{ action: "request", to: "w2", task: "t", afterSeq: 3 }, /afterSeq was removed/u],
+		[{ action: "control", command: "revise_work", workId: "x", expectedRevision: 1, task: "t", supersedes: "old" }, /supersedes was removed/u],
+		[{ action: "reply", result: { status: "succeeded", summary: "x" }, replyTo: "m1" }, /replyTo was removed/u],
+	];
+	let sequence = 1;
+	for (const [args, message] of cases) {
+		const reply = call(runtime, worker, sequence++, `legacy-${sequence}`, args);
+		assert.equal(reply.ok, false, JSON.stringify(args));
+		assert.equal(!reply.ok && reply.error.code, "INVALID_ARGUMENT");
+		assert.match(!reply.ok ? reply.error.message : "", message);
+	}
+	assert.equal(snapshot(runtime, teamId), before, "no legacy bypass reaches the ledger");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")!.lifecycle, "open", "a business error does not fault the member");
+	runtime.assertInvariants(teamId);
+});
+
+test("A06: a last real answer without an intent becomes natural_final only for the current version with no unresolved children", () => {
+	const { runtime, teamId } = runtimeFor(["w1", "w2"], [{ to: "w1", task: "plain" }, { to: "w2", task: "with child" }]);
+	bootIdle(runtime, teamId);
+	const plain = start(runtime, teamId);
+	const parent = start(runtime, teamId);
+	assert.deepEqual([plain.binding.memberId, parent.binding.memberId], ["w1", "w2"]);
+	assert.equal(runtime.nativeSettled(plain.binding, plain.scope.activationId, { status: "success", finalAssistantText: "Plain final answer." }).ok, true);
+	assert.equal(runtime.cleanupFinished(plain.binding, plain.scope.activationId, { ok: true }).ok, true);
+	const plainWork = runtime.getWork(teamId, plain.scope.work!)!;
+	assert.equal(plainWork.current.state, "resolved");
+	const record = runtime.getResult(teamId, plainWork.current.resultRef!)!;
+	assert.deepEqual([record.source, record.result.summary, record.author], ["natural_final", "Plain final answer.", "w1"]);
+	const child = call(runtime, parent, 1, "child", { action: "request", to: "w1", task: "unresolved child" });
+	assert.ok(child.ok && child.receipt?.status === "accepted");
+	assert.equal(runtime.nativeSettled(parent.binding, parent.scope.activationId, { status: "success", finalAssistantText: "I am done anyway." }).ok, true);
+	assert.equal(runtime.cleanupFinished(parent.binding, parent.scope.activationId, { ok: true }).ok, true);
+	const parentWork = runtime.getWork(teamId, parent.scope.work!)!;
+	assert.equal(parentWork.current.resultRef, undefined, "no natural_final while an owned child is unresolved");
+	assert.equal(parentWork.current.state, "blocked");
+	assert.equal(parentWork.current.hold?.reason, "protocol");
+	assert.equal(runtime.getWork(teamId, child.receipt.work)!.current.state, "queued", "the child obligation is kept");
+	runtime.assertInvariants(teamId);
+});

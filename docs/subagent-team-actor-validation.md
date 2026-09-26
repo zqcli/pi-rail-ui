@@ -1,265 +1,505 @@
-# Team Actor v2：本轮阶段性验证报告
+# Team Actor v2：验证报告（§24 100 项）
 
-## 结论与阻碍
+## 1. 结论
 
-**完整规格未交付，100 项验收未全部通过。** 本报告记录本轮实际运行，而不是历史测试成绩。阶段 A/B 基础已提交；C/D 未实施。当前旧 Team UI/prepare/launch 入口尚未迁移，而 Broker 已拒绝旧 v1 dispatch，因此本分支暂不适合作为完整 Team 功能使用。
+规格 §24 的 100 项全部映射到具体测试（§5）。每条引用都是 §4 词典中的稳定编号，编号对应完整文件路径和 `test("…")` 的完整原文。生成本报告时已用脚本校验：100 个场景 ID 无重复、无缺漏；每个引用编号都在词典中定义；每个词典条目的名称都在所在文件中逐字存在；N 组每项至少引用一条 native 测试。
 
-指定 Claude 实施代理终止后，按授权改用 `cus-resp/gpt-6-luna:max`、Fast、默认上下文。阶段 B 提交后，同一 fallback 会话连续两次失败于 `WebSocket closed 1006`；更换为空白 fallback 会话排除会话因素后，仍在实施前失败。没有继续更改模型/全局配置或无限重试。C 没有产生代码改动。
+父审查者在最终工作树上亲自重跑了全量检查，结果无失败、取消或跳过（§3）。
 
-## 版本和提交
+本轮**未验证**的范围：
 
-- 分支：`feat/subagent-team-coordination`
-- 用户基线：`acb612bd5a44bb89c838d35b7d0ae0f1df2413d2`；开始时 HEAD 与其相同。
-- Node：`v24.15.0`。
-- 本地四个 Pi 包：`pi-ai`、`pi-agent-core`、`pi-coding-agent`、`pi-tui` 均为 `0.87.1`。
-- A：`a909fda` — `feat(team): establish actor v2 protocol and pure request runtime`。
-- B / 本报告代码验证对象：`9ccc1e8` — `feat(team): add owned native member lifetimes and v2 activation driver`。
-- 两个代码提交作者均为 `zqcli <276883664+zqcli@users.noreply.github.com>`，提交命令显式覆盖身份，不使用系统 GitHub 身份或 PAT。
-- 开始时只有用户提供的规格文件未跟踪；该文件保持不修改、不暂存。
-- 没有运行 `npm ci`；本地已安装的精确依赖满足本轮检查。没有修改上游 Pi、node_modules、凭据或已有用户 session，没有 push/merge/deploy。
+- 真实在线模型的决策质量。
+- TUI 人工验收。
+- 长时间（长程）运行与真实负载。
+- 跨父进程恢复：规格明确不支持。
+- X09 只证明本地长期不返回的工具可以被有界 cancel 并给出诊断，**不**证明一般意义上的死锁已被避免。
+- N08 只覆盖运行中阶段的预热决策（§7）。
 
-## 父审查者实际执行
+## 2. 版本与基线
 
-所有下列完成命令退出码均为 **0**。
-
-| 检查 | 结果 |
+| 项 | 值 |
 | --- | --- |
-| A：`node_modules/.bin/tsx --test --test-concurrency=2 tests/subagent/team-runtime.test.ts` | 24 tests，24 pass，0 fail/cancel/skip |
-| A：`node_modules/.bin/tsc --noEmit -p tsconfig.json` | 通过 |
-| B：下方六文件定向测试 | 153 tests，151 pass，0 fail/cancel，2 skip |
-| B：`node_modules/.bin/tsc --noEmit -p tsconfig.json` | 通过 |
-| `PI_OFFLINE=1 PI_TELEMETRY=0 npm test` | 980 tests，28 suites，970 pass，0 fail/cancel，10 skip；约 29.46s |
-| `PI_SUBAGENT_DEPTH=1 PI_OFFLINE=1 PI_TELEMETRY=0 npm test` | 980 tests，28 suites，970 pass，0 fail/cancel，10 skip；约 29.39s |
-| 每次代码提交前 `git diff --cached --check` | 通过 |
+| 原始基线 | `acb612bd5a44bb89c838d35b7d0ae0f1df2413d2`（Team v2 开发开始前） |
+| 本轮代码 | `1c38b7a`（D2a）之上的 D2b 工作树。`1c38b7a` **不**包含 D2b 的代码、测试和文档；包含本报告的那次提交固定了本报告所验证的工作树 |
+| Node | v24.15.0 |
+| Pi | `@earendil-works/pi-coding-agent`、`pi-ai`、`pi-agent-core`、`pi-tui` 均为 0.87.1 |
 
-B 定向命令：
+## 3. 命令与结果
+
+隔离环境的要求：
+
+- 使用全新的临时 HOME 和 agent 目录。
+- 清空继承的环境变量，因此不带任何 provider key 或代理。
+- 离线运行，关闭遥测，loopback 地址走 `NO_PROXY`。
+- 不使用付费或在线模型，不修改 `node_modules`、全局设置或用户会话。
+
+下面的片段在仓库根目录运行，不依赖任何临时脚本：
 
 ```bash
-PI_OFFLINE=1 PI_TELEMETRY=0 node_modules/.bin/tsx --test --test-concurrency=2 \
-  tests/subagent/team-runtime.test.ts \
-  tests/subagent/team-rpc-v2.test.ts \
-  tests/subagent/team-member-driver.test.ts \
-  tests/subagent/team-websocket-integration.test.ts \
-  tests/subagent/session-broker.test.ts \
-  tests/subagent/rpc-worker.test.ts
+run_isolated() {
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/rail-team-check.XXXXXX")
+  mkdir -p "$root/home" "$root/agent"
+  env -i PATH="$PATH" TERM="${TERM:-xterm}" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-en_US.UTF-8}" \
+    HOME="$root/home" PI_CODING_AGENT_DIR="$root/agent" PI_OFFLINE=1 PI_TELEMETRY=0 \
+    NO_PROXY=127.0.0.1,localhost,::1 no_proxy=127.0.0.1,localhost,::1 \
+    npm_config_offline=true npm_config_update_notifier=false "$@"
+}
+run_isolated npm run check                       # typecheck + npm test
+run_isolated env PI_SUBAGENT_DEPTH=1 npm test     # 与嵌套 subagent 深度并存
+git diff --check
 ```
 
-全量日志暂存在执行机器 `/tmp/pi-rail-team-actor-full-test.log` 与 `/tmp/pi-rail-team-actor-depth-test.log`；它们不是仓库持久交付文件。测试结果已在此摘要，不能依赖这些临时路径永久存在。
+`npm run check` 即 `npm run typecheck && npm test`，其中 `npm test` = `tsx --test "tests/**/*.test.ts"`。开发时用的 `/tmp/rail-d2/env.sh` 与上面的片段等价，但它不是仓库文件。
 
-### 跳过项及测试限制
+**父审查者重跑（最终工作树，此后代码未再修改）：**
 
-10 个 skip 是 `team-integration.test.ts` 中 8 个旧 v1 集成用例，以及 `team-websocket-integration.test.ts` 中 2 个旧 v1 用例。旧 afterRun/总结屏障已退役，但这 **不等于旧测试覆盖的所有不变量都已迁移**。v2 有 retry、threshold compaction、WebSocket 输入/取消及历史重开测试；完整暂停、预算、Manager 总结替换、context_edit 和关闭管线仍缺验收。
+| 命令 | exit | tests | pass | fail | cancelled | skipped | todo | duration_ms | 日志 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 隔离环境 `npm run check` | 0 | 900 | 900 | 0 | 0 | 0 | 0 | 69179 | `/tmp/pi-rail-final-check.log` |
+| 隔离环境 `PI_SUBAGENT_DEPTH=1 npm test` | 0 | 900 | 900 | 0 | 0 | 0 | 0 | 68976 | `/tmp/pi-rail-final-depth.log` |
 
-真实 Pi 测试使用本地 `dist/bundle/cli.js`、临时 HOME/agent/session 目录、synthetic provider 或 loopback WebSocket。它们不调用真实付费模型。没有在线模型验收、TUI 人工验收、长程运行或恢复能力验收。
+实现者先前在同一代码上的运行结果与此一致：typecheck exit 0；两条 `npm test` 都是 exit 0、900/900；`git diff --check` exit 0。最终的 `git diff --check` 由父审查者在提交前执行。
 
-隔离和清理还有待修复事项：`team-member-driver.test.ts` 的子进程环境未显式传 `PI_TELEMETRY=0`（父测试命令设置了它，但测试构造显式 env）；其 harness teardown 仍捕获并忽略部分 close/shutdown 错误。因此全量绿灯 **不能作为 U10“全部资源收敛”的证据**。不得以这些 catch 替代后续清理修复。新 v2 网络 fixture 使用合成服务，不把测试进程环境等同于真实生产隔离保证。
+Team 专属测试共 181 条，分布在 13 个 `tests/subagent/team-*.test.ts` 文件中。
 
-## 证据索引
+## 4. 测试编号词典
 
-编号引用的是实际测试名，可在相应文件定位。下表分层是证据范围，而不是产品整体通过。
+编号规则：文件代码加上该文件中顶层 `test("…")` 的序号，只在本报告内有效。层级按测试体判定：
 
-| 编号 | 文件与实际测试名 | 层 |
-| --- | --- | --- |
-| R1 | `team-runtime.test.ts`: `P: v2 codec rejects v1 live frames, legacy actions, unknown fields and non-JSON values` | 纯 Runtime/codec |
-| R2 | 同上：`P: request admission is activation-idempotent and derives identity/root from the binding` | 纯 Runtime |
-| R3 | 同上：`P: private activate codec validates binding, delivery, nested fields and typed public replies` | codec |
-| R4 | 同上：`W: a yielded parent releases its member for a dependent return trip and observes each outcome once` | 纯 Runtime |
-| R5 | 同上：`W: an outcome that arrives before yield is not lost and produces one ready activation` | 纯 Runtime |
-| R6 | 同上：`W: cycle detection includes parent completion edges and rejects without reserving a wait` | 纯 Runtime |
-| R7 | 同上：`W: revision fences an active old WorkRef until native cleanup, then reuses the same member lifetime` | 纯 Runtime |
-| R8 | 同上：`W: cancelled dependency is not deliverable until the old activation cleanup is confirmed` | 纯 Runtime |
-| R9 | 同上：`W: reply refuses a logically cancelled child while its native cleanup is pending` | 纯 Runtime |
-| R10 | 同上：`W: native failure faults a worker and terminalizes its other assigned work` | 纯 Runtime |
-| R11 | 同上：`A: staged reply remains uncommitted through settlement and needs matching native tool-result evidence` | 纯 Runtime |
-| R12 | 同上：`A: oversized natural final is protocol-held after cleanup and remains manager-disposable` | 纯 Runtime |
-| R13 | 同上：`L: request-before-close blocks close; close-before-request rejects without creating work` | 纯 Runtime |
-| R14 | 同上：`L: close_team is a staged Manager decision and reports closed only after all exits are confirmed` | 纯 Runtime |
-| R15 | 同上：`L: native failure after staged close converges to failed Team and still permits confirmed exits` | 纯 Runtime |
-| R16 | 同上：`A: provider/tool gates require the exact delivered WorkRef and reject the activation after a staged intent` | 纯 Runtime |
-| R17 | 同上：`A: pre-settlement transport loss clears the running slot as outcome-unknown and faults only that member` | 纯 Runtime |
-| R18 | 同上：`P: exhausted result slots reject request admission without ledger or budget side effects`；`P: revise_work capacity rejection preserves the current writer, revision and reserved slots` | 纯 Runtime |
-| R19 | 同上：`W: revising a resolved root preserves its committed result and old review`；`W: revision rejects a closed assignee without changing work, results or member state` | 纯 Runtime |
-| R20 | 同上：`L: close_team refuses faulted worker resources that were never released`；`L: close_team cannot absorb a worker already closing but not yet released` | 纯 Runtime |
-| R21 | 同上：`P: prepare rejects initial per-member overflow before reserving a Team or changing live state`；`P: explicit deadline starts at launch admission, while prepare time is unbounded` | 纯 Runtime |
-| F1 | `team-rpc-v2.test.ts`: `identical child requests are idempotent, stale sequence replies do not execute, and ACK duplicates are diagnosed` | fake transport |
-| F2 | 同上：`late private requests from the just-closed activation are ignored and diagnosed` | fake transport |
-| F3 | 同上：`pending private requests are never evicted and requests older than the bounded completed cache are not re-executed` | fake transport |
-| F4 | 同上：`a stop/exit failure propagates from send and close instead of reporting a released resource` | fake transport |
-| F5 | 同上：`native Team run may exceed the five-second ACK bound and still waits for real agent_settled`；`Team command application ACK still fails closed at the independent five-second timeout` | fake transport |
-| F6 | 同上：`an explicit abort requests native cancellation but still waits for Pi agent_settled`；`opaque native tool-call IDs stay transcript evidence and end intents match the exact executed call/result` | fake transport |
-| E1 | `team-extension-v2.test.ts`: `Team v2 tool schema is a strict action union and bind selects role-specific tools` | fake extension |
-| E2 | 同上：`native custom activation is persisted and verified before input_ready/provider_gate; repeats are idempotent` | fake extension；native 顺序另由 N1 验证 |
-| E3 | 同上：`wrong native context aborts before private readiness or provider continuation`；`business tool errors retain the structured TeamError JSON including its code` | fake extension |
-| N1 | `team-member-driver.test.ts`: `real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member` | 真实 Pi + synthetic provider |
-| N2 | 同上：`real Pi automatic retry remains inside the Team native run and settles one activation` | 真实 Pi + synthetic provider |
-| N3 | 同上：`real Pi threshold compaction occurs inside a Team activation without losing provider/native ownership` | 真实 Pi + synthetic provider |
-| N4 | 同上：`real Pi rejects a non-sole end intent and Runtime commits only the true natural final` | 真实 Pi + synthetic provider |
-| N5 | 同上：`normal Team close preserves the native session and descriptor for ordinary history reopen` | 真实 Pi + synthetic provider；手工 driver close 非完整 Manager close_team 流程 |
-| N6 | `team-websocket-integration.test.ts`: `Stage B Team v2 actors use the configured Responses WebSocket for native input and tool settlement`；`Stage B Team v2 cancellation aborts a held native WebSocket run without another provider request` | 真实 Pi + loopback synthetic WebSocket |
-| B1 | `session-broker.test.ts`: `Team v2 open reserves one alias across startup and competing opens cannot remove the owner's lock` | fake worker/Broker |
-| B2 | 同上：`Team v2 startup cancelled by broker shutdown retains the persistent session but never returns a live handle` | fake worker/Broker |
-| B3 | 同上：`Team v2 close preserves descriptor and ownership until an exit timeout's reap promise resolves`；`failed Team v2 binding keeps ownership until process exit, then permits an ordinary history reopen` | fake worker/Broker |
-| B4 | `rpc-worker.test.ts`: `Team v2 restores the pre-activation context window after native compaction keeps the temporary budget` | fake transport |
-| U1 | 全量执行中的 `tool.test.ts`、`session-broker.test.ts`、`rpc-worker.test.ts` 等普通 subagent 回归 | 各文件现有单元/集成层；不作为新增 Team 验收替身 |
+- **pure**：纯 `TeamRuntime`、scheduler 或 codec。
+- **fake**：fake transport、extension host、broker、UI、Pi API 或 fake worker。
+- **native**：真实 Pi 0.87.1 子进程加隔离的本地合成 provider。`team-member-driver.test.ts` 中，测试体调用 `createHarness(` 或 `runScopedStopScenario(` 的为 native，其余为 fake；WS 通过真实 Pi CLI 连接 loopback WebSocket。
 
-## 100 项验收逐项映射
+词典列出全部 Team 测试，以及被引用的非 Team 测试。
 
-**“范围内已测”仅表示表中列出的层和断言；“部分”表示仍欠该场景的必要分支；“未验证”不能视为通过。** 所有场景仍需最终 live 入口迁移后的整体验收。没有把旧 v1 测试当作新 v2 场景成绩。
 
-### P：协议与身份
+**`tests/subagent/team-runtime.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| P01 | 部分 | R1 拒绝 v1 frame；尚缺完整父 v2/子 v1 原生握手且 provider 零调用的专门验收。 |
-| P02 | 部分 | R2/R3/E1 身份推导与字段拒绝；所有伪造组合未穷举。 |
-| P03 | 范围内已测 | R2/F1：同内容重复 request 不重建工作。 |
-| P04 | 范围内已测 | R2/E2：同 ID 不同内容拒绝，不重复副作用。 |
-| P05 | 部分 | R7/F2：旧 revision、closed activation；旧 epoch 全排列未完成。 |
-| P06 | 部分 | E2/F1 重复 bind/activate/reply/deactivate/ACK；完整新旧交错待补。 |
-| P07 | 部分 | R1/R3/E1：严格字段、嵌套与 null 基础；动作组合矩阵未全覆盖。 |
-| P08 | 范围内已测 | R1：拒绝旧动作；旧实时文件仍待 D 删除。 |
-| P09 | 部分 | R3/E2 覆盖 binding 伪造拒绝；双 Team 同 alias 的状态独立验收待补。 |
-| P10 | 范围内已测 | F3：pending 不淘汰，过期 sequence 不重执行。 |
+- `RT01` · pure · `P: v2 codec rejects v1 live frames, legacy actions, unknown fields and non-JSON values`
+- `RT02` · pure · `P: prepare rejects initial per-member overflow before reserving a Team or changing live state`
+- `RT03` · pure · `P: request admission is activation-idempotent and derives identity/root from the binding`
+- `RT04` · pure · `A/A09: provider/tool gates require the exact delivered WorkRef; a post-intent continuation stays settling and bounded`
+- `RT05` · pure · `C01: an idle paused worker accepts new work without launching it, then resumes unchanged`
+- `RT06` · pure · `C02/C03: pause waits for approved native tools, acknowledges every preflight result, and reacquires its permit`
+- `RT07` · pure · `C04: member resume does not clear a work hold; exact resume_work and HostControl release are idempotent`
+- `RT08` · pure · `C04: member resume and hold-release APIs cannot bypass an exhausted budget hold`
+- `RT09` · pure · `X02: a valid staged reply survives a concurrent pause and commits after cleanup`
+- `RT10` · pure · `C10: a genuine native provider error outranks a simultaneous pause request`
+- `RT11` · pure · `C05/C06: superseded reply evidence waits for cleanup, committed results survive revision, and stale revisions never apply`
+- `RT12` · pure · `C07/C08/C10: cancel only the selected subtree, keep same-member roots, and delay dependency outcomes until cleanup`
+- `RT13` · pure · `C09: pre-settlement worker transport loss isolates only that member and preserves unrelated queued work`
+- `RT14` · pure · `P: exhausted result slots reject request admission without ledger or budget side effects`
+- `RT15` · pure · `P: revise_work capacity rejection preserves the current writer, revision and reserved slots`
+- `RT16` · pure · `P: native tool-call IDs remain opaque and exact across private preflight/result frames`
+- `RT17` · pure · `P: private activate codec validates binding, delivery, nested fields and typed public replies`
+- `RT18` · pure · `P: explicit deadline starts at launch admission, while prepare time is unbounded`
+- `RT19` · pure · `W: a yielded parent releases its member for a dependent return trip and observes each outcome once`
+- `RT20` · pure · `W: an outcome that arrives before yield is not lost and produces one ready activation`
+- `RT21` · pure · `W: cycle detection includes parent completion edges and rejects without reserving a wait`
+- `RT22` · pure · `W: revision fences an active old WorkRef until native cleanup, then reuses the same member lifetime`
+- `RT23` · pure · `W: revising a resolved root preserves its committed result and old review`
+- `RT24` · pure · `W: cancelled dependency is not deliverable until the old activation cleanup is confirmed`
+- `RT25` · pure · `W: reply refuses a logically cancelled child while its native cleanup is pending`
+- `RT26` · pure · `W: native failure faults a worker and terminalizes its other assigned work`
+- `RT27` · pure · `W: revision rejects a closed assignee without changing work, results or member state`
+- `RT28` · pure · `L: close blockers never expose private activation or delivery IDs`
+- `RT29` · pure · `L: close_team refuses faulted worker resources that were never released`
+- `RT30` · pure · `L: close_team cannot absorb a worker already closing but not yet released`
+- `RT31` · pure · `A: staged reply remains uncommitted through settlement and needs matching native tool-result evidence`
+- `RT32` · pure · `A: oversized natural final is protocol-held after cleanup and remains manager-disposable`
+- `RT33` · pure · `L: request-before-close blocks close; close-before-request rejects without creating work`
+- `RT34` · pure · `L: close_team is a staged Manager decision and reports closed only after all exits are confirmed`
+- `RT35` · pure · `L: native failure after staged close converges to failed Team and still permits confirmed exits`
+- `RT36` · pure · `C04/G10: hold release rejects manager_unavailable and any release while the Manager is faulted, atomically`
+- `RT37` · pure · `C01/C10: re-pausing a parked worker whose resume awaits a permit keeps it parked; repeated resume is a no-op`
+- `RT38` · pure · `C08: native settlement releases a still-parked provider gate so cleanup never waits on it`
+- `RT39` · pure · `L10/X08: host cancel after a staged close_team keeps the close decision and does not stop the Manager settlement`
+- `RT40` · pure · `P/6.1: an unclaimed prepared Team cancels without launch, provider or resource claims`
+- `RT41` · pure · `C10/12.5: a real native error after cancel_work is isolated as native_failure, not masked as a policy stop`
 
-### W：账本与依赖
+**`tests/subagent/team-runtime-scheduler.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| W01 | 范围内已测 | R2/R4：root/parent/depth 来自 Runtime。 |
-| W02 | 未验证 | 没有新 v2 UI 事件尾部淘汰后的完整回归。 |
-| W03 | 范围内已测 | R4/N1：W1→W2→W1 的请求链合法，同成员复用 session。 |
-| W04 | 范围内已测 | R6：真实依赖环拒绝且图不变化。 |
-| W05 | 范围内已测 | R6：父完成约束边参与环检测。 |
-| W06 | 范围内已测 | R5：结果先到再 yield，不丢唤醒。 |
-| W07 | 范围内已测 | R4/R5：已观察 outcome 不再生成 ready。 |
-| W08 | 部分 | R8/R10：取消/失败基础；三种 outcome 的所有依赖组合未全覆盖。 |
-| W09 | 部分 | R4/R9/R11：子工作及清理义务拒绝；完整错误 blocker 组合待补。 |
-| W10 | 未验证 | 代码有 terminal parent 拒绝，缺独立测试证明。 |
+- `RS01` · pure · `Runtime event drain reserves one same-member activation and schedules the next only after cleanup`
+- `RS02` · pure · `Manager event batches are finite and semantic quiescence remains idle without repeated execution`
+- `RS03` · pure · `new Manager events stay in the next sealed batch and faults outrank incidents stably`
+- `RS04` · pure · `an internal memberReleased exception is observable as failed and does not become an unhandled effect rejection`
+- `RS05` · pure · `G10: Manager native failure parks workers and HostControl cancels without another Manager activation`
+- `RS06` · pure · `X08: deadline starts at launch, user cancellation wins later deadline, and an earlier close decision is retained`
+- `RS07` · pure · `X09/13.3: host cancel interrupts a running approved tool at once, then terminates a native run that never settles`
+- `RS08` · pure · `6.1/6.3: prepared cancel closes only claimed lifetimes and keeps an unconfirmed exit as cleanup_failed`
+- `RS09` · pure · `14.4/19.2: a worker native_failure keeps faulted history when host cancel releases its still-owned resource`
+- `RS10` · pure · `memberExitConfirmed accepts only an exact faulted unknown-exit lifetime`
 
-### D：交付与容量
+**`tests/subagent/team-budget.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| D01 | 范围内已测 | R2/R3/R11：账本接受与 input_ready 分离。 |
-| D02 | 范围内已测 | E2/E3：ACK 不代表 canonical native 输入已就绪。 |
-| D03 | 范围内已测 | E2/N1/N6：固定 trigger + 一份原生 custom message。 |
-| D04 | 部分 | R11/R13 检查 settling 预约；R2 各到达时刻组合待补。 |
-| D05 | 未验证 | 生产 event-driven pump 尚未实现。 |
-| D06 | 部分 | R18/R21 接受前容量拒绝；64 项队列满时合法 reply 的专门测试待补。 |
-| D07 | 部分 | R1/R3/R12/R18：字节和输入/结果基础边界；最大组合欠缺。 |
-| D08 | 未验证 | 多依赖截断预览与精确交付的专门测试待补。 |
-| D09 | 范围内已测 | F4/F5/R17：ACK 超时、transport unknown、无自动重放。 |
-| D10 | 部分 | R13/R14/N5 保留结果与 session；关闭作者后完整公开 status 查询待补。 |
+- `RB01` · pure · `G05/G08: new child IDs accumulate on the same root until it holds; unrelated roots continue; a root grant resumes the same work`
+- `RB02` · pure · `G06: revisions keep accumulating root activations instead of resetting them`
+- `RB03` · pure · `G07/G09: new roots cannot evade the Team budget; the Manager gets bounded restricted emergency activations, then only the host`
+- `RB04` · pure · `gates: every observable provider request counts, including a retry, and exhaustion is a budget hold`
+- `RB05` · pure · `gates: invalid end intents consume tool budget; one charged final attempt lets a legal reply finish`
+- `RB06` · pure · `gates: repeated invalid end intents cannot bypass exhaustion; the next attempt and request stop as a budget hold`
+- `RB07` · pure · `gates: tool-budget denials that end naturally become a budget hold, not a protocol failure`
+- `RB08` · pure · `C04: a parked pause resumed after exhaustion stops at budget, and grants never lift attention or pause holds`
+- `RB09` · pure · `X05: root child capacity rejects before admission; grants validate everything before applying anything`
+- `RB10` · pure · `X08: host cancel of a budget-held Team explains both causes and later grants are refused`
+- `RB11` · pure · `usage: one fold per activation, repeats never double-bill, contextTokens keeps the latest value`
+- `RB12` · pure · `journal: bounded critical facts only, written before publish, terminal written once; the generation deactivates permanently`
+- `RB13` · pure · `actual Runtime terminal journal records round-trip through the strict history codec`
+- `RB14` · pure · `journal: a lost terminal write reports the Team as failed, never as a clean close`
+- `RB15` · pure · `journal: a failed result write never publishes the result and fails the Team closed`
+- `RB16` · pure · `journal: close decision and grant failures refuse the mutation; launch failure keeps the Team prepared`
+- `RB17` · pure · `usage: loss keeps observed cost once; settle/lost races and repeats never double-bill; cancellation keeps its cost`
+- `RB18` · pure · `9.4: activation input carries the tightest current scope budget summary`
+- `RB19` · pure · `grant validation rejects a safe-integer overflow of any raised limit atomically, before the journal`
+- `RB20` · pure · `final first-wins: host cancel of an already failed Team keeps failed, its original reason and close decision`
+- `RB21` · pure · `G09: a Manager stopped mid-activation by budget does not replay its batch; emergency activations stay bounded`
+- `RB22` · pure · `team view and status pages stay inside one private reply frame with maximal roots, grants, incidents and multi-byte text`
 
-### A：Activation 与提交
+**`tests/subagent/team-runtime-properties.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| A01 | 范围内已测 | N1：同成员/session 多工作，reply/yield 不关闭成员。 |
-| A02 | 范围内已测 | R11/F6/N1：成功 terminate 证据与清理前不提交。 |
-| A03 | 范围内已测 | R7/R11/B4：settled/reset/deactivate 边界仍占有成员。 |
-| A04 | 范围内已测 | R16/F6：结束意图后 gate 拒绝业务。 |
-| A05 | 部分 | R11/R15：缺证据/close 后 native error；worker 的所有 post-intent error 组合待补。 |
-| A06 | 范围内已测 | N4/R12：使用本 activation 最后回答，合法才 natural_final。 |
-| A07 | 部分 | R11 不把空文本替代显式结果；之前非空/最终空的全原生测试待补。 |
-| A08 | 部分 | N1 管理 activation 自然结束不关闭；最终用户入口尚未接入。 |
-| A09 | 未验证 | 第三方 continuation 与累计预算保护待 C。 |
-| A10 | 部分 | Runtime/Broker 互斥已有检查；重复 schedule effect 测试等待 pump。 |
+- `RP01` · pure · `X10: fixed-seed random Runtime traces keep every invariant and replay identically`
+- `RP02` · pure · `D08: more outcomes than previews or one input can carry stay referenced, unselected ones stay undelivered, and previews are never full results`
+- `RP03` · pure · `W02: an unresolved request far behind many newer events remains addressable in the ledger and replies normally`
+- `RP04` · pure · `D07/X04: a maximal roster with maximal multi-byte, escape-heavy inputs fits every frame; one byte more is refused before admission`
+- `RP05` · pure · `X10 regression: cancelling or superseding held work clears its scheduling hold, so no host hold points at a terminal version`
+- `RP06` · pure · `X10 regression: a worker transport loss after a staged yield removes the lost intent's wait edge`
+- `RP07` · pure · `13.3/13.5 known failures wake waiters automatically: a settled native error and a successful failed-status reply`
+- `RP08` · pure · `13.5: a transport loss with confirmed exit holds the waiting parent once; explicit release keeps AND waits blocked and delivers the unknown outcome with results intact`
+- `RP09` · pure · `13.5: an unknown exit keeps cleanup pending, so the dependency hold cannot be released until the exit is confirmed`
+- `RP10` · pure · `13.5: releasing an unrelated protocol hold does not acknowledge an unknown child; the parent is held again for that decision`
+- `RP11` · pure · `13.3: a normal cancel_work whose native cleanup is confirmed stays a known, automatically deliverable outcome`
+- `RP12` · pure · `X01/L03: close_member at every activation latch of its target is blocked until cleanup; after closing, a request is refused without work`
+- `RP13` · pure · `X07: a Manager event arriving at any latch of a management activation joins the next sealed batch exactly once`
+- `RP14` · pure · `P02/P07: forged identity fields and illegal combinations are refused before state changes; declared optionals accept null`
+- `RP15` · pure · `P09: two Teams with the same aliases cannot reference each other's work or results; the other Team is unchanged`
+- `RP16` · pure · `W08/W09: failed, cancelled and superseded children are each delivered to the parent; unresolved children block reply with exact blockers`
+- `RP17` · pure · `W10: a child of a terminal parent cannot be revised into a new obligation; state is unchanged`
+- `RP18` · pure · `A04/A07: after a staged intent new business is ACTIVATION_ENDING; an empty last answer never falls back to earlier text`
+- `RP19` · pure · `D04/D05/D06: requests arriving during settling or after idle wake once; a full recipient queue refuses new work but a staged reply still settles`
+- `RP20` · pure · `U04/U05: waiting and hold changes advance stateVersion while activity stays idle; reads do not; status pages are bounded with stable cursors`
+- `RP21` · pure · `L04/L06/L07/L08: outgoing obligations block close_member, the Manager cannot close itself, close_team linearizes against requests, and succeeded needs accepted succeeded roots`
+- `RP22` · pure · `G02/G03/G04: duplicate result/incident facts raise one Manager event; status, no-op controls and an inactive Manager yield create no new activation`
+- `RP23` · pure · `A05: a staged worker reply followed by a native error is never published as a clean result and isolates only that member`
+- `RP24` · pure · `19.1: the Team status text shows lifecycle, health, member activity/pause, current WorkRef and task, queue/hold counts, policy, incidents and budget`
+- `RP25` · pure · `W07: re-yielding on an already delivered, unchanged outcome is NO_NEW_DEPENDENCY and schedules nothing`
+- `RP26` · pure · `W01/W03/D01: identities come from the binding; a legal R1→R2→R3 chain back to the first member is accepted; an outcome is not delivered before input_ready`
+- `RP27` · pure · `P05/P06: late frames from a finished activation never touch the current work; duplicate input_ready/settle/cleanup settle once`
+- `RP28` · pure · `A08/G01: a Manager natural answer leaves the Team active with an idle Manager, no summary, no close and no polling activation`
+- `RP29` · pure · `D10/L05: after its author is closed and released, a resultRef stays readable and acceptable without waking the author`
+- `RP30` · pure · `P08: every retired v1 action and field returns its migration error from the Runtime and changes nothing`
+- `RP31` · pure · `A06: a last real answer without an intent becomes natural_final only for the current version with no unresolved children`
 
-### C：暂停、修订、取消
+**`tests/subagent/team-member-driver.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| C01 | 未验证 | pause/resume 尚未实现。 |
-| C02 | 未验证 | 安全点暂停与 confirmed 状态待 C。 |
-| C03 | 未验证 | 同批部分工具通过后暂停的原生互锁测试待 C。 |
-| C04 | 未验证 | resume 对其他 hold 的边界待 C。 |
-| C05 | 部分 | R7/R19：旧版清理 fence、已提交版本保持；完整两个交错待补。 |
-| C06 | 部分 | R7 涉及 revision fence；多次过期 expectedRevision 序列待补。 |
-| C07 | 部分 | R8/R9：子请求取消基础；同成员无关 root 完整组合待补。 |
-| C08 | 范围内已测 | R8/R9/F6：未 cleanup 不交付安全终态，不提前释放。 |
-| C09 | 部分 | R17/F4：局部故障；双 Team 故障隔离与全部 protocol 类型待补。 |
-| C10 | 部分 | R2/F1 幂等基础；完整控制重复计数待 C。 |
+- `DR01` · native · `N09 driver policy mismatch is rejected before claiming or opening a native member lifetime`
+- `DR02` · native · `real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member`
+- `DR03` · native · `real Pi Runtime scheduler completes request, reply, Manager acceptance, close_team, and confirmed member exits`
+- `DR04` · native · `TeamMemberDriver.stopTeam cancels a prepared Team without provider calls and closes only the opened lifetimes`
+- `DR05` · native · `TeamMemberDriver.stopTeam cancels a launched native lifetime directly`
+- `DR06` · native · `Rail stop of one live Team worker fails only its work while an unrelated worker root continues`
+- `DR07` · native · `Rail delete confirms the stopped Team member exit before removing its descriptor/session, with no late resurrection`
+- `DR08` · native · `Rail stop of the Manager marks ManagerUnavailable and pauses workers without ending the Team`
+- `DR09` · native · `real Pi rejects flat close_team when another tool shares the finalized assistant batch`
+- `DR10` · native · `real Pi pauses a partially preflighted tool batch, accounts for both tool_results, then resumes the same WorkRef`
+- `DR11` · native · `real Pi pause requested while a reply is being staged lets the reply commit without aborting the native run`
+- `DR12` · native · `real Pi X09: a tool ignoring abort is terminated after the stop bound, releases its owner, and allows an explicit ordinary reopen`
+- `DR13` · native · `real Pi revision interrupts the old scope's running tool and runs the new revision only after cleanup`
+- `DR14` · native · `real Pi work cancellation interrupts only the selected root's running tool and preserves another root on the same member`
+- `DR15` · fake · `Manager cleanup failure returns failed after worker exits while retaining the unknown Manager lifetime`
+- `DR16` · fake · `an internal cleanup transition error is fail-closed, visible, and allows other exits to converge`
+- `DR17` · fake · `prepared stopTeam waits for an in-flight open, closes that late handle, and never opens a new lifetime`
+- `DR18` · fake · `a confirmed-exit worker fault releases its Broker owner once; Team cancel and shutdown never re-close it`
+- `DR19` · fake · `an unknown-exit worker fault keeps its owner through Team cancel; only an explicit retry reconciles the late exit`
+- `DR20` · fake · `a normal close whose private unbind fails releases the exited resource but the Team is failed, not closed`
+- `DR21` · fake · `launch failure preserves the original error and detaches the never-started executor`
+- `DR22` · native · `TeamMemberDriver.close retains a failed member handle for a confirmed retry`
+- `DR23` · fake · `a pre-settlement native send failure is isolated without inventing native completion or retaining the running slot`
+- `DR24` · native · `real Pi automatic retry remains inside the Team native run and settles one activation`
+- `DR25` · native · `real Pi budget safe stop: the root model budget stops after the running step, and a host root grant continues the same WorkRef`
+- `DR26` · native · `real Pi A09: a third-party continuation after a staged reply stays settling, is refused new side effects, is budget-bounded, and commits the intent once`
+- `DR27` · native · `real Pi tool budget: invalid end intents are counted native steps and one final legal reply still settles`
+- `DR28` · native · `real Pi Manager budget stop mid-activation: the batch is not replayed and the emergency follow-up is bounded`
+- `DR29` · native · `real Pi Manager budget: an exhausted Manager gets a restricted emergency activation that can accept and close but not request`
+- `DR30` · native · `real Pi threshold compaction occurs inside a Team activation without losing provider/native ownership`
+- `DR31` · native · `real Pi rejects a non-sole end intent and Runtime commits only the true natural final`
+- `DR32` · native · `normal Team close preserves the native session and descriptor for ordinary history reopen`
+- `DR33` · native · `N01 real Pi: BOOT and initial work run while a role-only writer receives no placeholder provider request`
+- `DR34` · native · `N03 real Pi: four workers yielding for the eighth free their permits, the eighth runs, and the Manager never uses a worker permit`
+- `DR35` · native · `N06 real Pi: after a canonical context_edit and threshold compaction the current WorkRef, checkpoint and resultRef continue without reviving the deleted input`
+- `DR36` · native · `N10/U10 real Pi: the writer asks an idle reviewer in its same session, the Manager closes on the writer's result without a summary, and all resources converge`
+- `DR37` · native · `P01 real Pi: a v2 parent refuses a child exposing only the v1 Team command before any command, prompt or provider call`
+- `DR38` · native · `N08 real Pi: with cache warming configured and worthwhile, a Team binding stops the in-run warm refresh without touching settings; the same session warms once ordinary`
 
-### L：关闭竞争
+**`tests/subagent/team-rpc-v2.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| L01 | 范围内已测 | R13：request 先接受则关闭被阻止。 |
-| L02 | 范围内已测 | R13：关闭先提交则请求拒绝且无 work。 |
-| L03 | 部分 | R11/R20：settling/cleanup 阻止关闭；parked 暂停待 C。 |
-| L04 | 部分 | R4/R9 保留 owned-child 义务；专门 outgoing close 验收待补。 |
-| L05 | 部分 | R13/R14/N5：不因历史结果删除作者历史；完整状态查询待补。 |
-| L06 | 部分 | R14：自身管理 activation 可以 staged close；完整 self close_member 拒绝待专测。 |
-| L07 | 部分 | R13/R14 为同步关闭基础；close_team/peer request 两序组合待补。 |
-| L08 | 部分 | R14/R20 覆盖部分前置条件；未验收/partial 等全矩阵待补。 |
-| L09 | 范围内已测 | R14/B3/F4：延迟 exit 不 closed，超时保留 ownership。 |
-| L10 | 部分 | R15/F2：关闭后 native error/迟到 scope；用户 cancel 同时竞争待 C。 |
+- `RV01` · fake · `native Team run may exceed the five-second ACK bound and still waits for real agent_settled`
+- `RV02` · fake · `Team command application ACK still fails closed at the independent five-second timeout`
+- `RV03` · fake · `an explicit abort requests native cancellation but still waits for Pi agent_settled`
+- `RV04` · fake · `terminate stops a native run that ignores abort and reports confirmed exit through the pending send`
+- `RV05` · fake · `terminate with an unconfirmed exit keeps the send's resource as not released`
+- `RV06` · fake · `usage observed before a transport loss is frozen into the activation failure`
+- `RV07` · fake · `an aborted activation reports the usage it already consumed, and events after agent_settled are not added`
+- `RV08` · fake · `identical child requests are idempotent, stale sequence replies do not execute, and ACK duplicates are diagnosed`
+- `RV09` · fake · `late private requests from the just-closed activation are ignored and diagnosed`
+- `RV10` · fake · `opaque native tool-call IDs stay transcript evidence and end intents match the exact executed call/result`
+- `RV11` · fake · `a later empty assistant turn preserves exact staged end-intent evidence and supplies the final text`
+- `RV12` · fake · `flattened close_team control is recognized as a terminating native intent`
+- `RV13` · fake · `pending private requests are never evicted and requests older than the bounded completed cache are not re-executed`
+- `RV14` · fake · `a stop/exit failure propagates from send and close instead of reporting a released resource`
 
-### G：Manager、预算与循环
+**`tests/subagent/team-extension-v2.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| G01 | 部分 | R4/N1 手动 drain 可 idle；真实事件调度长期无轮询验收待 C。 |
-| G02 | 部分 | R2/R5 消息结果幂等；incident 语义版本完整测试待 C。 |
-| G03 | 未验证 | status/no-op/ACK 不制造管理进展的专门验收待补。 |
-| G04 | 部分 | N1 基础 management yield；incident 不重入批次测试待补。 |
-| G05 | 未验证 | root 全寿命累计预算未完成。 |
-| G06 | 未验证 | revise/yield 后累计计数未完成。 |
-| G07 | 未验证 | Team 总执行预算未完成；仅容量/activation 基础限制存在。 |
-| G08 | 未验证 | root budget hold 与无关 root 并行待 C。 |
-| G09 | 未验证 | 紧急额度/Host grant 尚未实现。 |
-| G10 | 未验证 | Manager fault 后运行中 worker 的安全停驻未完成。 |
+- `EX01` · fake · `Team v2 tool schema is a strict action union and bind selects role-specific tools`
+- `EX02` · fake · `flat close_team control is rejected before RPC when its native assistant batch has another tool`
+- `EX03` · fake · `native custom activation is persisted and verified before input_ready/provider_gate; repeats are idempotent`
+- `EX04` · fake · `wrong native context aborts before private readiness or provider continuation`
+- `EX05` · fake · `business tool errors retain the structured TeamError JSON including its code`
 
-### N：真实 Pi 0.87.1
+**`tests/subagent/team-tool.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| N01 | 部分 | N1 有真实 BOOT/worker；无初始请求 writer 的完整流程待 C/D。 |
-| N02 | 范围内已测 | N1：真实 Pi 依赖回问、多次工作、同 session。 |
-| N03 | 未验证 | 四个 worker yield 等第八个、自动许可调度待 C。 |
-| N04 | 范围内已测 | N1/N4/F6：sole batch、原生 toolCall/result/terminate 证据。 |
-| N05 | 范围内已测 | N2/N3/B4：原生 retry、threshold compaction、reset 和最终 settlement。 |
-| N06 | 部分 | N3/B4 仅 compaction；canonical context_edit/显式删除不复活原文待补。 |
-| N07 | 部分 | N1/E1/N6：输入与 schema 基础；最终管理/总结全流程待补。 |
-| N08 | 部分 | E1/E2 fake hook 验证 stop；真实开启预热的计费/调用观测待补。 |
-| N09 | 部分 | B4/U1 与 Driver policy 校验；新 prepare 固定真实政策的入口待 D。 |
-| N10 | 未验证 | Manager→writer→idle reviewer→明确 close_team 闭环未实现。 |
+- `TT01` · fake · `prepare validates and pins the complete member policy without starting a provider`
+- `TT02` · fake · `N09 resolves native/default and trust-aware context reserves, pins policy, and refuses drift before opening`
+- `TT03` · fake · `historical status pages result refs, keeps full records out of details, and fetches one explicit result`
+- `TT04` · fake · `pre-aborted launch performs no opens, retains prepared policy, and can be retried`
+- `TT05` · fake · `launch waits for the full Team lifetime and passes only the prepared member requests`
+- `TT06` · fake · `runtime launch abort is a structured tool error, preserves host control, and cannot update a retired generation`
 
-### U：回归与可观察性
+**`tests/subagent/team-command.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| U01 | 范围内已测 | 本轮全量与 depth 回归通过普通 subagent 测试；10 项旧 Team skip 单列。 |
-| U02 | 部分 | N1/B1：Team-owned 普通 dispatch/control/model/Fast 等拒绝；UI 入口未迁移。 |
-| U03 | 部分 | B2/B3/U1：启动 shutdown/lease 基础；TeamRuntime stop/delete 路由待 D。 |
-| U04 | 未验证 | 完整 hold/wait public version 与 UI 观察待 D。 |
-| U05 | 未验证 | 分页/游标/大产物完整测试待 D。 |
-| U06 | 未验证 | v2 Team usage 跨 activation 累计尚未完成。 |
-| U07 | 未验证 | runtime generation/journal 永久失活尚未接入。 |
-| U08 | 未验证 | 旧 v1 仅历史映射及损坏记录处理尚未迁移。 |
-| U09 | 范围内已测 | N5：关闭保留 session，再普通打开不带 Team 扩展。 |
-| U10 | 未验证 | 有 B3/F4 局部 exit 证据，但部分 harness 吞 cleanup；全 effects 收敛不可声称通过。 |
+- `TC01` · fake · `rail-team registers ID/subcommand completion and prints every root budget`
+- `TC02` · fake · `budget grants show exact impacts and require confirmation; headless UI cannot mutate`
+- `TC03` · fake · `host messages are confirmed and become explicitly attributed Manager events`
+- `TC04` · fake · `cancel of a prepared Team is explicitly confirmed and closes resources without a provider`
 
-### X：组合与性质测试
+**`tests/subagent/team-history.test.ts`**
 
-| ID | 状态 | 本轮证据 / 缺口 |
-| --- | --- | --- |
-| X01 | 部分 | R13/R14 覆盖若干线性化顺序，不是 I01–I30 全组合。 |
-| X02 | 部分 | R7/R11 覆盖 revision/settlement；pause 组合未实现。 |
-| X03 | 部分 | R4/R6/R8 具体 DAG 与取消案例，不是任意 DAG 性质测试。 |
-| X04 | 未验证 | 最大 roster 与最大组合输入/结果未全测。 |
-| X05 | 部分 | R18/R21：结果预留与低容量拒绝；完整高容量结算待补。 |
-| X06 | 部分 | F1/F2/F3/E2：重复、旧帧、容量；完整交错序列待补。 |
-| X07 | 未验证 | 管理批次封存/交付/settling 并发事件全排列待 C。 |
-| X08 | 未验证 | deadline/预算/host cancel 同时触发尚未实现。 |
-| X09 | 部分 | N6 provider held cancellation；不是本地 native 工具长期不返回场景。 |
-| X10 | 未验证 | 固定 seed、trace 和可复现状态机随机测试尚未新增。 |
+- `TH01` · pure · `history retains bounded worker-authored ResultRecords and validates terminal close association`
+- `TH02` · pure · `a close decision with a mismatched terminal closeId remains interrupted`
+- `TH03` · pure · `U08: retired v1 snapshots and launched v2 Teams without a terminal are read-only interrupted; damaged records are skipped`
+- `TH04` · pure · `interrupted history never accepts a later terminal or malformed grant`
 
-## Review 修复与后续验收门槛
+**`tests/subagent/team-index-lifecycle.test.ts`**
 
-A review 实际修复了请求结果槽预检晚于写账本、旧 revision yield、closed/faulted assignee 修订、已提交版本被覆盖、自然结果超大后卡住清理、关闭资源条件及公开泄露 activation ID 等问题。
+- `TI01` · fake · `installRailSubagent lifecycle hooks seal each generation and suppress late callbacks after tree/switch/shutdown`
 
-B review 实际修复了把整个 run 套 ACK 五秒超时、关闭删除 persistent session、exit 未知仍释放 ownership、任意工具 schema/Manager loadout、非规范输入路径、重复帧处理与未 settled 的故障结清等问题。
+**`tests/subagent/team-integration.test.ts`**
 
-这些修复有本轮回归证据，但不能据此认定所有强制契约已满足。继续实施应从 C1/C2 开始，随后替换入口/UI/历史并删除旧实时桥接。必须再次完整执行新验收矩阵与普通回归；不得直接沿用本报告的 970 pass 数字作为后续版本成绩。
+- `TG01` · fake · `session host journals interruption before cleanup and seals its branch generation`
+- `TG02` · fake · `interruption journal write failure is surfaced as a host diagnostic while native cleanup still runs`
+- `TG03` · fake · `post-tree fallback retires the old writer without appending into the new leaf`
+
+**`tests/subagent/team-websocket-integration.test.ts`**
+
+- `WS01` · native · `Stage B Team v2 actors use the configured Responses WebSocket for native input and tool settlement`
+- `WS02` · native · `Stage B Team v2 cancellation aborts a held native WebSocket run without another provider request`
+
+**`tests/subagent/session-broker.test.ts`**
+
+- `SB01` · fake · `ordinary dispatch preserves the native run and usage objects`
+- `SB03` · fake · `Team v2 open reserves one alias across startup and competing opens cannot remove the owner's lock`
+- `SB04` · fake · `Team v2 startup cancelled by broker shutdown retains the persistent session but never returns a live handle`
+- `SB06` · fake · `failed Team v2 binding keeps ownership until process exit, then permits an ordinary history reopen`
+
+**`tests/subagent/tool.test.ts`**
+
+- `TL05` · fake · `control mode steers and queues follow-ups for an active persistent target`
+- `TL10` · fake · `grouped tasks forward independent fastMode policies to stateless and new persistent dispatches`
+- `TL22` · fake · `model plus alias creates a persistent session and target continues it`
+- `TL24` · fake · `parallel parent content is fair and details keep a bounded retained answer`
+- `TL30` · fake · `model without alias or session runs stateless and creates no broker instance`
+- `TL36` · fake · `chain mode preserves ordering and substitutes the previous final output`
+
+## 5. 100 项映射
+
+“层”列由所引用测试的层级自动汇总，只表示“至少一条引用属于该层”，不表示每个断言步骤都在该层完成。N09 的分层另见行内说明。
+
+### P. 协议与身份
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| P01 | native | `DR37` | 握手在任何 command、prompt 或 provider 调用之前明确失败；v1 子端活动日志为空；业务 provider 调用 0 次 |
+| P02 | pure | `RP14`, `RT03` | 伪造的 role、epoch、跨 Team binding 被拒；Team 快照逐字节不变；requester/root 只来自 binding |
+| P03 | pure + fake | `RT03`, `RV08` | 相同 rpcId 返回同一个 receipt，只有一份 WorkRecord 和一个 accepted 事实 |
+| P04 | pure + fake | `RT03`, `EX03` | 相同 ID、不同内容返回 `PROTOCOL_FAILURE`，业务快照不变；同一 commandId、不同 canonical 内容的 bind 被拒 |
+| P05 | pure + fake | `RP27`, `RP14`, `RV09`, `RT11` | 旧 activation 晚到的 reply 被拒；当前工作保持 running，没有 resultRef；过期 epoch 被拒；快照不变 |
+| P06 | pure + fake | `RP27`, `EX03`, `RV08` | 重复的 bind/activate/input_ready/settle/cleanup/deactivate 都只结清一次；重复 ACK 有诊断；结果只有一份 |
+| P07 | pure | `RT01`, `RT17`, `RP14` | 未知字段、非 JSON 值、互斥字段被拒；声明为可选的字段接受 null |
+| P08 | pure | `RP30`, `RT01` | send/report/wait/finish 以及 afterSeq/supersedes/replyTo 各自返回迁移说明（`INVALID_ARGUMENT`）；成员不 fault；快照不变 |
+| P09 | pure | `RP15` | 跨 Team 引用返回 `UNKNOWN_WORK`/`UNKNOWN_RESULT`；另一个同 alias 的 Team 快照不变 |
+| P10 | fake | `RV13` | pending 请求不被淘汰；超出有界缓存的旧请求不会被重新执行 |
+
+### W. 账本与依赖
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| W01 | pure | `RP26`, `RT03` | requester/assignee/root/parent/depth（0–3）由 Runtime 推导；工作总数与 root 数精确 |
+| W02 | pure | `RP03` | 大量新事件之后，未解决的请求仍可在账本中定位并正常 reply |
+| W03 | pure + native | `RP26`, `RT19`, `DR02` | R1→R2→R3→R4 回到首个成员的链被接受（不按成员环拒绝）；真实 Pi 中完成 W1/W2 往返 |
+| W04 | pure | `RT21` | 返回 `DEPENDENCY_CYCLE`；不预留 wait，图与 waitingFor 不变 |
+| W05 | pure | `RT21` | parent 的完成约束边参与环检测 |
+| W06 | pure | `RT20` | 结果早于 yield 到达时只交付一次，产生一个 ready activation |
+| W07 | pure | `RP25` | `NO_NEW_DEPENDENCY`；快照不变；之后没有新 activation |
+| W08 | pure | `RP16` | failed、cancelled、superseded 三种 child outcome 都交付给 parent |
+| W09 | pure | `RP16`, `RT25` | 分别返回 `UNRESOLVED_CHILDREN`/`UNOBSERVED_CHILD_RESULTS`，blockers 精确列出 child |
+| W10 | pure | `RP17` | `INVALID_ARGUMENT`，消息建议新建独立 work；快照不变 |
+
+### D. 交付与容量
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| D01 | pure | `RP26`, `RT04` | 已预约的 outcome 在 input_ready 之前不计入 observedOutcomes，waitingFor 不变；provider gate 返回 `delivery_pending` |
+| D02 | pure + fake | `RT04`, `EX03`, `EX04` | canonical 输入核验通过才发 input_ready；gate 在此之前不放行；上下文不符时中止 |
+| D03 | native | `DR02` | 每次 activation 恰好一个固定触发 prompt、一条 custom 输入、一次 input_ready；provider 请求中只有一份有效工作输入 |
+| D04 | pure | `RP19` | R1 settling 期间入箱的 R2 保持 queued，R1 不变 |
+| D05 | pure | `RP19` | idle 判定前后到达的请求两种顺序都只唤醒一次 |
+| D06 | pure | `RP19`, `RB09` | 接收方队列满时新请求返回 `REQUEST_QUEUE_FULL`；已暂存的 reply 照常结算 |
+| D07 | pure | `RP04` | 多字节、重转义的组合大小在接受前检查；多一个字节即拒绝 |
+| D08 | pure | `RP02` | 未选中的 outcome 保持未交付；完整 resultRef 可查；预览不是完整结果 |
+| D09 | pure + fake | `RV02`, `RV14`, `RT13`, `RP08` | ACK 超时明确失败；stop/exit 失败不报告已释放；传输丢失标记 outcomeUnknown；不自动重放 |
+| D10 | pure + fake | `RP29`, `TT03` | 作者 closed 后原结果可读、可 accept，不唤醒作者；历史 status 可读取单条完整结果 |
+
+### A. Activation 与原生提交
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| A01 | native | `DR02` | w1 的 3 次 activation 共用同一个 sessionId；成员始终 open，结束后为 idle |
+| A02 | pure + fake + native | `RV10`, `RT31`, `DR02` | 结束意图带精确的原生 toolCall/result 证据；settlement 前不提交；真实 Pi 中暂存 reply 后没有额外 provider 轮询 |
+| A03 | pure | `RS01`, `RT31` | cleanup 完成前不释放成员预约，也不开始下一次 send |
+| A04 | pure | `RP18`, `RT04` | `ACTIVATION_ENDING`/`INTENT_CONFLICT`，不创建工作 |
+| A05 | pure | `RP23` | 不发布干净结果；只隔离该成员 |
+| A06 | pure + native | `RP31`, `DR31`, `RT32` | 只有当前版本且没有未决 child 时才生成 natural_final；否则进入 protocol hold 并保留 child 义务；超大回答进入 hold |
+| A07 | pure + fake | `RP18`, `RV11` | 最后一条回答为空时不回退到早先文本，不生成 resultRef |
+| A08 | pure | `RP28` | Team active；成员 open/idle；没有结果、TeamResult 或自唤醒 |
+| A09 | pure + native | `RT04`, `DR26` | 保持 settling；新副作用被拒；计入预算；意图只提交一次 |
+| A10 | pure | `RS01` | 同一成员同时只有一个 activation 被预约和执行 |
+
+### C. 暂停、修订、取消
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| C01 | pure | `RT05`, `RT37` | 暂停中的成员仍 open；新工作 accepted 但不启动；重复 resume 为 no-op |
+| C02 | pure + native | `RT06`, `DR11` | requested 与 confirmed 分开；已开始的工具不被中断；暂停期间 staged reply 照常提交 |
+| C03 | pure + native | `RT06`, `DR10` | 部分预检通过后暂停，每个工具都有 toolResult；没有预检互锁；恢复同一 WorkRef |
+| C04 | pure | `RT07`, `RT08`, `RB08`, `RT36` | resume 不绕过依赖、预算、attention 或 Manager 故障造成的阻塞 |
+| C05 | pure + native | `RT11`, `RT22`, `DR13` | 旧结果只对应旧版本；新版本在旧 scope cleanup 之后才运行（真实 Pi 中中断旧工具） |
+| C06 | pure | `RT11` | 过时的 expectedRevision 返回 `STALE_REVISION`，不覆盖较新的任务 |
+| C07 | pure + native | `RT12`, `DR14` | 只影响选中的子树；同成员无关 root 保留（真实 Pi 中只中断选中 root 的工具） |
+| C08 | pure | `RT12`, `RT24`, `RT38`, `RP11` | cleanup 确认前不交付 outcome、不释放 writer |
+| C09 | pure + native | `RT13`, `RT26`, `DR06` | 只隔离该成员；其工作 outcome 明确；无关工作继续 |
+| C10 | pure | `RT12`, `RT37`, `RT10`, `RT41` | 重复命令无双计数、双清理或进度重置；原生错误不被暂停/取消掩盖 |
+
+### L. 关闭竞争
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| L01 | pure | `RT33` | `CLOSE_BLOCKED`；请求仍存在且可执行 |
+| L02 | pure | `RT33`, `RP12` | `RECIPIENT_CLOSING`；没有新 work |
+| L03 | pure | `RP12` | 在 reserved/input_ready/staged/settled 四个 latch 都返回 `CLOSE_BLOCKED`；staged reply 照常提交 |
+| L04 | pure | `RP21` | 有 outgoing 待回复请求时返回 `CLOSE_BLOCKED` |
+| L05 | pure | `RP29`, `RP12` | 只剩已提交历史结果的作者可以关闭；结果仍可查 |
+| L06 | pure | `RP21` | Manager 以 close_member 关闭自己返回 `FORBIDDEN_ACTION`；close_team 不要求 Manager 事先 idle |
+| L07 | pure | `RP21` | 已 accepted 的未决请求使 close_team 返回 `CLOSE_BLOCKED`；close_team 提交后同一 activation 的新请求和宿主消息被拒，work 数不变；close_team 要求 worker 无 activation，因此 peer 无法在其后发起请求 |
+| L08 | pure | `RP21` | root 未验收或结果为 partial 时，succeeded 关闭返回 `INVALID_TEAM_OUTCOME` |
+| L09 | pure + fake + native | `RT34`, `RS08`, `DR15`, `DR22` | 退出确认前不报告 closed；未确认的退出为 cleanup_failed 并保留 lease；真实 Pi 中失败的 close 保留句柄供确认重试 |
+| L10 | pure + fake | `RT39`, `RT35`, `DR18`, `RB20` | 无自动 reopen、无重复 release、无错误的 closed success |
+
+### G. Manager、预算与循环
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| G01 | pure + native | `RP28`, `RS02`, `DR33` | 全员 idle 时 Team 保持 active；最多一次语义 TEAM_QUIESCENT，之后反复 drain 都没有 activation。Runtime 的定时器只有 `timeoutSeconds` 截止计时器和有界的停止/清理计时器，没有轮询 |
+| G02 | pure | `RP22`, `RS03` | 重复的结果/incident 事实只产生一个 Manager 事件 |
+| G03 | pure | `RP22` | status、no-op 控制和 ACK 不产生 activation 或业务进展 |
+| G04 | pure | `RP22` | 同一批次不自动回队；incident 保持可见 |
+| G05 | pure + native | `RB01`, `DR25` | 新 child ID 在同一 root 上累计直到 hold；真实 Pi 中当前步骤安全停止，grant 后同一 WorkRef 继续 |
+| G06 | pure | `RB02` | 修订不重置 root activation 计数 |
+| G07 | pure | `RB03` | 新 root 不能规避 Team 总预算 |
+| G08 | pure + native | `RB01`, `DR25` | 该 root 停止；无关 root 继续；结果和控制可结算 |
+| G09 | pure + native | `RB03`, `RB21`, `DR28`, `DR29` | 紧急额度有界；模型不能 grant；之后只剩宿主可操作；批次不重放 |
+| G10 | pure + native | `RS05`, `DR08`, `RT36` | needs_attention；worker 在安全点暂停；无自动接任或自唤醒 |
+
+### N. 真实 Pi 0.87.1 集成
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| N01 | native | `DR33` | 只有角色的 writer 没有 provider 调用；其他初始工作正常完成 |
+| N02 | native | `DR02` | W1→W2→W1 回问成功；每个成员单一 session；普通 dispatch/control/Fast/model/stop/delete/detach 被 ownership 拒绝 |
+| N03 | native | `DR34` | 第 8 个 worker 得到执行机会；Manager 不占用 worker 许可 |
+| N04 | native | `DR02`, `DR09`, `DR31` | toolCall 与 toolResult 精确配对；终止后没有额外轮询；非独占批次被拒 |
+| N05 | native | `DR24`, `DR30` | 原生 retry/compaction 期间不把第一次 agent_end 当作 settled；结果不重复 |
+| N06 | native | `DR35` | canonical context_edit 与压缩之后，当前 work/checkpoint/resultRef 仍有效；被删除的输入不复活 |
+| N07 | native | `DR02`, `DR03` | 合成 provider 只根据本次请求可见的消息和成功工具历史决定动作（fixture 不用外部 Map 记忆），即可完成 request→reply→accept→close_team |
+| N08 | native | `DR38` | Pi 自身的决策是 warm；Team 阶段没有 cache_warm 使用、没有 maxTokens=1 调用；settings.json 不变；恢复普通使用后同一 session 产生一次 cache_warm。只覆盖运行中阶段的预热决策（见 §7） |
+| N09 | fake + native | `DR01`, `DR30`, `TT02` | 真实 Pi harness 中，driver 对 model/contextWindow 不符在打开前拒绝（open 0 次、resource 状态不变），随后合法策略真实打开 1 次；真实 Pi 压缩使用固定的 64000 窗口。prepare 的策略固定、reserve 解析与 launch 前漂移拒绝由 fake broker/host 测试 TT02 覆盖，不是 native |
+| N10 | native | `DR36` | writer 报告被提交；Manager 不二次总结；正常 close，资源全部收敛 |
+
+### U. 回归与可观察性
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| U01 | fake | `TL05`, `TL10`, `TL22`, `TL24`, `TL30`, `TL36`, `SB01` | 普通 stateless/persistent/grouped/parallel/chain/control 的公开行为不变（另有全量非 Team 套件全部通过） |
+| U02 | fake + native | `DR02`, `SB03`, `SB06` | Team 成员拒绝普通修改；ownership 覆盖 startup 与 unbind；非 Team 目标照常 |
+| U03 | fake + native | `DR07`, `DR17`, `DR05`, `TI01`, `SB04` | 先打断再等待；无死锁；删除后 descriptor 不复活；shutdown 不返回 live handle |
+| U04 | pure | `RP20`, `RP24` | activity 不变时 waiting/hold 变化仍推进 stateVersion，读取不推进；状态文本显示原因 |
+| U05 | pure + fake | `RP20`, `TT03`, `RB22` | 预览有界；游标稳定；完整 resultRef 可读；最大视图不超出私有帧 |
+| U06 | pure + fake | `RB11`, `RB17`, `RV06`, `RV07` | usage 每次 activation 只累加一次；contextTokens 取最新值而不相加 |
+| U07 | pure + fake | `TI01`, `TG01`, `TG03`, `RB12` | 旧 journal generation 永久失活；不写入新分支 |
+| U08 | pure | `TH03`, `TH04` | 旧 v1 与没有 terminal 的 v2 记录只读显示为 interrupted/legacy；损坏条目跳过；不恢复 live |
+| U09 | native | `DR32` | 普通 reopen 的 provider 看到 `teamCalls = 0`，不带 live Team 工具或旧 activation 权限 |
+| U10 | fake + native | `DR36`, `DR19` | listener/timer/native owner 全部收敛；退出未知时明确保留 owner |
+
+### X. 组合与性质测试
+
+| ID | 层 | 测试编号 | 实际断言 |
+| --- | --- | --- | --- |
+| X01 | pure | `RP12`, `RP01` | 关键 latch 的所有排列下，每一步都通过动态不变量检查（覆盖范围见 §6） |
+| X02 | pure | `RT09`, `RT11`, `RP01` | 旧 scope 永不提交当前版本；暂停意图不丢 |
+| X03 | pure | `RP01`, `RT21`, `RP16` | 可满足的依赖只唤醒一次，环被拒。环拒绝由确定性测试 RT21 断言，随机游走只断言不变量 |
+| X04 | pure | `RP04` | 最大 roster 与最大合法输入/结果下，私有帧与公开输入都不越界 |
+| X05 | pure | `RB09`, `RT14`, `RT15`, `RP19` | 容量耗尽时在接受前拒绝；已接受的合法结果仍可结算 |
+| X06 | pure + fake | `RV08`, `RV09`, `EX03`, `RP27` | 重复和晚到的 ACK/帧不错投、不双提交、不自发生成新 work |
+| X07 | pure | `RP13` | 封存、交付、settling 各边界到达的事件进入下一批，下一批不丢、本批不重复 |
+| X08 | pure | `RS06`, `RB10`, `RT39` | deadline、预算、用户 cancel 同时触发时原因与作用域可解释；cleanup 幂等 |
+| X09 | pure + fake + native | `DR12`, `RS07`, `RV04` | 有界 cancel、终止并给出诊断。**不**声称一般死锁已被证明不存在 |
+| X10 | pure | `RP01`, `RP05`, `RP06` | 固定 seed（60×160 步 + 15×400 步），每步检查不变量；trace 重放一致；断言 outcome-unknown 路径被覆盖；不依赖 LLM |
+
+另有 `WS01`、`WS02` 在真实 Pi + loopback Responses WebSocket 上补充验证原生输入、工具结算与取消，不单独计入某一项。
+
+## 6. I01–I30 覆盖方式
+
+`TeamRuntime.assertInvariants` 由 X10 随机游走每步调用，多数 pure 测试也会调用。它只动态检查以下标签：I01、I02、I04、I06、I07、I08、I09、I11、I13、I14、I15、I16、I17、I20、I24、I26、I27、I28，以及规格 13.5（未确认的 outcome-unknown 依赖不能运行）和“终态版本不带 hold”。**它不覆盖全部 I01–I30。** 其余 12 条由场景测试覆盖：
+
+| 不变量 | 测试编号 |
+| --- | --- |
+| I03 | `RS01`, `DR02` |
+| I05 | `RT33`, `RP21` |
+| I10 | `RP22`, `DR02` |
+| I12 | `RT19`, `DR34` |
+| I18 | `RP28`, `RS02` |
+| I19 | `RP22` |
+| I21 | `RB03` |
+| I22 | `RP21` |
+| I23 | `RP14`, `RP15`, `RP17`, `RP30`, `RP25`, `RB09`, `RT14` |
+| I25 | `DR35`, `DR30` |
+| I29 | `TL05`, `TL22`, `TL24`, `TL30`, `TL36`, `SB01` |
+| I30 | `RV13`, `RV02`, `RT13` |
+
+## 7. 本轮修复、观察与已知差异
+
+- **状态展示（规格 19.1）：** 成员行原先只显示当前 WorkRef，不显示任务。现在 live 视图附带每个成员当前 work 的有界任务预览（`tools/subagents/team-tool.ts` 的 `liveView`/`formatTeamView`），由 `RP24` 覆盖。
+- **删除 `TEAM_MAX_UI_EVENTS` 与 `TeamUiEvent`：** 二者从未被使用。状态展示直接读取有界的 public snapshot，义务只存在于账本中；`RP03`（W02）证明早期请求不会被事件量挤掉。
+- **N08 的观察范围：**
+  - rail broker/Team harness 中，原生运行结束后的 idle 阶段没有进入 Pi 的预热决策，普通 reopen 也是如此。
+  - 普通 CLI 和直接的 `RpcSessionWorker` 探针中，idle 预热会触发。
+  - 已核对子进程参数与环境一致，根因未查明。
+  - `DR38` 因此只验证运行中阶段的预热决策：provider 配置 1 s 预热延迟，工具等待 2.5 s。
+  - “Team 绑定期间 stop 预热”由 extension 的 `cache_warming_decision` 处理器实现；把该处理器改为不阻止时，`DR38` 失败。
+  - 本报告不声称 idle 阶段的预热在 Team 下已被验证。
+- **分层差异：**
+  - N09 的真实 Pi 部分是 driver 在打开前拒绝和合法策略的真实打开；prepare 阶段的策略固定与漂移拒绝只有 fake 覆盖（`TT02`）。
+  - U01 使用 fake broker/worker 的回归套件。
+  - `team-member-driver.test.ts` 中的 fake 条目为 `DR15`, `DR16`, `DR17`, `DR18`, `DR19`, `DR20`, `DR21`, `DR23`，其余 DR 条目均为 native。L09、L10、U10 引用的 `DR15`、`DR18`、`DR19` 属于 fake。
+
+## 8. 历史阶段结果（非本轮成绩）
+
+D1 阶段曾报告 1033 条测试通过，D2a 报告 881/877 条通过（后者为 `PI_SUBAGENT_DEPTH=1`）。这些数字包含已删除的 v1 测试，或早于本轮新增的测试，只作历史参考。v1 时期的在线验收与测试数量见各 legacy 文档（`docs/subagent-team-plan.md` 等），同样不是当前结果。

@@ -1,5 +1,7 @@
 # Team 分支：Pi 0.86.0 适配与验收
 
+> **Legacy（v1 Team，已退役）。** 本文记录旧 coordinator/finish/inbox/wait 实时机制时期的设计与验收，对应代码已删除，其中的测试数量与在线流程不是当前成绩。当前协议见 [Team Actor v2](subagent-team-actor.md)，当前验证见 [Team Actor v2 验证报告](subagent-team-actor-validation.md)。
+
 ## 结果与基线
 
 - 日期：2026-09-20。

@@ -73,6 +73,14 @@ function call(id, args) {
 const A09_CONTINUATION = "third-party boundary continuation";
 
 function actionFor(scenario, input, replies, turn, messages = [], activationIndex = 0) {
+	if (scenario === "n08-cache-warming") {
+		if (input.scope.kind === "management") return [call(`n08-manager-yield-${turn}`, { action: "yield" })];
+		// Keep the native run active past the 1s warming delay so Pi reaches its refresh decision while bound.
+		if (!messages.some((message) => message?.role === "toolResult" && message.toolCallId === "n08-bound-wait")) {
+			return [{ type: "toolCall", id: "n08-bound-wait", name: "bash", arguments: { command: "sleep 2.5; printf bound-wait-done" } }];
+		}
+		return [call("n08-reply", { action: "reply", result: { status: "succeeded", summary: "N08 work complete." } })];
+	}
 	if (scenario === "n01-role-only") {
 		// The Manager never assigns the role-only writer; any writer activation is a failure of N01.
 		if (input.scope.kind === "management") return [call(`n01-manager-yield-${turn}`, { action: "yield" })];
@@ -361,6 +369,11 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 
 export default function install(pi) {
 	let turns = 0;
+	const cacheWarming = process.env.TEAM_V2_SCENARIO === "n08-cache-warming";
+	// Record Pi's own warm-or-stop decision without overriding it (a handler returning nothing never wins).
+	if (cacheWarming) pi.on("cache_warming_decision", (event) => {
+		pi.appendEntry("team-v2-warm-decision", { action: event.action, missCost: event.missCost, warmCost: event.warmCost });
+	});
 	let n06ContextEditWritten = false;
 	if (process.env.TEAM_V2_SCENARIO === "n06-context-edit") pi.on("agent_before_settle", (_event, ctx) => {
 		if (n06ContextEditWritten) return;
@@ -408,7 +421,9 @@ export default function install(pi) {
 	});
 	pi.registerProvider("rail-team-local", {
 		name: "Offline Team v2 probe", baseUrl: "offline://team-v2", apiKey: "synthetic-local-only", api: "rail-team-v2-local-api",
-		models: [{ id: "probe", name: "probe", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 128 }],
+		models: [{ id: "probe", name: "probe", reasoning: false, input: ["text"],
+			cost: cacheWarming ? { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			...(cacheWarming ? { promptCache: { short: 11 } } : {}), contextWindow: 128000, maxTokens: 128 }],
 		streamSimple(model, context, options) {
 			const scenario = process.env.TEAM_V2_SCENARIO ?? "n02";
 			if (++turns > 12) throw new Error("Unexpected Team v2 provider polling");
@@ -419,19 +434,23 @@ export default function install(pi) {
 			if (messageText(lastUser) === "verify restored context window") {
 				content = [{ type: "text", text: `window=${model.contextWindow}` }];
 			} else if (messageText(lastUser) === "ordinary reopen marker") {
-				content = [{ type: "text", text: "Ordinary session reopened with its previous Team history." }];
+				const waited = context.messages.some((message) => message?.role === "toolResult" && message.toolCallId === "n08-ordinary-wait");
+				content = cacheWarming && !waited
+					? [{ type: "toolCall", id: "n08-ordinary-wait", name: "bash", arguments: { command: "sleep 2.5; printf ordinary-wait-done" } }]
+					: [{ type: "text", text: "Ordinary session reopened with its previous Team history." }];
 			} else {
 				activation = latestActivation(context.messages);
 				replies = teamReplies(context.messages, activation.index);
 				content = actionFor(scenario, activation.input, replies, turns, context.messages, activation.index);
 			}
 			const retry = scenario === "retry" && activation?.input.member.id === "w1" && turns === 1;
-			const inputTokens = (scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1)
+			const inputTokens = cacheWarming ? 50000 : (scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1)
 				|| (scenario === "n06-context-edit" && activation?.input.member.id === "w1" && activation.input.scope.kind === "work"
 					&& activation.input.scope.task === "N06 root" && activation.input.outcomes.length > 0 && replies.length === 0) ? 60000 : 1;
 			if (retry) content = [];
 			pi.appendEntry("team-v2-provider", {
 				turn: turns,
+				maxTokens: options?.maxTokens,
 				activationDeliveryId: activation?.input.deliveryId,
 				modelContextWindow: model.contextWindow,
 				retry,

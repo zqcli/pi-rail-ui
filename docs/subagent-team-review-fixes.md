@@ -1,5 +1,7 @@
 # Team 审查问题修复
 
+> **Legacy（v1 Team，已退役）。** 本文记录旧 coordinator/finish/inbox/wait 实时机制时期的设计与验收，对应代码已删除，其中的测试数量与在线流程不是当前成绩。当前协议见 [Team Actor v2](subagent-team-actor.md)，当前验证见 [Team Actor v2 验证报告](subagent-team-actor-validation.md)。
+
 日期：2026-09-25。运行时基线：Pi 0.87.1。
 
 本文记录对 `feat/subagent-team-coordination` 的代码审查所发现问题的修复。协议边界（运行时绑定身份、消息视为不可信数据、ACK 只表示已应用、安全点协作式暂停）保持不变。[协作契约加固](subagent-team-hardening.md) 中与本文冲突的描述以本文为准。

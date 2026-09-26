@@ -101,9 +101,10 @@ export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSumma
 	const width = Math.max(...view.members.map((member) => member.id.length));
 	for (const member of view.members) {
 		// Idle is a live state, never "done": say what the member is waiting on instead.
+		const current = member.currentWork ? works.find((work) => workRefKey(work.work) === workRefKey(member.currentWork!)) : undefined;
 		const activity = member.activity === "idle" && !member.currentWork && member.queued + member.blocked + member.held === 0
 			? "IDLE · no assigned work"
-			: `${upper(member.activity)}${member.currentWork ? ` ${workRefKey(member.currentWork)}` : ""} · queued ${member.queued} · blocked ${member.blocked} · held ${member.held}`;
+			: `${upper(member.activity)}${member.currentWork ? ` ${workRefKey(member.currentWork)}` : ""}${current ? ` "${previewText(current.taskPreview, 80)}"` : ""} · queued ${member.queued} · blocked ${member.blocked} · held ${member.held}`;
 		const pause = member.pause === "none" ? "" : ` · pause ${member.pause}`;
 		const policy = `${member.policy.model ?? "model ?"} · FAST ${member.policy.fastMode ? "on" : "off"} · SEARCH ${member.policy.searchMode ?? "off"}`;
 		const error = member.error ? ` · ${member.error.code}: ${previewText(member.error.message, 160)}` : "";
@@ -223,8 +224,13 @@ function textResult(text: string, details: TeamToolDetails): AgentToolResult<Tea
 }
 
 function liveView(host: TeamSessionHost, teamId: string): { view: TeamTeamView; works: TeamWorkSummary[]; holdsTotal: number } {
-	const held = host.runtime.listWorks(teamId).filter((work) => work.hold);
-	return { view: host.runtime.getTeam(teamId), works: held.slice(0, 8), holdsTotal: held.length };
+	const all = host.runtime.listWorks(teamId);
+	const view = host.runtime.getTeam(teamId);
+	const held = all.filter((work) => work.hold);
+	// Bounded details: at most 8 holds plus each member's current work (for its task preview).
+	const current = new Set(view.members.flatMap((member) => member.currentWork ? [workRefKey(member.currentWork)] : []));
+	const works = [...held.slice(0, 8), ...all.filter((work) => current.has(workRefKey(work.work)) && !work.hold)];
+	return { view, works, holdsTotal: held.length };
 }
 
 // ---------------------------------------------------------------------------------------------

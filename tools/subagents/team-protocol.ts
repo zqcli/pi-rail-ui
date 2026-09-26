@@ -42,7 +42,6 @@ export const TEAM_VIEW_MAX_INCIDENTS = 32;
 export const TEAM_MAX_TERMINAL_INCIDENTS = 512;
 export const TEAM_VIEW_MAX_BUDGET_ROOTS = 32;
 export const TEAM_VIEW_MAX_GRANTS = 16;
-export const TEAM_MAX_UI_EVENTS = 64;
 export const TEAM_MAX_INITIAL_REQUESTS = 8;
 export const TEAM_MAX_LIVE_TEAMS = 32;
 export const TEAM_MAX_RESERVED_RESULT_BYTES = 16 * 1024 * 1024;
@@ -518,15 +517,6 @@ export interface TeamStatusPage {
 	items: Array<TeamWorkSummary | { id: string; work: WorkRef; author: string; status: WorkResult["status"]; summaryPreview: string } | TeamIncidentView>;
 	cursor?: string;
 	hasMore: boolean;
-}
-export interface TeamUiEvent {
-	seq: number;
-	at: number;
-	actor: string;
-	kind: string;
-	message: string;
-	work?: WorkRef;
-	memberId?: string;
 }
 
 export interface TeamResult {

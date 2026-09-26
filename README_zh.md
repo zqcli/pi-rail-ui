@@ -88,25 +88,31 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 #### 协作 Team（按需启用）
 
-当前入口是 `subagent_team` 的 **prepare → launch**：一个 Manager 加 1–8 个 worker，成员使用全新且唯一的 persistent alias。`prepare` 接收 Manager/worker 的 `alias` 与 `roleDescription`、共享 `brief.goal`，以及可选的 `initialRequests`；只验证并固定模型、cwd、Fast/Search 和 contextWindow/compaction reserve 策略，不启动 provider 或工具。策略在 launch 前会再次核对；模型、项目 trust 或 compaction 设置发生变化时，launch 会拒绝并保留 prepared Team，需重新检查后重试。
+普通 subagent 模式不变。Team 的入口是 `subagent_team` 的 **prepare → launch**：固定一个 Manager 加 1–8 个 worker，全部使用全新且唯一的 persistent alias，每个成员是独立的原生 Pi session。成员完成一项工作后不退出，而是保持 open/idle 并可继续接收工作；只有 Manager 的条件式 `close_team`（或宿主取消、故障）结束 Team。Manager 负责分配、验收、处理阻塞和关闭，不撰写最终总结；总结是交给普通 worker 的一项工作。
+
+`prepare` 只校验并固定计划，不启动 provider 或工具：`manager`/`workers` 为 `{alias, roleDescription, model?, cwd?, fastMode?, contextWindow?}`，可选字段为 `null` 或省略即使用默认值；`brief.goal` 必填（可带 `acceptanceCriteria`、`constraints`、`authorizations`）；`initialRequests` 最多 8 条且只能指向 worker，只有角色、没有初始工作的 worker 合法且不会被调用；`timeoutSeconds` 为 `null`/省略表示没有 Team 总截止，正数（≤86400）从 launch 开始计时。模型、cwd、Fast/Search 与 contextWindow/compaction reserve 策略在 prepare 固定，launch 前再次核对，漂移时拒绝并保留 prepared Team。
 
 ```json
-{"action":"prepare","manager":{"alias":"lead","roleDescription":"协调审查并验收结果"},"workers":[{"alias":"impl-review","roleDescription":"审查实现正确性，不修改文件"},{"alias":"test-review","roleDescription":"审查回归覆盖，不修改文件"}],"brief":{"goal":"审查当前变更","acceptanceCriteria":["报告证据与限制"]},"initialRequests":[{"to":"impl-review","task":"检查实现与调用方"}],"timeoutSeconds":null}
+{"action":"prepare","manager":{"alias":"lead","roleDescription":"分配、验收、处理阻塞并关闭；不撰写最终报告","model":null,"cwd":null,"fastMode":null,"contextWindow":null},"workers":[{"alias":"review","roleDescription":"审查实现，不修改文件"},{"alias":"writer","roleDescription":"基于结果引用撰写报告，必要时向 review 补问"}],"brief":{"goal":"审查当前变更并提交有证据的报告","acceptanceCriteria":["标明测试范围与未验证项"]},"initialRequests":[{"to":"review","task":"审查本地变更","inputRefs":[]}],"timeoutSeconds":null}
 ```
 
-然后以返回的 `teamId` 启动，launch 持有整个 Team lifetime，直到 Manager 结束 Team 才返回：
+然后以返回的 `teamId` 启动；launch 持有整个 Team lifetime，Team 结束后返回 `TeamResult`（Manager 选定的 worker 结果引用，不再由 Manager 改写）：
 
 ```json
 {"action":"launch","teamId":"<teamId>"}
 ```
 
-中止 launch 的等待不会暗示取消 Team：工具返回明确错误，Team 仍由宿主管理，可用 `/rail-team <teamId> status` 检查或显式 cancel。不要用普通 `subagent` 工具启动 Team 成员。
+中止 launch 的等待不会取消 Team：工具返回明确错误，Team 仍由宿主管理，可用 `/rail-team <teamId> status` 检查或显式 cancel。不要用普通 `subagent` 工具启动 Team 成员；Team 成员不能递归创建 subagent。
 
-`/rail-team` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、resume、grant 和 cancel。模型工具 `subagent_team status` 也以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。完整历史只读，跨 session branch 不恢复旧 Promise 或继续运行。
+成员通过 `team` 工具协作：`request`（同步接受并返回 WorkRef，不等待接收者运行）、`reply`（只为当前 WorkRef 暂存结果，原生收尾和清理后才提交）、`yield`（等待具体 WorkRef、请求 Manager 决策，或让 Manager 本批 idle；等待会结束本次原生运行，不占住成员）、只读 `status`，以及 Manager 专用的扁平 `control`（`{"action":"control","command":"close_team","resultRefs":["<resultRef>"],"outcome":"succeeded"}`；另有 `pause_member`、`resume_member`、`revise_work`、`cancel_work`、`resume_work`、`accept_result`、`close_member`）。`reply`、`yield`、`close_team` 必须是最终 assistant 批次中唯一的工具调用。业务错误以带 `code` 的结构化工具错误返回。结果未知（传输丢失、清理未确认等）的依赖不会自动唤醒下游，而是挂起并等待 Manager/宿主明确处置。全员 idle 是正常状态，不会自动失败或关闭；没有模型轮询。
+
+执行预算（默认：4 个 worker 执行许可加 Manager 独立许可、Team 512 次 activation、1024 次模型请求、4096 次工具调用等）从 launch 起累计，修订、新 ID 或 idle 都不重置；模型不能给自己加额度，只有宿主可以 grant。
+
+`/rail-team` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、resume（解除 attention/protocol hold）、grant 和 cancel。模型工具 `subagent_team status` 以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。历史只读：跨 session branch 或重启不恢复旧 Promise 或继续运行，未结束的 Team 显示为 interrupted；旧 v1 Team 记录只读映射为 legacy。
 
 在 `/rail-agent` 面板选中成员后按 `s` 停止、按 `x` 删除。对 Team worker，Stop 只停止该成员，并将其运行中 work 记录为 outcome unknown；同 Team 其他 worker/root 与无关 Team 不会被一并取消。停止 Manager 会标记 `MANAGER_UNAVAILABLE` 并暂停 worker，Team 保持可由宿主管理。Delete 只有在成员原生进程实际退出得到确认后才删除 session 与 descriptor；退出未知时保留资源所有权并拒绝删除。
 
-Team v2 的本地 Runtime、真实 Pi RPC 合成 provider、Broker lifecycle 与 branch-hook 定向用例位于 `tests/subagent/team-*.test.ts`。这些检查不代表文档中旧 v1 inbox/wait 行为仍受支持，也不构成完整 100 场景发布验收；真实外网模型的决策质量未由合成测试验证。
+完整协议、状态、错误码与限制见 [Team Actor v2](docs/subagent-team-actor.md)，100 项验收映射与本地证据见 [验证报告](docs/subagent-team-actor-validation.md)。这些是纯 Runtime、fake transport 与真实 Pi 0.87.1 + 本地合成 provider 的测试，不代表真实在线模型的决策质量，也不包含 TUI 人工验收和长时间、真实负载运行。缓存预热检查只覆盖运行中阶段的预热决策；idle 阶段预热在 rail 子进程中未能触发，原因未查明。
 
 ## 测试
 
@@ -127,7 +133,7 @@ agent_dir=$(mktemp -d)
 PI_CODING_AGENT_DIR="$agent_dir" PI_OFFLINE=1 PI_TELEMETRY=0 npm run check
 ```
 
-测试使用本地 mock provider 和仓库内的 Pi bundle，不调用付费模型。共享运行时当前版本见 [Pi 0.87.1 兼容报告](docs/pi-0.87.1-compatibility.md)与 [Pi 0.87.0 迁移记录](docs/pi-0.87.0-migration.md)。[Team Pi 0.87.1](docs/subagent-team-pi-0.87.1.md) 和 [Team Pi 0.86.0](docs/subagent-team-pi-0.86.0.md) 报告是对应历史阶段的记录，不代表当前 Team 已完成 100 场景/I01–I30 整体验收。
+测试使用本地 mock provider 和仓库内的 Pi bundle，不调用付费模型。共享运行时当前版本见 [Pi 0.87.1 兼容报告](docs/pi-0.87.1-compatibility.md)与 [Pi 0.87.0 迁移记录](docs/pi-0.87.0-migration.md)。当前 Team 验证见 [Team Actor v2 验证报告](docs/subagent-team-actor-validation.md)：100 个规格场景都映射到具体测试；动态不变量检查只覆盖 I01–I30 中列出的一部分，其余由具名场景测试覆盖。[Team Pi 0.87.1](docs/subagent-team-pi-0.87.1.md) 和 [Team Pi 0.86.0](docs/subagent-team-pi-0.86.0.md) 报告是 v1 时期的 legacy 记录。
 
 ## 命令
 

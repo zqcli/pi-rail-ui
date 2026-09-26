@@ -2,9 +2,9 @@ import { resolve } from "node:path";
 import type { RailModelRef } from "./models";
 import { railModelReference } from "./models";
 import type { BrokeredTeamMemberHandle, SessionBroker } from "./session-broker";
-import type { ChildRequestFrame, PrivateReply } from "./team-protocol";
+import type { ChildRequestFrame, PrivateReply, TeamResult } from "./team-protocol";
 import { sameBinding, sameScope } from "./team-codec";
-import { TeamRuntime, type NativeCompletion, type RuntimeActivation } from "./team-runtime";
+import { TeamRuntime, type NativeCompletion, type RuntimeActivation, type TeamRuntimeExecutor } from "./team-runtime";
 import { TeamActivationFailure } from "./team-rpc-v2";
 
 export interface OpenTeamMemberRequest {
@@ -40,6 +40,7 @@ function errorMessage(error: unknown): string {
 export class TeamMemberDriver {
 	private readonly members = new Map<string, ManagedMember>();
 	private readonly runningMembers = new Set<string>();
+	private readonly launched = new Map<string, Promise<TeamResult>>();
 
 	constructor(private readonly runtime: TeamRuntime, private readonly broker: SessionBroker) {}
 
@@ -76,12 +77,45 @@ export class TeamMemberDriver {
 	}
 
 	/** Native resources must all be bound before Runtime admits any activation. */
-	launch(teamId: string) {
+	launch(teamId: string): Promise<TeamResult> {
+		const existing = this.launched.get(teamId);
+		if (existing) return existing;
 		const team = this.runtime.getTeam(teamId);
 		if (team.lifecycle !== "prepared") throw new Error(`Cannot launch Team in ${team.lifecycle}`);
 		const missing = team.members.filter((member) => !this.members.has(key(teamId, member.id))).map((member) => member.id);
 		if (missing.length) throw new Error(`Team members need Broker-owned native lifetimes before launch: ${missing.join(", ")}`);
-		return this.runtime.launch(teamId);
+		const executor: TeamRuntimeExecutor = {
+			runActivation: (activation) => this.executeActivation(activation),
+			closeMember: async (binding) => {
+				const id = key(binding.teamId, binding.memberId);
+				const member = this.members.get(id);
+				if (!member) return { ok: false, error: { code: "CLEANUP_FAILED", message: `No native lifetime remains for ${binding.memberId}`, outcomeUnknown: true } };
+				if (this.runningMembers.has(id)) return { ok: false, error: { code: "CLEANUP_FAILED", message: `${binding.memberId} still has a native activation in flight`, outcomeUnknown: true } };
+				try {
+					await member.handle.close();
+					this.members.delete(id);
+					return { ok: true };
+				} catch (error) {
+					return { ok: false, error: { code: "CLEANUP_FAILED", message: errorMessage(error), outcomeUnknown: true } };
+				}
+			},
+		};
+		const detach = this.runtime.attachExecutor(teamId, executor);
+		try {
+			this.runtime.launch(teamId);
+		} catch (error) {
+			try { detach(); }
+			catch (detachError) {
+				throw new AggregateError([error, detachError], "Team launch failed and Runtime executor rollback also failed", { cause: error });
+			}
+			throw error;
+		}
+		const lifetime = this.runtime.waitForCompletion(teamId).then((result) => {
+			if (result.lifecycle === "closed") detach();
+			return result;
+		});
+		this.launched.set(teamId, lifetime);
+		return lifetime;
 	}
 
 	/** Runtime alone selects the next activation; this driver only performs the native effect. */
@@ -93,6 +127,10 @@ export class TeamMemberDriver {
 		if (missing.length) throw new Error(`Team members lack Broker-owned native lifetimes: ${missing.join(", ")}`);
 		const activation = this.runtime.takeNextActivation(teamId);
 		if (!activation) return undefined;
+		return this.executeActivation(activation, options);
+	}
+
+	private async executeActivation(activation: RuntimeActivation, options: { signal?: AbortSignal } = {}): Promise<TeamActivationRun> {
 		const id = key(activation.binding.teamId, activation.binding.memberId);
 		const member = this.members.get(id);
 		if (!member) throw new Error(`No Broker-owned native lifetime for Team member ${activation.binding.memberId}`);

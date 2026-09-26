@@ -45,7 +45,7 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction") {
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed") {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
 	await writeFile(join(root, "settings.json"), JSON.stringify({
 		compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 1 },
@@ -68,6 +68,7 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 				HOME: root,
 				PI_CODING_AGENT_DIR: root,
 				PI_OFFLINE: "1",
+				PI_TELEMETRY: "0",
 				PI_SKIP_VERSION_CHECK: "1",
 				TEAM_V2_SCENARIO: scenario,
 			},
@@ -85,20 +86,21 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 			{ alias: "w2", roleDescription: "Handle W2's assigned work and ask W1 for independent facts.", model: "rail-team-local/probe", cwd: root, fastMode: false },
 		],
 		brief: { goal: "Verify same-session Team v2 activation and result settlement." },
-		initialRequests: [{ to: "w1", task: scenario === "mixed-end" ? "N04 mixed end" : "W1 root", inputRefs: [] }],
+		initialRequests: scenario === "close-loop" || scenario === "close-mixed" ? [] : [{ to: "w1", task: scenario === "mixed-end" ? "N04 mixed end" : "W1 root", inputRefs: [] }],
 		timeoutSeconds: null,
 	});
 	const driver = new TeamMemberDriver(runtime, broker);
 	const handles = new Map<string, Awaited<ReturnType<TeamMemberDriver["openMember"]>>>();
 	t.after(async () => {
-		await driver.close().catch(() => undefined);
-		await broker.shutdown().catch(() => undefined);
-		await rm(root, { recursive: true, force: true });
+		const failures: unknown[] = [];
+		try { await driver.close(); } catch (error) { failures.push(error); }
+		try { await broker.shutdown(); } catch (error) { failures.push(error); }
+		try { await rm(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+		if (failures.length) throw new AggregateError(failures, "Team driver harness cleanup failed");
 	});
 	for (const memberId of ["lead", "w1", "w2"]) {
 		handles.set(memberId, await driver.openMember({ teamId: prepared.teamId, memberId, model: MODEL, cwd: root }));
 	}
-	driver.launch(prepared.teamId);
 	return { root, runtime, teamId: prepared.teamId, driver, handles, broker, store };
 }
 
@@ -114,6 +116,7 @@ async function drain(driver: TeamMemberDriver, teamId: string, max = 24) {
 
 test("real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n02");
+	runtime.launch(teamId);
 	await assert.rejects(broker.dispatch({ target: "w1", task: "ordinary writer intrusion" }), /active team operation/u);
 	await assert.rejects(broker.control({ target: "w1", delivery: "steer", message: "intrusion" }), /Team-owned/u);
 	await assert.rejects(broker.setFastMode("w1", true), /Team-owned/u);
@@ -195,6 +198,212 @@ test("real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settl
 	assert.ok(runs.every((run) => !run.completion.pendingToolCalls));
 });
 
+test("real Pi Runtime scheduler completes request, reply, Manager acceptance, close_team, and confirmed member exits", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles, store } = await createHarness(t, "close-loop");
+	const closeObserved = new Set<string>();
+	const managerHandle = handles.get("lead")!;
+	for (const memberId of ["lead", "w1", "w2"]) {
+		const handle = handles.get(memberId)!;
+		const close = handle.close.bind(handle);
+		handle.close = async () => {
+			const team = runtime.getTeam(teamId);
+			const manager = team.members.find((member) => member.id === "lead")!;
+			assert.equal(manager.lifecycle, "closing");
+			assert.equal(manager.activity, "idle", "no member may exit while the Manager's close activation is active");
+			const entries = parseSession(await readFile(managerHandle.instance.sessionFile, "utf8"));
+			assert.ok(entries.some((entry) => entry.type === "message" && entry.message?.role === "toolResult"
+				&& entry.message.toolCallId === "close-team" && entry.message.isError !== true),
+			"all resource exits follow the Manager's successful native close_team result");
+			closeObserved.add(memberId);
+			await close();
+		};
+	}
+	const result = await driver.launch(teamId);
+	const managerEntries = parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8"));
+	assert.equal(result.lifecycle, "closed", JSON.stringify(result));
+	assert.equal(result.outcome, "succeeded");
+	assert.equal(result.finalResultRefs.length, 1);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "closed");
+	assert.equal(runtime.getTeam(teamId).works.resolved, 1);
+	assert.ok(runtime.getTeam(teamId).members.every((member) => member.lifecycle === "closed" && member.resourceState === "released"));
+	assert.deepEqual([...closeObserved].sort(), ["lead", "w1", "w2"]);
+	const work = runtime.getWork(teamId, result.roots[0]!.work)!;
+	assert.equal(work.current.review?.disposition, "accepted");
+	assert.equal(work.current.resultRef, result.finalResultRefs[0]);
+	for (const memberId of ["lead", "w1", "w2"]) {
+		const handle = handles.get(memberId)!;
+		assert.ok(await store.get(handle.instance.agentId), `${memberId}'s persistent descriptor survives normal Team close`);
+	}
+	const managerActivations = managerEntries.map(promptInput).filter(Boolean);
+	assert.ok(managerActivations.some((activation) => activation.scope.kind === "management"
+		&& activation.scope.events.some((event: any) => event.kind === "BOOT")));
+	assert.ok(managerActivations.some((activation) => activation.scope.kind === "management"
+		&& activation.scope.events.some((event: any) => event.kind === "ROOT_RESULT_READY")));
+});
+
+test("real Pi rejects flat close_team when another tool shares the finalized assistant batch", { timeout: 60000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "close-mixed");
+	runtime.launch(teamId);
+	const run = await driver.runNext(teamId);
+	assert.equal(run?.activation.scope.kind, "management");
+	assert.equal(run?.completion.status, "success");
+	assert.equal(run?.completion.appliedToolCallId, undefined, "mixed close_team never stages Runtime termination evidence");
+	const team = runtime.getTeam(teamId);
+	assert.equal(team.lifecycle, "active");
+	assert.equal(team.members.find((member) => member.id === "lead")?.lifecycle, "open");
+	assert.equal(team.members.find((member) => member.id === "lead")?.activity, "idle");
+	const entries = parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8"));
+	const results = entries.filter((entry) => entry.type === "message" && entry.message?.role === "toolResult");
+	assert.equal(results.find((entry) => entry.message.toolCallId === "mixed-close-team")?.message.isError, true);
+	assert.equal(results.find((entry) => entry.message.toolCallId === "mixed-sibling-status")?.message.isError, false);
+});
+
+test("Manager cleanup failure returns failed after worker exits while retaining the unknown Manager lifetime", { timeout: 10000 }, async () => {
+	const runtime = new TeamRuntime();
+	const prepared = runtime.prepare({
+		manager: { alias: "lead", roleDescription: "Manage and close." },
+		workers: [{ alias: "w1", roleDescription: "Idle worker." }],
+		brief: { goal: "Verify failed close convergence." },
+		timeoutSeconds: null,
+	});
+	const closedMembers: string[] = [];
+	const broker = {
+		openTeamMember: async ({ binding }: any) => ({
+			instance: { agentId: binding.memberId, alias: binding.memberId, sessionId: `session-${binding.memberId}` },
+			sessionId: `session-${binding.memberId}`,
+			runActivation: async (activation: any, onRequest: any, onNativeSettled: any) => {
+				const closesTeam = activation.scope.kind === "management"
+					&& !activation.input.scope.events.some((event: any) => event.kind === "BOOT");
+				const args = closesTeam
+					? { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "synthetic close" }
+					: { action: "yield" };
+				const ready = await onRequest({
+					version: 2, kind: "request", binding: activation.binding, activation: activation.scope,
+					sequence: 1, rpcRequestId: `ready-${activation.scope.activationId}`,
+					request: { action: "input_ready", deliveryId: activation.deliveryId },
+				});
+				assert.equal(ready.kind, "ack");
+				const toolCallId = `intent-${activation.scope.activationId}`;
+				const frame = {
+					version: 2, kind: "request", binding: activation.binding, activation: activation.scope,
+					sequence: 2, rpcRequestId: `rpc-${activation.scope.activationId}`, request: { action: "business", args },
+				};
+				const reply = await onRequest(frame, toolCallId);
+				assert.equal(reply.kind, "business");
+				assert.equal(reply.reply.ok, true, JSON.stringify(reply));
+				onNativeSettled({ status: "success", appliedToolCallId: toolCallId });
+				if (closesTeam) throw new Error("Manager deactivate/reset failed after agent_settled");
+			},
+			close: async () => { closedMembers.push(binding.memberId); },
+		}),
+	} as unknown as SessionBroker;
+	const driver = new TeamMemberDriver(runtime, broker);
+	for (const memberId of ["lead", "w1"]) await driver.openMember({ teamId: prepared.teamId, memberId, model: MODEL });
+
+	const result = await driver.launch(prepared.teamId);
+	assert.equal(result.lifecycle, "failed");
+	assert.match(result.reason ?? "", /close activation cleanup failed/u);
+	assert.deepEqual(closedMembers, ["w1"], "the worker exit is confirmed but the uncertain Manager writer is not stopped or released");
+	const team = runtime.getTeam(prepared.teamId);
+	const manager = team.members.find((member) => member.id === "lead")!;
+	const worker = team.members.find((member) => member.id === "w1")!;
+	assert.equal(manager.lifecycle, "faulted");
+	assert.equal(manager.resourceState, "cleanup_failed");
+	assert.equal(manager.activity, "settling", "the unknown Manager activation remains attached to its owned lifetime");
+	assert.equal(worker.lifecycle, "closed");
+	assert.equal(worker.resourceState, "released");
+	runtime.assertInvariants(prepared.teamId);
+});
+
+test("an internal cleanup transition error is fail-closed, visible, and allows other exits to converge", { timeout: 10000 }, async () => {
+	const runtime = new TeamRuntime();
+	const prepared = runtime.prepare({
+		manager: { alias: "lead", roleDescription: "Manage and close." },
+		workers: [{ alias: "w1", roleDescription: "Idle worker." }],
+		brief: { goal: "Verify cleanup-transition failure handling." },
+		timeoutSeconds: null,
+	});
+	const closedMembers: string[] = [];
+	const broker = {
+		openTeamMember: async ({ binding }: any) => ({
+			instance: { agentId: binding.memberId, alias: binding.memberId, sessionId: `session-${binding.memberId}` },
+			sessionId: `session-${binding.memberId}`,
+			runActivation: async (activation: any, onRequest: any, onNativeSettled: any) => {
+				const closesTeam = activation.scope.kind === "management"
+					&& !activation.input.scope.events.some((event: any) => event.kind === "BOOT");
+				const args = closesTeam
+					? { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "synthetic close" }
+					: { action: "yield" };
+				const ready = await onRequest({
+					version: 2, kind: "request", binding: activation.binding, activation: activation.scope,
+					sequence: 1, rpcRequestId: `ready-${activation.scope.activationId}`,
+					request: { action: "input_ready", deliveryId: activation.deliveryId },
+				});
+				assert.equal(ready.kind, "ack");
+				const toolCallId = `intent-${activation.scope.activationId}`;
+				const frame = {
+					version: 2, kind: "request", binding: activation.binding, activation: activation.scope,
+					sequence: 2, rpcRequestId: `rpc-${activation.scope.activationId}`, request: { action: "business", args },
+				};
+				const reply = await onRequest(frame, toolCallId);
+				assert.equal(reply.kind, "business");
+				assert.equal(reply.reply.ok, true, JSON.stringify(reply));
+				onNativeSettled({ status: "success", appliedToolCallId: toolCallId });
+				if (closesTeam) throw new Error("native reset completed with unknown cleanup");
+			},
+			close: async () => { closedMembers.push(binding.memberId); },
+		}),
+	} as unknown as SessionBroker;
+	const driver = new TeamMemberDriver(runtime, broker);
+	for (const memberId of ["lead", "w1"]) await driver.openMember({ teamId: prepared.teamId, memberId, model: MODEL });
+	const nativeCleanupFinished = runtime.cleanupFinished.bind(runtime);
+	runtime.cleanupFinished = (binding, activationId, cleanup) => {
+		if (!cleanup.ok) throw new Error("injected cleanup transition failure");
+		return nativeCleanupFinished(binding, activationId, cleanup);
+	};
+
+	const result = await driver.launch(prepared.teamId);
+	assert.equal(result.lifecycle, "failed");
+	assert.match(result.reason ?? "", /cleanup report failed.*injected cleanup transition failure/u);
+	assert.deepEqual(closedMembers, ["w1"]);
+	const manager = runtime.getTeam(prepared.teamId).members.find((member) => member.id === "lead")!;
+	assert.equal(manager.lifecycle, "faulted");
+	assert.equal(manager.resourceState, "cleanup_failed");
+	assert.equal(runtime.getTeam(prepared.teamId).members.find((member) => member.id === "w1")?.resourceState, "released");
+	runtime.assertInvariants(prepared.teamId);
+});
+
+test("launch failure preserves the original error and detaches the never-started executor", async () => {
+	const runtime = new TeamRuntime();
+	const prepared = runtime.prepare({
+		manager: { alias: "lead", roleDescription: "Manage." },
+		workers: [{ alias: "w1", roleDescription: "Work." }],
+		brief: { goal: "Verify executor rollback before launch." },
+		timeoutSeconds: null,
+	});
+	let closeCalls = 0;
+	const broker = {
+		openTeamMember: async ({ binding }: any) => ({
+			instance: { agentId: binding.memberId, alias: binding.memberId, sessionId: `session-${binding.memberId}` },
+			sessionId: `session-${binding.memberId}`,
+			runActivation: async () => undefined,
+			close: async () => { closeCalls++; },
+		}),
+	} as unknown as SessionBroker;
+	const driver = new TeamMemberDriver(runtime, broker);
+	for (const memberId of ["lead", "w1"]) await driver.openMember({ teamId: prepared.teamId, memberId, model: MODEL });
+	const expected = new Error("injected launch admission failure");
+	const originalLaunch = runtime.launch.bind(runtime);
+	runtime.launch = (() => { throw expected; }) as typeof runtime.launch;
+	assert.throws(() => driver.launch(prepared.teamId), (error) => error === expected);
+	assert.equal(runtime.getTeam(prepared.teamId).lifecycle, "prepared");
+	const executor = runtime.attachExecutor(prepared.teamId, { runActivation: async () => undefined, closeMember: async () => ({ ok: true }) });
+	executor();
+	runtime.launch = originalLaunch;
+	await driver.close();
+	assert.equal(closeCalls, 2);
+});
+
 test("TeamMemberDriver.close retains a failed member handle for a confirmed retry", { timeout: 60000 }, async (t) => {
 	const { teamId, driver, handles, store } = await createHarness(t, "n02");
 	const member = handles.get("w1")!;
@@ -243,7 +452,7 @@ test("a pre-settlement native send failure is isolated without inventing native 
 	} as unknown as SessionBroker;
 	const driver = new TeamMemberDriver(runtime, broker);
 	for (const memberId of ["lead", "w1", "w2"]) await driver.openMember({ teamId: prepared.teamId, memberId, model: MODEL });
-	driver.launch(prepared.teamId);
+	runtime.launch(prepared.teamId);
 	const cancelledBeforeReservation = new AbortController();
 	cancelledBeforeReservation.abort();
 	const beforeCancel = runtime.getTeam(prepared.teamId);
@@ -268,6 +477,7 @@ test("a pre-settlement native send failure is isolated without inventing native 
 
 test("real Pi automatic retry remains inside the Team native run and settles one activation", { timeout: 90000 }, async (t) => {
 	const { runtime, teamId, driver, handles } = await createHarness(t, "retry");
+	runtime.launch(teamId);
 	const runs = await drain(driver, teamId);
 	assert.ok(runs.some((run: any) => run.completion.status === "success"));
 	const workerEntries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
@@ -285,6 +495,7 @@ test("real Pi automatic retry remains inside the Team native run and settles one
 
 test("real Pi threshold compaction occurs inside a Team activation without losing provider/native ownership", { timeout: 90000 }, async (t) => {
 	const { runtime, teamId, driver, handles } = await createHarness(t, "compaction");
+	runtime.launch(teamId);
 	await drain(driver, teamId);
 	const workerEntries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
 	assert.ok(workerEntries.some((entry) => entry.type === "compaction"), "native compaction writes its actual session checkpoint");
@@ -298,6 +509,7 @@ test("real Pi threshold compaction occurs inside a Team activation without losin
 
 test("real Pi rejects a non-sole end intent and Runtime commits only the true natural final", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles } = await createHarness(t, "mixed-end");
+	runtime.launch(teamId);
 	const manager = await driver.runNext(teamId);
 	assert.equal(manager?.completion.status, "success");
 	const run = await driver.runNext(teamId);
@@ -317,6 +529,7 @@ test("real Pi rejects a non-sole end intent and Runtime commits only the true na
 
 test("normal Team close preserves the native session and descriptor for ordinary history reopen", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles, broker, store } = await createHarness(t, "n02");
+	runtime.launch(teamId);
 	await drain(driver, teamId);
 	const member = handles.get("w1")!;
 	const original = member.instance;

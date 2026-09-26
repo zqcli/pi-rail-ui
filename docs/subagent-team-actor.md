@@ -55,7 +55,7 @@ work 必须有具体依赖，或使用 `attention` 与 checkpoint；不允许无
 只读查询不确认 child outcome 已经交付，不推进业务状态。
 
 ```json
-{"action":"control","control":{"command":"close_team","resultRefs":["宿主返回的resultRef"],"outcome":"succeeded"}}
+{"action":"control","command":"close_team","resultRefs":["宿主返回的resultRef"],"outcome":"succeeded"}
 ```
 
 Manager-only 控制还包括修订、取消、验收、成员关闭。schema 已声明 pause/resume 等完整契约，但当前 Runtime 明确拒绝尚未实现的控制，不能因 schema 存在就声称可用。

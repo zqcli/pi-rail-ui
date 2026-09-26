@@ -79,7 +79,7 @@ function finalAssistantIsSoleToolCall(ctx: ExtensionContext, toolCallId: string)
 
 function isEndIntent(args: Record<string, unknown>): boolean {
 	if (args["action"] === "reply" || args["action"] === "yield") return true;
-	return args["action"] === "control" && isRecord(args["control"]) && args["control"]["command"] === "close_team";
+	return args["action"] === "control" && args["command"] === "close_team";
 }
 
 function stagedReply(reply: TeamReply): boolean {
@@ -153,7 +153,7 @@ export default function install(pi: ExtensionAPI): void {
 		pi.registerTool({
 			name: "team",
 			label: "Team",
-			description: `${TEAM_TOOL_DESCRIPTION} reply and yield must be the only tool call in their finalized assistant batch.`,
+			description: `${TEAM_TOOL_DESCRIPTION} reply, yield, and close_team must be the only tool call in their finalized assistant batch.`,
 			parameters: TEAM_TOOL_SCHEMA,
 			executionMode: "sequential",
 			async execute(toolCallId, params, signal, _update, ctx) {
@@ -296,7 +296,7 @@ export default function install(pi: ExtensionAPI): void {
 		};
 		active.customMessageCreated = true;
 		return { ...(message ? { message } : {}),
-			systemPrompt: `${event.systemPrompt}\n\nTeam member: ${binding.memberId} (${binding.role}). The rail-team-activation custom message is authoritative for this activation. Use the team tool for Team operations. A successful reply or yield ends this native activation; those intents must be the sole tool call in the finalized assistant batch. Do not claim a result unless the runtime accepts the team reply.` };
+			systemPrompt: `${event.systemPrompt}\n\nTeam member: ${binding.memberId} (${binding.role}). The rail-team-activation custom message is authoritative for this activation. Use the team tool for Team operations. A successful reply, yield, or close_team ends this native activation; each end intent must be the sole tool call in the finalized assistant batch. Do not claim a result unless the runtime accepts the team reply.` };
 	});
 
 	pi.on("context", async (event, ctx) => {

@@ -44,6 +44,11 @@ export interface TeamRuntimeOptions {
 	limits?: Partial<TeamBudgetLimits>;
 }
 
+export interface TeamRuntimeExecutor {
+	runActivation(activation: RuntimeActivation): Promise<unknown>;
+	closeMember(binding: BindingV2, closeId: string): Promise<CleanupCompletion>;
+}
+
 interface CachedAction {
 	fingerprint: string;
 	reply: TeamReply;
@@ -105,6 +110,7 @@ interface TeamState {
 	deadline: number | null;
 	plan: TeamPlan;
 	manager: string;
+	bootProcessed: boolean;
 	members: Map<string, RuntimeMember>;
 	ledger: WorkLedger;
 	ready: WorkRef[];
@@ -135,6 +141,10 @@ function fail(code: TeamErrorCode, message: string, blockers?: TeamProtocolError
  */
 export class TeamRuntime {
 	private readonly teams = new Map<string, TeamState>();
+	private readonly executors = new Map<string, TeamRuntimeExecutor>();
+	private readonly scheduledDrains = new Set<string>();
+	private readonly closingEffects = new Set<string>();
+	private readonly completionWaiters = new Map<string, Set<(result: TeamResult) => void>>();
 	private readonly now: () => number;
 	private readonly createId: () => string;
 	private readonly limits: TeamBudgetLimits;
@@ -188,7 +198,7 @@ export class TeamRuntime {
 		const team: TeamState = {
 			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt,
 			deadline: null,
-			plan: copy(plan), manager: plan.manager.alias, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(),
+			plan: copy(plan), manager: plan.manager.alias, bootProcessed: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(),
 			events: [], eventBatches: new Map(), incidents: [], limits: { ...this.limits },
 			teamActivations: 0, managerActivations: 0, reservedResultBytes: reserved, usage: emptySubagentUsage(),
 		};
@@ -218,21 +228,71 @@ export class TeamRuntime {
 		this.addEvent(team, { key: "BOOT", kind: "BOOT", message: "Team is active. Review the brief, manage work and close explicitly." });
 		this.changed(team);
 		this.check(team);
+		this.requestDrain(teamId);
 		return this.view(team);
 	}
 
+	/** Attach the sole effect executor before launch; Runtime retains scheduling and reservation authority. */
+	attachExecutor(teamId: string, executor: TeamRuntimeExecutor): () => void {
+		const team = this.team(teamId);
+		if (team.lifecycle !== "prepared") fail("INVALID_ARGUMENT", "An executor must be attached before Team launch");
+		if (this.executors.has(teamId)) fail("TEAM_OWNED", "This Team already has an effect executor");
+		this.executors.set(teamId, executor);
+		return () => {
+			if (this.executors.get(teamId) !== executor) return;
+			if (team.lifecycle === "prepared") {
+				if ([...team.members.values()].some((member) => member.active)
+					|| this.scheduledDrains.has(teamId)
+					|| [...this.closingEffects].some((key) => key.startsWith(`${teamId}\0`))) {
+					throw new Error("Cannot roll back an executor after Team effects have started");
+				}
+				this.executors.delete(teamId);
+				return;
+			}
+			if (!TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle)) {
+				throw new Error("Cannot detach a Team executor before the Team reaches a terminal lifecycle");
+			}
+			if ([...team.members.values()].some((member) => member.active)
+				|| [...this.closingEffects].some((key) => key.startsWith(`${teamId}\0`))) {
+				throw new Error("Cannot detach a Team executor while effects remain in flight");
+			}
+			this.executors.delete(teamId);
+		};
+	}
+
+	/** Resolves only after Runtime observes a terminal Team lifecycle and its required exit evidence. */
+	waitForCompletion(teamId: string): Promise<TeamResult> {
+		const team = this.team(teamId);
+		const current = this.getTeamResult(teamId);
+		if (current && this.completionReady(team)) return Promise.resolve(current);
+		return new Promise((resolve) => {
+			const waiters = this.completionWaiters.get(teamId) ?? new Set<(result: TeamResult) => void>();
+			waiters.add(resolve);
+			this.completionWaiters.set(teamId, waiters);
+		});
+	}
+
 	/**
-	 * Reserve one FIFO work item or one finite Manager event batch. Reservation is synchronous and
-	 * exclusive; callers perform native work only after this method returns.
+	 * Explicit reservation seam for pure/fake-driver tests. A bound production executor is the only
+	 * caller allowed to reserve activations once attached.
 	 */
 	takeNextActivation(teamId: string): RuntimeActivation | undefined {
+		if (this.executors.has(teamId)) fail("TEAM_OWNED", "The attached Runtime executor owns activation scheduling");
+		return this.reserveNextActivation(teamId);
+	}
+
+	private reserveNextActivation(teamId: string): RuntimeActivation | undefined {
 		const team = this.team(teamId);
 		if (team.lifecycle !== "active") return undefined;
 		const manager = team.members.get(team.manager)!;
 		if (manager.lifecycle !== "open") return undefined;
 		if (!manager.active && manager.pause === "none") {
-			const pending = team.events.filter((event) => !event.processed && event.batchId === undefined)
-				.slice(0, TEAM_MAX_MANAGER_EVENT_BATCH);
+			const pending = team.events.map((event, index) => ({ event, index }))
+				.filter(({ event }) => !event.processed && event.batchId === undefined)
+				.sort((left, right) => this.managerEventPriority(left.event.kind) - this.managerEventPriority(right.event.kind)
+					|| left.index - right.index)
+				.slice(0, TEAM_MAX_MANAGER_EVENT_BATCH)
+				.map(({ event }) => event);
 			if (pending.length) {
 				if (team.teamActivations >= team.limits.teamActivations || team.managerActivations >= team.limits.managerActivations) {
 					this.createIncident(team, "BUDGET_HIT", "Manager activation budget is exhausted");
@@ -268,6 +328,10 @@ export class TeamRuntime {
 		}
 		this.check(team);
 		return undefined;
+	}
+
+	private managerEventPriority(kind: ManagerEventView["kind"]): number {
+		return kind === "MEMBER_FAULTED" || kind === "DECISION_REQUEST" || kind === "BUDGET_HIT" ? 0 : 1;
 	}
 
 	/** Exact input_ready acknowledgment. A duplicate matching acknowledgment is harmless. */
@@ -360,6 +424,7 @@ export class TeamRuntime {
 			const binding = this.validateBinding(bindingValue);
 			memberId = binding.memberId;
 			const team = this.team(binding.teamId);
+			const stateVersionBefore = team.stateVersion;
 			const member = this.authenticatedMember(binding);
 			const scope = this.validateScope(scopeValue);
 			if (!Number.isSafeInteger(sequence) || sequence < 1) fail("PROTOCOL_FAILURE", "sequence must be a positive safe integer");
@@ -389,7 +454,10 @@ export class TeamRuntime {
 				reply = errorReply(member.id, error);
 			}
 			this.cacheAction(active, key, fingerprint, reply);
-			if (reply.ok) this.check(team);
+			if (reply.ok) {
+				this.check(team);
+				if (team.stateVersion !== stateVersionBefore) this.requestDrain(team.id);
+			}
 			return copy(reply);
 		} catch (error) {
 			return errorReply(memberId, error);
@@ -442,6 +510,8 @@ export class TeamRuntime {
 		if (cleanup.ok) member.lastActivation = { activationId, deliveryId: active.deliveryId, native: copy(active.native), cleanup: copy(cleanup) };
 		this.finishActivation(team, member, active);
 		this.check(team);
+		this.requestDrain(team.id);
+		this.settleCompletion(team);
 		return okReply(member.id);
 	}
 
@@ -491,6 +561,8 @@ export class TeamRuntime {
 		this.changed(team);
 		this.updateQuiescence(team);
 		this.check(team);
+		this.requestDrain(team.id);
+		this.settleCompletion(team);
 		return okReply(member.id);
 	}
 
@@ -525,6 +597,8 @@ export class TeamRuntime {
 		this.changed(team);
 		this.finishTeamCloseIfReady(team);
 		this.check(team);
+		this.requestDrain(team.id);
+		this.settleCompletion(team);
 		return result.ok
 			? okReply(member.id, { receipt: { status: "applied", command: "close_member", memberId: member.id } })
 			: errorReply(member.id, new TeamProtocolError("CLEANUP_FAILED", member.error?.message ?? "Member exit was not confirmed"));
@@ -1153,7 +1227,7 @@ export class TeamRuntime {
 			const closing = member.lifecycle === "closing";
 			if (team.lifecycle === "closing") {
 				team.lifecycle = "failed";
-				team.reason = "Manager close activation did not settle with confirmed native evidence";
+				team.reason = `Manager close activation lacked confirmed native evidence (status=${active.native?.status ?? "missing"}, hasIntent=${!!intent}, hasAppliedId=${!!active.native?.appliedToolCallId}, intentApplied=${intentApplied})`;
 			}
 			if (!closing) member.lifecycle = "faulted";
 			member.error = { code: active.native?.error?.code ?? (intentApplied ? "MANAGER_FAILURE" : "PROTOCOL_FAILURE"),
@@ -1229,13 +1303,13 @@ export class TeamRuntime {
 	}
 
 	private updateQuiescence(team: TeamState): void {
-		if (team.lifecycle !== "active" || [...team.members.values()].some((member) => member.active)) return;
+		if (!team.bootProcessed || team.lifecycle !== "active" || [...team.members.values()].some((member) => member.active)) return;
 		if (team.ledger.order.some((id) => !isTerminalWorkState(team.ledger.current(id)!.state)
 			&& team.ledger.current(id)!.state !== "blocked")) return;
 		const signature = team.ledger.order.map((id) => {
 			const record = team.ledger.get(id)!.record;
 			const version = currentVersion(record);
-			return `${id}@${record.currentRevision}:${version.state}:${version.hold?.incidentId ?? ""}:${version.resultRef ?? ""}`;
+			return `${id}@${record.currentRevision}:${version.state}:${version.hold?.incidentId ?? ""}:${version.resultRef ?? ""}:${version.review?.disposition ?? ""}:${version.review?.reason ?? ""}`;
 		}).join("|");
 		this.addEvent(team, { key: `quiescent:${signature}`, kind: "TEAM_QUIESCENT", message: "No work is runnable; review blocked work or decide whether to close", });
 	}
@@ -1332,7 +1406,11 @@ export class TeamRuntime {
 		if (!batch) return;
 		for (const id of batch.eventIds) {
 			const event = team.events.find((item) => item.id === id);
-			if (event) { event.processed = true; delete event.batchId; }
+			if (event) {
+				if (event.kind === "BOOT") team.bootProcessed = true;
+				event.processed = true;
+				delete event.batchId;
+			}
 		}
 		team.eventBatches.delete(batchId);
 	}
@@ -1347,6 +1425,162 @@ export class TeamRuntime {
 		if (team.closeDecision.reason) team.reason = team.closeDecision.reason;
 		else delete team.reason;
 		this.changed(team);
+		this.settleCompletion(team);
+	}
+
+	private requestDrain(teamId: string): void {
+		if (!this.executors.has(teamId) || this.scheduledDrains.has(teamId)) return;
+		this.scheduledDrains.add(teamId);
+		queueMicrotask(() => {
+			this.scheduledDrains.delete(teamId);
+			this.drainEffects(teamId);
+		});
+	}
+
+	private drainEffects(teamId: string): void {
+		const executor = this.executors.get(teamId);
+		if (!executor) return;
+		const team = this.teams.get(teamId);
+		if (!team) return;
+
+		if (team.lifecycle === "active") {
+			for (let count = 0; count < team.limits.workerPermits + 1; count++) {
+				const activation = this.reserveNextActivation(teamId);
+				if (!activation) break;
+				void Promise.resolve().then(() => executor.runActivation(activation)).catch((error: unknown) => {
+					try {
+						this.activationEffectFailed(teamId, activation, error);
+					} catch (reportError) {
+						const effectMessage = error instanceof Error ? error.message : String(error);
+						const reportMessage = reportError instanceof Error ? reportError.message : String(reportError);
+						this.recordEffectFailure(teamId, activation.binding.memberId, "activation cleanup report",
+							new AggregateError([error, reportError], `Native activation effect failed (${effectMessage}); Runtime cleanup report failed (${reportMessage})`));
+					}
+				});
+			}
+		}
+
+		// close_team must not stop even an idle worker until the Manager's own final activation
+		// has crossed native settlement and cleanup. Individual close_member remains independent.
+		const manager = team.members.get(team.manager)!;
+		if (team.lifecycle === "closing" && manager.active) return;
+		for (const member of team.members.values()) {
+			if (member.lifecycle !== "closing" || member.resourceState !== "stopping" || member.active || !member.closeId) continue;
+			const effectKey = `${teamId}\0${member.id}\0${member.closeId}`;
+			if (this.closingEffects.has(effectKey)) continue;
+			this.closingEffects.add(effectKey);
+			const binding = this.binding(team, member);
+			void this.executeCloseEffect(executor, binding, member.closeId!, effectKey)
+				.catch((error: unknown) => this.recordEffectFailure(teamId, member.id, "member exit effect", error));
+		}
+	}
+
+	private async executeCloseEffect(executor: TeamRuntimeExecutor, binding: BindingV2, closeId: string, effectKey: string): Promise<void> {
+		try {
+			let result: CleanupCompletion;
+			try {
+				result = await executor.closeMember(binding, closeId);
+			} catch (error) {
+				result = { ok: false, error: { code: "CLEANUP_FAILED", message: error instanceof Error ? error.message : String(error), outcomeUnknown: true } };
+			}
+			try {
+				const reply = this.memberReleased(binding, closeId, result);
+				if (result.ok && !reply.ok) throw new Error(reply.error.message);
+			} catch (error) {
+				this.failRuntimeEffect(binding.teamId, binding.memberId, "member exit report", error);
+			}
+		} catch (error) {
+			this.failRuntimeEffect(binding.teamId, binding.memberId, "member exit", error);
+		} finally {
+			this.closingEffects.delete(effectKey);
+			this.requestDrain(binding.teamId);
+			const team = this.teams.get(binding.teamId);
+			if (team) this.settleCompletion(team);
+		}
+	}
+
+	private activationEffectFailed(teamId: string, activation: RuntimeActivation, error: unknown): void {
+		const team = this.teams.get(teamId);
+		const member = team?.members.get(activation.binding.memberId);
+		const active = member?.active;
+		if (team && member && active && sameScope(active.scope, activation.scope)) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (active.native && !active.cleanup) {
+				this.cleanupFinished(activation.binding, activation.scope.activationId, {
+					ok: false, error: { code: "CLEANUP_FAILED", message, outcomeUnknown: true },
+				});
+			} else if (!active.native) {
+				this.activationLost(activation.binding, activation.scope.activationId,
+					{ code: "DRIVER_FAILURE", message, outcomeUnknown: true }, false);
+			}
+		}
+		this.requestDrain(teamId);
+		if (team) this.settleCompletion(team);
+	}
+
+	private failRuntimeEffect(teamId: string, memberId: string, phase: string, error: unknown): void {
+		const team = this.teams.get(teamId);
+		if (!team) return;
+		const member = team.members.get(memberId);
+		const detail = error instanceof Error ? error.message : String(error);
+		const message = `Runtime ${phase} processing failed: ${detail}`;
+		if (member) {
+			if (member.lifecycle !== "closed" || member.resourceState !== "released") {
+				member.lifecycle = "faulted";
+				member.resourceState = "cleanup_failed";
+			}
+			member.error = { code: "RUNTIME_EFFECT_FAILURE", message };
+		}
+		team.lifecycle = "failed";
+		team.health = "needs_attention";
+		team.reason = message;
+		this.changed(team);
+		this.requestDrain(teamId);
+		this.settleCompletion(team);
+	}
+
+	private recordEffectFailure(teamId: string, memberId: string, phase: string, error: unknown): void {
+		try {
+			this.failRuntimeEffect(teamId, memberId, phase, error);
+		} catch (reportError) {
+			const team = this.teams.get(teamId);
+			if (!team) return;
+			const detail = (value: unknown) => value instanceof Error ? value.message : String(value);
+			const message = `Runtime ${phase} failed (${detail(error)}); fail-closed reporting also failed (${detail(reportError)})`;
+			const member = team.members.get(memberId);
+			if (member && !(member.lifecycle === "closed" && member.resourceState === "released")) {
+				member.lifecycle = "faulted";
+				member.resourceState = "cleanup_failed";
+				member.error = { code: "RUNTIME_EFFECT_FAILURE", message };
+			}
+			team.lifecycle = "failed";
+			team.health = "needs_attention";
+			team.reason = message;
+			team.stateVersion++;
+			try { this.requestDrain(teamId); }
+			catch (drainError) { team.reason += `; Runtime could not resume effect drain: ${detail(drainError)}`; }
+			try { this.settleCompletion(team); }
+			catch (settleError) { team.reason += `; Runtime could not settle Team lifetime: ${detail(settleError)}`; }
+		}
+	}
+
+	private settleCompletion(team: TeamState): void {
+		if (!this.completionReady(team)) return;
+		const result = this.getTeamResult(team.id);
+		if (!result) return;
+		const waiters = this.completionWaiters.get(team.id);
+		if (!waiters) return;
+		this.completionWaiters.delete(team.id);
+		for (const resolve of waiters) resolve(copy(result));
+	}
+
+	private completionReady(team: TeamState): boolean {
+		return TERMINAL_TEAM_LIFECYCLES.includes(team.lifecycle)
+			&& ![...team.members.values()].some((member) => {
+				if (team.lifecycle === "failed" && member.lifecycle === "faulted" && member.resourceState === "cleanup_failed") return false;
+				return member.active !== undefined || member.lifecycle === "closing" || member.resourceState === "stopping";
+			})
+			&& ![...this.closingEffects].some((key) => key.startsWith(`${team.id}\0`));
 	}
 
 	private requireWorkScope(team: TeamState, member: RuntimeMember, active: ActiveActivation): WorkRef {

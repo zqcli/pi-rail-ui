@@ -463,16 +463,17 @@ async function setupV2(t: TestContext, server: LoopbackResponsesServer, scenario
 	const model = { provider: nativeModel.provider, modelId: nativeModel.id };
 	const handles = new Map<string, Awaited<ReturnType<TeamMemberDriver["openMember"]>>>();
 	for (const memberId of ["A", "B1"]) handles.set(memberId, await driver.openMember({ teamId: prepared.teamId, memberId, model, cwd: sandbox }));
-	driver.launch(prepared.teamId);
 	t.after(async () => {
-		await driver.close().catch(() => undefined);
-		await broker.shutdown();
+		const failures: unknown[] = [];
+		try { await driver.close(); } catch (error) { failures.push(error); }
+		try { await broker.shutdown(); } catch (error) { failures.push(error); }
 		for (const key of environmentKeys) {
 			const value = previousEnvironment.get(key);
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
-		await rm(sandbox, { recursive: true, force: true });
+		try { await rm(sandbox, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+		if (failures.length) throw new AggregateError(failures, "Team WebSocket harness cleanup failed");
 	});
 	return { runtime, teamId: prepared.teamId, driver, handles, store, leases, broker, agentDir, scenario };
 }
@@ -481,6 +482,7 @@ test("Stage B Team v2 actors use the configured Responses WebSocket for native i
 	const server = await startLoopbackResponsesServer("v2");
 	t.after(async () => { await server.close(); });
 	const harness = await setupV2(t, server, "v2");
+	harness.runtime.launch(harness.teamId);
 	const manager = await harness.driver.runNext(harness.teamId);
 	assert.equal(manager?.completion.status, "success");
 	const worker = await harness.driver.runNext(harness.teamId);
@@ -505,6 +507,7 @@ test("Stage B Team v2 cancellation aborts a held native WebSocket run without an
 	const server = await startLoopbackResponsesServer("v2-cancel");
 	t.after(async () => { await server.close(); });
 	const harness = await setupV2(t, server, "v2-cancel");
+	harness.runtime.launch(harness.teamId);
 	const manager = await harness.driver.runNext(harness.teamId);
 	assert.equal(manager?.completion.status, "success");
 	const controller = new AbortController();

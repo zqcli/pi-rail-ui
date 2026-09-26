@@ -102,6 +102,32 @@ test("Team v2 tool schema is a strict action union and bind selects role-specifi
 	const manager = harness("manager");
 	await manager.command(bindCommand(manager));
 	assert.deepEqual(manager.activeTools(), ["team"], "Manager gets no filesystem, shell, or subagent tools");
+	assert.match(manager.tools.get("team").description, /reply, yield, and close_team must be the only tool call/u);
+});
+
+test("flat close_team control is rejected before RPC when its native assistant batch has another tool", async () => {
+	const h = harness();
+	await h.command(bindCommand(h));
+	await h.command(activateCommand(h));
+	h.branch.push({ type: "message", message: { role: "assistant", content: [
+		{ type: "toolCall", id: "mixed-close", name: "team" },
+		{ type: "toolCall", id: "sibling-status", name: "team" },
+	] } });
+	const execution = h.tools.get("team").execute("mixed-close", {
+		action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "synthetic mixed batch",
+	}, h.ctx.signal, () => undefined, h.ctx);
+	const observed = execution.then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error }));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const business = h.privateFrames().find((frame) => frame.kind === "request" && frame.request.action === "business");
+	if (business?.kind === "request" && business.request.action === "business") {
+		await replyToRequest(h, business, { kind: "business", reply: { ok: true, from: "@hub", to: h.binding.memberId,
+			receipt: { status: "closing", command: "close_team", closeId: "test-close" } } }, "mixed-close-response");
+	}
+	const result = await observed;
+	assert.equal(result.ok, false, "an end intent in a mixed batch must return an error rather than reach Runtime");
+	if (result.ok) return;
+	assert.match(result.error instanceof Error ? result.error.message : String(result.error), /only tool call in the finalized assistant batch/u);
+	assert.equal(h.privateFrames().filter((frame) => frame.kind === "request" && frame.request.action === "business").length, 0);
 });
 
 test("native custom activation is persisted and verified before input_ready/provider_gate; repeats are idempotent", async () => {

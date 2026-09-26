@@ -29,6 +29,7 @@ class FakeTransport implements RpcTransport {
 	triggerDelayMs = 0;
 	triggerFailure: Error | undefined;
 	stopFailure: Error | undefined;
+	emitTrailingEmptyTurn = false;
 	private triggerTimer: NodeJS.Timeout | undefined;
 	private triggerDone: (() => void) | undefined;
 	private nativeByRequest = new Map<string, string>();
@@ -74,7 +75,8 @@ class FakeTransport implements RpcTransport {
 			if (frame.operation === "reply") {
 				const nativeToolCallId = this.nativeByRequest.get(frame.rpcRequestId);
 				if (nativeToolCallId) {
-					const staged = frame.reply.kind === "business" && frame.reply.reply.ok && frame.reply.reply.receipt?.status === "staged";
+					const receipt = frame.reply.kind === "business" && frame.reply.reply.ok ? frame.reply.reply.receipt : undefined;
+					const staged = receipt?.status === "staged" || (receipt?.status === "closing" && receipt.command === "close_team");
 					if (staged) this.stagedNativeToolCallId = nativeToolCallId;
 					this.emit({ type: "tool_execution_end", toolCallId: nativeToolCallId, toolName: "team", isError: false,
 						result: { terminate: staged } });
@@ -103,6 +105,9 @@ class FakeTransport implements RpcTransport {
 			content: staged ? [{ type: "toolCall", id: this.stagedNativeToolCallId, name: "team" }]
 				: stopReason === "stop" ? [{ type: "text", text: "native done" }] : [] },
 		toolResults: staged ? [{ toolCallId: this.stagedNativeToolCallId, toolName: "team", isError: false }] : [] });
+		if (staged && this.emitTrailingEmptyTurn) {
+			this.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop", content: [] }, toolResults: [] });
+		}
 		this.emit({ type: "agent_settled" });
 		done();
 	}
@@ -248,6 +253,58 @@ test("opaque native tool-call IDs stay transcript evidence and end intents match
 	assert.equal(intentId, `team-intent-${rpcRequestId}`);
 	assert.notEqual(intentId, nativeToolCallId);
 	assert.equal(completion.appliedToolCallId, intentId, "runtime intent evidence uses a safe logical ID only after exact native transcript verification");
+	await connection.deactivate(activation());
+	await connection.close();
+});
+
+test("a later empty assistant turn preserves exact staged end-intent evidence and supplies the final text", async () => {
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 500;
+	transport.emitTrailingEmptyTurn = true;
+	const rpcRequestId = "reply-before-empty-turn";
+	const frame: ChildRequestFrame = {
+		version: 2, kind: "request", binding, activation: activation().scope, sequence: 1, rpcRequestId,
+		request: { action: "business", args: { action: "reply", result: { status: "succeeded", summary: "done" } } },
+	};
+	let intentId: string | undefined;
+	const { connection, run } = await startConnection(transport, async (_parsed, intent) => {
+		intentId = intent;
+		return { kind: "business", reply: { ok: true, from: "@hub", to: binding.memberId,
+			receipt: { status: "staged", intent: "reply" } } };
+	});
+	transport.emitChild(frame);
+	await waitFor(() => replyCount(transport) === 1);
+	const completion = await run;
+	assert.equal(completion.status, "success");
+	assert.equal(completion.finalAssistantText, "", "final assistant text comes from the actual last turn, not the intent candidate");
+	assert.equal(completion.appliedToolCallId, intentId, "the later empty turn does not erase the exact successful terminate evidence");
+	await connection.deactivate(activation());
+	await connection.close();
+});
+
+test("flattened close_team control is recognized as a terminating native intent", async () => {
+	const transport = new FakeTransport();
+	transport.triggerDelayMs = 500;
+	const rpcRequestId = "close-team-request";
+	const frame: ChildRequestFrame = {
+		version: 2, kind: "request", binding, activation: activation().scope, sequence: 1, rpcRequestId,
+		request: { action: "business", args: { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "synthetic close" } },
+	};
+	let intentId: string | undefined;
+	const { connection, run } = await startConnection(transport, async (parsed: ChildRequestFrame, intent?: string) => {
+		assert.equal(parsed.request.action, "business");
+		if (parsed.request.action !== "business") throw new Error("Expected a business request");
+		assert.equal(parsed.request.args["action"], "control");
+		assert.equal(parsed.request.args["command"], "close_team");
+		intentId = intent;
+		return { kind: "business", reply: { ok: true, from: "@hub", to: binding.memberId,
+			receipt: { status: "closing", command: "close_team", closeId: "close-test" } } };
+	});
+	transport.emitChild(frame);
+	await waitFor(() => replyCount(transport) === 1);
+	const completion = await run;
+	assert.equal(intentId, `team-intent-${rpcRequestId}`);
+	assert.equal(completion.appliedToolCallId, intentId, "close_team requires the same exact native terminate evidence as reply/yield");
 	await connection.deactivate(activation());
 	await connection.close();
 });

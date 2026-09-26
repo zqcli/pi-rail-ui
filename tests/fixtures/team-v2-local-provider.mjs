@@ -53,6 +53,34 @@ function call(id, args) {
 }
 
 function actionFor(scenario, input, replies) {
+	if (scenario === "close-mixed" && input.scope.kind === "management") {
+		if (replies.length === 0) return [
+			call("mixed-close-team", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "synthetic mixed batch" }),
+			call("mixed-sibling-status", { action: "status", view: "team" }),
+		];
+		return [{ type: "text", text: "The mixed close_team batch was rejected; Team remains open." }];
+	}
+	if (scenario === "close-loop") {
+		if (input.scope.kind === "management") {
+			const events = input.scope.events;
+			if (events.some((event) => event.kind === "BOOT")) {
+				const accepted = replies.some((reply) => reply.receipt?.status === "accepted");
+				return accepted ? [call("boot-yield", { action: "yield" })]
+					: [call("boot-request", { action: "request", to: "w1", task: "C1a synthetic root", inputRefs: [] })];
+			}
+			const root = events.find((event) => event.kind === "ROOT_RESULT_READY");
+			if (!root?.work || !root.resultRef) throw new Error(`Manager did not receive a root result event: ${JSON.stringify(events)}`);
+			const accepted = replies.some((reply) => reply.receipt?.status === "applied" && reply.receipt.command === "accept_result");
+			return accepted ? [call("close-team", {
+				action: "control", command: "close_team", resultRefs: [root.resultRef], outcome: "succeeded",
+			})] : [call("accept-root", {
+				action: "control", command: "accept_result", work: root.work, disposition: "accepted",
+			})];
+		}
+		if (input.scope.task === "C1a synthetic root") return [call("root-reply", {
+			action: "reply", result: { status: "succeeded", summary: "Synthetic worker result accepted and closed by Manager." },
+		})];
+	}
 	if (scenario === "compaction" && input.scope.kind === "work" && input.scope.task === "W1 root") {
 		if (replies.length === 0) return [call("compaction-status", { action: "status", view: "team" })];
 		return [call("compaction-reply", { action: "reply", result: { status: "succeeded", summary: "W1 completed after native compaction." } })];

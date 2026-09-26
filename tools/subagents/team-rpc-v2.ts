@@ -25,6 +25,7 @@ interface ActiveRun {
 	started: boolean;
 	settled?: NativeCompletion;
 	lastTurn?: { message: unknown; toolResults: unknown[] };
+	candidateEndIntentTurn?: { message: unknown; toolResults: unknown[] };
 	nativeToolCalls: Map<string, { toolName: string; execution?: { isError: boolean; terminate: boolean } }>;
 	pendingNativeToolCalls: Set<string>;
 	claimedNativeToolCalls: Set<string>;
@@ -97,8 +98,7 @@ function resultId(result: unknown): string | undefined {
 function isStagedEndIntent(frame: ChildRequestFrame, reply: PrivateReply, intentId?: string): string | undefined {
 	if (frame.request.action !== "business" || !intentId || reply.kind !== "business" || !reply.reply.ok) return;
 	const action = frame.request.args["action"];
-	const closingTeam = action === "control" && record(frame.request.args["control"])
-		&& frame.request.args["control"]["command"] === "close_team";
+	const closingTeam = action === "control" && frame.request.args["command"] === "close_team";
 	const receipt = reply.reply.receipt;
 	if ((action === "reply" || action === "yield") && receipt?.status === "staged") return intentId;
 	if (closingTeam && receipt?.status === "closing" && receipt.command === "close_team") return intentId;
@@ -108,11 +108,10 @@ function isStagedEndIntent(frame: ChildRequestFrame, reply: PrivateReply, intent
 function completionFor(run: ActiveRun): NativeCompletion {
 	const message = run.lastTurn?.message;
 	const stopReason = record(message) ? message["stopReason"] : undefined;
-	const calls = toolCalls(message);
-	const results = run.lastTurn?.toolResults ?? [];
-	const resultIds = new Set(results.map(resultId).filter((id): id is string => id !== undefined));
-	const pendingToolCalls = calls.some((call) => !resultIds.has(call.id));
-	const finalTurnToolResults = calls.length === results.length && results.every((result) => resultId(result) !== undefined);
+	const finalCalls = toolCalls(message);
+	const finalResults = run.lastTurn?.toolResults ?? [];
+	const finalResultIds = new Set(finalResults.map(resultId).filter((id): id is string => id !== undefined));
+	const pendingToolCalls = finalCalls.some((call) => !finalResultIds.has(call.id));
 	let status: NativeCompletion["status"];
 	if (stopReason === "aborted") status = "aborted";
 	else if (stopReason === "error") status = "error";
@@ -123,9 +122,14 @@ function completionFor(run: ActiveRun): NativeCompletion {
 	let appliedToolCallId: string | undefined;
 	const stagedIntent = run.stagedIntent;
 	const nativeToolCallId = stagedIntent?.nativeToolCallId;
-	if (status === "success" && stagedIntent && nativeToolCallId && finalTurnToolResults && calls.length === 1 && results.length === 1
-		&& calls[0]!.id === nativeToolCallId && calls[0]!.name === "team" && resultId(results[0]) === nativeToolCallId
-		&& record(results[0]) && results[0]["toolName"] === "team" && results[0]["isError"] === false) {
+	const intentTurn = run.candidateEndIntentTurn;
+	const intentCalls = toolCalls(intentTurn?.message);
+	const intentResults = intentTurn?.toolResults ?? [];
+	const intentTurnSettled = intentCalls.length === 1 && intentResults.length === 1
+		&& intentCalls[0]!.id === nativeToolCallId && intentCalls[0]!.name === "team"
+		&& resultId(intentResults[0]) === nativeToolCallId && record(intentResults[0])
+		&& intentResults[0]["toolName"] === "team" && intentResults[0]["isError"] === false;
+	if (status === "success" && stagedIntent && nativeToolCallId && intentTurnSettled) {
 		const executed = run.nativeToolCalls.get(nativeToolCallId);
 		if (executed?.toolName === "team" && executed.execution?.isError === false && executed.execution.terminate) {
 			appliedToolCallId = stagedIntent.intentId;
@@ -340,7 +344,11 @@ export class TeamRpcV2Connection {
 				}
 			}
 			if (event.type === "turn_end") {
-				run.lastTurn = { message: event["message"], toolResults: Array.isArray(event["toolResults"]) ? event["toolResults"] : [] };
+				const turn = { message: event["message"], toolResults: Array.isArray(event["toolResults"]) ? event["toolResults"] : [] };
+				run.lastTurn = turn;
+				if (record(turn.message) && turn.message["role"] === "assistant" && toolCalls(turn.message).length > 0) {
+					run.candidateEndIntentTurn = turn;
+				}
 			}
 			if (event.type === "tool_execution_end" && typeof event["toolCallId"] === "string" && typeof event["toolName"] === "string") {
 				const toolCallId = event["toolCallId"];
@@ -355,6 +363,7 @@ export class TeamRpcV2Connection {
 			}
 			if (event.type === "agent_settled" && !run.settled) {
 				run.settled = completionFor(run);
+				delete run.candidateEndIntentTurn;
 				run.nativeToolCalls.clear();
 				run.pendingNativeToolCalls.clear();
 				run.claimedNativeToolCalls.clear();

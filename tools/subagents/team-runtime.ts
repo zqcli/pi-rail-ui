@@ -663,6 +663,7 @@ export class TeamRuntime {
 			fail("INVALID_ARGUMENT", "The exact WorkRef is not held by this incident");
 		}
 		this.applyHoldRelease(team, ref, incidentId, instruction);
+		this.note(team, `host released the hold on ${shortWorkRef(ref)}`);
 		this.requestDrain(teamId);
 		return { actor: "@host", status: "applied", teamId, work: ref };
 	}
@@ -1837,6 +1838,7 @@ export class TeamRuntime {
 			fail("INVALID_ARGUMENT", "The current WorkRef is not held by this incident");
 		}
 		this.applyHoldRelease(team, ref, incidentId, instruction);
+		this.note(team, `${manager.id} resumed ${shortWorkRef(ref)}`);
 		this.requestDrain(team.id);
 		return okReply(manager.id, { receipt: { status: "applied", command: "resume_work", work: ref } });
 	}

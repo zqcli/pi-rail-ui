@@ -189,6 +189,10 @@ test("peer dependency: a held worker gets another worker's resultRef from the Ma
 		assert.equal(action(runtime, resumed, 2, "w1-reply", { action: "reply", result: { status: "succeeded", summary: "step 2 done" } }).ok, true);
 		settle(runtime, resumed, "w1-reply");
 		assert.equal(runtime.getWork(teamId, first.scope.work!)!.revisions[0]!.state, "resolved");
+		const timeline = runtime.panelFacts(teamId).timeline.map((entry) => entry.text);
+		const heldAt = timeline.findIndex((text) => /^w1 ended work \S+ \(yield attention\)$/u.test(text));
+		const resumedAt = timeline.findIndex((text) => /^lead resumed work \S+$/u.test(text));
+		assert.ok(heldAt >= 0 && resumedAt > heldAt, "the timeline shows the hold and the Manager's hand-off");
 	}
 	// Path 2: w1 waits on w2's WorkRef itself and wakes with its outcome.
 	{

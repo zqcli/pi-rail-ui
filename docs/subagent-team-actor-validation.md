@@ -626,6 +626,18 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 
 两次均未重复派发、一步 `succeeded` 关闭、Manager 无轮询。运行 2 首次 prepare 因 Manager 别名与既有 persistent 会话重名被拒（未启动任何成员），改名后成功，属预期校验。TUI 面板渲染未做人工验收。
 
+### 7.6 subagent 代码 review 后的改进
+
+对 `tools/subagents/` 全部模块（含 Team）做了针对性 review：未用导出、吞错、定时器、按 Team 保存的状态与清理、父文本预算、实测会话中的 Manager/worker 行为。改进如下（均有回归，改前失败、改后通过）：
+
+- grouped subagent 父文本原先按结果数平分 50 KiB，一份 30 KB 的回答会被截到约 12 KB，而其他短回答留下的额度被浪费。现与 Team launch 共用 `text-budget.ts` 的 `fairShares`：短回答完整保留，只有最长的几份分剩余额度；persistent 回答被截断时注明全文仍在该 persistent session。回归：`tool.test.ts` · `parallel parent content keeps short answers whole and gives their unused budget to a long one`（fake）。
+- `TeamMemberDriver` 按 Team 保存的成员活动记录、lifetime promise、已结算集合和启动失败记录从不释放，而 Runtime 只保留有限个已结束 Team；长会话中会持续增长。现在打开新成员时释放 Runtime 已淘汰 Team 的这些记录。回归：`team-integration.test.ts` · `the driver forgets member activity of Teams the Runtime has evicted`（fake）。
+- 依赖同伴结论的路径协议早已支持，但提示中未写，实测中 worker 从未使用。work notice 现写明三条路径（直接等待对方 WorkRef、request 对方、attention 请 Manager）；management notice 写明用 `resume_work` 在 instruction 中给出 resultRef/WorkRef 回应 `WORK_HELD`，并说明 `close_team` 自行检查所有 root、关闭前无需 status。时间线新增 “resumed / host released the hold”。回归：`team-runtime.test.ts` · `peer dependency: …`（pure，覆盖经 Manager 转交与直接等待两条路径及时间线）与扩展的 `Manager guidance: …`。
+
+隔离环境全量：`npm run check` 947/947（78799 ms，`/tmp/pi-review-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 947/947（75528 ms，`/tmp/pi-review-depth.log`）。加入时间线 “resumed” 后复跑 `npm run check` 仍为 947/947（78443 ms，`/tmp/pi-review-check2.log`）。
+
+真实在线验证（同前的启动方式，父 `cus-resp/gpt-6-sol:xhigh`，worker `cus-resp/gpt-6-luna:max` + FAST，session `b4abc34a…`，提示要求 A 依据 B 的统计结论评估、依赖由团队内部协调）：A 于 0:15 `yield attention`，Manager 0:15 收到 `WORK_HELD`；B 0:22 提交，Manager 0:32 accept 后以 `resume_work` 把 B 的 resultRef、WorkRef 与结论写入 instruction；A 0:47 恢复、3:19 提交；3:45 `close_team succeeded`，3:46 全部释放。依赖经 Manager 正确传递，A 未自行统计；Manager 关闭前仍调用一次 `status`。该运行时间线尚无 resume 行，据此补上。
+
 ## 8. 历史阶段结果（非本轮成绩）
 
 上一版 D2b／`5368b05` 的父全量记录为：

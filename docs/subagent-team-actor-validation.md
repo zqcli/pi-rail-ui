@@ -638,6 +638,19 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 
 真实在线验证（同前的启动方式，父 `cus-resp/gpt-6-sol:xhigh`，worker `cus-resp/gpt-6-luna:max` + FAST，session `b4abc34a…`，提示要求 A 依据 B 的统计结论评估、依赖由团队内部协调）：A 于 0:15 `yield attention`，Manager 0:15 收到 `WORK_HELD`；B 0:22 提交，Manager 0:32 accept 后以 `resume_work` 把 B 的 resultRef、WorkRef 与结论写入 instruction；A 0:47 恢复、3:19 提交；3:45 `close_team succeeded`，3:46 全部释放。依赖经 Manager 正确传递，A 未自行统计；Manager 关闭前仍调用一次 `status`。该运行时间线尚无 resume 行，据此补上。
 
+### 7.7 review 遗留项的处理
+
+- Manager 逐份 `status(result)` 读结果：`ROOT_RESULT_READY` 现直接携带该 root 结果全文（与 launch 最终文本同一格式 `formatWorkResult`）和 resultRef；事件 message 上限相应为 16 KiB（结果 12 KiB 加标题），批次仍受 64 KiB 输入上限约束，放不下的事件留待下一批。回归：`team-runtime.test.ts` · `ROOT_RESULT_READY carries a maximum-size root result in full inside a valid Manager activation input`（pure，并经子进程侧 `parseParentCommand` 校验）与更新的 `Manager guidance: …`。
+- “Manager 关闭前查 status”：核对会话后发现两次 status 都是验收前的 `status(result)`，已由上一项消除。
+- incident 事件分类（上一轮实测 worker 发现）：除 `BUDGET_HIT`/`WORK_HELD` 外，所有 incident 都以 `DEPENDENCY_UNAVAILABLE` 通知 Manager，成员故障还会与 `MEMBER_FAULTED` 重复。现协议 hold（结果超槽位、未观察 child、无有效 reply/yield、结束意图未确认）经 `holdWork` 统一为 `WORK_HELD`；成员级故障为 `MEMBER_FAULTED`，丢失 activation/清理失败每次只发一个事件。回归：`team-runtime-scheduler.test.ts` · `new Manager events stay in the next sealed batch and faults outrank incidents stably`、`team-runtime.test.ts` · `A: oversized natural final is protocol-held …`。
+- 模型引用 provider 写错（实测父 agent 写成 `openai/gpt-6-luna:max`）：错误信息现直接提示同一 model id 的真实 provider。回归：`models.test.ts` · `resolveRailModel names the same model id under its real provider when the prefix is wrong`。
+- 删除从未使用的 `TEAM_RESERVED_ACTORS`。
+- 不改动并说明理由：`check()` 在 500 个 work 时单次 0.37 ms（本地基准，每次状态转换一次），保留这一不变量安全网；`team-runtime.ts` 拆文件只移动代码，TeamState 为私有状态、方法之间以 `this` 紧密耦合，拆分需要导出内部结构，代码更多而行为不变；其余“未使用导出”都是被导出函数签名引用的类型，保留。
+
+隔离环境全量：`npm run check` 949/949（75502 ms，`/tmp/pi-model-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 949/949（73992 ms，`/tmp/pi-model-depth.log`）。
+
+真实在线复测（session `d5018664…`，同一依赖场景，代码为结果内联之后、incident 分类之前）：2:24 以 `succeeded` 关闭；Manager 调用 `accept_result`×2、`resume_work`、`close_team`、`yield`×3，**没有任何 status 调用**；时间线包含 `coord resumed work …`。A 先直接 `yield waitingFor` B 的 WorkRef（0:12），B 0:15 提交后 A 收到 outcome，但按提示词“依赖由团队内部协调”再以 attention 请 Manager 正式转交（0:23），Manager 0:46 resume。incident 分类与模型提示两项仅由测试验证。
+
 ## 8. 历史阶段结果（非本轮成绩）
 
 上一版 D2b／`5368b05` 的父全量记录为：

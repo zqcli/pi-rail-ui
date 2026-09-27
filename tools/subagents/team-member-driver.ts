@@ -127,6 +127,18 @@ export class TeamMemberDriver {
 		this.notifyActivity(teamId);
 	}
 
+	/** Drop bookkeeping of Teams the Runtime has evicted; it keeps only a bounded number of ended Teams. */
+	private forgetEvictedTeams(): void {
+		const known = new Set(this.runtime.listTeams().map((team) => team.teamId));
+		const teamOf = (id: string) => id.slice(0, id.indexOf("\0"));
+		for (const map of [this.activity, this.failedOpenings]) {
+			for (const id of map.keys()) if (!known.has(teamOf(id))) map.delete(id);
+		}
+		for (const teams of [this.launched, this.preparedStops, this.settledLifetimes]) {
+			for (const teamId of teams.keys()) if (!known.has(teamId)) teams.delete(teamId);
+		}
+	}
+
 	private notifyActivity(teamId: string): void {
 		for (const listener of [...this.activityListeners]) {
 			try { listener(teamId); } catch { /* A display observer never affects the member. */ }
@@ -155,6 +167,7 @@ export class TeamMemberDriver {
 		if (this.members.has(id)) throw new Error(`Team member ${request.memberId} already has a native lifetime`);
 		// The claim fails once the Team is no longer prepared, so a cancelled Team never gains a new lifetime.
 		const binding = this.runtime.claimNativeLifetime(request.teamId, request.memberId);
+		this.forgetEvictedTeams();
 		const activity: ActivityRecord = { transcript: new SubagentTranscript(""), activeMs: 0, output: "" };
 		this.activity.set(id, activity);
 		const opened = this.broker.openTeamMember({

@@ -4,7 +4,7 @@ import type { AgentInstance, SessionBroker } from "../../tools/subagents/session
 import type { RailModelRef } from "../../tools/subagents/models";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import type { TeamJournalRecord } from "../../tools/subagents/team-journal";
-import type { BindingV2 } from "../../tools/subagents/team-protocol";
+import { TEAM_MAX_LIVE_TEAMS, type BindingV2 } from "../../tools/subagents/team-protocol";
 
 const model: RailModelRef = { provider: "test-provider", modelId: "test-model", thinkingLevel: "medium" };
 
@@ -125,4 +125,25 @@ test("post-tree fallback retires the old writer without appending into the new l
 	assert.equal(result.lifecycle, "interrupted");
 	assert.deepEqual(records.map(({ branch: owner, record }) => [owner, record.kind]), [["old-branch", "launched"]]);
 	assert.equal(active.host.journal.active, false);
+});
+
+test("the driver forgets member activity of Teams the Runtime has evicted", async () => {
+	const host = new TeamSessionHost(fakeBroker(() => {}), () => {}, []);
+	const teamIds: string[] = [];
+	for (let index = 0; index < TEAM_MAX_LIVE_TEAMS + 1; index++) {
+		const prepared = host.runtime.prepare({
+			manager: { alias: `lead-${index}`, roleDescription: "Manage the Team." },
+			workers: [{ alias: `worker-${index}`, roleDescription: "Complete assigned work." }],
+			brief: { goal: "Exercise driver bookkeeping." },
+			initialRequests: [],
+			timeoutSeconds: null,
+		});
+		teamIds.push(prepared.teamId);
+		await host.driver.openMember({ teamId: prepared.teamId, memberId: `lead-${index}`, model });
+		assert.ok(host.driver.memberActivity(prepared.teamId, `lead-${index}`));
+		await host.driver.stopTeam(prepared.teamId, "done");
+	}
+	assert.equal(host.runtime.listTeams().some((team) => team.teamId === teamIds[0]), false, "the Runtime evicted the oldest ended Team");
+	assert.equal(host.driver.memberActivity(teamIds[0]!, "lead-0"), undefined, "its member activity is released with it");
+	assert.ok(host.driver.memberActivity(teamIds.at(-1)!, `lead-${TEAM_MAX_LIVE_TEAMS}`), "retained Teams keep their activity");
 });

@@ -61,6 +61,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 - 成功的 yield 会结束本次原生运行，不占住成员。
 - 结果早于 yield 到达也不会丢；下一次 activation 交付可容纳的 outcome 批次，超出部分保持未交付，后续 yield 可继续观察。
 - 对已交付且没有变化的 outcome 再次 yield，返回 `NO_NEW_DEPENDENCY`。
+- 依赖同伴结论：worker 做到一半需要另一成员的结论时，有三条路径，work activation 的 notice 会写明。(1) 用 `status(work)` 找到对方的 WorkRef，直接 `yield {waitingFor, checkpoint}`，结果提交后自动唤醒并在 `outcomes` 中收到；(2) `request` 该成员创建 child，再等待返回的 WorkRef；(3) `yield {attention, checkpoint}` 请 Manager 处理。Manager 收到 `WORK_HELD` 后用 `resume_work {workId, expectedRevision, incidentId, instruction}` 在 instruction 里给出所需 resultRef 或 WorkRef，管理 activation 的 notice 同样写明这一点。恢复的 activation 带原 checkpoint 和 instruction，全文用 `status(result)` 读取。
 - 依赖环（包括 parent 对 child 的完成约束边）返回 `DEPENDENCY_CYCLE`。
 
 ```json

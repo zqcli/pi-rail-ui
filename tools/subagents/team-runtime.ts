@@ -40,9 +40,13 @@ function incidentView(incident: TeamIncidentView): TeamIncidentView {
 /** Grant reasons are retained in the bounded Team view; keep them short. */
 const TEAM_MAX_GRANT_REASON_BYTES = 512;
 const TEAM_MAX_TIMELINE = 60;
-const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work.";
+const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work. "
+	+ "If it needs another member's conclusion first, yield {waitingFor:[that member's WorkRef from status work], checkpoint}, "
+	+ "or request it from that member and wait on the returned WorkRef, or ask the Manager with yield {attention, checkpoint}. Read a full result with status(result).";
 const MANAGEMENT_NOTICE = "Management activation: there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
-	+ "New results, failures and incidents start the next management activation automatically; do not poll status to wait.";
+	+ "New results, failures and incidents start the next management activation automatically; do not poll status to wait. "
+	+ "A WORK_HELD event is a member asking for input: answer with resume_work {workId, expectedRevision, incidentId, instruction} "
+	+ "(for example naming the resultRef or WorkRef it needs), or revise_work/cancel_work. close_team checks every root itself and names any blocker, so no status check is needed before it.";
 
 export interface RuntimeActivation {
 	binding: BindingV2;

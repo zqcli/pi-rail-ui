@@ -110,6 +110,9 @@ test("Manager guidance: management input says to yield instead of polling, and h
 	const boot = runtime.takeNextActivation(teamId)!;
 	assert.equal(boot.scope.kind, "management");
 	assert.match(boot.input.notice, /no current WorkRef.*yield.*do not poll status/u);
+	assert.match(boot.input.notice, /WORK_HELD .*resume_work \{workId, expectedRevision, incidentId, instruction\}.*resultRef or WorkRef/u,
+		"the Manager learns how to hand a held member the conclusion it needs");
+	assert.match(boot.input.notice, /close_team checks every root itself/u);
 	const bootEvent = boot.input.scope.kind === "management" ? boot.input.scope.events[0]! : undefined;
 	assert.match(bootEvent?.message ?? "", /1 initial request\(s\) are already assigned.*w1 \S+@1 "root work".*Do not request them again/u,
 		"BOOT names the initialRequests that already run, so the Manager does not duplicate them");
@@ -123,6 +126,8 @@ test("Manager guidance: management input says to yield instead of polling, and h
 
 	const work = runtime.takeNextActivation(teamId)!;
 	assert.match(work.input.notice, /Only the current WorkRef is authorized/u);
+	assert.match(work.input.notice, /needs another member's conclusion.*yield \{waitingFor:.*request it from that member.*yield \{attention, checkpoint\}/u,
+		"a worker learns the peer-dependency paths");
 	reply(runtime, work, "w1-reply", "first result");
 	const facts = runtime.panelFacts(teamId);
 	assert.ok(facts.pendingManagerEvents >= 1, "the committed result waits as a Manager event");
@@ -151,6 +156,59 @@ test("Manager guidance: management input says to yield instead of polling, and h
 	assert.deepEqual(refused.ok ? [] : refused.error.blockers?.map((blocker) => [blocker.kind, blocker.id, blocker.reason]),
 		[["root_outcome", `${duplicateRef.workId}@1`, "root is cancelled and not accepted"]]);
 });
+
+test("peer dependency: a held worker gets another worker's resultRef from the Manager, or waits on its WorkRef directly", () => {
+	const setup = (initialRequests: Array<{ to: string; task: string }>) => {
+		const { runtime, teamId } = makeRuntime(initialRequests);
+		finishManagerBoot(runtime, teamId);
+		return { runtime, teamId, first: runtime.takeNextActivation(teamId)!, second: runtime.takeNextActivation(teamId)! };
+	};
+	// Path 1: w1 asks the Manager; the Manager resumes it naming w2's committed result.
+	{
+		const { runtime, teamId, first, second } = setup([{ to: "w1", task: "step 1, then step 2 with w2's conclusion" }, { to: "w2", task: "conclude" }]);
+		reply(runtime, second, "w2-reply", "w2 conclusion: plan X");
+		inputReady(runtime, first);
+		assert.equal(action(runtime, first, 1, "w1-held", { action: "yield", attention: "need w2's conclusion", checkpoint: "step 1 done" }).ok, true);
+		settle(runtime, first, "w1-held");
+		const manager = runtime.takeNextActivation(teamId)!;
+		const events = manager.input.scope.kind === "management" ? manager.input.scope.events : [];
+		const held = events.find((event) => event.kind === "WORK_HELD")!;
+		const conclusion = events.find((event) => event.kind === "ROOT_RESULT_READY")!.resultRef!;
+		inputReady(runtime, manager);
+		assert.equal(action(runtime, manager, 1, "resume", { action: "control", command: "resume_work", workId: held.work!.workId, expectedRevision: 1,
+			incidentId: held.incidentId!, instruction: `w2's conclusion is result ${conclusion}` }).ok, true);
+		assert.equal(action(runtime, manager, 2, "manager-yield", { action: "yield" }).ok, true);
+		settle(runtime, manager, "manager-yield");
+		const resumed = runtime.takeNextActivation(teamId)!;
+		assert.equal(resumed.binding.memberId, "w1");
+		assert.equal(resumed.input.scope.kind === "work" ? resumed.input.scope.checkpoint : undefined, "step 1 done");
+		assert.match(resumed.input.scope.kind === "work" ? resumed.input.scope.resumeInstruction ?? "" : "", new RegExp(conclusion, "u"));
+		inputReady(runtime, resumed);
+		const read = action(runtime, resumed, 1, "read", { action: "status", view: "result", id: conclusion });
+		assert.equal((read as any).data.result.summary, "w2 conclusion: plan X");
+		assert.equal(action(runtime, resumed, 2, "w1-reply", { action: "reply", result: { status: "succeeded", summary: "step 2 done" } }).ok, true);
+		settle(runtime, resumed, "w1-reply");
+		assert.equal(runtime.getWork(teamId, first.scope.work!)!.revisions[0]!.state, "resolved");
+	}
+	// Path 2: w1 waits on w2's WorkRef itself and wakes with its outcome.
+	{
+		const { runtime, teamId, first, second } = setup([{ to: "w1", task: "needs w2" }, { to: "w2", task: "conclude" }]);
+		inputReady(runtime, first);
+		assert.equal(action(runtime, first, 1, "w1-wait", { action: "yield", waitingFor: [second.scope.work], checkpoint: "waiting for w2" }).ok, true);
+		settle(runtime, first, "w1-wait");
+		reply(runtime, second, "w2-reply", "w2 conclusion: plan X");
+		let next = runtime.takeNextActivation(teamId)!;
+		while (next.binding.memberId === "lead") { finishIdle(runtime, next); next = runtime.takeNextActivation(teamId)!; }
+		assert.equal(next.binding.memberId, "w1");
+		assert.equal(next.input.outcomes[0]?.preview?.summary, "w2 conclusion: plan X");
+	}
+});
+
+function finishIdle(runtime: TeamRuntime, activation: RuntimeActivation): void {
+	inputReady(runtime, activation);
+	assert.equal(action(runtime, activation, 1, `idle-${activation.scope.activationId}`, { action: "yield" }).ok, true);
+	settle(runtime, activation, `idle-${activation.scope.activationId}`);
+}
 
 test("P: prepare rejects initial per-member overflow before reserving a Team or changing live state", () => {
 	let ids = 0;

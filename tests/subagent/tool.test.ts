@@ -1031,6 +1031,25 @@ test("parallel parent content is fair and details keep a bounded retained answer
 	assert.ok(Buffer.byteLength(JSON.stringify(result.details), "utf8") <= 512 * 1024);
 });
 
+test("parallel parent content keeps short answers whole and gives their unused budget to a long one", async () => {
+	const long = `${"a".repeat(30_000)}LONG-END`;
+	const { tool } = setupTool({
+		runStateless: async (request: { task: string }) => ({
+			output: request.task.includes("long") ? long : `short answer for ${request.task}`,
+			exitCode: 0,
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
+		}),
+	});
+	const result = await tool.execute("call-uneven", {
+		tasks: ["long", "one", "two", "three"].map((task) => ({ model: "cus-resp/gpt-5.6-sol:xhigh", task })),
+	}, undefined, undefined, context());
+	const text: string = result.content[0].text;
+	assert.ok(Buffer.byteLength(text, "utf8") <= 50 * 1024);
+	assert.match(text, /LONG-END/u, "a 30 KB answer fits once the short answers leave their share unused");
+	for (const task of ["one", "two", "three"]) assert.match(text, new RegExp(`short answer for Task: ${task}|short answer for ${task}`, "u"));
+	assert.doesNotMatch(text, /truncated/u);
+});
+
 test("full initial task rendering stays out of bounded parent details", async () => {
 	const initialTask = [
 		"FULL INITIAL TASK START",

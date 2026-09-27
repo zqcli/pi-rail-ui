@@ -32,6 +32,7 @@ import {
 	type SubagentTranscriptRun,
 	type SubagentTranscriptSnapshot,
 } from "./transcript";
+import { fairShares } from "./text-budget";
 import { emptySubagentUsage } from "./usage";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -640,11 +641,16 @@ function aggregateText(mode: "parallel" | "chain", results: StatefulSubagentRunD
 			return `- ${result.alias} · ${result.status} · ${result.model ?? "model unavailable"}${error ? ` · ${error.slice(0, 300)}` : ""}`;
 		}),
 	].join("\n");
-	const remaining = Math.max(1024, OUTPUT_CAP - Buffer.byteLength(summary, "utf8") - 512);
-	const perRun = Math.max(512, Math.floor(remaining / Math.max(1, results.length)));
-	const outputs = results.map((result) => {
-		const snippet = truncateUtf8(result.output, perRun, "\n[answer snippet truncated]").value;
-		return `### ${result.alias} [${result.status}]\n\n${snippet}`;
+	const headings = results.map((result) => `### ${result.alias} [${result.status}]\n\n`);
+	const overhead = headings.reduce((sum, heading) => sum + Buffer.byteLength(heading, "utf8"), 0) + 7 * Math.max(0, results.length - 1);
+	// Short answers stay complete; only the longest ones share what is left of the parent budget.
+	const shares = fairShares(results.map((result) => Buffer.byteLength(result.output, "utf8")),
+		Math.max(1024, OUTPUT_CAP - Buffer.byteLength(summary, "utf8") - 512 - overhead), 512);
+	const outputs = results.map((result, index) => {
+		const suffix = result.persistent && result.status === "completed"
+			? `\n[answer truncated; the full answer remains in persistent session ${result.alias}]`
+			: "\n[answer snippet truncated]";
+		return `${headings[index]}${truncateUtf8(result.output, shares[index]!, suffix).value}`;
 	}).join("\n\n---\n\n");
 	return truncateParentContent(`${summary}\n\n${outputs}`);
 }

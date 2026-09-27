@@ -17,6 +17,7 @@ import {
 	type ResolvedTeamMemberPolicy,
 } from "./tool";
 import { boundSubagentRunTranscripts, renderSubagentTranscript, type SubagentTranscriptRun } from "./transcript";
+import { fairShares } from "./text-budget";
 import { addActivationUsage } from "./usage";
 
 const MAX_MEMBER_OUTPUT_BYTES = 16 * 1024;
@@ -297,19 +298,13 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		const body = record ? resultBody(record) : "";
 		const truncated = `[Result truncated for the parent; full record: subagent_team status resultRef ${ref}]`;
 		// Fixed cost of a block: blank separator, heading, and room for the truncation note.
-		return { ref, heading, body, overhead: Buffer.byteLength(`\n\n${heading}\n\n${truncated}`, "utf8"), truncated };
+		return { heading, body, overhead: Buffer.byteLength(`\n\n${heading}\n\n${truncated}`, "utf8"), truncated };
 	});
-	// Water-fill the budget: shorter results stay complete, and only the largest ones share what is left.
-	let remaining = MAX_FINAL_TEXT_BYTES - Buffer.byteLength(lines.join("\n"), "utf8");
-	const budgets = new Map<string, number>();
-	const bySize = [...blocks].sort((left, right) => jsonTextBytes(left.body) - jsonTextBytes(right.body));
-	bySize.forEach((block, index) => {
-		const budget = Math.max(512, Math.floor(remaining / (bySize.length - index)) - block.overhead);
-		budgets.set(block.ref, budget);
-		remaining -= Math.min(budget, jsonTextBytes(block.body)) + block.overhead;
-	});
-	for (const block of blocks) {
-		const body = truncateText(block.body, budgets.get(block.ref)!);
+	// Shorter results stay complete, and only the largest ones share what is left.
+	const available = MAX_FINAL_TEXT_BYTES - Buffer.byteLength(lines.join("\n"), "utf8") - blocks.reduce((sum, block) => sum + block.overhead, 0);
+	const shares = fairShares(blocks.map((block) => jsonTextBytes(block.body)), available, 512);
+	for (const [index, block] of blocks.entries()) {
+		const body = truncateText(block.body, shares[index]!);
 		lines.push("", [block.heading, body.text, ...(body.truncated ? [block.truncated] : [])].join("\n"));
 	}
 	return lines.join("\n");

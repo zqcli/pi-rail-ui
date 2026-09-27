@@ -609,6 +609,23 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 
 隔离环境全量：`npm run check` 943/943（72135 ms，`/tmp/pi-boot-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 943/943（71444 ms，`/tmp/pi-boot-depth.log`）；均无 fail/cancelled/skipped。在线 Manager 是否不再重复派发仍需实际运行确认。
 
+### 7.5 第三次实测后的 launch 最终输出与时间线
+
+第三次真实运行（Team 以 `succeeded` 关闭、未重复派发，证实 §7.4 生效）中，launch 最终文本只有各结果的 summary 预览和 “Limitations: N” 计数，父 agent 于是在 launch 后又调用了 3 次 `status`（team、results、result）读取 findings、evidence 和时序；Team 关闭后 `status` 仍显示 Manager 待处理事件；§8 文档有一行重复。
+
+修复：launch 最终文本像 grouped subagent 一样直接携带结果——Team 结论、roots/works、每个成员的 lifecycle/资源、模型、FAST、轮次、活跃时长与结果数、Runtime 时间线，以及 Manager 选定的每份 worker 结果全文（summary、findings、evidence、limitations、artifacts）。全文受 48 KiB 约束，短结果完整保留，只截断超额的大结果并注明 `status resultRef`。worker 子面板显示其最近结果全文，Manager 子面板显示关闭决定。Runtime 在状态转换处记录仅供显示的有界时间线（launch 与初始派发、request、activation 开始/结束及结束意图、结果提交、accept/waive、cancel、revise、close_team、成员退出、Team 终态；最多 60 条并计省略数，不参与协议、恢复或义务）。Team 结束后 `panelFacts` 不再报告待处理事件。回归：`team-tool.test.ts` · `launch final output carries every selected result in full with a timeline, so no status call is needed`（fake，8 个 root 含 4 个约 11 KB 结果，断言全文、截断提示、时间线结构与 48 KiB 上限）。
+
+隔离环境全量：`npm run check` 944/944（76555 ms，`/tmp/pi-timeline-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 944/944（77698 ms，`/tmp/pi-timeline-depth.log`）；均无 fail/cancelled/skipped。
+
+真实在线复测（`pi --no-extensions -e <本工作区>/index.ts --model cus-resp/gpt-6-sol --thinking xhigh -p <用户原始提示>`，worker 由父按提示选 `cus-resp/gpt-6-luna:max` + FAST）：
+
+| 运行 | 代码 | 结果 | launch 后 status 调用 | 观察 |
+| --- | --- | --- | --- | --- |
+| 1（session `e763707d…`） | `1d23c3c` | CLOSED · succeeded，3 个 root 全部 accepted | 0 | 结果全文随 launch 返回；父指出时间线只有结果提交，不含派发/验收，据此加入 Runtime 时间线 |
+| 2（session `55bbcf61…`） | `5710ff0` | CLOSED · succeeded，2/2 root accepted，1:42 完成 | 0 | 时间线含派发、各 activation、结果、accept、close_team 与成员退出；父直接据此报告时序 |
+
+两次均未重复派发、一步 `succeeded` 关闭、Manager 无轮询。运行 2 首次 prepare 因 Manager 别名与既有 persistent 会话重名被拒（未启动任何成员），改名后成功，属预期校验。TUI 面板渲染未做人工验收。
+
 ## 8. 历史阶段结果（非本轮成绩）
 
 上一版 D2b／`5368b05` 的父全量记录为：

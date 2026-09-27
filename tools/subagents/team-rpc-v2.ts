@@ -178,6 +178,8 @@ export class TeamRpcV2Connection {
 		private readonly transport: RpcTransport,
 		private readonly binding: BindingV2,
 		private readonly onFailure: (error: Error) => void,
+		/** Display-only observer of native events inside an activation; it never affects the protocol. */
+		private readonly onActivity?: (event: RpcEvent) => void,
 	) {}
 
 	get diagnosticCount(): number { return this.diagnostics; }
@@ -347,7 +349,10 @@ export class TeamRpcV2Connection {
 		}
 		const run = this.run;
 		if (run) {
-			if (!run.settled) run.usage.ingest(event);
+			if (!run.settled) {
+				run.usage.ingest(event);
+				try { this.onActivity?.(event); } catch { /* A display observer failure never affects the member. */ }
+			}
 			if (event.type === "agent_start") run.started = true;
 			if (event.type === "tool_execution_start" && typeof event["toolCallId"] === "string" && typeof event["toolName"] === "string") {
 				const toolCallId = event["toolCallId"];

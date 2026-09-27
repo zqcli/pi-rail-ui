@@ -9,7 +9,8 @@ const EXPANDED_ROWS = 16;
 const MAX_ENTRY_ROWS = 5;
 
 export type SubagentTranscriptKind = "user" | "assistant" | "thinking" | "tool" | "toolResult";
-export type SubagentTranscriptStatus = "running" | "completed" | "accepted" | "failed";
+/** `idle` is a live session waiting for work (a Team member); it is never shown as completed. */
+export type SubagentTranscriptStatus = "running" | "idle" | "completed" | "accepted" | "failed";
 
 export interface SubagentTranscriptEntry {
 	id: string;
@@ -58,6 +59,10 @@ export interface SubagentTranscriptRun {
 	contextWindowText?: string;
 	fastModeText?: "on" | "off";
 	searchModeText?: "on" | "off";
+	/** Grouped identity label replacing persistent/one-off (for example a Team role). */
+	role?: string;
+	/** Extra state line under the header (for example a Team member's lifecycle and work). */
+	detail?: string;
 }
 
 export interface SubagentTranscriptRenderOptions {
@@ -768,6 +773,7 @@ function statusText(run: SubagentTranscriptRun): string {
 	if (run.status === "failed") return "Failed";
 	if (run.status === "running" && run.isCompacting) return "Compacting";
 	if (run.status === "running") return "Running";
+	if (run.status === "idle") return "Idle";
 	if (run.status === "accepted") return "Accepted";
 	return "Completed";
 }
@@ -799,19 +805,20 @@ function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control",
 	const contextWindow = ` · ContextWindow ${run.contextWindowText ?? "Default"}`;
 	const fast = ` · FAST ${run.fastModeText ?? "off"}`;
 	const search = ` · SEARCH ${run.searchModeText ?? "off"}`;
-	return `${step}${run.alias} · ${run.persistent ? "persistent" : "one-off"} · ${run.model ?? "model unavailable"}${contextWindow}${fast}${search}`;
+	return `${step}${run.alias} · ${run.role ?? (run.persistent ? "persistent" : "one-off")} · ${run.model ?? "model unavailable"}${contextWindow}${fast}${search}`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
 	if (run.status === "failed") return theme.fg("error", "✗");
 	if (run.status === "running" && run.isCompacting) return theme.fg("warning", "Compacting");
 	if (run.status === "running") return theme.fg("warning", "…");
+	if (run.status === "idle") return theme.fg("muted", "○");
 	if (run.status === "accepted") return theme.fg("accent", "↪");
 	return theme.fg("success", "✓");
 }
 
 function canRenderAnswerMarkdown(run: SubagentTranscriptRun): boolean {
-	return run.status === "completed"
+	return (run.status === "completed" || run.status === "idle")
 		&& run.stopReason !== "length"
 		&& !run.outputTruncated
 		&& !run.output.includes("[Final answer truncated in the parent session details.");
@@ -863,13 +870,15 @@ class SubagentRunPanel implements Component {
 				? runtimeMetricsText(this.run)
 				: "";
 		if (metrics) lines.push(truncateToWidth(this.theme.fg("dim", metrics), innerWidth, "", true));
+		if (this.run.detail) lines.push(this.theme.fg("muted", this.run.detail));
 		if (this.terminal) lines.push(...this.renderCompleted(innerWidth));
 		else lines.push(...this.renderActivity(innerWidth));
 		if (!boxed) return lines.flatMap((line, index) => index === 0
 			? [line]
 			: new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
-		const borderColor = this.run.status === "failed" ? "error" : this.run.status === "running" ? "warning" : "borderAccent";
+		const borderColor = this.run.status === "failed" ? "error" : this.run.status === "running" ? "warning"
+			: this.run.status === "idle" ? "borderMuted" : "borderAccent";
 		const border = (value: string) => this.theme.fg(borderColor, value);
 		const result = [border(`╭${"─".repeat(innerWidth)}╮`)];
 		for (const line of lines) {
@@ -902,7 +911,7 @@ class SubagentRunPanel implements Component {
 				: [];
 			const label = this.layout === "control"
 				? this.run.status === "failed" ? "Control error" : "Control acknowledgement"
-				: "Final answer";
+				: this.run.status === "idle" ? "Latest output" : "Final answer";
 			return [...activity, ...error, this.theme.fg("dim", label), ...rendered];
 		}
 		const initial = this.layout === "control" ? [] : this.run.transcript
@@ -960,7 +969,8 @@ class MultiSubagentPanelView implements Component {
 		const completed = this.runs.filter((run) => run.status === "completed").length;
 		const accepted = this.runs.filter((run) => run.status === "accepted").length;
 		const failed = this.runs.filter((run) => run.status === "failed").length;
-		const running = this.runs.length - completed - accepted - failed;
+		const idle = this.runs.filter((run) => run.status === "idle").length;
+		const running = this.runs.length - completed - accepted - failed - idle;
 		const total = this.runs.reduce((usage, run) => {
 			if (!run.usage) return usage;
 			usage.input += run.usage.input;
@@ -971,7 +981,7 @@ class MultiSubagentPanelView implements Component {
 			usage.searches += run.usage.searches ?? 0;
 			return usage;
 		}, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, searches: 0 });
-		const summary = `${this.runs.length} model ${this.runs.length === 1 ? "session" : "sessions"} · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running · ${failed} failed`;
+		const summary = `${this.runs.length} model ${this.runs.length === 1 ? "session" : "sessions"} · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running${idle ? ` · ${idle} idle` : ""} · ${failed} failed`;
 		const metrics = [
 			`${compactNumber(total.input)} in`,
 			`${compactNumber(total.output)} out`,

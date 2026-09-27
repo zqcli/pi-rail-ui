@@ -1,11 +1,14 @@
 import { resolve } from "node:path";
 import type { RailModelRef } from "./models";
 import { railModelReference } from "./models";
-import { TeamMemberOpenError, type BrokeredTeamMemberHandle, type SessionBroker } from "./session-broker";
+import { TeamMemberOpenError, type BrokeredTeamMemberHandle, type SessionBroker, type SubagentUsage } from "./session-broker";
+import type { RpcEvent } from "./rpc-worker";
+import { assistantText, RunResultCollector } from "./run-result";
 import type { ChildRequestFrame, PrivateReply, TeamResult } from "./team-protocol";
 import { sameBinding, sameScope } from "./team-codec";
 import { TeamRuntime, type ActivationCompletionReason, type NativeCompletion, type RuntimeActivation, type TeamRuntimeExecutor } from "./team-runtime";
 import { TeamActivationFailure } from "./team-rpc-v2";
+import { SubagentTranscript, type SubagentTranscriptSnapshot } from "./transcript";
 
 export interface OpenTeamMemberRequest {
 	teamId: string;
@@ -27,6 +30,26 @@ interface ManagedMember {
 	binding: RuntimeActivation["binding"];
 	handle: BrokeredTeamMemberHandle;
 	contextWindow?: number;
+}
+
+/** Display-only native activity of one member across all of its activations. */
+export interface TeamMemberActivity {
+	transcript: SubagentTranscriptSnapshot;
+	/** Latest assistant text. */
+	output: string;
+	/** Usage of the in-flight activation that Runtime has not folded into the member yet. */
+	liveUsage?: SubagentUsage;
+	isCompacting?: boolean;
+	/** Time spent in native activations, including the current one. */
+	durationMs: number;
+}
+
+interface ActivityRecord {
+	transcript: SubagentTranscript;
+	run?: RunResultCollector;
+	startedAt?: number;
+	activeMs: number;
+	output: string;
 }
 
 function key(teamId: string, memberId: string): string {
@@ -58,8 +81,57 @@ export class TeamMemberDriver {
 	private readonly preparedStops = new Map<string, Promise<TeamResult>>();
 	private readonly opening = new Map<string, Promise<unknown>>();
 	private readonly failedOpenings = new Map<string, TeamMemberOpenError>();
+	private readonly activity = new Map<string, ActivityRecord>();
+	private readonly activityListeners = new Set<(teamId: string) => void>();
 
 	constructor(private readonly runtime: TeamRuntime, private readonly broker: SessionBroker) {}
+
+	/** Display observation of native member activity; listeners must only read. */
+	onActivity(listener: (teamId: string) => void): () => void {
+		this.activityListeners.add(listener);
+		return () => { this.activityListeners.delete(listener); };
+	}
+
+	/** Kept after a member closes so a finished Team still shows what each member did. */
+	memberActivity(teamId: string, memberId: string): TeamMemberActivity | undefined {
+		const activity = this.activity.get(key(teamId, memberId));
+		if (!activity) return undefined;
+		const live = activity.run?.result("");
+		return {
+			transcript: activity.transcript.snapshot(),
+			output: live?.output || activity.output,
+			...(live ? { liveUsage: live.usage } : {}),
+			...(live?.isCompacting ? { isCompacting: true } : {}),
+			durationMs: activity.activeMs + (activity.startedAt !== undefined ? Date.now() - activity.startedAt : 0),
+		};
+	}
+
+	private recordActivity(teamId: string, activity: ActivityRecord, event: RpcEvent): void {
+		// The activation trigger prompt is protocol plumbing, not member activity.
+		const userMessage = (event.type === "message_start" || event.type === "message_end")
+			&& (event.message as { role?: unknown } | undefined)?.role === "user";
+		if (!userMessage) activity.transcript.ingest(event);
+		activity.run?.ingest(event);
+		this.notifyActivity(teamId);
+	}
+
+	/** Freeze the settled activation; Runtime has folded (or recorded as lost) its usage by now. */
+	private finishActivity(teamId: string, id: string): void {
+		const activity = this.activity.get(id);
+		if (!activity?.run) return;
+		const output = activity.run.result("").output;
+		if (output) activity.output = output;
+		activity.activeMs += Date.now() - activity.startedAt!;
+		delete activity.run;
+		delete activity.startedAt;
+		this.notifyActivity(teamId);
+	}
+
+	private notifyActivity(teamId: string): void {
+		for (const listener of [...this.activityListeners]) {
+			try { listener(teamId); } catch { /* A display observer never affects the member. */ }
+		}
+	}
 
 	async openMember(request: OpenTeamMemberRequest): Promise<BrokeredTeamMemberHandle> {
 		const planned = this.runtime.getTeam(request.teamId).members.find((member) => member.id === request.memberId);
@@ -83,12 +155,15 @@ export class TeamMemberDriver {
 		if (this.members.has(id)) throw new Error(`Team member ${request.memberId} already has a native lifetime`);
 		// The claim fails once the Team is no longer prepared, so a cancelled Team never gains a new lifetime.
 		const binding = this.runtime.claimNativeLifetime(request.teamId, request.memberId);
+		const activity: ActivityRecord = { transcript: new SubagentTranscript(""), activeMs: 0, output: "" };
+		this.activity.set(id, activity);
 		const opened = this.broker.openTeamMember({
 			binding,
 			model: request.model,
 			...(cwd ? { cwd } : {}),
 			...(fastMode !== undefined ? { fastMode } : {}),
 			...(contextWindow !== undefined ? { contextWindow } : {}),
+			onActivity: (event) => this.recordActivity(request.teamId, activity, event),
 		});
 		this.opening.set(id, opened);
 		try {
@@ -265,6 +340,11 @@ export class TeamMemberDriver {
 		if (!sameBinding(member.binding, activation.binding)) throw new Error("Runtime activation binding changed during a member lifetime");
 		if (this.runningMembers.has(id)) throw new Error(`Team member ${activation.binding.memberId} already has an activation in flight`);
 		this.runningMembers.add(id);
+		const activity = this.activity.get(id);
+		if (activity) {
+			activity.run = new RunResultCollector("", assistantText);
+			activity.startedAt = Date.now();
+		}
 		const controller = new AbortController();
 		this.activationControllers.set(id, { activationId: activation.scope.activationId, controller });
 		const pendingStop = this.pendingStops.get(id);
@@ -286,6 +366,7 @@ export class TeamMemberDriver {
 					if (native) throw new Error("Native activation emitted more than one settled completion");
 					native = completion;
 					const result = this.runtime.nativeSettled(activation.binding, activation.scope.activationId, completion);
+					this.finishActivity(activation.binding.teamId, id);
 					if (!result.ok) settlementError = new Error(result.error.message);
 					else nativeAccepted = true;
 				},
@@ -304,6 +385,7 @@ export class TeamMemberDriver {
 			return { activation, completion: native, completionReason: this.runtime.activationCompletionReason(activation.binding, activation.scope.activationId) ?? "normal",
 				sessionId: member.handle.sessionId };
 		} catch (error) {
+			this.finishActivity(activation.binding.teamId, id);
 			if (!native && !lostProcessed) {
 				const released = error instanceof TeamActivationFailure && error.resourceReleased;
 				this.runtime.activationLost(activation.binding, activation.scope.activationId, {
@@ -322,6 +404,7 @@ export class TeamMemberDriver {
 			}
 			throw settlementError ?? error;
 		} finally {
+			this.finishActivity(activation.binding.teamId, id);
 			this.runningMembers.delete(id);
 			if (this.activationControllers.get(id)?.activationId === activation.scope.activationId) this.activationControllers.delete(id);
 		}

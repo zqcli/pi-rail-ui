@@ -4,7 +4,7 @@
 
 本报告保留规格 §24 的 100 项映射及原测试编号，作为可追溯的覆盖索引（§4–§5），**不把“100 项都有映射”或测试全绿当作无缺陷证明**。上一版 900/900 全绿之后，父 review 仍发现六类缺陷：长错误输出、grant 后 children 展示、子端超大业务参数、关闭退出时限、被取消的导航、启动准入失败清理。本轮逐类修复并补回归（§7.1）；旧测试没有覆盖这些触发条件，不能用旧成绩替代新证据。
 
-父审查者在 repair 代码/测试工作树上亲自执行两次全量验证，均为 **938 passed，0 failed/cancelled/skipped**（§3）。验证后冻结代码与测试，本次只更新文档。词典以实际源码声明和两份父审查日志核对；参数化测试明确列出模板及展开条件，不冒充静态顶层 `test("…")` 声明。
+父审查者在 repair 代码/测试工作树上亲自执行两次全量验证，均为 **938 passed，0 failed/cancelled/skipped**（§3）。之后一次真实在线运行又暴露 Manager 轮询等待与 launch 面板问题，其修复和 943/943 全量结果见 §7.3。验证后冻结代码与测试，本次只更新文档。词典以实际源码声明和两份父审查日志核对；参数化测试明确列出模板及展开条件，不冒充静态顶层 `test("…")` 声明。
 
 本轮**未验证**的范围：
 
@@ -580,6 +580,26 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
   - U01 使用 fake broker/worker 的回归套件。
   - NV01–NV06 使用真实 Pi 导航/ExtensionRunner 方法与 fake 上下文；即使标题含 `native`，也不计入 native provider/CLI 层。LC06 使用 mock timers 验证 5 秒与 6 秒边界，不是一次真实进程 6 秒退出测量。
   - `team-member-driver.test.ts` 中的 fake 条目为 `DR15`, `DR16`, `DR17`, `DR18`, `DR19`, `DR20`, `DR21`, `DR23`，其余 DR 条目均为 native。L09、L10、U10 引用的 `DR15`、`DR18`、`DR19` 属于 fake。
+
+### 7.3 实测会话后的面板与 Manager 引导修复
+
+一次真实在线 Team 运行（成功关闭）暴露了以下问题，上述 100 项映射与 938 green 均未覆盖：
+
+- Manager 用带 `waitingFor` 的 yield 等待 worker 被拒后，在同一 activation 内轮询 `status` 约 3 分钟；其间 worker 结果事件无法交付，`close_team` 被 `CLOSE_BLOCKED`。现在管理 activation 的 notice、Manager yield 错误、工具 schema/描述和 close blocker 都明确指引“派发后 yield、由新事件重新激活、不要轮询”；work activation 的 notice 不变。行为约束本身未变。
+- 面板只显示计数，不显示已提交结果、Manager 待处理事件和成员运行中的活动（规格 19.1）；launch 结束后成员表被最终文本替换；prepare 面板显示成员表而非固定的计划文本。现在 launch 复用 grouped subagent 面板，每个成员一个子面板（见 actor 文档 §11），成员原生事件由 v2 连接以只读观察者转给 driver，不影响协议；结束后保留成员面板。
+- 会话切换时对已 CLOSED 的 Team 补写了 `interrupted` 记录（历史解析仍保留 terminal，但记录错误）。现在只对 active/closing Team 写标记。
+
+新增回归（均在下列全量运行中通过）：
+
+| 测试 | 层 | 覆盖 |
+|---|---|---|
+| `team-runtime.test.ts` · `Manager guidance: management input says to yield instead of polling, and host panel facts count events and results` | pure | 管理 notice、Manager yield 错误指引、work notice 不变、待处理事件与按作者的结果计数 |
+| `team-member-driver.test.ts` · `real Pi member activity feeds the launch panel across activations and freezes live usage at settlement` | native | 真实 Pi 子进程事件进入成员活动；跨 activation 保留；隐藏触发 prompt；结算后不再报告实时用量（不双计）；成员关闭后仍可读 |
+| `team-tool.test.ts` · `launch panel reuses grouped subagent panels per member, live and after the Team ends` | fake | 实时与最终 details 含每个成员面板、角色、任务、实时用量、待处理事件；idle 不显示为完成；prepare 面板显示计划文本；details 可序列化 |
+| `transcript.test.ts` · `grouped panels show a live idle member as idle, never completed, with its role and state line` | pure | 共享渲染器的 idle 状态、角色标签与状态行 |
+| `team-integration.test.ts` · `host shutdown writes no interruption marker for a Team that already ended` | fake | 已结束 Team 不补写 interrupted（撤掉修复时该测试失败） |
+
+本轮隔离环境全量结果：`npm run check` 943/943 通过（74781 ms，`/tmp/pi-panel-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 943/943 通过（75518 ms，`/tmp/pi-panel-depth.log`）；均无 fail/cancelled/skipped。未做在线模型或交互 TUI 手工验收；在线 Manager 是否遵循新指引需要实际运行观察。
 
 ## 8. 历史阶段结果（非本轮成绩）
 

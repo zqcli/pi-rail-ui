@@ -39,6 +39,9 @@ function incidentView(incident: TeamIncidentView): TeamIncidentView {
 
 /** Grant reasons are retained in the bounded Team view; keep them short. */
 const TEAM_MAX_GRANT_REASON_BYTES = 512;
+const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work.";
+const MANAGEMENT_NOTICE = "Management activation: there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
+	+ "New results, failures and incidents start the next management activation automatically; do not poll status to wait.";
 
 export interface RuntimeActivation {
 	binding: BindingV2;
@@ -1560,6 +1563,18 @@ export class TeamRuntime {
 		return result ? copy(result) : undefined;
 	}
 
+	/** Host panel facts outside the member-facing view: waiting Manager events and each author's results. */
+	panelFacts(teamId: string): { pendingManagerEvents: number; results: Map<string, { count: number; latest: ResultRecord }> } {
+		const team = this.team(teamId);
+		const latest = new Map<string, { count: number; id: string }>();
+		for (const id of team.ledger.resultOrder) {
+			const author = team.ledger.results.get(id)!.author;
+			latest.set(author, { count: (latest.get(author)?.count ?? 0) + 1, id });
+		}
+		const results = new Map([...latest].map(([author, { count, id }]) => [author, { count, latest: copy(team.ledger.results.get(id)!) }]));
+		return { pendingManagerEvents: team.events.filter((event) => !event.processed && event.batchId === undefined).length, results };
+	}
+
 	listResultRefsPage(teamId: string, cursor?: string, limit = TEAM_STATUS_DEFAULT_LIMIT): {
 		items: Array<{ id: string; work: WorkRef; author: string; status: WorkResult["status"]; summaryPreview: string }>;
 		cursor?: string; hasMore: boolean; total: number;
@@ -1697,7 +1712,7 @@ export class TeamRuntime {
 
 	private stageYield(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: Extract<TeamAction, { action: "yield" }>, toolCallId: string): TeamReply {
 		if (active.scope.kind === "management") {
-			if (action.waitingFor.length || action.attention !== undefined) fail("INVALID_ARGUMENT", "Management yield cannot wait for work or request attention");
+			if (action.waitingFor.length || action.attention !== undefined) fail("INVALID_ARGUMENT", "A Manager never waits inside an activation: end it with yield {checkpoint?} and no waitingFor/attention. New results, failures and incidents start the next management activation automatically; do not poll status to wait.");
 			active.intent = { kind: "manager_idle", ...(action.checkpoint ? { checkpoint: action.checkpoint } : {}), toolCallId };
 			member.activity = "settling";
 			this.changed(team);
@@ -2002,7 +2017,7 @@ export class TeamRuntime {
 			blockers.push({ kind: "delivery", id: delivery.memberId, reason: "required input is in flight" });
 		}
 		for (const event of team.events) if (!event.processed && event.kind !== "TEAM_QUIESCENT" && event.batchId !== active.scope.eventBatchId) {
-			blockers.push({ kind: "manager_event", id: event.id, reason: "an unprocessed Manager event is outside the closing activation batch" });
+			blockers.push({ kind: "manager_event", id: event.id, reason: "an unprocessed Manager event is outside the closing activation batch; end this activation with yield to receive it, then close" });
 		}
 		// An exhausted-budget notice that holds no work is not an unresolved obligation; held work blocks on its own.
 		const holdsWork = (incidentId: string) => team.ledger.order.some((id) => team.ledger.current(id)?.hold?.incidentId === incidentId);
@@ -2177,7 +2192,7 @@ export class TeamRuntime {
 			roster: [...team.members.values()].map((item) => ({ id: item.id, role: item.role, lifecycle: item.lifecycle,
 				rolePreview: previewText(item.roleDescription, 512) })),
 			scope: copy(scope), outcomes, omittedOutcomes: 0,
-			ownedChildren, budget, notice: "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work.",
+			ownedChildren, budget, notice: scope.kind === "work" ? WORK_NOTICE : MANAGEMENT_NOTICE,
 		};
 		return projectActivationInput(result);
 	}
@@ -2896,7 +2911,7 @@ export class TeamRuntime {
 			scope, outcomes: [], omittedOutcomes: 0, ownedChildren: [],
 			// Size check only: the largest possible budget summary.
 			budget: { emergency: false, modelRequests: Number.MAX_SAFE_INTEGER, toolCalls: Number.MAX_SAFE_INTEGER, activations: Number.MAX_SAFE_INTEGER },
-			notice: "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work.",
+			notice: WORK_NOTICE,
 		};
 		try { encodeActivationInput(input); } catch (error) {
 			if (error instanceof TeamProtocolError) fail("INPUT_BUDGET_EXCEEDED", `Required Team input cannot fit: ${error.message}`);

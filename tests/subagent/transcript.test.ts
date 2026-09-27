@@ -799,6 +799,26 @@ test("grouped panels retain child identity, explicit dispatch policy, and chain 
 	}
 });
 
+test("grouped panels show a live idle member as idle, never completed, with its role and state line", () => {
+	const runs: SubagentTranscriptRun[] = [
+		{ alias: "lead", role: "manager", model: "provider/gpt", status: "running", output: "", persistent: true,
+			detail: "OPEN · RUNNING · pending events 2", transcript: { entries: [], omittedEntries: 0 } },
+		{ alias: "writer", role: "worker", model: "provider/gpt", status: "idle", output: "Earlier summary", persistent: true,
+			detail: "OPEN · IDLE · no assigned work · results 1", transcript: { entries: [], omittedEntries: 0 } },
+	];
+	const text = renderSubagentTranscript(runs, false, theme as any, { mode: "parallel" }).render(120).join("\n");
+	assert.match(text, /2 model sessions · 0 complete · 1 running · 1 idle · 0 failed/);
+	assert.match(text, /… lead · manager · provider\/gpt/);
+	assert.match(text, /○ writer · worker · provider\/gpt/);
+	assert.match(text, /OPEN · RUNNING · pending events 2/);
+	assert.match(text, /OPEN · IDLE · no assigned work · results 1/);
+	assert.match(text, /Earlier summary/);
+	assert.doesNotMatch(text, /✓|persistent/, "idle is not rendered as completed, and the role replaces persistent/one-off");
+	const expanded = renderSubagentTranscript(runs, true, theme as any, { mode: "parallel" }).render(120).join("\n");
+	assert.match(expanded, /Latest output/);
+	assert.doesNotMatch(expanded, /Final answer/);
+});
+
 test("grouped child panels show the explicit per-slot search policy while single and control panels stay silent", () => {
 	const runs: SubagentTranscriptRun[] = [
 		{

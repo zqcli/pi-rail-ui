@@ -411,12 +411,12 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	schemaObject({ action: Type.Literal("reply"), result: resultSchema }, "Stage a result for only the current WorkRef; it commits after native settlement and cleanup."),
 	schemaObject({ action: Type.Literal("yield"), waitingFor: Type.Array(workRefSchema, { minItems: 1, maxItems: TEAM_MAX_WAITING_FOR }),
 		checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
-	}, "End this work activation while waiting for the listed immutable WorkRefs."),
+	}, "Work activations only: end this work activation while waiting for the listed immutable WorkRefs."),
 	schemaObject({ action: Type.Literal("yield"), attention: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
 		checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
 	}, "Hold this work for explicit Manager or host attention."),
 	schemaObject({ action: Type.Literal("yield"), checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })) },
-		"Manager-only idle yield. It does not automatically retry or create a follow-up activation."),
+		"Manager-only: end this management activation. The Manager never waits in-run; new results, failures and incidents start its next activation automatically."),
 	schemaObject({ action: Type.Literal("status"), view: Type.Optional(Type.Literal("team")),
 		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
 	"Read the bounded Team summary. Team view does not accept an id or cursor."),
@@ -454,7 +454,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Manager only: close the Team after all roots and member resources are explicitly settled."),
 ]);
 
-export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or lets the Manager idle; status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and Manager messages are separate host APIs, not model actions.";
+export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or ends a Manager activation (a Manager never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new events); status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and Manager messages are separate host APIs, not model actions.";
 
 const LEGACY_ACTIONS: Record<string, string> = {
 	send: "send was replaced by request {to, task}; a reply never creates a new request",

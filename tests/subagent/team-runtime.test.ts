@@ -105,6 +105,31 @@ test("P: v2 codec rejects v1 live frames, legacy actions, unknown fields and non
 	});
 });
 
+test("Manager guidance: management input says to yield instead of polling, and host panel facts count events and results", () => {
+	const { runtime, teamId } = makeRuntime();
+	const boot = runtime.takeNextActivation(teamId)!;
+	assert.equal(boot.scope.kind, "management");
+	assert.match(boot.input.notice, /no current WorkRef.*yield.*do not poll status/u);
+	inputReady(runtime, boot);
+	const waiting = action(runtime, boot, 1, "manager-wait", { action: "yield", waitingFor: [{ workId: "any", revision: 1 }], checkpoint: "wait" });
+	assert.equal(code(waiting), "INVALID_ARGUMENT");
+	assert.match(waiting.ok ? "" : waiting.error.message, /never waits inside an activation.*start the next management activation automatically/u);
+	assert.equal(action(runtime, boot, 2, "boot-yield", { action: "yield" }).ok, true);
+	settle(runtime, boot, "boot-yield");
+
+	const work = runtime.takeNextActivation(teamId)!;
+	assert.match(work.input.notice, /Only the current WorkRef is authorized/u);
+	reply(runtime, work, "w1-reply", "first result");
+	const facts = runtime.panelFacts(teamId);
+	assert.ok(facts.pendingManagerEvents >= 1, "the committed result waits as a Manager event");
+	assert.equal(facts.results.get("w1")?.count, 1);
+	assert.equal(facts.results.get("w1")?.latest.result.summary, "first result");
+	assert.equal(facts.results.has("lead"), false);
+	const next = runtime.takeNextActivation(teamId)!;
+	assert.equal(next.scope.kind, "management");
+	assert.equal(runtime.panelFacts(teamId).pendingManagerEvents, 0, "events delivered to an activation are no longer pending");
+});
+
 test("P: prepare rejects initial per-member overflow before reserving a Team or changing live state", () => {
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `prepare-${++ids}`, limits: { memberUnresolvedWork: 1 } });

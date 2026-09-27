@@ -82,7 +82,8 @@ export class TeamSessionHost {
 			const at = Date.now();
 			const boundedReason = reason.trim().slice(0, 4096) || "Host session runtime ended";
 			for (const team of this.runtime.listTeams()) {
-				if (team.lifecycle === "prepared") continue;
+				// Prepared Teams never started and ended Teams already have their terminal fact.
+				if (team.lifecycle !== "active" && team.lifecycle !== "closing") continue;
 				try {
 					this.journal.write({ version: 2, kind: "interrupted", teamId: team.teamId, at, reason: boundedReason });
 				} catch (error) {

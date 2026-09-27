@@ -70,7 +70,7 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 	}
 	switch (subcommand) {
 		case "status":
-			ctx.ui.notify(formatTeamView(host.runtime.getTeam(teamId), host.runtime.listWorks(teamId)).join("\n"), "info");
+			ctx.ui.notify(formatTeamView(host.runtime.getTeam(teamId), host.runtime.listWorks(teamId), undefined, host.runtime.panelFacts(teamId)).join("\n"), "info");
 			return;
 		case "results": {
 			const page = host.runtime.listResultRefsPage(teamId, text || undefined);

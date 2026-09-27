@@ -148,7 +148,7 @@ export interface StatefulSubagentToolOptions {
 	getMarkdownTheme?: () => MarkdownTheme;
 }
 
-function markdownThemeFromTheme(theme: Theme): MarkdownTheme {
+export function markdownThemeFromTheme(theme: Theme): MarkdownTheme {
 	return {
 		heading: (text) => theme.fg("mdHeading", text),
 		link: (text) => theme.fg("mdLink", text),
@@ -506,7 +506,7 @@ function initialTasksForRender(
 	});
 }
 
-function formatContextWindowForDisplay(value: number | null | undefined): string {
+export function formatContextWindowForDisplay(value: number | null | undefined): string {
 	if (value === undefined || value === null) return "Default";
 	if (!Number.isSafeInteger(value) || value <= 0) return String(value);
 	const thousands = Math.floor(value / 1000);

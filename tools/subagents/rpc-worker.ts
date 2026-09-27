@@ -430,7 +430,7 @@ export class RpcSessionWorker implements SessionWorker {
 		await this.transport.stop();
 	}
 
-	async openTeamMemberV2(binding: BindingV2, onFailure: (error: Error) => void): Promise<TeamMemberProtocolSession> {
+	async openTeamMemberV2(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession> {
 		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
 		if (this.teamSession || this.runInFlight || this.modelChangeInFlight) throw new ContextProtocolError("Team lifetime bind requires an idle, unbound RPC worker");
 		const state = await this.state();
@@ -439,7 +439,7 @@ export class RpcSessionWorker implements SessionWorker {
 		const connection = new TeamRpcV2Connection(this.transport, binding, (error) => {
 			this.unusable = true;
 			onFailure(error);
-		});
+		}, onActivity);
 		await connection.bind();
 		let session!: TeamMemberProtocolSession;
 		session = {

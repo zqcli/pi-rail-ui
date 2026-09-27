@@ -230,6 +230,57 @@ test("launch waits for the full Team lifetime and passes only the prepared membe
 	assert.doesNotMatch(result.content[0].text, /fresh final summary|coordinator summary/u);
 });
 
+const theme = {
+	fg: (_color: string, text: string) => text, bold: (text: string) => text, italic: (text: string) => text,
+	strikethrough: (text: string) => text, underline: (text: string) => text,
+};
+
+test("launch panel reuses grouped subagent panels per member, live and after the Team ends", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	const preparedPanel = tool.renderResult(prepared, { expanded: false, isPartial: false }, theme).render(200).join("\n");
+	assert.match(preparedPanel, /nothing has started.*\n.*ContextWindow native default/u, "prepare shows the pinned plan text");
+
+	let resolveLifetime!: (result: TeamResult) => void;
+	const lifetime = new Promise<TeamResult>((resolve) => { resolveLifetime = resolve; });
+	host.driver.openAndLaunch = async () => { host.runtime.launch(teamId); return { lifetime }; };
+	const live = { input: 7, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 10, turns: 1 };
+	host.driver.memberActivity = (_id: string, memberId: string) => memberId !== "worker" ? undefined : {
+		transcript: { entries: [{ id: "tool:1", kind: "tool", label: "bash", groupId: "tool:1", text: "git status", status: "running", order: 5 }], omittedEntries: 0 },
+		output: "", liveUsage: live, durationMs: 61_000,
+	} as any;
+	const updates: any[] = [];
+	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context());
+	await new Promise((resolve) => setTimeout(resolve, 300));
+
+	const update = updates.at(-1);
+	const [lead, worker] = update.details.members;
+	assert.deepEqual([lead.alias, lead.role, worker.alias, worker.role], ["lead", "manager", "worker", "worker"]);
+	assert.equal(worker.usage.input, 7, "in-flight native usage is shown before Runtime folds it");
+	assert.equal(worker.transcript.entries[0].text, "Inspect the changed files.", "the member's current work is its initial task");
+	assert.equal(lead.transcript.entries[0].text, "Review the requested change.", "the Manager's task is the Team goal");
+	assert.match(lead.detail, /pending events \d+/u);
+	assert.match(update.content[0].text, /lead\s+manager · .*pending events/u);
+	const livePanel = tool.renderResult(update, { expanded: false, isPartial: true }, theme).render(160).join("\n");
+	assert.match(livePanel, new RegExp(`Team ${teamId} · ACTIVE`, "u"));
+	assert.match(livePanel, /2 model sessions/u);
+	assert.match(livePanel, /lead · manager · /u);
+	assert.match(livePanel, /worker · worker · .*FAST off/u);
+	assert.match(livePanel, /2 idle/u, "members waiting for the executor are idle, not complete");
+	const expandedPanel = tool.renderResult(update, { expanded: true, isPartial: true }, theme).render(160).join("\n");
+	assert.match(expandedPanel, /Recent activity[\s\S]*tool bash\s+git status/u);
+
+	resolveLifetime(terminal(teamId));
+	const result = await pending;
+	assert.match(result.content[0].text, new RegExp(`Team ${teamId} CLOSED`, "u"), "the model still receives the bounded TeamResult text");
+	assert.equal(result.details.members.length, 2, "the finished panel keeps every member panel");
+	const finalPanel = tool.renderResult(result, { expanded: false, isPartial: false }, theme).render(160).join("\n");
+	assert.match(finalPanel, /lead · manager/u);
+	assert.match(finalPanel, /worker · worker/u);
+	assert.ok(JSON.parse(JSON.stringify(result.details)).members.length === 2, "details stay serializable for session reload");
+});
+
 test("runtime launch abort is a structured tool error, preserves host control, and cannot update a retired generation", async () => {
 	const { host, tool } = setup();
 	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());

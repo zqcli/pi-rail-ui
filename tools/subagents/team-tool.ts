@@ -1,19 +1,26 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { SessionBroker } from "./session-broker";
-import { normalizeTeamPlan, previewText } from "./team-codec";
+import { normalizeTeamPlan, previewText, truncateText } from "./team-codec";
 import type { TeamHistoryEntry } from "./team-history";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
 	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
-	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary,
+	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef,
 } from "./team-protocol";
-import { resolveTeamMemberPolicy, verifyPinnedTeamMemberPolicy, type ResolvedTeamMemberPolicy } from "./tool";
+import type { TeamRuntime } from "./team-runtime";
+import {
+	formatContextWindowForDisplay, markdownThemeFromTheme, resolveTeamMemberPolicy, verifyPinnedTeamMemberPolicy,
+	type ResolvedTeamMemberPolicy,
+} from "./tool";
+import { boundSubagentRunTranscripts, renderSubagentTranscript, type SubagentTranscriptRun } from "./transcript";
+import { addActivationUsage } from "./usage";
 
 const MAX_RESULT_SUMMARY_BYTES = 2 * 1024;
+const MAX_MEMBER_OUTPUT_BYTES = 16 * 1024;
 const MAX_FINAL_TEXT_BYTES = 48 * 1024;
 const UPDATE_INTERVAL_MS = 250;
 const LIVE_LIFECYCLES = ["prepared", "active", "closing"];
@@ -72,6 +79,9 @@ export interface TeamToolDetails {
 	resultRecord?: ResultRecord;
 	resultPage?: TeamResultRefPage;
 	holdsTotal?: number;
+	/** launch: one grouped-subagent panel per member (bounded transcripts), and the launch wall time. */
+	members?: SubagentTranscriptRun[];
+	durationMs?: number;
 }
 
 export class TeamLaunchWaitAbortedError extends Error {
@@ -88,7 +98,43 @@ export class TeamLaunchWaitAbortedError extends Error {
 const upper = (value: string) => value.replaceAll("_", " ").toUpperCase();
 const limit = (used: number, max: number) => `${used}/${max}`;
 
-export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSummary[] = [], totalHolds = works.filter((work) => work.hold).length): string[] {
+type PanelFacts = ReturnType<TeamRuntime["panelFacts"]>;
+
+/** Panel form of a WorkRef (its work UUID prefix and revision); status text keeps the full ref. */
+function shortWorkRef(ref: WorkRef): string {
+	const id = ref.workId.slice(ref.workId.lastIndexOf(":") + 1);
+	return `work ${id.slice(0, 8)}@${ref.revision}`;
+}
+
+/** Team state of one member: lifecycle, activity and current work, queues, pause, Manager events, results, error. */
+function memberStateText(member: TeamTeamView["members"][number], works: readonly TeamWorkSummary[], facts?: PanelFacts,
+	refText: (ref: WorkRef) => string = workRefKey): string {
+	// Idle is a live state, never "done": say what the member is waiting on instead.
+	const current = member.currentWork ? works.find((work) => workRefKey(work.work) === workRefKey(member.currentWork!)) : undefined;
+	const activity = member.activity === "idle" && !member.currentWork && member.queued + member.blocked + member.held === 0
+		? "IDLE · no assigned work"
+		: `${upper(member.activity)}${member.currentWork ? ` ${refText(member.currentWork)}` : ""}${current ? ` "${previewText(current.taskPreview, 80)}"` : ""} · queued ${member.queued} · blocked ${member.blocked} · held ${member.held}`;
+	const pause = member.pause === "none" ? "" : ` · pause ${member.pause}`;
+	const events = facts && member.role === "manager" ? ` · pending events ${facts.pendingManagerEvents}` : "";
+	const results = facts?.results.get(member.id)?.count;
+	const error = member.error ? ` · ${member.error.code}: ${previewText(member.error.message, 160)}` : "";
+	return `${upper(member.lifecycle)} · ${activity}${pause}${events}${results ? ` · results ${results}` : ""}${error}`;
+}
+
+export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSummary[] = [], totalHolds = works.filter((work) => work.hold).length,
+	facts?: PanelFacts): string[] {
+	const width = Math.max(...view.members.map((member) => member.id.length));
+	const members = view.members.map((member) => {
+		const policy = `${member.policy.model ?? "model ?"} · FAST ${member.policy.fastMode ? "on" : "off"} · SEARCH ${member.policy.searchMode ?? "off"}`;
+		return `${member.id.padEnd(width)} ${member.role === "manager" ? "manager" : "worker "} · ${memberStateText(member, works, facts)} · ${policy}`;
+	});
+	const usage = view.usage;
+	return [...teamLines(view, works, totalHolds, members),
+		`Usage: ${usage.turns} turns · input ${usage.input} · output ${usage.output} · cache ${usage.cacheRead}/${usage.cacheWrite} · cost ${usage.cost.toFixed(4)}`];
+}
+
+/** Team-level lines; the launch panel passes no member lines because each member has its own panel. */
+function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalHolds: number, memberLines: readonly string[]): string[] {
 	const openIncidents = view.incidents.filter((incident) => incident.state === "open");
 	const health = view.health === "needs_attention" ? `needs attention ${openIncidents.length}` : "ok";
 	const lines = [
@@ -98,18 +144,7 @@ export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSumma
 	if (view.reason) lines.push(`Reason: ${previewText(view.reason, 400)}`);
 	const w = view.works;
 	lines.push(`Works: ${w.total} total · queued ${w.queued} · running ${w.running} · blocked ${w.blocked} · held ${w.held} · resolved ${w.resolved} · failed ${w.failed} · cancelled ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`);
-	const width = Math.max(...view.members.map((member) => member.id.length));
-	for (const member of view.members) {
-		// Idle is a live state, never "done": say what the member is waiting on instead.
-		const current = member.currentWork ? works.find((work) => workRefKey(work.work) === workRefKey(member.currentWork!)) : undefined;
-		const activity = member.activity === "idle" && !member.currentWork && member.queued + member.blocked + member.held === 0
-			? "IDLE · no assigned work"
-			: `${upper(member.activity)}${member.currentWork ? ` ${workRefKey(member.currentWork)}` : ""}${current ? ` "${previewText(current.taskPreview, 80)}"` : ""} · queued ${member.queued} · blocked ${member.blocked} · held ${member.held}`;
-		const pause = member.pause === "none" ? "" : ` · pause ${member.pause}`;
-		const policy = `${member.policy.model ?? "model ?"} · FAST ${member.policy.fastMode ? "on" : "off"} · SEARCH ${member.policy.searchMode ?? "off"}`;
-		const error = member.error ? ` · ${member.error.code}: ${previewText(member.error.message, 160)}` : "";
-		lines.push(`${member.id.padEnd(width)} ${member.role === "manager" ? "manager" : "worker "} · ${upper(member.lifecycle)} · ${activity}${pause} · ${policy}${error}`);
-	}
+	lines.push(...memberLines);
 	const holds = works.filter((work) => work.hold);
 	if (holds.length) {
 		lines.push(`Holds: ${holds.slice(0, 8).map((work) => `${workRefKey(work.work)} ${work.hold} (${work.assignee})`).join(" · ")}${totalHolds > holds.length ? ` · +${totalHolds - holds.length} more` : ""}`);
@@ -120,9 +155,44 @@ export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSumma
 	if (openIncidents.length > 5) lines.push(`+${openIncidents.length - 5} more open incidents`);
 	const { limits, used } = view.budget;
 	lines.push(`Budget${view.budget.exhausted ? " EXHAUSTED" : ""}: activations ${limit(used.teamActivations, limits.teamActivations)} · manager ${limit(used.managerActivations, limits.managerActivations)} · model requests ${limit(used.teamModelRequests, limits.teamModelRequests)} · tool calls ${limit(used.teamToolCalls, limits.teamToolCalls)} · works ${limit(used.teamWorks, limits.teamWorks)}${view.budget.rootsOmitted ? ` · ${view.budget.rootsOmitted} roots omitted (see /rail-team ${view.teamId} budget)` : ""}`);
-	const usage = view.usage;
-	lines.push(`Usage: ${usage.turns} turns · input ${usage.input} · output ${usage.output} · cache ${usage.cacheRead}/${usage.cacheWrite} · cost ${usage.cost.toFixed(4)}`);
 	return lines;
+}
+
+/**
+ * One grouped-subagent run per member: its Team state, the task it is (or was last) working on, its
+ * latest submitted result, native activity across activations, and settled plus in-flight usage.
+ */
+function memberRuns(host: TeamSessionHost, teamId: string): SubagentTranscriptRun[] {
+	const view = host.runtime.getTeam(teamId);
+	const works = host.runtime.listWorks(teamId);
+	const facts = host.runtime.panelFacts(teamId);
+	return boundSubagentRunTranscripts(view.members.map((member, slot): SubagentTranscriptRun => {
+		const activity = host.driver.memberActivity(teamId, member.id);
+		const usage = { ...member.usage };
+		if (activity?.liveUsage) addActivationUsage(usage, activity.liveUsage);
+		const latest = facts.results.get(member.id)?.latest;
+		const currentKey = member.currentWork ? workRefKey(member.currentWork) : undefined;
+		const task = member.role === "manager" ? view.brief.goal
+			: (works.find((work) => workRefKey(work.work) === currentKey) ?? works.findLast((work) => work.assignee === member.id))?.taskPreview;
+		const entries = activity?.transcript.entries ?? [];
+		return {
+			slot, alias: member.id, role: member.role, model: member.policy.model ?? "model unavailable", persistent: true,
+			status: member.lifecycle === "faulted" ? "failed" : member.lifecycle === "closed" ? "completed"
+				: member.activity !== "idle" || member.lifecycle === "starting" || member.lifecycle === "closing" ? "running" : "idle",
+			output: latest ? truncateText(latest.result.summary, MAX_MEMBER_OUTPUT_BYTES).text : activity?.output ?? "",
+			usage, ...(activity ? { durationMs: activity.durationMs } : {}),
+			contextWindowText: formatContextWindowForDisplay(member.policy.contextWindow),
+			fastModeText: member.policy.fastMode ? "on" : "off", searchModeText: member.policy.searchMode === "on" ? "on" : "off",
+			// The task is the panel's initial-task line; a short WorkRef keeps the state line on one row.
+			detail: memberStateText(member, [], facts, shortWorkRef),
+			transcript: {
+				entries: task ? [{ id: "initial-task", kind: "user", initial: true, text: task, order: 0 }, ...entries] : entries,
+				omittedEntries: activity?.transcript.omittedEntries ?? 0,
+			},
+			...(activity?.isCompacting ? { isCompacting: true } : {}),
+			...(member.error ? { errorMessage: member.error.message } : {}),
+		};
+	}));
 }
 
 export function formatHistorySummary(entry: TeamHistoryEntry): string {
@@ -305,16 +375,21 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 
 		let finished = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		const startedAt = Date.now();
+		const panel = (): TeamToolDetails => ({ ...liveView(host, teamId), members: memberRuns(host, teamId), durationMs: Date.now() - startedAt });
 		const publish = () => {
 			timer = undefined;
 			// No update after the call settled, or from a generation whose branch has ended.
 			if (finished || !host.active || !onUpdate) return;
-			const current = liveView(host, teamId);
-			onUpdate(textResult(formatTeamView(current.view, current.works, current.holdsTotal).join("\n"), current));
+			const current = panel();
+			onUpdate(textResult(formatTeamView(current.view!, current.works, current.holdsTotal, host.runtime.panelFacts(teamId)).join("\n"), current));
 		};
-		const unsubscribe = host.runtime.onChange((changed) => {
+		// Team state and member native activity share one throttled panel update.
+		const schedule = (changed: string) => {
 			if (changed === teamId && !timer && !finished) timer = setTimeout(publish, UPDATE_INTERVAL_MS);
-		});
+		};
+		const unsubscribe = host.runtime.onChange(schedule);
+		const unsubscribeActivity = host.driver.onActivity(schedule);
 		publish();
 		let detach: (() => void) | undefined;
 		const detached = new Promise<{ kind: "detached" }>((resolve) => {
@@ -350,11 +425,12 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			}
 			const text = finalTeamText(host, outcome.result);
 			if (outcome.result.lifecycle !== "closed") throw new Error(text);
-			return textResult(text, {});
+			return textResult(text, panel());
 		} finally {
 			finished = true;
 			if (timer) clearTimeout(timer);
 			unsubscribe();
+			unsubscribeActivity();
 			detach?.();
 		}
 	};
@@ -376,7 +452,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			if (live) {
 				const current = liveView(host, teamId);
 				const page = host.runtime.listResultRefsPage(teamId, params.cursor?.trim() || undefined);
-				const lines = [...formatTeamView(current.view, current.works, current.holdsTotal), ...formatResultRefPage(page)];
+				const lines = [...formatTeamView(current.view, current.works, current.holdsTotal, host.runtime.panelFacts(teamId)), ...formatResultRefPage(page)];
 				return textResult(lines.join("\n"), { ...current, resultPage: page });
 			}
 			const entry = host.history.teams.find((team) => team.teamId === teamId);
@@ -416,7 +492,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			throw new Error(`Team ${teamId} cancellation is incomplete; member exits are not all confirmed: ${details.join("; ")}`);
 		}
 		const current = liveView(host, teamId);
-		return textResult(formatTeamView(current.view, current.works, current.holdsTotal).join("\n"), current);
+		return textResult(formatTeamView(current.view, current.works, current.holdsTotal, host.runtime.panelFacts(teamId)).join("\n"), current);
 	};
 
 	pi.registerTool({
@@ -467,11 +543,21 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			const members = action === "prepare" && Array.isArray(args.workers) ? ` · 1 manager + ${args.workers.length} workers` : "";
 			return new Text(`${theme.fg("toolTitle", theme.bold("subagent_team "))}${theme.fg("accent", `${action}${team}${members}`)}`, 0, 0);
 		},
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded, isPartial }, theme) {
 			const details = result.details as TeamToolDetails | undefined;
-			const text = details?.resultRecord ? formatResultRecord(details.resultRecord).split("\n")
-				: details?.view ? [...formatTeamView(details.view, details.works, details.holdsTotal), ...(details.resultPage ? formatResultRefPage(details.resultPage) : [])]
-					: result.content.flatMap((item) => item.type === "text" ? item.text.split("\n") : []);
+			if (details?.members && details.view) {
+				// launch: Team-level state, then the same grouped panels as a grouped subagent call.
+				const [title, ...rest] = teamLines(details.view, details.works ?? [], details.holdsTotal ?? 0, []);
+				const panel = new Container();
+				panel.addChild(new Text([theme.fg("accent", title!), ...rest.map((line) => theme.fg("dim", line))].join("\n"), 0, 0));
+				panel.addChild(renderSubagentTranscript(details.members, expanded, theme, {
+					isPartial, mode: "parallel", ...(details.durationMs !== undefined ? { durationMs: details.durationMs } : {}),
+					markdownTheme: markdownThemeFromTheme(theme),
+				}));
+				return panel;
+			}
+			// Every other action's text is exactly what the model received (prepare keeps its policy/plan lines).
+			const text = result.content.flatMap((item) => item.type === "text" ? item.text.split("\n") : []);
 			const shown = expanded ? text : text.slice(0, 16);
 			const [header, ...rest] = shown;
 			return new Text([theme.fg("accent", header ?? ""), ...rest, ...(shown.length < text.length ? [theme.fg("dim", `… ${text.length - shown.length} more lines`)] : [])].join("\n"), 0, 0);

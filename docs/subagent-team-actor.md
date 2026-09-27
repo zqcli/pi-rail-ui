@@ -57,7 +57,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 ```
 
 - 等待具体依赖或请求 attention 时 checkpoint 必填；`waitingFor` 与 `attention` 互斥。
-- 空 `yield` 只允许用在 Manager 的管理 activation。
+- 空 `yield` 只允许用在 Manager 的管理 activation。Manager 不在运行中等待：派发后直接 `yield`（只带可选 checkpoint），新的结果、失败和 incident 会自动开启下一次管理 activation；不要用 `status` 轮询等待。管理 activation 的输入 notice 和带 `waitingFor` 的 Manager yield 错误都会给出这条指引。尚未交付给当前管理批次的 Manager 事件会阻止 `close_team`（blocker 提示先 yield 接收再关闭）。
 - 成功的 yield 会结束本次原生运行，不占住成员。
 - 结果早于 yield 到达也不会丢；下一次 activation 交付可容纳的 outcome 批次，超出部分保持未交付，后续 yield 可继续观察。
 - 对已交付且没有变化的 outcome 再次 yield，返回 `NO_NEW_DEPENDENCY`。
@@ -187,10 +187,11 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 
 ## 11. 状态展示、TeamResult 与历史
 
-- Tool 面板和 `/rail-team status` 显示：Team lifecycle/health/outcome、各工作计数与根验收数；每个成员的 lifecycle、activity、pause、当前 WorkRef 与任务预览、queued/blocked/held、model/FAST/SEARCH 和错误；hold、未决 incident、预算与 usage。idle 不会显示为“已完成”。
+- `status` 文本和 `/rail-team status` 显示：Team lifecycle/health/outcome、各工作计数与根验收数；每个成员的 lifecycle、activity、pause、当前 WorkRef 与任务预览、queued/blocked/held、Manager 待处理事件数、已提交结果数、model/FAST/SEARCH 和错误；hold、未决 incident、预算与 usage。idle 不会显示为“已完成”。
+- `launch` 面板复用 grouped subagent 面板：顶部是 Team lifecycle/health、目标、工作计数、hold/incident 与预算；其下每个成员一个带框子面板（Manager 在前，按 roster 顺序），标题为 `别名 · manager|worker · model · ContextWindow · FAST · SEARCH`，随后是原生运行指标、Team 状态行（lifecycle/activity/当前 WorkRef/队列/Manager 待处理事件/结果数）、当前或最近任务（Manager 为 Team 目标）、跨 activation 的最近活动，以及该成员最近提交的结果。Usage 为已结算用量加当前 activation 的实时用量，汇总行给出总用量和 launch 墙钟时间。idle 成员以 `○ Idle` 显示，不会画成完成。面板随 Runtime 状态和成员原生事件节流刷新；结束后结果仍保留每个成员子面板（活动记录有界），给模型的文本仍是有界 TeamResult。`prepare`、`status`、`cancel` 面板显示与模型收到的相同文本。
 - `TeamResult`（version 2）：`lifecycle`、`outcome`、`reason`、`finalResultRefs`，各 root 的 WorkRef/状态/resultRef/review，各成员的 lifecycle/resourceState、usage 和未决 incident。最终内容引用 worker 撰写的结果，不再调用 Manager 重写。
 - journal 只同步写入有界事实：launched、result（发布前写入）、revise/cancel 决定、close decision、grant、terminal。写入失败时 fail closed。
-- session tree/switch/fork 的导航尝试进入 before hook 时就结束旧 generation：对已启动 Team 尝试写 interrupted 标记，再永久封存旧 writer 并等待资源清理。即使后续扩展取消导航，或分支摘要 abort/error 导致导航未提交，旧 Team 也不会恢复；清理确认后，当前分支可在新的空 generation 中重新 prepare。未知 exit 会阻止本次及后续导航尝试，不能因旧 host 已 inactive 绕过检查。导航实际提交后再按目标分支重建只读历史，旧回调无法写入新分支。reload/shutdown 同样永久撤销旧 writer；标记写入失败会明确诊断，不声称已持久化。
+- session tree/switch/fork 的导航尝试进入 before hook 时就结束旧 generation：对仍在运行（active/closing）的 Team 尝试写 interrupted 标记（已结束的 Team 保留其 terminal 事实，不再补写），再永久封存旧 writer 并等待资源清理。即使后续扩展取消导航，或分支摘要 abort/error 导致导航未提交，旧 Team 也不会恢复；清理确认后，当前分支可在新的空 generation 中重新 prepare。未知 exit 会阻止本次及后续导航尝试，不能因旧 host 已 inactive 绕过检查。导航实际提交后再按目标分支重建只读历史，旧回调无法写入新分支。reload/shutdown 同样永久撤销旧 writer；标记写入失败会明确诊断，不声称已持久化。
 - 历史只读：没有 terminal 记录的 v2 Team 显示为 interrupted；旧 v1 快照（`rail-subagent-team`）映射为 legacy，未完成的同样显示 interrupted；损坏条目逐条跳过。关闭后保留 persistent session/descriptor，之后可以作为普通 subagent 打开，但不带 Team 工具或旧权限。
 
 ## 12. 不支持的能力与限制

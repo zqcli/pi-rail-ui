@@ -234,6 +234,36 @@ test("N09 driver policy mismatch is rejected before claiming or opening a native
 	assert.equal(opens, 1);
 });
 
+test("real Pi member activity feeds the launch panel across activations and freezes live usage at settlement", { timeout: 60000 }, async (t) => {
+	const { runtime, teamId, driver } = await createHarness(t, "n02");
+	let notifications = 0;
+	let liveUsageSeen = false;
+	const unsubscribe = driver.onActivity((changed) => {
+		if (changed !== teamId) return;
+		notifications++;
+		liveUsageSeen ||= driver.memberActivity(teamId, "w1")?.liveUsage !== undefined;
+	});
+	t.after(unsubscribe);
+	runtime.launch(teamId);
+	const runs = await drain(driver, teamId);
+	assert.ok(notifications > 0 && liveUsageSeen, "native events are observed while an activation is in flight");
+	for (const memberId of ["lead", "w1", "w2"]) {
+		const activity = driver.memberActivity(teamId, memberId)!;
+		const entries = activity.transcript.entries;
+		// This synthetic Manager ends each management activation with text; workers call the team tool.
+		if (memberId !== "lead") assert.ok(entries.some((entry) => entry.kind === "tool" && entry.label === "team"), `${memberId} shows its team tool calls`);
+		assert.equal(entries.some((entry) => entry.kind === "user"), false, `${memberId} hides the activation trigger prompt`);
+		assert.equal(activity.liveUsage, undefined, `${memberId} usage is folded by Runtime, never shown twice`);
+		assert.ok(activity.durationMs > 0);
+	}
+	const managerRuns = runs.filter((run) => run.activation.binding.memberId === "lead").length;
+	assert.ok(managerRuns >= 2, "the Manager ran more than one activation");
+	const leadMessages = driver.memberActivity(teamId, "lead")!.transcript.entries.filter((entry) => entry.kind === "assistant").length;
+	assert.ok(leadMessages >= managerRuns, "the member transcript spans every activation, not only the latest one");
+	await driver.close();
+	assert.ok(driver.memberActivity(teamId, "w1")!.transcript.entries.length > 0, "activity outlives the closed member");
+});
+
 test("real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n02");
 	runtime.launch(teamId);

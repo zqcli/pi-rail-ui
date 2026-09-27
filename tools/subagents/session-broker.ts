@@ -10,6 +10,7 @@ import type { SessionLease } from "./session-lease";
 import type { SubagentTranscriptSnapshot } from "./transcript";
 import { emptySubagentUsage } from "./usage";
 import type { NativeCompletion, RuntimeActivation } from "./team-runtime";
+import type { RpcEvent } from "./rpc-worker";
 import { parseBinding, sameBinding } from "./team-codec";
 
 export interface SubagentUsage {
@@ -106,7 +107,7 @@ export interface SessionWorker {
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult>;
 	control?(request: WorkerControlRequest): Promise<void>;
 	setModel?(model: RailModelRef): Promise<RailModelRef>;
-	openTeamMemberV2?(binding: BindingV2, onFailure: (error: Error) => void): Promise<TeamMemberProtocolSession>;
+	openTeamMemberV2?(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession>;
 	isReusable?(): boolean;
 	stop(): Promise<void>;
 }
@@ -202,6 +203,8 @@ export interface TeamMemberOpenRequest {
 	cwd?: string;
 	fastMode?: boolean;
 	contextWindow?: number;
+	/** Display-only native events of this member's activations. */
+	onActivity?: (event: RpcEvent) => void;
 }
 
 export interface BrokeredTeamMemberHandle {
@@ -611,7 +614,7 @@ export class SessionBroker {
 			protocol = await state.worker.openTeamMemberV2(binding, (error) => {
 				this.runtimeErrors.set(instance!.agentId, error.message);
 				this.emitRuntimeChange();
-			});
+			}, request.onActivity);
 			if (this.shuttingDown) throw new Error("Broker shut down during Team member startup");
 			const ownedProtocol = protocol;
 			const ownedState = state;

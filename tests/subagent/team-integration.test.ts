@@ -76,6 +76,16 @@ test("session host journals interruption before cleanup and seals its branch gen
 	assert.equal(records.some((entry) => entry.branch === branch), false, "late work can never append to the selected branch");
 });
 
+test("host shutdown writes no interruption marker for a Team that already ended", async () => {
+	const records: Array<{ branch: string; record: TeamJournalRecord }> = [];
+	const active = await createActiveHost("current", records, () => {});
+	const ended = await active.host.driver.stopTeam(active.teamId, "finished before the session switch");
+	assert.equal(ended.lifecycle, "cancelled");
+	await active.host.close("Parent session switch (resume)");
+	assert.deepEqual(records.map(({ record }) => record.kind), ["launched", "terminal"],
+		"the terminal fact stays last; an ended Team is never re-marked interrupted");
+});
+
 test("interruption journal write failure is surfaced as a host diagnostic while native cleanup still runs", async () => {
 	const records: Array<{ branch: string; record: TeamJournalRecord }> = [];
 	const closed: string[] = [];

@@ -102,8 +102,12 @@ export function resolveRailModel(
 	const thinkingLevel = suffix && THINKING_LEVELS.includes(suffix) ? suffix : undefined;
 	const parsedModel = thinkingLevel ? findModel(normalized.slice(0, separator), available) : undefined;
 	if (!parsedModel) {
+		// A wrong provider prefix is the common mistake: name the same model id under its real provider.
+		const base = thinkingLevel ? normalized.slice(0, separator) : normalized;
+		const sameId = available.filter((model) => model.id === base.slice(base.indexOf("/") + 1));
+		const hint = sameId.length ? ` Did you mean ${sameId.map((model) => `${model.provider}/${model.id}${thinkingLevel ? `:${thinkingLevel}` : ""}`).join(" or ")}?` : "";
 		const choices = available.slice(0, 12).map((model) => `${model.provider}/${model.id}`).join(", ");
-		throw new Error(`Unknown Pi model: ${reference}. Available: ${choices || "none"}`);
+		throw new Error(`Unknown Pi model: ${reference}.${hint} Available: ${choices || "none"}`);
 	}
 	return railModelFromModel(parsedModel, thinkingLevel);
 }

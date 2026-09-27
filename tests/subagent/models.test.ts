@@ -75,6 +75,12 @@ test("resolveRailModel accepts an available model outside the main session scope
 	});
 });
 
+test("resolveRailModel names the same model id under its real provider when the prefix is wrong", () => {
+	assert.throws(() => resolveRailModel("openai/gpt-5.6-sol:max", context() as any),
+		/^Error: Unknown Pi model: openai\/gpt-5\.6-sol:max\. Did you mean cus-resp\/gpt-5\.6-sol:max\? Available: /u);
+	assert.throws(() => resolveRailModel("openai/other", context() as any), (error: Error) => !error.message.includes("Did you mean"));
+});
+
 test("resolveRailModel defaults to the current Pi model", () => {
 	assert.deepEqual(resolveRailModel(undefined, context() as any), {
 		provider: "cus-resp",

@@ -96,7 +96,7 @@ Ordinary subagent modes are unchanged. A team uses **`subagent_team` prepare →
 {"action":"prepare","manager":{"alias":"lead","roleDescription":"Assign, review, handle blockers and close; do not write the final report","model":null,"cwd":null,"fastMode":null,"contextWindow":null},"workers":[{"alias":"review","roleDescription":"Review the implementation without edits"},{"alias":"writer","roleDescription":"Write the report from result references; ask review follow-up questions when needed"}],"brief":{"goal":"Review the current change and submit an evidenced report","acceptanceCriteria":["State test scope and unverified items"]},"initialRequests":[{"to":"review","task":"Review the local change","inputRefs":[]}],"timeoutSeconds":null}
 ```
 
-Then launch with the returned `teamId`. launch owns the whole team lifetime and returns a `TeamResult` when the team ends (the worker-authored result references the Manager selected, never rewritten by the Manager):
+Then launch with the returned `teamId`. launch owns the whole team lifetime and, when the team ends, returns the outcome, per-member totals, a timeline and the full text of every worker-authored result the Manager selected (never rewritten by the Manager; bounded to 48 KiB, where only an oversized result is truncated and names its `resultRef`), so no follow-up `status` call is needed to read them. The launch panel shows one grouped-subagent-style panel per member. Launch call:
 
 ```json
 {"action":"launch","teamId":"<teamId>"}

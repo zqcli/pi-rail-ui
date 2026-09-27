@@ -3,7 +3,7 @@ import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionC
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { SessionBroker } from "./session-broker";
-import { normalizeTeamPlan, previewText, truncateText } from "./team-codec";
+import { jsonTextBytes, normalizeTeamPlan, previewText, truncateText } from "./team-codec";
 import type { TeamHistoryEntry } from "./team-history";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
@@ -19,7 +19,6 @@ import {
 import { boundSubagentRunTranscripts, renderSubagentTranscript, type SubagentTranscriptRun } from "./transcript";
 import { addActivationUsage } from "./usage";
 
-const MAX_RESULT_SUMMARY_BYTES = 2 * 1024;
 const MAX_MEMBER_OUTPUT_BYTES = 16 * 1024;
 const MAX_FINAL_TEXT_BYTES = 48 * 1024;
 const UPDATE_INTERVAL_MS = 250;
@@ -179,7 +178,10 @@ function memberRuns(host: TeamSessionHost, teamId: string): SubagentTranscriptRu
 			slot, alias: member.id, role: member.role, model: member.policy.model ?? "model unavailable", persistent: true,
 			status: member.lifecycle === "faulted" ? "failed" : member.lifecycle === "closed" ? "completed"
 				: member.activity !== "idle" || member.lifecycle === "starting" || member.lifecycle === "closing" ? "running" : "idle",
-			output: latest ? truncateText(latest.result.summary, MAX_MEMBER_OUTPUT_BYTES).text : activity?.output ?? "",
+			// Like a grouped subagent's final answer: the member's latest result in full, or the Manager's close decision.
+			output: latest ? truncateText(resultBody(latest), MAX_MEMBER_OUTPUT_BYTES).text
+				: member.role === "manager" && view.outcome ? `Team ${upper(view.lifecycle)} · outcome ${view.outcome}${view.reason ? `\n\n${view.reason}` : ""}`
+					: activity?.output ?? "",
 			usage, ...(activity ? { durationMs: activity.durationMs } : {}),
 			contextWindowText: formatContextWindowForDisplay(member.policy.contextWindow),
 			fastModeText: member.policy.fastMode ? "on" : "off", searchModeText: member.policy.searchMode === "on" ? "on" : "off",
@@ -220,14 +222,23 @@ function resultPageOffset(cursor?: string | null): number {
 }
 
 function formatResultRecord(record: ResultRecord): string {
+	return [`${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`, resultBody(record)].join("\n");
+}
+
+/** The complete worker-authored result: summary, findings, evidence, limitations and artifacts. */
+function resultBody(record: ResultRecord): string {
 	return [
-		`${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`,
 		record.result.summary,
 		...(record.result.findings?.length ? ["Findings:", ...record.result.findings.map((item) => `- ${item}`)] : []),
 		...(record.result.evidence?.length ? ["Evidence:", ...record.result.evidence.map((item) => `- ${item.basis}: ${item.source}${item.locator ? ` (${item.locator})` : ""}`)] : []),
 		...(record.result.limitations?.length ? ["Limitations:", ...record.result.limitations.map((item) => `- ${item}`)] : []),
 		...(record.result.artifacts?.length ? ["Artifacts:", ...record.result.artifacts.map((item) => `- ${item}`)] : []),
 	].join("\n");
+}
+
+function clock(ms: number): string {
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 function formatResultRefPage(page: TeamResultRefPage): string[] {
@@ -257,34 +268,54 @@ function assertActionParams(params: Params, action: Params["action"]): void {
 	if (extra.length) throw new Error(`${action} does not accept field(s): ${extra.join(", ")}`);
 }
 
-/** Bounded final text: TeamResult facts plus the Manager-selected results, attributed to author and WorkRef. */
-function finalTeamText(host: TeamSessionHost, result: TeamResult): string {
+/**
+ * Final launch text, like a grouped subagent's aggregate: TeamResult facts, per-member totals, a timeline,
+ * then every Manager-selected worker result in full (bounded; only an oversized record is truncated).
+ */
+function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: number, endedAt: number): string {
+	const view = host.runtime.getTeam(result.teamId);
+	const facts = host.runtime.panelFacts(result.teamId);
+	const w = view.works;
 	const lines = [
 		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""}${result.reason ? ` · ${previewText(result.reason, 400)}` : ""}`,
 		`Roots: ${result.roots.map((root) => `${workRefKey(root.work)} ${root.state}${root.review ? ` (${root.review.disposition})` : ""}`).join(" · ") || "none"}`,
-		`Members: ${result.members.map((member) => `${member.id} ${member.lifecycle}/${member.resourceState}`).join(" · ")}`,
-		`Usage: ${result.usage.turns} turns · input ${result.usage.input} · output ${result.usage.output} · cost ${result.usage.cost.toFixed(4)}`,
+		`Works: ${w.total} total · resolved ${w.resolved} · failed ${w.failed} · cancelled ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`,
+		"Members:",
+		...view.members.map((member) => {
+			const activity = host.driver.memberActivity(result.teamId, member.id);
+			return `- ${member.id} · ${member.role} · ${member.lifecycle}/${member.resourceState} · ${member.policy.model ?? "model ?"} · FAST ${member.policy.fastMode ? "on" : "off"}`
+				+ ` · ${member.usage.turns} turns${activity ? ` · active ${clock(activity.durationMs)}` : ""} · results ${facts.results.get(member.id)?.count ?? 0}`;
+		}),
+		`Timeline (m:ss from launch): 0:00 launch${facts.commits.slice(0, 20).map((commit) => ` · ${clock(commit.at - startedAt)} ${commit.author} ${commit.status} result`).join("")}`
+			+ `${facts.commits.length > 20 ? ` · +${facts.commits.length - 20} more results` : ""} · ${clock(endedAt - startedAt)} Team ${result.lifecycle}`,
+		`Usage: ${result.usage.turns} turns · input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 	];
 	for (const incident of result.unresolvedIncidents.slice(0, 5)) lines.push(`Unresolved ${incident.code}: ${previewText(incident.message, 200)}`);
 	if (result.unresolvedIncidentsOmitted) lines.push(`${result.unresolvedIncidentsOmitted} additional unresolved incidents omitted from the bounded terminal snapshot.`);
-	if (result.finalResultRefs.length) lines.push("", "Selected results (worker-authored; the Manager does not rewrite them):");
-	let bytes = Buffer.byteLength(lines.join("\n"), "utf8");
-	for (const ref of result.finalResultRefs) {
-		let record;
-		try { record = host.runtime.getResult(result.teamId, ref); } catch { record = undefined; }
-		const block = record
-			? [`### ${ref} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`,
-				previewText(record.result.summary, MAX_RESULT_SUMMARY_BYTES),
-				...(record.result.artifacts?.length ? [`Artifacts: ${record.result.artifacts.slice(0, 8).map((item) => previewText(item, 200)).join(" · ")}`] : []),
-				...(record.result.limitations?.length ? [`Limitations: ${record.result.limitations.length}`] : [])].join("\n")
-			: `### ${ref} · result not retained in this runtime`;
-		const size = Buffer.byteLength(block, "utf8") + 2;
-		if (bytes + size > MAX_FINAL_TEXT_BYTES) {
-			lines.push(`[${result.finalResultRefs.length - result.finalResultRefs.indexOf(ref)} selected results omitted for size; use subagent_team status]`);
-			break;
-		}
-		lines.push("", block);
-		bytes += size;
+	const unselected = facts.commits.length - result.finalResultRefs.length;
+	if (result.finalResultRefs.length) {
+		lines.push("", `Selected results in full (worker-authored; the Manager does not rewrite them)${unselected > 0 ? `; ${unselected} other committed result(s) via status` : ""}:`);
+	}
+	const blocks = result.finalResultRefs.map((ref) => {
+		const record = host.runtime.getResult(result.teamId, ref);
+		const heading = record ? `### ${record.author} · ${workRefKey(record.work)} · ${record.result.status} · ${ref}` : `### ${ref} · result not retained in this runtime`;
+		const body = record ? resultBody(record) : "";
+		const truncated = `[Result truncated for the parent; full record: subagent_team status resultRef ${ref}]`;
+		// Fixed cost of a block: blank separator, heading, and room for the truncation note.
+		return { ref, heading, body, overhead: Buffer.byteLength(`\n\n${heading}\n\n${truncated}`, "utf8"), truncated };
+	});
+	// Water-fill the budget: shorter results stay complete, and only the largest ones share what is left.
+	let remaining = MAX_FINAL_TEXT_BYTES - Buffer.byteLength(lines.join("\n"), "utf8");
+	const budgets = new Map<string, number>();
+	const bySize = [...blocks].sort((left, right) => jsonTextBytes(left.body) - jsonTextBytes(right.body));
+	bySize.forEach((block, index) => {
+		const budget = Math.max(512, Math.floor(remaining / (bySize.length - index)) - block.overhead);
+		budgets.set(block.ref, budget);
+		remaining -= Math.min(budget, jsonTextBytes(block.body)) + block.overhead;
+	});
+	for (const block of blocks) {
+		const body = truncateText(block.body, budgets.get(block.ref)!);
+		lines.push("", [block.heading, body.text, ...(body.truncated ? [block.truncated] : [])].join("\n"));
 	}
 	return lines.join("\n");
 }
@@ -423,7 +454,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 				}
 				throw error;
 			}
-			const text = finalTeamText(host, outcome.result);
+			const text = finalTeamText(host, outcome.result, startedAt, Date.now());
 			if (outcome.result.lifecycle !== "closed") throw new Error(text);
 			return textResult(text, panel());
 		} finally {
@@ -501,11 +532,11 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		description: "Run a Team: one Manager plus 1-8 workers, all new persistent aliases, coordinated through a shared work ledger. "
 			+ "(1) prepare {\"action\":\"prepare\",\"manager\":{\"alias\":\"lead\",\"roleDescription\":\"...\"},\"workers\":[{\"alias\":\"review\",\"roleDescription\":\"...\"}],\"brief\":{\"goal\":\"...\"},\"initialRequests\":[{\"to\":\"review\",\"task\":\"...\"}],\"timeoutSeconds\":null} "
 			+ "validates and pins every member's model, cwd, Fast/Search and context budget, and returns the plan, initial WorkRefs and budget without starting anything. "
-			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with the TeamResult and the worker results the Manager selected. "
+			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with the outcome, per-member totals, a timeline and the full text of every worker result the Manager selected, so no status call is needed to read them. "
 			+ "status (teamId optional) lists Teams; status with teamId pages resultRefs using cursor, or fetches one full worker ResultRecord with resultRef. cancel (teamId, reason) inspects or stops a Team. The Manager assigns, reviews and closes; it does not write a final summary. "
 			+ "The parent model is not woken while launch waits; budget grants and hold releases are host-only (/rail-team).",
 		promptGuidelines: [
-			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool.",
+			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected worker results in full and a timeline; use status afterwards only for results it names as truncated or unselected.",
 			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
 			"Role-only workers are valid: they stay idle until the Manager assigns work. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
 			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",

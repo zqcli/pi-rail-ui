@@ -235,6 +235,47 @@ const theme = {
 	strikethrough: (text: string) => text, underline: (text: string) => text,
 };
 
+/** Drive the Runtime without an executor: BOOT yields, then the worker replies to each root with `result(index)`. */
+function completeRoots(host: TeamSessionHost, teamId: string, result: (index: number) => unknown): string[] {
+	const refs: string[] = [];
+	let index = 0;
+	for (let activation = host.runtime.takeNextActivation(teamId); activation; activation = host.runtime.takeNextActivation(teamId)) {
+		assert.equal(host.runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
+		const call = `call-${index}`;
+		const args = activation.scope.kind === "management" ? { action: "yield" } : { action: "reply", result: result(index++) };
+		assert.equal(host.runtime.handleAction(activation.binding, activation.scope, 1, call, args, call).ok, true);
+		host.runtime.nativeSettled(activation.binding, activation.scope.activationId, { status: "success", appliedToolCallId: call });
+		host.runtime.cleanupFinished(activation.binding, activation.scope.activationId, { ok: true });
+		if (activation.scope.kind === "work") refs.push(host.runtime.getWork(teamId, activation.scope.work!)!.current.resultRef!);
+	}
+	return refs;
+}
+
+test("launch final output carries every selected result in full with a timeline, so no status call is needed", async () => {
+	const { host, tool } = setup();
+	const tasks = Array.from({ length: 8 }, (_value, index) => ({ to: "worker", task: `Inspect part ${index + 1}.`, inputRefs: null }));
+	const prepared = await tool.execute("prepare", { ...prepareArgs, initialRequests: tasks }, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	let refs: string[] = [];
+	host.driver.openAndLaunch = async () => {
+		host.runtime.launch(teamId);
+		refs = completeRoots(host, teamId, (index) => ({ status: "succeeded", summary: `Part ${index + 1} summary.`,
+			findings: index < 4 ? [`FINDING-${index + 1} ${"x".repeat(2_000)}`, `MORE-${index + 1} y`]
+				: [`FINDING-${index + 1} ${"x".repeat(5_400)}`, `MORE-${index + 1} ${"y".repeat(5_400)}`], limitations: [`LIMIT-${index + 1}`] }));
+		return { lifetime: Promise.resolve({ ...terminal(teamId), finalResultRefs: refs }) };
+	};
+	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
+	const text: string = result.content[0].text;
+	assert.match(text, /^Members:\n- lead · manager · .* · results 0\n- worker · worker · .* · results 8$/mu);
+	assert.match(text, /^Timeline \(m:ss from launch\): 0:00 launch( · \d+:\d\d worker succeeded result){8} · \d+:\d\d Team closed$/mu);
+	assert.match(text, /Part 1 summary\.\nFindings:\n- FINDING-1 x+\n- MORE-1 y+\nLimitations:\n- LIMIT-1/u, "a short result is included in full, not as a preview");
+	for (const ref of refs.slice(0, 4)) assert.doesNotMatch(text, new RegExp(`resultRef ${ref}`, "u"), "short results are never truncated");
+	assert.ok(Buffer.byteLength(text, "utf8") <= 48 * 1024, "the final text stays bounded");
+	assert.match(text, new RegExp(`\\[Result truncated for the parent; full record: subagent_team status resultRef ${refs[7]}\\]`, "u"),
+		"only an over-budget record is truncated, and it names the exact resultRef to read");
+	assert.equal(result.details.members[1].output.startsWith("Part 8 summary.\nFindings:"), true, "the member panel's final answer is its full latest result");
+});
+
 test("launch panel reuses grouped subagent panels per member, live and after the Team ends", async () => {
 	const { host, tool } = setup();
 	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());

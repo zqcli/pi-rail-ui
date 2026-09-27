@@ -1563,16 +1563,25 @@ export class TeamRuntime {
 		return result ? copy(result) : undefined;
 	}
 
-	/** Host panel facts outside the member-facing view: waiting Manager events and each author's results. */
-	panelFacts(teamId: string): { pendingManagerEvents: number; results: Map<string, { count: number; latest: ResultRecord }> } {
+	/** Host panel facts outside the member-facing view: waiting Manager events, each author's results, commit times. */
+	panelFacts(teamId: string): {
+		pendingManagerEvents: number;
+		results: Map<string, { count: number; latest: ResultRecord }>;
+		commits: Array<{ author: string; status: WorkResult["status"]; at: number }>;
+	} {
 		const team = this.team(teamId);
 		const latest = new Map<string, { count: number; id: string }>();
+		const commits: Array<{ author: string; status: WorkResult["status"]; at: number }> = [];
 		for (const id of team.ledger.resultOrder) {
-			const author = team.ledger.results.get(id)!.author;
+			const { author, result, committedAt } = team.ledger.results.get(id)!;
 			latest.set(author, { count: (latest.get(author)?.count ?? 0) + 1, id });
+			commits.push({ author, status: result.status, at: committedAt });
 		}
 		const results = new Map([...latest].map(([author, { count, id }]) => [author, { count, latest: copy(team.ledger.results.get(id)!) }]));
-		return { pendingManagerEvents: team.events.filter((event) => !event.processed && event.batchId === undefined).length, results };
+		// After close, leftover notices (for example MEMBER_CLOSED) are no longer work for the Manager.
+		const pendingManagerEvents = team.lifecycle === "active"
+			? team.events.filter((event) => !event.processed && event.batchId === undefined).length : 0;
+		return { pendingManagerEvents, results, commits };
 	}
 
 	listResultRefsPage(teamId: string, cursor?: string, limit = TEAM_STATUS_DEFAULT_LIMIT): {

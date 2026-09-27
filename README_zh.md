@@ -96,7 +96,7 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 {"action":"prepare","manager":{"alias":"lead","roleDescription":"分配、验收、处理阻塞并关闭；不撰写最终报告","model":null,"cwd":null,"fastMode":null,"contextWindow":null},"workers":[{"alias":"review","roleDescription":"审查实现，不修改文件"},{"alias":"writer","roleDescription":"基于结果引用撰写报告，必要时向 review 补问"}],"brief":{"goal":"审查当前变更并提交有证据的报告","acceptanceCriteria":["标明测试范围与未验证项"]},"initialRequests":[{"to":"review","task":"审查本地变更","inputRefs":[]}],"timeoutSeconds":null}
 ```
 
-然后以返回的 `teamId` 启动；launch 持有整个 Team lifetime，Team 结束后返回 `TeamResult`（Manager 选定的 worker 结果引用，不再由 Manager 改写）：
+然后以返回的 `teamId` 启动；launch 持有整个 Team lifetime，Team 结束后直接返回结论、每个成员的统计、时间线，以及 Manager 选定的每份 worker 结果全文（不由 Manager 改写；总量上限 48 KiB，只有超出额度的结果被截断并注明其 `resultRef`），因此之后无需再调用 `status` 读取结果。launch 面板像 grouped subagent 一样为每个成员显示一个子面板。启动调用：
 
 ```json
 {"action":"launch","teamId":"<teamId>"}

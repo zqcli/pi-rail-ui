@@ -601,6 +601,14 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 
 本轮隔离环境全量结果：`npm run check` 943/943 通过（74781 ms，`/tmp/pi-panel-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 943/943 通过（74341 ms，`/tmp/pi-panel-depth.log`）；均无 fail/cancelled/skipped。未做在线模型或交互 TUI 手工验收；在线 Manager 是否遵循新指引需要实际运行观察。
 
+### 7.4 第二次实测后的 Manager 指引修复
+
+第二次真实在线运行中，Manager 已按新指引派发后 yield、不再轮询；但 BOOT 事件只写“Team is active”，没有告诉它 `initialRequests` 已经派出，它便又向两名 worker 请求了两个重复 root。两名 worker 在交付原始结果后开始重复工作；Manager 取消重复 root 后，`succeeded` 关闭被 `INVALID_TEAM_OUTCOME` 拒绝且没有指出哪个 root，又因重复 root 未 waive 被 `CLOSE_BLOCKED` 拒绝一次，最终以 `partial` 关闭。此外 Manager 先逐个 `close_member` 并多等一轮事件才 `close_team`。
+
+修复（行为约束不变）：BOOT 列出已分派的初始 root（assignee、WorkRef、任务预览）并明确不要重复请求、每个 root 须 accepted 或 waived、`close_team` 自行关闭 idle worker；没有初始工作时提示派发后 yield。`ROOT_RESULT_READY` 注明结果状态和作者。`succeeded` 被拒时以 `root_outcome` blockers 逐个列出阻止成功的 root 并说明 waive → partial；未审阅 root 的 blocker 提示用 accept_result。回归：`team-runtime.test.ts` · `Manager guidance: …`（pure，扩展了 BOOT/结果事件/重复 root 关闭拒绝断言）。
+
+隔离环境全量：`npm run check` 943/943（72135 ms，`/tmp/pi-boot-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 943/943（71444 ms，`/tmp/pi-boot-depth.log`）；均无 fail/cancelled/skipped。在线 Manager 是否不再重复派发仍需实际运行确认。
+
 ## 8. 历史阶段结果（非本轮成绩）
 
 上一版 D2b／`5368b05` 的父全量记录为：

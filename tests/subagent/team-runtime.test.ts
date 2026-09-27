@@ -110,6 +110,10 @@ test("Manager guidance: management input says to yield instead of polling, and h
 	const boot = runtime.takeNextActivation(teamId)!;
 	assert.equal(boot.scope.kind, "management");
 	assert.match(boot.input.notice, /no current WorkRef.*yield.*do not poll status/u);
+	const bootEvent = boot.input.scope.kind === "management" ? boot.input.scope.events[0]! : undefined;
+	assert.match(bootEvent?.message ?? "", /1 initial request\(s\) are already assigned.*w1 \S+@1 "root work".*Do not request them again/u,
+		"BOOT names the initialRequests that already run, so the Manager does not duplicate them");
+	assert.match(bootEvent?.message ?? "", /close_team itself closes idle workers/u);
 	inputReady(runtime, boot);
 	const waiting = action(runtime, boot, 1, "manager-wait", { action: "yield", waitingFor: [{ workId: "any", revision: 1 }], checkpoint: "wait" });
 	assert.equal(code(waiting), "INVALID_ARGUMENT");
@@ -128,6 +132,24 @@ test("Manager guidance: management input says to yield instead of polling, and h
 	const next = runtime.takeNextActivation(teamId)!;
 	assert.equal(next.scope.kind, "management");
 	assert.equal(runtime.panelFacts(teamId).pendingManagerEvents, 0, "events delivered to an activation are no longer pending");
+	const resultEvent = next.input.scope.kind === "management" ? next.input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY") : undefined;
+	assert.match(resultEvent?.message ?? "", /committed succeeded result from w1; read it with status\(result\)/u);
+
+	// A duplicate root that the Manager cancels is named when a succeeded close is refused.
+	inputReady(runtime, next);
+	const duplicate = action(runtime, next, 1, "dup-request", { action: "request", to: "w2", task: "duplicate root" });
+	assert.equal(duplicate.ok, true);
+	const duplicateRef = (duplicate as any).receipt.work;
+	assert.equal(action(runtime, next, 2, "dup-cancel", { action: "control", command: "cancel_work", workId: duplicateRef.workId,
+		expectedRevision: 1, reason: "duplicate" }).ok, true);
+	const rootRef = resultEvent!.work!;
+	assert.equal(action(runtime, next, 3, "accept", { action: "control", command: "accept_result", work: rootRef, disposition: "accepted", reason: "ok" }).ok, true);
+	const resultRef = resultEvent!.resultRef!;
+	const refused = action(runtime, next, 4, "close-succeeded", { action: "control", command: "close_team", resultRefs: [resultRef], outcome: "succeeded" });
+	assert.equal(code(refused), "INVALID_TEAM_OUTCOME");
+	assert.match(refused.ok ? "" : refused.error.message, /waive it with accept_result disposition waived/u);
+	assert.deepEqual(refused.ok ? [] : refused.error.blockers?.map((blocker) => [blocker.kind, blocker.id, blocker.reason]),
+		[["root_outcome", `${duplicateRef.workId}@1`, "root is cancelled and not accepted"]]);
 });
 
 test("P: prepare rejects initial per-member overflow before reserving a Team or changing live state", () => {

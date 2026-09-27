@@ -373,7 +373,7 @@ export class TeamRuntime {
 			member.lifecycle = "open";
 			member.resourceState = "owned";
 		}
-		this.addEvent(team, { key: "BOOT", kind: "BOOT", message: "Team is active. Review the brief, manage work and close explicitly." });
+		this.addEvent(team, { key: "BOOT", kind: "BOOT", message: this.bootMessage(team) });
 		this.changed(team);
 		this.check(team);
 		if (team.plan.timeoutSeconds !== null) {
@@ -1999,7 +1999,8 @@ export class TeamRuntime {
 		for (const root of roots) {
 			const version = currentVersion(root);
 			if (!isTerminalWorkState(version.state)) blockers.push({ kind: "root_work", id: workRefKey({ workId: root.id, revision: root.currentRevision }), reason: `root is ${version.state}` });
-			if (!version.review) blockers.push({ kind: "root_review", id: workRefKey({ workId: root.id, revision: root.currentRevision }), reason: "root has not been accepted or waived" });
+			if (!version.review) blockers.push({ kind: "root_review", id: workRefKey({ workId: root.id, revision: root.currentRevision }),
+				reason: "root has not been reviewed: accept_result it (accepted, or waived with a reason)" });
 		}
 		for (const id of team.ledger.order) {
 			const record = team.ledger.get(id)!.record;
@@ -2027,9 +2028,17 @@ export class TeamRuntime {
 		}
 		for (const resultRef of resultRefs) if (!team.ledger.results.has(resultRef)) fail("UNKNOWN_RESULT", `Unknown result reference ${resultRef}`);
 		if (outcome === "succeeded") {
-			if (roots.some((root) => currentVersion(root).review?.disposition !== "accepted"
-				|| team.ledger.results.get(currentVersion(root).resultRef ?? "")?.result.status !== "succeeded") || resultRefs.length === 0) {
-				fail("INVALID_TEAM_OUTCOME", "succeeded requires every current root accepted with a succeeded result and at least one final resultRef");
+			const unsuccessful = roots.filter((root) => currentVersion(root).review?.disposition !== "accepted"
+				|| team.ledger.results.get(currentVersion(root).resultRef ?? "")?.result.status !== "succeeded");
+			if (unsuccessful.length || resultRefs.length === 0) {
+				// Name every root that prevents success so the Manager can fix all of them in one step.
+				fail("INVALID_TEAM_OUTCOME", "succeeded requires every current root accepted with a succeeded result and at least one final resultRef. "
+					+ "A cancelled, failed or waived root (for example a duplicate) can only close as partial: waive it with accept_result disposition waived and a reason.",
+				unsuccessful.slice(0, 32).map((root) => {
+					const version = currentVersion(root);
+					return { kind: "root_outcome", id: workRefKey({ workId: root.id, revision: root.currentRevision }),
+						reason: version.review ? `root is ${version.state} and ${version.review.disposition}` : `root is ${version.state} and not accepted` };
+				}));
 			}
 		} else if (outcome === "partial") {
 			if (!reason || resultRefs.length === 0) fail("INVALID_TEAM_OUTCOME", "partial requires a reason and at least one resultRef");
@@ -2440,8 +2449,22 @@ export class TeamRuntime {
 		if (result.status === "failed") version.error = { code: "BUSINESS_FAILED", message: result.summary };
 		else delete version.error;
 		version.updatedAt = committed.committedAt;
-		if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY", message: `Root work ${workRefKey(ref)} has a committed result`, work: ref, resultRef });
+		if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY",
+			message: `Root work ${workRefKey(ref)} has a committed ${result.status} result from ${member.id}; read it with status(result) before accept_result`, work: ref, resultRef });
 		this.wakeWaiters(team);
+	}
+
+	/** Tell the Manager which roots already run from initialRequests, so it never requests them again. */
+	private bootMessage(team: TeamState): string {
+		const initial = team.ledger.order.map((id) => team.ledger.get(id)!.record);
+		const outcomeRule = "Every root must end accepted with a succeeded result (close succeeded) or waived (close partial), so request only work you need; "
+			+ "close_team itself closes idle workers.";
+		if (!initial.length) {
+			return `Team is active. No work is assigned yet: request work from workers per the brief, then yield. ${outcomeRule} Close explicitly.`;
+		}
+		const assigned = initial.map((record) => `${record.assignee} ${workRefKey({ workId: record.id, revision: record.currentRevision })} "${previewText(currentVersion(record).task, 160)}"`);
+		return `Team is active. ${initial.length} initial request(s) are already assigned and run without Manager action: ${assigned.join("; ")}. `
+			+ `Do not request them again; each root result arrives as an event. ${outcomeRule} Close explicitly.`;
 	}
 
 	private canCommitNaturalFinal(team: TeamState, ref: WorkRef, active: ActiveActivation): boolean {

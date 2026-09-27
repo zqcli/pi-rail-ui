@@ -128,6 +128,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 
 - Runtime 通过唯一的 effect drain 调度：worker 最多 4 个执行许可，Manager 有独立的 1 个；ready 队列为 FIFO，每个 WorkRef 最多一个 ready 项。
 - yield 完整结束后释放许可，排在后面的成员（例如第 8 个 worker）因此有机会运行。
+- BOOT 事件列出由 `initialRequests` 建立、无需 Manager 派发即会运行的 root（assignee、WorkRef、任务预览），并提示不要重复请求、每个 root 最终都须 accepted 或 waived；`ROOT_RESULT_READY` 注明结果状态和作者。
 - Manager 事件：`BOOT, USER_COMMAND, ROOT_RESULT_READY, DECISION_REQUEST, WORK_HELD, MEMBER_FAULTED, MEMBER_CLOSED, DEPENDENCY_UNAVAILABLE, BUDGET_HIT, TEAM_QUIESCENT`，按语义键去重；批次一旦封存，最多 16 项，且必须与 brief/role 等共同满足 64 KiB 输入上限。长错误先做公开投影，仍放不下时缩小事件批次；未选事件不被封存或确认，留待后续批次。新事件进入下一批；已处理的批次即使 Manager 什么都没做也不会重新入队。
 - status 查询、no-op 控制和 ACK 不产生事件。全员 idle 时 Team 保持 active；只在语义版本变化时发出一次 `TEAM_QUIESCENT`。
 - Manager 故障时：Team 进入 needs_attention，worker 在安全点暂停，账本保留；没有自动接任，也没有自唤醒。
@@ -141,8 +142,8 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 ## 8. 关闭
 
 - `close_member`：目标必须 open、没有 activation（包括停驻中的）、没有名下的未终态工作、没有待其接收的 outgoing 请求、资源状态确定。条件不满足返回 `CLOSE_BLOCKED` 和 blockers，状态不变。满足时进入 closing，新请求得到 `RECIPIENT_CLOSING`。只剩已提交历史结果的作者可以关闭。
-- `close_team`：只能在管理 activation 中调用。要求所有 root 和 child 都有明确 outcome，root 已被 accepted 或 waived，worker 都没有运行中的 activation 或清理，resultRefs 属于本 Team。
-  - `succeeded`：所有 root 都是 accepted 且结果为 succeeded，没有未决 incident，至少一个 resultRef。
+- `close_team`：只能在管理 activation 中调用。要求所有 root 和 child 都有明确 outcome，root 已被 accepted 或 waived，worker 都没有运行中的 activation 或清理，resultRefs 属于本 Team。它自己会关闭仍 open 的 idle worker，无需先逐个 `close_member`。
+  - `succeeded`：所有 root 都是 accepted 且结果为 succeeded，没有未决 incident，至少一个 resultRef。被拒时 `INVALID_TEAM_OUTCOME` 的 blockers（`root_outcome`）列出每个阻止成功的 root；被取消、失败或 waived 的 root（例如重复派发的工作）只能以 `partial` 关闭。`close_team` 自己会关闭仍 open 的 idle worker，无需先逐个 `close_member`。被拒时 `INVALID_TEAM_OUTCOME` 的 blockers（`root_outcome`）列出每个阻止成功的 root；被取消、失败或 waived 的 root（例如重复派发的工作）只能以 `partial` 关闭。
   - `partial`：需要 reason 和至少一个 resultRef。
   - `failed`：需要 reason。
 - close_team 提交后入口立即关闭（原子）。Manager 在本次 activation 正常收尾后才停止；所有成员退出确认后 Team 才是 `closed`。清理失败或关闭后出错时 Team 为 `failed`，不会报告为 closed success。

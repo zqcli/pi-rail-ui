@@ -295,7 +295,7 @@ test("new Manager events stay in the next sealed batch and faults outrank incide
 
 	const nextBatch = managerBatches[1]!;
 	assert.deepEqual(nextBatch.map((event) => event.kind), [
-		"MEMBER_FAULTED", "MEMBER_FAULTED", "DEPENDENCY_UNAVAILABLE", "DEPENDENCY_UNAVAILABLE", "TEAM_QUIESCENT",
+		"MEMBER_FAULTED", "MEMBER_FAULTED", "TEAM_QUIESCENT",
 	]);
 	assert.deepEqual(nextBatch.filter((event) => event.kind === "MEMBER_FAULTED").map((event) => event.memberId), ["w2", "w3"],
 		"equal-priority faults retain event creation order");

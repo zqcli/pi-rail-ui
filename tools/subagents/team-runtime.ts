@@ -1444,9 +1444,8 @@ export class TeamRuntime {
 			this.holdManagerWork(team);
 			this.pauseWorkersForManagerFault(team);
 		} else if (ref) this.failWorkerWork(team, member, ref);
-		this.createIncident(team, resourceReleased ? "NATIVE_OUTCOME_UNKNOWN" : "CLEANUP_FAILED", error.message, ref, member.id);
-		this.addEvent(team, { key: `member-fault:${member.id}:${activationId}`, kind: "MEMBER_FAULTED",
-			message: `${member.id} lost its native activation before settlement`, memberId: member.id, ...(ref ? { work: ref } : {}) });
+		this.createIncident(team, resourceReleased ? "NATIVE_OUTCOME_UNKNOWN" : "CLEANUP_FAILED",
+			`${member.id} lost its native activation before settlement: ${error.message}`, ref, member.id);
 		this.changed(team);
 		// Known failures (e.g. unstarted MEMBER_UNAVAILABLE work) wake their waiters; outcome-unknown work holds them.
 		this.wakeWaiters(team);
@@ -2272,8 +2271,8 @@ export class TeamRuntime {
 				this.pauseWorkersForManagerFault(team);
 			} else if (scope.kind === "work") this.failWorkerWork(team, member, scope.work!);
 			delivery.state = "unknown";
-			this.createIncident(team, "CLEANUP_FAILED", member.error.message, scope.kind === "work" ? scope.work : undefined, member.id);
-			this.addEvent(team, { key: `member-fault:${member.id}:${scope.activationId}`, kind: "MEMBER_FAULTED", message: `${member.id} could not confirm activation cleanup`, memberId: member.id });
+			this.createIncident(team, "CLEANUP_FAILED", `${member.id} could not confirm activation cleanup: ${member.error.message}`,
+				scope.kind === "work" ? scope.work : undefined, member.id);
 			this.note(team, `${member.id} activation cleanup failed`);
 			member.activity = "settling";
 			this.changed(team);
@@ -2367,10 +2366,7 @@ export class TeamRuntime {
 		const intent = active.intent;
 		if (intent && active.native?.appliedToolCallId !== intent.toolCallId) {
 			delete team.ledger.get(ref.workId)!.stagedWait;
-			const incident = this.createIncident(team, "PROTOCOL_FAILURE", "The staged end-intent result was not confirmed in the native transcript", ref, member.id);
-			version.state = "blocked";
-			version.hold = { reason: "protocol", incidentId: incident.id };
-			version.updatedAt = this.timestamp();
+			this.holdWork(team, member, ref, "PROTOCOL_FAILURE", "The staged end-intent result was not confirmed in the native transcript", "protocol");
 			this.wakeWaiters(team);
 			return;
 		}
@@ -2387,12 +2383,9 @@ export class TeamRuntime {
 			if (allReady && !team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
 			this.updateQuiescence(team);
 		} else if (intent?.kind === "yield_attention") {
-			const incident = this.createIncident(team, "WORK_HELD", intent.attention, ref, member.id);
+			this.holdWork(team, member, ref, "WORK_HELD", intent.attention, "attention");
 			version.checkpoint = intent.checkpoint;
-			version.hold = { reason: "attention", incidentId: incident.id };
-			version.state = "blocked";
 			version.waitingFor = [];
-			version.updatedAt = this.timestamp();
 		} else if (intent?.kind === "manager_idle") {
 			version.state = "failed";
 			version.error = { code: "PROTOCOL_FAILURE", message: "A work activation cannot use a management-idle intent" };
@@ -2401,10 +2394,7 @@ export class TeamRuntime {
 			const result: WorkResult = { status: "succeeded", summary: active.native!.finalAssistantText!.trim() };
 			this.commitResult(team, member, ref, result, "natural_final");
 		} else {
-			const incident = this.createIncident(team, "PROTOCOL_FAILURE", "Native work ended without a valid reply or yield", ref, member.id);
-			version.state = "blocked";
-			version.hold = { reason: "protocol", incidentId: incident.id };
-			version.updatedAt = this.timestamp();
+			this.holdWork(team, member, ref, "PROTOCOL_FAILURE", "Native work ended without a valid reply or yield", "protocol");
 		}
 		this.wakeWaiters(team);
 	}
@@ -2449,20 +2439,14 @@ export class TeamRuntime {
 		const version = team.ledger.version(ref)!;
 		if (team.ledger.currentRef(ref.workId)?.revision !== ref.revision || version.state !== "running") return;
 		if (Buffer.byteLength(JSON.stringify(result), "utf8") > TEAM_MAX_RESULT_BYTES) {
-			const incident = this.createIncident(team, "RESULT_TOO_LARGE", "Candidate result exceeds its reserved result slot", ref, member.id);
-			version.state = "blocked";
-			version.hold = { reason: "protocol", incidentId: incident.id };
-			version.updatedAt = this.timestamp();
+			this.holdWork(team, member, ref, "RESULT_TOO_LARGE", "Candidate result exceeds its reserved result slot", "protocol");
 			return;
 		}
 		const record = team.ledger.get(ref.workId)!.record;
 		const children = team.ledger.ownedChildren(ref);
 		if (children.some((child) => !team.ledger.outcomeReady(child)
 			|| !version.observedOutcomes.some((observed) => sameWorkRef(observed, child)))) {
-			const incident = this.createIncident(team, "UNOBSERVED_CHILD_RESULTS", "Result commit was blocked by an unobserved child outcome", ref, member.id);
-			version.state = "blocked";
-			version.hold = { reason: "protocol", incidentId: incident.id };
-			version.updatedAt = this.timestamp();
+			this.holdWork(team, member, ref, "UNOBSERVED_CHILD_RESULTS", "Result commit was blocked by an unobserved child outcome", "protocol");
 			return;
 		}
 		const resultRef = this.id("result");
@@ -2689,7 +2673,17 @@ export class TeamRuntime {
 		team.ready = team.ready.filter((item) => !sameWorkRef(item, ref));
 	}
 
-	private createIncident(team: TeamState, code: string, message: string, work?: WorkRef, memberId?: string, scopeRootId?: string): TeamIncidentView {
+	/** Hold a work version for a Manager decision, announced as WORK_HELD (answered by resume_work, revise or cancel). */
+	private holdWork(team: TeamState, member: RuntimeMember, ref: WorkRef, code: string, message: string, reason: "attention" | "protocol"): void {
+		const incident = this.createIncident(team, code, message, ref, member.id, undefined, "WORK_HELD");
+		const version = team.ledger.version(ref)!;
+		version.state = "blocked";
+		version.hold = { reason, incidentId: incident.id };
+		version.updatedAt = this.timestamp();
+	}
+
+	private createIncident(team: TeamState, code: string, message: string, work?: WorkRef, memberId?: string, scopeRootId?: string,
+		kind: ManagerEventView["kind"] = code === "BUDGET_HIT" || code === "DEPENDENCY_UNAVAILABLE" ? code : "MEMBER_FAULTED"): TeamIncidentView {
 		const rootId = work ? team.ledger.get(work.workId)?.record.rootId : scopeRootId;
 		const current = team.incidents.find((incident) => incident.state === "open" && incident.code === code
 			&& incident.memberId === memberId && incident.rootId === rootId && (incident.work ? work && sameWorkRef(incident.work, work) : !work));
@@ -2697,8 +2691,7 @@ export class TeamRuntime {
 		const incident: TeamIncidentView = { id: this.id("incident"), code, message, state: "open", createdAt: this.timestamp(),
 			...(work ? { work: copy(work) } : {}), ...(rootId ? { rootId } : {}), ...(memberId ? { memberId } : {}) };
 		team.incidents.push(incident);
-		this.addEvent(team, { key: `incident:${incident.id}`, kind: code === "BUDGET_HIT" ? "BUDGET_HIT" : code === "WORK_HELD" ? "WORK_HELD" : "DEPENDENCY_UNAVAILABLE",
-			message, ...(work ? { work: copy(work) } : {}), ...(memberId ? { memberId } : {}), incidentId: incident.id });
+		this.addEvent(team, { key: `incident:${incident.id}`, kind, message, ...(work ? { work: copy(work) } : {}), ...(memberId ? { memberId } : {}), incidentId: incident.id });
 		team.health = "needs_attention";
 		return incident;
 	}

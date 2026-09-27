@@ -1223,6 +1223,9 @@ test("A: oversized natural final is protocol-held after cleanup and remains mana
 	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.activity, "idle");
 	const manager = runtime.takeNextActivation(teamId)!;
 	assert.equal(manager.scope.kind, "management");
+	const heldEvent = manager.input.scope.kind === "management" ? manager.input.scope.events.find((event) => event.incidentId) : undefined;
+	assert.equal(heldEvent?.kind, "WORK_HELD", "a protocol hold asks the Manager for a decision like any held work");
+	assert.match(heldEvent?.message ?? "", /without a valid reply or yield/u);
 	inputReady(runtime, manager);
 	assert.equal(action(runtime, manager, 1, "dispose-large-natural", {
 		action: "control", command: "cancel_work", workId: ref.workId, expectedRevision: ref.revision, reason: "Oversized native result was rejected.",

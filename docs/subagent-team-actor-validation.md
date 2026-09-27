@@ -599,7 +599,7 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 | `transcript.test.ts` · `grouped panels show a live idle member as idle, never completed, with its role and state line` | pure | 共享渲染器的 idle 状态、角色标签与状态行 |
 | `team-integration.test.ts` · `host shutdown writes no interruption marker for a Team that already ended` | fake | 已结束 Team 不补写 interrupted（撤掉修复时该测试失败） |
 
-本轮隔离环境全量结果：`npm run check` 943/943 通过（74781 ms，`/tmp/pi-panel-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 943/943 通过（75518 ms，`/tmp/pi-panel-depth.log`）；均无 fail/cancelled/skipped。未做在线模型或交互 TUI 手工验收；在线 Manager 是否遵循新指引需要实际运行观察。
+本轮隔离环境全量结果：`npm run check` 943/943 通过（74781 ms，`/tmp/pi-panel-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 943/943 通过（74341 ms，`/tmp/pi-panel-depth.log`）；均无 fail/cancelled/skipped。未做在线模型或交互 TUI 手工验收；在线 Manager 是否遵循新指引需要实际运行观察。
 
 ## 8. 历史阶段结果（非本轮成绩）
 

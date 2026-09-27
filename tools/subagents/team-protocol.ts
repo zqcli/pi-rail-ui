@@ -22,6 +22,8 @@ export const TEAM_MAX_BRIEF_BYTES = 32 * 1024;
 export const TEAM_MAX_NOTE_BYTES = 4 * 1024; // checkpoint, attention, resume instruction, reasons
 export const TEAM_MAX_TEXT_ITEM_BYTES = 8 * 1024;
 export const TEAM_MAX_RESULT_BYTES = 12 * 1024;
+/** A Manager event may carry one complete root result plus its heading. */
+export const TEAM_MAX_EVENT_MESSAGE_BYTES = TEAM_MAX_RESULT_BYTES + TEAM_MAX_NOTE_BYTES;
 export const TEAM_MAX_RESULT_ITEMS = 32;
 export const TEAM_MAX_INPUT_REFS = 32;
 export const TEAM_MAX_WAITING_FOR = 32;
@@ -54,8 +56,6 @@ export const TEAM_MAX_TIMEOUT_SECONDS = 86400;
 /** Completed idempotency entries kept per active member; pending entries are never evicted. */
 export const TEAM_COMMAND_CACHE = 128;
 export const TEAM_MAX_PENDING_OPERATIONS = 32;
-
-export const TEAM_RESERVED_ACTORS = ["@hub", "@host", "@parent"] as const;
 
 export const TEAM_ERROR_CODES = [
 	"INVALID_ARGUMENT", "UNSUPPORTED_PROTOCOL", "UNKNOWN_MEMBER", "FORBIDDEN_ACTION", "SELF_REQUEST", "RECIPIENT_CLOSING",

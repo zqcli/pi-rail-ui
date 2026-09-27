@@ -130,7 +130,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 - Runtime 通过唯一的 effect drain 调度：worker 最多 4 个执行许可，Manager 有独立的 1 个；ready 队列为 FIFO，每个 WorkRef 最多一个 ready 项。
 - yield 完整结束后释放许可，排在后面的成员（例如第 8 个 worker）因此有机会运行。
 - BOOT 事件列出由 `initialRequests` 建立、无需 Manager 派发即会运行的 root（assignee、WorkRef、任务预览），并提示不要重复请求、每个 root 最终都须 accepted 或 waived；`ROOT_RESULT_READY` 注明结果状态和作者。
-- Manager 事件：`BOOT, USER_COMMAND, ROOT_RESULT_READY, DECISION_REQUEST, WORK_HELD, MEMBER_FAULTED, MEMBER_CLOSED, DEPENDENCY_UNAVAILABLE, BUDGET_HIT, TEAM_QUIESCENT`，按语义键去重；批次一旦封存，最多 16 项，且必须与 brief/role 等共同满足 64 KiB 输入上限。长错误先做公开投影，仍放不下时缩小事件批次；未选事件不被封存或确认，留待后续批次。新事件进入下一批；已处理的批次即使 Manager 什么都没做也不会重新入队。
+- Manager 事件：`BOOT, USER_COMMAND, ROOT_RESULT_READY, DECISION_REQUEST, WORK_HELD, MEMBER_FAULTED, MEMBER_CLOSED, DEPENDENCY_UNAVAILABLE, BUDGET_HIT, TEAM_QUIESCENT`，按语义键去重；`ROOT_RESULT_READY` 直接带上该 root 结果全文（summary、findings、evidence、limitations、artifacts）和 resultRef，Manager 无需再 `status(result)` 即可验收；批次一旦封存，最多 16 项，且必须与 brief/role 等共同满足 64 KiB 输入上限。长错误先做公开投影，仍放不下时缩小事件批次；未选事件不被封存或确认，留待后续批次。新事件进入下一批；已处理的批次即使 Manager 什么都没做也不会重新入队。
 - status 查询、no-op 控制和 ACK 不产生事件。全员 idle 时 Team 保持 active；只在语义版本变化时发出一次 `TEAM_QUIESCENT`。
 - Manager 故障时：Team 进入 needs_attention，worker 在安全点暂停，账本保留；没有自动接任，也没有自唤醒。
 
@@ -175,6 +175,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 | shared brief | 32 KiB 完整 JSON |
 | checkpoint / attention / 恢复说明 / reason | 各 4 KiB，并计入输入总量 |
 | WorkResult | 12 KiB 完整 JSON，每类数组最多 32 项 |
+| Manager 事件 message | 16 KiB（容纳一份完整 root 结果及其标题） |
 | 原始成员工具参数 | 64 KiB 完整 JSON；各 action/字段另有更小上限 |
 | ActivationInput | 64 KiB 完整 JSON |
 | 私有帧 | 1 MiB 完整 JSON，含 native tool-call evidence |

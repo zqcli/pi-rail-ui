@@ -3,7 +3,7 @@ import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionC
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { SessionBroker } from "./session-broker";
-import { jsonTextBytes, normalizeTeamPlan, previewText, truncateText } from "./team-codec";
+import { formatWorkResult, jsonTextBytes, normalizeTeamPlan, previewText, truncateText } from "./team-codec";
 import type { TeamHistoryEntry } from "./team-history";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
@@ -174,7 +174,7 @@ function memberRuns(host: TeamSessionHost, teamId: string): SubagentTranscriptRu
 			status: member.lifecycle === "faulted" ? "failed" : member.lifecycle === "closed" ? "completed"
 				: member.activity !== "idle" || member.lifecycle === "starting" || member.lifecycle === "closing" ? "running" : "idle",
 			// Like a grouped subagent's final answer: the member's latest result in full, or the Manager's close decision.
-			output: latest ? truncateText(resultBody(latest), MAX_MEMBER_OUTPUT_BYTES).text
+			output: latest ? truncateText(formatWorkResult(latest.result), MAX_MEMBER_OUTPUT_BYTES).text
 				: member.role === "manager" && view.outcome ? `Team ${upper(view.lifecycle)} · outcome ${view.outcome}${view.reason ? `\n\n${view.reason}` : ""}`
 					: activity?.output ?? "",
 			usage, ...(activity ? { durationMs: activity.durationMs } : {}),
@@ -217,18 +217,7 @@ function resultPageOffset(cursor?: string | null): number {
 }
 
 function formatResultRecord(record: ResultRecord): string {
-	return [`${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`, resultBody(record)].join("\n");
-}
-
-/** The complete worker-authored result: summary, findings, evidence, limitations and artifacts. */
-function resultBody(record: ResultRecord): string {
-	return [
-		record.result.summary,
-		...(record.result.findings?.length ? ["Findings:", ...record.result.findings.map((item) => `- ${item}`)] : []),
-		...(record.result.evidence?.length ? ["Evidence:", ...record.result.evidence.map((item) => `- ${item.basis}: ${item.source}${item.locator ? ` (${item.locator})` : ""}`)] : []),
-		...(record.result.limitations?.length ? ["Limitations:", ...record.result.limitations.map((item) => `- ${item}`)] : []),
-		...(record.result.artifacts?.length ? ["Artifacts:", ...record.result.artifacts.map((item) => `- ${item}`)] : []),
-	].join("\n");
+	return [`${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`, formatWorkResult(record.result)].join("\n");
 }
 
 function clock(ms: number): string {
@@ -295,7 +284,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 	const blocks = result.finalResultRefs.map((ref) => {
 		const record = host.runtime.getResult(result.teamId, ref);
 		const heading = record ? `### ${record.author} · ${workRefKey(record.work)} · ${record.result.status} · ${ref}` : `### ${ref} · result not retained in this runtime`;
-		const body = record ? resultBody(record) : "";
+		const body = record ? formatWorkResult(record.result) : "";
 		const truncated = `[Result truncated for the parent; full record: subagent_team status resultRef ${ref}]`;
 		// Fixed cost of a block: blank separator, heading, and room for the truncation note.
 		return { heading, body, overhead: Buffer.byteLength(`\n\n${heading}\n\n${truncated}`, "utf8"), truncated };

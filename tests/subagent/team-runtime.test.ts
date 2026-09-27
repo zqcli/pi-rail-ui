@@ -138,7 +138,7 @@ test("Manager guidance: management input says to yield instead of polling, and h
 	assert.equal(next.scope.kind, "management");
 	assert.equal(runtime.panelFacts(teamId).pendingManagerEvents, 0, "events delivered to an activation are no longer pending");
 	const resultEvent = next.input.scope.kind === "management" ? next.input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY") : undefined;
-	assert.match(resultEvent?.message ?? "", /committed succeeded result from w1; read it with status\(result\)/u);
+	assert.match(resultEvent?.message ?? "", /committed succeeded result \S+ from w1, in full below; review it .* without a status call:\n\nfirst result$/u);
 
 	// A duplicate root that the Manager cancels is named when a succeeded close is refused.
 	inputReady(runtime, next);
@@ -155,6 +155,22 @@ test("Manager guidance: management input says to yield instead of polling, and h
 	assert.match(refused.ok ? "" : refused.error.message, /waive it with accept_result disposition waived/u);
 	assert.deepEqual(refused.ok ? [] : refused.error.blockers?.map((blocker) => [blocker.kind, blocker.id, blocker.reason]),
 		[["root_outcome", `${duplicateRef.workId}@1`, "root is cancelled and not accepted"]]);
+});
+
+test("ROOT_RESULT_READY carries a maximum-size root result in full inside a valid Manager activation input", () => {
+	const { runtime, teamId } = makeRuntime();
+	finishManagerBoot(runtime, teamId);
+	const work = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, work);
+	const finding = "界".repeat(1300);
+	const findings = Array.from({ length: 3 }, (_, index) => `${index}${finding}`);
+	assert.equal(action(runtime, work, 1, "big", { action: "reply", result: { status: "succeeded", summary: "big", findings } }).ok, true);
+	settle(runtime, work, "big");
+	const manager = runtime.takeNextActivation(teamId)!;
+	const event = manager.input.scope.kind === "management" ? manager.input.scope.events.find((item) => item.kind === "ROOT_RESULT_READY") : undefined;
+	assert.ok(event?.message.endsWith(`Findings:\n${findings.map((item) => `- ${item}`).join("\n")}`));
+	assert.doesNotThrow(() => parseParentCommand({ version: 2, commandId: "activate", operation: "activate", binding: manager.binding,
+		activation: manager.scope, deliveryId: manager.deliveryId, input: manager.input }));
 });
 
 test("peer dependency: a held worker gets another worker's resultRef from the Manager, or waits on its WorkRef directly", () => {

@@ -12,7 +12,7 @@ import {
 	type TeamWorkSummary, type TeamWorkView, type WorkError, type WorkRecord, type WorkRef, type WorkResult, type WorkVersion,
 } from "./team-protocol";
 import {
-	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, normalizeNativeToolCallId, normalizeTeamAction, normalizeTeamPlan, parseActivationScope, parseBinding, sameScope,
+	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeTeamAction, normalizeTeamPlan, parseActivationScope, parseBinding, sameScope,
 	okReply, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
 import { WorkLedger } from "./team-work-ledger";
@@ -2482,7 +2482,7 @@ export class TeamRuntime {
 		else delete version.error;
 		version.updatedAt = committed.committedAt;
 		if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY",
-			message: `Root work ${workRefKey(ref)} has a committed ${result.status} result from ${member.id}; read it with status(result) before accept_result`, work: ref, resultRef });
+			message: `Root work ${workRefKey(ref)} has a committed ${result.status} result ${resultRef} from ${member.id}, in full below; review it and accept_result or waive it without a status call:\n\n${formatWorkResult(result)}`, work: ref, resultRef });
 		this.wakeWaiters(team);
 	}
 

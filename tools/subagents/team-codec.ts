@@ -9,7 +9,7 @@ import {
 	TEAM_ERROR_CODES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_ALIAS_LENGTH, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_FRAME_BYTES,
 	TEAM_MAX_ACTION_BYTES, TEAM_MAX_PUBLIC_CHILDREN, TEAM_MAX_OWNED_CHILD_PREVIEWS,
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_INPUT_REFS, TEAM_MAX_MEMBERS, TEAM_MAX_NOTE_BYTES,
-	TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
+	TEAM_MAX_EVENT_MESSAGE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_WORKERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
@@ -122,6 +122,17 @@ export function previewText(value: string, maxBytes: number): string {
 		result += character;
 	}
 	return result + TRUNCATED;
+}
+
+/** A complete worker result as text: summary, findings, evidence, limitations and artifacts. */
+export function formatWorkResult(result: WorkResult): string {
+	return [
+		result.summary,
+		...(result.findings?.length ? ["Findings:", ...result.findings.map((item) => `- ${item}`)] : []),
+		...(result.evidence?.length ? ["Evidence:", ...result.evidence.map((item) => `- ${item.basis}: ${item.source}${item.locator ? ` (${item.locator})` : ""}`)] : []),
+		...(result.limitations?.length ? ["Limitations:", ...result.limitations.map((item) => `- ${item}`)] : []),
+		...(result.artifacts?.length ? ["Artifacts:", ...result.artifacts.map((item) => `- ${item}`)] : []),
+	].join("\n");
 }
 
 /** Truncate (keeping line structure) to a JSON-content byte budget; returns whether it was cut. */
@@ -1253,7 +1264,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 			if (!(MANAGER_EVENT_KINDS as readonly unknown[]).includes(raw["kind"])) return protocol(`${field}.kind is invalid`);
 			if (raw["actor"] !== undefined && (raw["actor"] !== "@host" || raw["kind"] !== "USER_COMMAND")) return protocol(`${field}.actor is only valid as @host on USER_COMMAND`);
 			return { id: frameId(raw["id"], `${field}.id`), kind: raw["kind"] as ManagerEventView["kind"],
-				message: text(raw["message"], `${field}.message`, TEAM_MAX_NOTE_BYTES),
+				message: text(raw["message"], `${field}.message`, TEAM_MAX_EVENT_MESSAGE_BYTES),
 				...(raw["actor"] === "@host" ? { actor: "@host" as const } : {}),
 				...(raw["work"] !== undefined ? { work: normalizeWorkRef(raw["work"], `${field}.work`) } : {}),
 				...(raw["memberId"] !== undefined ? { memberId: normalizeAlias(raw["memberId"], `${field}.memberId`) } : {}),
@@ -1380,7 +1391,7 @@ export function projectActivationInput(input: ActivationInput): ActivationInput 
 		projected.scope.previous.error = projectWorkError(projected.scope.previous.error);
 	}
 	if (projected.scope.kind === "management") {
-		for (const event of projected.scope.events) event.message = projectErrorText(event.message);
+		for (const event of projected.scope.events) event.message = projectErrorText(event.message, TEAM_MAX_EVENT_MESSAGE_BYTES);
 	}
 	for (const outcome of projected.outcomes) if (outcome.error) outcome.error = projectWorkError(outcome.error);
 	projected.omittedOutcomes += Math.max(0, projected.outcomes.length - TEAM_MAX_DELIVERED_OUTCOMES);

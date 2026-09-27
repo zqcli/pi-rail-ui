@@ -552,4 +552,6 @@ export interface TeamResult {
 
 export const sameWorkRef = (left: WorkRef, right: WorkRef): boolean => left.workId === right.workId && left.revision === right.revision;
 export const workRefKey = (ref: WorkRef): string => `${ref.workId}@${ref.revision}`;
+/** Display form of a WorkRef (work UUID prefix and revision); protocol and status text keep the full ref. */
+export const shortWorkRef = (ref: WorkRef): string => `work ${ref.workId.slice(ref.workId.lastIndexOf(":") + 1).slice(0, 8)}@${ref.revision}`;
 export const isTerminalWorkState = (state: WorkState): boolean => TERMINAL_WORK_STATES.includes(state);

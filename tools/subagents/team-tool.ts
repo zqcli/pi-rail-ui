@@ -9,7 +9,7 @@ import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
 	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
-	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef,
+	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, shortWorkRef,
 } from "./team-protocol";
 import type { TeamRuntime } from "./team-runtime";
 import {
@@ -98,12 +98,6 @@ const upper = (value: string) => value.replaceAll("_", " ").toUpperCase();
 const limit = (used: number, max: number) => `${used}/${max}`;
 
 type PanelFacts = ReturnType<TeamRuntime["panelFacts"]>;
-
-/** Panel form of a WorkRef (its work UUID prefix and revision); status text keeps the full ref. */
-function shortWorkRef(ref: WorkRef): string {
-	const id = ref.workId.slice(ref.workId.lastIndexOf(":") + 1);
-	return `work ${id.slice(0, 8)}@${ref.revision}`;
-}
 
 /** Team state of one member: lifecycle, activity and current work, queues, pause, Manager events, results, error. */
 function memberStateText(member: TeamTeamView["members"][number], works: readonly TeamWorkSummary[], facts?: PanelFacts,
@@ -272,7 +266,7 @@ function assertActionParams(params: Params, action: Params["action"]): void {
  * Final launch text, like a grouped subagent's aggregate: TeamResult facts, per-member totals, a timeline,
  * then every Manager-selected worker result in full (bounded; only an oversized record is truncated).
  */
-function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: number, endedAt: number): string {
+function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: number): string {
 	const view = host.runtime.getTeam(result.teamId);
 	const facts = host.runtime.panelFacts(result.teamId);
 	const w = view.works;
@@ -286,13 +280,14 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 			return `- ${member.id} · ${member.role} · ${member.lifecycle}/${member.resourceState} · ${member.policy.model ?? "model ?"} · FAST ${member.policy.fastMode ? "on" : "off"}`
 				+ ` · ${member.usage.turns} turns${activity ? ` · active ${clock(activity.durationMs)}` : ""} · results ${facts.results.get(member.id)?.count ?? 0}`;
 		}),
-		`Timeline (m:ss from launch): 0:00 launch${facts.commits.slice(0, 20).map((commit) => ` · ${clock(commit.at - startedAt)} ${commit.author} ${commit.status} result`).join("")}`
-			+ `${facts.commits.length > 20 ? ` · +${facts.commits.length - 20} more results` : ""} · ${clock(endedAt - startedAt)} Team ${result.lifecycle}`,
 		`Usage: ${result.usage.turns} turns · input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 	];
 	for (const incident of result.unresolvedIncidents.slice(0, 5)) lines.push(`Unresolved ${incident.code}: ${previewText(incident.message, 200)}`);
 	if (result.unresolvedIncidentsOmitted) lines.push(`${result.unresolvedIncidentsOmitted} additional unresolved incidents omitted from the bounded terminal snapshot.`);
-	const unselected = facts.commits.length - result.finalResultRefs.length;
+	const origin = facts.timeline[0]?.at ?? startedAt;
+	lines.push(`Timeline (m:ss from launch${facts.timelineOmitted ? `; ${facts.timelineOmitted} earlier milestones omitted` : ""}):`,
+		...facts.timeline.map((entry) => `- ${clock(entry.at - origin)} ${entry.text}`));
+	const unselected = [...facts.results.values()].reduce((total, { count }) => total + count, 0) - result.finalResultRefs.length;
 	if (result.finalResultRefs.length) {
 		lines.push("", `Selected results in full (worker-authored; the Manager does not rewrite them)${unselected > 0 ? `; ${unselected} other committed result(s) via status` : ""}:`);
 	}
@@ -454,7 +449,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 				}
 				throw error;
 			}
-			const text = finalTeamText(host, outcome.result, startedAt, Date.now());
+			const text = finalTeamText(host, outcome.result, startedAt);
 			if (outcome.result.lifecycle !== "closed") throw new Error(text);
 			return textResult(text, panel());
 		} finally {

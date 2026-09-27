@@ -4,7 +4,7 @@ import {
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_PROTOCOL_VERSION,
 	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, DEFAULT_TEAM_BUDGET, isTerminalWorkState, sameWorkRef,
-	workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
+	workRefKey, shortWorkRef, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type ActivationInput, type ActivationScope, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
 	type ManagerEventView, type MemberRecord, type OutcomeView, type ResultRecord,
 	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle, type GateDecision,
@@ -39,6 +39,7 @@ function incidentView(incident: TeamIncidentView): TeamIncidentView {
 
 /** Grant reasons are retained in the bounded Team view; keep them short. */
 const TEAM_MAX_GRANT_REASON_BYTES = 512;
+const TEAM_MAX_TIMELINE = 60;
 const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work.";
 const MANAGEMENT_NOTICE = "Management activation: there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
 	+ "New results, failures and incidents start the next management activation automatically; do not poll status to wait.";
@@ -232,6 +233,9 @@ interface TeamState {
 	journalFailure?: string;
 	journalFailureApplied?: boolean;
 	terminalJournaled?: boolean;
+	/** Display-only schedule of milestones for the host (bounded); never an obligation or a recovery log. */
+	timeline: Array<{ at: number; text: string }>;
+	timelineOmitted: number;
 	outcome?: "succeeded" | "partial" | "failed";
 	reason?: string;
 	closeDecision?: CloseDecision;
@@ -338,7 +342,7 @@ export class TeamRuntime {
 			deadline: null,
 			plan: copy(plan), manager: plan.manager.alias, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
-			reservedResultBytes: reserved, usage: emptySubagentUsage(),
+			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
 		};
 		for (const initial of plan.initialRequests) {
 			const record = this.makeWork(team.manager, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
@@ -374,6 +378,8 @@ export class TeamRuntime {
 			member.resourceState = "owned";
 		}
 		this.addEvent(team, { key: "BOOT", kind: "BOOT", message: this.bootMessage(team) });
+		const initial = team.ledger.order.map((workId) => team.ledger.get(workId)!.record);
+		this.note(team, `launch${initial.length ? ` · initial ${initial.map((record) => `${shortWorkRef({ workId: record.id, revision: 1 })} → ${record.assignee}`).join(", ")}` : ""}`);
 		this.changed(team);
 		this.check(team);
 		if (team.plan.timeoutSeconds !== null) {
@@ -1420,6 +1426,7 @@ export class TeamRuntime {
 		member.resourceState = resourceReleased ? "released" : "cleanup_failed";
 		member.error = { code: error.code, message: error.message };
 		member.lastLostActivation = { activationId, error: copy(error), resourceReleased, reason: "transport_failure" };
+		this.note(team, `${member.id} activation lost (${error.code})`);
 		delete member.active;
 		delete member.currentWork;
 		this.resumeParkedActivations(team);
@@ -1479,6 +1486,7 @@ export class TeamRuntime {
 		if (result.ok && !faultedRelease) this.addEvent(team, {
 			key: `member-closed:${member.id}:${closeId}`, kind: "MEMBER_CLOSED", message: `${member.id} closed after confirmed resource release`, memberId: member.id,
 		});
+		this.note(team, `${member.id} ${result.ok && !faultedRelease ? "closed" : "exit failed"}`);
 		this.changed(team);
 		this.finishTeamCloseIfReady(team);
 		this.check(team);
@@ -1563,25 +1571,24 @@ export class TeamRuntime {
 		return result ? copy(result) : undefined;
 	}
 
-	/** Host panel facts outside the member-facing view: waiting Manager events, each author's results, commit times. */
+	/** Host panel facts outside the member-facing view: waiting Manager events, each author's results, the milestone timeline. */
 	panelFacts(teamId: string): {
 		pendingManagerEvents: number;
 		results: Map<string, { count: number; latest: ResultRecord }>;
-		commits: Array<{ author: string; status: WorkResult["status"]; at: number }>;
+		timeline: Array<{ at: number; text: string }>;
+		timelineOmitted: number;
 	} {
 		const team = this.team(teamId);
 		const latest = new Map<string, { count: number; id: string }>();
-		const commits: Array<{ author: string; status: WorkResult["status"]; at: number }> = [];
 		for (const id of team.ledger.resultOrder) {
-			const { author, result, committedAt } = team.ledger.results.get(id)!;
+			const author = team.ledger.results.get(id)!.author;
 			latest.set(author, { count: (latest.get(author)?.count ?? 0) + 1, id });
-			commits.push({ author, status: result.status, at: committedAt });
 		}
 		const results = new Map([...latest].map(([author, { count, id }]) => [author, { count, latest: copy(team.ledger.results.get(id)!) }]));
 		// After close, leftover notices (for example MEMBER_CLOSED) are no longer work for the Manager.
 		const pendingManagerEvents = team.lifecycle === "active"
 			? team.events.filter((event) => !event.processed && event.batchId === undefined).length : 0;
-		return { pendingManagerEvents, results, commits };
+		return { pendingManagerEvents, results, timeline: copy(team.timeline), timelineOmitted: team.timelineOmitted };
 	}
 
 	listResultRefsPage(teamId: string, cursor?: string, limit = TEAM_STATUS_DEFAULT_LIMIT): {
@@ -1693,6 +1700,7 @@ export class TeamRuntime {
 		team.ledger.add(work);
 		team.ready.push({ workId: work.id, revision: 1 });
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
+		this.note(team, `${requester.id} requested ${shortWorkRef({ workId: work.id, revision: 1 })} → ${recipient.id}`);
 		this.changed(team);
 		return okReply(requester.id, { receipt: { status: "accepted", work: { workId: work.id, revision: 1 }, recipient: recipient.id, ...(recipient.pause !== "none" ? { paused: true } : {}) } });
 	}
@@ -1894,6 +1902,7 @@ export class TeamRuntime {
 		this.assertInputFits(team, assignee, { ...entry.record, currentRevision: nextRevision, versions: [...entry.record.versions, candidate] }, entry.record.parent);
 		const currentRef = { workId: entry.record.id, revision: entry.record.currentRevision };
 		this.writeJournal(team, { version: 2, kind: "decision", teamId: team.id, at: candidate.createdAt, decision: "revise_work", work: currentRef });
+		this.note(team, `${manager.id} revised ${shortWorkRef(currentRef)}`);
 		if (!isTerminalWorkState(current.state)) {
 			this.cancelDescendants(team, currentRef, "superseded");
 			current.state = "superseded";
@@ -1926,6 +1935,7 @@ export class TeamRuntime {
 			return okReply(manager.id, { receipt: { status: "unchanged", command: "cancel_work", work: ref } });
 		}
 		this.writeJournal(team, { version: 2, kind: "decision", teamId: team.id, at: this.timestamp(), decision: "cancel_work", work: ref, reason: control.reason });
+		this.note(team, `${manager.id} cancelled ${shortWorkRef(ref)}`);
 		const affected = [ref, ...team.ledger.openSubtree(ref)];
 		for (const work of affected) {
 			const version = team.ledger.version(work)!;
@@ -1968,6 +1978,7 @@ export class TeamRuntime {
 			fail("INVALID_TEAM_OUTCOME", "A non-terminal root must be cancelled or completed before it can be waived");
 		}
 		version.review = { disposition: control.disposition, ...(control.reason ? { reason: control.reason } : {}) };
+		this.note(team, `${manager.id} ${control.disposition} ${shortWorkRef(control.work)}`);
 		version.updatedAt = this.timestamp();
 		this.changed(team);
 		return okReply(manager.id, { receipt: { status: "applied", command: "accept_result", work: control.work } });
@@ -2063,6 +2074,7 @@ export class TeamRuntime {
 		});
 		this.writeJournal(team, { version: 2, kind: "close_decision", teamId: team.id, at: this.timestamp(), closeId, outcome,
 			resultRefs: copy(resultRefs), roots: copy(rootSnapshot), ...(reason ? { reason } : {}) });
+		this.note(team, `${manager.id} close_team ${outcome}`);
 		team.closeDecision = { id: closeId, outcome, ...(reason ? { reason } : {}), resultRefs: copy(resultRefs), roots: copy(rootSnapshot) };
 		team.lifecycle = "closing";
 		team.outcome = outcome;
@@ -2147,6 +2159,7 @@ export class TeamRuntime {
 			budget: team.budget.recordActivation(undefined, true, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
 		member.activity = "running";
+		this.note(team, `${member.id} management activation (${selected.map((event) => event.kind).join(", ")})`);
 		this.addDelivery(team, member, scope, input, eventBatch.eventIds);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
@@ -2173,6 +2186,7 @@ export class TeamRuntime {
 			budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.currentWork = copy(ref);
 		member.activity = "running";
+		this.note(team, `${member.id} started ${shortWorkRef(ref)}`);
 		this.addDelivery(team, member, scope, input);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
@@ -2254,6 +2268,7 @@ export class TeamRuntime {
 			delivery.state = "unknown";
 			this.createIncident(team, "CLEANUP_FAILED", member.error.message, scope.kind === "work" ? scope.work : undefined, member.id);
 			this.addEvent(team, { key: `member-fault:${member.id}:${scope.activationId}`, kind: "MEMBER_FAULTED", message: `${member.id} could not confirm activation cleanup`, memberId: member.id });
+			this.note(team, `${member.id} activation cleanup failed`);
 			member.activity = "settling";
 			this.changed(team);
 			this.wakeWaiters(team);
@@ -2262,6 +2277,7 @@ export class TeamRuntime {
 		if (delivery.state === "in_flight") delivery.state = active.inputReady ? "delivered" : "unknown";
 		if (scope.kind === "management") this.finishManagement(team, member, active);
 		else this.finishWork(team, member, active);
+		this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "management activation"}${active.intent ? ` (${active.intent.kind.replaceAll("_", " ")})` : ""}`);
 		if (member.active === active) delete member.active;
 		delete member.currentWork;
 		member.activity = "idle";
@@ -2453,6 +2469,7 @@ export class TeamRuntime {
 			return;
 		}
 		team.ledger.commitResult(committed);
+		this.note(team, `${member.id} ${result.status} result for ${shortWorkRef(ref)}`);
 		version.resultRef = resultRef;
 		version.state = "resolved";
 		if (result.status === "failed") version.error = { code: "BUSINESS_FAILED", message: result.summary };
@@ -2461,6 +2478,15 @@ export class TeamRuntime {
 		if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY",
 			message: `Root work ${workRefKey(ref)} has a committed ${result.status} result from ${member.id}; read it with status(result) before accept_result`, work: ref, resultRef });
 		this.wakeWaiters(team);
+	}
+
+	/** Host display milestone (wall clock, so the injectable Runtime clock is unaffected); bounded, keeping the launch line. */
+	private note(team: TeamState, text: string): void {
+		team.timeline.push({ at: Date.now(), text });
+		if (team.timeline.length > TEAM_MAX_TIMELINE) {
+			team.timeline.splice(1, 1);
+			team.timelineOmitted++;
+		}
 	}
 
 	/** Tell the Manager which roots already run from initialRequests, so it never requests them again. */
@@ -2854,6 +2880,7 @@ export class TeamRuntime {
 		if (!this.completionReady(team)) return;
 		if (!team.terminalJournaled) {
 			team.terminalJournaled = true;
+			this.note(team, `Team ${team.lifecycle}${team.outcome ? ` · outcome ${team.outcome}` : ""}`);
 			const terminal = this.getTeamResult(team.id);
 			// A closed success is only reported once its terminal history is written.
 			if (terminal && !this.tryJournal(team, { version: 2, kind: "terminal", teamId: team.id, at: this.timestamp(),

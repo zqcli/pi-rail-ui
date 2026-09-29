@@ -87,7 +87,7 @@ test("Rail subagent installer exposes only Rail-namespaced slash commands", () =
 		else process.env["PI_SUBAGENT_DEPTH"] = previousDepth;
 	}
 
-	assert.deepEqual(commands, ["rail-team", "rail-agent"]);
+	assert.deepEqual(commands, ["rail-agent"]);
 });
 
 test("Rail subagent registers an input hook and consumes direct controls before session start", async () => {

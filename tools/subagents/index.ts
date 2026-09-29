@@ -1,4 +1,3 @@
-import { installTeamCommand } from "./team-command";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "./team-journal";
 import { TeamSessionHost } from "./team-host";
 import { installTeamTool } from "./team-tool";
@@ -123,7 +122,6 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 	};
 
 	installTeamTool(pi, { host: () => getRuntime().host, broker: () => getRuntime().broker });
-	installTeamCommand(pi, () => runtime?.host);
 	installStatefulSubagentTool(pi, {
 		broker: () => getRuntime().broker,
 		knownFastMode: (target) => runtime?.broker.knownFastMode(target),

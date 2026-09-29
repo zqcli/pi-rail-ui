@@ -155,16 +155,16 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 默认值：worker 许可 4、每成员未解决工作 64、Team 工作 512、每 root child 64、深度 8、每工作修订 32、每 root activation 128、Team activation 512、Manager activation 128、每 activation 模型请求 64/工具调用 256、每 root 模型请求 256/工具调用 1024、Team 模型请求 1024/工具调用 4096、紧急 Manager activation 3、结果预留 16 MiB。
 
 - 计数从 launch 开始只增不减。命中上限时，当前步骤安全收尾，工作进入 budget hold，并产生一条 incident；某个 root 耗尽不影响其他 root。
-- Team/Manager 预算耗尽后，Manager 只剩受限的紧急 activation（status、cancel_work、accept_result、close_member、close_team、yield）；紧急额度用完后只有宿主能处理。
+- Team/Manager 预算耗尽后，Manager 只剩受限的紧急 activation（status、cancel_work、accept_result、close_member、close_team、yield）；紧急额度用完后只能取消被挂起的工作或整个 Team。
 
-非模型的 `TeamHostControl`（actor 固定为 `@host`）：
+Runtime 保留非模型的 `TeamHostControl`（actor 固定为 `@host`）；`/rail-team` 已移除，用户侧没有调用入口，查看和取消 Team 通过 `subagent_team` 的 `status`/`cancel`：
 
 - `cancel_team(reason)`：整队取消。
 - `grant(scope, increments, reason)`：scope 为 Team 或已知 root；增量为正安全整数；先完整校验、写 journal，再应用。
 - `release_hold(work, incidentId, instruction)`：只解除 attention/protocol hold；不会提额，也不能绕过 Manager 故障造成的暂停。
 - `message_manager(text)`：产生一条去重的 `USER_COMMAND` 事件。
 
-`/rail-team [list] | <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>`：grant 和 resume 会先展示影响范围并要求确认；无 UI 的环境不能修改。`/rail-agent` 中对 Team 成员的 Stop/Delete 会经 Runtime 路由（见 README）。
+`/rail-agent` 中对 Team 成员的 Stop/Delete 会经 Runtime 路由（见 README）。
 
 ## 10. 容量上限
 
@@ -190,7 +190,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 
 ## 11. 状态展示、TeamResult 与历史
 
-- `status` 文本和 `/rail-team status` 显示：Team lifecycle/health/outcome、各工作计数与根验收数；每个成员的 lifecycle、activity、pause、当前 WorkRef 与任务预览、queued/blocked/held、Manager 待处理事件数、已提交结果数、model/FAST/SEARCH 和错误；hold、未决 incident、预算与 usage。idle 不会显示为“已完成”。
+- `status` 文本显示：Team lifecycle/health/outcome、各工作计数与根验收数；每个成员的 lifecycle、activity、pause、当前 WorkRef 与任务预览、queued/blocked/held、Manager 待处理事件数、已提交结果数、model/FAST/SEARCH 和错误；hold、未决 incident、预算与 usage。idle 不会显示为“已完成”。
 - `launch` 面板复用 grouped subagent 面板：顶部是 Team lifecycle/health、目标、工作计数、hold/incident 与预算。标题按结果着色（succeeded 绿、partial/需要处理/取消 黄、failed 红），hold 与 incident 行为黄色、预算耗尽为红色，其余为灰色；折叠时目标与 reason 各保留一行。其下每个成员一个带框子面板（Manager 在前，按 roster 顺序）：首行为 `状态图标 别名 · manager|worker · model`，第二行为运行指标（ctx、轮次、以分钟计的活跃时长）及 `ContextWindow · FAST · SEARCH`，第三行为成员状态短句（如 `running work xxxxxxxx@1`、`held · needs a Manager decision`、`waiting on other work`、`queued for a worker slot`、`closed · 2 results`），随后是当前或最近任务（折叠时一行；Manager 不重复 Team 目标）、最近活动，以及该成员最近提交的结果。状态、图标与外框颜色在所有 subagent 面板（单个、parallel、chain、Team）和 /rail-agent 中统一：运行 `▶`（蓝）、完成 `✓`（绿）、失败 `✗`（红）、held `⏸`（黄，需要 Manager 决定）、waiting `⧗` 与 idle `○`（灰），压缩中为 `◐`（黄）；汇总行按成员计数（`N members · … · 1 held · 1 waiting · …`）。没有输出的 idle/waiting/held 成员不显示占位文字。Usage 为已结算用量加当前 activation 的实时用量，汇总行给出总用量和 launch 墙钟时间。面板随 Runtime 状态和成员原生事件节流刷新；结束后结果仍保留每个成员子面板（活动记录有界），每个 worker 子面板的最终内容是它最近提交的完整结果（summary、findings、evidence、limitations、artifacts），Manager 子面板是关闭决定。给模型的最终文本和 grouped subagent 一样直接包含结果：Team 结论、roots/works、每个成员的状态、轮次、活跃时长与结果数、从 Runtime launch 起算的时间线（初始与后续派发、每次 activation 的开始与结束、结果提交、验收/取消/修订、恢复 held 工作（resume_work 或宿主 release_hold）、close_team、成员退出和 Team 终态；按墙钟记录，仅供显示，已提交的 reply 只记一条结果、不再重复记“结束”；最多保留 100 条并注明省略数），以及 Manager 选定的每份 worker 结果全文。全文总量上限 48 KiB，按“短结果完整保留、只由最大的几份平分剩余额度”分配；只有超出额度的结果被截断，并注明读取全文的 `status resultRef`。因此 launch 之后无需再调用 status 读取结果。`prepare`、`status`、`cancel` 面板显示与模型收到的相同文本。
 - `TeamResult`（version 2）：`lifecycle`、`outcome`、`reason`、`finalResultRefs`，各 root 的 WorkRef/状态/resultRef/review，各成员的 lifecycle/resourceState、usage 和未决 incident。最终内容引用 worker 撰写的结果，不再调用 Manager 重写。
 - journal 只同步写入有界事实：launched、result（发布前写入）、revise/cancel 决定、close decision、grant、terminal。写入失败时 fail closed。
@@ -214,4 +214,4 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 | `team-runtime.ts` | 唯一权威状态机：接受、调度、交付、提交、控制、关闭、预算、incident |
 | `team-budget.ts` / `team-journal.ts` | 累计计数 / 有界 journal generation |
 | `team-member-driver.ts` / `team-rpc-v2.ts` / `team-extension-v2.ts` | 原生 lifetime driver、私有 RPC、子扩展 |
-| `team-tool.ts` / `team-command.ts` / `team-host.ts` / `team-history.ts` | 父层工具、`/rail-team`、branch 宿主、只读历史 |
+| `team-tool.ts` / `team-host.ts` / `team-history.ts` | 父层工具、branch 宿主、只读历史 |

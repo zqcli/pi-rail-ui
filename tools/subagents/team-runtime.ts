@@ -831,7 +831,7 @@ export class TeamRuntime {
 	/** One open incident per exhausted Team/root scope; repeated hits reuse it instead of re-notifying. */
 	private budgetIncident(team: TeamState, hit: BudgetExhaustion): TeamIncidentView {
 		const rootId = hit.scope.kind === "root" ? hit.scope.rootId : undefined;
-		return this.createIncident(team, "BUDGET_HIT", `${rootId ? `Root ${rootId}` : "Team"} budget ${hit.counter} is exhausted; a host grant or cancellation is required`,
+		return this.createIncident(team, "BUDGET_HIT", `${rootId ? `Root ${rootId}` : "Team"} budget ${hit.counter} is exhausted; cancel the held work or the Team`,
 			undefined, undefined, rootId);
 	}
 
@@ -892,7 +892,7 @@ export class TeamRuntime {
 			if (pendingEvents().length) {
 				const exhausted = team.budget.teamExhausted(true);
 				// An exhausted Manager gets a bounded number of restricted emergency activations; after
-				// that only the host can grant or cancel. Workers with remaining budget keep running.
+				// the held work must be cancelled. Workers with remaining budget keep running.
 				if (exhausted) this.budgetIncident(team, exhausted);
 				if (!exhausted || team.budget.emergencyAvailable()) {
 					const activation = this.reserveManagement(team, manager, pendingEvents(), exhausted !== undefined);

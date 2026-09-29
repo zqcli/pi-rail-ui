@@ -216,29 +216,26 @@ function liveContext(toolCallId: string) {
 
 test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestration rules", () => {
 	const { tool } = setupTool();
-
-	assert.match(tool.description, /Use exactly one mode: single, parallel, chain, or control/);
-	assert.match(tool.description, /\{"model":"provider\/model:thinking","task":"one-off work","contextWindow":null\}/);
-	assert.match(tool.description, /\{"model":"provider\/model:thinking","alias":"worker","task":"initial work","contextWindow":null\}/);
-	assert.match(tool.description, /\{"target":"worker","task":"follow-up","contextWindow":null\}/);
-	assert.match(tool.description, /\{"tasks":\[\{"task":"A","contextWindow":null\},\{"model":"provider\/model","alias":"worker","task":"B","contextWindow":null\}\]\}/);
-	assert.match(tool.description, /Explicit single example: \{"task":"work","contextWindow":64000\}/);
-	assert.match(tool.description, /Explicit grouped example: \{"tasks":\[\{"task":"A","contextWindow":64000\},\{"task":"B","contextWindow":128000\}\]\}/);
-	assert.match(tool.description, /\{"chain":\[\{"task":"plan","contextWindow":null\},\{"target":"worker","task":"implement \{previous\}","contextWindow":null\}\]\}/);
-	assert.match(tool.description, /\{"target":"worker","control":\{"delivery":"steer","message":"redirect now"\}\}/);
-	assert.match(tool.description, /Set contextWindow to null by default/);
-	assert.match(tool.description, /fastMode/);
-	assert.match(tool.description, /Parallel and chain calls may set fastMode independently on each eligible item/);
-	assert.match(tool.description, /do not set a grouped top-level fastMode/);
-	assert.match(tool.description, /no search parameter/);
-	assert.match(tool.description, /existing target.*descriptor|descriptor.*existing target/iu);
-	assert.match(tool.description, /through \/rail-agent/);
-	assert.match(tool.description, /Null or omission uses the selected child model's native default/);
-	assert.match(tool.description, /Only use a positive safe integer when the user explicitly requests a specific child context or compaction budget/);
-	assert.match(tool.description, /Top-level numeric contextWindow is only for single mode/);
-	assert.match(tool.description, /each tasks or chain item owns its own numeric contextWindow/);
-	assert.match(tool.description, /multiple sibling subagent calls in the same assistant turn/);
-	assert.match(tool.description, /do not use tasks/);
+	const description: string = tool.description;
+	assert.match(description, /exactly ONE mode/);
+	// One canonical, valid example per usage; each must parse as the arguments it describes.
+	const examples = [...description.matchAll(/(\{"(?:task|model|target|session|tasks|chain)".*?\})(?=[ .;)]|$)/gmu)].map((match) => match[1]!);
+	const parsed = examples.map((example) => JSON.parse(example));
+	assert.deepEqual(parsed.find((args) => args.alias), { model: "provider/id", alias: "reviewer", task: "..." });
+	assert.deepEqual(parsed.find((args) => args.target && args.task), { target: "reviewer", task: "..." });
+	assert.deepEqual(parsed.find((args) => args.session), { session: { mode: "fork", path: "/path/session.jsonl" }, task: "..." });
+	assert.equal(parsed.find((args) => args.tasks)?.tasks.length, 2);
+	assert.match(parsed.find((args) => args.chain)?.chain[1].task, /\{previous\}/);
+	assert.deepEqual(parsed.find((args) => args.control), { target: "reviewer", control: { delivery: "steer", message: "..." } });
+	assert.match(description, /several SINGLE subagent tool calls in the same response/);
+	assert.match(description, /Do not also set top-level task/);
+	assert.match(description, /Never placeholders/);
+	assert.match(description, /one-off helper does not see this conversation/);
+	assert.match(description, /contextWindow: omit it/);
+	assert.match(description, /fastMode: true only when the user asks/);
+	assert.match(description, /not allowed with target or control/);
+	assert.match(description, /subagent_team tool, never subagent/);
+	assert.match(description, /Helpers cannot call subagent/);
 	assert.equal(tool.executionMode, "parallel");
 	const contextWindowSchemas = [
 		tool.parameters.properties.contextWindow,
@@ -259,34 +256,16 @@ test("tool prompt teaches the LLM stateless, persistent, follow-up, and orchestr
 		assert.deepEqual(schema.anyOf.map((variant: any) => variant.type), ["boolean", "null"]);
 		assert.match(schema.description, /Ignored on a non-GPT model/);
 	}
+	assert.match(tool.parameters.properties.confirmSessionAttach.description, /Do not ask the user yourself/);
 	const guidance = tool.promptGuidelines.join("\n");
-	assert.match(guidance, /lifecycle by continuity/);
-	assert.match(guidance, /existing saved Pi session/);
-	assert.match(guidance, /fork by default/);
-	assert.match(guidance, /another repository/);
-	assert.match(guidance, /preserve that session's project cwd/);
-	assert.match(guidance, /new long-term helper expected to receive follow-ups/);
-	assert.match(guidance, /do not create an empty, idle, or placeholder persistent session/);
-	assert.match(guidance, /stateless one-off work/);
-	assert.match(guidance, /make the task self-contained/);
-	assert.match(guidance, /Use contextWindow:null by default/);
-	assert.match(guidance, /fastMode/);
-	assert.match(guidance, /On a non-GPT model it is silently ignored/);
-	assert.match(guidance, /parallel and chain.*individual item/iu);
-	assert.match(guidance, /existing.*rail-agent|rail-agent.*existing/iu);
-	assert.match(guidance, /Only use a positive integer when the user explicitly requests/);
-	assert.match(guidance, /Null or omission uses the selected child model's native default/);
-	assert.match(guidance, /create no child JSONL and never appear in \/resume/);
-	assert.match(guidance, /separate top-level Tool Call panels/);
-	assert.match(guidance, /Pi preflights sibling calls in order and executes them concurrently/);
-	assert.match(guidance, /tasks array only when the user wants one grouped subagent Tool Call/);
-	assert.match(guidance, /started by subagent_team launch, never by subagent/);
-	assert.match(guidance, /Never invent placeholder values/);
-	assert.match(guidance, /Live controls apply only to an already-running local persistent subagent/);
-	assert.match(guidance, /needs_input.*specialist_request/);
-	assert.match(guidance, /permanently deleted from the \/rail-agent panel/);
-	assert.match(guidance, /later target calls.*unknown persistent subagent/);
-	assert.equal(tool.promptGuidelines.some((line: string) => /cannot recursively call subagent/.test(line)), true);
+	assert.match(guidance, /one-off helper by default/);
+	assert.match(guidance, /persistent helper \(model\+alias\) only when you expect follow-ups/);
+	assert.match(guidance, /emit all their subagent calls in one response/);
+	assert.match(guidance, /session \{mode:"fork", path\}/);
+	assert.match(guidance, /@agent\/<alias>.*target=<alias>/);
+	assert.match(guidance, /@new\/<provider>\/<id>.*model=<provider>\/<id>/);
+	assert.match(guidance, /needs_input or specialist_request/);
+	assert.match(guidance, /unknown persistent subagent/);
 });
 
 test("control mode steers and queues follow-ups for an active persistent target", async () => {

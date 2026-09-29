@@ -41,25 +41,46 @@ const MAX_CONCURRENCY = 4;
 const OUTPUT_CAP = 50 * 1024;
 const DETAILS_TOTAL_CAP = 512 * 1024;
 
+const SUBAGENT_DESCRIPTION = [
+	"Delegate work to other Pi model sessions (helpers). Each call uses exactly ONE mode, chosen by the field you fill:",
+	"",
+	"SINGLE: fill `task` for one helper.",
+	"- One-off helper (default; nothing is saved): {\"task\":\"...\"}. Add \"model\":\"provider/id\" to pick a model; omit it to use your current model.",
+	"- New persistent helper you will message again: {\"model\":\"provider/id\",\"alias\":\"reviewer\",\"task\":\"...\"}",
+	"- Follow-up to an existing persistent helper: {\"target\":\"reviewer\",\"task\":\"...\"} (no model, no alias).",
+	"- Continue a saved Pi session file: {\"session\":{\"mode\":\"fork\",\"path\":\"/path/session.jsonl\"},\"task\":\"...\"}. fork works on a copy; use exclusive only if the user asks to take over the original. Set cwd to that session's project directory when it differs from the current one.",
+	"PARALLEL: fill `tasks` for up to 8 independent helpers shown together in one panel: {\"tasks\":[{\"task\":\"A\"},{\"model\":\"provider/id\",\"task\":\"B\"}]}. Each item takes the SINGLE fields. Do not also set top-level task.",
+	"SEPARATE CALLS: if the user wants each helper as its own call or panel, emit several SINGLE subagent tool calls in the same response, e.g. subagent({\"task\":\"security review\"}) and subagent({\"task\":\"performance review\"}) side by side. They run concurrently; do not wait for the first before emitting the second.",
+	"CHAIN: fill `chain` for up to 8 steps run in order, when a step needs the previous step's answer. {previous} in a task is replaced by the previous step's final answer: {\"chain\":[{\"task\":\"Write a plan\"},{\"task\":\"Critique this plan: {previous}\"}]}",
+	"CONTROL: message a persistent helper that is running right now: {\"target\":\"reviewer\",\"control\":{\"delivery\":\"steer\",\"message\":\"...\"}}. steer redirects it before its next model call; followUp queues the message until its current run finishes. No task. Never send a control in the same response that starts the helper.",
+	"",
+	"Rules:",
+	"- Leave every unused field out. If you must fill it, use \"\" for text fields (model, target, alias, task, cwd), null for session/control/contextWindow/fastMode, and [] for tasks/chain. Never placeholders such as \"/\" or \"null\".",
+	"- Write self-contained tasks: a one-off helper does not see this conversation. A target or forked session keeps its own history.",
+	"- contextWindow: omit it for the native default. Set a positive integer only when the user asks for a specific budget, on the single call or on each tasks/chain item.",
+	"- fastMode: true only when the user asks for fast mode, on a one-off or new persistent helper (each item in tasks/chain). Ignored on non-GPT models; not allowed with target or control.",
+	"- Teams (a manager coordinating workers) use the subagent_team tool, never subagent. Helpers cannot call subagent themselves.",
+].join("\n");
+
 const SessionSourceSchema = Type.Object({
 	mode: StringEnum(["fork", "exclusive"] as const, {
-		description: "How to adopt an existing saved Pi session: use fork by default to preserve the original; use exclusive only when the user explicitly wants in-place ownership and no other process has it open",
+		description: "fork (default) continues in a copy and leaves the original file untouched; exclusive takes over the original, only when the user explicitly asks and no other Pi process has it open",
 	}),
-	path: Type.String({ description: "Existing saved Pi session path whose conversation history and project context should be continued" }),
+	path: Type.String({ description: "Path of the saved Pi session .jsonl file to continue" }),
 });
 
 const ControlSchema = Type.Object({
 	delivery: StringEnum(["steer", "followUp"] as const, {
-		description: "steer is delivered after the current child assistant turn and its tool calls, before the next model call; followUp runs after the child's current work finishes",
+		description: "steer: deliver before the helper's next model call (redirect now). followUp: queue until its current run finishes",
 	}),
-	message: Type.String({ description: "Control message for an already-running local persistent subagent" }),
+	message: Type.String({ description: "Message for the running persistent helper" }),
 });
 
 // Providers that fill every property need a real no-op value for these objects;
 // otherwise they invent placeholders such as {"path":"/nonexistent"} or {"message":"start"}.
 function sessionSourceSchema() {
 	return Type.Optional(Type.Union([SessionSourceSchema, Type.Null()], {
-		description: "Only to adopt an existing saved Pi session. Otherwise omit it or use null; never a placeholder path.",
+		description: "Only to continue a saved Pi session file named by the user. Otherwise omit it (or null); never a placeholder path.",
 	}));
 }
 
@@ -69,7 +90,7 @@ function contextWindowSchema() {
 		Type.Null(),
 	], {
 		default: null,
-		description: "Child-local context/compaction budget. Use null by default; null or omission uses the selected child model's native default. Use a positive safe integer only when the user explicitly requests one.",
+		description: "Helper context budget in tokens. Omit it (or null) for the model's native default; a positive integer only when the user asks for a specific budget, using their exact number (64000 stays 64000). Never the string \"null\".",
 	}));
 }
 
@@ -79,27 +100,27 @@ function fastModeSchema() {
 		Type.Null(),
 	], {
 		default: null,
-		description: "Use native OpenAI priority fast mode for a stateless call or a new persistent agent. Ignored on a non-GPT model, where the dispatch still runs with Fast off; a GPT model on an API without native support still fails the eligibility check. null or omission means off. Existing targets are managed in /rail-agent.",
+		description: "true only when the user asks for fast mode, on a one-off or new persistent helper. Ignored on a non-GPT model; a GPT model without native OpenAI fast mode is rejected. Not allowed with target (its policy is managed in /rail-agent). Omit (or null) for off.",
 	}));
 }
 
 const TaskItem = Type.Object({
-	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. Use with no alias/session for stateless work or with alias to create a persistent session." })),
-	target: Type.Optional(Type.String({ description: "Exact linked persistent alias or agentId whose existing conversation memory should continue; omit model when target is set" })),
-	alias: Type.Optional(Type.String({ description: "Alias for a new persistent long-term helper that is expected to receive follow-ups; omit for one-off stateless work" })),
-	task: Type.String({ description: "Self-contained one-off task for stateless work, concrete initial task for a new persistent helper, or follow-up message for target" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; when adopting a cross-project saved session, use its original project directory when known" })),
+	model: Type.Optional(Type.String({ description: "Model as provider/id, optionally :thinking (e.g. openai/gpt-5.5:high). Omit to use the current model. Not with target." })),
+	target: Type.Optional(Type.String({ description: "Alias of an existing persistent helper to continue; do not also set model or alias" })),
+	alias: Type.Optional(Type.String({ description: "Name for a NEW persistent helper that keeps its history for later target calls; omit for one-off work" })),
+	task: Type.String({ description: "Self-contained instructions: a one-off helper does not see this conversation" }),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted helper; defaults to the current directory" })),
 	session: sessionSourceSchema(),
 	contextWindow: contextWindowSchema(),
 	fastMode: fastModeSchema(),
 });
 
 const ChainItem = Type.Object({
-	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model" })),
-	target: Type.Optional(Type.String({ description: "Exact linked persistent alias or agentId to continue; omit model when target is set" })),
-	alias: Type.Optional(Type.String({ description: "Alias for a new persistent helper expected to receive follow-ups; omit for stateless work" })),
-	task: Type.String({ description: "Self-contained task, persistent initial/follow-up task, and optional {previous} placeholder" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session" })),
+	model: Type.Optional(Type.String({ description: "Model as provider/id, optionally :thinking (e.g. openai/gpt-5.5:high). Omit to use the current model. Not with target." })),
+	target: Type.Optional(Type.String({ description: "Alias of an existing persistent helper to continue; do not also set model or alias" })),
+	alias: Type.Optional(Type.String({ description: "Name for a NEW persistent helper that keeps its history for later target calls; omit for one-off work" })),
+	task: Type.String({ description: "Self-contained instructions: a one-off helper does not see this conversation. {previous} is replaced by the previous step's final answer." }),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted helper; defaults to the current directory" })),
 	session: sessionSourceSchema(),
 	contextWindow: contextWindowSchema(),
 	fastMode: fastModeSchema(),
@@ -107,22 +128,22 @@ const ChainItem = Type.Object({
 
 const SubagentParams = Type.Object({
 	teamId: Type.Optional(Type.Union([Type.String(), Type.Null()], { description: "Retired. Omit or null; Teams run only through subagent_team." })),
-	model: Type.Optional(Type.String({ description: "Pi model reference; omit to use the current model. In single mode, model+task without alias/session is stateless; model+alias+task creates persistent." })),
-	target: Type.Optional(Type.String({ description: "Continue the exact linked persistent alias or agentId and its existing conversation memory; do not also set model" })),
-	alias: Type.Optional(Type.String({ description: "Create a new persistent long-term helper expected to receive future follow-ups; omit for one-off stateless work" })),
-	task: Type.Optional(Type.String({ description: "Self-contained stateless task, concrete initial task for a new persistent helper, or persistent follow-up message" })),
-	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted session; preserve the saved session project directory for cross-project work when known" })),
+	model: Type.Optional(Type.String({ description: "Model as provider/id, optionally :thinking (e.g. openai/gpt-5.5:high). Omit to use the current model. Not with target." })),
+	target: Type.Optional(Type.String({ description: "Alias of an existing persistent helper to continue; do not also set model or alias" })),
+	alias: Type.Optional(Type.String({ description: "Name for a NEW persistent helper that keeps its history for later target calls; omit for one-off work" })),
+	task: Type.Optional(Type.String({ description: "SINGLE mode. Self-contained instructions: a one-off helper does not see this conversation. For target, the follow-up message." })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for a new or adopted helper; defaults to the current directory" })),
 	session: sessionSourceSchema(),
 	contextWindow: contextWindowSchema(),
 	fastMode: fastModeSchema(),
 	control: Type.Optional(Type.Union([ControlSchema, Type.Null()], {
-		description: "Only for control mode (target + control, no task). For every other call omit it or use null; a non-empty message makes the call a control.",
+		description: "CONTROL mode only (with target, no task). Otherwise omit it (or null); any non-empty message makes the call a control.",
 	})),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Group independent model-session tasks inside one subagent Tool Call; each item may be stateless or persistent. Use only when one grouped parent Tool Call with child panels is desired." })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Sequential model-session tasks; {previous} inserts the preceding final output" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: up to 8 independent helpers in one grouped panel; each item takes the single-mode fields. Leave top-level task empty." })),
+	chain: Type.Optional(Type.Array(ChainItem, { description: "CHAIN mode: up to 8 steps run in order; {previous} in a step's task is replaced by the previous step's final answer. Leave top-level task empty." })),
 	confirmSessionAttach: Type.Optional(Type.Boolean({
 		default: true,
-		description: "Confirm before forking or exclusively opening an existing session",
+		description: "The tool itself shows a confirmation dialog before opening a saved session; leave the default. Do not ask the user yourself.",
 	})),
 });
 
@@ -1082,39 +1103,16 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Delegate work to Pi model sessions. Use exactly one mode: single, parallel, chain, or control.\n"
-			+ "Context budget rule: Set contextWindow to null by default. Null or omission uses the selected child model's native default. Only use a positive safe integer when the user explicitly requests a specific child context or compaction budget. Top-level numeric contextWindow is only for single mode; each tasks or chain item owns its own numeric contextWindow. A top-level null is tolerated in grouped/control calls as the default sentinel. Explicit single example: {\"task\":\"work\",\"contextWindow\":64000}. Explicit grouped example: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":64000},{\"task\":\"B\",\"contextWindow\":128000}]}.\n"
-			+ "1. single: dispatch one task. Lifecycle options:\n"
-			+ "   - stateless (one-off, no saved JSONL): {\"model\":\"provider/model:thinking\",\"task\":\"one-off work\",\"contextWindow\":null} (omit model to use current model)\n"
-			+ "   - new persistent (expected follow-ups): {\"model\":\"provider/model:thinking\",\"alias\":\"worker\",\"task\":\"initial work\",\"contextWindow\":null}\n"
-			+ "   - continue linked helper: {\"target\":\"worker\",\"task\":\"follow-up\",\"contextWindow\":null} (do not provide model)\n"
-			+ "   - adopt existing saved session: {\"session\":{\"mode\":\"fork\",\"path\":\"/path/to/session.jsonl\"},\"task\":\"continue work\",\"contextWindow\":null} (use fork unless the user explicitly requests exclusive ownership)\n"
-			+ "2. parallel: group independent tasks into one parent Tool Call panel: {\"tasks\":[{\"task\":\"A\",\"contextWindow\":null},{\"model\":\"provider/model\",\"alias\":\"worker\",\"task\":\"B\",\"contextWindow\":null}]}. For independent work that should appear as separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn and do not use tasks; Pi executes sibling calls concurrently.\n"
-			+ "3. chain: sequential pipeline where {previous} inserts the preceding final output: {\"chain\":[{\"task\":\"plan\",\"contextWindow\":null},{\"target\":\"worker\",\"task\":\"implement {previous}\",\"contextWindow\":null}]}.\n"
-			+ "4. control: steer or queue follow-up for an already-running local persistent helper: {\"target\":\"worker\",\"control\":{\"delivery\":\"steer\",\"message\":\"redirect now\"}}. Controls apply only to active persistent targets; do not include task, model, alias, session, tasks, or chain. contextWindow must be null or omitted, never numeric, and control must never be issued as a sibling of the dispatch it intends to control.\n"
-			+ "Fast mode: set fastMode:true only for a stateless call or the initial creation of a new persistent agent. On a non-GPT model the value is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Parallel and chain calls may set fastMode independently on each eligible item; do not set a grouped top-level fastMode or put it on an existing target or control call. fastMode:false keeps that new call or agent off; null or omission means off. Existing target policy is stored in its descriptor and changed only through /rail-agent. Native hosted search is an internal live policy for eligible GPT children; there is no search parameter. Grouped child panels show each item's effective FAST and SEARCH state.\n"
-			+ "Teams: never start Team members with subagent. Use the subagent_team tool: prepare (manager, workers, brief, initialRequests), then launch with only the returned teamId. Child sessions cannot recursively call subagent. Persistent agents can be permanently deleted from /rail-agent.",
-		promptSnippet: "Delegate self-contained work to stateless Pi model sessions, or create and continue persistent model sessions",
+		description: SUBAGENT_DESCRIPTION,
+		promptSnippet: "Delegate self-contained work to one-off or persistent helper model sessions (single, parallel, chain, or control)",
 		executionMode: "parallel",
 		promptGuidelines: [
-			"Choose the subagent lifecycle by continuity: use target for an already linked persistent helper; use session in fork mode to adopt an existing saved Pi session whose history or project context matters; use model+alias+task for a new long-term helper expected to receive follow-ups; otherwise use model+task as stateless one-off work.",
-			"For an existing linked subagent, continue with target+task and no model. Reuse the exact alias so the same child conversation memory, session, and working context continue.",
-			"When adopting an existing saved Pi session, use session mode fork by default so the original remains untouched. This is appropriate for continuing prior work or modifying another repository; preserve that session's project cwd when known. Use exclusive only with explicit user intent and no other writer.",
-			"Create a new persistent subagent only when future follow-ups need the same child context. The first model+alias call must include a concrete initial task; do not create an empty, idle, or placeholder persistent session. One model can back many aliases with independent histories.",
-			"For stateless subagent work, call subagent with task, optional model, and contextWindow:null by default. Omit alias, target, and session. Use it proactively for bounded code search, focused analysis, verification, comparison, or review, and make the task self-contained because no state persists. Stateless runs create no child JSONL and never appear in /resume.",
-			"In subagent calls, omit model to use the current Pi model. Select an explicit model only when the delegated task benefits from a different model or thinking level.",
-			"Use contextWindow:null by default. Null or omission uses the selected child model's native default. Only use a positive integer when the user explicitly requests a specific child context or compaction budget; for parallel and chain calls, put an explicit numeric value on the individual item that owns it.",
-			"Use fastMode:true only for a stateless call or a new persistent agent. On a non-GPT model it is silently ignored and the call runs with Fast off. GPT models retain the supported native OpenAI API requirement. Keep fastMode null or omitted by default. For parallel and chain, put fastMode on the individual item that owns it; do not use a grouped top-level fastMode or put it on an existing target or control call. Existing persistent target policy is managed through /rail-agent. Hosted Search is an internal policy with no search parameter; grouped child panels show each item's effective FAST and SEARCH state.",
-			"For independent parallel work that should have separate top-level Tool Call panels, emit multiple sibling subagent calls in the same assistant turn. Give each call exactly one single-mode task using model+task, target+task, or model+alias+task as appropriate; do not put those tasks in one tasks array. Pi preflights sibling calls in order and executes them concurrently.",
-			"Use the tasks array only when the user wants one grouped subagent Tool Call with multiple child panels. Team members are started by subagent_team launch, never by subagent. Use chain only when each step depends on the previous result, inserting {previous} where the prior final output is needed.",
-			"Live controls apply only to an already-running local persistent subagent. Use target+control with delivery=steer to redirect it before its next model call, or delivery=followUp to queue work after its current run. Do not include task, model, alias, session, tasks, or chain in a control call; contextWindow must be null or omitted, never numeric. Do not issue a control as a sibling of the initial dispatch because startup and preflight can race. A parent LLM normally cannot call control while its own subagent Tool Call is pending, so the practical interactive path is /rail-agent and the Tool control mode is primarily for host-side or external orchestration.",
-			"When a child asks for input or another specialist in its ordinary final answer (for example by using the plain-language labels needs_input or specialist_request), keep orchestration in the parent: resolve the question or dispatch the specialist, then continue the original persistent child with target+task. These labels are guidance, not a structured wire protocol. Do not enable recursive child subagent calls.",
-			"When the user names @agent/<alias> or agent://<alias>, use subagent with target set to that exact alias.",
-			"When the user names @new/<provider>/<modelId> or new://<provider>/<modelId>, use subagent with model set to that canonical model reference and assign a concise alias.",
-			"Subagent child sessions cannot recursively call subagent. Keep nested decomposition and orchestration in the parent session.",
-			"In subagent calls, use session only to adopt an existing saved Pi session; do not set it for ordinary stateless work or a newly created persistent helper.",
-			"Leave fields of unused modes out or null: session and control accept null, and tasks/chain accept []. Never invent placeholder values (for example a dummy session path or a control message such as \"start\"); any non-empty control.message turns the call into a control call.",
-			"Persistent subagents may be permanently deleted from the /rail-agent panel. Deletion intentionally removes only that child JSONL and Rail descriptor; it does not rewrite links stored in other parent sessions, so later target calls from those sessions fail with an unknown persistent subagent error.",
+			"Use subagent for bounded, self-contained work worth delegating: code search, focused analysis, review, verification, comparison. Use a one-off helper by default; create a persistent helper (model+alias) only when you expect follow-ups, then continue it with target.",
+			"Start independent helpers at the same time: emit all their subagent calls in one response (one call with tasks for a grouped panel, or several single calls for separate panels). Do not wait for one helper before starting an independent one.",
+			"When the user asks to continue or resume work from a saved Pi session file (.jsonl), call subagent with session {mode:\"fork\", path} and the task, rather than asking a helper to read the file.",
+			"@agent/<alias> or agent://<alias> in the user message means subagent with target=<alias>. @new/<provider>/<id> or new://<provider>/<id> means a new persistent helper with model=<provider>/<id> and a short alias.",
+			"Keep orchestration in this session. If a helper's answer asks for input or another specialist (for example needs_input or specialist_request), resolve it here, then continue the same helper with target+task.",
+			"A deleted persistent helper (removed in /rail-agent) cannot be continued; a target call to it fails with an unknown persistent subagent error.",
 		],
 		parameters: SubagentParams,
 		prepareArguments(params: unknown): SubagentParamsValue {

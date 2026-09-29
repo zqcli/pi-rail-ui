@@ -252,7 +252,7 @@ test("subagent transcript view keeps a hard row cap and follows the newest activ
 	assert.match(wideText, /ctx 1\.4k/);
 	assert.match(wideText, /2 turns/);
 	assert.match(wideText, /\$0\.012/);
-	assert.match(wideText, / 0:\d\d\b/u);
+	assert.match(wideText, /<1m/);
 	assert.match(text, /earlier activity hidden/);
 	assert.match(text, /1\.2k in[\s\S]*earlier activity hidden/);
 	assert.ok(view.render(10).every((line) => visibleWidth(line) <= 10));
@@ -283,7 +283,7 @@ test("completed expanded panels show the full final answer and usage metrics", (
 	assert.match(expanded, /18\.2k cached/);
 	assert.match(expanded, /\$0\.083/);
 	assert.doesNotMatch(expanded, /\$0\.0831/);
-	assert.match(expanded, / 1:\d\d\b/u);
+	assert.match(expanded, /1m/);
 	assert.doesNotMatch(expanded, /· stop/);
 	assert.match(expanded, /Recent activity[\s\S]*Final answer/);
 	assert.match(expanded, /3 turns[\s\S]*final answer line 0/);
@@ -406,7 +406,7 @@ test("parallel runs render as independent panels with aggregate wall usage", () 
 
 	assert.match(text, /2 model sessions · 2 complete/);
 	assert.match(text, /3k in/);
-	assert.match(text, /wall 0:\d\d/);
+	assert.match(text, /wall <1m/);
 	assert.match(text, /alpha · one-off · provider\/model-a:high/);
 	assert.match(text, /beta · persistent · provider\/model-b:xhigh/);
 	assert.match(text, /alpha final/);
@@ -421,7 +421,17 @@ test("parallel runs render as independent panels with aggregate wall usage", () 
 	}
 });
 
-test("usage elapsed time shows m:ss, and h:mm:ss past an hour", () => {
+test("panel borders use one intuitive color per state: running blue, completed green, held yellow, failed red, idle gray", () => {
+	const tagged = { fg: (color: string, text: string) => `{${color}|${text}}`, bold: (text: string) => text };
+	const base = { model: "provider/gpt", output: "done", persistent: false, transcript: { entries: [], omittedEntries: 0 } };
+	const runs: SubagentTranscriptRun[] = (["running", "completed", "held", "failed", "idle", "waiting"] as const)
+		.map((status) => ({ ...base, alias: status, status }));
+	const lines = renderSubagentTranscript(runs, false, tagged as any, { mode: "parallel" }).render(80);
+	const borderOf = (alias: string) => lines[lines.findIndex((line) => line.includes(`${alias} · one-off`)) - 1]!.match(/^\{(\w+)\|╭/u)?.[1];
+	assert.deepEqual(runs.map((run) => borderOf(run.alias)), ["border", "success", "warning", "error", "borderMuted", "borderMuted"]);
+});
+
+test("usage elapsed time changes only at minute boundaries", () => {
 	const renderDuration = (durationMs: number): string => renderSubagentTranscript([{
 		alias: "timer",
 		status: "running",
@@ -431,11 +441,12 @@ test("usage elapsed time shows m:ss, and h:mm:ss past an hour", () => {
 		durationMs,
 	}], false, theme as any).render(100).join("\n");
 
-	assert.match(renderDuration(1_000), / 0:01\b/u);
-	assert.match(renderDuration(59_999), / 0:59\b/u);
-	assert.match(renderDuration(60_000), / 1:00\b/u);
-	assert.match(renderDuration(119_999), / 1:59\b/u);
-	assert.match(renderDuration(3_723_000), / 1:02:03\b/u);
+	assert.match(renderDuration(1_000), /<1m/);
+	assert.match(renderDuration(59_999), /<1m/);
+	assert.match(renderDuration(60_000), /1m/);
+	assert.doesNotMatch(renderDuration(60_000), /<1m/);
+	assert.match(renderDuration(119_999), /1m/);
+	assert.match(renderDuration(120_000), /2m/);
 });
 
 test("empty runs render only a zero-summary header within the row cap", () => {
@@ -695,7 +706,7 @@ test("single panels keep the initial task while separating runtime and usage lin
 		fastModes: ["on"],
 	}).render(120).join("\n");
 
-	assert.match(text, /Compacting · cus-resp\/gpt-5\.6-luna:max · ctx 358\.5k · 4 turns · 1:\d\d/);
+	assert.match(text, /Compacting · cus-resp\/gpt-5\.6-luna:max · ctx 358\.5k · 4 turns · 1m/);
 	assert.match(text, /697\.7k in · 3\.4k out · 646\.1k cached/);
 	assert.match(text, /INITIAL SINGLE TASK/);
 	assert.match(text, /INITIAL SINGLE TASK END/);
@@ -721,7 +732,7 @@ test("completed and failed single panels share runtime hierarchy and hide normal
 	const completed = renderSubagentTranscript([base], true, theme as any, {
 		contextWindows: ["64K"],
 	}).render(120).join("\n");
-	assert.match(completed, /Completed · provider\/gpt-review · ctx 1\.5k · 2 turns · 0:\d\d/);
+	assert.match(completed, /Completed · provider\/gpt-review · ctx 1\.5k · 2 turns · <1m/);
 	assert.match(completed, /1k in · 200 out · 500 cached/);
 	assert.doesNotMatch(completed, /· stop|Usage|ContextWindow 64K|FAST|SEARCH/);
 	assert.match(completed, /completed initial task/);
@@ -729,7 +740,7 @@ test("completed and failed single panels share runtime hierarchy and hide normal
 	const failed = renderSubagentTranscript([{ ...base, status: "failed", output: "provider failed", errorMessage: "provider failed", stopReason: "error" }], false, theme as any, {
 		contextWindows: ["64K"],
 	}).render(120).join("\n");
-	assert.match(failed, /Failed · provider\/gpt-review · ctx 1\.5k · 2 turns · 0:\d\d · error/);
+	assert.match(failed, /Failed · provider\/gpt-review · ctx 1\.5k · 2 turns · <1m · error/);
 	assert.match(failed, /provider failed/);
 	assert.doesNotMatch(failed, /Usage|ContextWindow 64K|FAST|SEARCH/);
 });
@@ -776,7 +787,7 @@ test("grouped panels retain child identity, explicit dispatch policy, and chain 
 	}).render(120).join("\n");
 
 	assert.match(text, /2 model sessions · 1 complete · 0 running · 1 failed/);
-	assert.match(text, /3k in · 400 out · 600 cached · \$0\.100 · wall 0:\d\d/);
+	assert.match(text, /3k in · 400 out · 600 cached · \$0\.100 · wall <1m/);
 	assert.match(text, /1\/2 · planner · one-off · provider\/gpt-plan/);
 	assert.match(text, /1\/2 · planner · one-off · provider\/gpt-plan[^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH off/);
 	assert.match(text, /2\/2 · reviewer · persistent · provider\/gpt-review[^\n]*\n[^\n]*ContextWindow 64K · FAST on · SEARCH on/);
@@ -789,7 +800,7 @@ test("grouped panels retain child identity, explicit dispatch policy, and chain 
 	assert.ok(firstPanelStart >= 0 && firstPanelEnd > firstPanelStart);
 	const firstPanel = text.slice(firstPanelStart, firstPanelEnd);
 	assert.doesNotMatch(firstPanel, /\bin\b|\bout\b|cached|cache write|\$/);
-	assert.match(firstPanel, /ctx 1\.1k · 1 turn · 0:\d\d/);
+	assert.match(firstPanel, /ctx 1\.1k · 1 turn · <1m/);
 	for (const width of [40, 80, 120]) {
 		assert.ok(renderSubagentTranscript(runs, false, theme as any, {
 			contextWindows: [undefined, "64K"],

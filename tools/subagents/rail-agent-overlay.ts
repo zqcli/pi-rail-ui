@@ -74,9 +74,9 @@ function phaseLabel(agent: RailAgentView): string {
 	return agent.phase.toUpperCase();
 }
 
-function phaseColor(phase: RailAgentPhase, isCompacting = false): "accent" | "warning" | "error" | "muted" | "dim" {
+function phaseColor(phase: RailAgentPhase, isCompacting = false): "border" | "warning" | "error" | "muted" | "dim" {
 	if (isCompacting) return "warning";
-	if (phase === "running") return "accent";
+	if (phase === "running") return "border";
 	if (phase === "starting" || phase === "queued") return "warning";
 	if (phase === "error") return "error";
 	if (phase === "idle") return "muted";

@@ -741,11 +741,8 @@ function compactNumber(value: number): string {
 
 function compactDuration(durationMs: number | undefined): string {
 	if (durationMs === undefined) return "";
-	const seconds = Math.max(0, Math.floor(durationMs / 1000));
-	const pad = (value: number) => String(value).padStart(2, "0");
-	const hours = Math.floor(seconds / 3600);
-	const minutes = Math.floor(seconds / 60) % 60;
-	return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
+	const minutes = Math.floor(durationMs / 60_000);
+	return minutes > 0 ? `${minutes}m` : "<1m";
 }
 
 function hostedSearchText(count: number): string {
@@ -798,11 +795,15 @@ function statusText(run: SubagentTranscriptRun): string {
 	return "Completed";
 }
 
-/** One color per state, shared by icons, headers and borders: attention is the only yellow. */
-function statusColor(run: SubagentTranscriptRun): "accent" | "success" | "error" | "warning" | "muted" {
+/**
+ * One color per state, shared by icons, headers and borders: running blue, completed green, needs
+ * attention yellow, failed red, idle or waiting gray. Blue and green stay apart in both built-in themes.
+ */
+function statusColor(run: SubagentTranscriptRun): "border" | "accent" | "success" | "error" | "warning" | "muted" {
 	if (run.status === "failed") return "error";
 	if (run.status === "held" || (run.status === "running" && run.isCompacting)) return "warning";
-	if (run.status === "running" || run.status === "accepted") return "accent";
+	if (run.status === "running") return "border";
+	if (run.status === "accepted") return "accent";
 	if (run.status === "idle" || run.status === "waiting") return "muted";
 	return "success";
 }
@@ -921,7 +922,7 @@ class SubagentRunPanel implements Component {
 			: new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
 		const color = statusColor(this.run);
-		const borderColor = color === "muted" ? "borderMuted" : color === "success" ? "borderAccent" : color;
+		const borderColor = color === "muted" ? "borderMuted" : color;
 		const border = (value: string) => this.theme.fg(borderColor, value);
 		const result = [border(`╭${"─".repeat(innerWidth)}╮`)];
 		for (const line of lines) {

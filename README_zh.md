@@ -208,7 +208,7 @@ Rail 复用 Pi 0.87.1 当前实例的 CacheWarmer、以一 token 为*输出预�
 
 ### `/rail-session`
 
-使用 Pi 原生 overlay 显示当前 Rail session 摘要（启用时包含 keep-alive 状态）。
+使用 Pi 原生 overlay 显示当前 Rail session，每秒自动刷新：**Now**（模型与思考级别、上下文占用、keep-alive `KA N|M` 及其状态、排队消息）、**Usage**（消息、token、缓存命中率、费用）、**Workspace**（目录与分支、session ID、完整 session 文件路径），以及全部已启用的 **Tools** 和每条 **Extension** 状态。宽终端下 Now 与 Usage 并排显示；内容超过终端高度时可用 ↑/↓、j/k、PgUp/PgDn、空格、Home/End 滚动。Esc、Enter 或 q 关闭。
 
 ### `/rail-oai-fast`
 

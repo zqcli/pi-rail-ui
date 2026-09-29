@@ -27,7 +27,9 @@ type FooterStore = {
 
 const FOOTER_STORE_KEY = Symbol.for("pi-rail-ui.footer-state");
 const MODAL_MIN_WIDTH = 56;
-const MODAL_MAX_WIDTH = 92;
+const MODAL_MAX_WIDTH = 120;
+/** The open panel re-reads the session this often so countdowns, context and statuses stay current. */
+const MODAL_REFRESH_MS = 1000;
 
 function footerStore(): FooterStore {
 	return ((globalThis as any)[FOOTER_STORE_KEY] ??= { turnStartTime: undefined, turnDuration: undefined } satisfies FooterStore);
@@ -187,7 +189,7 @@ function resolveRailSessionOverlayOptions(): RailSessionOverlayOptions {
 	const availableWidth = Math.max(MODAL_MIN_WIDTH, terminalWidth - margin * 2);
 	const width = Math.max(MODAL_MIN_WIDTH, Math.min(MODAL_MAX_WIDTH, availableWidth));
 	const availableHeight = Math.max(12, terminalHeight - margin * 2);
-	const maxHeight = Math.min(26, availableHeight);
+	const maxHeight = availableHeight;
 
 	return { anchor: "center", width, maxHeight, margin };
 }
@@ -201,13 +203,26 @@ function modalPad(text: string, width: number): string {
 	return `${fitted}${" ".repeat(Math.max(0, width - visibleWidth(fitted)))}`;
 }
 
-class RailSessionModal implements Component {
+export class RailSessionModal implements Component {
+	private scroll = 0;
+	private lastPage = 1;
+
+	/** maxHeight may be read per frame, so a terminal resize changes the page instead of clipping it. */
 	constructor(
-		private readonly snapshot: RailSessionSnapshot,
+		private snapshot: RailSessionSnapshot,
 		private readonly theme: Theme,
-		private readonly maxHeight: number,
+		private readonly maxHeight: number | (() => number),
 		private readonly done: () => void,
+		private readonly onDispose: () => void = () => {},
 	) {}
+
+	dispose(): void {
+		this.onDispose();
+	}
+
+	update(snapshot: RailSessionSnapshot): void {
+		this.snapshot = snapshot;
+	}
 
 	render(width: number): string[] {
 		const frameWidth = Math.max(32, width);
@@ -215,33 +230,46 @@ class RailSessionModal implements Component {
 		const contentWidth = Math.max(1, innerWidth - 2);
 		const border = (text: string) => this.theme.fg("border", text);
 		const row = (content: string) => `${border("│")}${modalPad(` ${content}`, innerWidth)}${border("│")}`;
-		const maxContentRows = Math.max(1, this.maxHeight - 4);
-		let content = renderRailSessionContent(this.snapshot, this.theme, contentWidth);
-		if (content.length > maxContentRows) {
-			content = [
-				...content.slice(0, Math.max(0, maxContentRows - 1)),
-				this.theme.fg("dim", "  …"),
-			];
-		}
-		const lines = [
+		const content = renderRailSessionContent(this.snapshot, this.theme, contentWidth);
+		const page = Math.max(1, (typeof this.maxHeight === "function" ? this.maxHeight() : this.maxHeight) - 4);
+		this.lastPage = page;
+		this.scroll = Math.max(0, Math.min(this.scroll, content.length - page));
+		const visible = content.slice(this.scroll, this.scroll + page);
+		const more = content.length > page;
+		const hint = more
+			? `${this.scroll + 1}-${this.scroll + visible.length}/${content.length} · ↑↓ PgUp/PgDn scroll · Esc close`
+			: "Esc/Enter/q close";
+		return [
 			border(`╭${"─".repeat(innerWidth)}╮`),
-			...content.map(row),
+			...visible.map(row),
 			row(""),
-			row(this.theme.fg("dim", "Esc/Enter/q close")),
+			row(this.theme.fg("dim", hint)),
 			border(`╰${"─".repeat(innerWidth)}╯`),
 		];
-		return lines;
 	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape") || matchesKey(data, "enter") || matchesKey(data, "ctrl+c") || data === "q") {
 			this.done();
+			return;
 		}
+		const step = matchesKey(data, "up") || data === "k" ? -1 : matchesKey(data, "down") || data === "j" ? 1
+			: matchesKey(data, "pageUp") ? -this.lastPage : matchesKey(data, "pageDown") || data === " " ? this.lastPage
+			: matchesKey(data, "home") ? -Infinity : matchesKey(data, "end") ? Infinity : 0;
+		// render() clamps the offset to the content length.
+		if (step) this.scroll = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, this.scroll + step));
 	}
 
 	invalidate(): void {
-		// Snapshot renderer; nothing cached between frames.
+		// Rendered from the latest snapshot on every frame.
 	}
+}
+
+function railSessionSnapshot(ctx: ExtensionContext, pi: ExtensionAPI): RailSessionSnapshot {
+	const snapshot = collectRailSessionSnapshot(ctx, pi, latestFooterData());
+	snapshot.keepAlive = keepAliveStatus(ctx.sessionManager);
+	snapshot.keepAliveLabel = keepAliveLabel(ctx.sessionManager);
+	return snapshot;
 }
 
 export async function openRailSessionModal(ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
@@ -250,13 +278,31 @@ export async function openRailSessionModal(ctx: ExtensionCommandContext, pi: Ext
 		return;
 	}
 
-	const snapshot = collectRailSessionSnapshot(ctx, pi, latestFooterData());
-	snapshot.keepAlive = keepAliveStatus(ctx.sessionManager);
 	const overlayOptions = resolveRailSessionOverlayOptions();
-	await ctx.ui.custom<void>(
-		(_tui, theme, _keybindings, done) => new RailSessionModal(snapshot, theme, overlayOptions.maxHeight, () => done()),
-		{ overlay: true, overlayOptions },
-	);
+	let stop = () => {};
+	try {
+		await ctx.ui.custom<void>(
+			(tui, theme, _keybindings, done) => {
+				let timer: ReturnType<typeof setInterval> | undefined;
+				let unsubscribe = () => {};
+				stop = () => { clearInterval(timer); unsubscribe(); };
+				const modal = new RailSessionModal(railSessionSnapshot(ctx, pi), theme,
+					() => resolveRailSessionOverlayOptions().maxHeight, () => done(), () => stop());
+				const refresh = () => {
+					// A reload or session switch can hide the panel without closing it; its ctx is then stale.
+					try { modal.update(railSessionSnapshot(ctx, pi)); } catch { stop(); return; }
+					tui.requestRender();
+				};
+				timer = setInterval(refresh, MODAL_REFRESH_MS);
+				timer.unref?.();
+				unsubscribe = onKeepAliveChange(ctx.sessionManager, refresh);
+				return modal;
+			},
+			{ overlay: true, overlayOptions },
+		);
+	} finally {
+		stop();
+	}
 }
 
 export function renderFooter(

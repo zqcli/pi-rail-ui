@@ -1,5 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
 	formatCost,
 	formatNum,
@@ -8,7 +8,10 @@ import {
 	type RailSessionStats,
 } from "./footer-session-snapshot";
 
-const MODAL_LABEL_WIDTH = 12;
+const LABEL_WIDTH = 11;
+/** At this content width the Now/Workspace and Usage sections sit side by side. */
+const TWO_COLUMN_MIN_WIDTH = 110;
+const COLUMN_GAP = 3;
 
 function formatInteger(value: number): string {
 	if (!Number.isFinite(value) || value <= 0) return "0";
@@ -20,128 +23,155 @@ function trimFixed(value: number, digits: number): string {
 }
 
 function formatTokenAmount(value: number): string {
-	if (!Number.isFinite(value) || value <= 0) return "0K";
+	if (!Number.isFinite(value) || value <= 0) return "0";
 	if (value >= 1_000_000) return `${trimFixed(value / 1_000_000, 2)}M`;
-	const thousands = value / 1000;
-	if (thousands < 0.1) return "<0.1K";
-	return `${trimFixed(thousands, 1)}K`;
+	if (value < 1000) return String(Math.round(value));
+	return `${trimFixed(value / 1000, 1)}K`;
 }
 
 function formatCachePercent(tokens: RailSessionStats["tokens"]): string {
 	const cacheRead = Math.max(0, tokens.cacheRead);
-	const nonCachedInput = Math.max(0, tokens.input);
-	const totalInput = cacheRead + nonCachedInput;
+	const totalInput = cacheRead + Math.max(0, tokens.input);
 	if (totalInput <= 0) return "0%";
 	return `${trimFixed((cacheRead / totalInput) * 100, 1)}%`;
 }
 
-function modalFit(text: string, width: number): string {
+function fit(text: string, width: number): string {
 	return truncateToWidth(text, Math.max(0, width), "…", true);
 }
 
-function modalPad(text: string, width: number): string {
-	const fitted = modalFit(text, width);
+function pad(text: string, width: number): string {
+	const fitted = fit(text, width);
 	return `${fitted}${" ".repeat(Math.max(0, width - visibleWidth(fitted)))}`;
 }
 
-function modalSection(theme: Theme, label: string): string {
-	return ` ${theme.fg("accent", theme.bold(label))}`;
+function section(theme: Theme, label: string, detail?: string): string {
+	return `${theme.fg("accent", theme.bold(label))}${detail ? theme.fg("dim", `  ${detail}`) : ""}`;
 }
 
-function modalField(theme: Theme, label: string, value: string, width: number): string {
-	const safeLabel = modalPad(label, MODAL_LABEL_WIDTH);
-	const prefix = `  ${theme.fg("dim", safeLabel)} `;
-	return modalFit(`${prefix}${value}`, width);
+function field(theme: Theme, label: string, value: string, width: number): string {
+	return fit(`  ${theme.fg("dim", pad(label, LABEL_WIDTH))} ${value}`, width);
 }
 
-function modalMetricCell(theme: Theme, label: string, value: string, width: number): string {
-	const labelWidth = Math.min(12, Math.max(7, Math.floor(width * 0.52)));
-	return modalPad(`${theme.fg("dim", modalPad(label, labelWidth))} ${theme.fg("success", value)}`, width);
+/** A labelled value that wraps onto aligned continuation lines instead of being cut off. */
+function wrappedField(theme: Theme, label: string, value: string, width: number): string[] {
+	const indent = 2 + LABEL_WIDTH + 1;
+	const lines = wrapTextWithAnsi(value, Math.max(8, width - indent));
+	return lines.map((line, index) => index === 0 ? field(theme, label, line, width) : fit(`${" ".repeat(indent)}${line}`, width));
 }
 
-function modalMetricRow(theme: Theme, left: [string, string], right: [string, string], width: number): string {
-	const gap = 2;
-	const bodyWidth = Math.max(1, width - 2);
-	const leftWidth = Math.max(1, Math.floor((bodyWidth - gap) / 2));
-	const rightWidth = Math.max(1, bodyWidth - gap - leftWidth);
-	return modalFit(`  ${modalMetricCell(theme, left[0], left[1], leftWidth)}${" ".repeat(gap)}${modalMetricCell(theme, right[0], right[1], rightWidth)}`, width);
+function metricRow(theme: Theme, cells: Array<[string, string]>, width: number): string[] {
+	const body = Math.max(1, width - 2);
+	// Too narrow for side-by-side cells: one metric per line.
+	if (cells.length > 1 && body / cells.length < 24) return cells.flatMap((cell) => metricRow(theme, [cell], width));
+	const cellWidth = Math.max(2, Math.floor(body / cells.length));
+	// Labels shrink before values on narrow panels; one column always separates the cells.
+	const labelWidth = Math.max(4, Math.min(11, cellWidth - 10));
+	const text = cells.map(([label, value]) => `${pad(`${theme.fg("dim", pad(label, labelWidth))} ${theme.fg("text", value)}`, cellWidth - 1)} `).join("");
+	return [fit(`  ${text}`, width)];
 }
 
-function contextProgress(theme: Theme, percent: number | null | undefined): string | undefined {
-	if (typeof percent !== "number" || !Number.isFinite(percent)) return undefined;
-	const used = Math.max(0, Math.min(100, percent));
-	const cells = 18;
-	const filled = Math.round((used / 100) * cells);
-	const bar = `${theme.fg(used >= 70 ? "warning" : "accent", "█".repeat(filled))}${theme.fg("dim", "░".repeat(cells - filled))}`;
-	return `${bar} ${theme.fg(used >= 70 ? "warning" : "success", `${used.toFixed(2)}% used`)}`;
-}
-
-function toolSummary(state: FooterLiveState): string | undefined {
-	if (state.activeTools.length > 0 && state.activeTools.length <= 8) return state.activeTools.join(", ");
-	if (state.activeTools.length > 0) return `${state.activeTools.length}/${state.allToolCount || state.activeTools.length} active`;
-	if (state.allToolCount > 0) return `0/${state.allToolCount} active`;
-	return undefined;
-}
-
-function extensionSummary(state: FooterLiveState): string | undefined {
-	if (state.extensionStatuses.length === 0) return undefined;
-	if (state.extensionStatuses.length === 1) return state.extensionStatuses[0];
-	return `${state.extensionStatuses.length} statuses · ${state.extensionStatuses[0]}`;
-}
-
-function contextValue(theme: Theme, state: FooterLiveState): string {
+function contextRow(theme: Theme, state: FooterLiveState, width: number): string {
+	const percent = typeof state.contextPercent === "number" && Number.isFinite(state.contextPercent) ? Math.max(0, Math.min(100, state.contextPercent)) : undefined;
 	const tokens = typeof state.contextTokens === "number" && Number.isFinite(state.contextTokens) ? state.contextTokens : undefined;
 	const window = typeof state.contextWindow === "number" && Number.isFinite(state.contextWindow) ? state.contextWindow : undefined;
-	const percent = typeof state.contextPercent === "number" && Number.isFinite(state.contextPercent) ? `${state.contextPercent.toFixed(2)}% used` : undefined;
-	if (tokens !== undefined && window !== undefined) {
-		return `${theme.fg("success", formatNum(tokens))}${theme.fg("dim", " used / ")}${theme.fg("success", formatNum(window))}${percent ? theme.fg("dim", ` (${percent})`) : ""}`;
+	const color = percent !== undefined && percent >= 70 ? "warning" : "success";
+	const parts: string[] = [];
+	if (percent !== undefined) {
+		const cells = 16;
+		const filled = Math.round((percent / 100) * cells);
+		parts.push(`${theme.fg(color === "warning" ? "warning" : "accent", "█".repeat(filled))}${theme.fg("dim", "░".repeat(cells - filled))}`);
+		parts.push(theme.fg(color, `${percent.toFixed(1)}%`));
 	}
-	if (percent) return theme.fg("success", percent);
-	if (tokens !== undefined) return `${theme.fg("success", formatNum(tokens))}${theme.fg("dim", " used")}`;
-	return theme.fg("dim", "unknown");
+	if (tokens !== undefined) parts.push(`${theme.fg("text", formatNum(tokens))}${window !== undefined ? theme.fg("dim", ` / ${formatNum(window)}`) : ""}`);
+	else if (window !== undefined) parts.push(theme.fg("dim", `window ${formatNum(window)}`));
+	return field(theme, "Context", parts.length ? parts.join(" ") : theme.fg("dim", "unknown"), width);
 }
 
+/** `KA 50|45` plus the detail without repeating the interval, e.g. `WAIT (next 19:32:10)` or the pause reason. */
+function keepAliveRows(theme: Theme, snapshot: RailSessionSnapshot, width: number): string[] {
+	if (!snapshot.keepAlive) return [];
+	const detail = snapshot.keepAlive.replace(/^KA \d+m /u, "").replace(/^PAUSED \((.*)\)$/u, "paused: $1");
+	const paused = snapshot.keepAlive.includes(" PAUSED");
+	const label = snapshot.keepAliveLabel ?? snapshot.keepAlive.split(" ").slice(0, 2).join(" ");
+	return wrappedField(theme, "Keep-alive",
+		`${theme.fg(paused ? "error" : "warning", label)}${theme.fg("dim", ` · ${detail} · fees unknown`)}`, width);
+}
+
+function nowSection(theme: Theme, snapshot: RailSessionSnapshot, width: number): string[] {
+	const { state } = snapshot;
+	const model = `${state.provider ? `${state.provider}/` : ""}${state.modelId ?? "no model"}`;
+	const rows = [
+		section(theme, "Now", state.idle ? "idle" : "running"),
+		...wrappedField(theme, "Model", `${theme.fg("text", model)}${theme.fg("dim", ` · thinking ${state.thinking}`)}`, width),
+		contextRow(theme, state, width),
+	];
+	rows.push(...keepAliveRows(theme, snapshot, width));
+	if (state.pending) rows.push(field(theme, "Queue", theme.fg("warning", "pending messages"), width));
+	return rows;
+}
+
+function usageSection(theme: Theme, session: RailSessionStats, state: FooterLiveState, width: number): string[] {
+	const cost = `${formatCost(session.cost)}${state.usingSubscription ? " (sub)" : ""}`;
+	return [
+		section(theme, "Usage", `${formatInteger(session.totalMessages)} message${session.totalMessages === 1 ? "" : "s"}`),
+		...metricRow(theme, [["User", formatInteger(session.userMessages)], ["Input", formatTokenAmount(session.tokens.input)]], width),
+		...metricRow(theme, [["Assistant", formatInteger(session.assistantMessages)], ["Output", formatTokenAmount(session.tokens.output)]], width),
+		...metricRow(theme, [["Tool calls", formatInteger(session.toolCalls)], ["Cache hit", formatCachePercent(session.tokens)]], width),
+		...metricRow(theme, [["Results", formatInteger(session.toolResults)], ["Cache R/W", `${formatTokenAmount(session.tokens.cacheRead)}/${formatTokenAmount(session.tokens.cacheWrite)}`]], width),
+		...metricRow(theme, [["Cost", cost], ["Total", formatTokenAmount(session.tokens.total)]], width),
+	];
+}
+
+function workspaceSection(theme: Theme, snapshot: RailSessionSnapshot, width: number): string[] {
+	const { state, session } = snapshot;
+	const rows = [section(theme, "Workspace")];
+	rows.push(...wrappedField(theme, "Directory", `${theme.fg("text", state.cwd)}${state.branch ? theme.fg("dim", ` · ${state.branch}`) : ""}`, width));
+	rows.push(field(theme, "Session ID", theme.fg("text", session.sessionId), width));
+	// The file path is the longest value; keep all of it visible so it can be copied.
+	rows.push(...wrappedField(theme, "File", theme.fg("text", session.sessionFile ?? "in-memory"), width));
+	return rows;
+}
+
+function toolsSection(theme: Theme, state: FooterLiveState, width: number): string[] {
+	if (state.activeTools.length === 0 && state.allToolCount === 0) return [];
+	const total = Math.max(state.allToolCount, state.activeTools.length);
+	const header = section(theme, "Tools", `${state.activeTools.length}/${total} active`);
+	if (state.activeTools.length === 0) return [header, field(theme, "", theme.fg("dim", "none active"), width)];
+	return [header, ...wrapTextWithAnsi(theme.fg("text", state.activeTools.join("  ")), Math.max(8, width - 2)).map((line) => fit(`  ${line}`, width))];
+}
+
+function extensionsSection(theme: Theme, state: FooterLiveState, width: number): string[] {
+	if (state.extensionStatuses.length === 0) return [];
+	return [section(theme, "Extensions"), ...state.extensionStatuses.flatMap((status) =>
+		wrapTextWithAnsi(theme.fg("text", status), Math.max(8, width - 4))
+			.map((line, index) => fit(`  ${index === 0 ? theme.fg("dim", "•") : " "} ${line}`, width)))];
+}
+
+function sideBySide(left: string[], right: string[], leftWidth: number, width: number): string[] {
+	const rows = Math.max(left.length, right.length);
+	return Array.from({ length: rows }, (_, index) =>
+		fit(`${pad(left[index] ?? "", leftWidth)}${" ".repeat(COLUMN_GAP)}${right[index] ?? ""}`, width));
+}
+
+/**
+ * Full panel content, most-watched facts first. It is not cut to a height: the overlay scrolls, so
+ * tools and extension statuses stay reachable however many rows keep-alive or a long path adds.
+ */
 export function renderRailSessionContent(snapshot: RailSessionSnapshot, theme: Theme, width: number): string[] {
 	const { state, session } = snapshot;
-	const model = `${state.provider ? `${state.provider}/` : ""}${state.modelId ?? "no model"}`;
-	const tools = toolSummary(state);
-	const extensions = extensionSummary(state);
-	const rows: string[] = [
-		`${theme.fg("accent", theme.bold("Rail Session"))}${theme.fg("dim", `  ${snapshot.capturedAt.toLocaleTimeString()}`)}`,
-		"",
-		modalSection(theme, "Session Info"),
-		modalField(theme, "File", theme.fg("text", session.sessionFile ?? "in-memory"), width),
-		modalField(theme, "ID", theme.fg("text", session.sessionId), width),
-	];
-
-	if (state.sessionName) rows.push(modalField(theme, "Name", theme.fg("text", state.sessionName), width));
-
-	rows.push("", modalSection(theme, "Messages / Tokens"));
-	rows.push(modalMetricRow(theme, ["User", formatInteger(session.userMessages)], ["Input", formatTokenAmount(session.tokens.input)], width));
-	rows.push(modalMetricRow(theme, ["Assistant", formatInteger(session.assistantMessages)], ["Output", formatTokenAmount(session.tokens.output)], width));
-	rows.push(modalMetricRow(theme, ["Tool Calls", formatInteger(session.toolCalls)], ["Cache", formatCachePercent(session.tokens)], width));
-	rows.push(modalMetricRow(theme, ["Tool Results", formatInteger(session.toolResults)], ["Cache R/W", `${formatTokenAmount(session.tokens.cacheRead)}/${formatTokenAmount(session.tokens.cacheWrite)}`], width));
-	rows.push(modalMetricRow(theme, ["Total", formatInteger(session.totalMessages)], ["Tokens", formatTokenAmount(session.tokens.total)], width));
-	if (session.cost > 0 || state.usingSubscription) {
-		const billing = `${theme.fg("success", formatCost(session.cost))}${state.usingSubscription ? theme.fg("dim", " (sub)") : ""}`;
-		rows.push(modalField(theme, "Cost", billing, width));
+	const title = `${theme.fg("accent", theme.bold("Rail Session"))}${state.sessionName ? theme.fg("text", `  ${state.sessionName}`) : ""}`;
+	const rows = [fit(`${title}${theme.fg("dim", `  · ${snapshot.capturedAt.toLocaleTimeString()}`)}`, width), ""];
+	if (width >= TWO_COLUMN_MIN_WIDTH) {
+		const leftWidth = Math.floor((width - COLUMN_GAP) / 2);
+		const rightWidth = width - COLUMN_GAP - leftWidth;
+		rows.push(...sideBySide(nowSection(theme, snapshot, leftWidth), usageSection(theme, session, state, rightWidth), leftWidth, width));
+		rows.push("", ...workspaceSection(theme, snapshot, width));
+	} else {
+		rows.push(...nowSection(theme, snapshot, width), "", ...usageSection(theme, session, state, width), "", ...workspaceSection(theme, snapshot, width));
 	}
-
-	rows.push("", modalSection(theme, "Runtime"));
-	rows.push(modalField(theme, "Model", theme.fg("text", model), width));
-	rows.push(modalField(theme, "Thinking", theme.fg("text", state.thinking), width));
-	if (snapshot.keepAlive) {
-		rows.push(modalField(theme, "Keep-alive", theme.fg("warning", snapshot.keepAlive), width));
-		rows.push(modalField(theme, "Refresh fees", theme.fg("warning", "unknown; cache hit not verified"), width));
+	for (const block of [toolsSection(theme, state, width), extensionsSection(theme, state, width)]) {
+		if (block.length) rows.push("", ...block);
 	}
-	if (state.pending) rows.push(modalField(theme, "Queue", theme.fg("warning", "pending messages"), width));
-	rows.push(modalField(theme, "Directory", theme.fg("text", state.cwd), width));
-	if (state.branch) rows.push(modalField(theme, "Branch", theme.fg("text", state.branch), width));
-	const progress = contextProgress(theme, state.contextPercent);
-	if (progress) rows.push(modalField(theme, "Context", progress, width));
-	rows.push(modalField(theme, "Window", contextValue(theme, state), width));
-	if (tools || extensions) rows.push(modalField(theme, "Tools", theme.fg("text", tools ?? "none"), width));
-	if (extensions) rows.push(modalField(theme, "Extensions", theme.fg("text", extensions), width));
-
 	return rows;
 }

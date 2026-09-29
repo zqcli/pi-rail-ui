@@ -209,7 +209,7 @@ Rail reuses Pi 0.87.1's live session CacheWarmer, its provider request with a on
 
 ### `/rail-session`
 
-Shows the current Rail session summary (including keep-alive status when enabled) in a Pi-native overlay.
+Shows the current Rail session in a Pi-native overlay that refreshes every second: **Now** (model and thinking level, context usage, keep-alive `KA N|M` with its state, queued messages), **Usage** (messages, tokens, cache hit rate, cost), **Workspace** (directory and branch, session ID, full session file path), every active **Tool**, and each **Extension** status. Wide terminals put Now and Usage side by side; when the content is taller than the terminal, scroll with ↑/↓, j/k, PgUp/PgDn, Space, Home/End. Esc, Enter or q closes it.
 
 ### `/rail-oai-fast`
 

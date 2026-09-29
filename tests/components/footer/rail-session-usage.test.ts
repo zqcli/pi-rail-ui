@@ -106,7 +106,8 @@ test("session token and cost totals include compaction and branch summary LLM sp
 	});
 
 	const rendered = renderRailSessionContent(snapshot, theme, 80).join("\n");
-	assert.match(rendered, /Tokens/);
+	assert.match(rendered, /Total\s+555/);
+	assert.match(rendered, /Cost\s+\$1\.75/);
 });
 
 test("summary entries without usage keep message-only totals (legacy compatibility)", () => {

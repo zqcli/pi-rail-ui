@@ -28,6 +28,7 @@ test("bundled CLI: capture the actual warmer through public AgentSession without
  assert.equal(result.captured, true);
  assert.equal(result.bound, true);
  assert.match(result.status, /KA 1m WAIT.*fresh real request/);
+ assert.equal(result.nativeStatus.state, "inactive", "no real request snapshot exists yet");
  assert.equal(result.usage, 0);
 });
 
@@ -56,6 +57,10 @@ test("bundled CLI local mock provider: refresh retains request hooks and writes 
  const result = JSON.parse(await readFile(output, "utf8"));
  const requests = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line));
  assert.equal(result.bound, true);
+ assert.equal(result.nativeStatus.state, "scheduled", "manual schedule must not appear inactive without economics");
+ assert.equal(result.nativeStatus.decision.economicsAvailable, false);
+ assert.equal(result.nativeStatus.manual, true);
+ assert.match(result.nativeStatus.reason, /Rail manual 1m/);
  assert.equal(result.usage, 1, JSON.stringify({ result, requests: requests.map(({ payload, ...rest }) => rest) }));
  assert.equal(result.assistant, 1);
  assert.equal(requests.length, 2);

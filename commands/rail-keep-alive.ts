@@ -11,7 +11,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 type Mode = { minutes?: number | null | undefined; paused?: string | undefined };
 type Run = { timer?: ReturnType<typeof setTimeout> | undefined; controller: AbortController; isCurrent: () => boolean; nextWarmAt: number; phase: string; [key: string]: any };
 type Warmer = {
- run?: Run; models: { streamSimple: (...args: any[]) => any }; sessionManager: any;
+ run?: Run; status: any; models: { streamSimple: (...args: any[]) => any }; sessionManager: any;
  getMode: () => string; decide: (event: any) => Promise<string>; onWarmed?: ((entry: any) => void) | undefined;
  start: (request: any, isCurrent: () => boolean) => void; schedule: (run: Run) => void;
  onAgentSettled: () => void; refreshDeadlineMissed: (run: Run) => boolean;
@@ -19,10 +19,28 @@ type Warmer = {
  stop: (reason: string) => void; cancel: () => void; clearRun: () => void;
  refresh: (run: Run) => Promise<void>;
 };
-type State = { manager: any; warmer?: Warmer | undefined; mode: Mode; restore?: (() => void) | undefined; notify?: (text: string) => void; isIdle?: () => boolean };
+type State = { manager: any; warmer?: Warmer | undefined; mode: Mode; unsupported?: string | undefined; restore?: (() => void) | undefined; notify?: (text: string) => void; isIdle?: () => boolean };
 type Bridge = { pending: Set<State>; active: Set<State>; original?: any; wrapper?: any; disposeOriginal?: any; disposeWrapper?: any };
 const bridge = createStore<Bridge>("keep-alive-bridge", () => ({ pending: new Set(), active: new Set() }));
 const states = createStore<Map<any, State>>("keep-alive-states", () => new Map());
+const listeners = createStore<Map<any, Set<() => void>>>("keep-alive-listeners", () => new Map());
+
+export function onKeepAliveChange(manager: any, callback: () => void): () => void {
+ const subscriptions = listeners();
+ let callbacks = subscriptions.get(manager);
+ if (!callbacks) { callbacks = new Set(); subscriptions.set(manager, callbacks); }
+ callbacks.add(callback);
+ return () => {
+  callbacks.delete(callback);
+  if (callbacks.size === 0 && subscriptions.get(manager) === callbacks) subscriptions.delete(manager);
+ };
+}
+
+function changed(state: State): void {
+ for (const callback of [...(listeners().get(state.manager) ?? [])]) {
+  try { callback(); } catch { /* A footer render must never affect cache warming. */ }
+ }
+}
 
 function releaseBridge(state: State): void {
  const b = bridge();
@@ -61,7 +79,9 @@ function awaitSession(state: State): void {
  AgentSession.prototype.prompt = b.wrapper;
 }
 function valid(w: any, session: AgentSession, state: State): w is Warmer {
+ const status = w && Object.getOwnPropertyDescriptor(Object.getPrototypeOf(w), "status");
  return VERSION === "0.87.1" && session instanceof AgentSession && w?.sessionManager === state.manager &&
+  typeof status?.get === "function" && Object.getOwnPropertyDescriptor(w, "status")?.configurable !== false &&
   typeof w.start === "function" && typeof w.schedule === "function" &&
   typeof w.refresh === "function" && typeof w.onAgentSettled === "function" &&
   typeof w.refreshDeadlineMissed === "function" && typeof w.evaluate === "function" && typeof w.clearRun === "function" &&
@@ -72,16 +92,22 @@ function valid(w: any, session: AgentSession, state: State): w is Warmer {
 function pause(state: State, reason: string): void {
  state.mode.paused = reason;
  state.warmer?.stop(reason);
+ changed(state);
  state.notify?.(`Rail keep-alive PAUSED: ${reason}`);
 }
 function bind(state: State, session: AgentSession): void {
  const w = (session as any)._cacheWarmer;
  if (!valid(w, session, state)) {
-  state.mode.paused = "unsupported Pi CacheWarmer (requires 0.87.1 live session)";
-  state.notify?.(`Rail keep-alive PAUSED: ${state.mode.paused}`);
+  state.unsupported = "unsupported Pi CacheWarmer (requires 0.87.1 live session)";
+  state.mode.paused = state.unsupported;
+  changed(state);
+  state.notify?.(`Rail keep-alive unavailable: ${state.unsupported}; cannot control native warming`);
   return;
  }
  state.warmer = w;
+ state.unsupported = undefined;
+ const statusDescriptor = Object.getOwnPropertyDescriptor(w, "status");
+ const nativeStatus = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(w), "status")!.get!;
  const original = {
   start: w.start, schedule: w.schedule, settled: w.onAgentSettled,
   deadline: w.refreshDeadlineMissed, evaluate: w.evaluate, mode: w.getMode, decide: w.decide,
@@ -101,6 +127,7 @@ function bind(state: State, session: AgentSession): void {
   generation++;
   if (run) pendingDecisions.get(run)?.();
   original.clearRun.call(w);
+  if (state.mode.minutes) changed(state);
  };
  // Session entries that cannot change provider context must not invalidate a
  // request snapshot. Keep context edits, compactions and branch ancestry guarded.
@@ -113,9 +140,18 @@ function bind(state: State, session: AgentSession): void {
   return now.length === path.length && now.every((id: any, index: number) => id === path[index]);
  };
  w.getMode = () => state.mode.minutes === null ? "off" : state.mode.minutes ? "idle" : original.mode();
+ Object.defineProperty(w, "status", { configurable: true, get() {
+  if (!state.mode.minutes) return nativeStatus.call(w);
+  const run = w.run;
+  if (!run || !run.isCurrent()) return nativeStatus.call(w);
+  if (run.phase !== "idle") return { state: "inactive", reason: "Rail manual: waiting for agent settlement" };
+  return { state: run.timer === undefined ? "refreshing" : "scheduled",
+   nextWarmAt: run.nextWarmAt, decision: w.evaluate(run), extensionOverride: true,
+   reason: `Rail manual ${state.mode.minutes}m idle interval`, manual: true };
+ } });
  w.start = function(request, isCurrent) {
-  if (state.mode.minutes === null) { w.stop("Rail keep-alive off"); return; }
-  if (!state.mode.minutes) { original.start.call(w, request, isCurrent); return; }
+  if (state.mode.minutes === null) { w.stop("Rail keep-alive off"); changed(state); return; }
+  if (!state.mode.minutes) { original.start.call(w, request, isCurrent); changed(state); return; }
   w.clearRun();
   state.mode.paused = undefined;
   if (request.options?.cacheRetention === "none") { pause(state, "request disabled prompt caching"); return; }
@@ -125,6 +161,7 @@ function bind(state: State, session: AgentSession): void {
   path = contextPath();
   const current = () => isCurrent() && samePath();
   w.run = { ...request, isCurrent: current, controller: new AbortController(), phase: "streaming", nextWarmAt: 0, extensionOverride: false };
+  changed(state);
   // Only settle schedules the manual idle interval; no streaming timer.
  };
  w.onAgentSettled = function() {
@@ -141,6 +178,7 @@ function bind(state: State, session: AgentSession): void {
   run.nextWarmAt = Date.now() + state.mode.minutes * INTERVAL;
   run.timer = setTimeout(() => {
    run.timer = undefined;
+   changed(state);
    if (Date.now() > run.nextWarmAt + LATE_MS) { pause(state, "timer late after sleep; send a fresh real request"); return; }
    if (!state.isIdle?.()) { pause(state, "session is busy; send a fresh real request"); return; }
    void w.refresh(run).catch((error) => {
@@ -148,6 +186,7 @@ function bind(state: State, session: AgentSession): void {
    });
   }, state.mode.minutes * INTERVAL);
   run.timer.unref?.();
+  changed(state);
  };
  w.refreshDeadlineMissed = function(run) {
   if (!state.mode.minutes) return original.deadline.call(w, run);
@@ -155,10 +194,14 @@ function bind(state: State, session: AgentSession): void {
   if (w.run === run) pause(state, "refresh deadline missed; send a fresh real request");
   return true;
  };
- w.evaluate = (run) => state.mode.minutes
-  ? { phase: run.phase, warmCost: NaN, missCost: NaN, continuationProbability: NaN,
-      expectedSavings: NaN, economicsAvailable: false, action: "warm" }
-  : original.evaluate.call(w, run);
+ w.evaluate = (run) => {
+  if (!state.mode.minutes) return original.evaluate.call(w, run);
+  // Missing price metadata must not be represented as a zero-dollar estimate.
+  let decision;
+  try { if (run["model"]?.cost) decision = original.evaluate.call(w, run); } catch { /* Unknown economics. */ }
+  return { ...(decision ?? { phase: run.phase, warmCost: NaN, missCost: NaN,
+   continuationProbability: NaN, expectedSavings: NaN, economicsAvailable: false }), action: "warm" };
+ };
  w.decide = async (event) => {
   if (!state.mode.minutes) return original.decide.call(w, event);
   const run = w.run;
@@ -243,6 +286,8 @@ function bind(state: State, session: AgentSession): void {
  };
  state.restore = () => {
   w.clearRun();
+  if (statusDescriptor) Object.defineProperty(w, "status", statusDescriptor);
+  else delete (w as any).status;
   if (session.compact === compactWrapper) {
    if (compactDescriptor) Object.defineProperty(session, "compact", compactDescriptor);
    else delete (session as any).compact;
@@ -253,6 +298,7 @@ function bind(state: State, session: AgentSession): void {
   w.getMode = original.mode; w.decide = original.decide; w.evaluate = original.evaluate;
   w.models = original.models; w.sessionManager = original.manager; w.onWarmed = original.warmed;
  };
+ changed(state);
 }
 function stop(state: State): void {
  releaseBridge(state);
@@ -267,6 +313,8 @@ function stop(state: State): void {
  state.warmer = undefined;
  state.restore = undefined;
  states().delete(state.manager);
+ changed(state);
+ listeners().delete(state.manager);
 }
 export function keepAliveStatus(manager: any): string | undefined {
  const state = states().get(manager);
@@ -292,10 +340,11 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
   const minutes = saved?.data?.minutes;
   state = { manager, mode: { minutes: minutes === null || (typeof minutes === "number" && Number.isSafeInteger(minutes) && minutes > 0 && minutes * INTERVAL <= 2 ** 31 - 1) ? minutes : undefined }, notify: (text) => ctx.ui.notify(text, "warning"), isIdle: () => ctx.isIdle() } as State;
   states().set(manager, state);
+  changed(state);
   awaitSession(state);
  });
  pi.on("session_shutdown", (_event, ctx) => { const state = states().get(ctx.sessionManager); if (state) stop(state); });
- const invalidate = (ctx: ExtensionContext) => { const state = states().get(ctx.sessionManager); if (state?.mode.minutes) { state.warmer?.cancel(); state.mode.paused = undefined; } };
+ const invalidate = (ctx: ExtensionContext) => { const state = states().get(ctx.sessionManager); if (state?.mode.minutes) { state.warmer?.cancel(); state.mode.paused = undefined; changed(state); } };
  pi.on("input", (_event, ctx) => { invalidate(ctx); });
  pi.on("before_agent_start", (_event, ctx) => { invalidate(ctx); });
  pi.on("model_select", (_event, ctx) => { invalidate(ctx); });
@@ -305,13 +354,18 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
  pi.on("session_compact_failed", (_event, ctx) => { invalidate(ctx); });
  pi.registerCommand("rail-keep-alive", {
   description: "Session-only paid idle cache refresh: N minutes, off, or status",
+  getArgumentCompletions: (prefix) => ["30", "50", "off", "status"]
+   .filter((value) => value.startsWith(prefix.trim()))
+   .map((value) => ({ value, label: value })),
   handler: async (args, ctx) => {
    const state = states().get(ctx.sessionManager);
    if (!state) { ctx.ui.notify("Rail keep-alive unavailable: session not initialized", "warning"); return; }
    const text = args.trim();
    if (!text || text === "status") {
     const status = keepAliveStatus(ctx.sessionManager);
-    ctx.ui.notify(status ? `${status} · refresh fees unknown; cache hit unverified` : state.mode.minutes === null
+    ctx.ui.notify(state.unsupported || !state.warmer
+     ? `Rail keep-alive unavailable: ${state.unsupported ?? "live Pi session not captured"}; cannot control native warming`
+     : status ? `${status} · refresh fees unknown; cache hit unverified` : state.mode.minutes === null
      ? "Rail keep-alive off (native warming disabled for this session)"
      : "Rail keep-alive not enabled (native warming unchanged)", "info");
     return;
@@ -319,10 +373,14 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
    if (text !== "off" && (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(Number(text)) || Number(text) * INTERVAL > 2 ** 31 - 1)) {
     ctx.ui.notify("Usage: /rail-keep-alive N|off|status (N: positive integer minutes)", "warning"); return;
    }
+   if (!state.warmer) {
+    ctx.ui.notify(`Rail keep-alive unavailable: ${state.unsupported ?? "live Pi session not captured"}; cannot control native warming; no setting changed`, "warning");
+    return;
+   }
    state.warmer?.cancel();
    state.mode = { minutes: text === "off" ? null : Number(text) };
    pi.appendEntry(ENTRY, { sessionId: ctx.sessionManager.getSessionId(), minutes: state.mode.minutes });
-   if (state.mode.minutes && !state.warmer) state.mode.paused = "unsupported Pi CacheWarmer (requires live 0.87.1 session)";
+   changed(state);
    const status = keepAliveStatus(ctx.sessionManager);
    ctx.ui.notify(status ? `${status} · refresh fees unknown; cache hit unverified`
     : "Rail keep-alive off for this session (native timer cancelled)", "info");

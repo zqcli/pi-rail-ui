@@ -5,18 +5,23 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 // Test-only import: production always captures the live instance, never this class.
 const { CacheWarmer } = await import(pathToFileURL(join(getPackageDir(), "dist/core/cache-warmer.js")).href);
-import { installRailKeepAlive, keepAliveLabel, keepAliveStatus } from "../../commands/rail-keep-alive";
+import { installRailKeepAlive, keepAliveLabel, keepAliveStatus, onKeepAliveChange } from "../../commands/rail-keep-alive";
 
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 function harness() {
  const handlers = new Map<string, Function[]>();
  const commands = new Map<string, Function>();
+ let argumentCompletions: ((prefix: string) => Array<{ value: string }>) | undefined;
  const pi = {
   on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); return () => {}; },
-  registerCommand(name: string, { handler }: { handler: Function }) { commands.set(name, handler); },
+  registerCommand(name: string, { handler, getArgumentCompletions }: { handler: Function; getArgumentCompletions?: (prefix: string) => Array<{ value: string }> }) {
+   commands.set(name, handler);
+   if (name === "rail-keep-alive") argumentCompletions = getArgumentCompletions;
+  },
   appendEntry(_kind: string, data: any) { manager.entries.push({ type: "custom", customType: "rail-keep-alive", data }); manager.leaf++; },
  } as unknown as ExtensionAPI;
  const calls: any[] = [];
+ const notices: string[] = [];
  const manager = {
   entries: [] as any[], leaf: 0, getLeafId() { return String(this.leaf); }, getSessionId() { return "parent"; },
   getBranch() { return this.entries; }, getEntries() { return this.entries; },
@@ -40,7 +45,7 @@ function harness() {
  const session = Object.create(AgentSession.prototype) as AgentSession;
  Object.defineProperties(session, { sessionManager: { value: manager }, _cacheWarmer: { value: warmer } });
  let idle = true;
- const ctx = { sessionManager: manager, isIdle: () => idle, ui: { notify() {} } } as any;
+ const ctx = { sessionManager: manager, isIdle: () => idle, ui: { notify(text: string) { notices.push(text); } } } as any;
  const emitAt = async (name: string, target: any, event: any = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, target); };
  const emit = (name: string, event: any = {}) => emitAt(name, ctx, event);
  const command = async (args: string) => commands.get("rail-keep-alive")!(args, ctx);
@@ -50,7 +55,7 @@ function harness() {
  AgentSession.prototype.prompt = async () => {};
  AgentSession.prototype.dispose = () => {};
  installRailKeepAlive(pi);
- return { warmer, session, manager, ctx, emit, emitAt, command, request, calls, setIdle: (value: boolean) => { idle = value; }, registerHook: (name: string, fn: Function) => pi.on(name as any, fn as any), setResult(value: any) { result = value; }, async begin() {
+ return { warmer, session, manager, ctx, emit, emitAt, command, request, calls, notices, completions: (prefix: string) => argumentCompletions?.(prefix).map((item) => item.value), setIdle: (value: boolean) => { idle = value; }, registerHook: (name: string, fn: Function) => pi.on(name as any, fn as any), setResult(value: any) { result = value; }, async begin() {
   await emit("session_start", { reason: "startup" });
   await session.prompt("capture without real request");
  }, cleanup: async () => { await emit("session_shutdown"); AgentSession.prototype.prompt = originalPrompt; AgentSession.prototype.dispose = originalDispose; } };
@@ -80,6 +85,68 @@ test("manual idle interval reuses native refresh and usage, beyond 30/180 minute
   t.mock.timers.tick(60_000); await flush();
   assert.match(keepAliveStatus(h.manager)!, /PAUSED.*late after sleep/);
   assert.equal(h.calls.length, 182, "sleep must not cause catch-up requests");
+ } finally { await h.cleanup(); }
+});
+
+test("manual native status remains scheduled with unknown costs, and retains real known estimates", async (t) => {
+ t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+ const h = harness();
+ try {
+  await h.begin(); await h.command("1");
+  h.warmer.start({ ...h.request, model: { ...h.request.model, cost: undefined } }, () => true);
+  h.warmer.onAgentSettled();
+  const unknown = h.session.cacheWarmingStatus! as any;
+  assert.equal(unknown.state, "scheduled");
+  assert.equal(unknown.decision.economicsAvailable, false);
+  assert.ok(Number.isNaN(unknown.decision.warmCost), "unknown does not become $0");
+  assert.match(unknown.reason, /Rail manual 1m/);
+  h.manager.entries.push({ type: "message", message: { role: "assistant", usage: { input: 20_000, cacheRead: 0, cacheWrite: 0 } } });
+  const priced = { ...h.request, model: { ...h.request.model, cost: { input: 10, output: 2, cacheRead: 1, cacheWrite: 10 } } };
+  h.warmer.start(priced, () => true); h.warmer.onAgentSettled();
+  const known = h.session.cacheWarmingStatus! as any;
+  assert.equal(known.state, "scheduled");
+  assert.equal(known.decision.economicsAvailable, true);
+  assert.ok(Number.isFinite(known.decision.warmCost) && known.decision.warmCost > 0);
+  assert.ok(Number.isFinite(known.decision.missCost) && known.decision.missCost > 0);
+  assert.equal(known.decision.action, "warm", "manual overrides the native savings threshold, not its measurements");
+  assert.equal(known.manual, true);
+  await h.command("off");
+  assert.equal(h.session.cacheWarmingStatus!.state, "inactive");
+ } finally { await h.cleanup(); }
+});
+
+test("keep-alive change subscription covers start/schedule/refresh/pause/off and unsubscribes", async (t) => {
+ t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+ const h = harness();
+ const labels: Array<string | undefined> = [];
+ const unsubscribe = onKeepAliveChange(h.manager, () => labels.push(keepAliveLabel(h.manager)));
+ try {
+  await h.begin();
+  assert.ok(labels.length >= 2, "session start and live instance bind both publish");
+  await h.command("1");
+  h.warmer.start(h.request, () => true);
+  h.warmer.onAgentSettled();
+  t.mock.timers.tick(60_000); await flush();
+  h.warmer.start({ ...h.request, options: { cacheRetention: "none" } }, () => true);
+  await h.command("off");
+  assert.ok(labels.includes("KA 1m WAIT"));
+  assert.ok(labels.includes("KA 1m WARM"));
+  assert.ok(labels.includes("KA 1m PAUSED"));
+  assert.equal(labels.at(-1), undefined);
+  const count = labels.length;
+  unsubscribe();
+  await h.command("1");
+  assert.equal(labels.length, count);
+ } finally { unsubscribe(); await h.cleanup(); }
+});
+
+test("command argument completions include common intervals, off and status", async () => {
+ const h = harness();
+ try {
+  const completions = h.completions;
+  assert.deepEqual(completions(""), ["30", "50", "off", "status"]);
+  assert.deepEqual(completions("5"), ["50"]);
+  assert.deepEqual(completions("o"), ["off"]);
  } finally { await h.cleanup(); }
 });
 
@@ -163,6 +230,7 @@ test("SDK dispose aborts a pending manual timer and restores the temporary bridg
   h.warmer.start(h.request, () => true);
   h.warmer.onAgentSettled();
   h.session.dispose();
+  assert.equal(Object.hasOwn(h.warmer, "status"), false, "native status getter is restored on dispose");
   t.mock.timers.tick(60_000); await flush();
   assert.equal(h.calls.length, 0);
   assert.equal(keepAliveStatus(h.manager), undefined);
@@ -183,13 +251,33 @@ test("unsafe replay and missing live warmer pause visibly without a request", as
  } finally { await h.cleanup(); }
 });
 
-test("unsupported live warmer structure fails closed and reports PAUSED", async () => {
+test("unsupported live warmer cannot claim N/off succeeded or persist an uncontrolled setting", async () => {
  const h = harness();
  try {
   h.warmer.refresh = undefined;
-  await h.begin(); await h.command("1");
-  assert.match(keepAliveStatus(h.manager)!, /PAUSED.*unsupported Pi CacheWarmer/);
+  await h.begin();
+  await h.command("1");
+  await h.command("off");
+  await h.command("status");
+  assert.equal(keepAliveStatus(h.manager), undefined);
+  assert.equal(h.manager.entries.filter((e) => e.customType === "rail-keep-alive").length, 0);
+  assert.ok(h.notices.every((text) => /unavailable.*cannot control native warming/.test(text)), h.notices.join("; "));
+  assert.equal(h.warmer.getMode(), "streaming", "native mode is unchanged, not falsely reported disabled");
   assert.equal(h.calls.length, 0);
+ } finally { await h.cleanup(); }
+});
+
+test("unsupported resume retains a PAUSED reason when subsequent N/off commands are rejected", async () => {
+ const h = harness();
+ try {
+  h.manager.entries.push({ type: "custom", customType: "rail-keep-alive", data: { sessionId: "parent", minutes: 30 } });
+  h.warmer.refresh = undefined;
+  await h.begin();
+  assert.match(keepAliveStatus(h.manager)!, /KA 30m PAUSED.*unsupported Pi CacheWarmer/);
+  await h.command("50");
+  await h.command("off");
+  assert.match(keepAliveStatus(h.manager)!, /KA 30m PAUSED/);
+  assert.equal(h.manager.entries.length, 1, "no new authorization entry is recorded");
  } finally { await h.cleanup(); }
 });
 

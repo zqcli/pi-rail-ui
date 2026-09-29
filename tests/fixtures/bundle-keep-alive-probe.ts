@@ -95,7 +95,8 @@ export default function probe(pi: ExtensionAPI) {
   handler: async (_args, ctx) => {
    const warmer = live?._cacheWarmer;
    const before = { captured: Boolean(live && live.sessionManager === ctx.sessionManager),
-    bound: warmer?.getMode() === "idle", status: keepAliveStatus(ctx.sessionManager) };
+    bound: warmer?.getMode() === "idle", status: keepAliveStatus(ctx.sessionManager),
+    nativeStatus: live?.cacheWarmingStatus };
    if (warmer?.run) {
     clearTimeout(warmer.run.timer);
     warmer.run.timer = undefined;

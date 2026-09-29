@@ -3,7 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@eare
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
 import { railFastFooterLabel } from "../../commands/rail-fast";
-import { keepAliveLabel, keepAliveStatus } from "../../commands/rail-keep-alive";
+import { keepAliveLabel, keepAliveStatus, onKeepAliveChange } from "../../commands/rail-keep-alive";
 import { railOaiSearchFooterLabel } from "../../commands/rail-oai-search";
 import {
 	collectFooterLiveState,
@@ -272,7 +272,9 @@ export function renderFooter(
 
 class RailFooterComponent {
 	private usageCache?: { entryCount: number; lastEntry: any; stats: FooterUsageStats } | undefined;
+	private disposed = false;
 	private readonly unsubscribe?: () => void;
+	private readonly unsubscribeKeepAlive: () => void;
 
 	constructor(
 		private readonly tui: any,
@@ -284,10 +286,14 @@ class RailFooterComponent {
 		this.unsubscribe = footerData.onBranchChange?.(() => {
 			requestFooterRender(this.tui);
 		});
+		this.unsubscribeKeepAlive = onKeepAliveChange(ctx.sessionManager, () => requestFooterRender(this.tui));
 	}
 
 	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
 		this.unsubscribe?.();
+		this.unsubscribeKeepAlive();
 	}
 
 	invalidate(): void {

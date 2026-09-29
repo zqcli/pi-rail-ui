@@ -68,7 +68,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 {"action":"status","view":"result","id":"team-1:result:def"}
 ```
 
-`status` 是只读查询：`view` 省略或为 `team` 时只接受 `limit`；`work`/`result`/`incident` 可以带精确 `id`，或带不透明的 `cursor` 翻页（二者只能选一）；`limit` 默认 20、最多 50。它不推进状态，也不代表 child 结果已被 parent 观察。
+`status` 是只读查询：`view` 省略或为 `team` 时只接受 `limit`；`work`/`result`/`incident` 可以带精确 `id`，或带不透明的 `cursor` 翻页（二者只能选一）；`limit` 默认 20、最多 50。它不推进状态，也不代表 child 结果已被 parent 观察。worker 查询他人的 work 只得到摘要（状态、任务预览、resultRef），完整依赖与观察记录只对 assignee 和 Manager 可见。`inputRefs`、`resultRefs` 只接受 result ID（`result:…`）；误传 work ID 时，`UNKNOWN_RESULT` 会给出该 work 当前的 result ID。
 
 从属 children 的公开列表是预览，不是完成义务的完整集合：activation 的 `ownedChildren` 最多 8 项，`ownedChildrenOmitted` 表示未展示数量；work 详情的 `children` 最多 64 个 WorkRef，`childrenOmitted` 表示其余数量。宿主 grant 可以增加 root 的 child 创建预算，但不会扩大这些展示上限。需要完整枚举时，调用 `status {view:"work", limit:50}`，随后按返回的 `cursor` 翻至 `hasMore:false`，筛选摘要中 `parent.workId` **和** `parent.revision` 都等于目标父 WorkRef 的条目，读取其 `work`。不要只按 workId 匹配，也不要把预览当作完整 children；Runtime 的完整父子义务仍只在 ledger 中。
 

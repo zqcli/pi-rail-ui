@@ -396,6 +396,7 @@ const schemaObject = (properties: Record<string, unknown>, description?: string)
 });
 const aliasSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ALIAS_LENGTH, description: "Exact alias from the Team roster." });
 const idSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH, description: "Opaque ID returned by Team status or a receipt." });
+const resultIdSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH, description: "A result ID (result:…), never a work ID; a work's result ID is its resultRef in outcomes, events or status." });
 const workRefSchema = schemaObject({ workId: idSchema, revision: Type.Integer({ minimum: 1 }) }, "An immutable work version reference.");
 const resultSchema = schemaObject({
 	status: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
@@ -417,7 +418,7 @@ const controlAction = (command: string, properties: Record<string, unknown>, des
 export const TEAM_TOOL_SCHEMA = Type.Union([
 	schemaObject({ action: Type.Literal("request"), to: aliasSchema,
 		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
-		inputRefs: Type.Optional(Type.Array(idSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
+		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
 	}, "Accept a child request for an exact recipient. A reply never creates a request."),
 	schemaObject({ action: Type.Literal("reply"), result: resultSchema }, "Stage a result for only the current WorkRef; it commits after native settlement and cleanup."),
 	schemaObject({ action: Type.Literal("yield"), waitingFor: Type.Array(workRefSchema, { minItems: 1, maxItems: TEAM_MAX_WAITING_FOR }),
@@ -437,7 +438,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 		`Read a bounded ${view} page; status(result) is read-only and does not acknowledge child-result observation.`),
 		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), id: idSchema,
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
-		`Read one exact ${view} id.`),
+		`Read one exact ${view} id${view === "work" ? "; a worker sees only the summary of another member's work" : ""}.`),
 		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), cursor: idSchema,
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
 		`Continue a ${view} page from its opaque cursor.`),
@@ -446,7 +447,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	controlAction("resume_member", { memberId: aliasSchema }, "Manager only: resume the same parked WorkRef after it reacquires a worker permit; dependencies and budget holds remain."),
 	controlAction("revise_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
-		inputRefs: Type.Optional(Type.Array(idSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
+		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
 	}, "Manager only: replace the exact current work revision; preserve its workId and result history."),
 	controlAction("cancel_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		reason: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
@@ -459,7 +460,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
 	}, "Manager only: explicitly accept a successful root or waive a terminal outcome with a reason."),
 	controlAction("close_member", { memberId: aliasSchema }, "Manager only: close an idle worker with no unresolved obligations."),
-	controlAction("close_team", { resultRefs: Type.Array(idSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
+	controlAction("close_team", { resultRefs: Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
 		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
 	}, "Manager only: close the Team after all roots and member resources are explicitly settled."),

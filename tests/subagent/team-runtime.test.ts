@@ -191,10 +191,15 @@ test("peer dependency: a held worker gets another worker's resultRef from the Ma
 		const held = events.find((event) => event.kind === "WORK_HELD")!;
 		const conclusion = events.find((event) => event.kind === "ROOT_RESULT_READY")!.resultRef!;
 		inputReady(runtime, manager);
-		assert.equal(action(runtime, manager, 1, "resume", { action: "control", command: "resume_work", workId: held.work!.workId, expectedRevision: 1,
+		const producer = events.find((event) => event.kind === "ROOT_RESULT_READY")!.work!;
+		const misuse = action(runtime, manager, 1, "work-as-input", { action: "request", to: "w2", task: "follow up", inputRefs: [producer.workId] });
+		assert.equal(code(misuse), "UNKNOWN_RESULT");
+		assert.match(misuse.ok ? "" : misuse.error.message, new RegExp(`is a work ID, not a result ID; its current result is ${conclusion}`, "u"),
+			"passing a work ID where a result ID belongs names the result to use");
+		assert.equal(action(runtime, manager, 2, "resume", { action: "control", command: "resume_work", workId: held.work!.workId, expectedRevision: 1,
 			incidentId: held.incidentId!, instruction: `w2's conclusion is result ${conclusion}` }).ok, true);
 		assert.equal(runtime.getTeam(teamId).health, "ok", "an answered WORK_HELD no longer flags the Team");
-		assert.equal(action(runtime, manager, 2, "manager-yield", { action: "yield" }).ok, true);
+		assert.equal(action(runtime, manager, 3, "manager-yield", { action: "yield" }).ok, true);
 		settle(runtime, manager, "manager-yield");
 		const resumed = runtime.takeNextActivation(teamId)!;
 		assert.equal(resumed.binding.memberId, "w1");

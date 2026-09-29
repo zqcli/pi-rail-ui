@@ -1697,7 +1697,7 @@ export class TeamRuntime {
 			if (rootChildren >= team.budget.rootLimit(rootId, "rootChildren")) fail("BUDGET_BLOCKED", `Root ${rootId} exceeded its child-work limit`);
 			if (isTerminalWorkState(parentVersion.state)) fail("WORK_NOT_RUNNING", "Cannot create children from terminal work");
 		}
-		for (const resultRef of action.inputRefs) if (!team.ledger.results.has(resultRef)) fail("UNKNOWN_RESULT", `Unknown result reference ${resultRef}`);
+		for (const resultRef of action.inputRefs) this.requireResult(team, resultRef);
 		const at = this.timestamp();
 		const work = this.makeWork(requester.id, recipient.id, action.task, action.inputRefs, parent, at, rootId, depth);
 		this.assertInputFits(team, recipient, work, parent);
@@ -1899,7 +1899,7 @@ export class TeamRuntime {
 			const parent = team.ledger.version(entry.record.parent);
 			if (!parent || isTerminalWorkState(parent.state)) fail("INVALID_ARGUMENT", "A child of a terminal parent cannot be revised; create independent work");
 		}
-		for (const inputRef of control.inputRefs) if (!team.ledger.results.has(inputRef)) fail("UNKNOWN_RESULT", `Unknown result reference ${inputRef}`);
+		for (const inputRef of control.inputRefs) this.requireResult(team, inputRef);
 		if (team.reservedResultBytes + TEAM_MAX_RESULT_BYTES > team.limits.reservedResultBytes) fail("TEAM_CAPACITY", "Reserved result capacity is full");
 		const nextRevision = entry.record.currentRevision + 1;
 		const candidate = this.makeVersion(nextRevision, control.task, control.inputRefs, this.timestamp());
@@ -2050,7 +2050,7 @@ export class TeamRuntime {
 			&& (incident.code !== "BUDGET_HIT" || holdsWork(incident.id)))) {
 			blockers.push({ kind: "incident", reason: "succeeded close cannot leave an unresolved incident" });
 		}
-		for (const resultRef of resultRefs) if (!team.ledger.results.has(resultRef)) fail("UNKNOWN_RESULT", `Unknown result reference ${resultRef}`);
+		for (const resultRef of resultRefs) this.requireResult(team, resultRef);
 		if (outcome === "succeeded") {
 			const unsuccessful = roots.filter((root) => currentVersion(root).review?.disposition !== "accepted"
 				|| team.ledger.results.get(currentVersion(root).resultRef ?? "")?.result.status !== "succeeded");
@@ -2673,6 +2673,14 @@ export class TeamRuntime {
 		version.hold = { reason: "budget", incidentId: incident.id };
 		version.updatedAt = this.timestamp();
 		team.ready = team.ready.filter((item) => !sameWorkRef(item, ref));
+	}
+
+	private requireResult(team: TeamState, ref: string): void {
+		if (team.ledger.results.has(ref)) return;
+		const work = team.ledger.get(ref);
+		const resultRef = work && currentVersion(work.record).resultRef;
+		fail("UNKNOWN_RESULT", work ? `${ref} is a work ID, not a result ID; ${resultRef ? `its current result is ${resultRef}` : "it has no committed result yet"}`
+			: `Unknown result reference ${ref}`);
 	}
 
 	/** Ending held work (cancel, revise) is the Manager's answer to its attention/protocol incident. */

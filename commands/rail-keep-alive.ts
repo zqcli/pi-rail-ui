@@ -19,7 +19,7 @@ type Warmer = {
  stop: (reason: string) => void; cancel: () => void; clearRun: () => void;
  refresh: (run: Run) => Promise<void>;
 };
-type State = { manager: any; warmer?: Warmer | undefined; mode: Mode; restore?: (() => void) | undefined; notify?: (text: string) => void };
+type State = { manager: any; warmer?: Warmer | undefined; mode: Mode; restore?: (() => void) | undefined; notify?: (text: string) => void; isIdle?: () => boolean };
 type Bridge = { pending: Set<State>; active: Set<State>; original?: any; wrapper?: any; disposeOriginal?: any; disposeWrapper?: any };
 const bridge = createStore<Bridge>("keep-alive-bridge", () => ({ pending: new Set(), active: new Set() }));
 const states = createStore<Map<any, State>>("keep-alive-states", () => new Map());
@@ -85,9 +85,33 @@ function bind(state: State, session: AgentSession): void {
  const original = {
   start: w.start, schedule: w.schedule, settled: w.onAgentSettled,
   deadline: w.refreshDeadlineMissed, evaluate: w.evaluate, mode: w.getMode, decide: w.decide,
-  models: w.models, manager: w.sessionManager, warmed: w.onWarmed,
+  models: w.models, manager: w.sessionManager, warmed: w.onWarmed, clearRun: w.clearRun,
  };
- let leaf: string | null = state.manager.getLeafId();
+ const compactDescriptor = Object.getOwnPropertyDescriptor(session, "compact");
+ const compact = session.compact;
+ const compactWrapper = function(this: AgentSession, ...args: Parameters<AgentSession["compact"]>) {
+  if (state.mode.minutes) { w.cancel(); state.mode.paused = undefined; }
+  return compact.apply(this, args);
+ };
+ session.compact = compactWrapper;
+ const pendingDecisions = new Map<Run, () => void>();
+ let generation = 0;
+ w.clearRun = function() {
+  const run = w.run;
+  generation++;
+  if (run) pendingDecisions.get(run)?.();
+  original.clearRun.call(w);
+ };
+ // Session entries that cannot change provider context must not invalidate a
+ // request snapshot. Keep context edits, compactions and branch ancestry guarded.
+ const contextPath = () => state.manager.getBranch()
+  .filter((entry: any) => !["usage", "session_info", "label", "custom"].includes(entry.type))
+  .map((entry: any) => entry.id ?? entry);
+ let path = contextPath();
+ const samePath = () => {
+  const now = contextPath();
+  return now.length === path.length && now.every((id: any, index: number) => id === path[index]);
+ };
  w.getMode = () => state.mode.minutes === null ? "off" : state.mode.minutes ? "idle" : original.mode();
  w.start = function(request, isCurrent) {
   if (state.mode.minutes === null) { w.stop("Rail keep-alive off"); return; }
@@ -98,15 +122,15 @@ function bind(state: State, session: AgentSession): void {
   if (request.options?.reasoning && request.model?.api === "anthropic-messages" && request.model?.compat?.forceAdaptiveThinking !== true) {
    pause(state, "Anthropic thinking request cannot be replayed with a one-token cap"); return;
   }
-  leaf = state.manager.getLeafId();
-  const current = () => isCurrent() && state.manager.getLeafId() === leaf;
+  path = contextPath();
+  const current = () => isCurrent() && samePath();
   w.run = { ...request, isCurrent: current, controller: new AbortController(), phase: "streaming", nextWarmAt: 0, extensionOverride: false };
   // Only settle schedules the manual idle interval; no streaming timer.
  };
  w.onAgentSettled = function() {
   if (!state.mode.minutes) { original.settled.call(w); return; }
   if (!w.run || state.mode.paused) return;
-  leaf = state.manager.getLeafId();
+  path = contextPath();
   w.run.phase = "idle";
   w.schedule(w.run);
  };
@@ -118,6 +142,7 @@ function bind(state: State, session: AgentSession): void {
   run.timer = setTimeout(() => {
    run.timer = undefined;
    if (Date.now() > run.nextWarmAt + LATE_MS) { pause(state, "timer late after sleep; send a fresh real request"); return; }
+   if (!state.isIdle?.()) { pause(state, "session is busy; send a fresh real request"); return; }
    void w.refresh(run).catch((error) => {
     if (w.run === run) pause(state, error instanceof Error ? error.message : String(error));
    });
@@ -127,7 +152,7 @@ function bind(state: State, session: AgentSession): void {
  w.refreshDeadlineMissed = function(run) {
   if (!state.mode.minutes) return original.deadline.call(w, run);
   if (Date.now() <= run.nextWarmAt + LATE_MS) return false;
-  pause(state, "refresh deadline missed; send a fresh real request");
+  if (w.run === run) pause(state, "refresh deadline missed; send a fresh real request");
   return true;
  };
  w.evaluate = (run) => state.mode.minutes
@@ -136,18 +161,34 @@ function bind(state: State, session: AgentSession): void {
   : original.evaluate.call(w, run);
  w.decide = async (event) => {
   if (!state.mode.minutes) return original.decide.call(w, event);
+  const run = w.run;
+  const decisionGeneration = generation;
+  const isCurrentDecision = () => w.run === run && generation === decisionGeneration;
+  if (!run || !state.isIdle?.()) {
+   if (run) pause(state, "session is busy; send a fresh real request");
+   return "stop";
+  }
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
    const action = await Promise.race([
     original.decide.call(w, event),
+    new Promise<string>((resolve) => pendingDecisions.set(run, () => resolve("stop"))),
     new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("decision hook timed out")), REQUEST_TIMEOUT_MS); timeout.unref?.(); }),
    ]);
-   if (action === "stop" && w.run) pause(state, "stopped by another extension");
+   if (!isCurrentDecision()) return "stop";
+   if (!state.isIdle?.()) {
+    pause(state, "session is busy; send a fresh real request");
+    return "stop";
+   }
+   if (action === "stop") pause(state, "stopped by another extension");
    return action;
   } catch (error) {
-   pause(state, error instanceof Error ? error.message : String(error));
+   if (isCurrentDecision()) pause(state, error instanceof Error ? error.message : String(error));
    return "stop";
-  } finally { if (timeout) clearTimeout(timeout); }
+  } finally {
+   if (timeout) clearTimeout(timeout);
+   pendingDecisions.delete(run);
+  }
  };
  w.sessionManager = {
   getBranch: () => original.manager.getBranch(),
@@ -162,6 +203,10 @@ function bind(state: State, session: AgentSession): void {
  // Native refresh retains request options (including payload, response and header
  // hooks), appendUsage and validation. Observe failures its best-effort catch hides.
  w.models = { streamSimple(...args: any[]) {
+  if (state.mode.minutes && !state.isIdle?.()) {
+   pause(state, "session is busy; send a fresh real request");
+   throw new Error("session is busy; refresh not sent");
+  }
   let stream: any;
   try { stream = original.models.streamSimple(...args); }
   catch (error) {
@@ -190,7 +235,6 @@ function bind(state: State, session: AgentSession): void {
   } };
  } };
  w.onWarmed = (entry) => {
-  leaf = state.manager.getLeafId();
   try { original.warmed?.call(w, entry); }
   catch (error) {
    if (state.mode.minutes) pause(state, error instanceof Error ? error.message : String(error));
@@ -199,6 +243,11 @@ function bind(state: State, session: AgentSession): void {
  };
  state.restore = () => {
   w.clearRun();
+  if (session.compact === compactWrapper) {
+   if (compactDescriptor) Object.defineProperty(session, "compact", compactDescriptor);
+   else delete (session as any).compact;
+  }
+  w.clearRun = original.clearRun;
   w.start = original.start; w.schedule = original.schedule;
   w.onAgentSettled = original.settled; w.refreshDeadlineMissed = original.deadline;
   w.getMode = original.mode; w.decide = original.decide; w.evaluate = original.evaluate;
@@ -241,7 +290,7 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
   if (state) stop(state);
   const saved = [...manager.getEntries()].reverse().find((e: any) => e.type === "custom" && e.customType === ENTRY && e.data?.sessionId === manager.getSessionId()) as { data?: { minutes?: number | null } } | undefined;
   const minutes = saved?.data?.minutes;
-  state = { manager, mode: { minutes: minutes === null || (typeof minutes === "number" && Number.isSafeInteger(minutes) && minutes > 0 && minutes * INTERVAL <= 2 ** 31 - 1) ? minutes : undefined }, notify: (text) => ctx.ui.notify(text, "warning") } as State;
+  state = { manager, mode: { minutes: minutes === null || (typeof minutes === "number" && Number.isSafeInteger(minutes) && minutes > 0 && minutes * INTERVAL <= 2 ** 31 - 1) ? minutes : undefined }, notify: (text) => ctx.ui.notify(text, "warning"), isIdle: () => ctx.isIdle() } as State;
   states().set(manager, state);
   awaitSession(state);
  });
@@ -251,6 +300,7 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
  pi.on("before_agent_start", (_event, ctx) => { invalidate(ctx); });
  pi.on("model_select", (_event, ctx) => { invalidate(ctx); });
  pi.on("session_tree", (_event, ctx) => { invalidate(ctx); });
+ pi.on("session_before_compact", (_event, ctx) => { invalidate(ctx); });
  pi.on("session_compact", (_event, ctx) => { invalidate(ctx); });
  pi.on("session_compact_failed", (_event, ctx) => { invalidate(ctx); });
  pi.registerCommand("rail-keep-alive", {

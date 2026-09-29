@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -61,4 +61,58 @@ test("bundled CLI local mock provider: refresh retains request hooks and writes 
  assert.equal(requests.length, 2);
  assert.equal(requests[1].maxTokens, 1);
  assert.deepEqual(requests.map(request => [request.hasPayloadHook, request.hasResponseHook, request.hasHeadersHook]), [[true, true, true], [true, true, true]]);
+});
+
+test("real SessionManager + AgentSession.setSessionName preserves an idle warm snapshot", { timeout: 30_000 }, async (t) => {
+ const root = join(process.cwd(), ".tmp");
+ await mkdir(root, { recursive: true });
+ const dir = await mkdtemp(join(root, "ka-name-"));
+ const output = join(dir, "result.json");
+ const log = join(dir, "provider.jsonl");
+ const transport = new PiRpcProcessTransport({
+  command: process.execPath,
+  args: [bundle, "--mode", "rpc", "--no-session", "--model", "rail-ka-local/local", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline", "-e", fixture],
+  cwd: process.cwd(), env: { ...process.env, HOME: join(dir, "home"), PI_CODING_AGENT_DIR: join(dir, "agent"), PI_OFFLINE: "1", KA_PROBE_OUTPUT: output, KA_PROBE_LOG: log },
+ });
+ t.after(async () => { await transport.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+ await transport.start();
+ await transport.request({ type: "prompt", message: "/rail-keep-alive 1" });
+ const settled = new Promise<void>((resolve) => { const off = transport.onEvent((e) => { if (e.type === "agent_settled") { off(); resolve(); } }); });
+ await transport.request({ type: "prompt", message: "real prompt (local mock)" });
+ await settled;
+ await transport.request({ type: "prompt", message: "/ka-name" });
+ const result = JSON.parse(await readFile(output, "utf8"));
+ assert.equal(result.count, 1, JSON.stringify(result));
+ assert.match(result.status, /KA 1m WAIT \(next/);
+ assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 2);
+});
+
+test("real AgentSession.compact cancels idle warming before the blocked compaction hook", { timeout: 30_000 }, async (t) => {
+ const root = join(process.cwd(), ".tmp");
+ await mkdir(root, { recursive: true });
+ const dir = await mkdtemp(join(root, "ka-compact-"));
+ const output = join(dir, "result.json");
+ const log = join(dir, "provider.jsonl");
+ const agentDir = join(dir, "agent");
+ await mkdir(agentDir, { recursive: true });
+ await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 1, reserveTokens: 100 } }));
+ const transport = new PiRpcProcessTransport({
+  command: process.execPath,
+  args: [bundle, "--mode", "rpc", "--no-session", "--model", "rail-ka-local/local", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline", "-e", fixture],
+  cwd: process.cwd(), env: { ...process.env, HOME: join(dir, "home"), PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", KA_PROBE_OUTPUT: output, KA_PROBE_LOG: log },
+ });
+ t.after(async () => { await transport.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+ await transport.start();
+ await transport.request({ type: "prompt", message: "/rail-keep-alive 1" });
+ for (let i = 0; i < 2; i++) {
+  const settled = new Promise<void>((resolve) => { const off = transport.onEvent((e) => { if (e.type === "agent_settled") { off(); resolve(); } }); });
+  await transport.request({ type: "prompt", message: `real local turn ${i}` });
+  await settled;
+ }
+ await transport.request({ type: "prompt", message: "/ka-compact" });
+ const result = JSON.parse(await readFile(output, "utf8"));
+ assert.equal(result.compacting, true);
+ assert.equal(result.cancelledOldRun, true, JSON.stringify(result));
+ assert.equal(result.requests, 2, "no warm request during compaction");
+ assert.match(result.status, /WAIT.*fresh real request/);
 });

@@ -1,4 +1,4 @@
-import { appendFile, writeFile } from "node:fs/promises";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installRailKeepAlive, keepAliveStatus } from "../../commands/rail-keep-alive";
@@ -32,11 +32,65 @@ export default function probe(pi: ExtensionAPI) {
  pi.on("before_provider_headers", ({ headers }) => { headers["x-ka-probe"] = "yes"; });
  const original = AgentSession.prototype.prompt;
  let live: any;
+ let blockCompaction: (() => void) | undefined;
+ let enteredCompaction: (() => void) | undefined;
+ pi.on("session_before_compact", async () => {
+  if (!blockCompaction) return;
+  enteredCompaction?.();
+  await new Promise<void>((resolve) => { blockCompaction = resolve; });
+  return { cancel: true };
+ });
  AgentSession.prototype.prompt = function(this: AgentSession, ...args: any[]) {
   live = this;
   return original.apply(this, args as [string]);
  };
  installRailKeepAlive(pi);
+ pi.registerCommand("ka-name", {
+  handler: async (_args, ctx) => {
+   const warmer = live?._cacheWarmer;
+   const before = warmer?.run;
+   live.setSessionName("renamed while idle");
+   if (before?.timer) clearTimeout(before.timer);
+   if (before) { before.timer = undefined; await warmer.refresh(before); }
+   const count = ctx.sessionManager.getEntries().filter((entry) => entry.type === "usage" && entry.kind === "cache_warm").length;
+   await writeFile(process.env["KA_PROBE_OUTPUT"]!, JSON.stringify({ count, status: keepAliveStatus(ctx.sessionManager) }));
+  },
+ });
+ pi.registerCommand("ka-compact", {
+  handler: async (_args, ctx) => {
+   const warmer = live?._cacheWarmer;
+   const oldRun = warmer?.run;
+   let entered!: () => void;
+   const reachedHook = new Promise<void>((resolve) => { entered = resolve; });
+   enteredCompaction = entered;
+   blockCompaction = () => {};
+   const compaction = live.compact();
+   try {
+    await Promise.race([
+     reachedHook,
+     compaction.then(() => { throw new Error("compaction finished before before_compact hook"); }, (error: Error) => { throw error; }),
+     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("compaction hook not reached")), 5000)),
+    ]);
+    // Reproduce the old timer callback while compaction is blocked. If the
+    // session did not cancel it, native refresh would send a paid request.
+    if (oldRun && !oldRun.controller.signal.aborted) {
+     if (oldRun.timer) clearTimeout(oldRun.timer);
+     oldRun.timer = undefined;
+     await warmer.refresh(oldRun);
+    }
+    const requests = (await readFile(process.env["KA_PROBE_LOG"]!, "utf8")).trim().split("\n").length;
+    await writeFile(process.env["KA_PROBE_OUTPUT"]!, JSON.stringify({
+     compacting: live.isCompacting, cancelledOldRun: oldRun?.controller.signal.aborted,
+     requests, status: keepAliveStatus(ctx.sessionManager),
+    }));
+   } finally {
+    blockCompaction?.();
+    blockCompaction = undefined;
+    enteredCompaction = undefined;
+    await compaction.catch(() => undefined);
+   }
+  },
+ });
  pi.registerCommand("ka-probe", {
   handler: async (_args, ctx) => {
    const warmer = live?._cacheWarmer;

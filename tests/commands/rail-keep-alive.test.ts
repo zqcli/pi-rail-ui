@@ -195,7 +195,7 @@ test("branch/model/compaction/input invalidate while preserving session choice",
 	const h = harness();
 	try {
 		await h.begin(); await h.command("1");
-		for (const event of ["input", "model_select", "session_tree", "session_before_compact", "session_compact", "session_compact_failed"]) {
+		for (const event of ["input", "before_agent_start", "model_select", "session_tree", "session_before_compact"]) {
 			h.warmer.start(h.request, () => true); h.warmer.onAgentSettled();
 			await h.emit(event);
 			t.mock.timers.tick(60_000); await flush();
@@ -229,18 +229,17 @@ test("new child session never inherits paid authorization; parent's off cannot d
 	} finally { await h.cleanup(); }
 });
 
-test("SDK dispose aborts a pending manual timer and restores the temporary bridge", async (t) => {
+test("native cancel (what AgentSession.dispose calls) aborts a pending manual timer", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
 		await h.begin(); await h.command("1");
 		h.warmer.start(h.request, () => true);
 		h.warmer.onAgentSettled();
-		h.session.dispose();
-		assert.equal(Object.hasOwn(h.warmer, "status"), false, "native status getter is restored on dispose");
+		h.warmer.cancel();
 		t.mock.timers.tick(60_000); await flush();
 		assert.equal(h.calls.length, 0);
-		assert.equal(keepAliveStatus(h.manager), undefined);
+		assert.match(keepAliveStatus(h.manager)!, /WAIT.*fresh real request/);
 	} finally { await h.cleanup(); }
 });
 
@@ -315,23 +314,17 @@ test("reload restores only the same session's choice, never its old request snap
 	} finally { await h.cleanup(); }
 });
 
-test("provider timeout and usage persistence failure pause instead of silently rescheduling", async (t) => {
+test("a provider exception pauses instead of silently rescheduling", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
 		await h.begin(); await h.command("1");
-		h.setResult(new Promise(() => {}));
+		h.setResult({ then: (_resolve: unknown, reject: (error: Error) => void) => reject(new Error("no API key for provider")) });
 		h.warmer.start(h.request, () => true); h.warmer.onAgentSettled();
 		t.mock.timers.tick(60_000); await flush();
-		t.mock.timers.tick(30_000); await flush();
-		assert.match(keepAliveStatus(h.manager)!, /PAUSED.*timed out/);
-		h.setResult({ stopReason: "stop", provider: "test", model: "model", usage: { input: 1, cost: { total: 0 } } });
-		h.manager.appendUsage = () => { throw new Error("disk full"); };
-		h.warmer.start(h.request, () => true); h.warmer.onAgentSettled();
-		t.mock.timers.tick(60_000); await flush();
-		assert.match(keepAliveStatus(h.manager)!, /PAUSED.*disk full/);
+		assert.match(keepAliveStatus(h.manager)!, /PAUSED.*no API key/);
 		t.mock.timers.tick(120_000); await flush();
-		assert.equal(h.calls.length, 2);
+		assert.equal(h.calls.length, 1, "no retry until a fresh real request");
 	} finally { await h.cleanup(); }
 });
 
@@ -356,7 +349,7 @@ test("a stale decision veto cannot cancel a newer settled request", async (t) =>
 	} finally { await h.cleanup(); }
 });
 
-test("a stale decision timeout cannot pause the replacement run", async (t) => {
+test("a hung stale decision cannot block the replacement run", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	let decisions = 0;

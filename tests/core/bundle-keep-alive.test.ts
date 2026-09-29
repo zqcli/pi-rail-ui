@@ -92,7 +92,7 @@ test("real SessionManager + AgentSession.setSessionName preserves an idle warm s
 	assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 2);
 });
 
-test("real AgentSession.compact cancels idle warming before the blocked compaction hook", { timeout: 30_000 }, async (t) => {
+test("real AgentSession.compact: a refresh while the compaction hook is blocked is not sent", { timeout: 30_000 }, async (t) => {
 	const root = join(process.cwd(), ".tmp");
 	await mkdir(root, { recursive: true });
 	const dir = await mkdtemp(join(root, "ka-compact-"));
@@ -119,5 +119,5 @@ test("real AgentSession.compact cancels idle warming before the blocked compacti
 	assert.equal(result.compacting, true);
 	assert.equal(result.cancelledOldRun, true, JSON.stringify(result));
 	assert.equal(result.requests, 2, "no warm request during compaction");
-	assert.match(result.status, /WAIT.*fresh real request/);
+	assert.match(result.status, /PAUSED.*busy/, "the compacting session is busy, so the refresh pauses before any request");
 });

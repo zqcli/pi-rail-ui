@@ -189,7 +189,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 	}
 	if (scenario === "tool-budget" && input.scope.kind === "work") {
 		// Two invalid end intents (still real, counted tool calls), then a legal final reply past the limit.
-		if (replies.length === 0) return [call("tool-budget-bad-yield", { action: "yield", waitingFor: [{ workId: "missing-work", revision: 1 }] })];
+		if (replies.length === 0) return [call("tool-budget-bad-yield", { action: "yield", waitingFor: [{ workId: "missing-work", revision: 1 }], checkpoint: "Waits on unknown work." })];
 		if (replies.length === 1) return [call("tool-budget-idle-yield", { action: "yield" })];
 		return [call("tool-budget-reply", { action: "reply", result: { status: "succeeded", summary: "Finished with the final attempt." } })];
 	}

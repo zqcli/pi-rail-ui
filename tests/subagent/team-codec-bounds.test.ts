@@ -124,6 +124,15 @@ test("activation projection budgets combined errors and previews, without droppi
 	assert.throws(() => projectActivationInput(impossible), (error: unknown) => error instanceof TeamProtocolError && error.code === "INPUT_BUDGET_EXCEEDED");
 });
 
+test("the model-facing schema requires a checkpoint on work yields, as the Runtime does", () => {
+	const ref = { workId: "work:1", revision: 1 };
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", waitingFor: [ref] }), false);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", attention: "decide scope" }), false);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", waitingFor: [ref], checkpoint: "step 1 done" }), true);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", attention: "decide scope", checkpoint: "step 1 done" }), true);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield" }), true, "the Manager's plain yield stays valid");
+});
+
 test("schema-valid ~1.32 MB result is INVALID_ARGUMENT before a private frame can be built", () => {
 	const text = "x".repeat(TEAM_MAX_TEXT_ITEM_BYTES);
 	const list = Array.from({ length: 32 }, () => text);

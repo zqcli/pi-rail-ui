@@ -39,7 +39,7 @@ function incidentView(incident: TeamIncidentView): TeamIncidentView {
 
 /** Grant reasons are retained in the bounded Team view; keep them short. */
 const TEAM_MAX_GRANT_REASON_BYTES = 512;
-const TEAM_MAX_TIMELINE = 60;
+const TEAM_MAX_TIMELINE = 100;
 const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work. "
 	+ "If it needs another member's conclusion first, yield {waitingFor:[that member's WorkRef from status work], checkpoint}, "
 	+ "or request it from that member and wait on the returned WorkRef, or ask the Manager with yield {attention, checkpoint}. Read a full result with status(result).";
@@ -2281,7 +2281,10 @@ export class TeamRuntime {
 		if (delivery.state === "in_flight") delivery.state = active.inputReady ? "delivered" : "unknown";
 		if (scope.kind === "management") this.finishManagement(team, member, active);
 		else this.finishWork(team, member, active);
-		this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "management activation"}${active.intent ? ` (${active.intent.kind.replaceAll("_", " ")})` : ""}`);
+		// A committed reply already has its own result milestone.
+		if (!(active.intent?.kind === "reply" && team.ledger.version(scope.work!)?.resultRef)) {
+			this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "management activation"}${active.intent ? ` (${active.intent.kind.replaceAll("_", " ")})` : ""}`);
+		}
 		if (member.active === active) delete member.active;
 		delete member.currentWork;
 		member.activity = "idle";
@@ -3114,7 +3117,8 @@ export class TeamRuntime {
 
 	private newId(): string { return this.createId(); }
 	private id(kind: string): string {
-		const id = `${this.newId()}:${kind}:${this.createId()}`;
+		// Short opaque IDs: members copy them into tool calls, and every extra character is a chance to mistype.
+		const id = `${kind}:${this.createId()}`;
 		if (id.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(id)) fail("TEAM_CAPACITY", "ID generator returned an invalid identifier");
 		return id;
 	}

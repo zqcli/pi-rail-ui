@@ -137,7 +137,7 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 	];
 	if (view.reason) lines.push(`Reason: ${previewText(view.reason, 400)}`);
 	const w = view.works;
-	lines.push(`Works: ${w.total} total · queued ${w.queued} · running ${w.running} · blocked ${w.blocked} · held ${w.held} · resolved ${w.resolved} · failed ${w.failed} · cancelled ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`);
+	lines.push(`Works: ${w.total} total · queued ${w.queued} · running ${w.running} · blocked ${w.blocked} · held ${w.held} · resolved ${w.resolved} · failed ${w.failed} · cancelled/superseded ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`);
 	lines.push(...memberLines);
 	const holds = works.filter((work) => work.hold);
 	if (holds.length) {
@@ -263,7 +263,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 	const lines = [
 		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""}${result.reason ? ` · ${previewText(result.reason, 400)}` : ""}`,
 		`Roots: ${result.roots.map((root) => `${workRefKey(root.work)} ${root.state}${root.review ? ` (${root.review.disposition})` : ""}`).join(" · ") || "none"}`,
-		`Works: ${w.total} total · resolved ${w.resolved} · failed ${w.failed} · cancelled ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`,
+		`Works: ${w.total} total · resolved ${w.resolved} · failed ${w.failed} · cancelled/superseded ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`,
 		"Members:",
 		...view.members.map((member) => {
 			const activity = host.driver.memberActivity(result.teamId, member.id);

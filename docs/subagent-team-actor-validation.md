@@ -669,6 +669,14 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 
 隔离环境全量：`npm run check` 950/950（71421 ms，`/tmp/pi-r5-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 950/950（71301 ms，`/tmp/pi-r5-depth.log`）。真实在线复测（session `ccece5c4…`，三来源 → writer → reviewer，两轮返工复核，Manager `cus-resp/gpt-6-sol:xhigh`，worker `cus-resp/gpt-6-luna:max` + FAST）：9:41 `succeeded`，7 个 root 全部接受，6 个成员会话 team 工具错误 0 次，时间线完整无省略。独立 review（`cus-resp/gpt-6-astra:high`）结论 approve、无问题，其复跑 107 项相关测试（含 real-Pi driver 39 项）全部通过。
 
+### 7.10 第六轮复杂场景实测后的调整
+
+用户会话中 3 个 Team（两个负责人共用一个专家队列且专家提前 `close_member` 后仍读取其结果；双下游先消费上游 v1 再切换到同一 work 的 v2 并分页审计；取消正在执行的过时子树而保留同成员队列中的有效 sibling；共 19 成员、25 work、约 36 分钟）全部以 `succeeded` 关闭，成员全部释放，时间线完整、无重复 reply 行，缺 checkpoint 的错误未再出现。没有运行时缺陷。team 工具错误共 3 次，均已恢复：2 次是模型把 work ID 放进只接受 result ID 的 `inputRefs`，1 次抄错 result ID。另有一次 Manager 误以为按精确 id 查询他人 work 能看到完整详情（worker 按设计只见摘要），导致 reviewer 多返工一轮；一次 producer 自行臆造“改查 session-name”的指令，经 Manager 纠正（模型问题）。
+
+调整：`inputRefs`/`resultRefs` 误传 work ID 时，`UNKNOWN_RESULT` 直接指出这是 work ID 并给出其当前 result ID（没有结果时说明尚未提交）；schema 描述写明这些字段只接受 result ID，精确 `status(work)` 描述写明 worker 只能看到他人 work 的摘要。回归：`team-runtime.test.ts` · `peer dependency: …`（改前失败、改后通过）。
+
+隔离环境全量：`npm run check` 950/950（79232 ms，`/tmp/pi-r6-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 950/950（76797 ms，`/tmp/pi-r6-depth.log`）。独立 review（`cus-resp/gpt-6-astra:high`）结论 approve、无问题；另做 18 个拒绝场景确认失败调用不改变状态，复跑 4 个相关测试文件 69/69。本轮只改错误提示与描述，未另做在线复测。
+
 ## 8. 历史阶段结果（非本轮成绩）
 
 上一版 D2b／`5368b05` 的父全量记录为：

@@ -366,7 +366,7 @@ test("Rail agent overlay shows current/global counts and truthful worker status"
 		const text = lines.join("\n");
 		assert.match(text, /Current 1/);
 		assert.match(text, /All 1/);
-		assert.match(text, /0 running · 0 queued · 1 idle/);
+		assert.match(text, /│ 1 idle +│/, "zero counts are omitted");
 		assert.match(text, /auth-review/);
 		assert.match(text, /IDLE/);
 		assert.ok(lines.every((line) => visibleWidth(line) <= 100));
@@ -457,7 +457,7 @@ test("running agents show compacting as an activity status while remaining contr
 	try {
 		const text = state.component.render(100).join("\n");
 		assert.match(text, /COMPACTING/);
-		assert.match(text, /1 running · 0 queued/);
+		assert.match(text, /│ 1 running +│/);
 	} finally {
 		state.component.dispose();
 	}

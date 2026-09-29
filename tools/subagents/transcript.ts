@@ -7,10 +7,15 @@ const MAX_ENTRY_CHARS = 4000;
 const COLLAPSED_ROWS = 10;
 const EXPANDED_ROWS = 16;
 const MAX_ENTRY_ROWS = 5;
+const COLLAPSED_INITIAL_ROWS = 1;
+const COLLAPSED_ANSWER_ROWS = 3;
 
 export type SubagentTranscriptKind = "user" | "assistant" | "thinking" | "tool" | "toolResult";
-/** `idle` is a live session waiting for work (a Team member); it is never shown as completed. */
-export type SubagentTranscriptStatus = "running" | "idle" | "completed" | "accepted" | "failed";
+/**
+ * `idle`, `waiting` (on other work or a worker slot) and `held` (needs a Manager decision) are live
+ * Team members between activations; they are never shown as completed.
+ */
+export type SubagentTranscriptStatus = "running" | "idle" | "waiting" | "held" | "completed" | "accepted" | "failed";
 
 export interface SubagentTranscriptEntry {
 	id: string;
@@ -76,6 +81,11 @@ export interface SubagentTranscriptRenderOptions {
 	sequenceTotal?: number;
 	control?: boolean;
 	markdownTheme?: MarkdownTheme;
+	/**
+	 * Team member panels: the summary counts members, and collapsed panels keep one task row so the
+	 * latest activity stays visible. Ordinary dispatches always show the full initial task.
+	 */
+	unit?: "member";
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -642,10 +652,11 @@ class BoundedTranscriptView implements Component {
 		private readonly maxRows: number,
 		private readonly theme: Theme,
 		private readonly statusLine?: string,
+		private readonly initialRows = Number.POSITIVE_INFINITY,
 	) {}
 
 	render(width: number): string[] {
-		const headerLines = [truncateToWidth(this.header, Math.max(1, width), "", true)];
+		const headerLines = this.header ? [truncateToWidth(this.header, Math.max(1, width), "", true)] : [];
 		const statusLines = this.statusLine
 			? [truncateToWidth(this.theme.fg("dim", this.statusLine), Math.max(1, width), "", true)]
 			: [];
@@ -667,10 +678,14 @@ class BoundedTranscriptView implements Component {
 
 	invalidate(): void {}
 
+	/** Team member panels keep only the task's first rows when collapsed; other panels show it whole. */
 	renderInitial(width: number): string[] {
 		const entries = this.groups.flatMap((group) => group.entries.filter((entry) => isInitialEntry(entry)));
-		if (entries.length === 0) return [];
-		return entries.flatMap((entry) => this.renderEntry(entry, width, true));
+		const lines = entries.flatMap((entry) => this.renderEntry(entry, width, true));
+		if (lines.length <= this.initialRows) return lines;
+		const kept = lines.slice(0, this.initialRows);
+		kept[kept.length - 1] = truncateToWidth(`${kept.at(-1)!.trimEnd()} …`, Math.max(1, width), "…");
+		return kept;
 	}
 
 	private renderEntry(entry: SubagentTranscriptEntry, width: number, unbounded = false): string[] {
@@ -726,8 +741,11 @@ function compactNumber(value: number): string {
 
 function compactDuration(durationMs: number | undefined): string {
 	if (durationMs === undefined) return "";
-	const minutes = Math.floor(durationMs / 60_000);
-	return minutes > 0 ? `${minutes}m` : "<1m";
+	const seconds = Math.max(0, Math.floor(durationMs / 1000));
+	const pad = (value: number) => String(value).padStart(2, "0");
+	const hours = Math.floor(seconds / 3600);
+	const minutes = Math.floor(seconds / 60) % 60;
+	return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
 }
 
 function hostedSearchText(count: number): string {
@@ -774,8 +792,19 @@ function statusText(run: SubagentTranscriptRun): string {
 	if (run.status === "running" && run.isCompacting) return "Compacting";
 	if (run.status === "running") return "Running";
 	if (run.status === "idle") return "Idle";
+	if (run.status === "waiting") return "Waiting";
+	if (run.status === "held") return "Held";
 	if (run.status === "accepted") return "Accepted";
 	return "Completed";
+}
+
+/** One color per state, shared by icons, headers and borders: attention is the only yellow. */
+function statusColor(run: SubagentTranscriptRun): "accent" | "success" | "error" | "warning" | "muted" {
+	if (run.status === "failed") return "error";
+	if (run.status === "held" || (run.status === "running" && run.isCompacting)) return "warning";
+	if (run.status === "running" || run.status === "accepted") return "accent";
+	if (run.status === "idle" || run.status === "waiting") return "muted";
+	return "success";
 }
 
 function runsWithDispatchMetadata(
@@ -802,23 +831,33 @@ function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control",
 	const step = run.step !== undefined
 		? `${sequenceTotal !== undefined ? `${run.step}/${sequenceTotal}` : `step ${run.step}`} · `
 		: "";
-	const contextWindow = ` · ContextWindow ${run.contextWindowText ?? "Default"}`;
-	const fast = ` · FAST ${run.fastModeText ?? "off"}`;
-	const search = ` · SEARCH ${run.searchModeText ?? "off"}`;
-	return `${step}${run.alias} · ${run.role ?? (run.persistent ? "persistent" : "one-off")} · ${run.model ?? "model unavailable"}${contextWindow}${fast}${search}`;
+	// A one-off alias is "<model> #N"; the model follows anyway, so only the slot number is kept.
+	const model = run.model ?? "model unavailable";
+	const name = !run.persistent && run.alias.startsWith(`${model.split(":")[0]} #`) ? run.alias.slice(run.alias.lastIndexOf("#")) : run.alias;
+	return `${step}${name} · ${run.role ?? (run.persistent ? "persistent" : "one-off")} · ${model}`;
+}
+
+/** Static dispatch policy, after the live metrics so a narrow terminal truncates it first. */
+function policyText(run: SubagentTranscriptRun): string {
+	return `ContextWindow ${run.contextWindowText ?? "Default"} · FAST ${run.fastModeText ?? "off"} · SEARCH ${run.searchModeText ?? "off"}`;
 }
 
 function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
-	if (run.status === "failed") return theme.fg("error", "✗");
-	if (run.status === "running" && run.isCompacting) return theme.fg("warning", "Compacting");
-	if (run.status === "running") return theme.fg("warning", "…");
-	if (run.status === "idle") return theme.fg("muted", "○");
-	if (run.status === "accepted") return theme.fg("accent", "↪");
-	return theme.fg("success", "✓");
+	const icon = run.status === "failed" ? "✗"
+		: run.status === "running" ? (run.isCompacting ? "◐" : "▶")
+			: run.status === "idle" ? "○" : run.status === "waiting" ? "⧗" : run.status === "held" ? "⏸"
+				: run.status === "accepted" ? "↪" : "✓";
+	return theme.fg(statusColor(run), icon);
+}
+
+/** Collapsed answers skip headings and blank lines, so the preview starts with content. */
+function previewSource(answer: string): string {
+	const content = answer.split("\n").filter((line) => line.trim() && !/^\s*#{1,6}\s/u.test(line));
+	return content.length ? content.join("\n") : answer;
 }
 
 function canRenderAnswerMarkdown(run: SubagentTranscriptRun): boolean {
-	return (run.status === "completed" || run.status === "idle")
+	return (run.status === "completed" || run.status === "idle" || run.status === "waiting" || run.status === "held")
 		&& run.stopReason !== "length"
 		&& !run.outputTruncated
 		&& !run.output.includes("[Final answer truncated in the parent session details.");
@@ -833,6 +872,8 @@ function runGroups(run: SubagentTranscriptRun, includeInitial = true): RenderGro
 
 class SubagentRunPanel implements Component {
 	private readonly answer: string;
+	/** A live member between activations with nothing to show yet; "(no output)" would only be noise. */
+	private readonly silent: boolean;
 	private readonly errorMessage: string | undefined;
 	private readonly answerMarkdown: Markdown | undefined;
 
@@ -845,10 +886,12 @@ class SubagentRunPanel implements Component {
 		markdownTheme?: MarkdownTheme,
 		private readonly layout: "single" | "grouped" | "control" = "single",
 		private readonly sequenceTotal?: number,
+		private readonly initialRows = Number.POSITIVE_INFINITY,
 	) {
 		const output = cleanDisplayText(run.output, "");
 		const errorMessage = cleanDisplayText(run.errorMessage ?? "", "");
 		this.answer = output || errorMessage || "(no output)";
+		this.silent = !output && !errorMessage && (run.status === "idle" || run.status === "waiting" || run.status === "held");
 		this.errorMessage = run.status === "failed" && output !== "" && errorMessage !== "" && errorMessage !== output
 			? errorMessage
 			: undefined;
@@ -861,24 +904,24 @@ class SubagentRunPanel implements Component {
 		const boxed = this.boxed && width >= 3;
 		const innerWidth = Math.max(1, width - (boxed ? 2 : 0));
 		const header = this.layout === "single"
-			? this.theme.fg("toolTitle", this.theme.bold(`${statusText(this.run)} · ${runtimeText(this.run)}`))
+			? `${this.theme.fg(statusColor(this.run), this.theme.bold(statusText(this.run)))}${this.theme.fg("toolTitle", this.theme.bold(` · ${runtimeText(this.run)}`))}`
 			: `${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run, this.layout, this.sequenceTotal)))}`;
 		const lines = [truncateToWidth(header, innerWidth, "", true)];
 		const metrics = this.layout === "single"
 			? usageText(this.run)
 			: this.layout === "grouped"
-				? runtimeMetricsText(this.run)
+				? [this.run.isCompacting ? "compacting" : "", runtimeMetricsText(this.run), policyText(this.run)].filter(Boolean).join(" · ")
 				: "";
 		if (metrics) lines.push(truncateToWidth(this.theme.fg("dim", metrics), innerWidth, "", true));
-		if (this.run.detail) lines.push(this.theme.fg("muted", this.run.detail));
+		if (this.run.detail) lines.push(this.theme.fg(this.run.status === "held" ? "warning" : "muted", this.run.detail));
 		if (this.terminal) lines.push(...this.renderCompleted(innerWidth));
 		else lines.push(...this.renderActivity(innerWidth));
 		if (!boxed) return lines.flatMap((line, index) => index === 0
 			? [line]
 			: new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
-		const borderColor = this.run.status === "failed" ? "error" : this.run.status === "running" ? "warning"
-			: this.run.status === "idle" ? "borderMuted" : "borderAccent";
+		const color = statusColor(this.run);
+		const borderColor = color === "muted" ? "borderMuted" : color === "success" ? "borderAccent" : color;
 		const border = (value: string) => this.theme.fg(borderColor, value);
 		const result = [border(`╭${"─".repeat(innerWidth)}╮`)];
 		for (const line of lines) {
@@ -895,7 +938,9 @@ class SubagentRunPanel implements Component {
 	}
 
 	private renderCompleted(width: number): string[] {
-		const rendered = this.answerMarkdown?.render(width) ?? new Text(this.answer, 0, 0).render(width);
+		const failedAnswer = this.run.status === "failed" && !cleanDisplayText(this.run.output, "");
+		const answerText = failedAnswer ? this.theme.fg("error", this.answer) : this.answer;
+		const rendered = this.silent ? [] : this.answerMarkdown?.render(width) ?? new Text(answerText, 0, 0).render(width);
 		const error = this.errorMessage
 			? new Text(this.theme.fg("error", `Error · ${this.errorMessage}`), 0, 0).render(width)
 			: [];
@@ -911,15 +956,16 @@ class SubagentRunPanel implements Component {
 				: [];
 			const label = this.layout === "control"
 				? this.run.status === "failed" ? "Control error" : "Control acknowledgement"
-				: this.run.status === "idle" ? "Latest output" : "Final answer";
-			return [...activity, ...error, this.theme.fg("dim", label), ...rendered];
+				: this.run.status === "idle" || this.run.status === "waiting" || this.run.status === "held" ? "Latest output" : "Final answer";
+			return [...activity, ...error, ...(rendered.length ? [this.theme.fg("dim", label), ...rendered] : [])];
 		}
 		const initial = this.layout === "control" ? [] : this.run.transcript
-			? new BoundedTranscriptView("", runGroups(this.run), 0, 0, this.theme).renderInitial(width)
+			? new BoundedTranscriptView("", runGroups(this.run), 0, 0, this.theme, undefined, this.initialRows).renderInitial(width)
 			: [];
 		const collapsedError = error.slice(0, 1);
-		const preview = rendered.slice(0, 2);
-		if (rendered.length > preview.length) preview.push(this.theme.fg("dim", "… expand for full answer"));
+		const summary = this.silent ? [] : new Text(failedAnswer ? answerText : previewSource(this.answer), 0, 0).render(width);
+		const preview = summary.slice(0, COLLAPSED_ANSWER_ROWS);
+		if (rendered.length > preview.length || summary.length > preview.length) preview.push(this.theme.fg("dim", "… expand for full answer"));
 		const controlLabel = this.layout === "control"
 			? [this.theme.fg("dim", this.run.status === "failed" ? "Control error" : "Control acknowledgement")]
 			: [];
@@ -931,12 +977,15 @@ class SubagentRunPanel implements Component {
 			return new Text(cleanDisplayText(this.run.output, "(running...)"), 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
 		}
 		if (!this.run.transcript) return new Text(cleanDisplayText(this.run.output, "(running...)"), 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
+		// Collapsed, no row goes to a label, so the newest steps stay visible.
 		const view = new BoundedTranscriptView(
-			this.theme.fg("dim", "Activity"),
+			this.expanded ? this.theme.fg("dim", "Activity") : "",
 			runGroups(this.run, true),
 			this.run.transcript.omittedEntries,
 			this.expanded ? 7 : 4,
 			this.theme,
+			undefined,
+			this.expanded ? Number.POSITIVE_INFINITY : this.initialRows,
 		);
 		return view.render(width);
 	}
@@ -944,6 +993,7 @@ class SubagentRunPanel implements Component {
 
 class MultiSubagentPanelView implements Component {
 	private readonly panels: SubagentRunPanel[];
+	private readonly members: boolean;
 
 	constructor(
 		private readonly runs: SubagentTranscriptRun[],
@@ -952,7 +1002,9 @@ class MultiSubagentPanelView implements Component {
 		private readonly theme: Theme,
 		markdownTheme?: MarkdownTheme,
 		sequenceTotal?: number,
+		unit?: "member",
 	) {
+		this.members = unit === "member";
 		this.panels = runs.map((run) => new SubagentRunPanel(
 			run,
 			expanded,
@@ -962,6 +1014,7 @@ class MultiSubagentPanelView implements Component {
 			markdownTheme,
 			"grouped",
 			sequenceTotal,
+			unit === "member" && !expanded ? COLLAPSED_INITIAL_ROWS : Number.POSITIVE_INFINITY,
 		));
 	}
 
@@ -970,7 +1023,9 @@ class MultiSubagentPanelView implements Component {
 		const accepted = this.runs.filter((run) => run.status === "accepted").length;
 		const failed = this.runs.filter((run) => run.status === "failed").length;
 		const idle = this.runs.filter((run) => run.status === "idle").length;
-		const running = this.runs.length - completed - accepted - failed - idle;
+		const waiting = this.runs.filter((run) => run.status === "waiting").length;
+		const held = this.runs.filter((run) => run.status === "held").length;
+		const running = this.runs.length - completed - accepted - failed - idle - waiting - held;
 		const total = this.runs.reduce((usage, run) => {
 			if (!run.usage) return usage;
 			usage.input += run.usage.input;
@@ -981,7 +1036,8 @@ class MultiSubagentPanelView implements Component {
 			usage.searches += run.usage.searches ?? 0;
 			return usage;
 		}, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, searches: 0 });
-		const summary = `${this.runs.length} model ${this.runs.length === 1 ? "session" : "sessions"} · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running${idle ? ` · ${idle} idle` : ""} · ${failed} failed`;
+		const noun = this.members ? (this.runs.length === 1 ? "member" : "members") : `model ${this.runs.length === 1 ? "session" : "sessions"}`;
+		const summary = `${this.runs.length} ${noun} · ${completed} complete${accepted ? ` · ${accepted} accepted` : ""} · ${running} running${held ? ` · ${held} held` : ""}${waiting ? ` · ${waiting} waiting` : ""}${idle ? ` · ${idle} idle` : ""} · ${failed} failed`;
 		const metrics = [
 			`${compactNumber(total.input)} in`,
 			`${compactNumber(total.output)} out`,
@@ -991,8 +1047,9 @@ class MultiSubagentPanelView implements Component {
 			...(total.searches > 0 ? [hostedSearchText(total.searches)] : []),
 			...(this.durationMs !== undefined ? [`wall ${compactDuration(this.durationMs)}`] : []),
 		].join(" · ");
+		const summaryColor = failed ? "error" : held ? "warning" : "toolTitle";
 		const lines = [
-			truncateToWidth(this.theme.fg("toolTitle", this.theme.bold(summary)), width, "", true),
+			truncateToWidth(this.theme.fg(summaryColor, this.theme.bold(summary)), width, "", true),
 			...(metrics ? [truncateToWidth(this.theme.fg("dim", metrics), width, "", true)] : []),
 		];
 		for (const panel of this.panels) {
@@ -1027,6 +1084,7 @@ export function renderSubagentTranscript(
 			theme,
 			options.markdownTheme,
 			sequenceTotal,
+			options.unit,
 		);
 	}
 	const only = boundedRuns[0];
@@ -1059,7 +1117,7 @@ export function renderSubagentTranscript(
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	const header = theme.fg("toolTitle", theme.bold(`${statusText(only)} · ${runtimeText(only)}`));
+	const header = `${theme.fg(statusColor(only), theme.bold(statusText(only)))}${theme.fg("toolTitle", theme.bold(` · ${runtimeText(only)}`))}`;
 	const usage = usageText(only);
 	return new BoundedTranscriptView(
 		header,

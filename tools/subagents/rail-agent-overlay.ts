@@ -74,9 +74,9 @@ function phaseLabel(agent: RailAgentView): string {
 	return agent.phase.toUpperCase();
 }
 
-function phaseColor(phase: RailAgentPhase, isCompacting = false): "success" | "warning" | "error" | "muted" | "dim" {
+function phaseColor(phase: RailAgentPhase, isCompacting = false): "accent" | "warning" | "error" | "muted" | "dim" {
 	if (isCompacting) return "warning";
-	if (phase === "running") return "success";
+	if (phase === "running") return "accent";
 	if (phase === "starting" || phase === "queued") return "warning";
 	if (phase === "error") return "error";
 	if (phase === "idle") return "muted";
@@ -229,7 +229,9 @@ export class RailAgentOverlayComponent implements Focusable {
 
 	private summaryText(): string {
 		const counts = this.snapshot.counts;
-		return `${counts.running} running · ${counts.queued} queued · ${counts.idle} idle · ${counts.stopped} not connected · ${counts.inUseElsewhere} elsewhere${counts.errors ? ` · ${counts.errors} errors` : ""}`;
+		const parts = [[counts.running, "running"], [counts.queued, "queued"], [counts.idle, "idle"], [counts.stopped, "not connected"],
+			[counts.inUseElsewhere, "elsewhere"], [counts.errors, "errors"]].filter(([count]) => count).map(([count, label]) => `${count} ${label}`);
+		return parts.join(" · ") || "no agents";
 	}
 
 	private renderAgents(innerWidth: number): string[] {

@@ -603,10 +603,10 @@ test("grouped tasks forward independent fastMode policies to stateless and new p
 	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 	assert.match(tool.renderCall(args, theme).render(320).join("\n"), /FAST 1=on, 2=off, 3=on, 4=off/u);
 	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(320).join("\n");
-	assert.match(panel, /#1 · one-off · .* · ContextWindow Default · FAST on · SEARCH on/u);
-	assert.match(panel, /#2 · one-off · .* · ContextWindow Default · FAST off · SEARCH on/u);
-	assert.match(panel, /fast-persistent · persistent · .* · ContextWindow Default · FAST on · SEARCH on/u);
-	assert.match(panel, /#4 · one-off · deepseek\/deepseek-v4 · ContextWindow Default · FAST off · SEARCH off/u);
+	assert.match(panel, /#1 · one-off · [^\n]*\n[^\n]*ContextWindow Default · FAST on · SEARCH on/u);
+	assert.match(panel, /#2 · one-off · [^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH on/u);
+	assert.match(panel, /fast-persistent · persistent · [^\n]*\n[^\n]*ContextWindow Default · FAST on · SEARCH on/u);
+	assert.match(panel, /#4 · one-off · deepseek\/deepseek-v4[^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH off/u);
 });
 
 test("dispatch headers always show defaults and use the saved fast policy for existing targets", async () => {
@@ -749,8 +749,8 @@ test("restored result panels resolve display models by run.slot instead of array
 	};
 	const panel = tool.renderResult(result, { expanded: false }, theme).render(240).join("\n");
 
-	assert.match(panel, /first · one-off · cus-resp\/gpt-5\.6-sol:xhigh · ContextWindow Default · FAST off · SEARCH on/u);
-	assert.match(panel, /second · one-off · cus-oai\/gpt-5\.6-sol-completions:xhigh · ContextWindow Default · FAST off · SEARCH off/u);
+	assert.match(panel, /first · one-off · cus-resp\/gpt-5\.6-sol:xhigh[^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH on/u);
+	assert.match(panel, /second · one-off · cus-oai\/gpt-5\.6-sol-completions:xhigh[^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH off/u);
 });
 
 test("mixed grouped dispatch keeps independent FAST and SEARCH slot mappings", async () => {
@@ -784,9 +784,9 @@ test("mixed grouped dispatch keeps independent FAST and SEARCH slot mappings", a
 
 	const result = await tool.execute("mixed-policy", args, undefined, undefined, context());
 	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(280).join("\n");
-	assert.match(panel, /auth-review · persistent · cus-oai\/gpt-5\.6-sol-completions:xhigh · ContextWindow Default · FAST on · SEARCH off/u);
-	assert.match(panel, /#2 · one-off · deepseek\/deepseek-v4 · ContextWindow Default · FAST off · SEARCH off/u);
-	assert.match(panel, /#3 · one-off · cus-resp\/gpt-5\.6-sol:xhigh · ContextWindow Default · FAST off · SEARCH on/u);
+	assert.match(panel, /auth-review · persistent · cus-oai\/gpt-5\.6-sol-completions:xhigh[^\n]*\n[^\n]*ContextWindow Default · FAST on · SEARCH off/u);
+	assert.match(panel, /#2 · one-off · deepseek\/deepseek-v4[^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH off/u);
+	assert.match(panel, /#3 · one-off · cus-resp\/gpt-5\.6-sol:xhigh[^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH on/u);
 	assert.doesNotMatch(JSON.stringify(result.details), /searchMode/iu);
 });
 
@@ -1331,8 +1331,8 @@ test("forwards contextWindow only as per-task execution metadata", async () => {
 	const call = tool.renderCall(args, theme).render(140).join("\n");
 	assert.match(call, /ContextWindow 1=64K, 2=128K · FAST off · SEARCH on/);
 	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(160).join("\n");
-	assert.match(panel, /cus-resp\/gpt-5\.6-sol #1 · one-off · cus-resp\/gpt-5\.6-sol:xhigh · ContextWindow 64K · FAST off · SEARCH on/);
-	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh · ContextWindow 128K · FAST off · SEARCH on/);
+	assert.match(panel, /#1 · one-off · cus-resp\/gpt-5\.6-sol:xhigh[^\n]*\n[^\n]*ContextWindow 64K · FAST off · SEARCH on/);
+	assert.match(panel, /persistent-budget · persistent · cus-resp\/gpt-5\.6-sol:xhigh[^\n]*\n[^\n]*ContextWindow 128K · FAST off · SEARCH on/);
 });
 
 test("null contextWindow uses the native default without forwarding a temporary budget", async () => {
@@ -1651,8 +1651,8 @@ test("grouped FAST metadata preserves a saved target policy across partial and f
 		toolCallId: "grouped-saved-fast",
 	}).render(240).join("\n");
 	assert.doesNotMatch(final.slice(0, final.indexOf("╭")), /ContextWindow|FAST|SEARCH/);
-	assert.match(final, /#1 · one-off · .* · ContextWindow Default · FAST off · SEARCH on/);
-	assert.match(final, /auth-review · persistent · .* · ContextWindow Default · FAST on · SEARCH on/);
+	assert.match(final, /#1 · one-off · [^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH on/);
+	assert.match(final, /auth-review · persistent · [^\n]*\n[^\n]*ContextWindow Default · FAST on · SEARCH on/);
 	assert.doesNotMatch(JSON.stringify(result.details), /fastMode/);
 });
 
@@ -1676,8 +1676,8 @@ test("chain FAST metadata preserves a saved target policy for the target step", 
 	assert.match(tool.renderCall(args, theme).render(240).join("\n"), /ContextWindow Default · FAST 1=off, 2=on · SEARCH on/);
 	const result = await tool.execute("chain-saved-fast", args, undefined, undefined, context());
 	const panel = tool.renderResult(result, { expanded: false }, theme, { args }).render(240).join("\n");
-	assert.match(panel, /1\/2 · .* · one-off · .* · ContextWindow Default · FAST off · SEARCH on/);
-	assert.match(panel, /2\/2 · auth-review · persistent · .* · ContextWindow Default · FAST on · SEARCH on/);
+	assert.match(panel, /1\/2 · .* · one-off · [^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH on/);
+	assert.match(panel, /2\/2 · auth-review · persistent · [^\n]*\n[^\n]*ContextWindow Default · FAST on · SEARCH on/);
 	assert.doesNotMatch(JSON.stringify(result.details), /fastMode/);
 });
 
@@ -1707,8 +1707,8 @@ test("panels show the effective per-slot SEARCH policy only in grouped child met
 	const groupedPanel = tool.renderResult(grouped, { expanded: false }, theme, { args: groupedArgs }).render(240).join("\n");
 	assert.equal((groupedPanel.match(/SEARCH on/gu) ?? []).length, 2);
 	assert.doesNotMatch(groupedPanel.slice(0, groupedPanel.indexOf("╭")), /SEARCH/);
-	assert.match(groupedPanel, /cus-resp\/gpt-5\.6-sol #1 · one-off · .* · ContextWindow Default · FAST off · SEARCH on/u);
-	assert.match(groupedPanel, /auth-review · persistent · .* · ContextWindow Default · FAST on · SEARCH on/u);
+	assert.match(groupedPanel, /#1 · one-off · [^\n]*\n[^\n]*ContextWindow Default · FAST off · SEARCH on/u);
+	assert.match(groupedPanel, /auth-review · persistent · [^\n]*\n[^\n]*ContextWindow Default · FAST on · SEARCH on/u);
 
 	const controlArgs = { target: "auth-review", control: { delivery: "steer" as const, message: "Focus on tests" } };
 	assert.doesNotMatch(tool.renderCall(controlArgs, theme).render(200).join("\n"), /SEARCH/);

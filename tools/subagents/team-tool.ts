@@ -1,6 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { Container, Text, TruncatedText } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { SessionBroker } from "./session-broker";
 import { formatWorkResult, jsonTextBytes, normalizeTeamPlan, previewText, truncateText } from "./team-codec";
@@ -152,6 +152,26 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 	return lines;
 }
 
+/** A member's panel state line: plain words, only the facts that matter now. */
+function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts): string {
+	const results = facts.results.get(member.id)?.count ?? 0;
+	const resultText = results ? `${results} ${results === 1 ? "result" : "results"}` : "";
+	if (member.lifecycle === "closed") return ["closed", resultText].filter(Boolean).join(" · ");
+	const now = member.currentWork ? `running ${shortWorkRef(member.currentWork)}`
+		: member.held ? "held · needs a Manager decision"
+			: member.blocked ? "waiting on other work"
+				: member.queued ? "queued for a worker slot" : "no assigned work";
+	return [
+		member.lifecycle === "open" ? "" : member.lifecycle,
+		now,
+		member.currentWork && member.queued ? `${member.queued} queued` : "",
+		member.pause === "none" ? "" : `pause ${member.pause}`,
+		member.role === "manager" && facts.pendingManagerEvents ? `${facts.pendingManagerEvents} pending events` : "",
+		resultText,
+		member.error ? `${member.error.code}: ${previewText(member.error.message, 160)}` : "",
+	].filter(Boolean).join(" · ");
+}
+
 /**
  * One grouped-subagent run per member: its Team state, the task it is (or was last) working on, its
  * latest submitted result, native activity across activations, and settled plus in-flight usage.
@@ -166,22 +186,23 @@ function memberRuns(host: TeamSessionHost, teamId: string): SubagentTranscriptRu
 		if (activity?.liveUsage) addActivationUsage(usage, activity.liveUsage);
 		const latest = facts.results.get(member.id)?.latest;
 		const currentKey = member.currentWork ? workRefKey(member.currentWork) : undefined;
-		const task = member.role === "manager" ? view.brief.goal
+		// The Manager's task is the Team goal, already in the Team header.
+		const task = member.role === "manager" ? undefined
 			: (works.find((work) => workRefKey(work.work) === currentKey) ?? works.findLast((work) => work.assignee === member.id))?.taskPreview;
 		const entries = activity?.transcript.entries ?? [];
 		return {
 			slot, alias: member.id, role: member.role, model: member.policy.model ?? "model unavailable", persistent: true,
 			status: member.lifecycle === "faulted" ? "failed" : member.lifecycle === "closed" ? "completed"
-				: member.activity !== "idle" || member.lifecycle === "starting" || member.lifecycle === "closing" ? "running" : "idle",
+				: member.activity !== "idle" || member.lifecycle === "starting" || member.lifecycle === "closing" ? "running"
+					: member.held ? "held" : member.blocked || member.queued ? "waiting" : "idle",
 			// Like a grouped subagent's final answer: the member's latest result in full, or the Manager's close decision.
 			output: latest ? truncateText(formatWorkResult(latest.result), MAX_MEMBER_OUTPUT_BYTES).text
-				: member.role === "manager" && view.outcome ? `Team ${upper(view.lifecycle)} · outcome ${view.outcome}${view.reason ? `\n\n${view.reason}` : ""}`
+				: member.role === "manager" && view.outcome ? view.reason ?? `outcome ${view.outcome}`
 					: activity?.output ?? "",
 			usage, ...(activity ? { durationMs: activity.durationMs } : {}),
 			contextWindowText: formatContextWindowForDisplay(member.policy.contextWindow),
 			fastModeText: member.policy.fastMode ? "on" : "off", searchModeText: member.policy.searchMode === "on" ? "on" : "off",
-			// The task is the panel's initial-task line; a short WorkRef keeps the state line on one row.
-			detail: memberStateText(member, [], facts, shortWorkRef),
+			detail: memberDetail(member, facts),
 			transcript: {
 				entries: task ? [{ id: "initial-task", kind: "user", initial: true, text: task, order: 0 }, ...entries] : entries,
 				omittedEntries: activity?.transcript.omittedEntries ?? 0,
@@ -556,12 +577,22 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		renderResult(result, { expanded, isPartial }, theme) {
 			const details = result.details as TeamToolDetails | undefined;
 			if (details?.members && details.view) {
-				// launch: Team-level state, then the same grouped panels as a grouped subagent call.
-				const [title, ...rest] = teamLines(details.view, details.works ?? [], details.holdsTotal ?? 0, []);
+				// launch: Team-level state, then the same grouped panels as a grouped subagent call. Problems
+				// are colored; collapsed, the goal and reason keep one row each.
+				const view = details.view;
+				const [title, ...rest] = teamLines(view, details.works ?? [], details.holdsTotal ?? 0, []);
+				const titleColor = view.lifecycle === "failed" || view.outcome === "failed" ? "error"
+					: view.health === "needs_attention" || view.outcome === "partial" || view.lifecycle === "cancelled" || view.lifecycle === "interrupted" ? "warning"
+						: view.outcome === "succeeded" ? "success" : "accent";
 				const panel = new Container();
-				panel.addChild(new Text([theme.fg("accent", title!), ...rest.map((line) => theme.fg("dim", line))].join("\n"), 0, 0));
+				panel.addChild(new TruncatedText(theme.fg(titleColor, theme.bold(title!)), 0, 0));
+				for (const line of rest) {
+					const color = /^Budget EXHAUSTED/u.test(line) ? "error" : /^(Holds|Incident|\+\d+ more open incidents)/u.test(line) ? "warning" : "dim";
+					const styled = theme.fg(color, line);
+					panel.addChild(!expanded && /^(Goal|Reason):/u.test(line) ? new TruncatedText(styled, 0, 0) : new Text(styled, 0, 0));
+				}
 				panel.addChild(renderSubagentTranscript(details.members, expanded, theme, {
-					isPartial, mode: "parallel", ...(details.durationMs !== undefined ? { durationMs: details.durationMs } : {}),
+					isPartial, mode: "parallel", unit: "member", ...(details.durationMs !== undefined ? { durationMs: details.durationMs } : {}),
 					markdownTheme: markdownThemeFromTheme(theme),
 				}));
 				return panel;

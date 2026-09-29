@@ -39,6 +39,7 @@ import {
 
 const EXPECTED_TOOLS = ["apply-patch", "subagent_team", "subagent"];
 const EXPECTED_COMMANDS = [
+	"rail-team",
 	"rail-agent",
 	"rail-duplicate",
 	"rail-oai-compaction",

@@ -87,13 +87,13 @@ export interface TeamToolDetails {
 export class TeamLaunchWaitAbortedError extends Error {
 	readonly code = "TEAM_LAUNCH_WAIT_ABORTED";
 	constructor(readonly teamId: string, readonly lifecycle: TeamTeamView["lifecycle"]) {
-		super(`Launch stopped waiting for Team ${teamId} after an abort signal. The Team was not cancelled; current lifecycle is ${lifecycle}. Inspect or cancel it with subagent_team status or cancel and this teamId.`);
+		super(`Launch stopped waiting for Team ${teamId} after an abort signal. The Team was not cancelled; current lifecycle is ${lifecycle}. It remains host-managed: inspect or cancel it with /rail-team ${teamId} status|cancel.`);
 		this.name = "TeamLaunchWaitAbortedError";
 	}
 }
 
 // ---------------------------------------------------------------------------------------------
-// Bounded text views shared by the tool panel and tool results.
+// Bounded text views shared by the tool panel, tool results and /rail-team.
 
 const upper = (value: string) => value.replaceAll("_", " ").toUpperCase();
 const limit = (used: number, max: number) => `${used}/${max}`;
@@ -148,7 +148,7 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 	}
 	if (openIncidents.length > 5) lines.push(`+${openIncidents.length - 5} more open incidents`);
 	const { limits, used } = view.budget;
-	lines.push(`Budget${view.budget.exhausted ? " EXHAUSTED" : ""}: activations ${limit(used.teamActivations, limits.teamActivations)} · manager ${limit(used.managerActivations, limits.managerActivations)} · model requests ${limit(used.teamModelRequests, limits.teamModelRequests)} · tool calls ${limit(used.teamToolCalls, limits.teamToolCalls)} · works ${limit(used.teamWorks, limits.teamWorks)}${view.budget.rootsOmitted ? ` · ${view.budget.rootsOmitted} roots omitted` : ""}`);
+	lines.push(`Budget${view.budget.exhausted ? " EXHAUSTED" : ""}: activations ${limit(used.teamActivations, limits.teamActivations)} · manager ${limit(used.managerActivations, limits.managerActivations)} · model requests ${limit(used.teamModelRequests, limits.teamModelRequests)} · tool calls ${limit(used.teamToolCalls, limits.teamToolCalls)} · works ${limit(used.teamWorks, limits.teamWorks)}${view.budget.rootsOmitted ? ` · ${view.budget.rootsOmitted} roots omitted (see /rail-team ${view.teamId} budget)` : ""}`);
 	return lines;
 }
 
@@ -224,7 +224,7 @@ export function formatHistoryEntry(entry: TeamHistoryEntry, cursor?: string): st
 	const lines = [formatHistorySummary(entry)];
 	for (const record of items) lines.push(`  ${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}: ${previewText(record.result.summary, 512)}`);
 	const next = offset + items.length;
-	if (next < entry.results.length) lines.push(`Next page cursor: page:${next}`);
+	if (next < entry.results.length) lines.push(`Next result refs: /rail-team ${entry.teamId} results page:${next}`);
 	if (offset > 0 && items.length === 0) throw new Error(`Result page ${cursor} is past the end for Team ${entry.teamId}`);
 	return lines.join("\n");
 }
@@ -375,7 +375,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			}),
 			`Initial work: ${works.map((work) => `${workRefKey(work.work)} → ${work.assignee}`).join(" · ") || "none (workers start idle; the Manager assigns work)"}`,
 			`Deadline: ${plan.timeoutSeconds === null ? "no Team deadline" : `${plan.timeoutSeconds}s from launch`}`,
-			`Budget: activations ${view.budget.limits.teamActivations} · manager ${view.budget.limits.managerActivations} · model requests ${view.budget.limits.teamModelRequests} · tool calls ${view.budget.limits.teamToolCalls} · works ${view.budget.limits.teamWorks}`,
+			`Budget: activations ${view.budget.limits.teamActivations} · manager ${view.budget.limits.managerActivations} · model requests ${view.budget.limits.teamModelRequests} · tool calls ${view.budget.limits.teamToolCalls} · works ${view.budget.limits.teamWorks}; the host can grant more with /rail-team.`,
 			`Next: in your next message call subagent_team {"action":"launch","teamId":"${view.teamId}"}. It returns when the whole Team has ended. Do not start members with the subagent tool.`,
 		];
 		return textResult(lines.join("\n"), { view, works });
@@ -534,7 +534,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			+ "validates and pins every member's model, cwd, Fast/Search and context budget, and returns the plan, initial WorkRefs and budget without starting anything. "
 			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with the outcome, per-member totals, a timeline and the full text of every worker result the Manager selected, so no status call is needed to read them. "
 			+ "status (teamId optional) lists Teams; status with teamId pages resultRefs using cursor, or fetches one full worker ResultRecord with resultRef. cancel (teamId, reason) inspects or stops a Team. The Manager assigns, reviews and closes; it does not write a final summary. "
-			+ "The parent model is not woken while launch waits.",
+			+ "The parent model is not woken while launch waits; budget grants and hold releases are host-only (/rail-team).",
 		promptGuidelines: [
 			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected worker results in full and a timeline; use status afterwards only for results it names as truncated or unselected.",
 			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",

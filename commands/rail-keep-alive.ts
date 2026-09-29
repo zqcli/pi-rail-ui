@@ -10,7 +10,7 @@ const INTERVAL = 60_000;
 const LATE_MS = 15_000;
 const MAX_TIMER_MS = 2 ** 31 - 1;
 type Mode = { minutes?: number | null | undefined; paused?: string | undefined };
-type Run = { timer?: ReturnType<typeof setTimeout> | undefined; tick?: ReturnType<typeof setInterval> | undefined; controller: AbortController; isCurrent: () => boolean; nextWarmAt: number; phase: string; [key: string]: any };
+type Run = { timer?: ReturnType<typeof setTimeout> | undefined; tick?: ReturnType<typeof setTimeout> | undefined; path?: unknown[]; controller: AbortController; isCurrent: () => boolean; nextWarmAt: number; phase: string; [key: string]: any };
 type Warmer = {
 	run?: Run | undefined; sessionManager: unknown; models: { streamSimple: (...args: any[]) => any };
 	getMode: () => string; decide: (event: any) => Promise<string>;
@@ -18,11 +18,13 @@ type Warmer = {
 	refreshDeadlineMissed: (run: Run) => boolean; evaluate: (run: Run) => any; refresh: (run: Run) => Promise<void>;
 	stop: (reason: string) => void; cancel: () => void; clearRun: () => void;
 };
-type State = { manager: any; mode: Mode; warmer?: Warmer | undefined; unsupported?: string | undefined; restore?: (() => void) | undefined; notify: (text: string) => void; isIdle: () => boolean };
+type State = { manager: any; mode: Mode; session?: AgentSession | undefined; warmer?: Warmer | undefined; unsupported?: string | undefined; restore?: ((keepRun?: boolean) => void) | undefined; notify: (text: string) => void; isIdle: () => boolean };
 type Bridge = { pending: Set<State>; original?: AgentSession["prompt"] | undefined; wrapper?: AgentSession["prompt"] | undefined };
 const bridge = createStore<Bridge>("keep-alive-bridge", () => ({ pending: new Set() }));
 const states = createStore<Map<any, State>>("keep-alive-states", () => new Map());
 const listeners = createStore<Map<any, Set<() => void>>>("keep-alive-listeners", () => new Map());
+/** A scheduled run handed from the old extension instance to the new one across /reload (same AgentSession). */
+const carried = createStore<Map<any, { session: AgentSession; run: Run }>>("keep-alive-carried", () => new Map());
 const WARMER_METHODS = ["start", "schedule", "refresh", "onAgentSettled", "refreshDeadlineMissed", "evaluate", "decide", "getMode", "stop", "cancel", "clearRun"];
 
 export function onKeepAliveChange(manager: any, callback: () => void): () => void {
@@ -40,6 +42,18 @@ function changed(state: State): void {
 	for (const callback of [...(listeners().get(state.manager) ?? [])]) {
 		try { callback(); } catch { /* A footer render must never affect cache warming. */ }
 	}
+}
+
+// Usage, labels and metadata never reach the provider; context edits, compactions and branch summaries rewrite it.
+const NON_CONTEXT = ["usage", "session_info", "label", "custom"];
+const REWRITES = ["context_edit", "compaction", "branch_summary"];
+const contextEntries = (manager: any): any[] => manager.getBranch().filter((entry: any) => !NON_CONTEXT.includes(entry.type));
+const entryKey = (entry: any) => entry.id ?? entry;
+/** The snapshot's context is still a prefix of the branch (e.g. a later `!cmd` output only appends to it). */
+function extendsSnapshot(manager: any, snapshot: unknown[]): boolean {
+	const now = contextEntries(manager);
+	return snapshot.every((key, index) => index < now.length && entryKey(now[index]) === key)
+		&& !now.slice(snapshot.length).some((entry) => REWRITES.includes(entry.type));
 }
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -91,7 +105,7 @@ function pause(state: State, reason: string): void {
  * Rail replaces only the schedule (a fixed idle interval without TTL metadata or 30/60-minute windows), forces
  * the decision to warm, and pauses visibly where the native best-effort path would silently retry or stop.
  */
-function bind(state: State, session: AgentSession): void {
+function bind(state: State, session: AgentSession, resumed?: Run): void {
 	const w = (session as any)._cacheWarmer;
 	if (!valid(w, session, state)) {
 		state.unsupported = "unsupported Pi CacheWarmer (requires 0.87.1 live session)";
@@ -101,6 +115,7 @@ function bind(state: State, session: AgentSession): void {
 		return;
 	}
 	state.warmer = w;
+	state.session = session;
 	state.unsupported = undefined;
 	const nativeStatus = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(w), "status")!.get!;
 	const original = {
@@ -114,15 +129,26 @@ function bind(state: State, session: AgentSession): void {
 		return { phase: run.phase, warmCost: NaN, missCost: NaN,
 			continuationProbability: NaN, expectedSavings: NaN, economicsAvailable: false, action: "stop" };
 	};
-	// Native isCurrent compares agent messages and model; context edits and branch ancestry change the
-	// provider context without that, while usage, labels and metadata entries do not.
-	const contextPath = () => state.manager.getBranch()
-		.filter((entry: any) => !["usage", "session_info", "label", "custom"].includes(entry.type))
-		.map((entry: any) => entry.id ?? entry);
-	let path = contextPath();
-	const samePath = () => {
-		const now = contextPath();
-		return now.length === path.length && now.every((id: any, index: number) => id === path[index]);
+	const snapshot = () => contextEntries(state.manager).map(entryKey);
+	/** Refresh after `delay`; the footer countdown is re-rendered at each whole minute before it. */
+	const arm = (run: Run, delay: number) => {
+		clearTimeout(run.timer);
+		clearTimeout(run.tick);
+		run.nextWarmAt = Date.now() + delay;
+		run.timer = setTimeout(() => {
+			run.timer = undefined;
+			clearTimeout(run.tick);
+			changed(state);
+			void w.refresh(run);
+		}, delay);
+		run.timer.unref?.();
+		const tick = () => {
+			const left = run.nextWarmAt - Date.now();
+			run.tick = left > INTERVAL ? setTimeout(() => { changed(state); tick(); }, left % INTERVAL || INTERVAL) : undefined;
+			run.tick?.unref?.();
+		};
+		tick();
+		changed(state);
 	};
 	w.getMode = () => state.mode.minutes === null ? "off" : manual() ? "idle" : original.getMode.call(w);
 	Object.defineProperty(w, "status", { configurable: true, get() {
@@ -142,36 +168,24 @@ function bind(state: State, session: AgentSession): void {
 		if (request.options?.reasoning && request.model?.api === "anthropic-messages" && request.model?.compat?.forceAdaptiveThinking !== true) {
 			pause(state, "Anthropic thinking request cannot be replayed with a one-token cap"); return;
 		}
-		path = contextPath();
+		// Native isCurrent compares agent messages and model; it misses context edits and branch replacement.
+		const run: Run = { ...request, controller: new AbortController(), phase: "streaming", nextWarmAt: 0, extensionOverride: false, path: snapshot(),
+			isCurrent: () => isCurrent() && extendsSnapshot(state.manager, run.path!) };
 		// Only settlement schedules the idle interval; there is no streaming timer.
-		w.run = { ...request, isCurrent: () => isCurrent() && samePath(), controller: new AbortController(), phase: "streaming", nextWarmAt: 0, extensionOverride: false };
+		w.run = run;
 		changed(state);
 	};
 	w.onAgentSettled = function() {
 		if (!manual()) { original.onAgentSettled.call(w); return; }
 		if (!w.run || state.mode.paused) return;
-		path = contextPath();
+		w.run.path = snapshot();
 		w.run.phase = "idle";
 		w.schedule(w.run);
 	};
 	w.schedule = function(run) {
 		if (!manual()) { original.schedule.call(w, run); return; }
 		if (w.run !== run || state.mode.paused) return;
-		if (run.timer) clearTimeout(run.timer);
-		clearInterval(run.tick);
-		const delay = state.mode.minutes! * INTERVAL;
-		run.nextWarmAt = Date.now() + delay;
-		run.timer = setTimeout(() => {
-			run.timer = undefined;
-			clearInterval(run.tick);
-			changed(state);
-			void w.refresh(run);
-		}, delay);
-		// The footer countdown drops by one each minute from here.
-		run.tick = setInterval(() => changed(state), INTERVAL);
-		run.timer.unref?.();
-		run.tick.unref?.();
-		changed(state);
+		arm(run, state.mode.minutes! * INTERVAL);
 	};
 	w.refreshDeadlineMissed = function(run) {
 		if (!manual()) return original.refreshDeadlineMissed.call(w, run);
@@ -188,7 +202,7 @@ function bind(state: State, session: AgentSession): void {
 		return action;
 	};
 	w.clearRun = function() {
-		clearInterval(w.run?.tick);
+		clearTimeout(w.run?.tick);
 		original.clearRun.call(w);
 		if (manual()) changed(state);
 	};
@@ -210,18 +224,23 @@ function bind(state: State, session: AgentSession): void {
 			return result;
 		} };
 	} };
-	state.restore = () => {
-		w.clearRun();
+	state.restore = (keepRun) => {
+		if (keepRun && w.run) { clearTimeout(w.run.timer); clearTimeout(w.run.tick); } else w.clearRun();
 		delete (w as any).status;
 		Object.assign(w, original);
 	};
+	// The same scheduled refresh continues after /reload, keeping its planned time.
+	if (resumed && manual()) {
+		w.run = resumed;
+		arm(resumed, Math.max(0, resumed.nextWarmAt - Date.now()));
+	} else if (resumed) w.clearRun();
 	changed(state);
 }
 
-function stop(state: State): void {
+function stop(state: State, keepRun = false): void {
 	releaseBridge(state);
-	state.restore?.();
-	state.warmer = state.restore = undefined;
+	state.restore?.(keepRun);
+	state.warmer = state.session = state.restore = undefined;
 	states().delete(state.manager);
 	changed(state);
 	listeners().delete(state.manager);
@@ -250,8 +269,10 @@ export function keepAliveLabel(manager: any): string | undefined {
 }
 
 export function installRailKeepAlive(pi: ExtensionAPI): void {
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", (event, ctx) => {
 		const manager = ctx.sessionManager;
+		const handoff = carried().get(manager);
+		carried().delete(manager);
 		const previous = states().get(manager);
 		if (previous) stop(previous);
 		// Only the same session ID restores the choice: a fork or clone copying this entry is not authorized.
@@ -262,9 +283,18 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
 			notify: (text) => ctx.ui.notify(text, "warning"), isIdle: () => ctx.isIdle() };
 		states().set(manager, state);
 		changed(state);
-		awaitSession(state);
+		if (event.reason === "reload" && handoff) bind(state, handoff.session, handoff.run);
+		else awaitSession(state);
 	});
-	pi.on("session_shutdown", (_event, ctx) => { const state = states().get(ctx.sessionManager); if (state) stop(state); });
+	pi.on("session_shutdown", (event, ctx) => {
+		const state = states().get(ctx.sessionManager);
+		if (!state) return;
+		// /reload keeps the AgentSession and its warmer; only this extension instance is replaced.
+		const run = state.warmer?.run;
+		const keep = event.reason === "reload" && !!state.session && !!run?.timer && run.phase === "idle" && !state.mode.paused;
+		if (keep) carried().set(state.manager, { session: state.session!, run: run! });
+		stop(state, keep);
+	});
 	const invalidate = (ctx: ExtensionContext) => {
 		const state = states().get(ctx.sessionManager);
 		if (!state?.mode.minutes) return;

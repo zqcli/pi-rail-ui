@@ -317,23 +317,32 @@ test("unsupported resume retains a PAUSED reason when subsequent N/off commands 
 	} finally { await h.cleanup(); }
 });
 
-test("reload restores only the same session's choice, never its old request snapshot", async (t) => {
+test("/reload keeps a scheduled refresh on time; a quit and resume waits for a fresh request", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
-		await h.begin(); await h.command("1");
+		await h.begin(); await h.command("3");
 		h.warmer.start(h.request, () => true);
 		h.warmer.onAgentSettled();
+		t.mock.timers.tick(60_000);
+		assert.equal(keepAliveLabel(h.manager), "KA 3|2");
 		await h.emit("session_shutdown", { reason: "reload" });
 		await h.emit("session_start", { reason: "reload" });
-		assert.match(keepAliveStatus(h.manager)!, /WAIT.*fresh real request/);
-		t.mock.timers.tick(60_000); await flush();
-		assert.equal(h.calls.length, 0);
+		assert.equal(keepAliveLabel(h.manager), "KA 3|2", "the countdown continues without a new request");
+		t.mock.timers.tick(120_000); await flush();
+		assert.equal(h.calls.length, 1, "the refresh fires at its original time");
+		assert.equal(h.calls[0].options.onPayload, h.request.options.onPayload, "the same request snapshot is replayed");
+		assert.equal(keepAliveLabel(h.manager), "KA 3|3");
+		await h.emit("session_shutdown", { reason: "quit" });
+		await h.emit("session_start", { reason: "resume" });
+		assert.equal(keepAliveLabel(h.manager), "KA 3|-", "a new process has no request snapshot to replay");
+		t.mock.timers.tick(10 * 60_000); await flush();
+		assert.equal(h.calls.length, 1);
 		await h.session.prompt("fresh capture");
 		h.warmer.start(h.request, () => true);
 		h.warmer.onAgentSettled();
-		t.mock.timers.tick(60_000); await flush();
-		assert.equal(h.calls.length, 1);
+		t.mock.timers.tick(3 * 60_000); await flush();
+		assert.equal(h.calls.length, 2);
 		await h.command("off");
 		await h.emit("session_shutdown", { reason: "reload" });
 		await h.emit("session_start", { reason: "reload" });
@@ -396,7 +405,7 @@ test("a hung stale decision cannot block the replacement run", async (t) => {
 	} finally { await h.cleanup(); }
 });
 
-test("non-context metadata and usage do not stale the snapshot, but context_edit and branch replacement do", async (t) => {
+test("metadata and appended messages keep the snapshot; context_edit and branch replacement stale it", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
@@ -404,8 +413,9 @@ test("non-context metadata and usage do not stale the snapshot, but context_edit
 		h.manager.entries.push({ id: "user-a", type: "message", message: { role: "user" } });
 		h.warmer.start(h.request, () => true); h.warmer.onAgentSettled();
 		h.manager.entries.push({ id: "title", type: "session_info" }, { id: "note", type: "custom" }, { id: "label", type: "label" });
+		h.manager.entries.push({ id: "bang", type: "message", message: { role: "bashExecution" } });
 		t.mock.timers.tick(60_000); await flush();
-		assert.equal(h.calls.length, 1);
+		assert.equal(h.calls.length, 1, "an appended `!cmd` output leaves the cached prefix intact");
 		h.manager.entries.push({ id: "edit", type: "context_edit", targetId: "user-a", replacement: null });
 		t.mock.timers.tick(60_000); await flush();
 		assert.equal(h.calls.length, 1, "a context edit invalidates even if the original messages still match");

@@ -1,7 +1,7 @@
 import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { installRailKeepAlive, keepAliveStatus } from "../../commands/rail-keep-alive";
+import { installRailKeepAlive, keepAliveLabel, keepAliveStatus } from "../../commands/rail-keep-alive";
 
 export default function probe(pi: ExtensionAPI) {
 	pi.registerProvider("rail-ka-local", {
@@ -45,6 +45,12 @@ export default function probe(pi: ExtensionAPI) {
 		return original.apply(this, args as [string]);
 	};
 	installRailKeepAlive(pi);
+	// Registered after Rail's handler: records what the footer shows right after /reload, before any prompt.
+	pi.on("session_start", async (event, ctx) => {
+		if (event.reason !== "reload" || !process.env["KA_RELOAD_OUTPUT"]) return;
+		await writeFile(process.env["KA_RELOAD_OUTPUT"], JSON.stringify({ label: keepAliveLabel(ctx.sessionManager), status: keepAliveStatus(ctx.sessionManager) }));
+	});
+	pi.registerCommand("ka-reload", { handler: async (_args, ctx) => { await ctx.reload(); } });
 	pi.registerCommand("ka-name", {
 		handler: async (_args, ctx) => {
 			const warmer = live?._cacheWarmer;

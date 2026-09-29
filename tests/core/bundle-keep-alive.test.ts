@@ -68,6 +68,35 @@ test("bundled CLI local mock provider: refresh retains request hooks and writes 
 	assert.deepEqual(requests.map(request => [request.hasPayloadHook, request.hasResponseHook, request.hasHeadersHook]), [[true, true, true], [true, true, true]]);
 });
 
+test("real /reload hands the scheduled refresh to the reloaded extension without a new request", { timeout: 30_000 }, async (t) => {
+	const root = join(process.cwd(), ".tmp");
+	await mkdir(root, { recursive: true });
+	const dir = await mkdtemp(join(root, "ka-reload-"));
+	const output = join(dir, "result.json");
+	const reloadOutput = join(dir, "reload.json");
+	const log = join(dir, "provider.jsonl");
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundle, "--mode", "rpc", "--no-session", "--model", "rail-ka-local/local", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline", "-e", fixture],
+		cwd: process.cwd(),
+		env: { ...process.env, HOME: join(dir, "home"), PI_CODING_AGENT_DIR: join(dir, "agent"), PI_OFFLINE: "1", KA_PROBE_OUTPUT: output, KA_PROBE_LOG: log, KA_RELOAD_OUTPUT: reloadOutput },
+	});
+	t.after(async () => { await transport.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+	await transport.start();
+	await transport.request({ type: "prompt", message: "/rail-keep-alive 3" });
+	const settled = new Promise<void>((resolve) => { const off = transport.onEvent((e) => { if (e.type === "agent_settled") { off(); resolve(); } }); });
+	await transport.request({ type: "prompt", message: "real local turn" });
+	await settled;
+	await transport.request({ type: "prompt", message: "/ka-reload" });
+	const afterReload = JSON.parse(await readFile(reloadOutput, "utf8"));
+	assert.equal(afterReload.label, "KA 3|3", JSON.stringify(afterReload));
+	assert.match(afterReload.status, /KA 3m WAIT \(next/);
+	await transport.request({ type: "prompt", message: "/ka-probe" });
+	const result = JSON.parse(await readFile(output, "utf8"));
+	assert.equal(result.usage, 1, "the carried snapshot refreshes after reload");
+	assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 2);
+});
+
 test("real SessionManager + AgentSession.setSessionName preserves an idle warm snapshot", { timeout: 30_000 }, async (t) => {
 	const root = join(process.cwd(), ".tmp");
 	await mkdir(root, { recursive: true });

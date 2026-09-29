@@ -651,6 +651,16 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 
 真实在线复测（session `d5018664…`，同一依赖场景，代码为结果内联之后、incident 分类之前）：2:24 以 `succeeded` 关闭；Manager 调用 `accept_result`×2、`resume_work`、`close_team`、`yield`×3，**没有任何 status 调用**；时间线包含 `coord resumed work …`。A 先直接 `yield waitingFor` B 的 WorkRef（0:12），B 0:15 提交后 A 收到 outcome，但按提示词“依赖由团队内部协调”再以 attention 请 Manager 正式转交（0:23），Manager 0:46 resume。incident 分类与模型提示两项仅由测试验证。
 
+### 7.8 第四轮实测（多场景）后的修复
+
+用户会话 `2026-09-29T01-42-10…` 中 6 个真实 Team（并行调查汇总、worker 直接等待同伴、worker 自主委派 child、澄清→修订→取消、业务失败→降级）均正常收尾，所有成员释放。唯一在日常使用中会出现的问题：Manager 用 `cancel_work`/`revise_work` 回应 `WORK_HELD` 后，hold 被清除但 incident 仍 open，launch 结果列出过时的 `Unresolved WORK_HELD`，health 保持 needs_attention，且 open incident 会阻止 `succeeded` 关闭；`resume_work` 虽解决 incident 但不恢复 health。
+
+修复：`dropHold` 在 cancel、revise 及其级联的 descendant 上解决 attention/protocol hold 的 incident；`resolveIncident` 在没有其他 open incident 和成员错误时把 health 恢复为 ok，resume/release_hold 同样使用。回归：扩展 `team-runtime-properties.test.ts` · `X10 regression: cancelling or superseding held work …`（incident resolved、health ok）与 `team-runtime.test.ts` · `peer dependency: …`（resume 后 health ok），均改前失败、改后通过。
+
+未修复（实际使用中罕见）：已取消的 work 恰好遇到 native error 时，会发出两条 `MEMBER_FAULTED`（只是多一条通知）；host 停止一个 work 处于 held 状态的成员时，其 `WORK_HELD` incident 仍 open（成员错误本身已让 Team 保持 needs_attention）。worker 在自由文本中抄错 resultRef 属模型输出问题，结构化 `inputRefs` 仍由 Runtime 校验。
+
+隔离环境全量：`npm run check` 949/949（72835 ms，`/tmp/pi-hold-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 949/949（72180 ms，`/tmp/pi-hold-depth.log`）。真实在线复测（session `46d0b63d…`，同一澄清/修订/取消场景，父与 Manager `cus-resp/gpt-6-sol:xhigh`，worker `cus-resp/gpt-6-luna:max` + FAST）：4:43 以 `partial` 关闭，无任何 `Unresolved` 行（修复前同类场景有两条），父 launch 后未调用 status。独立 review（`cus-resp/gpt-6-astra:high`）结论 approve；其指出的一条恒真断言已删除，复跑三个 Runtime 测试文件 85/85。
+
 ## 8. 历史阶段结果（非本轮成绩）
 
 上一版 D2b／`5368b05` 的父全量记录为：

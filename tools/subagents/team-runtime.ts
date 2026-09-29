@@ -1880,8 +1880,7 @@ export class TeamRuntime {
 			version.state = "queued";
 			if (!team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
 		}
-		const incident = team.incidents.find((item) => item.id === incidentId);
-		if (incident) incident.state = "resolved";
+		this.resolveIncident(team, incidentId);
 		this.changed(team);
 		// Releasing any other hold never acknowledges an unknown dependency: it is held again for that decision.
 		this.holdUnknownDependencies(team);
@@ -1912,7 +1911,7 @@ export class TeamRuntime {
 			this.cancelDescendants(team, currentRef, "superseded");
 			current.state = "superseded";
 			current.waitingFor = [];
-			delete current.hold;
+			this.dropHold(team, current);
 			current.updatedAt = this.timestamp();
 		}
 		delete entry.stagedWait;
@@ -1948,7 +1947,7 @@ export class TeamRuntime {
 			version.state = "cancelled";
 			version.error = { code: "CANCELLED", message: control.reason };
 			version.waitingFor = [];
-			delete version.hold;
+			this.dropHold(team, version);
 			version.updatedAt = this.timestamp();
 			delete team.ledger.get(work.workId)!.stagedWait;
 			const assignee = team.members.get(team.ledger.get(work.workId)!.record.assignee)!;
@@ -2577,7 +2576,7 @@ export class TeamRuntime {
 			const active = member.active?.scope.kind === "work" && sameWorkRef(member.active.scope.work!, child);
 			version.state = state;
 			version.waitingFor = [];
-			delete version.hold;
+			this.dropHold(team, version);
 			version.updatedAt = this.timestamp();
 			version.error = { code: state.toUpperCase(), message: `Parent work ${workRefKey(ref)} was ${state}`,
 				...(unknownActiveOutcome && active ? { outcomeUnknown: true } : {}) };
@@ -2671,6 +2670,19 @@ export class TeamRuntime {
 		version.hold = { reason: "budget", incidentId: incident.id };
 		version.updatedAt = this.timestamp();
 		team.ready = team.ready.filter((item) => !sameWorkRef(item, ref));
+	}
+
+	/** Ending held work (cancel, revise) is the Manager's answer to its attention/protocol incident. */
+	private dropHold(team: TeamState, version: WorkVersion): void {
+		if (version.hold?.reason === "attention" || version.hold?.reason === "protocol") this.resolveIncident(team, version.hold.incidentId);
+		delete version.hold;
+	}
+
+	private resolveIncident(team: TeamState, incidentId: string): void {
+		const incident = team.incidents.find((item) => item.id === incidentId);
+		if (incident) incident.state = "resolved";
+		// Faults and stopped members keep the Team flagged; only answered incidents clear it.
+		if (!team.incidents.some((item) => item.state === "open") && ![...team.members.values()].some((member) => member.error)) team.health = "ok";
 	}
 
 	/** Hold a work version for a Manager decision, announced as WORK_HELD (answered by resume_work, revise or cancel). */

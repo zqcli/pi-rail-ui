@@ -193,6 +193,7 @@ test("peer dependency: a held worker gets another worker's resultRef from the Ma
 		inputReady(runtime, manager);
 		assert.equal(action(runtime, manager, 1, "resume", { action: "control", command: "resume_work", workId: held.work!.workId, expectedRevision: 1,
 			incidentId: held.incidentId!, instruction: `w2's conclusion is result ${conclusion}` }).ok, true);
+		assert.equal(runtime.getTeam(teamId).health, "ok", "an answered WORK_HELD no longer flags the Team");
 		assert.equal(action(runtime, manager, 2, "manager-yield", { action: "yield" }).ok, true);
 		settle(runtime, manager, "manager-yield");
 		const resumed = runtime.takeNextActivation(teamId)!;

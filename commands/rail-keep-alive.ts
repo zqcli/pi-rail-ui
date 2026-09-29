@@ -168,9 +168,11 @@ function bind(state: State, session: AgentSession, resumed?: Run): void {
 		if (request.options?.reasoning && request.model?.api === "anthropic-messages" && request.model?.compat?.forceAdaptiveThinking !== true) {
 			pause(state, "Anthropic thinking request cannot be replayed with a one-token cap"); return;
 		}
-		// Native isCurrent compares agent messages and model; it misses context edits and branch replacement.
+		// Native isCurrent compares agent message object identity, which Pi re-projects after each turn when the
+		// context holds a compaction summary, custom message or edited message; compare session entries instead.
 		const run: Run = { ...request, controller: new AbortController(), phase: "streaming", nextWarmAt: 0, extensionOverride: false, path: snapshot(),
-			isCurrent: () => isCurrent() && extendsSnapshot(state.manager, run.path!) };
+			isCurrent: () => session.model?.provider === request.model?.provider && session.model?.id === request.model?.id
+				&& extendsSnapshot(state.manager, run.path!) };
 		// Only settlement schedules the idle interval; there is no streaming timer.
 		w.run = run;
 		changed(state);

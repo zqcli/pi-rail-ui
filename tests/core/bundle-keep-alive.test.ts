@@ -97,6 +97,37 @@ test("real /reload hands the scheduled refresh to the reloaded extension without
 	assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 2);
 });
 
+test("real compacted session: the scheduled refresh fires after a turn re-projects the messages", { timeout: 30_000 }, async (t) => {
+	const root = join(process.cwd(), ".tmp");
+	await mkdir(root, { recursive: true });
+	const dir = await mkdtemp(join(root, "ka-compacted-"));
+	const output = join(dir, "result.json");
+	const log = join(dir, "provider.jsonl");
+	await mkdir(join(dir, "agent"), { recursive: true });
+	await writeFile(join(dir, "agent", "settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 1 } }));
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundle, "--mode", "rpc", "--no-session", "--model", "rail-ka-local/local", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline", "-e", fixture],
+		cwd: process.cwd(),
+		env: { ...process.env, HOME: join(dir, "home"), PI_CODING_AGENT_DIR: join(dir, "agent"), PI_OFFLINE: "1", KA_PROBE_OUTPUT: output, KA_PROBE_LOG: log },
+	});
+	t.after(async () => { await transport.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+	await transport.start();
+	const turn = async (message: string) => {
+		const settled = new Promise<void>((resolve) => { const off = transport.onEvent((e) => { if (e.type === "agent_settled") { off(); resolve(); } }); });
+		await transport.request({ type: "prompt", message });
+		await settled;
+	};
+	await transport.request({ type: "prompt", message: "/rail-keep-alive 3" });
+	await turn("first"); await turn("second");
+	await transport.request({ type: "compact" });
+	await turn("after compaction");
+	await transport.request({ type: "prompt", message: "/ka-probe" });
+	const result = JSON.parse(await readFile(output, "utf8"));
+	assert.equal(result.nativeStatus.state, "scheduled", JSON.stringify(result.nativeStatus));
+	assert.equal(result.usage, 1, "the compaction summary is re-created after each turn; the refresh must still be sent");
+});
+
 test("real SessionManager + AgentSession.setSessionName preserves an idle warm snapshot", { timeout: 30_000 }, async (t) => {
 	const root = join(process.cwd(), ".tmp");
 	await mkdir(root, { recursive: true });

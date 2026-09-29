@@ -148,7 +148,7 @@ test("RailFooterComponent redraws on keep-alive transitions and disposes its sub
  let complete!: (message: any) => void;
  const warmer: any = new CacheWarmer({ streamSimple() { return { result: () => new Promise((resolve) => { complete = resolve; }) }; } }, manager, () => "streaming");
  const session = Object.create(AgentSession.prototype) as AgentSession;
- Object.defineProperties(session, { sessionManager: { value: manager }, _cacheWarmer: { value: warmer } });
+ Object.defineProperties(session, { sessionManager: { value: manager }, _cacheWarmer: { value: warmer }, agent: { value: { state: { model } } } });
  let renders = 0;
  let branchDisposals = 0;
  const footerData: any = {

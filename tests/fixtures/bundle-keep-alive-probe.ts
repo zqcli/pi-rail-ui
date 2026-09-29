@@ -30,6 +30,8 @@ export default function probe(pi: ExtensionAPI) {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 64 }],
 	});
 	pi.on("before_provider_headers", ({ headers }) => { headers["x-ka-probe"] = "yes"; });
+	// Like Rail's search status: any turn_end handler makes Pi re-project agent messages after the turn.
+	pi.on("turn_end", () => {});
 	const original = AgentSession.prototype.prompt;
 	let live: any;
 	let blockCompaction: (() => void) | undefined;

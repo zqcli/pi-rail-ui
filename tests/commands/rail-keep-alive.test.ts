@@ -50,12 +50,15 @@ function harness() {
 	const emit = (name: string, event: any = {}) => emitAt(name, ctx, event);
 	const command = async (args: string) => commands.get("rail-keep-alive")!(args, ctx);
 	const request = { model: { provider: "test", id: "model", api: "openai-responses", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, context: { messages: [{ role: "system", content: "secret" }] }, options: { onPayload: () => {}, onResponse: () => {}, headers: { token: "local" } } };
+	// AgentSession.model reads agent.state.model.
+	const agent = { state: { model: request.model } };
+	Object.defineProperty(session, "agent", { value: agent });
 	const originalPrompt = AgentSession.prototype.prompt;
 	const originalDispose = AgentSession.prototype.dispose;
 	AgentSession.prototype.prompt = async () => {};
 	AgentSession.prototype.dispose = () => {};
 	installRailKeepAlive(pi);
-	return { warmer, session, manager, ctx, emit, emitAt, command, request, calls, notices, completions: (prefix: string) => argumentCompletions?.(prefix).map((item) => item.value), setIdle: (value: boolean) => { idle = value; }, registerHook: (name: string, fn: Function) => pi.on(name as any, fn as any), setResult(value: any) { result = value; }, async begin() {
+	return { warmer, session, agent, manager, ctx, emit, emitAt, command, request, calls, notices, completions: (prefix: string) => argumentCompletions?.(prefix).map((item) => item.value), setIdle: (value: boolean) => { idle = value; }, registerHook: (name: string, fn: Function) => pi.on(name as any, fn as any), setResult(value: any) { result = value; }, async begin() {
 		await emit("session_start", { reason: "startup" });
 		await session.prompt("capture without real request");
 	}, cleanup: async () => { await emit("session_shutdown"); AgentSession.prototype.prompt = originalPrompt; AgentSession.prototype.dispose = originalDispose; } };
@@ -350,6 +353,24 @@ test("/reload keeps a scheduled refresh on time; a quit and resume waits for a f
 		assert.equal(h.warmer.getMode(), "off", "persisted off overrides native streaming");
 		h.warmer.start({ ...h.request, model: { ...h.request.model, promptCache: { short: 300 } } }, () => true);
 		assert.equal(h.warmer.run, undefined);
+	} finally { await h.cleanup(); }
+});
+
+test("re-projected agent messages keep the snapshot; a model switch stales it", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("1");
+		// Pi's native check compares message objects, which a turn_end refresh re-creates for compaction summaries.
+		h.warmer.start(h.request, () => false);
+		h.warmer.onAgentSettled();
+		assert.equal(keepAliveLabel(h.manager), "KA 1|1");
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 1, "the same session entries still refresh");
+		h.agent.state.model = { ...h.request.model, id: "other" };
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 1);
+		assert.equal(keepAliveLabel(h.manager), "KA 1|-");
 	} finally { await h.cleanup(); }
 });
 

@@ -50,6 +50,7 @@ export type FooterLiveState = {
 };
 
 export type RailSessionSnapshot = {
+	keepAlive?: string | undefined;
 	state: FooterLiveState;
 	session: RailSessionStats;
 	capturedAt: Date;

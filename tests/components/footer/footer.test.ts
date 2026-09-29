@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installRailFast } from "../../../commands/rail-fast";
 import { installRailOaiSearch } from "../../../commands/rail-oai-search";
+import { installRailKeepAlive } from "../../../commands/rail-keep-alive";
 import { createRailFooter } from "../../../components/footer";
 import { stripAnsi } from "../../../core/utils";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 test("renders the active native search mode in the Rail footer", async () => {
 	const commands = new Map<string, any>();
@@ -74,4 +76,38 @@ test("renders the active native search mode in the Rail footer", async () => {
 		component.dispose();
 		for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
 	}
+});
+
+test("keep-alive footer respects narrow widths, off hides label, and footer disposes subscription", async () => {
+ const handlers = new Map<string, Function[]>();
+ const commands = new Map<string, any>();
+ const entries: any[] = [];
+ const pi: any = {
+  on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
+  registerCommand: (name: string, command: any) => commands.set(name, command),
+  appendEntry: (_name: string, data: any) => entries.push({ type: "custom", data }),
+  getThinkingLevel: () => "off",
+ };
+ let unsubscribed = 0;
+ const ctx: any = {
+  cwd: "/tmp/rail", isIdle: () => true, getContextUsage: () => undefined,
+  sessionManager: { getEntries: () => entries, getBranch: () => entries, getSessionId: () => "footer-ka", getCwd: () => "/tmp/rail" },
+  ui: { notify: () => {} },
+ };
+ const footerData: any = {
+  getGitBranch: () => null, getExtensionStatuses: () => new Map(),
+  onBranchChange: () => () => { unsubscribed++; },
+ };
+ const emit = async (name: string) => { for (const fn of handlers.get(name) ?? []) await fn({}, ctx); };
+ installRailKeepAlive(pi);
+ const footer = createRailFooter(ctx, pi)({ requestRender() {} }, undefined, footerData);
+ try {
+  await emit("session_start");
+  await commands.get("rail-keep-alive").handler("1", ctx);
+  for (const width of [20, 40, 90]) assert.ok(visibleWidth(footer.render(width)[0]!) <= width);
+  assert.match(stripAnsi(footer.render(90).join("")), /KA 1m PAUSED/);
+  await commands.get("rail-keep-alive").handler("off", ctx);
+  assert.doesNotMatch(stripAnsi(footer.render(90).join("")), /KA 1m/);
+ } finally { footer.dispose(); await emit("session_shutdown"); }
+ assert.equal(unsubscribed, 1);
 });

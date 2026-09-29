@@ -167,9 +167,21 @@ This is useful for exploring alternative approaches or experimenting with differ
 
 `/rail-duplicate` is intentionally **not** equivalent to Pi's native `/clone`: `/clone` extracts the current active branch into a new child session and switches to it immediately, while `/rail-duplicate` stays in the current session and creates a sibling that shares the same `parentSession` (the new file is not a child of the source).
 
+### `/rail-keep-alive`
+
+```text
+/rail-keep-alive N       # explicitly allow a refresh every N idle minutes
+/rail-keep-alive off     # disable both Rail and native warming for this session
+/rail-keep-alive status  # no argument also shows status
+```
+
+`N` is a positive integer **idle interval**, not a TTL or a total duration. The first refresh is scheduled after the next real request's `agent_settled`; each completed refresh starts a new N-minute wait, without Pi's native 30/60-minute time window. Enabling after an old turn does not replay session history: status shows `WAIT` until a fresh real request. A new request cancels the old timer/in-flight refresh; model, branch and compaction changes invalidate its request snapshot. Timer delays after sleep and replay, authentication, provider or timeout failures show `PAUSED` and require a new real request. Unsafe Anthropic thinking replay and explicit `cacheRetention: none` pause without a request. This can incur **unknown charges** on every refresh; a cache hit is never guaranteed (especially if N exceeds the provider's unverified TTL). No model pricing or cache lifetime is invented. Other extensions' `cache_warming_decision` stop veto remains effective.
+
+Rail reuses Pi 0.87.1's live session CacheWarmer, its one-token provider request (including original auth, headers and hooks), and its standalone `cache_warm` usage entry; it does not send a chat message or call a tool. The setting is stored only as a non-context entry in the same session. A fork, clone, duplicate or subagent with a new session ID does not inherit the authorization, even if it copies those entries. Resuming the **same** session restores the setting but waits for a fresh request. A session that never uses the command retains native behavior; explicit `off` overrides native `streaming`/`idle` without changing global settings. The footer shows `KA Nm WAIT/WARM/PAUSED` only while enabled; `/rail-session` and the status command provide details. Unsupported Pi runtime/warmer internals fail closed with a visible `PAUSED` reason. No real paid request is made by the test suite.
+
 ### `/rail-session`
 
-Shows the current Rail session summary in a Pi-native overlay.
+Shows the current Rail session summary (including keep-alive status when enabled) in a Pi-native overlay.
 
 ### `/rail-oai-fast`
 

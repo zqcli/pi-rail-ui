@@ -3,6 +3,7 @@ import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@eare
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
 import { railFastFooterLabel } from "../../commands/rail-fast";
+import { keepAliveLabel, keepAliveStatus, onKeepAliveChange } from "../../commands/rail-keep-alive";
 import { railOaiSearchFooterLabel } from "../../commands/rail-oai-search";
 import {
 	collectFooterLiveState,
@@ -130,7 +131,7 @@ function latestFooterData(): ReadonlyFooterDataProvider | undefined {
 	return footerStore().footerData;
 }
 
-function renderSimpleFooter(width: number, state: FooterLiveState, stats: FooterUsageStats, style: FooterStyle): string[] {
+function renderSimpleFooter(width: number, state: FooterLiveState, stats: FooterUsageStats, style: FooterStyle, ka?: string): string[] {
 	const identity = `${style.text}▸ ${fitToWidth(state.cwdShort, FOOTER_LAYOUT.cwdMaxWidth)}${state.branch ? `${style.mint}@${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : ""}`;
 	const fastLabel = railFastFooterLabel();
 	const searchLabel = railOaiSearchFooterLabel();
@@ -140,6 +141,7 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 		`${style.amber}${state.thinking}`,
 		fastLabel ? `${style.sky}${fastLabel}` : undefined,
 		searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
+		ka ? `${style.amber}${ka}` : undefined,
 	];
 	const suffixParts = [
 		turnDurationText(state, style),
@@ -249,6 +251,7 @@ export async function openRailSessionModal(ctx: ExtensionCommandContext, pi: Ext
 	}
 
 	const snapshot = collectRailSessionSnapshot(ctx, pi, latestFooterData());
+	snapshot.keepAlive = keepAliveStatus(ctx.sessionManager);
 	const overlayOptions = resolveRailSessionOverlayOptions();
 	await ctx.ui.custom<void>(
 		(_tui, theme, _keybindings, done) => new RailSessionModal(snapshot, theme, overlayOptions.maxHeight, () => done()),
@@ -264,12 +267,14 @@ export function renderFooter(
 	stats: FooterUsageStats = collectFooterUsageStats(ctx),
 	style: FooterStyle = RAIL_FOOTER_STYLE,
 ): string[] {
-	return renderSimpleFooter(width, collectFooterLiveState(ctx, pi, footerData), stats, style);
+	return renderSimpleFooter(width, collectFooterLiveState(ctx, pi, footerData), stats, style, keepAliveLabel(ctx.sessionManager));
 }
 
 class RailFooterComponent {
 	private usageCache?: { entryCount: number; lastEntry: any; stats: FooterUsageStats } | undefined;
+	private disposed = false;
 	private readonly unsubscribe?: () => void;
+	private readonly unsubscribeKeepAlive: () => void;
 
 	constructor(
 		private readonly tui: any,
@@ -281,10 +286,14 @@ class RailFooterComponent {
 		this.unsubscribe = footerData.onBranchChange?.(() => {
 			requestFooterRender(this.tui);
 		});
+		this.unsubscribeKeepAlive = onKeepAliveChange(ctx.sessionManager, () => requestFooterRender(this.tui));
 	}
 
 	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
 		this.unsubscribe?.();
+		this.unsubscribeKeepAlive();
 	}
 
 	invalidate(): void {
@@ -305,7 +314,7 @@ class RailFooterComponent {
 
 	render(width: number): string[] {
 		const state = collectFooterLiveState(this.ctx, this.pi, this.footerData);
-		return renderSimpleFooter(width, state, this.usageStats(), RAIL_FOOTER_STYLE);
+		return renderSimpleFooter(width, state, this.usageStats(), RAIL_FOOTER_STYLE, keepAliveLabel(this.ctx.sessionManager));
 	}
 
 }

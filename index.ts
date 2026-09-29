@@ -7,6 +7,7 @@ import { type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { RailEditor } from "./components/editor";
 import { createRailFooter, openRailSessionModal, setTurnEndTime, setTurnStartTime } from "./components/footer";
 import { handleDuplicateCommand } from "./commands/duplicate";
+import { installRailKeepAlive } from "./commands/rail-keep-alive";
 import { installRailFast } from "./commands/rail-fast";
 import { installRailOaiSearch } from "./commands/rail-oai-search";
 import { installRailResponsesWebSocket } from "./openai/responses-websocket";
@@ -30,6 +31,7 @@ export * from "./components/executions";
 export default async function piRailUi(pi: ExtensionAPI) {
 	let enabled = true;
 
+	installRailKeepAlive(pi);
 	installApplyPatchTool(pi);
 	installRailFast(pi);
 	installRailOaiSearch(pi);

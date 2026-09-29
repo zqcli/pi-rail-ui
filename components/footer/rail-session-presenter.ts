@@ -130,6 +130,10 @@ export function renderRailSessionContent(snapshot: RailSessionSnapshot, theme: T
 	rows.push("", modalSection(theme, "Runtime"));
 	rows.push(modalField(theme, "Model", theme.fg("text", model), width));
 	rows.push(modalField(theme, "Thinking", theme.fg("text", state.thinking), width));
+	if (snapshot.keepAlive) {
+		rows.push(modalField(theme, "Keep-alive", theme.fg("warning", snapshot.keepAlive), width));
+		rows.push(modalField(theme, "Refresh fees", theme.fg("warning", "unknown; cache hit not verified"), width));
+	}
 	if (state.pending) rows.push(modalField(theme, "Queue", theme.fg("warning", "pending messages"), width));
 	rows.push(modalField(theme, "Directory", theme.fg("text", state.cwd), width));
 	if (state.branch) rows.push(modalField(theme, "Branch", theme.fg("text", state.branch), width));

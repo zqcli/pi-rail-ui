@@ -194,9 +194,21 @@ Rail 可按 provider/model 白名单把 HTTP SSE 替换为原生 Responses WebSo
 
 `/rail-duplicate` 刻意**不与** Pi 原生 `/clone` 等价：`/clone` 会把当前 active branch 提取成新的 child session 并立即切换过去；`/rail-duplicate` 留在当前 session，创建与源共享同一 `parentSession` 的同级 session（新文件不是源的 child）。
 
+### `/rail-keep-alive`
+
+```text
+/rail-keep-alive N       # 显式授权每隔 N 分钟空闲刷新
+/rail-keep-alive off     # 关闭当前会话的 Rail 和原生预热
+/rail-keep-alive status  # 无参数也可查询状态
+```
+
+`N` 必须是正整数分钟，表示**空闲刷新间隔**，不是 TTL 或总保活时长。首次等待从下一次真实请求的 `agent_settled` 开始；每次刷新完成后再等待 N 分钟，不受 Pi 原生 30/60 分钟窗口限制。开启后如没有新鲜真实请求，仅显示 `WAIT`，不从 JSONL 重建请求。新请求会撤销旧计时和在途刷新；模型、分支及压缩变化令旧请求快照失效。睡眠导致的迟到、重放不安全、认证/协议失败和超时都会进入 `PAUSED`，等待下一次真实请求。Anthropic 不安全的 thinking 重放及显式 `cacheRetention: none` 不发送刷新。**每次刷新可能产生未知费用**；不保证缓存命中，特别是 N 超过未知的实际 TTL 时。不伪造模型费用或缓存时长；其他扩展的 `cache_warming_decision` stop 否决仍有效。
+
+Rail 复用 Pi 0.87.1 当前实例的 CacheWarmer、以一 token 为*输出预算意图*的原生 provider 请求（保留认证、headers、hooks；Responses 等 adapter 可能强制至少 16 token，不能保证实际仅输出一 token）以及独立 `cache_warm` usage entry；不生成聊天消息或工具调用。授权只保存为当前会话的非上下文 entry；新 ID 的 fork/clone/duplicate/subagent 即使复制该 entry 也不会继承。`/reload` 保留同一个 live session，已排定的刷新按原时间继续；在新进程中恢复**同一**会话可恢复开关，但仍须等新请求。请求之后追加的输出（如 `!cmd`）不改变已缓存的前缀，快照仍有效。未使用命令的会话保持 Pi 原生行为；显式 `off` 仅覆盖该会话的原生预热，不改全局设置。启用时 启用后 footer 显示 `KA N|M`：`N` 是设定间隔，`M` 是距下次刷新的剩余整分钟（刷新中为 `0`，真实请求结束前为 `-`，暂停时为 `PAUSED`）；`/rail-session` 和状态命令提供详情。不支持的 Pi 版本或 warmer 结构无法控制原生计时器：命令拒绝修改或持久化设置，并明确警告原生预热仍可能运行。Pi 原生 `/session` 的 Mode 仍显示全局设置；Rail 的当前会话 manual 间隔与状态以 `/rail-session` 或 `/rail-keep-alive status` 为准。测试套件不产生真实付费请求。
+
 ### `/rail-session`
 
-使用 Pi 原生 overlay 显示当前 Rail session 摘要。
+使用 Pi 原生 overlay 显示当前 Rail session 摘要（启用时包含 keep-alive 状态）。
 
 ### `/rail-oai-fast`
 

@@ -77,6 +77,26 @@ describe("rail editor autocomplete seam", () => {
 		assert.equal(editor.autocompleteState, null);
 	});
 
+	test("keeps /rail-keep-alive in the editor so its N/off/status argument can be completed", () => {
+		const provider = new CombinedAutocompleteProvider([{ name: "rail-keep-alive" }], process.cwd());
+		let submitted = false;
+		const editor = {
+			state: { lines: ["/rail-keep"], cursorLine: 0, cursorCol: 10 },
+			autocompleteState: {} as unknown,
+			autocompleteProvider: provider,
+			autocompletePrefix: "/rail-keep",
+			autocompleteList: { getSelectedItem: () => ({ value: "rail-keep-alive", label: "rail-keep-alive" }) },
+			cancelAutocomplete() { this.autocompleteState = null; },
+		};
+		assert.equal(completeSlashCommandWithoutSubmit({
+			editor, data: "enter", keybindings: { matches: () => true },
+			requestRender: () => { submitted = true; },
+		}), true);
+		assert.equal(editor.state.lines.join("\n"), "/rail-keep-alive ");
+		assert.equal(editor.autocompleteState, null);
+		assert.equal(submitted, true);
+	});
+
 	test("keeps GPT compaction command arguments in the editor", () => {
 		const provider = new CombinedAutocompleteProvider([{ name: "rail-oai-compaction" }], process.cwd());
 		const editor = {

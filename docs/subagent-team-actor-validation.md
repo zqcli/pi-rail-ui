@@ -661,6 +661,14 @@ NV01–NV03 是模板 `native ExtensionRunner later session_before_${kind} cance
 
 隔离环境全量：`npm run check` 949/949（72835 ms，`/tmp/pi-hold-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 949/949（72180 ms，`/tmp/pi-hold-depth.log`）。真实在线复测（session `46d0b63d…`，同一澄清/修订/取消场景，父与 Manager `cus-resp/gpt-6-sol:xhigh`，worker `cus-resp/gpt-6-luna:max` + FAST）：4:43 以 `partial` 关闭，无任何 `Unresolved` 行（修复前同类场景有两条），父 launch 后未调用 status。独立 review（`cus-resp/gpt-6-astra:high`）结论 approve；其指出的一条恒真断言已删除，复跑三个 Runtime 测试文件 85/85。
 
+### 7.9 第五轮长流程实测后的调整
+
+用户会话中 3 个长流程 Team（多层 child/grandchild 整体修订、七 worker 五来源汇总与双重返工、失败 child 原位重试并交叉暂停/hold/取消；共 21 成员、23 work、27 分钟）全部以 `succeeded` 关闭，§7.8 的 incident 修复在级联修订与取消中验证通过。没有运行时缺陷；实际摩擦为：模型抄错约 81 字符的双 UUID ID 导致 4 次 `UNKNOWN_RESULT`；模型可见 schema 中工作 yield 的 `checkpoint` 为可选而 Runtime 要求必填，导致 1 次 `INVALID_ARGUMENT`；长 Team 超出 60 条时间线上限（分别省略 17、12 条）；launch 文本 “cancelled” 计数含 superseded。
+
+调整：ID 改为 `kind:uuid`（约 43 字符，旧格式历史仍按完整 ID 读取）；两个工作 yield 分支 schema 要求 `checkpoint`，Manager 的空 yield 不变（fixture 中故意无效的 yield 补上 checkpoint，仍在 Runtime 以 `UNKNOWN_WORK` 被拒并计费）；已提交 reply 不再重复记“ended (reply)”，上限 100；计数改名 `cancelled/superseded`。回归：`team-codec-bounds.test.ts` · `the model-facing schema requires a checkpoint on work yields, as the Runtime does` 与更新的 `team-tool.test.ts` 时间线断言，均改前失败、改后通过。
+
+隔离环境全量：`npm run check` 950/950（71421 ms，`/tmp/pi-r5-check.log`）；`PI_SUBAGENT_DEPTH=1 npm test` 950/950（71301 ms，`/tmp/pi-r5-depth.log`）。真实在线复测（session `ccece5c4…`，三来源 → writer → reviewer，两轮返工复核，Manager `cus-resp/gpt-6-sol:xhigh`，worker `cus-resp/gpt-6-luna:max` + FAST）：9:41 `succeeded`，7 个 root 全部接受，6 个成员会话 team 工具错误 0 次，时间线完整无省略。独立 review（`cus-resp/gpt-6-astra:high`）结论 approve、无问题，其复跑 107 项相关测试（含 real-Pi driver 39 项）全部通过。
+
 ## 8. 历史阶段结果（非本轮成绩）
 
 上一版 D2b／`5368b05` 的父全量记录为：

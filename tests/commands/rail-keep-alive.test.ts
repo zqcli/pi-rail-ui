@@ -136,14 +136,44 @@ test("keep-alive change subscription covers start/schedule/refresh/pause/off and
 		t.mock.timers.tick(60_000); await flush();
 		h.warmer.start({ ...h.request, options: { cacheRetention: "none" } }, () => true);
 		await h.command("off");
-		assert.ok(labels.includes("KA 1m WAIT"));
-		assert.ok(labels.includes("KA 1m WARM"));
-		assert.ok(labels.includes("KA 1m PAUSED"));
+		assert.ok(labels.includes("KA 1|-"));
+		assert.ok(labels.includes("KA 1|0"));
+		assert.ok(labels.includes("KA 1|PAUSED"));
 		assert.equal(labels.at(-1), undefined);
 		const count = labels.length;
 		unsubscribe();
 		await h.command("1");
 		assert.equal(labels.length, count);
+	} finally { unsubscribe(); await h.cleanup(); }
+});
+
+test("footer label counts down whole minutes to the next refresh and re-renders each minute", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: 1000 });
+	const h = harness();
+	let renders = 0;
+	const unsubscribe = onKeepAliveChange(h.manager, () => renders++);
+	try {
+		await h.begin(); await h.command("3");
+		assert.equal(keepAliveLabel(h.manager), "KA 3|-", "no countdown before a real request settles");
+		h.warmer.start(h.request, () => true);
+		assert.equal(keepAliveLabel(h.manager), "KA 3|-", "no countdown while the agent runs");
+		h.warmer.onAgentSettled();
+		assert.equal(keepAliveLabel(h.manager), "KA 3|3");
+		t.mock.timers.tick(30_000);
+		assert.equal(keepAliveLabel(h.manager), "KA 3|3", "a partial minute rounds up");
+		const before = renders;
+		t.mock.timers.tick(30_000);
+		assert.ok(renders > before, "each minute boundary re-renders the footer");
+		assert.equal(keepAliveLabel(h.manager), "KA 3|2");
+		t.mock.timers.tick(60_000);
+		assert.equal(keepAliveLabel(h.manager), "KA 3|1");
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 1, "the refresh fires when the countdown reaches 0");
+		assert.equal(keepAliveLabel(h.manager), "KA 3|3", "a completed refresh restarts the countdown");
+		await h.command("off");
+		const afterOff = renders;
+		t.mock.timers.tick(10 * 60_000);
+		assert.equal(renders, afterOff, "off stops the minute ticks");
 	} finally { unsubscribe(); await h.cleanup(); }
 });
 

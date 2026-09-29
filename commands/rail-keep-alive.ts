@@ -10,7 +10,7 @@ const INTERVAL = 60_000;
 const LATE_MS = 15_000;
 const MAX_TIMER_MS = 2 ** 31 - 1;
 type Mode = { minutes?: number | null | undefined; paused?: string | undefined };
-type Run = { timer?: ReturnType<typeof setTimeout> | undefined; controller: AbortController; isCurrent: () => boolean; nextWarmAt: number; phase: string; [key: string]: any };
+type Run = { timer?: ReturnType<typeof setTimeout> | undefined; tick?: ReturnType<typeof setInterval> | undefined; controller: AbortController; isCurrent: () => boolean; nextWarmAt: number; phase: string; [key: string]: any };
 type Warmer = {
 	run?: Run | undefined; sessionManager: unknown; models: { streamSimple: (...args: any[]) => any };
 	getMode: () => string; decide: (event: any) => Promise<string>;
@@ -158,14 +158,19 @@ function bind(state: State, session: AgentSession): void {
 		if (!manual()) { original.schedule.call(w, run); return; }
 		if (w.run !== run || state.mode.paused) return;
 		if (run.timer) clearTimeout(run.timer);
+		clearInterval(run.tick);
 		const delay = state.mode.minutes! * INTERVAL;
 		run.nextWarmAt = Date.now() + delay;
 		run.timer = setTimeout(() => {
 			run.timer = undefined;
+			clearInterval(run.tick);
 			changed(state);
 			void w.refresh(run);
 		}, delay);
+		// The footer countdown drops by one each minute from here.
+		run.tick = setInterval(() => changed(state), INTERVAL);
 		run.timer.unref?.();
+		run.tick.unref?.();
 		changed(state);
 	};
 	w.refreshDeadlineMissed = function(run) {
@@ -183,6 +188,7 @@ function bind(state: State, session: AgentSession): void {
 		return action;
 	};
 	w.clearRun = function() {
+		clearInterval(w.run?.tick);
 		original.clearRun.call(w);
 		if (manual()) changed(state);
 	};
@@ -232,8 +238,15 @@ export function keepAliveStatus(manager: any): string | undefined {
 	return run.timer === undefined ? `KA ${minutes}m WARM` : `KA ${minutes}m WAIT (next ${new Date(run.nextWarmAt).toLocaleTimeString()})`;
 }
 
+/** Footer form `KA <interval>|<minutes to the next refresh>`: 0 while refreshing, `-` until a real request settles. */
 export function keepAliveLabel(manager: any): string | undefined {
-	return keepAliveStatus(manager)?.split(" (")[0];
+	const state = states().get(manager);
+	const minutes = state?.mode.minutes;
+	if (!state || !minutes) return undefined;
+	const run = state.warmer?.run;
+	const next = state.mode.paused ? "PAUSED" : run?.phase !== "idle" ? "-" : run.timer === undefined ? "0"
+		: String(Math.max(0, Math.ceil((run.nextWarmAt - Date.now()) / INTERVAL)));
+	return `KA ${minutes}|${next}`;
 }
 
 export function installRailKeepAlive(pi: ExtensionAPI): void {

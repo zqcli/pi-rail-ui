@@ -111,9 +111,9 @@ test("keep-alive footer respects narrow widths, off hides label, and footer disp
   await emit("session_start");
   await commands.get("rail-keep-alive").handler("1", ctx);
   for (const width of [20, 40, 90]) assert.ok(visibleWidth(footer.render(width)[0]!) <= width);
-  assert.doesNotMatch(stripAnsi(footer.render(90).join("")), /KA 1m/, "unsupported control cannot advertise an enabled interval");
+  assert.doesNotMatch(stripAnsi(footer.render(90).join("")), /KA 1\|/, "unsupported control cannot advertise an enabled interval");
   await commands.get("rail-keep-alive").handler("off", ctx);
-  assert.doesNotMatch(stripAnsi(footer.render(90).join("")), /KA 1m/);
+  assert.doesNotMatch(stripAnsi(footer.render(90).join("")), /KA 1\|/);
  } finally { footer.dispose(); await emit("session_shutdown"); }
  assert.equal(unsubscribed, 1);
 });
@@ -162,7 +162,7 @@ test("RailFooterComponent redraws on keep-alive transitions and disposes its sub
   await emit("session_start");
   await session.prompt("bind only; no provider request");
   await commands.get("rail-keep-alive").handler("1", ctx);
-  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1m WAIT/);
+  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1\|-/);
   warmer.start({ model, context: { messages: [] }, options: {} }, () => true);
   warmer.onAgentSettled();
   const scheduledRenders = renders;
@@ -170,14 +170,14 @@ test("RailFooterComponent redraws on keep-alive transitions and disposes its sub
   t.mock.timers.tick(60_000);
   for (let i = 0; i < 10; i++) await Promise.resolve();
   assert.ok(renders > scheduledRenders, "the timer requests a render before the provider finishes");
-  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1m WARM/);
+  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1\|0/);
   complete({ stopReason: "stop", provider: "local", model: "mock", usage: { input: 1, cost: { total: 0 } } });
   for (let i = 0; i < 20; i++) await Promise.resolve();
-  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1m WAIT/);
+  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1\|1/);
   warmer.start({ model, context: { messages: [] }, options: { cacheRetention: "none" } }, () => true);
-  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1m PAUSED/);
+  assert.match(stripAnsi(footer.render(90)[0]!), /KA 1\|PAUSED/);
   await commands.get("rail-keep-alive").handler("off", ctx);
-  assert.doesNotMatch(stripAnsi(footer.render(90)[0]!), /KA 1m/);
+  assert.doesNotMatch(stripAnsi(footer.render(90)[0]!), /KA 1\|/);
   footer.dispose();
   const afterDispose = renders;
   await commands.get("rail-keep-alive").handler("1", ctx);

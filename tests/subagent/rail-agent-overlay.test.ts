@@ -44,7 +44,7 @@ const snapshot = {
 	counts: { linked: 1, global: 1, running: 0, queued: 0, idle: 1, stopped: 0, inUseElsewhere: 0, errors: 0 },
 };
 
-function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "error" | "in-use-elsewhere" | "unknown" = "idle", terminalRows = 30, compacting = false) {
+function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "error" | "in-use-elsewhere" | "unknown" = "idle", terminalRows = 30, compacting = false, fg = (_color: string, text: string) => text) {
 	let renders = 0;
 	let closed = false;
 	let subscribed: (() => void) | undefined;
@@ -98,10 +98,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	};
 	const component = new RailAgentOverlayComponent(
 		{ terminal: { rows: terminalRows }, requestRender: () => { renders++; } } as any,
-		{
-			fg: (_color: string, text: string) => text,
-			bold: (text: string) => text,
-		} as any,
+		{ fg, bold: (text: string) => text } as any,
 		keybindings as any,
 		() => { closed = true; },
 		ctx as any,
@@ -539,6 +536,21 @@ test("Shift+F permits stopped and error agents but rejects unknown ownership", a
 	} finally {
 		unknown.component.dispose();
 	}
+});
+
+test("agent phase colors follow the panel state colors: starting blue like running, queued gray like waiting", () => {
+	const colorOf = (phase: Parameters<typeof setup>[0], compacting = false) => {
+		const state = setup(phase, 30, compacting, (color, text) => `{${color}|${text}}`);
+		try {
+			return state.component.render(100).join("\n").match(/\{(\w+)\|(?:RUNNING|STARTING|QUEUED|IDLE|ERROR|COMPACTING)\}/u)?.[1];
+		} finally {
+			state.component.dispose();
+		}
+	};
+	assert.deepEqual(
+		[colorOf("running"), colorOf("starting"), colorOf("queued"), colorOf("idle"), colorOf("error"), colorOf("running", true)],
+		["border", "border", "muted", "muted", "error", "warning"],
+	);
 });
 
 test("fast toggle rejects busy and foreign-owned agents", () => {

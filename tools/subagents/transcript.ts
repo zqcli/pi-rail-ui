@@ -796,15 +796,16 @@ function statusText(run: SubagentTranscriptRun): string {
 }
 
 /**
- * One color per state, shared by icons, headers and borders: running blue, completed green, needs
- * attention yellow, failed red, idle or waiting gray. Blue and green stay apart in both built-in themes.
+ * One color per state, shared by every subagent panel and the /rail-agent list: running blue,
+ * completed green, needs attention yellow, failed red, idle or waiting gray. Blue and green stay
+ * apart in both built-in themes.
  */
-function statusColor(run: SubagentTranscriptRun): "border" | "accent" | "success" | "error" | "warning" | "muted" {
-	if (run.status === "failed") return "error";
-	if (run.status === "held" || (run.status === "running" && run.isCompacting)) return "warning";
-	if (run.status === "running") return "border";
-	if (run.status === "accepted") return "accent";
-	if (run.status === "idle" || run.status === "waiting") return "muted";
+export function statusColor(status: SubagentTranscriptStatus, isCompacting = false): "border" | "accent" | "success" | "error" | "warning" | "muted" {
+	if (status === "failed") return "error";
+	if (status === "held" || (status === "running" && isCompacting)) return "warning";
+	if (status === "running") return "border";
+	if (status === "accepted") return "accent";
+	if (status === "idle" || status === "waiting") return "muted";
 	return "success";
 }
 
@@ -848,7 +849,7 @@ function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
 		: run.status === "running" ? (run.isCompacting ? "◐" : "▶")
 			: run.status === "idle" ? "○" : run.status === "waiting" ? "⧗" : run.status === "held" ? "⏸"
 				: run.status === "accepted" ? "↪" : "✓";
-	return theme.fg(statusColor(run), icon);
+	return theme.fg(statusColor(run.status, run.isCompacting), icon);
 }
 
 /** Collapsed answers skip headings and blank lines, so the preview starts with content. */
@@ -905,7 +906,7 @@ class SubagentRunPanel implements Component {
 		const boxed = this.boxed && width >= 3;
 		const innerWidth = Math.max(1, width - (boxed ? 2 : 0));
 		const header = this.layout === "single"
-			? `${this.theme.fg(statusColor(this.run), this.theme.bold(statusText(this.run)))}${this.theme.fg("toolTitle", this.theme.bold(` · ${runtimeText(this.run)}`))}`
+			? `${this.theme.fg(statusColor(this.run.status, this.run.isCompacting), this.theme.bold(statusText(this.run)))}${this.theme.fg("toolTitle", this.theme.bold(` · ${runtimeText(this.run)}`))}`
 			: `${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run, this.layout, this.sequenceTotal)))}`;
 		const lines = [truncateToWidth(header, innerWidth, "", true)];
 		const metrics = this.layout === "single"
@@ -921,7 +922,7 @@ class SubagentRunPanel implements Component {
 			? [line]
 			: new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
-		const color = statusColor(this.run);
+		const color = statusColor(this.run.status, this.run.isCompacting);
 		const borderColor = color === "muted" ? "borderMuted" : color;
 		const border = (value: string) => this.theme.fg(borderColor, value);
 		const result = [border(`╭${"─".repeat(innerWidth)}╮`)];
@@ -1118,7 +1119,7 @@ export function renderSubagentTranscript(
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	const header = `${theme.fg(statusColor(only), theme.bold(statusText(only)))}${theme.fg("toolTitle", theme.bold(` · ${runtimeText(only)}`))}`;
+	const header = `${theme.fg(statusColor(only.status, only.isCompacting), theme.bold(statusText(only)))}${theme.fg("toolTitle", theme.bold(` · ${runtimeText(only)}`))}`;
 	const usage = usageText(only);
 	return new BoundedTranscriptView(
 		header,

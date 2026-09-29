@@ -4,6 +4,7 @@ import { Input, Key, matchesKey, stripTerminalSequences, truncateToWidth, type F
 import type { RailAgentManager, RailAgentManagerSnapshot, RailAgentPhase, RailAgentView } from "./agent-manager";
 import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { assertValidAgentAlias } from "./identity";
+import { statusColor } from "./transcript";
 import {
 	availableThinkingLevels,
 	railModelKey,
@@ -74,13 +75,13 @@ function phaseLabel(agent: RailAgentView): string {
 	return agent.phase.toUpperCase();
 }
 
-function phaseColor(phase: RailAgentPhase, isCompacting = false): "border" | "warning" | "error" | "muted" | "dim" {
-	if (isCompacting) return "warning";
-	if (phase === "running") return "border";
-	if (phase === "starting" || phase === "queued") return "warning";
-	if (phase === "error") return "error";
-	if (phase === "idle") return "muted";
-	return "dim";
+/** Reuses the panel state colors: starting counts as running, queued as waiting. */
+function phaseColor(phase: RailAgentPhase, isCompacting = false): ReturnType<typeof statusColor> | "dim" {
+	if (phase === "running" || phase === "starting") return statusColor("running", isCompacting);
+	if (phase === "queued") return statusColor("waiting");
+	if (phase === "error") return statusColor("failed");
+	if (phase === "idle") return statusColor("idle");
+	return isCompacting ? "warning" : "dim";
 }
 
 function sessionLabel(session: SessionInfo, currentCwd: string): string {

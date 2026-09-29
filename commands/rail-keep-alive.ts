@@ -113,6 +113,12 @@ function bind(state: State, session: AgentSession): void {
   deadline: w.refreshDeadlineMissed, evaluate: w.evaluate, mode: w.getMode, decide: w.decide,
   models: w.models, manager: w.sessionManager, warmed: w.onWarmed, clearRun: w.clearRun,
  };
+ const nativeEconomics = (run: Run) => {
+  // Missing price metadata must not be represented as a zero-dollar estimate.
+  try { if (run["model"]?.cost) return original.evaluate.call(w, run); } catch { /* Unknown economics. */ }
+  return { phase: run.phase, warmCost: NaN, missCost: NaN,
+   continuationProbability: NaN, expectedSavings: NaN, economicsAvailable: false, action: "stop" };
+ };
  const compactDescriptor = Object.getOwnPropertyDescriptor(session, "compact");
  const compact = session.compact;
  const compactWrapper = function(this: AgentSession, ...args: Parameters<AgentSession["compact"]>) {
@@ -146,7 +152,7 @@ function bind(state: State, session: AgentSession): void {
   if (!run || !run.isCurrent()) return nativeStatus.call(w);
   if (run.phase !== "idle") return { state: "inactive", reason: "Rail manual: waiting for agent settlement" };
   return { state: run.timer === undefined ? "refreshing" : "scheduled",
-   nextWarmAt: run.nextWarmAt, decision: w.evaluate(run), extensionOverride: true,
+   nextWarmAt: run.nextWarmAt, decision: nativeEconomics(run), extensionOverride: true,
    reason: `Rail manual ${state.mode.minutes}m idle interval`, manual: true };
  } });
  w.start = function(request, isCurrent) {
@@ -194,14 +200,9 @@ function bind(state: State, session: AgentSession): void {
   if (w.run === run) pause(state, "refresh deadline missed; send a fresh real request");
   return true;
  };
- w.evaluate = (run) => {
-  if (!state.mode.minutes) return original.evaluate.call(w, run);
-  // Missing price metadata must not be represented as a zero-dollar estimate.
-  let decision;
-  try { if (run["model"]?.cost) decision = original.evaluate.call(w, run); } catch { /* Unknown economics. */ }
-  return { ...(decision ?? { phase: run.phase, warmCost: NaN, missCost: NaN,
-   continuationProbability: NaN, expectedSavings: NaN, economicsAvailable: false }), action: "warm" };
- };
+ w.evaluate = (run) => state.mode.minutes
+  ? { ...nativeEconomics(run), action: "warm" }
+  : original.evaluate.call(w, run);
  w.decide = async (event) => {
   if (!state.mode.minutes) return original.decide.call(w, event);
   const run = w.run;

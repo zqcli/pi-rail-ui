@@ -4,7 +4,7 @@ import { AgentSession, VERSION, getPackageDir, type ExtensionAPI } from "@earend
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 // Test-only import: production always captures the live instance, never this class.
-const { CacheWarmer } = await import(pathToFileURL(join(getPackageDir(), "dist/core/cache-warmer.js")).href);
+const { CacheWarmer, formatCacheWarmingStatus } = await import(pathToFileURL(join(getPackageDir(), "dist/core/cache-warmer.js")).href);
 import { installRailKeepAlive, keepAliveLabel, keepAliveStatus, onKeepAliveChange } from "../../commands/rail-keep-alive";
 
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
@@ -100,6 +100,7 @@ test("manual native status remains scheduled with unknown costs, and retains rea
   assert.equal(unknown.decision.economicsAvailable, false);
   assert.ok(Number.isNaN(unknown.decision.warmCost), "unknown does not become $0");
   assert.match(unknown.reason, /Rail manual 1m/);
+  assert.match(formatCacheWarmingStatus(unknown, Date.now()), /extension override, cache economics unavailable/);
   h.manager.entries.push({ type: "message", message: { role: "assistant", usage: { input: 20_000, cacheRead: 0, cacheWrite: 0 } } });
   const priced = { ...h.request, model: { ...h.request.model, cost: { input: 10, output: 2, cacheRead: 1, cacheWrite: 10 } } };
   h.warmer.start(priced, () => true); h.warmer.onAgentSettled();
@@ -108,8 +109,14 @@ test("manual native status remains scheduled with unknown costs, and retains rea
   assert.equal(known.decision.economicsAvailable, true);
   assert.ok(Number.isFinite(known.decision.warmCost) && known.decision.warmCost > 0);
   assert.ok(Number.isFinite(known.decision.missCost) && known.decision.missCost > 0);
-  assert.equal(known.decision.action, "warm", "manual overrides the native savings threshold, not its measurements");
+  assert.equal(known.decision.action, "stop", "status reports the native economic decision");
+  assert.equal(h.warmer.evaluate(h.warmer.run).action, "warm", "manual execution remains explicitly warm");
+  assert.match(formatCacheWarmingStatus(known, Date.now()), /expected savings \$0\.007 < \$0\.050/);
+  assert.doesNotMatch(formatCacheWarmingStatus(known, Date.now()), /\$0\.007 >= \$0\.050/);
+  assert.equal(known.extensionOverride, true);
   assert.equal(known.manual, true);
+  t.mock.timers.tick(60_000); await flush();
+  assert.equal(h.calls.length, 1, "manual warm still dispatches below the native threshold");
   await h.command("off");
   assert.equal(h.session.cacheWarmingStatus!.state, "inactive");
  } finally { await h.cleanup(); }

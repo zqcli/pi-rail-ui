@@ -8,7 +8,8 @@ import { installTeamTool, TeamLaunchWaitAbortedError } from "../../tools/subagen
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import type { SessionBroker } from "../../tools/subagents/session-broker";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
-import type { ResultRecord, TeamResult } from "../../tools/subagents/team-protocol";
+import { shortWorkRef, type ResultRecord, type TeamResult } from "../../tools/subagents/team-protocol";
+import type { RuntimeActivation } from "../../tools/subagents/team-runtime";
 
 const nativeModel: any = {
 	provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol", api: "openai-responses",
@@ -277,6 +278,107 @@ test("launch final output carries every selected result in full with a timeline,
 	assert.match(text, new RegExp(`\\[Result truncated for the parent; full record: subagent_team status resultRef ${refs[7]}\\]`, "u"),
 		"only an over-budget record is truncated, and it names the exact resultRef to read");
 	assert.equal(result.details.members[1].output.startsWith("Part 8 summary.\nFindings:"), true, "the member panel's final answer is its full latest result");
+});
+
+/** Reserve the next activation and acknowledge its input, as a native member would. */
+function activate(host: TeamSessionHost, teamId: string): RuntimeActivation {
+	const activation = host.runtime.takeNextActivation(teamId)!;
+	assert.equal(host.runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
+	return activation;
+}
+
+/** Stage `args` as the activation's end intent and settle it as confirmed by the transcript. */
+function endActivation(host: TeamSessionHost, activation: RuntimeActivation, args: unknown, sequence = 1): void {
+	const call = `end-${activation.scope.activationId}`;
+	assert.equal(host.runtime.handleAction(activation.binding, activation.scope, sequence, call, args, call).ok, true);
+	host.runtime.nativeSettled(activation.binding, activation.scope.activationId, { status: "success", appliedToolCallId: call });
+	host.runtime.cleanupFinished(activation.binding, activation.scope.activationId, { ok: true });
+}
+
+const sourceWriterArgs = {
+	...prepareArgs,
+	workers: ["source", "writer"].map((alias) => ({ ...prepareArgs.workers[0]!, alias })),
+	initialRequests: [{ to: "source", task: "Find the fixture.", inputRefs: null }, { to: "writer", task: "Write the change.", inputRefs: null }],
+};
+
+test("launch panel says who a waiting member waits on, what a held one asks, and why the Team has not finished", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", sourceWriterArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	const notLaunched = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
+	assert.doesNotMatch(notLaunched.content[0].text, /Waiting for:/u, "a Team that is not active waits for nothing");
+
+	let resolveLifetime!: (result: TeamResult) => void;
+	const lifetime = new Promise<TeamResult>((resolve) => { resolveLifetime = resolve; });
+	host.driver.openAndLaunch = async () => { host.runtime.launch(teamId); return { lifetime }; };
+	const updates: any[] = [];
+	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context());
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	endActivation(host, activate(host, teamId), { action: "yield" });
+	const source = activate(host, teamId);
+	const writer = activate(host, teamId);
+	endActivation(host, source, { action: "yield", attention: "Which fixture should I use?", checkpoint: "stopped before choosing" });
+	endActivation(host, writer, { action: "yield", waitingFor: [source.scope.work], checkpoint: "needs the fixture" });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+
+	const update = updates.at(-1);
+	const detail = (alias: string): string => update.details.members.find((member: any) => member.alias === alias).detail;
+	assert.equal(detail("source"), 'held · asks: "Which fixture should I use?" · queued for Manager');
+	assert.equal(detail("writer"), `waiting on source (held ${shortWorkRef(source.scope.work!)})`);
+	assert.equal(update.details.waitingFor, "Manager decision on source's question");
+	assert.match(update.content[0].text, /^Works: [^\n]*\nWaiting for: Manager decision on source's question\n/mu, "the Team header carries the reason under the work counts");
+	const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
+	assert.match(status.content[0].text, /^Waiting for: Manager decision on source's question$/mu);
+
+	const tagged = { fg: (color: string, text: string) => `{${color}|${text}}`, bold: (text: string) => text };
+	const render = (details: unknown) => tool.renderResult({ ...update, details }, { expanded: false, isPartial: true }, tagged).render(200).join("\n");
+	const panel = render(update.details);
+	assert.match(panel, /\{warning\|Waiting for: Manager decision on source's question\}/u, "a question for the Manager is colored as a warning");
+	assert.match(panel, /held · asks: "Which fixture should I use\?" · queued for Manager/u);
+	assert.match(panel, /waiting on source \(held work /u);
+	assert.ok(render({ ...update.details, waitingFor: "Manager decisions on 3 questions" }).includes("{warning|Waiting for: Manager decisions on 3 questions}"));
+	for (const text of ["Manager review of 2 results", "Manager to close the Team", "source, writer (running) · review (waiting on source)"]) {
+		assert.ok(render({ ...update.details, waitingFor: text }).includes(`{dim|Waiting for: ${text}}`), `${text} is not a warning`);
+	}
+	const { waitingFor: _omitted, ...withoutReason } = update.details;
+	assert.doesNotMatch(render(withoutReason), /Waiting for:/u, "no reason, no line");
+
+	resolveLifetime(terminal(teamId));
+	await pending;
+});
+
+test("launch panel keeps the generic wait text while every dependency is terminal but its native cleanup is pending", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", sourceWriterArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	let resolveLifetime!: (result: TeamResult) => void;
+	const lifetime = new Promise<TeamResult>((resolve) => { resolveLifetime = resolve; });
+	host.driver.openAndLaunch = async () => { host.runtime.launch(teamId); return { lifetime }; };
+	const updates: any[] = [];
+	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context());
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	endActivation(host, activate(host, teamId), { action: "yield" });
+	const source = activate(host, teamId);
+	const writer = activate(host, teamId);
+	endActivation(host, writer, { action: "yield", waitingFor: [source.scope.work], checkpoint: "needs the source" });
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	const detail = (alias: string): string => updates.at(-1).details.members.find((member: any) => member.alias === alias).detail;
+	assert.equal(detail("writer"), `waiting on source (running ${shortWorkRef(source.scope.work!)})`);
+
+	host.runtime.hostControl(teamId).message_manager("Drop the source work.");
+	const manager = activate(host, teamId);
+	assert.equal(manager.scope.kind, "management");
+	const cancel = { action: "control", command: "cancel_work", workId: source.scope.work!.workId, expectedRevision: 1, reason: "Not needed." };
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "cancel-source", cancel, "cancel-source").ok, true);
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	assert.equal(detail("writer"), "waiting on other work", "source is cancelled, so it is no longer something to wait on");
+	assert.equal(detail("source"), `running ${shortWorkRef(source.scope.work!)}`, "until its activation confirms cleanup");
+
+	host.runtime.nativeSettled(source.binding, source.scope.activationId, { status: "aborted" });
+	host.runtime.cleanupFinished(source.binding, source.scope.activationId, { ok: true });
+	endActivation(host, manager, { action: "yield" }, 2);
+	resolveLifetime(terminal(teamId));
+	await pending;
 });
 
 test("launch panel reuses grouped subagent panels per member, live and after the Team ends", async () => {

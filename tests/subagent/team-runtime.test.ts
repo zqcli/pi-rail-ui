@@ -4,17 +4,21 @@ import {
 	TeamProtocolError, encodeActivationInput, jsonBytes, normalizeTeamAction, normalizeTeamPlan, parseChildFrame, parseParentCommand, parseTeamReply,
 } from "../../tools/subagents/team-codec";
 import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-runtime";
-import { TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_FRAME_BYTES, TEAM_MAX_RESULT_BYTES, type WorkRef } from "../../tools/subagents/team-protocol";
+import {
+	TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_FRAME_BYTES, TEAM_MAX_RESULT_BYTES, shortWorkRef, type TeamBudgetLimits, type WorkRef,
+} from "../../tools/subagents/team-protocol";
 
-function makeRuntime(initialRequests: Array<{ to: string; task: string }> = [{ to: "w1", task: "root work" }]) {
+function makeRuntime(initialRequests: Array<{ to: string; task: string }> = [{ to: "w1", task: "root work" }],
+	{ extraWorkers = [], limits = {} }: { extraWorkers?: string[]; limits?: Partial<TeamBudgetLimits> } = {}) {
 	let ids = 0;
 	let time = 1_700_000_000_000;
-	const runtime = new TeamRuntime({ now: () => time++, createId: () => `id${++ids}` });
+	const runtime = new TeamRuntime({ now: () => time++, createId: () => `id${++ids}`, limits });
 	const prepared = runtime.prepare({
 		manager: { alias: "lead", roleDescription: "Manage work, review roots and close the Team." },
 		workers: [
 			{ alias: "w1", roleDescription: "Perform assigned work." },
 			{ alias: "w2", roleDescription: "Perform dependent work." },
+			...extraWorkers.map((alias) => ({ alias, roleDescription: "Perform assigned work." })),
 		],
 		brief: { goal: "Complete the test work." },
 		initialRequests,
@@ -235,6 +239,162 @@ function finishIdle(runtime: TeamRuntime, activation: RuntimeActivation): void {
 	assert.equal(action(runtime, activation, 1, `idle-${activation.scope.activationId}`, { action: "yield" }).ok, true);
 	settle(runtime, activation, `idle-${activation.scope.activationId}`);
 }
+
+/** Acknowledge the input, stage a yield (the first action of the activation) and settle it. */
+function yieldWork(runtime: TeamRuntime, activation: RuntimeActivation, callId: string, args: Record<string, unknown>): void {
+	inputReady(runtime, activation);
+	assert.equal(action(runtime, activation, 1, callId, { action: "yield", ...args }).ok, true);
+	settle(runtime, activation, callId);
+}
+
+function request(runtime: TeamRuntime, activation: RuntimeActivation, sequence: number, to: string, task: string): WorkRef {
+	const requested = action(runtime, activation, sequence, `request-${to}`, { action: "request", to, task });
+	const ref = requested.ok && requested.receipt?.status === "accepted" ? requested.receipt.work : undefined;
+	assert.ok(ref);
+	return ref;
+}
+
+test("panel facts name who a blocked member waits on: a peer with its state, at most three names, and the timeline says who", () => {
+	{
+		const { runtime, teamId } = makeRuntime([{ to: "w1", task: "needs w2" }, { to: "w2", task: "conclude" }]);
+		finishManagerBoot(runtime, teamId);
+		const waiter = runtime.takeNextActivation(teamId)!;
+		const producer = runtime.takeNextActivation(teamId)!;
+		yieldWork(runtime, waiter, "w1-wait", { waitingFor: [workRef(producer)], checkpoint: "waiting for w2" });
+		const facts = runtime.panelFacts(teamId);
+		assert.equal(facts.stalled.get("w1"), `waiting on w2 (running ${shortWorkRef(workRef(producer))})`, "one peer: its alias, state and short ref");
+		assert.equal(facts.stalled.has("w2"), false, "a running member is not stalled");
+		assert.equal(facts.waitingFor, "w2 (running) · w1 (waiting on w2)");
+		assert.ok(facts.timeline.some((entry) => entry.text === `w1 ended ${shortWorkRef(workRef(waiter))} (waiting on w2)`),
+			"the timeline names the assignee a yielded work waits on");
+		reply(runtime, producer, "w2-reply", "w2 conclusion");
+		assert.equal(runtime.panelFacts(teamId).stalled.has("w1"), false, "once w2 has answered, w1 is queued and no longer waits");
+	}
+	{
+		const { runtime, teamId } = makeRuntime(["w1", "w2", "w3", "w4", "w5"].map((to) => ({ to, task: `root of ${to}` })), { extraWorkers: ["w3", "w4", "w5"] });
+		finishManagerBoot(runtime, teamId);
+		const hub = runtime.takeNextActivation(teamId)!;
+		const peers = runtime.listWorks(teamId).filter((work) => work.assignee !== "w1").map((work) => work.work);
+		yieldWork(runtime, hub, "hub-wait", { waitingFor: peers, checkpoint: "waiting for everyone" });
+		const facts = runtime.panelFacts(teamId);
+		assert.equal(facts.stalled.get("w1"), "waiting on w2 (queued), w3 (queued), w4 (queued) +1 more", "peers in creation order, three named");
+		assert.equal(facts.waitingFor, "w1 (waiting on w2, w3, w4 +1 more)");
+		// The timeline names the yielded assignees in the codec's canonical order, so only its shape is asserted.
+		assert.ok(facts.timeline.some((entry) => /^w1 ended \S+ \S+ \(waiting on w\d, w\d, w\d \+1 more\)$/u.test(entry.text)));
+	}
+});
+
+test("panel facts: a parent lists its unresolved sub-tasks, and a question shows what it asks and where the Manager stands", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "parent" }], { extraWorkers: ["w3"] });
+	finishManagerBoot(runtime, teamId);
+	const parent = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, parent);
+	const children = [request(runtime, parent, 1, "w2", "part for w2"), request(runtime, parent, 2, "w3", "part for w3")];
+	assert.equal(action(runtime, parent, 3, "parent-wait", { action: "yield", waitingFor: children, checkpoint: "collect both parts" }).ok, true);
+	settle(runtime, parent, "parent-wait");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "waiting on 2 sub-tasks: w2 (queued), w3 (queued)");
+
+	const first = runtime.takeNextActivation(teamId)!;
+	const second = runtime.takeNextActivation(teamId)!;
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "waiting on 2 sub-tasks: w2 (running), w3 (running)");
+	yieldWork(runtime, second, "w3-asks", { attention: "Which branch\nshould I diff?", checkpoint: "stopped before diffing" });
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "waiting on 2 sub-tasks: w2 (running), w3 (held)");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · queued for Manager',
+		"a question nobody has picked up yet is queued for the Manager, on one line");
+
+	const manager = runtime.takeNextActivation(teamId)!;
+	assert.equal(manager.scope.kind, "management");
+	inputReady(runtime, manager);
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · Manager handling',
+		"the Manager's current activation holds the WORK_HELD event");
+	yieldWork(runtime, first, "w2-asks", { attention: "Need credentials for the staging cluster. ".repeat(6), checkpoint: "stopped before deploying" });
+	const long = runtime.panelFacts(teamId).stalled.get("w2")!;
+	assert.match(long, /^held · asks: "Need credentials for the staging cluster\. .*…" · queued for Manager$/u);
+	assert.ok(long.length < 130, "a long question is cut to about 80 characters");
+
+	assert.equal(action(runtime, manager, 1, "manager-yield", { action: "yield" }).ok, true);
+	settle(runtime, manager, "manager-yield");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?"',
+		"a question the Manager has already seen and left open is not called queued");
+	assert.match(runtime.panelFacts(teamId).stalled.get("w2")!, / · queued for Manager$/u, "an event outside that batch is still queued");
+});
+
+test("panel facts: budget, protocol and Manager-unavailable holds say why they are held", () => {
+	{
+		const { runtime, teamId } = makeRuntime(undefined, { limits: { teamActivations: 1 } });
+		inputReady(runtime, runtime.takeNextActivation(teamId)!);
+		assert.equal(runtime.takeNextActivation(teamId), undefined, "the Manager consumed the only activation, so w1's root is budget-held");
+		assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "held · budget teamActivations exhausted");
+	}
+	{
+		const { runtime, teamId } = makeRuntime(undefined, { limits: { activationModelRequests: 1 } });
+		finishManagerBoot(runtime, teamId);
+		const worker = runtime.takeNextActivation(teamId)!;
+		inputReady(runtime, worker);
+		assert.deepEqual(runtime.gate(worker.binding, worker.scope, "provider_gate"), { allow: true });
+		assert.equal(runtime.gate(worker.binding, worker.scope, "provider_gate").allow, false);
+		runtime.nativeSettled(worker.binding, worker.scope.activationId, { status: "aborted" });
+		runtime.cleanupFinished(worker.binding, worker.scope.activationId, { ok: true });
+		assert.equal(runtime.getWork(teamId, workRef(worker))?.current.hold?.reason, "budget");
+		assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "held · budget exhausted", "a per-activation limit has no Team or root counter to name");
+	}
+	{
+		const { runtime, teamId } = makeRuntime();
+		finishManagerBoot(runtime, teamId);
+		const worker = runtime.takeNextActivation(teamId)!;
+		inputReady(runtime, worker);
+		settle(runtime, worker);
+		assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "held · protocol: Native work ended without a valid reply or yield");
+	}
+});
+
+test("panel facts: an active Team waits for questions, then Manager review, then its close, else for whoever is working", () => {
+	{
+		const { runtime, teamId } = makeRuntime([{ to: "w1", task: "first root" }, { to: "w2", task: "second root" }]);
+		assert.equal(runtime.panelFacts(teamId).waitingFor, undefined, "nothing is running yet");
+		const boot = runtime.takeNextActivation(teamId)!;
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "lead (running)");
+		inputReady(runtime, boot);
+		assert.equal(action(runtime, boot, 1, "boot-yield", { action: "yield" }).ok, true);
+		settle(runtime, boot, "boot-yield");
+		const first = runtime.takeNextActivation(teamId)!;
+		const second = runtime.takeNextActivation(teamId)!;
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "w1, w2 (running)");
+		reply(runtime, first, "first-reply", "first done");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "w2 (running)", "a root is still open, so no review is due yet");
+		reply(runtime, second, "second-reply", "second done");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager review of 2 results");
+
+		const manager = runtime.takeNextActivation(teamId)!;
+		inputReady(runtime, manager);
+		const accept = (activation: RuntimeActivation, sequence: number) => assert.equal(action(runtime, manager, sequence, `accept-${sequence}`,
+			{ action: "control", command: "accept_result", work: workRef(activation), disposition: "accepted", reason: "ok" }).ok, true);
+		accept(first, 1);
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager review of 1 result");
+		accept(second, 2);
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager to close the Team");
+		const resultRefs = [first, second].map((activation) => runtime.getWork(teamId, workRef(activation))!.current.resultRef!);
+		assert.equal(action(runtime, manager, 3, "close", { action: "control", command: "close_team", resultRefs, outcome: "succeeded" }).ok, true);
+		assert.equal(runtime.getTeam(teamId).lifecycle, "closing");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, undefined, "a Team that is closing is not waiting for anything");
+	}
+	{
+		const { runtime, teamId } = makeRuntime(["w1", "w2", "w3"].map((to) => ({ to, task: `root of ${to}` })), { extraWorkers: ["w3"] });
+		finishManagerBoot(runtime, teamId);
+		const askers = [runtime.takeNextActivation(teamId)!, runtime.takeNextActivation(teamId)!, runtime.takeNextActivation(teamId)!];
+		yieldWork(runtime, askers[0]!, "ask-1", { attention: "scope?", checkpoint: "stopped" });
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager decision on w1's question");
+		yieldWork(runtime, askers[1]!, "ask-2", { attention: "gate?", checkpoint: "stopped" });
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager decisions on w1's and w2's questions");
+		yieldWork(runtime, askers[2]!, "ask-3", { attention: "budget?", checkpoint: "stopped" });
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager decisions on 3 questions");
+	}
+	{
+		const { runtime, teamId } = makeRuntime([]);
+		finishIdle(runtime, runtime.takeNextActivation(teamId)!);
+		assert.equal(runtime.panelFacts(teamId).waitingFor, undefined, "a Team without roots has nothing to review or close yet");
+	}
+});
 
 test("P: prepare rejects initial per-member overflow before reserving a Team or changing live state", () => {
 	let ids = 0;
@@ -1042,6 +1202,7 @@ test("W: cancelled dependency is not deliverable until the old activation cleanu
 	}).ok, true);
 	assert.equal(runtime.getWork(teamId, childRef)?.current.state, "cancelled");
 	assert.equal(runtime.takeNextActivation(teamId), undefined, "dependent parent remains blocked while native cleanup is unknown");
+	assert.equal(runtime.panelFacts(teamId).stalled.has("w1"), false, "the cancelled dependency is terminal, so the panel has no one to name for the blocked parent");
 	runtime.nativeSettled(child.binding, child.scope.activationId, { status: "aborted" });
 	runtime.cleanupFinished(child.binding, child.scope.activationId, { ok: true });
 	const resumed = runtime.takeNextActivation(teamId)!;
@@ -1380,6 +1541,7 @@ test("C04/G10: hold release rejects manager_unavailable and any release while th
 	assert.equal(team.members.find((member) => member.id === "w2")?.pause, "requested", "the running worker is safety-paused, not aborted");
 	const managerHold = runtime.getWork(teamId, managerWork)!.current.hold;
 	assert.equal(managerHold?.reason, "manager_unavailable");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("lead"), "held · Manager unavailable");
 	const before = businessSnapshot(runtime, teamId, [heldRef, managerWork]);
 	const host = runtime.hostControl(teamId);
 	hostError(() => host.release_hold(managerWork, managerHold!.incidentId, "continue without a Manager"), "MEMBER_UNAVAILABLE");

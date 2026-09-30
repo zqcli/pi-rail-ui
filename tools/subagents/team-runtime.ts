@@ -146,6 +146,16 @@ interface EventBatch {
 	eventIds: string[];
 }
 
+/** A work that a blocked version still waits on, as the host panel names it. */
+interface WaitedWork {
+	work: WorkRef;
+	assignee: string;
+	/** The work state, or "held" when a hold is what keeps it from finishing. */
+	state: string;
+	/** One of the waiting version's own children rather than a peer's work. */
+	child: boolean;
+}
+
 interface ActiveActivation {
 	scope: ActivationScope;
 	deliveryId: string;
@@ -249,6 +259,19 @@ interface TeamState {
 const copy = <T>(value: T): T => structuredClone(value);
 const currentVersion = (record: WorkRecord): WorkVersion => record.versions[record.currentRevision - 1]!;
 const TERMINAL_TEAM_LIFECYCLES: readonly TeamLifecycle[] = ["closed", "failed", "cancelled", "interrupted"];
+const plural = (count: number): string => count === 1 ? "" : "s";
+/** At most `cap` items, then "+N more". */
+const capped = (items: readonly string[], cap: number, separator = ", "): string =>
+	items.slice(0, cap).join(separator) + (items.length > cap ? ` +${items.length - cap} more` : "");
+
+/** Panel phrase for what a member waits on; one dependency also shows its ref. */
+function waitingOnText(waits: readonly WaitedWork[]): string {
+	const named = waits.map((wait) => `${wait.assignee} (${wait.state}${waits.length === 1 ? ` ${shortWorkRef(wait.work)}` : ""})`);
+	return waits.every((wait) => wait.child)
+		? `waiting on ${waits.length} sub-task${plural(waits.length)}: ${capped(named, 3)}`
+		: `waiting on ${capped(named, 3)}`;
+}
+
 function fail(code: TeamErrorCode, message: string, blockers?: TeamProtocolError["blockers"]): never {
 	throw new TeamProtocolError(code, message, blockers);
 }
@@ -1575,10 +1598,14 @@ export class TeamRuntime {
 		return result ? copy(result) : undefined;
 	}
 
-	/** Host panel facts outside the member-facing view: waiting Manager events, each author's results, the milestone timeline. */
+	/** Host panel facts outside the member-facing view: waiting Manager events, each author's results, why work is stalled, the milestone timeline. */
 	panelFacts(teamId: string): {
 		pendingManagerEvents: number;
 		results: Map<string, { count: number; latest: ResultRecord }>;
+		/** Per member with blocked or held work: what it waits on, or why it is held. */
+		stalled: Map<string, string>;
+		/** Active Team only: the one reason most worth showing for why it has not finished. */
+		waitingFor?: string;
 		timeline: Array<{ at: number; text: string }>;
 		timelineOmitted: number;
 	} {
@@ -1592,7 +1619,80 @@ export class TeamRuntime {
 		// After close, leftover notices (for example MEMBER_CLOSED) are no longer work for the Manager.
 		const pendingManagerEvents = team.lifecycle === "active"
 			? team.events.filter((event) => !event.processed && event.batchId === undefined).length : 0;
-		return { pendingManagerEvents, results, timeline: copy(team.timeline), timelineOmitted: team.timelineOmitted };
+		const waits = this.memberWaits(team);
+		const holds = this.listHolds(teamId);
+		const stalled = new Map([...waits].map(([member, waited]) => [member, waitingOnText(waited)] as const));
+		const managerBatch = team.members.get(team.manager)!.active?.scope.eventBatchId;
+		const described = new Set<string>();
+		for (const hold of holds) {
+			// A hold outranks a wait, and a member's oldest hold speaks for it.
+			if (described.has(hold.assignee)) continue;
+			described.add(hold.assignee);
+			stalled.set(hold.assignee, this.holdText(team, hold, managerBatch));
+		}
+		const waitingFor = team.lifecycle === "active" ? this.teamWaitingFor(team, holds, waits) : undefined;
+		return { pendingManagerEvents, results, stalled, ...(waitingFor ? { waitingFor } : {}), timeline: copy(team.timeline), timelineOmitted: team.timelineOmitted };
+	}
+
+	/** Per member, the unresolved works its blocked, un-held versions wait on: their waitingFor and owned children, once each. */
+	private memberWaits(team: TeamState): Map<string, WaitedWork[]> {
+		const waits = new Map<string, Map<string, WaitedWork>>();
+		for (const id of team.ledger.order) {
+			const assignee = team.ledger.get(id)!.record.assignee;
+			const ref = team.ledger.currentRef(id)!;
+			const version = team.ledger.version(ref)!;
+			if (version.state !== "blocked" || version.hold) continue;
+			const children = team.ledger.ownedChildren(ref);
+			for (const work of [...version.waitingFor, ...children]) {
+				const waited = team.ledger.version(work)!;
+				if (isTerminalWorkState(waited.state)) continue;
+				const found = waits.get(assignee) ?? new Map<string, WaitedWork>();
+				found.set(workRefKey(work), { work, assignee: team.ledger.get(work.workId)!.record.assignee,
+					state: waited.hold ? "held" : waited.state, child: children.some((child) => sameWorkRef(child, work)) });
+				waits.set(assignee, found);
+			}
+		}
+		// waitingFor is canonicalized by WorkRef; name the waited works in creation order instead.
+		const created = (wait: WaitedWork) => team.ledger.order.indexOf(wait.work.workId);
+		return new Map([...waits].map(([member, found]) => [member, [...found.values()].sort((left, right) => created(left) - created(right))]));
+	}
+
+	/** Panel text for one hold; for a question it also says whether the Manager is on it, has it queued, or has already seen it. */
+	private holdText(team: TeamState, hold: HostHoldView, managerBatch: string | undefined): string {
+		switch (hold.reason) {
+			case "attention": {
+				const event = team.events.find((item) => item.incidentId === hold.incidentId)!;
+				const manager = event.batchId !== undefined && event.batchId === managerBatch ? " · Manager handling"
+					: event.processed ? "" : " · queued for Manager";
+				return `held · asks: "${previewText(hold.message, 80)}"${manager}`;
+			}
+			case "budget": {
+				const exhausted = team.budget.exhausted(hold.rootId, hold.assignee === team.manager);
+				return `held · budget ${exhausted ? `${exhausted.counter} ` : ""}exhausted`;
+			}
+			case "protocol": return `held · protocol: ${previewText(hold.message, 80)}`;
+			case "manager_unavailable": return "held · Manager unavailable";
+		}
+	}
+
+	/** The single most relevant reason an active Team has not finished, by priority. */
+	private teamWaitingFor(team: TeamState, holds: readonly HostHoldView[], waits: ReadonlyMap<string, WaitedWork[]>): string | undefined {
+		const questions = holds.filter((hold) => hold.reason === "attention").map((hold) => hold.assignee);
+		if (questions.length) {
+			const askers = [...new Set(questions)];
+			const who = questions.length <= 2 && askers.length === questions.length ? askers.map((asker) => `${asker}'s`).join(" and ") : questions.length;
+			return `Manager decision${plural(questions.length)} on ${who} question${plural(questions.length)}`;
+		}
+		// A Team without roots has nothing to review or close yet.
+		const { roots, blockers } = this.rootObligations(team);
+		if (roots.length && !blockers.some((blocker) => blocker.kind === "root_work")) {
+			const unreviewed = blockers.filter((blocker) => blocker.kind === "root_review").length;
+			return unreviewed ? `Manager review of ${unreviewed} result${plural(unreviewed)}` : "Manager to close the Team";
+		}
+		const running = [...team.members.values()].filter((member) => member.activity !== "idle").map((member) => member.id);
+		const waiting = [...waits].filter(([member]) => team.members.get(member)!.activity === "idle")
+			.map(([member, waited]) => `${member} (waiting on ${capped([...new Set(waited.map((wait) => wait.assignee))], 3)})`);
+		return [...(running.length ? [`${capped(running, 4)} (running)`] : []), ...(waiting.length ? [capped(waiting, 4, " · ")] : [])].join(" · ") || undefined;
 	}
 
 	listResultRefsPage(teamId: string, cursor?: string, limit = TEAM_STATUS_DEFAULT_LIMIT): {
@@ -2016,8 +2116,8 @@ export class TeamRuntime {
 		return okReply(manager.id, { receipt: { status: "closing", command: "close_member", memberId, closeId } });
 	}
 
-	private closeTeam(team: TeamState, manager: RuntimeMember, active: ActiveActivation, resultRefs: string[], outcome: "succeeded" | "partial" | "failed", reason: string | undefined, toolCallId: string): TeamReply {
-		if (manager.id !== team.manager || active.scope.kind !== "management") fail("FORBIDDEN_ACTION", "close_team requires the Manager's management activation");
+	/** The roots and what each still owes before close_team: to be terminal, then to be reviewed. */
+	private rootObligations(team: TeamState): { roots: WorkRecord[]; blockers: Array<{ kind: string; id?: string; reason: string }> } {
 		const blockers: Array<{ kind: string; id?: string; reason: string }> = [];
 		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
 		for (const root of roots) {
@@ -2026,6 +2126,12 @@ export class TeamRuntime {
 			if (!version.review) blockers.push({ kind: "root_review", id: workRefKey({ workId: root.id, revision: root.currentRevision }),
 				reason: "root has not been reviewed: accept_result it (accepted, or waived with a reason)" });
 		}
+		return { roots, blockers };
+	}
+
+	private closeTeam(team: TeamState, manager: RuntimeMember, active: ActiveActivation, resultRefs: string[], outcome: "succeeded" | "partial" | "failed", reason: string | undefined, toolCallId: string): TeamReply {
+		if (manager.id !== team.manager || active.scope.kind !== "management") fail("FORBIDDEN_ACTION", "close_team requires the Manager's management activation");
+		const { roots, blockers } = this.rootObligations(team);
 		for (const id of team.ledger.order) {
 			const record = team.ledger.get(id)!.record;
 			const version = currentVersion(record);
@@ -2283,7 +2389,11 @@ export class TeamRuntime {
 		else this.finishWork(team, member, active);
 		// A committed reply already has its own result milestone.
 		if (!(active.intent?.kind === "reply" && team.ledger.version(scope.work!)?.resultRef)) {
-			this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "management activation"}${active.intent ? ` (${active.intent.kind.replaceAll("_", " ")})` : ""}`);
+			const intent = active.intent;
+			const ending = intent?.kind === "yield_dependencies"
+				? `waiting on ${capped([...new Set(intent.waitingFor.map((ref) => team.ledger.get(ref.workId)!.record.assignee))], 3)}`
+				: intent?.kind.replaceAll("_", " ");
+			this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "management activation"}${ending ? ` (${ending})` : ""}`);
 		}
 		if (member.active === active) delete member.active;
 		delete member.currentWork;

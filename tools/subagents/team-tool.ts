@@ -79,6 +79,8 @@ export interface TeamToolDetails {
 	resultRecord?: ResultRecord;
 	resultPage?: TeamResultRefPage;
 	holdsTotal?: number;
+	/** launch: why the active Team has not finished yet (the header's `Waiting for:` line). */
+	waitingFor?: string;
 	/** launch: one grouped-subagent panel per member (bounded transcripts), and the launch wall time. */
 	members?: SubagentTranscriptRun[];
 	durationMs?: number;
@@ -123,12 +125,12 @@ export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSumma
 		return `${member.id.padEnd(width)} ${member.role === "manager" ? "manager" : "worker "} · ${memberStateText(member, works, facts)} · ${policy}`;
 	});
 	const usage = view.usage;
-	return [...teamLines(view, works, totalHolds, members),
+	return [...teamLines(view, works, totalHolds, members, facts?.waitingFor),
 		`Usage: ${usage.turns} turns · input ${usage.input} · output ${usage.output} · cache ${usage.cacheRead}/${usage.cacheWrite} · cost ${usage.cost.toFixed(4)}`];
 }
 
 /** Team-level lines; the launch panel passes no member lines because each member has its own panel. */
-function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalHolds: number, memberLines: readonly string[]): string[] {
+function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalHolds: number, memberLines: readonly string[], waitingFor?: string): string[] {
 	const openIncidents = view.incidents.filter((incident) => incident.state === "open");
 	const health = view.health === "needs_attention" ? `needs attention ${openIncidents.length}` : "ok";
 	const lines = [
@@ -138,6 +140,7 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 	if (view.reason) lines.push(`Reason: ${previewText(view.reason, 400)}`);
 	const w = view.works;
 	lines.push(`Works: ${w.total} total · queued ${w.queued} · running ${w.running} · blocked ${w.blocked} · held ${w.held} · resolved ${w.resolved} · failed ${w.failed} · cancelled/superseded ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`);
+	if (waitingFor) lines.push(`Waiting for: ${waitingFor}`);
 	lines.push(...memberLines);
 	const holds = works.filter((work) => work.hold);
 	if (holds.length) {
@@ -158,9 +161,8 @@ function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts
 	const resultText = results ? `${results} ${results === 1 ? "result" : "results"}` : "";
 	if (member.lifecycle === "closed") return ["closed", resultText].filter(Boolean).join(" · ");
 	const now = member.currentWork ? `running ${shortWorkRef(member.currentWork)}`
-		: member.held ? "held · needs a Manager decision"
-			: member.blocked ? "waiting on other work"
-				: member.queued ? "queued for a worker slot" : "no assigned work";
+		: member.held || member.blocked ? facts.stalled.get(member.id) ?? "waiting on other work"
+			: member.queued ? "queued for a worker slot" : "no assigned work";
 	return [
 		member.lifecycle === "open" ? "" : member.lifecycle,
 		now,
@@ -176,10 +178,9 @@ function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts
  * One grouped-subagent run per member: its Team state, the task it is (or was last) working on, its
  * latest submitted result, native activity across activations, and settled plus in-flight usage.
  */
-function memberRuns(host: TeamSessionHost, teamId: string): SubagentTranscriptRun[] {
+function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): SubagentTranscriptRun[] {
 	const view = host.runtime.getTeam(teamId);
 	const works = host.runtime.listWorks(teamId);
-	const facts = host.runtime.panelFacts(teamId);
 	return boundSubagentRunTranscripts(view.members.map((member, slot): SubagentTranscriptRun => {
 		const activity = host.driver.memberActivity(teamId, member.id);
 		const usage = { ...member.usage };
@@ -407,7 +408,10 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		let finished = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const startedAt = Date.now();
-		const panel = (): TeamToolDetails => ({ ...liveView(host, teamId), members: memberRuns(host, teamId), durationMs: Date.now() - startedAt });
+		const panel = (): TeamToolDetails => {
+			const facts = host.runtime.panelFacts(teamId);
+			return { ...liveView(host, teamId), members: memberRuns(host, teamId, facts), ...(facts.waitingFor ? { waitingFor: facts.waitingFor } : {}), durationMs: Date.now() - startedAt };
+		};
 		const publish = () => {
 			timer = undefined;
 			// No update after the call settled, or from a generation whose branch has ended.
@@ -580,14 +584,14 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 				// launch: Team-level state, then the same grouped panels as a grouped subagent call. Problems
 				// are colored; collapsed, the goal and reason keep one row each.
 				const view = details.view;
-				const [title, ...rest] = teamLines(view, details.works ?? [], details.holdsTotal ?? 0, []);
+				const [title, ...rest] = teamLines(view, details.works ?? [], details.holdsTotal ?? 0, [], details.waitingFor);
 				const titleColor = view.lifecycle === "failed" || view.outcome === "failed" ? "error"
 					: view.health === "needs_attention" || view.outcome === "partial" || view.lifecycle === "cancelled" || view.lifecycle === "interrupted" ? "warning"
 						: view.outcome === "succeeded" ? "success" : "accent";
 				const panel = new Container();
 				panel.addChild(new TruncatedText(theme.fg(titleColor, theme.bold(title!)), 0, 0));
 				for (const line of rest) {
-					const color = /^Budget EXHAUSTED/u.test(line) ? "error" : /^(Holds|Incident|\+\d+ more open incidents)/u.test(line) ? "warning" : "dim";
+					const color = /^Budget EXHAUSTED/u.test(line) ? "error" : /^(Holds|Incident|\+\d+ more open incidents|Waiting for: Manager decisions? on )/u.test(line) ? "warning" : "dim";
 					const styled = theme.fg(color, line);
 					panel.addChild(!expanded && /^(Goal|Reason):/u.test(line) ? new TruncatedText(styled, 0, 0) : new Text(styled, 0, 0));
 				}

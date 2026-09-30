@@ -9,9 +9,9 @@ import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
 	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
-	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, shortWorkRef,
+	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, shortWorkRef,
 } from "./team-protocol";
-import type { TeamRuntime } from "./team-runtime";
+import { capped, type TeamRuntime } from "./team-runtime";
 import {
 	formatContextWindowForDisplay, markdownThemeFromTheme, resolveTeamMemberPolicy, verifyPinnedTeamMemberPolicy,
 	type ResolvedTeamMemberPolicy,
@@ -155,14 +155,24 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 	return lines;
 }
 
+/** What the Manager has handed out that is still open: unfinished work, or a finished root awaiting its review. */
+function dispatchedText(manager: string, works: readonly TeamWorkSummary[]): string | undefined {
+	const open = works.flatMap((work) => work.requester !== manager ? []
+		: !isTerminalWorkState(work.state) ? [`${work.assignee} (${work.hold ? "held" : work.state === "blocked" ? "waiting" : work.state})`]
+			: !work.parent && !work.review ? [`${work.assignee} (awaiting review)`] : []);
+	return open.length ? `dispatched: ${capped(open, 3)}` : undefined;
+}
+
 /** A member's panel state line: plain words, only the facts that matter now. */
-function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts): string {
+function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts, works: readonly TeamWorkSummary[]): string {
 	const results = facts.results.get(member.id)?.count ?? 0;
 	const resultText = results ? `${results} ${results === 1 ? "result" : "results"}` : "";
 	if (member.lifecycle === "closed") return ["closed", resultText].filter(Boolean).join(" · ");
 	const now = member.currentWork ? `running ${shortWorkRef(member.currentWork)}`
-		: member.held || member.blocked ? facts.stalled.get(member.id) ?? "waiting on other work"
-			: member.queued ? "queued for a worker slot" : "no assigned work";
+		: member.role === "manager" && facts.managerHandling ? facts.managerHandling
+			: member.held || member.blocked ? facts.stalled.get(member.id) ?? "waiting on other work"
+				: member.queued ? "queued for a worker slot"
+					: (member.role === "manager" ? dispatchedText(member.id, works) : undefined) ?? "no assigned work";
 	return [
 		member.lifecycle === "open" ? "" : member.lifecycle,
 		now,
@@ -174,9 +184,23 @@ function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts
 	].filter(Boolean).join(" · ");
 }
 
+/** Title of a member's task line: who asked, which work and revision, and whether it is still open. */
+function taskLabel(work: TeamWorkSummary, manager: string): string {
+	return `${isTerminalWorkState(work.state) ? "last task" : "task"} from ${work.requester}${work.requester === manager ? "" : " (sub-task)"}`
+		+ ` · ${shortWorkRef(work.work)}${work.work.revision > 1 ? " · revised" : ""}`;
+}
+
+/** One line saying where a committed result went; a root's result also says whether the Manager has reviewed it. */
+function resultTarget(record: ResultRecord, works: readonly TeamWorkSummary[]): string {
+	const work = works.find((item) => item.work.workId === record.work.workId)!;
+	const fate = work.work.revision !== record.work.revision ? "superseded" : work.parent ? "" : work.review ?? "awaiting review";
+	return `result → ${work.requester}${fate ? ` · ${fate}` : ""}`;
+}
+
 /**
- * One grouped-subagent run per member: its Team state, the task it is (or was last) working on, its
- * latest submitted result, native activity across activations, and settled plus in-flight usage.
+ * One grouped-subagent run per member: its Team state, the task it is (or was last) working on and who
+ * asked for it, its latest submitted result and where it went, native activity across activations, and
+ * settled plus in-flight usage.
  */
 function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): SubagentTranscriptRun[] {
 	const view = host.runtime.getTeam(teamId);
@@ -188,8 +212,9 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 		const latest = facts.results.get(member.id)?.latest;
 		const currentKey = member.currentWork ? workRefKey(member.currentWork) : undefined;
 		// The Manager's task is the Team goal, already in the Team header.
+		const assigned = works.filter((work) => work.assignee === member.id);
 		const task = member.role === "manager" ? undefined
-			: (works.find((work) => workRefKey(work.work) === currentKey) ?? works.findLast((work) => work.assignee === member.id))?.taskPreview;
+			: assigned.find((work) => workRefKey(work.work) === currentKey) ?? assigned.find((work) => !isTerminalWorkState(work.state)) ?? assigned.at(-1);
 		const entries = activity?.transcript.entries ?? [];
 		return {
 			slot, alias: member.id, role: member.role, model: member.policy.model ?? "model unavailable", persistent: true,
@@ -197,15 +222,15 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 				: member.activity !== "idle" || member.lifecycle === "starting" || member.lifecycle === "closing" ? "running"
 					: member.held ? "held" : member.blocked || member.queued ? "waiting" : "idle",
 			// Like a grouped subagent's final answer: the member's latest result in full, or the Manager's close decision.
-			output: latest ? truncateText(formatWorkResult(latest.result), MAX_MEMBER_OUTPUT_BYTES).text
+			output: latest ? `${resultTarget(latest, works)}\n${truncateText(formatWorkResult(latest.result), MAX_MEMBER_OUTPUT_BYTES).text}`
 				: member.role === "manager" && view.outcome ? view.reason ?? `outcome ${view.outcome}`
 					: activity?.output ?? "",
 			usage, ...(activity ? { durationMs: activity.durationMs } : {}),
 			contextWindowText: formatContextWindowForDisplay(member.policy.contextWindow),
 			fastModeText: member.policy.fastMode ? "on" : "off", searchModeText: member.policy.searchMode === "on" ? "on" : "off",
-			detail: memberDetail(member, facts),
+			detail: memberDetail(member, facts, works),
 			transcript: {
-				entries: task ? [{ id: "initial-task", kind: "user", initial: true, text: task, order: 0 }, ...entries] : entries,
+				entries: task ? [{ id: "initial-task", kind: "user", initial: true, label: taskLabel(task, view.manager), text: task.taskPreview, order: 0 }, ...entries] : entries,
 				omittedEntries: activity?.transcript.omittedEntries ?? 0,
 			},
 			...(activity?.isCompacting ? { isCompacting: true } : {}),

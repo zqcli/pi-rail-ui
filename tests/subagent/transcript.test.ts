@@ -1169,3 +1169,34 @@ test("grouped aggregate usage sums hosted search counts while child panels stay 
 		assert.ok(lines.every((line) => visibleWidth(line) <= width), `grouped search usage exceeded width ${width}`);
 	}
 });
+
+test("a Team task entry titles itself, ordinary panels keep 'initial task', and a note is one dim separator line", () => {
+	const tagged = { fg: (color: string, text: string) => `{${color}|${text}}`, bold: (text: string) => text };
+	const team: SubagentTranscriptRun = {
+		alias: "writer", role: "worker", model: "provider/gpt", status: "running", output: "", persistent: true,
+		transcript: { omittedEntries: 12, entries: [
+			{ id: "initial-task", kind: "user", initial: true, label: "task from lead · work 98d1acb8@2 · revised", text: "Write the change.", order: 0 },
+			{ id: "assistant:0:0", kind: "assistant", text: "Earlier work step", order: 1 },
+			{ id: "note:1", kind: "note", text: "── work 98d1acb8@2 started", order: 2 },
+			{ id: "assistant:1:0", kind: "assistant", text: "Working now", order: 3 },
+		] },
+	};
+	for (const expanded of [false, true]) {
+		const panel = renderSubagentTranscript([team], expanded, tagged as any, { mode: "parallel", unit: "member" }).render(100).join("\n");
+		assert.match(panel, /› task from lead · work 98d1acb8@2 · revised\}\{toolOutput\|  Write the change\./u);
+		assert.doesNotMatch(panel, /initial task/u);
+		if (expanded) assert.match(panel, /\{dim\|── work 98d1acb8@2 started\}/u, "the separator is a dim line without icon or label");
+		else assert.doesNotMatch(panel, /── work|Earlier work step|earlier activity hidden/u, "collapsed shows only the current work's steps, without the separator");
+		assert.match(panel, /Working now/u);
+	}
+
+	const ordinary = new SubagentTranscript("Summarise the module.");
+	const ordinaryPanel = renderSubagentTranscript([{ alias: "a", model: "provider/gpt", status: "running", output: "", persistent: false, transcript: ordinary.snapshot() }],
+		false, theme as any, { mode: "parallel" }).render(100).join("\n");
+	assert.match(ordinaryPanel, /› initial task  Summarise the module\./u);
+
+	const marks = new SubagentTranscript("");
+	assert.equal(marks.mark("── first"), true);
+	assert.equal(marks.mark("── second"), true);
+	assert.deepEqual(marks.snapshot().entries.map((entry) => [entry.kind, entry.text]), [["note", "── first"], ["note", "── second"]]);
+});

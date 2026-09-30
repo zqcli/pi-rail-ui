@@ -277,7 +277,8 @@ test("launch final output carries every selected result in full with a timeline,
 	assert.ok(Buffer.byteLength(text, "utf8") <= 48 * 1024, "the final text stays bounded");
 	assert.match(text, new RegExp(`\\[Result truncated for the parent; full record: subagent_team status resultRef ${refs[7]}\\]`, "u"),
 		"only an over-budget record is truncated, and it names the exact resultRef to read");
-	assert.equal(result.details.members[1].output.startsWith("Part 8 summary.\nFindings:"), true, "the member panel's final answer is its full latest result");
+	assert.equal(result.details.members[1].output.startsWith("result → lead · awaiting review\nPart 8 summary.\nFindings:"), true,
+		"the member panel's final answer is its full latest result, under one line saying where it went");
 });
 
 /** Reserve the next activation and acknowledge its input, as a native member would. */
@@ -347,6 +348,71 @@ test("launch panel says who a waiting member waits on, what a held one asks, and
 	await pending;
 });
 
+test("launch panel titles each task with who asked and which work, says where a result went, and shows what the Manager handles or has dispatched", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", { ...sourceWriterArgs, initialRequests: [{ to: "writer", task: "Write the change.", inputRefs: null }] },
+		undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	let resolveLifetime!: (result: TeamResult) => void;
+	const lifetime = new Promise<TeamResult>((resolve) => { resolveLifetime = resolve; });
+	host.driver.openAndLaunch = async () => { host.runtime.launch(teamId); return { lifetime }; };
+	const updates: any[] = [];
+	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context());
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	/** The members of the newest panel update, once the throttled publish has run. */
+	const panel = async () => {
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		const members: any[] = updates.at(-1).details.members;
+		const run = (alias: string) => members.find((member) => member.alias === alias);
+		return { run, title: (alias: string): string | undefined => run(alias).transcript.entries.find((entry: any) => entry.initial)?.label };
+	};
+
+	endActivation(host, activate(host, teamId), { action: "yield" });
+	const writer = activate(host, teamId);
+	const writerRef = writer.scope.work!;
+	const requested = host.runtime.handleAction(writer.binding, writer.scope, 1, "ask-source", { action: "request", to: "source", task: "Find the fixture." }, "ask-source");
+	const fixtureRef = (requested as any).receipt.work;
+	endActivation(host, writer, { action: "yield", waitingFor: [fixtureRef], checkpoint: "needs the fixture" }, 2);
+	const source = activate(host, teamId);
+
+	let now = await panel();
+	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef(writerRef)}`);
+	assert.equal(now.title("source"), `task from writer (sub-task) · ${shortWorkRef(fixtureRef)}`, "work a peer asked for is a sub-task of that peer");
+	assert.equal(now.run("lead").transcript.entries.some((entry: any) => entry.initial), false, "the Manager's task is the Team goal, in the header");
+	assert.equal(now.run("writer").detail, `waiting on 1 sub-task: source (running ${shortWorkRef(fixtureRef)})`);
+	assert.equal(now.run("lead").detail, "dispatched: writer (waiting)", "the Manager's open dispatch replaces 'no assigned work'");
+
+	endActivation(host, source, { action: "reply", result: { status: "succeeded", summary: "Fixture found." } });
+	endActivation(host, activate(host, teamId), { action: "reply", result: { status: "succeeded", summary: "Change written." } });
+	now = await panel();
+	assert.equal(now.title("source"), `last task from writer (sub-task) · ${shortWorkRef(fixtureRef)}`, "an ended task is the last one");
+	assert.equal(now.title("writer"), `last task from lead · ${shortWorkRef(writerRef)}`);
+	assert.ok(now.run("source").output.startsWith("result → writer\nFixture found."), "a sub-task's result goes to the peer that asked");
+	assert.ok(now.run("writer").output.startsWith("result → lead · awaiting review\nChange written."));
+	assert.match(now.run("lead").detail, /^dispatched: writer \(awaiting review\) · \d+ pending events$/u);
+	const rendered = tool.renderResult({ ...updates.at(-1) }, { expanded: false, isPartial: true }, theme).render(100).join("\n");
+	assert.match(rendered, /result → lead · awaiting review/u);
+	assert.match(rendered, /last task from lead · work \S+@1\s+Write the change\./u);
+	assert.doesNotMatch(rendered, /initial task/u);
+
+	const manager = activate(host, teamId);
+	const accept = { action: "control", command: "accept_result", work: writerRef, disposition: "accepted", reason: "looks right" };
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "accept", accept, "accept").ok, true);
+	now = await panel();
+	assert.equal(now.run("lead").detail, "handling ROOT_RESULT_READY, TEAM_QUIESCENT", "a running Manager says which events it is handling");
+	assert.ok(now.run("writer").output.startsWith("result → lead · accepted\n"));
+
+	const revise = { action: "control", command: "revise_work", workId: writerRef.workId, expectedRevision: 1, task: "Write the change, with tests.", inputRefs: [] };
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 2, "revise", revise, "revise").ok, true);
+	now = await panel();
+	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef({ workId: writerRef.workId, revision: 2 })} · revised`);
+	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the task text is the current revision's");
+	assert.ok(now.run("writer").output.startsWith("result → lead · superseded\n"), "the earlier result belongs to a revision that was replaced");
+
+	resolveLifetime(terminal(teamId));
+	await pending;
+});
+
 test("launch panel keeps the generic wait text while every dependency is terminal but its native cleanup is pending", async () => {
 	const { host, tool } = setup();
 	const prepared = await tool.execute("prepare", sourceWriterArgs, undefined, undefined, context());
@@ -406,7 +472,7 @@ test("launch panel reuses grouped subagent panels per member, live and after the
 	assert.equal(worker.usage.input, 7, "in-flight native usage is shown before Runtime folds it");
 	assert.equal(worker.transcript.entries[0].text, "Inspect the changed files.", "the member's current work is its initial task");
 	assert.equal(lead.transcript.entries.some((entry: any) => entry.initial), false, "the Manager's goal is in the Team header, not repeated as its task");
-	assert.match(lead.detail, /^no assigned work · \d+ pending events$/u);
+	assert.match(lead.detail, /^dispatched: worker \(queued\) · \d+ pending events$/u, "the Manager's own dispatch is still open");
 	assert.equal(worker.status, "waiting", "queued work that has not started yet is waiting, not idle");
 	assert.match(worker.detail, /^queued for a worker slot$/u);
 	assert.match(update.content[0].text, /lead\s+manager · .*pending events/u);

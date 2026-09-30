@@ -10,7 +10,8 @@ const MAX_ENTRY_ROWS = 5;
 const COLLAPSED_INITIAL_ROWS = 1;
 const COLLAPSED_ANSWER_ROWS = 3;
 
-export type SubagentTranscriptKind = "user" | "assistant" | "thinking" | "tool" | "toolResult";
+/** `note` is a dim one-line separator (for example where a Team member starts its next work), not model output. */
+export type SubagentTranscriptKind = "user" | "assistant" | "thinking" | "tool" | "toolResult" | "note";
 /**
  * `idle`, `waiting` (on other work or a worker slot) and `held` (needs a Manager decision) are live
  * Team members between activations; they are never shown as completed.
@@ -20,6 +21,7 @@ export type SubagentTranscriptStatus = "running" | "idle" | "waiting" | "held" |
 export interface SubagentTranscriptEntry {
 	id: string;
 	kind: SubagentTranscriptKind;
+	/** The task that started the run; `label` replaces the default "initial task" title. */
 	initial?: boolean;
 	label?: string;
 	groupId?: string;
@@ -229,6 +231,7 @@ export class SubagentTranscript {
 	private assistantSequence = 0;
 	private userSequence = 0;
 	private anonymousResultSequence = 0;
+	private noteSequence = 0;
 	private initialUserEchoPending = false;
 	private activeAssistant: number | undefined;
 	private readonly toolCallDrafts = new Map<string, string>();
@@ -265,6 +268,11 @@ export class SubagentTranscript {
 			entries: this.entries.map((entry) => ({ ...entry })),
 			omittedEntries: this.omittedEntries,
 		};
+	}
+
+	/** Add a one-line separator between stretches of activity. */
+	mark(text: string): boolean {
+		return this.upsert(`note:${++this.noteSequence}`, { kind: "note", text });
 	}
 
 	private messageStart(message: UnknownRecord | undefined): boolean {
@@ -689,13 +697,14 @@ class BoundedTranscriptView implements Component {
 	}
 
 	private renderEntry(entry: SubagentTranscriptEntry, width: number, unbounded = false): string[] {
+		if (entry.kind === "note") return new Text(this.theme.fg("dim", entry.text), 0, 0).render(width);
 		const failed = entry.status === "failed";
 		const icon = entry.kind === "user" ? "›"
 			: entry.kind === "assistant" ? "●"
 				: entry.kind === "thinking" ? "◇"
 					: entry.kind === "tool" ? (failed ? "✗" : entry.status === "completed" ? "✓" : "⚙")
 						: (failed ? "↳✗" : "↳");
-		const label = entry.initial ? "initial task"
+		const label = entry.initial ? entry.label ?? "initial task"
 			: entry.kind === "tool" ? `tool ${entry.label ?? ""}`.trim()
 			: entry.kind === "toolResult" ? `result ${entry.label ?? ""}`.trim()
 				: entry.kind;
@@ -979,11 +988,15 @@ class SubagentRunPanel implements Component {
 			return new Text(cleanDisplayText(this.run.output, "(running...)"), 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
 		}
 		if (!this.run.transcript) return new Text(cleanDisplayText(this.run.output, "(running...)"), 0, 0).render(width).slice(0, this.expanded ? 6 : 3);
-		// Collapsed, no row goes to a label, so the newest steps stay visible.
+		// Collapsed, no row goes to a label, and a Team member shows only what followed its latest
+		// separator: the current work's steps, not the previous work's (the state line names the work).
+		const groups = runGroups(this.run, true);
+		const since = Math.max(-1, ...this.run.transcript.entries.filter((entry) => entry.kind === "note").map((entry) => entry.order));
 		const view = new BoundedTranscriptView(
 			this.expanded ? this.theme.fg("dim", "Activity") : "",
-			runGroups(this.run, true),
-			this.run.transcript.omittedEntries,
+			this.expanded ? groups : groups.map((group) => ({ ...group, entries: group.entries.filter((entry) => entry.initial || (entry.kind !== "note" && entry.order > since)) })),
+			// Evicted entries are older than any retained separator, so they are not "earlier" than the current work.
+			!this.expanded && since >= 0 ? 0 : this.run.transcript.omittedEntries,
 			this.expanded ? 7 : 4,
 			this.theme,
 			undefined,

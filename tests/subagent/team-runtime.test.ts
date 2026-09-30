@@ -3,7 +3,7 @@ import { test } from "node:test";
 import {
 	TeamProtocolError, encodeActivationInput, jsonBytes, normalizeTeamAction, normalizeTeamPlan, parseChildFrame, parseParentCommand, parseTeamReply,
 } from "../../tools/subagents/team-codec";
-import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-runtime";
+import { TeamRuntime, handlingText, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 import {
 	TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_FRAME_BYTES, TEAM_MAX_RESULT_BYTES, shortWorkRef, type TeamBudgetLimits, type WorkRef,
 } from "../../tools/subagents/team-protocol";
@@ -279,8 +279,8 @@ test("panel facts name who a blocked member waits on: a peer with its state, at 
 		const facts = runtime.panelFacts(teamId);
 		assert.equal(facts.stalled.get("w1"), "waiting on w2 (queued), w3 (queued), w4 (queued) +1 more", "peers in creation order, three named");
 		assert.equal(facts.waitingFor, "w1 (waiting on w2, w3, w4 +1 more)");
-		// The timeline names the yielded assignees in the codec's canonical order, so only its shape is asserted.
-		assert.ok(facts.timeline.some((entry) => /^w1 ended \S+ \S+ \(waiting on w\d, w\d, w\d \+1 more\)$/u.test(entry.text)));
+		// The codec sorts waitingFor by WorkRef (here w3, w4, w5, w2); the timeline names them in creation order, like the panel.
+		assert.ok(facts.timeline.some((entry) => /^w1 ended \S+ \S+ \(waiting on w2, w3, w4 \+1 more\)$/u.test(entry.text)));
 	}
 });
 
@@ -346,6 +346,44 @@ test("panel facts: budget, protocol and Manager-unavailable holds say why they a
 		settle(runtime, worker);
 		assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "held · protocol: Native work ended without a valid reply or yield");
 	}
+});
+
+test("panel facts: work held for budget or protocol is named in the Team's waiting reason even when nobody is running or waiting", () => {
+	{
+		const { runtime, teamId } = makeRuntime(undefined, { limits: { teamActivations: 1 } });
+		finishManagerBoot(runtime, teamId);
+		assert.equal(runtime.takeNextActivation(teamId), undefined, "the Manager's boot used the only activation, so w1's root is budget-held");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "w1 (held: budget exhausted)");
+	}
+	{
+		const { runtime, teamId } = makeRuntime([{ to: "w1", task: "first root" }, { to: "w2", task: "second root" }]);
+		finishManagerBoot(runtime, teamId);
+		const first = runtime.takeNextActivation(teamId)!;
+		const second = runtime.takeNextActivation(teamId)!;
+		inputReady(runtime, first);
+		settle(runtime, first);
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "w2 (running) · w1 (held: protocol)", "a held member is listed after those running");
+		reply(runtime, second, "second-reply", "second done");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "w1 (held: protocol)", "and alone once nobody is running");
+	}
+});
+
+test("panel facts: the Manager's current activation names the event kinds it is handling", () => {
+	assert.equal(handlingText([{ kind: "A" }, { kind: "B" }, { kind: "A" }, { kind: "C" }, { kind: "D" }, { kind: "E" }]), "handling A, B, C +2 more",
+		"kinds are distinct and at most three are named");
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "first root" }, { to: "w2", task: "second root" }]);
+	assert.equal(runtime.panelFacts(teamId).managerHandling, undefined, "nothing is handled before an activation starts");
+	const boot = runtime.takeNextActivation(teamId)!;
+	assert.equal(runtime.panelFacts(teamId).managerHandling, "handling BOOT");
+	finishIdle(runtime, boot);
+	assert.equal(runtime.panelFacts(teamId).managerHandling, undefined, "and nothing once it has settled");
+	const first = runtime.takeNextActivation(teamId)!;
+	const second = runtime.takeNextActivation(teamId)!;
+	reply(runtime, first, "first-reply", "first done");
+	yieldWork(runtime, second, "second-asks", { attention: "which scope?", checkpoint: "stopped" });
+	const manager = runtime.takeNextActivation(teamId)!;
+	assert.equal(manager.scope.kind, "management");
+	assert.equal(runtime.panelFacts(teamId).managerHandling, "handling ROOT_RESULT_READY, WORK_HELD, TEAM_QUIESCENT");
 });
 
 test("panel facts: an active Team waits for questions, then Manager review, then its close, else for whoever is working", () => {

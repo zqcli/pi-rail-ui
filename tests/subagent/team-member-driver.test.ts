@@ -12,7 +12,7 @@ import { TeamMemberDriver } from "../../tools/subagents/team-member-driver";
 import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 import { TeamActivationFailure } from "../../tools/subagents/team-rpc-v2";
 import type { RailModelRef } from "../../tools/subagents/models";
-import { TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
+import { TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_PRIVATE_ENTRY_TYPE, shortWorkRef } from "../../tools/subagents/team-protocol";
 
 const MODEL: RailModelRef = { provider: "rail-team-local", modelId: "probe" };
 const CLI = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
@@ -1126,6 +1126,60 @@ test("a pre-settlement native send failure is isolated without inventing native 
 		"cost observed before the transport loss is kept");
 	assert.deepEqual({ input: team.usage.input, contextTokens: team.usage.contextTokens }, { input: 42, contextTokens: 900 });
 	runtime.assertInvariants(prepared.teamId);
+	await driver.close();
+});
+
+test("a member's activity transcript is separated per activation: work started then resumed, and the events a Manager batch handles", async () => {
+	const runtime = new TeamRuntime();
+	const prepared = runtime.prepare({
+		manager: { alias: "lead", roleDescription: "Manage the work." },
+		workers: [{ alias: "w1", roleDescription: "Needs w2's conclusion." }, { alias: "w2", roleDescription: "Concludes." }],
+		brief: { goal: "Show where each activation begins." },
+		initialRequests: [{ to: "w1", task: "needs w2" }, { to: "w2", task: "conclude" }], timeoutSeconds: null,
+	});
+	const teamId = prepared.teamId;
+	let w1Runs = 0;
+	const broker = {
+		openTeamMember: async ({ binding }: any) => ({
+			instance: { agentId: binding.memberId, alias: binding.memberId, sessionId: `session-${binding.memberId}` },
+			sessionId: `session-${binding.memberId}`,
+			runActivation: async (activation: any, onRequest: any, onNativeSettled: any) => {
+				const firstW1Run = binding.memberId === "w1" && ++w1Runs === 1;
+				const args = firstW1Run
+					? { action: "yield", waitingFor: [runtime.listWorks(teamId).find((work) => work.assignee === "w2")!.work], checkpoint: "waiting for w2" }
+					: activation.scope.kind === "work" ? { action: "reply", result: { status: "succeeded", summary: `${binding.memberId} done` } } : { action: "yield" };
+				const ready = await onRequest({
+					version: 2, kind: "request", binding: activation.binding, activation: activation.scope,
+					sequence: 1, rpcRequestId: `ready-${activation.scope.activationId}`,
+					request: { action: "input_ready", deliveryId: activation.deliveryId },
+				});
+				assert.equal(ready.kind, "ack");
+				const toolCallId = `intent-${activation.scope.activationId}`;
+				const reply = await onRequest({
+					version: 2, kind: "request", binding: activation.binding, activation: activation.scope,
+					sequence: 2, rpcRequestId: `rpc-${activation.scope.activationId}`, request: { action: "business", args },
+				}, toolCallId);
+				assert.equal(reply.reply.ok, true, JSON.stringify(reply));
+				onNativeSettled({ status: "success", appliedToolCallId: toolCallId });
+			},
+			close: async () => ({}),
+		}),
+	} as unknown as SessionBroker;
+	const driver = new TeamMemberDriver(runtime, broker);
+	for (const memberId of ["lead", "w1", "w2"]) await driver.openMember({ teamId, memberId, model: MODEL });
+	runtime.launch(teamId);
+	const notes = (memberId: string) => driver.memberActivity(teamId, memberId)!.transcript.entries.filter((entry) => entry.kind === "note").map((entry) => entry.text);
+	const workOf = (assignee: string) => shortWorkRef(runtime.listWorks(teamId).find((work) => work.assignee === assignee)!.work);
+
+	await driver.runNext(teamId); // Manager BOOT
+	await driver.runNext(teamId); // w1 yields for w2
+	await driver.runNext(teamId); // w2 replies
+	await driver.runNext(teamId); // Manager reads w2's root result
+	assert.deepEqual(notes("lead"), ["── handling BOOT", "── handling ROOT_RESULT_READY"]);
+	assert.deepEqual(notes("w1"), [`── ${workOf("w1")} started`]);
+	await driver.runNext(teamId); // w1 wakes on w2's outcome: the same WorkRef again
+	assert.deepEqual(notes("w1"), [`── ${workOf("w1")} started`, `── ${workOf("w1")} resumed`]);
+	assert.deepEqual(notes("w2"), [`── ${workOf("w2")} started`]);
 	await driver.close();
 });
 

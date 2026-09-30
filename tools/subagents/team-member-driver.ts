@@ -4,9 +4,9 @@ import { railModelReference } from "./models";
 import { TeamMemberOpenError, type BrokeredTeamMemberHandle, type SessionBroker, type SubagentUsage } from "./session-broker";
 import type { RpcEvent } from "./rpc-worker";
 import { assistantText, RunResultCollector } from "./run-result";
-import type { ChildRequestFrame, PrivateReply, TeamResult } from "./team-protocol";
+import { shortWorkRef, workRefKey, type ChildRequestFrame, type PrivateReply, type TeamResult } from "./team-protocol";
 import { sameBinding, sameScope } from "./team-codec";
-import { TeamRuntime, type ActivationCompletionReason, type NativeCompletion, type RuntimeActivation, type TeamRuntimeExecutor } from "./team-runtime";
+import { TeamRuntime, handlingText, type ActivationCompletionReason, type NativeCompletion, type RuntimeActivation, type TeamRuntimeExecutor } from "./team-runtime";
 import { TeamActivationFailure } from "./team-rpc-v2";
 import { SubagentTranscript, type SubagentTranscriptSnapshot } from "./transcript";
 
@@ -50,6 +50,8 @@ interface ActivityRecord {
 	startedAt?: number;
 	activeMs: number;
 	output: string;
+	/** WorkRefs this member has run, so a later activation of one is shown as resumed. */
+	works: Set<string>;
 }
 
 function key(teamId: string, memberId: string): string {
@@ -168,7 +170,7 @@ export class TeamMemberDriver {
 		// The claim fails once the Team is no longer prepared, so a cancelled Team never gains a new lifetime.
 		const binding = this.runtime.claimNativeLifetime(request.teamId, request.memberId);
 		this.forgetEvictedTeams();
-		const activity: ActivityRecord = { transcript: new SubagentTranscript(""), activeMs: 0, output: "" };
+		const activity: ActivityRecord = { transcript: new SubagentTranscript(""), activeMs: 0, output: "", works: new Set() };
 		this.activity.set(id, activity);
 		const opened = this.broker.openTeamMember({
 			binding,
@@ -357,6 +359,14 @@ export class TeamMemberDriver {
 		if (activity) {
 			activity.run = new RunResultCollector("", assistantText);
 			activity.startedAt = Date.now();
+			// The transcript spans activations; this marks where the next piece of work begins.
+			const { scope } = activation.input;
+			if (scope.kind === "management") activity.transcript.mark(`── ${handlingText(scope.events)}`);
+			else {
+				const seen = activity.works.has(workRefKey(scope.work));
+				activity.works.add(workRefKey(scope.work));
+				activity.transcript.mark(`── ${shortWorkRef(scope.work)} ${seen ? "resumed" : "started"}`);
+			}
 		}
 		const controller = new AbortController();
 		this.activationControllers.set(id, { activationId: activation.scope.activationId, controller });

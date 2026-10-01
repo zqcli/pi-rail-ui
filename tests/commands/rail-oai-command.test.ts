@@ -152,10 +152,11 @@ test("/rail-oai-* commands share one GPT-only rejection and mutate no state", as
 	ctx.model = { ...GPT_MODEL };
 	await harness.run("model_select", {}, ctx);
 	await harness.run("turn_start", {}, ctx);
-	assert.equal(await harness.run("before_provider_request", { payload: { input: [] } }, ctx), undefined,
-		"rejected commands must not arm Fast or Search for a later GPT model");
+	assert.deepEqual(await harness.run("before_provider_request", { payload: { input: [] } }, ctx), {
+		input: [], tools: [{ type: "web_search", external_web_access: true }], include: ["web_search_call.action.sources"],
+	}, "rejected commands arm no Fast and leave Search at its live default for a later GPT model");
 	assert.equal(railFastFooterLabel(), undefined);
-	assert.equal(railOaiSearchFooterLabel(), undefined);
+	assert.equal(railOaiSearchFooterLabel(), "SEARCH LIVE");
 	await harness.run("session_shutdown", {}, ctx);
 });
 
@@ -357,11 +358,11 @@ test("search and compaction re-check the model after the idle wait", async (t) =
 	await startSession(harness);
 
 	// Search: the model switches to non-GPT while waitForIdle is pending, so the
-	// mode must not flip to live.
+	// mode must not flip from the live default to cached.
 	ctx.waitForIdle = async () => { ctx.model = { ...NON_GPT_MODEL }; };
-	await commands.get("rail-oai-search").handler("live", ctx);
+	await commands.get("rail-oai-search").handler("cached", ctx);
 	assert.equal(notices.at(-1), RAIL_OAI_GPT_ONLY_WARNING, "the post-idle re-check rejects the switched model");
-	assert.equal(lastStatus(statusWrites, "rail-oai-search"), undefined, "search stays off after the switch");
+	assert.equal(lastStatus(statusWrites, "rail-oai-search"), "SEARCH LIVE", "search stays live after the switch");
 
 	// Compaction: `on` selected before idle must not write once the model is non-GPT.
 	ctx.model = { ...GPT_MODEL };

@@ -56,9 +56,10 @@ export function railOaiSearchExtensionPath(): string {
 	return fileURLToPath(new URL("./rail-oai-search-standalone.ts", import.meta.url));
 }
 
+/** Sessions start in live search; it only takes effect on eligible GPT models. */
 function startupSearchMode(pi: ExtensionAPI): RailOaiSearchMode {
 	const value = pi.getFlag?.(RAIL_OAI_SEARCH_MODE_FLAG);
-	return value === "live" || value === "cached" ? value : "off";
+	return value === "cached" || value === "off" ? value : "live";
 }
 
 function isRecord(value: unknown): value is JsonObject {

@@ -192,7 +192,7 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 	installRailOaiSearch(pi as any);
 	assert.equal(commandName, "rail-oai-search");
 	await handlers.get("session_start")({}, ctx);
-	assert.equal(statuses.at(-1), undefined);
+	assert.equal(statuses.at(-1), "SEARCH LIVE", "GPT sessions start in live search");
 
 	await command.handler("live", ctx);
 	assert.equal(statuses.at(-1), "SEARCH LIVE");
@@ -362,11 +362,13 @@ test("persists observed search state before the assistant entry without requirin
 	await handlers.get("session_shutdown")({}, ctx);
 });
 
-test("child startup flag enables hosted search before the first provider request", async () => {
-	const cases: Array<[string, boolean | undefined]> = [
+test("startup flag selects hosted search before the first provider request, live by default", async () => {
+	const cases: Array<[string | undefined, boolean | undefined]> = [
 		["live", true],
 		["cached", false],
-		["bogus", undefined],
+		["off", undefined],
+		[undefined, true],
+		["bogus", true],
 	];
 	for (const [flag, externalWebAccess] of cases) {
 		let registeredFlag: string | undefined;

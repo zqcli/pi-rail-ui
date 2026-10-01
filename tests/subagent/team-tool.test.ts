@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { test } from "node:test";
 import { formatTeamView, installTeamTool, TeamLaunchWaitAbortedError } from "../../tools/subagents/team-tool";
+import * as teamTool from "../../tools/subagents/team-tool";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import type { SessionBroker } from "../../tools/subagents/session-broker";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
@@ -16,6 +17,19 @@ const nativeModel: any = {
 	contextWindow: 128_000, maxTokens: 4096, reasoning: true, input: ["text"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
+
+test("formatTimeline combines retained and rendered omissions within 100 rows", () => {
+	const timeline = Array.from({ length: 1000 }, (_, index) => ({ at: index * 1000, text: `milestone ${index}` }));
+	const lines = teamTool.formatTimeline(timeline, 50, 0);
+	assert.equal(lines.length, 100);
+	assert.equal(lines[0], "- 0:00 milestone 0");
+	assert.equal(lines[29], "- 0:29 milestone 29");
+	assert.equal(lines[30], "- … 951 milestones omitted …");
+	assert.equal(lines[31], "- 15:31 milestone 931");
+	assert.equal(lines.at(-1), "- 16:39 milestone 999");
+	assert.equal(teamTool.formatTimeline(timeline.slice(0, 100), 0, 0).length, 100);
+	assert.deepEqual(teamTool.formatTimeline([], 0, 0), []);
+});
 
 function context(cwd = process.cwd()) {
 	return {
@@ -227,7 +241,7 @@ test("launch waits for the full Team lifetime and passes only the prepared membe
 	assert.equal(settled, true);
 	assert.ok(updates.length > 0);
 	assert.match(result.content[0].text, new RegExp(`Team ${teamId} CLOSED · outcome succeeded`, "u"));
-	assert.match(result.content[0].text, /Roots: none/u);
+	assert.match(result.content[0].text, /Deliverables \(1 roots · 0 accepted · 0 waived\):/u);
 	assert.doesNotMatch(result.content[0].text, /fresh final summary|coordinator summary/u);
 });
 
@@ -252,7 +266,7 @@ function completeRoots(host: TeamSessionHost, teamId: string, result: (index: nu
 	return refs;
 }
 
-test("launch final output carries every selected result in full with a timeline, so no status call is needed", async () => {
+test("launch final output carries deliverables, process, members and selected results without a timeline", async () => {
 	const { host, tool } = setup();
 	const tasks = Array.from({ length: 8 }, (_value, index) => ({ to: "worker", task: `Inspect part ${index + 1}.`, inputRefs: null }));
 	const prepared = await tool.execute("prepare", { ...prepareArgs, initialRequests: tasks }, undefined, undefined, context());
@@ -267,18 +281,20 @@ test("launch final output carries every selected result in full with a timeline,
 	};
 	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
 	const text: string = result.content[0].text;
-	assert.match(text, /^Members:\n- lead · manager · .* · results 0\n- worker · worker · .* · results 8$/mu);
-	assert.match(text, /^Timeline \(m:ss from launch\):\n- 0:00 launch · initial (work [2-9a-hjkmnp-z]{4}@1 → worker(, )?){8}\n- \d+:\d\d lead management activation \(BOOT\)\n- \d+:\d\d lead ended management activation \(manager idle\)\n- \d+:\d\d worker started work [2-9a-hjkmnp-z]{4}@1\n- \d+:\d\d worker succeeded result for work [2-9a-hjkmnp-z]{4}@1\n- \d+:\d\d lead management activation \(ROOT_RESULT_READY\)$/mu,
-		"the timeline records dispatch, each activation and each result, from the Runtime launch");
-	assert.equal(text.match(/worker succeeded result for/gu)?.length, 8);
+	assert.match(text, /^Members:\n- lead · manager · .* · works done 0 · activations 9 · active 0:00\n- worker · worker · .* · works done 8 · activations 8 · active 0:00$/mu);
+	assert.match(text, /^Deliverables \(8 roots · 0 accepted · 0 waived\):/mu);
+	assert.match(text, /^Process:\n- works 8 \(8 roots, 0 sub-tasks\) · results 8/mu);
+	assert.match(text, /^Final results selected by the Manager \(in full\):/mu);
+	assert.match(text, /^Details on demand: subagent_team status .*resultRef.*reads any result in full.*Team view and the timeline\./mu);
+	assert.doesNotMatch(text, /Timeline \(m:ss|worker succeeded result for/u);
 	assert.doesNotMatch(text, /ended work \S+ \(reply\)/u, "a committed reply is shown once, as its result");
 	assert.match(text, /Part 1 summary\.\nFindings:\n- FINDING-1 x+\n- MORE-1 y+\nLimitations:\n- LIMIT-1/u, "a short result is included in full, not as a preview");
 	for (const ref of refs.slice(0, 4)) assert.doesNotMatch(text, new RegExp(`resultRef ${ref}`, "u"), "short results are never truncated");
 	assert.ok(Buffer.byteLength(text, "utf8") <= 48 * 1024, "the final text stays bounded");
 	assert.match(text, new RegExp(`\\[Result truncated for the parent; full record: subagent_team status teamId [^ ]+ resultRef ${refs[7]}\\]`, "u"),
 		"only an over-budget record is truncated, and it names the exact resultRef to read");
-	assert.equal(result.details.members[1].output.startsWith("result → lead · awaiting review\nPart 8 summary.\nFindings:"), true,
-		"the member panel's final answer is its full latest result, under one line saying where it went");
+	assert.equal(result.details.members[1].output.startsWith("Part 8 summary.\nFindings:"), true,
+		"the output body contains only the result, not its destination");
 });
 
 /** Reserve the next activation and acknowledge its input, as a native member would. */
@@ -364,6 +380,14 @@ test("launch panel titles each task with who asked and which work, says where a 
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		const members: any[] = updates.at(-1).details.members;
 		const run = (alias: string) => members.find((member) => member.alias === alias);
+		for (const expanded of [false, true]) {
+			const rendered = tool.renderResult(updates.at(-1), { expanded, isPartial: true }, theme).render(200).join("\n");
+			for (const member of members) {
+				const destination = member.transcript.entries.find((entry: any) => entry.id === "result-destination");
+				if (destination) assert.ok(rendered.includes(destination.text), `destination stays visible, expanded=${expanded}`);
+				if (member.alias === "lead") assert.equal(destination, undefined);
+			}
+		}
 		return { run, title: (alias: string): string | undefined => run(alias).transcript.entries.find((entry: any) => entry.initial)?.label };
 	};
 
@@ -377,6 +401,7 @@ test("launch panel titles each task with who asked and which work, says where a 
 
 	let now = await panel();
 	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef(writerRef)}`);
+	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress");
 	assert.equal(now.title("source"), `task from writer (sub-task) · ${shortWorkRef(fixtureRef)}`, "work a peer asked for is a sub-task of that peer");
 	assert.equal(now.run("lead").transcript.entries.some((entry: any) => entry.initial), false, "the Manager's task is the Team goal, in the header");
 	assert.equal(now.run("writer").detail, `waiting on 1 sub-task: source (running ${shortWorkRef(fixtureRef)})`);
@@ -387,8 +412,10 @@ test("launch panel titles each task with who asked and which work, says where a 
 	now = await panel();
 	assert.equal(now.title("source"), `last task from writer (sub-task) · ${shortWorkRef(fixtureRef)}`, "an ended task is the last one");
 	assert.equal(now.title("writer"), `last task from lead · ${shortWorkRef(writerRef)}`);
-	assert.ok(now.run("source").output.startsWith("result → writer\nFixture found."), "a sub-task's result goes to the peer that asked");
-	assert.ok(now.run("writer").output.startsWith("result → lead · awaiting review\nChange written."));
+	assert.equal(now.run("source").output, "Fixture found.");
+	assert.equal(now.run("source").transcript.entries[1].text, `↳ result → writer · ${host.runtime.getWork(teamId, fixtureRef)!.current.resultRef}`);
+	assert.equal(now.run("writer").output, "Change written.");
+	assert.equal(now.run("writer").transcript.entries[1].text, `↳ result → lead · awaiting review · ${host.runtime.getWork(teamId, writerRef)!.current.resultRef}`);
 	assert.match(now.run("lead").detail, /^dispatched: writer \(awaiting review\) · \d+ pending events$/u);
 	const rendered = tool.renderResult({ ...updates.at(-1) }, { expanded: false, isPartial: true }, theme).render(100).join("\n");
 	assert.match(rendered, /result → lead · awaiting review/u);
@@ -400,18 +427,58 @@ test("launch panel titles each task with who asked and which work, says where a 
 	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "accept", accept, "accept").ok, true);
 	now = await panel();
 	assert.equal(now.run("lead").detail, "handling ROOT_RESULT_READY, TEAM_QUIESCENT", "a running Manager says which events it is handling");
-	assert.ok(now.run("writer").output.startsWith("result → lead · accepted\n"));
+	assert.match(now.run("writer").transcript.entries[1].text, /^↳ result → lead · accepted · result:/u);
 
 	const revise = { action: "control", command: "revise_work", workId: writerRef.workId, expectedRevision: 1, task: "Write the change, with tests.", inputRefs: [] };
 	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 2, "revise", revise, "revise").ok, true);
 	now = await panel();
 	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef({ workId: writerRef.workId, revision: 2 })} · revised`);
 	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the task text is the current revision's");
-	assert.ok(now.run("writer").output.startsWith("result → lead · superseded\n"), "the earlier result belongs to a revision that was replaced");
+	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · superseded by @2", "the current revision has no resultRef yet");
+	const revised = activate(host, teamId);
+	endActivation(host, revised, { action: "reply", result: { status: "succeeded", summary: "Tests added." } });
+	const waive = { ...accept, work: revised.scope.work, disposition: "waived", reason: "Accepted with limitations." };
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 3, "waive", waive, "waive").ok, true);
+	now = await panel();
+	assert.match(now.run("writer").transcript.entries[1].text, /^↳ result → lead · waived · result:/u);
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 4, "new-task", {
+		action: "request", to: "writer", task: "Review another change.",
+	}).ok, true);
+	now = await panel();
+	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress", "a different work never borrows the last result's reference or review");
 
 	resolveLifetime(terminal(teamId));
 	await pending;
 });
+
+for (const state of ["cancelled", "failed"] as const) {
+	test(`launch result destination shows ${state} without a result`, async () => {
+		const { host, tool } = setup();
+		const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+		const teamId = prepared.details.view.teamId;
+		host.driver.openAndLaunch = async () => {
+			host.runtime.launch(teamId);
+			const manager = activate(host, teamId);
+			if (state === "cancelled") {
+				const root = host.runtime.listWorks(teamId)[0]!.work;
+				assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "cancel", {
+					action: "control", command: "cancel_work", workId: root.workId, expectedRevision: 1, reason: "Not needed.",
+				}).ok, true);
+			} else {
+				endActivation(host, manager, { action: "yield" });
+				const worker = activate(host, teamId);
+				host.runtime.nativeSettled(worker.binding, worker.scope.activationId, { status: "error", error: { code: "NATIVE_FAILURE", message: "Fake provider failed." } });
+				host.runtime.cleanupFinished(worker.binding, worker.scope.activationId, { ok: true });
+			}
+			return { lifetime: Promise.resolve(terminal(teamId)) };
+		};
+		const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
+		assert.equal(result.details.members[1].transcript.entries[1].text, `↳ result → lead · ${state}`);
+		for (const expanded of [false, true]) {
+			assert.match(tool.renderResult(result, { expanded, isPartial: false }, theme).render(200).join("\n"), new RegExp(`↳ result → lead · ${state}`, "u"));
+		}
+	});
+}
 
 test("launch panel keeps the generic wait text while every dependency is terminal but its native cleanup is pending", async () => {
 	const { host, tool } = setup();
@@ -465,8 +532,8 @@ test("launch final text keeps the Manager's verdict: the waive reason, the whole
 	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
 	const text: string = result.content[0].text;
 	const key = workRefKey(root!);
-	assert.match(text, new RegExp(`^Team ${teamId} CLOSED · outcome partial · ${reason}$`, "mu"), "the close reason is printed whole");
-	assert.match(text, new RegExp(`^Roots: ${key} resolved \\(waived: ${waiveReason}\\)$`, "mu"), "a waived root says why");
+	assert.match(text, new RegExp(`^Team ${teamId} CLOSED · outcome partial · \\d+:\\d\\d · ${reason}$`, "mu"), "the close reason is printed whole");
+	assert.match(text, new RegExp(`^- ${key} worker ← lead · waived: ${waiveReason} · result:`, "mu"), "a waived root says why");
 	assert.match(text, new RegExp(`^### worker · ${key} · succeeded · waived · result:`, "mu"), "the worker's own status is not the final verdict on the root");
 
 	const header = formatTeamView({ ...host.runtime.getTeam(teamId), reason }, [], 0).find((line) => line.startsWith("Reason:"));
@@ -474,7 +541,7 @@ test("launch final text keeps the Manager's verdict: the waive reason, the whole
 	assert.ok(Buffer.byteLength(reason, "utf8") > 400);
 });
 
-test("launch final text keeps the start of a long run and marks the dropped milestones in place", async () => {
+test("status timeline keeps the start of a long run and marks rendered omissions in place", async () => {
 	const { host, tool } = setup();
 	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
 	const teamId = prepared.details.view.teamId;
@@ -494,13 +561,18 @@ test("launch final text keeps the start of a long run and marks the dropped mile
 		return { lifetime: Promise.resolve(terminal(teamId)) };
 	};
 	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
-	const lines: string[] = result.content[0].text.split("\n");
-	const omitted = host.runtime.panelFacts(teamId).timelineOmitted;
-	assert.ok(omitted > 0, "the run produced more milestones than the timeline holds");
+	assert.doesNotMatch(result.content[0].text, /Timeline \(m:ss/u);
+	assert.match(result.content[0].text, /\+41 more roots/u);
+	const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
+	const lines: string[] = status.content[0].text.split("\n");
+	const facts = host.runtime.panelFacts(teamId);
+	const omitted = facts.timelineOmitted + facts.timeline.length - 99;
+	assert.ok(facts.timeline.length > 100, "runtime retains more than the rendered timeline");
+	assert.ok(omitted > 0);
 	const at = lines.indexOf("Timeline (m:ss from launch):");
 	assert.ok(at >= 0, "the header no longer carries the omission");
 	const timeline = lines.slice(at + 1);
-	assert.equal(timeline.length, 100 + 1, "the capped timeline plus the marker");
+	assert.equal(timeline.length, 100, "the cap includes the marker");
 	assert.match(timeline[0]!, /^- 0:00 launch \u00b7 initial /u, "the run's start is there");
 	assert.equal(timeline[TEAM_TIMELINE_HEAD], `- \u2026 ${omitted} milestones omitted \u2026`, "the marker sits right after the kept first entries");
 	assert.equal(timeline.filter((line) => line.startsWith("- \u2026")).length, 1);

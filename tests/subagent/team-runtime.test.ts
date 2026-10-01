@@ -408,8 +408,9 @@ test("timeline: a full timeline keeps its first entries and the newest, and coun
 	const { runtime, teamId } = makeRuntime([]);
 	const boot = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, boot);
+	let sequence = 0;
 	const requestAt = (index: number) => {
-		const requested = action(runtime, boot, index + 1, `request-${index}`, { action: "request", to: index % 2 ? "w1" : "w2", task: `task ${index}` });
+		const requested = action(runtime, boot, ++sequence, `request-${index}`, { action: "request", to: index % 2 ? "w1" : "w2", task: `task ${index}` });
 		return requested.ok && requested.receipt?.status === "accepted" ? requested.receipt.work : assert.fail(JSON.stringify(requested));
 	};
 	for (let index = 0; index < TEAM_TIMELINE_HEAD - 2; index++) requestAt(index);
@@ -419,11 +420,63 @@ test("timeline: a full timeline keeps its first entries and the newest, and coun
 	let last!: WorkRef;
 	for (let index = TEAM_TIMELINE_HEAD - 2; index < 120; index++) last = requestAt(index);
 	const facts = runtime.panelFacts(teamId);
-	assert.equal(facts.timeline.length, 100, "the cap is unchanged");
-	assert.equal(facts.timelineOmitted, 120 + 2 - 100);
+	assert.equal(facts.timeline.length, 122, "more than 100 milestones remain available to the popup");
+	assert.equal(facts.timelineOmitted, 0);
 	assert.deepEqual(facts.timeline.slice(0, TEAM_TIMELINE_HEAD), head, "the start of the run is kept, launch included");
 	assert.equal(facts.timeline.at(-1)!.text, `lead requested ${shortWorkRef(last)} \u2192 w1`, "and so is the newest milestone (request 119 went to w1)");
 	assert.match(facts.timeline[TEAM_TIMELINE_HEAD]!.text, /^lead requested work \S+ \u2192 w[12]$/u);
+	const cancel = (ref: WorkRef) => assert.equal(action(runtime, boot, ++sequence, `cancel-${ref.workId}`, {
+		action: "control", command: "cancel_work", workId: ref.workId, expectedRevision: 1, reason: "Not needed.",
+	}).ok, true);
+	for (const work of runtime.listWorks(teamId)) cancel(work.work);
+	for (let index = 120; index < 510; index++) cancel(requestAt(index));
+	const retained = runtime.panelFacts(teamId);
+	assert.equal(retained.timeline.length, 1000);
+	assert.equal(retained.timelineOmitted, 22);
+	assert.deepEqual(retained.timeline.slice(0, TEAM_TIMELINE_HEAD), head);
+	assert.match(retained.timeline.at(-1)!.text, /^lead cancelled /u);
+});
+
+test("processStats counts committed waits/questions, versions, results, activations and error replies once", () => {
+	const { runtime, teamId } = makeRuntime();
+	finishManagerBoot(runtime, teamId);
+	const worker = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, worker);
+	const requested = action(runtime, worker, 1, "child", { action: "request", to: "w2", task: "child task" });
+	assert.equal(requested.ok, true);
+	const child = (requested as any).receipt.work;
+	assert.equal(action(runtime, worker, 2, "wait", { action: "yield", waitingFor: [child], checkpoint: "wait" }).ok, true);
+	assert.equal(runtime.processStats(teamId).dependencyWaits, 0, "staged is not committed");
+	settle(runtime, worker, "wait");
+	const peer = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, peer);
+	assert.equal(action(runtime, peer, 1, "question", { action: "yield", attention: "Which input?", checkpoint: "paused" }).ok, true);
+	settle(runtime, peer, "question");
+	const manager = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, manager);
+	const bad = { action: "request", to: "missing", task: "bad" };
+	assert.equal(action(runtime, manager, 1, "bad", bad).ok, false);
+	assert.equal(action(runtime, manager, 1, "bad", bad).ok, false, "cached error is not a second action");
+	assert.equal(action(runtime, manager, 2, "revise", { action: "control", command: "revise_work", workId: child.workId, expectedRevision: 1, task: "Use fixture A", inputRefs: [] }).ok, true);
+	const stats = runtime.processStats(teamId);
+	assert.deepEqual(stats, {
+		works: 2, roots: 1, results: 0, activations: 4, modelTurns: 0,
+		dependencyWaits: 1, questions: 1, revisions: 1, cancelled: 0, toolErrors: 1,
+		memberActivations: new Map([["lead", 2], ["w1", 1], ["w2", 1]]),
+	});
+	assert.equal(action(runtime, manager, 3, "malformed", { action: "unknown" }).ok, false);
+	assert.equal(runtime.processStats(teamId).toolErrors, 2, "codec errors also produce error replies");
+	assert.equal(action(runtime, manager, 4, "idle", { action: "yield" }).ok, true);
+	runtime.nativeSettled(manager.binding, manager.scope.activationId, {
+		status: "success", appliedToolCallId: "idle",
+		usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 2 },
+	});
+	runtime.cleanupFinished(manager.binding, manager.scope.activationId, { ok: true });
+	const revised = runtime.takeNextActivation(teamId)!;
+	reply(runtime, revised, "done", "Fixture A is ready.");
+	assert.equal(runtime.processStats(teamId).results, 1);
+	assert.equal(runtime.processStats(teamId).modelTurns, 2);
+	assert.equal(runtime.processStats(teamId).activations, 5);
 });
 
 test("timeline: a management activation names each event kind once", () => {

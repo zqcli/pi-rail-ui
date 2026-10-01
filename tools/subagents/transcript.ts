@@ -689,11 +689,13 @@ class BoundedTranscriptView implements Component {
 	/** Team member panels keep only the task's first rows when collapsed; other panels show it whole. */
 	renderInitial(width: number): string[] {
 		const entries = this.groups.flatMap((group) => group.entries.filter((entry) => isInitialEntry(entry)));
-		const lines = entries.flatMap((entry) => this.renderEntry(entry, width, true));
-		if (lines.length <= this.initialRows) return lines;
-		const kept = lines.slice(0, this.initialRows);
-		kept[kept.length - 1] = truncateToWidth(`${kept.at(-1)!.trimEnd()} …`, Math.max(1, width), "…");
-		return kept;
+		return entries.flatMap((entry) => {
+			const lines = this.renderEntry(entry, width, true);
+			if (lines.length <= this.initialRows) return lines;
+			const kept = lines.slice(0, this.initialRows);
+			kept[kept.length - 1] = truncateToWidth(`${kept.at(-1)!.trimEnd()} …`, Math.max(1, width), "…");
+			return kept;
+		});
 	}
 
 	private renderEntry(entry: SubagentTranscriptEntry, width: number, unbounded = false): string[] {

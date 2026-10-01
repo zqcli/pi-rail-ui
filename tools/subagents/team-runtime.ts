@@ -39,7 +39,7 @@ function incidentView(incident: TeamIncidentView): TeamIncidentView {
 
 /** Grant reasons are retained in the bounded Team view; keep them short. */
 const TEAM_MAX_GRANT_REASON_BYTES = 512;
-const TEAM_MAX_TIMELINE = 100;
+const TEAM_MAX_TIMELINE = 1000;
 /** Once the timeline is full its first entries stay (a long run keeps its start); the oldest after them go. */
 export const TEAM_TIMELINE_HEAD = 30;
 const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work. "
@@ -256,6 +256,9 @@ interface TeamState {
 	/** Display-only schedule of milestones for the host (bounded: the first TEAM_TIMELINE_HEAD and the newest); never an obligation or a recovery log. */
 	timeline: Array<{ at: number; text: string }>;
 	timelineOmitted: number;
+	dependencyWaits: number;
+	questions: number;
+	toolErrors: number;
 	outcome?: "succeeded" | "partial" | "failed";
 	reason?: string;
 	closeDecision?: CloseDecision;
@@ -419,6 +422,7 @@ export class TeamRuntime {
 			plan: copy(plan), manager: plan.manager.alias, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
+			dependencyWaits: 0, questions: 0, toolErrors: 0,
 		};
 		for (const initial of plan.initialRequests) {
 			const record = this.makeWork(team, team.manager, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
@@ -1329,10 +1333,11 @@ export class TeamRuntime {
 		toolCallId = rpcRequestId,
 	): TeamReply {
 		let memberId = typeof bindingValue?.memberId === "string" ? bindingValue.memberId : "";
+		let team: TeamState | undefined;
 		try {
 			const binding = this.validateBinding(bindingValue);
 			memberId = binding.memberId;
-			const team = this.team(binding.teamId);
+			team = this.team(binding.teamId);
 			const stateVersionBefore = team.stateVersion;
 			const member = this.authenticatedMember(binding);
 			const scope = this.validateScope(scopeValue);
@@ -1360,6 +1365,7 @@ export class TeamRuntime {
 				}
 			} catch (error) {
 				if (!(error instanceof TeamProtocolError)) throw error;
+				team.toolErrors++;
 				reply = errorReply(member.id, error);
 			}
 			this.cacheAction(active, key, fingerprint, reply);
@@ -1370,6 +1376,7 @@ export class TeamRuntime {
 			}
 			return copy(reply);
 		} catch (error) {
+			if (team) team.toolErrors++;
 			return errorReply(memberId, error);
 		}
 	}
@@ -1645,6 +1652,25 @@ export class TeamRuntime {
 	getResult(teamId: string, resultRef: string): ResultRecord | undefined {
 		const result = this.team(teamId).ledger.results.get(resultRef);
 		return result ? copy(result) : undefined;
+	}
+
+	/** Host-only process totals; deliveries and all ledger versions survive activation settlement. */
+	processStats(teamId: string) {
+		const team = this.team(teamId);
+		const records = team.ledger.order.map((id) => team.ledger.get(id)!.record);
+		const memberActivations = new Map<string, number>();
+		for (const delivery of team.deliveries.values()) {
+			memberActivations.set(delivery.memberId, (memberActivations.get(delivery.memberId) ?? 0) + 1);
+		}
+		return {
+			works: records.length, roots: records.filter((record) => !record.parent).length,
+			results: team.ledger.results.size,
+			activations: team.budget.used.teamActivations + team.budget.used.emergencyManagerActivations,
+			modelTurns: team.usage.turns, dependencyWaits: team.dependencyWaits, questions: team.questions,
+			revisions: records.reduce((sum, record) => sum + record.versions.length - 1, 0),
+			cancelled: records.reduce((sum, record) => sum + record.versions.filter((version) => version.state === "cancelled").length, 0),
+			toolErrors: team.toolErrors, memberActivations,
+		};
 	}
 
 	/** Host panel facts outside the member-facing view: waiting Manager events, each author's results, why work is stalled, the milestone timeline. */
@@ -2563,6 +2589,7 @@ export class TeamRuntime {
 		if (intent?.kind === "reply") {
 			this.commitResult(team, member, ref, intent.result, "explicit_reply");
 		} else if (intent?.kind === "yield_dependencies") {
+			team.dependencyWaits++;
 			const record = team.ledger.get(ref.workId)!;
 			delete record.stagedWait;
 			version.waitingFor = intent.waitingFor.filter((dependency) => !version.observedOutcomes.some((observed) => sameWorkRef(observed, dependency)));
@@ -2573,6 +2600,7 @@ export class TeamRuntime {
 			if (allReady && !team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
 			this.updateQuiescence(team);
 		} else if (intent?.kind === "yield_attention") {
+			team.questions++;
 			this.holdWork(team, member, ref, "WORK_HELD", intent.attention, "attention");
 			version.checkpoint = intent.checkpoint;
 			version.waitingFor = [];

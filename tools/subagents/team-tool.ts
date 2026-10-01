@@ -191,11 +191,13 @@ function taskLabel(work: TeamWorkSummary, manager: string): string {
 		+ ` · ${shortWorkRef(work.work)}${work.work.revision > 1 ? " · revised" : ""}`;
 }
 
-/** One line saying where a committed result went; a root's result also says whether the Manager has reviewed it. */
-function resultTarget(record: ResultRecord, works: readonly TeamWorkSummary[]): string {
-	const work = works.find((item) => item.work.workId === record.work.workId)!;
-	const fate = work.work.revision !== record.work.revision ? "superseded" : work.parent ? "" : work.review ?? "awaiting review";
-	return `result → ${work.requester}${fate ? ` · ${fate}` : ""}`;
+/** Destination of the shown task, never the result of a different work. */
+function resultTarget(work: TeamWorkSummary, latest?: ResultRecord): string {
+	const superseded = latest?.work.workId === work.work.workId && latest.work.revision < work.work.revision;
+	const fate = superseded ? `superseded by @${work.work.revision}`
+		: work.review ?? (work.resultRef ? work.parent ? "" : "awaiting review"
+			: work.state === "cancelled" || work.state === "failed" ? work.state : "in progress");
+	return `↳ result → ${work.requester}${fate ? ` · ${fate}` : ""}${work.resultRef ? ` · ${work.resultRef}` : ""}`;
 }
 
 /**
@@ -223,7 +225,7 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 				: member.activity !== "idle" || member.lifecycle === "starting" || member.lifecycle === "closing" ? "running"
 					: member.held ? "held" : member.blocked || member.queued ? "waiting" : "idle",
 			// Like a grouped subagent's final answer: the member's latest result in full, or the Manager's close decision.
-			output: latest ? `${resultTarget(latest, works)}\n${truncateText(formatWorkResult(latest.result), MAX_MEMBER_OUTPUT_BYTES).text}`
+			output: latest ? truncateText(formatWorkResult(latest.result), MAX_MEMBER_OUTPUT_BYTES).text
 				: member.role === "manager" && view.outcome ? view.reason ?? `outcome ${view.outcome}`
 					: activity?.output ?? "",
 			usage, ...(activity ? { durationMs: activity.durationMs } : {}),
@@ -231,7 +233,11 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 			fastModeText: member.policy.fastMode ? "on" : "off", searchModeText: member.policy.searchMode === "on" ? "on" : "off",
 			detail: memberDetail(member, facts, works),
 			transcript: {
-				entries: task ? [{ id: "initial-task", kind: "user", initial: true, label: taskLabel(task, view.manager), text: task.taskPreview, order: 0 }, ...entries] : entries,
+				entries: task ? [
+					{ id: "initial-task", kind: "user", initial: true, label: taskLabel(task, view.manager), text: task.taskPreview, order: 0 },
+					{ id: "result-destination", kind: "note", initial: true, text: resultTarget(task, latest), order: 0 },
+					...entries,
+				] : entries,
 				omittedEntries: activity?.transcript.omittedEntries ?? 0,
 			},
 			...(activity?.isCompacting ? { isCompacting: true } : {}),
@@ -273,6 +279,16 @@ function clock(ms: number): string {
 	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
+/** Bounded status timeline: head 30, newest entries, and one in-place omission marker (100 rows total). */
+export function formatTimeline(timeline: readonly { at: number; text: string }[], omitted: number, origin: number): string[] {
+	const needsMarker = omitted > 0 || timeline.length > 100;
+	const skipped = Math.max(0, timeline.length - (needsMarker ? 99 : 100));
+	const entries = skipped ? [...timeline.slice(0, TEAM_TIMELINE_HEAD), ...timeline.slice(TEAM_TIMELINE_HEAD + skipped)] : timeline;
+	const lines = entries.map((entry) => `- ${clock(entry.at - origin)} ${entry.text}`);
+	if (needsMarker) lines.splice(TEAM_TIMELINE_HEAD, 0, `- … ${omitted + skipped} milestones omitted …`);
+	return lines;
+}
+
 function formatResultRefPage(page: TeamResultRefPage): string[] {
 	const lines = [`Result refs ${page.items.length ? `${page.items[0]!.id}…${page.items.at(-1)!.id}` : "(empty)"} · ${page.total} total`];
 	for (const item of page.items) lines.push(`  ${item.id} · ${item.author} · ${workRefKey(item.work)} · ${item.status}: ${previewText(item.summaryPreview, 240)}`);
@@ -301,36 +317,44 @@ function assertActionParams(params: Params, action: Params["action"]): void {
 }
 
 /**
- * Final launch text, like a grouped subagent's aggregate: TeamResult facts, per-member totals, a timeline,
- * then every Manager-selected worker result in full (bounded; only an oversized record is truncated).
+ * Final launch text: deliverables, process and members, then Manager-selected results in full.
+ * Only oversized results are truncated; the timeline is available through status.
  */
 function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: number): string {
 	const view = host.runtime.getTeam(result.teamId);
 	const facts = host.runtime.panelFacts(result.teamId);
-	const w = view.works;
+	const stats = host.runtime.processStats(result.teamId);
+	const roots = host.runtime.listWorks(result.teamId).filter((work) => !work.parent);
+	const reviewOf = (work: TeamWorkSummary) => result.roots.find((root) => sameWorkRef(root.work, work.work))?.review;
+	const accepted = roots.filter((work) => (reviewOf(work)?.disposition ?? work.review) === "accepted").length;
+	const waived = roots.filter((work) => (reviewOf(work)?.disposition ?? work.review) === "waived").length;
+	const unresolved = result.unresolvedIncidents.length + (result.unresolvedIncidentsOmitted ?? 0);
 	const lines = [
-		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""}${result.reason ? ` · ${previewText(result.reason, TEAM_MAX_NOTE_BYTES)}` : ""}`,
-		`Roots: ${result.roots.map((root) => `${workRefKey(root.work)} ${root.state}${root.review ? ` (${root.review.disposition}${root.review.disposition === "waived" && root.review.reason ? `: ${previewText(root.review.reason, 300)}` : ""})` : ""}`).join(" · ") || "none"}`,
-		`Works: ${w.total} total · resolved ${w.resolved} · failed ${w.failed} · cancelled/superseded ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`,
+		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""} · ${clock(Date.now() - startedAt)}${result.reason ? ` · ${previewText(result.reason, TEAM_MAX_NOTE_BYTES)}` : ""}`,
+		`Deliverables (${roots.length} roots · ${accepted} accepted · ${waived} waived):`,
+		...roots.slice(0, 20).map((work) => {
+			const record = work.resultRef ? host.runtime.getResult(result.teamId, work.resultRef) : undefined;
+			const review = reviewOf(work);
+			const verdict = review?.disposition ?? work.review ?? (work.resultRef ? "awaiting review" : work.state);
+			return `- ${workRefKey(work.work)} ${work.assignee} ← ${work.requester} · ${verdict}${review?.disposition === "waived" && review.reason ? `: ${previewText(review.reason, 300)}` : ""} · ${work.resultRef ?? "no result"} · ${record ? previewText(record.result.summary, 160) : ""}`;
+		}),
+		...(roots.length > 20 ? [`+${roots.length - 20} more roots`] : []),
+		"Process:",
+		`- works ${stats.works} (${stats.roots} roots, ${stats.works - stats.roots} sub-tasks) · results ${stats.results}`,
+		`- activations ${stats.activations} · model turns ${stats.modelTurns} · dependency waits ${stats.dependencyWaits} · questions to the Manager ${stats.questions}`,
+		`- revisions ${stats.revisions} · cancelled ${stats.cancelled} · tool errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
+		`- tokens input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 		"Members:",
 		...view.members.map((member) => {
 			const activity = host.driver.memberActivity(result.teamId, member.id);
-			return `- ${member.id} · ${member.role} · ${member.lifecycle}/${member.resourceState} · ${member.policy.model ?? "model ?"} · FAST ${member.policy.fastMode ? "on" : "off"}`
-				+ ` · ${member.usage.turns} turns${activity ? ` · active ${clock(activity.durationMs)}` : ""} · results ${facts.results.get(member.id)?.count ?? 0}`;
+			return `- ${member.id} · ${member.role} · ${member.policy.model ?? "model ?"}${member.policy.fastMode ? " +FAST" : ""}`
+				+ ` · works done ${facts.results.get(member.id)?.count ?? 0} · activations ${stats.memberActivations.get(member.id) ?? 0} · active ${clock(activity?.durationMs ?? 0)}`;
 		}),
-		`Usage: ${result.usage.turns} turns · input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 	];
 	for (const incident of result.unresolvedIncidents.slice(0, 5)) lines.push(`Unresolved ${incident.code}: ${previewText(incident.message, 200)}`);
 	if (result.unresolvedIncidentsOmitted) lines.push(`${result.unresolvedIncidentsOmitted} additional unresolved incidents omitted from the bounded terminal snapshot.`);
-	const origin = facts.timeline[0]?.at ?? startedAt;
-	const timeline = facts.timeline.map((entry) => `- ${clock(entry.at - origin)} ${entry.text}`);
-	// A full timeline keeps its first entries and the newest; the dropped ones were in between.
-	if (facts.timelineOmitted) timeline.splice(TEAM_TIMELINE_HEAD, 0, `- … ${facts.timelineOmitted} milestones omitted …`);
-	lines.push("Timeline (m:ss from launch):", ...timeline);
-	const unselected = [...facts.results.values()].reduce((total, { count }) => total + count, 0) - result.finalResultRefs.length;
-	if (result.finalResultRefs.length) {
-		lines.push("", `Selected results in full (worker-authored; the Manager does not rewrite them)${unselected > 0 ? `; ${unselected} other committed result(s) via status` : ""}:`);
-	}
+	lines.push("", "Final results selected by the Manager (in full):");
+	const details = `Details on demand: subagent_team status {teamId: "${result.teamId}", resultRef} reads any result in full; subagent_team status {teamId: "${result.teamId}"} returns the Team view and the timeline.`;
 	const blocks = result.finalResultRefs.map((ref) => {
 		const record = host.runtime.getResult(result.teamId, ref);
 		// The worker's own status says nothing about the Manager's verdict on a root.
@@ -342,12 +366,13 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		return { heading, body, overhead: Buffer.byteLength(`\n\n${heading}\n\n${truncated}`, "utf8"), truncated };
 	});
 	// Shorter results stay complete, and only the largest ones share what is left.
-	const available = MAX_FINAL_TEXT_BYTES - Buffer.byteLength(lines.join("\n"), "utf8") - blocks.reduce((sum, block) => sum + block.overhead, 0);
+	const available = MAX_FINAL_TEXT_BYTES - Buffer.byteLength(`${lines.join("\n")}\n\n${details}`, "utf8") - blocks.reduce((sum, block) => sum + block.overhead, 0);
 	const shares = fairShares(blocks.map((block) => jsonTextBytes(block.body)), available, 512);
 	for (const [index, block] of blocks.entries()) {
 		const body = truncateText(block.body, shares[index]!);
 		lines.push("", [block.heading, body.text, ...(body.truncated ? [block.truncated] : [])].join("\n"));
 	}
+	lines.push("", details);
 	return lines.join("\n");
 }
 
@@ -517,7 +542,9 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			if (live) {
 				const current = liveView(host, teamId);
 				const page = host.runtime.listResultRefsPage(teamId, params.cursor?.trim() || undefined);
-				const lines = [...formatTeamView(current.view, current.works, current.holdsTotal, host.runtime.panelFacts(teamId)), ...formatResultRefPage(page)];
+				const facts = host.runtime.panelFacts(teamId);
+				const lines = [...formatTeamView(current.view, current.works, current.holdsTotal, facts), ...formatResultRefPage(page)];
+				if (!params.cursor?.trim()) lines.push("Timeline (m:ss from launch):", ...formatTimeline(facts.timeline, facts.timelineOmitted, facts.timeline[0]?.at ?? 0));
 				return textResult(lines.join("\n"), { ...current, resultPage: page });
 			}
 			const entry = host.history.teams.find((team) => team.teamId === teamId);
@@ -566,11 +593,11 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		description: "Run a Team: one Manager plus 1-8 workers, all new persistent aliases, coordinated through a shared work ledger. "
 			+ "(1) prepare {\"action\":\"prepare\",\"manager\":{\"alias\":\"lead\",\"roleDescription\":\"...\"},\"workers\":[{\"alias\":\"review\",\"roleDescription\":\"...\"}],\"brief\":{\"goal\":\"...\"},\"initialRequests\":[{\"to\":\"review\",\"task\":\"...\"}],\"timeoutSeconds\":null} "
 			+ "validates and pins every member's model, cwd, Fast/Search and context budget, and returns the plan, initial WorkRefs and budget without starting anything. "
-			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with the outcome, per-member totals, a timeline and the full text of every worker result the Manager selected, so no status call is needed to read them. "
-			+ "status (teamId optional) lists Teams; status with teamId pages resultRefs using cursor, or fetches one full worker ResultRecord with resultRef. cancel (teamId, reason) inspects or stops a Team. The Manager assigns, reviews and closes; it does not write a final summary. "
+			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with deliverables, process counts, per-member totals and the full text of every worker result the Manager selected, so no status call is needed to read them. "
+			+ "status (teamId optional) lists Teams; status with teamId returns the Team view and timeline; cursor pages resultRefs, or resultRef fetches one full worker ResultRecord. cancel (teamId, reason) inspects or stops a Team. The Manager assigns, reviews and closes; it does not write a final summary. "
 			+ "The parent model is not woken while launch waits; budget grants and hold releases are host-only (/rail-team).",
 		promptGuidelines: [
-			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected worker results in full and a timeline; use status afterwards only for results it names as truncated or unselected.",
+			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected worker results in full; use status afterwards for the timeline or results it names as truncated or unselected.",
 			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
 			"Role-only workers are valid: they stay idle until the Manager assigns work. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
 			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",

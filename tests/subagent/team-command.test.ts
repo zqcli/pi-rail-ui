@@ -62,6 +62,16 @@ test("rail-team registers ID/subcommand completion and prints every root budget"
 	assert.match(output, /activations 0\//u);
 });
 
+test("budget prints unlimited instead of the raw sentinel limit", async () => {
+	const { host, teamId } = setup([{ to: "worker", task: "root one" }], "unlimited");
+	const { ctx, notifications } = commandContext();
+	await runTeamCommand(host, `${teamId} budget`, ctx);
+	const output = notifications.at(-1)?.text ?? "";
+	assert.match(output, /teamModelRequests: 0\/unlimited/u);
+	assert.match(output, /activations 0\/unlimited/u);
+	assert.doesNotMatch(output, /\/\d{6,}/u);
+});
+
 test("budget grants show exact impacts and require confirmation; headless UI cannot mutate", async () => {
 	const { host, teamId } = setup();
 	host.runtime.launch(teamId);

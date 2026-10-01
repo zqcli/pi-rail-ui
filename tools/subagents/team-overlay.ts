@@ -3,6 +3,7 @@ import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth,
 import type { TeamSessionHost } from "./team-host";
 import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, shortWorkRef, workRefKey, type TeamMemberView, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
+import { memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
 
 const TABS = ["Overview", "Members", "Tasks", "Timeline"] as const;
@@ -99,6 +100,7 @@ export class TeamOverlayComponent implements Focusable {
 	private selected = 0;
 	private offset = 0;
 	private pageSize = 1;
+	private maxSelected = 0;
 	private rows: Row[] = [];
 	private detail: string | undefined;
 	private expanded = new Set<string>();
@@ -164,7 +166,7 @@ export class TeamOverlayComponent implements Focusable {
 		} else if (this.keybindings.matches(data, "tui.select.up") || this.keybindings.matches(data, "tui.select.down") || matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown) || matchesKey(data, Key.home) || matchesKey(data, Key.end)) {
 			const step = this.keybindings.matches(data, "tui.select.up") ? -1 : this.keybindings.matches(data, "tui.select.down") ? 1 : matchesKey(data, Key.pageUp) ? -this.pageSize : this.pageSize;
 			this.selected = matchesKey(data, Key.home) ? 0 : matchesKey(data, Key.end) ? this.rows.length - 1 : this.selected + step;
-			this.selected = Math.max(0, Math.min(this.rows.length - 1, this.selected));
+			this.selected = Math.max(0, Math.min(this.maxSelected, this.selected));
 			this.followTimeline = this.selected === this.rows.length - 1;
 			this.timelineCursor = this.rows[this.selected]?.milestone;
 		} else if (this.keybindings.matches(data, "tui.select.confirm")) {
@@ -221,10 +223,15 @@ export class TeamOverlayComponent implements Focusable {
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
 		const available = Math.max(1, height - 7 - (notice ? 1 : 0) - (omitted ? 1 : 0));
 		const selectable = !!team && !this.detail && this.tab !== 0;
-		this.pageSize = selectable ? Math.max(1, Math.min(8, this.tui.terminal.rows - 13, available)) : available;
+		// The cap keeps the selection details under Members/Tasks; the Timeline has none.
+		const cap = this.tab === 3 ? available : Math.min(8, this.tui.terminal.rows - 13);
+		this.pageSize = selectable ? Math.max(1, Math.min(cap, available)) : available;
 		const details = team && facts && !this.detail ? this.selectionDetails(team, works, facts, inner - 1) : [];
 		const showDetails = details.length > 0 && available >= Math.min(rows.length, this.pageSize) + details.length + 1;
 		this.offset = Math.max(0, Math.min(this.offset, rows.length - this.pageSize));
+		// Without a visible cursor the hidden cursor is the scroll offset, so every key scrolls at once.
+		this.maxSelected = selectable ? rows.length - 1 : Math.max(0, rows.length - this.pageSize);
+		if (!selectable) this.offset = this.selected = Math.min(this.selected, this.maxSelected);
 		if (this.selected < this.offset) this.offset = this.selected;
 		if (this.selected >= this.offset + this.pageSize) this.offset = this.selected - this.pageSize + 1;
 		const body = rows.slice(this.offset, this.offset + this.pageSize).map((row, index) => {
@@ -300,10 +307,7 @@ export class TeamOverlayComponent implements Focusable {
 		const stateWidth = Math.max(1, width - aliasWidth - routeWidth - timeWidth - 8);
 		return rows.map(({ member, route, time }) => {
 			const status = memberStatus(member);
-			const state = member.currentWork ? `running ${shortWorkRef(member.currentWork)}`
-				: member.role === "manager" && facts.managerHandling ? facts.managerHandling
-					: facts.stalled.get(member.id) ?? (member.queued ? "queued for a worker slot" : `idle · ${facts.results.get(member.id)?.count ?? 0} results`);
-			return { member: member.id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${column(member.id, aliasWidth)}  ${column(oneLine(state), stateWidth)}  ${column(route, routeWidth)}  ${time.padStart(timeWidth)}` };
+			return { member: member.id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${column(member.id, aliasWidth)}  ${column(oneLine(memberDetail(member, facts, works)), stateWidth)}  ${column(route, routeWidth)}  ${time.padStart(timeWidth)}` };
 		});
 	}
 

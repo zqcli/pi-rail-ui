@@ -387,7 +387,7 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 	facts.timeline = Array.from({ length: 20 }, (_, index) => ({ at: index * 60_000, text: `milestone ${index}` }));
 	facts.timelineOmitted = 3;
 	host.runtime.panelFacts = () => facts;
-	const ui = overlay(host);
+	const ui = overlay(host, { rows: 20 });
 	t.after(() => ui.component.dispose());
 	ui.key("left");
 	const cursor = () => ui.component.render(100).find((line) => line.startsWith("│ →"))!;
@@ -449,4 +449,51 @@ test("arrows switch views, brackets switch Teams, and configurable select keys a
 	assert.match(ui.text(), /‹ 1\/2 ›/u);
 	ui.component.handleInput("q");
 	assert.deepEqual(ui.closed, [undefined]);
+});
+
+test("Members state shows lifecycle, error and pause instead of idle", (t) => {
+	const { host } = fixture();
+	const original = host.runtime.listTeams.bind(host.runtime);
+	host.runtime.listTeams = () => original().map((team) => ({ ...team, members: team.members.map((member) =>
+		member.id === "runner" ? { ...member, lifecycle: "faulted" as const, activity: "idle" as const, currentWork: undefined, error: { code: "model_error", message: "Provider failed" } }
+			: member.id === "waiter" ? { ...member, lifecycle: "closed" as const, activity: "idle" as const, currentWork: undefined }
+				: member) })) as ReturnType<typeof original>;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	const text = ui.text();
+	assert.match(text, /✗ runner\s+faulted · .*model_error: Provider failed/u);
+	assert.match(text, /✓ waiter\s+closed/u);
+	assert.doesNotMatch(text, /(runner|waiter)\s+idle/u);
+});
+
+test("Timeline pages use the available height instead of eight rows", (t) => {
+	const { host } = fixture();
+	const facts = host.runtime.panelFacts(host.runtime.listTeams()[0]!.teamId);
+	facts.timeline = Array.from({ length: 40 }, (_, index) => ({ at: index * 1000, text: `milestone ${index}` }));
+	host.runtime.panelFacts = () => facts;
+	const ui = overlay(host, { rows: 40 });
+	t.after(() => ui.component.dispose());
+	ui.key("left");
+	const shown = () => ui.component.render(100).filter((line) => /milestone \d+/u.test(line)).length;
+	const page = shown();
+	assert.ok(page > 8, `shown ${page}`);
+	ui.key("pageUp");
+	assert.match(ui.component.render(100).find((line) => line.startsWith("│ →"))!, new RegExp(`milestone ${39 - page}\\b`, "u"));
+});
+
+test("one Down press scrolls an overflowing Overview", (t) => {
+	const { host } = fixture();
+	const ui = overlay(host, { rows: 14 });
+	t.after(() => ui.component.dispose());
+	const first = () => ui.text().split("\n")[4]!;
+	const before = first();
+	ui.key("down");
+	assert.notEqual(first(), before);
+	ui.key("pageDown"); ui.key("pageDown"); ui.key("pageDown"); ui.text();
+	const end = first();
+	ui.key("down");
+	assert.equal(first(), end);
+	ui.key("up");
+	assert.notEqual(first(), end);
 });

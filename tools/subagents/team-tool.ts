@@ -168,7 +168,7 @@ function dispatchedText(manager: string, works: readonly TeamWorkSummary[]): str
 }
 
 /** A member's panel state line: plain words, only the facts that matter now. */
-function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts, works: readonly TeamWorkSummary[]): string {
+export function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts, works: readonly TeamWorkSummary[]): string {
 	const results = facts.results.get(member.id)?.count ?? 0;
 	const resultText = results ? `${results} ${results === 1 ? "result" : "results"}` : "";
 	if (member.lifecycle === "closed") return ["closed", resultText].filter(Boolean).join(" · ");

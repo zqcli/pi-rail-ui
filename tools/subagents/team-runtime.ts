@@ -1,8 +1,8 @@
-import { randomInt, randomUUID } from "node:crypto";
+import { createHash, randomInt, randomUUID } from "node:crypto";
 import {
 	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
-	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_PROTOCOL_VERSION,
+	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_PROTOCOL_VERSION,
 	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, isTerminalWorkState, sameWorkRef,
 	workRefKey, shortWorkRef, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type ActivationInput, type ActivationScope, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
@@ -13,7 +13,7 @@ import {
 } from "./team-protocol";
 import {
 	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeTeamAction, normalizeTeamPlan, normalizeTeamBudgetPreset, parseActivationScope, parseBinding, sameScope,
-	okReply, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
+	okReply, jsonTextBytes, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
 import { WorkLedger } from "./team-work-ledger";
 import { addActivationUsage, emptySubagentUsage } from "./usage";
@@ -110,6 +110,8 @@ export interface TeamRuntimeOptions {
 	activationStopTimeoutMs?: number;
 	/** Synchronous history writer for this runtime generation; critical writes fail closed. */
 	journal?: TeamJournalGeneration;
+	/** Run the full-ledger invariant sweep on hot paths (default true); `assertInvariants` always runs it. */
+	checkInvariants?: boolean;
 }
 
 export interface TeamRuntimeExecutor {
@@ -346,8 +348,10 @@ export class TeamRuntime {
 	private readonly activationStopTimeoutMs: number;
 	private readonly journalGeneration: TeamJournalGeneration | undefined;
 	private journalRetiredForHostTransition = false;
+	private readonly checkInvariants: boolean;
 
 	constructor(options: TeamRuntimeOptions = {}) {
+		this.checkInvariants = options.checkInvariants ?? true;
 		this.journalGeneration = options.journal;
 		this.now = options.now ?? Date.now;
 		this.createId = options.createId ?? randomUUID;
@@ -752,11 +756,12 @@ export class TeamRuntime {
 		if (team.lifecycle !== "active" || team.members.get(team.manager)!.lifecycle !== "open") {
 			fail("MEMBER_UNAVAILABLE", "The Manager cannot receive a host message in its current lifecycle");
 		}
-		const key = `host-message:${canonicalJson(text)}`;
-		const duplicate = team.events.some((event) => event.key === key);
-		const event = this.addEvent(team, { key, kind: "USER_COMMAND", actor: "@host", message: text });
+		// Only a still-pending identical message is a duplicate; a later repeat ("continue") is a new request.
+		const pending = team.events.find((event) => !event.processed && event.kind === "USER_COMMAND" && event.actor === "@host" && event.message === text);
+		if (pending) return { actor: "@host", status: "unchanged", teamId, eventId: pending.id };
+		const event = this.addEvent(team, { key: `host-message:${team.eventSeq}`, kind: "USER_COMMAND", actor: "@host", message: text });
 		this.requestDrain(teamId);
-		return { actor: "@host", status: duplicate ? "unchanged" : "applied", teamId, eventId: event.id };
+		return { actor: "@host", status: "applied", teamId, eventId: event.id };
 	}
 
 	/**
@@ -942,7 +947,7 @@ export class TeamRuntime {
 			const stillHeld = team.ledger.order.some((id) => team.ledger.current(id)?.hold?.incidentId === incident.id);
 			if (lifted && !stillHeld) incident.state = "resolved";
 		}
-		if (!team.incidents.some((incident) => incident.state === "open")) team.health = "ok";
+		this.refreshHealth(team);
 		return released;
 	}
 
@@ -1862,7 +1867,7 @@ export class TeamRuntime {
 	}
 
 	/** Test-only invariant entry point; production callers may use it for diagnostics as well. */
-	assertInvariants(teamId: string): void { this.check(this.team(teamId)); }
+	assertInvariants(teamId: string): void { this.check(this.team(teamId), true); }
 
 	/** Diagnostic count of Runtime-held effects for one Team; a converged terminal Team holds none. */
 	liveEffects(teamId: string): { executor: boolean; scheduledDrain: boolean; closingEffects: number; completionWaiters: number;
@@ -2756,7 +2761,7 @@ export class TeamRuntime {
 		const text = active.native?.finalAssistantText;
 		if (!active.inputReady || active.native?.status !== "success" || active.native.pendingToolCalls || typeof text !== "string" || !text.trim()) return false;
 		const candidate: WorkResult = { status: "succeeded", summary: text.trim() };
-		if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > TEAM_MAX_RESULT_BYTES) return false;
+		if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > TEAM_MAX_RESULT_BYTES || jsonTextBytes(candidate.summary) > TEAM_MAX_TEXT_ITEM_BYTES) return false;
 		const version = team.ledger.version(ref);
 		if (!version) return false;
 		return team.ledger.ownedChildren(ref).every((child) => team.ledger.outcomeReady(child)
@@ -2827,7 +2832,7 @@ export class TeamRuntime {
 			const version = currentVersion(record);
 			return `${id}@${record.currentRevision}:${version.state}:${version.hold?.incidentId ?? ""}:${version.resultRef ?? ""}:${version.review?.disposition ?? ""}:${version.review?.reason ?? ""}`;
 		}).join("|");
-		this.addEvent(team, { key: `quiescent:${signature}`, kind: "TEAM_QUIESCENT", message: "No work is runnable; review blocked work or decide whether to close", });
+		this.addEvent(team, { key: `quiescent:${createHash("sha1").update(signature).digest("hex")}`, kind: "TEAM_QUIESCENT", message: "No work is runnable; review blocked work or decide whether to close", });
 	}
 
 	private cancelDescendants(team: TeamState, ref: WorkRef, state: "cancelled" | "superseded", unknownActiveOutcome = false): void {
@@ -2950,7 +2955,11 @@ export class TeamRuntime {
 	private resolveIncident(team: TeamState, incidentId: string): void {
 		const incident = team.incidents.find((item) => item.id === incidentId);
 		if (incident) incident.state = "resolved";
-		// Faults and stopped members keep the Team flagged; only answered incidents clear it.
+		this.refreshHealth(team);
+	}
+
+	/** Faults and stopped members keep the Team flagged; only answered incidents clear it. */
+	private refreshHealth(team: TeamState): void {
 		if (!team.incidents.some((item) => item.state === "open") && ![...team.members.values()].some((member) => member.error)) team.health = "ok";
 	}
 
@@ -3475,7 +3484,8 @@ export class TeamRuntime {
 		}
 	}
 
-	private check(team: TeamState): void {
+	private check(team: TeamState, force = false): void {
+		if (!this.checkInvariants && !force) return;
 		const ready = new Set<string>();
 		for (const ref of team.ready) {
 			const key = workRefKey(ref);

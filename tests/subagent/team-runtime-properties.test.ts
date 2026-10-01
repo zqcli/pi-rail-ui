@@ -786,7 +786,6 @@ test("X07: a Manager event arriving at any latch of a management activation join
 		assert.equal(events.some((event) => sealed.includes(event.id)), false, "the sealed batch is never redelivered");
 		assert.equal(events[0]?.actor, "@host");
 		toLatch(runtime, next, "reserved", { action: "yield" }, `next-${latch}`)();
-		assert.equal(runtime.messageManager(teamId, `arrived at ${latch}`).status, "unchanged", "a repeated host message is deduplicated");
 		assert.equal(runtime.takeNextActivation(teamId), undefined, "a processed event never wakes the Manager again");
 		runtime.assertInvariants(teamId);
 	}

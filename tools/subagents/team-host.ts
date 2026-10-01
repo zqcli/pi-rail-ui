@@ -31,7 +31,8 @@ export class TeamSessionHost {
 
 	constructor(broker: SessionBroker, sink: TeamJournalSink, branch: readonly BranchEntry[], options: Omit<TeamRuntimeOptions, "journal"> = {}) {
 		this.journal = new TeamJournalGeneration(sink);
-		this.runtime = new TeamRuntime({ ...options, journal: this.journal });
+		// The full-ledger invariant sweep is O(works) per call on the UI thread; tests opt in explicitly.
+		this.runtime = new TeamRuntime({ checkInvariants: false, ...options, journal: this.journal });
 		this.driver = new TeamMemberDriver(this.runtime, broker);
 		let history: TeamHistory;
 		// History is display-only and must never prevent new Teams from starting.

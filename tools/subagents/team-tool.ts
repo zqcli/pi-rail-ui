@@ -11,7 +11,7 @@ import {
 	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
 	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, sameWorkRef, shortWorkRef,
 } from "./team-protocol";
-import { capped, type TeamRuntime } from "./team-runtime";
+import { capped, TEAM_TIMELINE_HEAD, type TeamRuntime } from "./team-runtime";
 import {
 	formatContextWindowForDisplay, markdownThemeFromTheme, resolveTeamMemberPolicy, verifyPinnedTeamMemberPolicy,
 	type ResolvedTeamMemberPolicy,
@@ -323,8 +323,10 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 	for (const incident of result.unresolvedIncidents.slice(0, 5)) lines.push(`Unresolved ${incident.code}: ${previewText(incident.message, 200)}`);
 	if (result.unresolvedIncidentsOmitted) lines.push(`${result.unresolvedIncidentsOmitted} additional unresolved incidents omitted from the bounded terminal snapshot.`);
 	const origin = facts.timeline[0]?.at ?? startedAt;
-	lines.push(`Timeline (m:ss from launch${facts.timelineOmitted ? `; ${facts.timelineOmitted} earlier milestones omitted` : ""}):`,
-		...facts.timeline.map((entry) => `- ${clock(entry.at - origin)} ${entry.text}`));
+	const timeline = facts.timeline.map((entry) => `- ${clock(entry.at - origin)} ${entry.text}`);
+	// A full timeline keeps its first entries and the newest; the dropped ones were in between.
+	if (facts.timelineOmitted) timeline.splice(TEAM_TIMELINE_HEAD, 0, `- … ${facts.timelineOmitted} milestones omitted …`);
+	lines.push("Timeline (m:ss from launch):", ...timeline);
 	const unselected = [...facts.results.values()].reduce((total, { count }) => total + count, 0) - result.finalResultRefs.length;
 	if (result.finalResultRefs.length) {
 		lines.push("", `Selected results in full (worker-authored; the Manager does not rewrite them)${unselected > 0 ? `; ${unselected} other committed result(s) via status` : ""}:`);

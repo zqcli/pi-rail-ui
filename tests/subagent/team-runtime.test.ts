@@ -3,9 +3,9 @@ import { test } from "node:test";
 import {
 	TeamProtocolError, encodeActivationInput, jsonBytes, normalizeTeamAction, normalizeTeamPlan, parseChildFrame, parseParentCommand, parseTeamReply,
 } from "../../tools/subagents/team-codec";
-import { TeamRuntime, handlingText, type RuntimeActivation } from "../../tools/subagents/team-runtime";
+import { TEAM_TIMELINE_HEAD, TeamRuntime, handlingText, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 import {
-	TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_FRAME_BYTES, TEAM_MAX_RESULT_BYTES, shortWorkRef, type TeamBudgetLimits, type WorkRef,
+	TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_FRAME_BYTES, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, shortWorkRef, workRefKey, type TeamBudgetLimits, type WorkRef,
 } from "../../tools/subagents/team-protocol";
 
 function makeRuntime(initialRequests: Array<{ to: string; task: string }> = [{ to: "w1", task: "root work" }],
@@ -132,6 +132,9 @@ test("Manager guidance: management input says to yield instead of polling, and h
 	settle(runtime, boot, "boot-yield");
 
 	const work = runtime.takeNextActivation(teamId)!;
+	assert.ok(work.input.notice.startsWith(`Current work: ${workRefKey(workRef(work))}. Earlier works in this session are finished; answer only this task, not a previous one. `),
+		"the notice names the exact current WorkRef, so a long-lived session does not answer an earlier work");
+	assert.ok(Buffer.byteLength(work.input.notice, "utf8") < TEAM_MAX_NOTE_BYTES, "and still fits the notice bound");
 	assert.match(work.input.notice, /Only the current WorkRef is authorized/u);
 	assert.match(work.input.notice, /An outcome's preview is only its status and summary; read its findings and evidence with status\(result\) before relying on them\./u,
 		"a woken worker is told a preview is not the dependency's full result");
@@ -399,6 +402,43 @@ for (const [kind, list] of Object.entries(ids)) {
 	assert.equal(ids.work.length, 61);
 	assert.equal(shortWorkRef({ workId: ids.work[0]!, revision: 2 }), `work ${ids.work[0]!.slice(5)}@2`, "the display form shows the whole code");
 	assert.equal(shortWorkRef({ workId: "work:3f2a9b1c-0a1b-4c2d-8e3f-123456789abc", revision: 1 }), "work 3f2a9b1c@1", "and still the first 8 characters of an old UUID");
+});
+
+test("timeline: a full timeline keeps its first entries and the newest, and counts the dropped ones in between", () => {
+	const { runtime, teamId } = makeRuntime([]);
+	const boot = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, boot);
+	const requestAt = (index: number) => {
+		const requested = action(runtime, boot, index + 1, `request-${index}`, { action: "request", to: index % 2 ? "w1" : "w2", task: `task ${index}` });
+		return requested.ok && requested.receipt?.status === "accepted" ? requested.receipt.work : assert.fail(JSON.stringify(requested));
+	};
+	for (let index = 0; index < TEAM_TIMELINE_HEAD - 2; index++) requestAt(index);
+	const head = runtime.panelFacts(teamId).timeline;
+	assert.equal(head.length, TEAM_TIMELINE_HEAD, "launch, the Manager's start and the requests so far");
+	assert.equal(runtime.panelFacts(teamId).timelineOmitted, 0);
+	let last!: WorkRef;
+	for (let index = TEAM_TIMELINE_HEAD - 2; index < 120; index++) last = requestAt(index);
+	const facts = runtime.panelFacts(teamId);
+	assert.equal(facts.timeline.length, 100, "the cap is unchanged");
+	assert.equal(facts.timelineOmitted, 120 + 2 - 100);
+	assert.deepEqual(facts.timeline.slice(0, TEAM_TIMELINE_HEAD), head, "the start of the run is kept, launch included");
+	assert.equal(facts.timeline.at(-1)!.text, `lead requested ${shortWorkRef(last)} \u2192 w1`, "and so is the newest milestone (request 119 went to w1)");
+	assert.match(facts.timeline[TEAM_TIMELINE_HEAD]!.text, /^lead requested work \S+ \u2192 w[12]$/u);
+});
+
+test("timeline: a management activation names each event kind once", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "first root" }, { to: "w2", task: "second root" }]);
+	finishManagerBoot(runtime, teamId);
+	const first = runtime.takeNextActivation(teamId)!;
+	const second = runtime.takeNextActivation(teamId)!;
+	reply(runtime, first, "first-reply", "first done");
+	reply(runtime, second, "second-reply", "second done");
+	const manager = runtime.takeNextActivation(teamId)!;
+	const kinds = manager.input.scope.kind === "management" ? manager.input.scope.events.map((event) => event.kind) : [];
+	assert.equal(kinds.filter((kind) => kind === "ROOT_RESULT_READY").length, 2, "the batch carries two events of the same kind");
+	const note = runtime.panelFacts(teamId).timeline.findLast((entry) => entry.text.startsWith("lead management activation"))!.text;
+	assert.equal(note, `lead management activation (${[...new Set(kinds)].join(", ")})`);
+	assert.doesNotMatch(note, /ROOT_RESULT_READY, ROOT_RESULT_READY/u);
 });
 
 test("panel facts name who a blocked member waits on: a peer with its state, at most three names, and the timeline says who", () => {

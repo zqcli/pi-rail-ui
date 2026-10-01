@@ -9,7 +9,7 @@ import { TeamSessionHost } from "../../tools/subagents/team-host";
 import type { SessionBroker } from "../../tools/subagents/session-broker";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
 import { shortWorkRef, workRefKey, type ResultRecord, type TeamResult } from "../../tools/subagents/team-protocol";
-import type { RuntimeActivation } from "../../tools/subagents/team-runtime";
+import { TEAM_TIMELINE_HEAD, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 
 const nativeModel: any = {
 	provider: "cus-resp", id: "gpt-5.6-sol", name: "GPT 5.6 Sol", api: "openai-responses",
@@ -472,6 +472,39 @@ test("launch final text keeps the Manager's verdict: the waive reason, the whole
 	const header = formatTeamView({ ...host.runtime.getTeam(teamId), reason }, [], 0).find((line) => line.startsWith("Reason:"));
 	assert.equal(header, `Reason: ${reason}`, "the Team header's Reason line is not cut at 400 bytes either");
 	assert.ok(Buffer.byteLength(reason, "utf8") > 400);
+});
+
+test("launch final text keeps the start of a long run and marks the dropped milestones in place", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	host.driver.openAndLaunch = async () => {
+		host.runtime.launch(teamId);
+		const boot = host.runtime.takeNextActivation(teamId)!;
+		assert.equal(host.runtime.inputReady(boot.binding, boot.scope.activationId, boot.deliveryId).ok, true);
+		for (let index = 0; index < 60; index++) {
+			const call = `request-${index}`;
+			assert.equal(host.runtime.handleAction(boot.binding, boot.scope, index + 1, call, { action: "request", to: "worker", task: `Part ${index}.` }, call).ok, true);
+		}
+		const call = "boot-yield";
+		assert.equal(host.runtime.handleAction(boot.binding, boot.scope, 61, call, { action: "yield" }, call).ok, true);
+		host.runtime.nativeSettled(boot.binding, boot.scope.activationId, { status: "success", appliedToolCallId: call });
+		host.runtime.cleanupFinished(boot.binding, boot.scope.activationId, { ok: true });
+		completeRoots(host, teamId, (index) => ({ status: "succeeded", summary: `Part ${index} done.` }));
+		return { lifetime: Promise.resolve(terminal(teamId)) };
+	};
+	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
+	const lines: string[] = result.content[0].text.split("\n");
+	const omitted = host.runtime.panelFacts(teamId).timelineOmitted;
+	assert.ok(omitted > 0, "the run produced more milestones than the timeline holds");
+	const at = lines.indexOf("Timeline (m:ss from launch):");
+	assert.ok(at >= 0, "the header no longer carries the omission");
+	const timeline = lines.slice(at + 1);
+	assert.equal(timeline.length, 100 + 1, "the capped timeline plus the marker");
+	assert.match(timeline[0]!, /^- 0:00 launch \u00b7 initial /u, "the run's start is there");
+	assert.equal(timeline[TEAM_TIMELINE_HEAD], `- \u2026 ${omitted} milestones omitted \u2026`, "the marker sits right after the kept first entries");
+	assert.equal(timeline.filter((line) => line.startsWith("- \u2026")).length, 1);
+	assert.ok(timeline.every((line, index) => index === TEAM_TIMELINE_HEAD || /^- \d+:\d\d /u.test(line)));
 });
 
 test("launch panel reuses grouped subagent panels per member, live and after the Team ends", async () => {

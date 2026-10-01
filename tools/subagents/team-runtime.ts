@@ -40,9 +40,13 @@ function incidentView(incident: TeamIncidentView): TeamIncidentView {
 /** Grant reasons are retained in the bounded Team view; keep them short. */
 const TEAM_MAX_GRANT_REASON_BYTES = 512;
 const TEAM_MAX_TIMELINE = 100;
+/** Once the timeline is full its first entries stay (a long run keeps its start); the oldest after them go. */
+export const TEAM_TIMELINE_HEAD = 30;
 const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work. "
 	+ "If it needs another member's conclusion first, yield {waitingFor:[that member's WorkRef from status work], checkpoint}, "
 	+ "or request it from that member and wait on the returned WorkRef, or ask the Manager with yield {attention, checkpoint}. An outcome's preview is only its status and summary; read its findings and evidence with status(result) before relying on them.";
+/** Names the exact work, because a member's session outlives its works and a model may answer an earlier one. */
+const workNotice = (work: WorkRef): string => `Current work: ${workRefKey(work)}. Earlier works in this session are finished; answer only this task, not a previous one. ${WORK_NOTICE}`;
 const MANAGEMENT_NOTICE = "Management activation: there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
 	+ "New results, failures and incidents start the next management activation automatically; do not poll status to wait. "
 	+ "A WORK_HELD event is a member asking for input: answer with resume_work {workId, expectedRevision, incidentId, instruction} "
@@ -146,6 +150,8 @@ interface EventBatch {
 	eventIds: string[];
 }
 
+type WorkScope = Extract<ActivationInput["scope"], { kind: "work" }>;
+
 /** A work that a blocked version still waits on, as the host panel names it. */
 interface WaitedWork {
 	work: WorkRef;
@@ -247,7 +253,7 @@ interface TeamState {
 	journalFailure?: string;
 	journalFailureApplied?: boolean;
 	terminalJournaled?: boolean;
-	/** Display-only schedule of milestones for the host (bounded); never an obligation or a recovery log. */
+	/** Display-only schedule of milestones for the host (bounded: the first TEAM_TIMELINE_HEAD and the newest); never an obligation or a recovery log. */
 	timeline: Array<{ at: number; text: string }>;
 	timelineOmitted: number;
 	outcome?: "succeeded" | "partial" | "failed";
@@ -297,8 +303,10 @@ const plural = (count: number): string => count === 1 ? "" : "s";
 /** At most `cap` items, then "+N more". */
 export const capped = (items: readonly string[], cap: number, separator = ", "): string =>
 	items.slice(0, cap).join(separator) + (items.length > cap ? ` +${items.length - cap} more` : "");
-/** Panel text for what the Manager is processing: the distinct kinds of an event batch. */
-export const handlingText = (events: readonly { kind: string }[]): string => `handling ${capped([...new Set(events.map((event) => event.kind))], 3)}`;
+/** The distinct kinds of an event batch, at most three named. */
+const eventKinds = (events: readonly { kind: string }[]): string => capped([...new Set(events.map((event) => event.kind))], 3);
+/** Panel text for what the Manager is processing. */
+export const handlingText = (events: readonly { kind: string }[]): string => `handling ${eventKinds(events)}`;
 /** Short panel words for a hold that is not a question for the Manager. */
 const HELD_REASON = { budget: "budget exhausted", protocol: "protocol", manager_unavailable: "Manager unavailable" } as const;
 
@@ -2339,7 +2347,7 @@ export class TeamRuntime {
 			budget: team.budget.recordActivation(undefined, true, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
 		member.activity = "running";
-		this.note(team, `${member.id} management activation (${selected.map((event) => event.kind).join(", ")})`);
+		this.note(team, `${member.id} management activation (${eventKinds(selected)})`);
 		this.addDelivery(team, member, scope, input, eventBatch.eventIds);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
@@ -2404,7 +2412,7 @@ export class TeamRuntime {
 			roster: [...team.members.values()].map((item) => ({ id: item.id, role: item.role, lifecycle: item.lifecycle,
 				rolePreview: previewText(item.roleDescription, 512) })),
 			scope: copy(scope), outcomes, omittedOutcomes: 0,
-			ownedChildren, budget, notice: scope.kind === "work" ? WORK_NOTICE : MANAGEMENT_NOTICE,
+			ownedChildren, budget, notice: scope.kind === "work" ? workNotice(scope.work) : MANAGEMENT_NOTICE,
 		};
 		return projectActivationInput(result);
 	}
@@ -2652,11 +2660,11 @@ export class TeamRuntime {
 		this.wakeWaiters(team);
 	}
 
-	/** Host display milestone (wall clock, so the injectable Runtime clock is unaffected); bounded, keeping the launch line. */
+	/** Host display milestone (wall clock, so the injectable Runtime clock is unaffected); bounded, keeping the start and the newest. */
 	private note(team: TeamState, text: string): void {
 		team.timeline.push({ at: Date.now(), text });
 		if (team.timeline.length > TEAM_MAX_TIMELINE) {
-			team.timeline.splice(1, 1);
+			team.timeline.splice(TEAM_TIMELINE_HEAD, 1);
 			team.timelineOmitted++;
 		}
 	}
@@ -3157,14 +3165,14 @@ export class TeamRuntime {
 
 	private assertInputFits(team: TeamState, member: RuntimeMember, work: WorkRecord, parent?: WorkRef): void {
 		const version = currentVersion(work);
-		const scope: ActivationInput["scope"] = {
+		const scope: WorkScope = {
 			kind: "work", work: { workId: work.id, revision: work.currentRevision }, task: version.task,
 			requester: work.requester, rootId: work.rootId, ...(parent ? { parent } : {}), depth: work.depth, inputRefs: version.inputRefs, waitingFor: version.waitingFor,
 		};
 		this.previewInput(team, member, `input-check:${work.id}`, scope);
 	}
 
-	private previewInput(team: TeamState, member: RuntimeMember, deliveryId: string, scope: ActivationInput["scope"]): ActivationInput {
+	private previewInput(team: TeamState, member: RuntimeMember, deliveryId: string, scope: WorkScope): ActivationInput {
 		const input: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
 			member: { id: member.id, role: member.role, roleDescription: member.roleDescription }, brief: copy(team.plan.brief),
@@ -3172,7 +3180,7 @@ export class TeamRuntime {
 			scope, outcomes: [], omittedOutcomes: 0, ownedChildren: [],
 			// Size check only: the largest possible budget summary.
 			budget: { emergency: false, modelRequests: Number.MAX_SAFE_INTEGER, toolCalls: Number.MAX_SAFE_INTEGER, activations: Number.MAX_SAFE_INTEGER },
-			notice: WORK_NOTICE,
+			notice: workNotice(scope.work),
 		};
 		try { encodeActivationInput(input); } catch (error) {
 			if (error instanceof TeamProtocolError) fail("INPUT_BUDGET_EXCEEDED", `Required Team input cannot fit: ${error.message}`);

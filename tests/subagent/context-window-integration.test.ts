@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
 import { SessionAgentRoster } from "../../tools/subagents/session-links";
 import { SessionBroker } from "../../tools/subagents/session-broker";
@@ -14,6 +14,19 @@ import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
 import { RpcSessionWorker, buildRpcWorkerArgs, type RpcEvent } from "../../tools/subagents/rpc-worker";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
+
+// createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
+let isolatedAgentDir = "";
+const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+before(async () => {
+	isolatedAgentDir = await mkdtemp(join(tmpdir(), "rail-isolated-agent-"));
+	process.env["PI_CODING_AGENT_DIR"] = isolatedAgentDir;
+});
+after(async () => {
+	if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+	else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+	await rm(isolatedAgentDir, { recursive: true, force: true });
+});
 
 const bundleCli = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const providerFixture = fileURLToPath(new URL("../fixtures/pi-context-window-stage2.mjs", import.meta.url));

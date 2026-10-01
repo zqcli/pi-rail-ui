@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND as TEAM_COMMAND_V2, TEAM_COMMAND_DESCRIPTION as TEAM_COMMAND_DESCRIPTION_V2, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import { parseParentCommand } from "../../tools/subagents/team-codec";
-import { describe, test } from "node:test";
+import { after, before, describe, test } from "node:test";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { railResponsesWebSocketExtensionPath } from "../../openai/responses-websocket";
@@ -18,6 +21,19 @@ import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools
 import { gptCompactionExtensionPath } from "../../tools/gpt-compaction/extension";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
+
+// createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
+let isolatedAgentDir = "";
+const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+before(async () => {
+	isolatedAgentDir = await mkdtemp(join(tmpdir(), "rail-isolated-agent-"));
+	process.env["PI_CODING_AGENT_DIR"] = isolatedAgentDir;
+});
+after(async () => {
+	if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+	else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+	await rm(isolatedAgentDir, { recursive: true, force: true });
+});
 
 class FakeTransport implements RpcTransport {
 	readonly commands: Array<Record<string, unknown>> = [];

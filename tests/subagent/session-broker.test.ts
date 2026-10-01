@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, test } from "node:test";
+import { after, before, describe, test } from "node:test";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
 import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
@@ -23,6 +23,19 @@ import {
 import type { RailModelRef } from "../../tools/subagents/models";
 import { RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 import type { BindingV2 } from "../../tools/subagents/team-protocol";
+
+// createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
+let isolatedAgentDir = "";
+const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+before(async () => {
+	isolatedAgentDir = await mkdtemp(join(tmpdir(), "rail-isolated-agent-"));
+	process.env["PI_CODING_AGENT_DIR"] = isolatedAgentDir;
+});
+after(async () => {
+	if (previousAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+	else process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+	await rm(isolatedAgentDir, { recursive: true, force: true });
+});
 
 test("ordinary dispatch preserves the native run and usage objects", async () => {
 	const worker = new FakeWorker("ordinary", "/tmp/ordinary.jsonl");

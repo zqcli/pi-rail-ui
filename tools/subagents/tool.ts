@@ -143,7 +143,7 @@ const SubagentParams = Type.Object({
 	chain: Type.Optional(Type.Array(ChainItem, { description: "CHAIN mode: up to 8 steps run in order; {previous} in a step's task is replaced by the previous step's final answer. Leave top-level task empty." })),
 	confirmSessionAttach: Type.Optional(Type.Boolean({
 		default: true,
-		description: "The tool itself shows a confirmation dialog before opening a saved session; leave the default. Do not ask the user yourself.",
+		description: "The tool itself shows a confirmation dialog before opening a saved session; leave the default. Do not ask the user yourself. false is honored only without a UI (headless).",
 	})),
 });
 
@@ -917,7 +917,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		const budgetModels = requestedItems.map((item) => !item.target && item.contextWindow != null ? resolveRailModel(item.model, ctx) : undefined);
 		await validateTaskContextWindows(requestedItems, budgetModels, broker, ctx.cwd);
 		const sessionAttachments = requestedItems.filter((item) => item.session != null);
-		if (sessionAttachments.length > 0 && (params.confirmSessionAttach ?? true)) {
+		if (sessionAttachments.length > 0 && (ctx.hasUI || (params.confirmSessionAttach ?? true))) {
 			if (!ctx.hasUI) throw new Error("Attaching an existing session requires UI confirmation or confirmSessionAttach=false");
 			const approved = await ctx.ui.confirm(
 				"Attach existing session as a Rail model session?",

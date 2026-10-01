@@ -10,7 +10,9 @@ const INTERVAL = 60_000;
 const LATE_MS = 15_000;
 const MAX_TIMER_MS = 2 ** 31 - 1;
 type Mode = { minutes?: number | null | undefined; paused?: string | undefined };
-type Run = { timer?: ReturnType<typeof setTimeout> | undefined; tick?: ReturnType<typeof setTimeout> | undefined; path?: unknown[]; controller: AbortController; isCurrent: () => boolean; nextWarmAt: number; phase: string; [key: string]: any };
+type Run = { timer?: ReturnType<typeof setTimeout> | undefined; tick?: ReturnType<typeof setTimeout> | undefined; path?: unknown[];
+	detachAbort?: (() => void) | undefined;
+	controller: AbortController; isCurrent: () => boolean; nextWarmAt: number; phase: string; [key: string]: any };
 type Warmer = {
 	run?: Run | undefined; sessionManager: unknown; models: { streamSimple: (...args: any[]) => any };
 	getMode: () => string; decide: (event: any) => Promise<string>;
@@ -18,7 +20,9 @@ type Warmer = {
 	refreshDeadlineMissed: (run: Run) => boolean; evaluate: (run: Run) => any; refresh: (run: Run) => Promise<void>;
 	stop: (reason: string) => void; cancel: () => void; clearRun: () => void;
 };
-type State = { manager: any; mode: Mode; session?: AgentSession | undefined; warmer?: Warmer | undefined; unsupported?: string | undefined; restore?: ((keepRun?: boolean) => void) | undefined; notify: (text: string) => void; isIdle: () => boolean };
+type State = { manager: any; mode: Mode; session?: AgentSession | undefined; warmer?: Warmer | undefined; unsupported?: string | undefined;
+	beginWait?: () => void;
+	restore?: ((keepRun?: boolean) => void) | undefined; notify: (text: string) => void; isIdle: () => boolean };
 type Bridge = { pending: Set<State>; original?: AgentSession["prompt"] | undefined; wrapper?: AgentSession["prompt"] | undefined };
 const bridge = createStore<Bridge>("keep-alive-bridge", () => ({ pending: new Set() }));
 const states = createStore<Map<any, State>>("keep-alive-states", () => new Map());
@@ -102,7 +106,7 @@ function pause(state: State, reason: string): void {
 
 /**
  * In manual mode the native warmer keeps its request snapshot, refresh, usage entry and extension decision;
- * Rail replaces only the schedule (a fixed idle interval without TTL metadata or 30/60-minute windows), forces
+ * Rail replaces the schedule (post-response intervals without TTL metadata or 30/60-minute windows), forces
  * the decision to warm, and pauses visibly where the native best-effort path would silently retry or stop.
  */
 function bind(state: State, session: AgentSession, resumed?: Run): void {
@@ -130,6 +134,21 @@ function bind(state: State, session: AgentSession, resumed?: Run): void {
 			continuationProbability: NaN, expectedSavings: NaN, economicsAvailable: false, action: "stop" };
 	};
 	const snapshot = () => contextEntries(state.manager).map(entryKey);
+	// A completed parent response opens a safe waiting window, even while Pi still says "working"
+	// (tools, Team launch, or async turn hooks). start() closes it before the next model request.
+	const canWarmWhileWorking = (run: Run) => run.phase === "waiting" && !session.isCompacting
+		&& !session.agent.signal?.aborted && !session.agent.state.streamingMessage;
+	state.beginWait = () => {
+		const run = w.run;
+		if (!manual() || !run || run.phase !== "streaming" || state.mode.paused) return;
+		const signal = session.agent.signal;
+		if (signal?.aborted || !run.isCurrent()) { w.cancel(); return; }
+		run.phase = "waiting";
+		const abort = () => { if (w.run === run) w.cancel(); };
+		signal?.addEventListener("abort", abort, { once: true });
+		run.detachAbort = () => signal?.removeEventListener("abort", abort);
+		w.schedule(run);
+	};
 	/** Refresh after `delay`; the footer countdown is re-rendered at each whole minute before it. */
 	const arm = (run: Run, delay: number) => {
 		clearTimeout(run.timer);
@@ -154,10 +173,10 @@ function bind(state: State, session: AgentSession, resumed?: Run): void {
 	Object.defineProperty(w, "status", { configurable: true, get() {
 		const run = w.run;
 		if (!manual() || !run || !run.isCurrent()) return nativeStatus.call(w);
-		if (run.phase !== "idle") return { state: "inactive", reason: "Rail manual: waiting for agent settlement" };
+		if (run.phase !== "idle" && run.phase !== "waiting") return { state: "inactive", reason: "Rail manual: waiting for agent settlement" };
 		return { state: run.timer === undefined ? "refreshing" : "scheduled",
 			nextWarmAt: run.nextWarmAt, decision: nativeEconomics(run), extensionOverride: true,
-			reason: `Rail manual ${state.mode.minutes}m idle interval`, manual: true };
+			reason: `Rail manual ${state.mode.minutes}m ${run.phase === "waiting" ? "tool wait" : "idle"} interval`, manual: true };
 	} });
 	w.start = function(request, isCurrent) {
 		if (state.mode.minutes === null) { w.stop("Rail keep-alive off"); changed(state); return; }
@@ -173,20 +192,26 @@ function bind(state: State, session: AgentSession, resumed?: Run): void {
 		const run: Run = { ...request, controller: new AbortController(), phase: "streaming", nextWarmAt: 0, extensionOverride: false, path: snapshot(),
 			isCurrent: () => session.model?.provider === request.model?.provider && session.model?.id === request.model?.id
 				&& extendsSnapshot(state.manager, run.path!) };
-		// Only settlement schedules the idle interval; there is no streaming timer.
+		// No timer during model generation. message_end arms it, before tools start executing.
 		w.run = run;
 		changed(state);
 	};
 	w.onAgentSettled = function() {
 		if (!manual()) { original.onAgentSettled.call(w); return; }
 		if (!w.run || state.mode.paused) return;
-		w.run.path = snapshot();
-		w.run.phase = "idle";
-		w.schedule(w.run);
+		const run = w.run;
+		if (!run.isCurrent()) { w.cancel(); return; }
+		run.detachAbort?.();
+		run.detachAbort = undefined;
+		const alreadyWaiting = run.phase === "waiting";
+		run.phase = "idle";
+		// Do not reset the post-response countdown (or overlap an in-flight warm) on settlement.
+		if (!alreadyWaiting) w.schedule(run);
+		else changed(state);
 	};
 	w.schedule = function(run) {
 		if (!manual()) { original.schedule.call(w, run); return; }
-		if (w.run !== run || state.mode.paused) return;
+		if (w.run !== run || state.mode.paused || (run.phase !== "idle" && run.phase !== "waiting")) return;
 		arm(run, state.mode.minutes! * INTERVAL);
 	};
 	w.refreshDeadlineMissed = function(run) {
@@ -204,6 +229,7 @@ function bind(state: State, session: AgentSession, resumed?: Run): void {
 		return action;
 	};
 	w.clearRun = function() {
+		w.run?.detachAbort?.();
 		clearTimeout(w.run?.tick);
 		original.clearRun.call(w);
 		if (manual()) changed(state);
@@ -216,7 +242,7 @@ function bind(state: State, session: AgentSession, resumed?: Run): void {
 			if (w.run === run) pause(state, errorText(error));
 			throw error;
 		};
-		if (!state.isIdle()) fail(new Error("session is busy; send a fresh real request"));
+		if (!state.isIdle() && !(run && canWarmWhileWorking(run))) fail(new Error("session is busy; send a fresh real request"));
 		let stream: any;
 		try { stream = original.models.streamSimple(...args); } catch (error) { fail(error); }
 		return { result: async () => {
@@ -255,17 +281,18 @@ export function keepAliveStatus(manager: any): string | undefined {
 	if (paused) return `KA ${minutes}m PAUSED (${paused})`;
 	const run = state.warmer?.run;
 	if (!run) return `KA ${minutes}m WAIT (fresh real request required)`;
-	if (run.phase !== "idle") return `KA ${minutes}m WAIT (agent running)`;
-	return run.timer === undefined ? `KA ${minutes}m WARM` : `KA ${minutes}m WAIT (next ${new Date(run.nextWarmAt).toLocaleTimeString()})`;
+	if (run.phase !== "idle" && run.phase !== "waiting") return `KA ${minutes}m WAIT (agent running)`;
+	const waiting = run.phase === "waiting" ? " · waiting for tools / turn completion" : "";
+	return (run.timer === undefined ? `KA ${minutes}m WARM` : `KA ${minutes}m WAIT (next ${new Date(run.nextWarmAt).toLocaleTimeString()})`) + waiting;
 }
 
-/** Footer form `KA <interval>|<minutes to the next refresh>`: 0 while refreshing, `-` until a real request settles. */
+/** Footer form `KA <interval>|<minutes to the next refresh>`: 0 while refreshing, `-` during model generation. */
 export function keepAliveLabel(manager: any): string | undefined {
 	const state = states().get(manager);
 	const minutes = state?.mode.minutes;
 	if (!state || !minutes) return undefined;
 	const run = state.warmer?.run;
-	const next = state.mode.paused ? "PAUSED" : run?.phase !== "idle" ? "-" : run.timer === undefined ? "0"
+	const next = state.mode.paused ? "PAUSED" : !run || (run.phase !== "idle" && run.phase !== "waiting") ? "-" : run.timer === undefined ? "0"
 		: String(Math.max(0, Math.ceil((run.nextWarmAt - Date.now()) / INTERVAL)));
 	return `KA ${minutes}|${next}`;
 }
@@ -304,14 +331,24 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
 		state.mode.paused = undefined;
 		changed(state);
 	};
-	// A new request, model, branch or compaction replaces the cached prefix; the next real request re-arms.
-	pi.on("input", (_event, ctx) => { invalidate(ctx); });
+	pi.on("message_end", (event, ctx) => {
+		if (event.message.role !== "assistant") return; // Child progress and tool results do not warm the parent's cache.
+		if (["error", "aborted"].includes(event.message.stopReason)) invalidate(ctx);
+		else states().get(ctx.sessionManager)?.beginWait?.();
+	});
+	// Queued steering/follow-ups do not replace the request until the tool batch ends. A real request
+	// still cancels the old timer in start(), and model/branch/compaction changes invalidate immediately.
+	pi.on("input", (_event, ctx) => {
+		if (states().get(ctx.sessionManager)?.warmer?.run?.phase !== "waiting") invalidate(ctx);
+	});
 	pi.on("before_agent_start", (_event, ctx) => { invalidate(ctx); });
+	// Close the waiting window before async request/context preparation, not just at streamFn.
+	pi.on("turn_start", (_event, ctx) => { invalidate(ctx); });
 	pi.on("model_select", (_event, ctx) => { invalidate(ctx); });
 	pi.on("session_tree", (_event, ctx) => { invalidate(ctx); });
 	pi.on("session_before_compact", (_event, ctx) => { invalidate(ctx); });
 	pi.registerCommand("rail-keep-alive", {
-		description: "Session-only paid idle cache refresh: N minutes, off, or status",
+		description: "Session-only paid cache refresh while idle or waiting for tools: N minutes, off, or status",
 		getArgumentCompletions: (prefix) => ["30", "50", "off", "status"]
 			.filter((value) => value.startsWith(prefix.trim()))
 			.map((value) => ({ value, label: value })),

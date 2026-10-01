@@ -51,14 +51,15 @@ function harness() {
 	const command = async (args: string) => commands.get("rail-keep-alive")!(args, ctx);
 	const request = { model: { provider: "test", id: "model", api: "openai-responses", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, context: { messages: [{ role: "system", content: "secret" }] }, options: { onPayload: () => {}, onResponse: () => {}, headers: { token: "local" } } };
 	// AgentSession.model reads agent.state.model.
-	const agent = { state: { model: request.model } };
+	const parentController = new AbortController();
+	const agent = { state: { model: request.model, streamingMessage: undefined as any }, signal: parentController.signal };
 	Object.defineProperty(session, "agent", { value: agent });
 	const originalPrompt = AgentSession.prototype.prompt;
 	const originalDispose = AgentSession.prototype.dispose;
 	AgentSession.prototype.prompt = async () => {};
 	AgentSession.prototype.dispose = () => {};
 	installRailKeepAlive(pi);
-	return { warmer, session, agent, manager, ctx, emit, emitAt, command, request, calls, notices, completions: (prefix: string) => argumentCompletions?.(prefix).map((item) => item.value), setIdle: (value: boolean) => { idle = value; }, registerHook: (name: string, fn: Function) => pi.on(name as any, fn as any), setResult(value: any) { result = value; }, async begin() {
+	return { warmer, session, agent, parentController, manager, ctx, emit, emitAt, command, request, calls, notices, completions: (prefix: string) => argumentCompletions?.(prefix).map((item) => item.value), setIdle: (value: boolean) => { idle = value; }, registerHook: (name: string, fn: Function) => pi.on(name as any, fn as any), setResult(value: any) { result = value; }, async begin() {
 		await emit("session_start", { reason: "startup" });
 		await session.prompt("capture without real request");
 	}, cleanup: async () => { await emit("session_shutdown"); AgentSession.prototype.prompt = originalPrompt; AgentSession.prototype.dispose = originalDispose; } };
@@ -223,12 +224,184 @@ function handlersStop(h: ReturnType<typeof harness>) {
 	});
 }
 
+const responseEnded = (h: ReturnType<typeof harness>, stopReason = "toolUse") =>
+	h.emit("message_end", { message: { role: "assistant", stopReason } });
+
+test("completed responses warm while working for hours; sibling tools, progress and queued input do not reset the interval", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("50"); h.setIdle(false);
+		h.warmer.start(h.request, () => true);
+		t.mock.timers.tick(60 * 60_000); await flush();
+		assert.equal(h.calls.length, 0, "no warm during a long model response");
+		await responseEnded(h);
+		const deadline = h.warmer.run.nextWarmAt;
+		assert.equal(keepAliveLabel(h.manager), "KA 50|50");
+		assert.match(keepAliveStatus(h.manager)!, /waiting for tools/);
+		assert.equal(h.session.cacheWarmingStatus!.state, "scheduled");
+		for (let cycle = 0; cycle < 4; cycle++) {
+			for (const toolName of ["subagent", "subagent_team", "bash"]) {
+				await h.emit("tool_execution_start", { toolName, toolCallId: toolName });
+				t.mock.timers.tick(10 * 60_000);
+				await h.emit("tool_execution_update", { toolName, toolCallId: toolName });
+				await h.emit("input", { text: "queued follow-up", source: "interactive" });
+				await h.emit("message_end", { message: { role: "toolResult", toolCallId: toolName } });
+				await h.emit("tool_execution_end", { toolName, toolCallId: toolName });
+			}
+			assert.equal(keepAliveLabel(h.manager), "KA 50|20");
+			assert.equal(h.warmer.run.nextWarmAt, deadline + cycle * 50 * 60_000);
+			t.mock.timers.tick(20 * 60_000); await flush();
+			assert.equal(h.calls.length, cycle + 1, "one loop for all tools; continues past 1h/3h");
+			assert.equal(keepAliveLabel(h.manager), "KA 50|50");
+		}
+		assert.equal(h.manager.entries.filter(e => e.type === "usage").length, 4);
+		assert.equal(h.calls[0].context, h.request.context, "replay the parent's request, not child progress/results");
+		assert.equal(h.calls[0].options.maxTokens, 1);
+	} finally { await h.cleanup(); }
+});
+
+test("settlement preserves the post-response deadline and an in-flight refresh", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("3"); h.setIdle(false);
+		h.warmer.start(h.request, () => true); await responseEnded(h, "stop");
+		t.mock.timers.tick(60_000);
+		h.setIdle(true); h.warmer.onAgentSettled();
+		assert.equal(keepAliveLabel(h.manager), "KA 3|2", "settling does not restart the interval");
+		t.mock.timers.tick(120_000); await flush();
+		assert.equal(h.calls.length, 1);
+		h.setIdle(false); h.warmer.start(h.request, () => true); await responseEnded(h);
+		let resolve!: (result: any) => void;
+		const result = new Promise(r => { resolve = r; });
+		h.setResult(result);
+		t.mock.timers.tick(180_000); await flush();
+		assert.equal(h.calls.length, 2);
+		h.setIdle(true); h.warmer.onAgentSettled();
+		assert.equal(keepAliveLabel(h.manager), "KA 3|0", "settlement cannot schedule a second refresh over the first");
+		resolve({ stopReason: "stop", provider: "test", model: "model", usage: { input: 1, cost: { total: 0 } } });
+		await flush();
+		assert.equal(keepAliveLabel(h.manager), "KA 3|3");
+	} finally { await h.cleanup(); }
+});
+
+test("new parent requests abort pending warms; late results cannot pause or reschedule the replacement", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("1"); h.setIdle(false);
+		let resolve!: (result: any) => void;
+		h.setResult(new Promise(r => { resolve = r; }));
+		h.warmer.start(h.request, () => true); await responseEnded(h);
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 1);
+		const old = h.warmer.run;
+		h.warmer.start({ ...h.request, context: { messages: ["new request"] } }, () => true);
+		assert.equal(old.controller.signal.aborted, true);
+		resolve({ stopReason: "aborted" }); await flush();
+		assert.equal(keepAliveLabel(h.manager), "KA 1|-");
+		assert.equal(h.notices.some(n => n.includes("PAUSED")), false);
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 1, "nothing scheduled during the replacement model request");
+		h.setResult({ stopReason: "stop", provider: "test", model: "model", usage: { input: 1, cost: { total: 0 } } });
+		await responseEnded(h);
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 2);
+		assert.deepEqual(h.calls[1].context.messages, ["new request"]);
+		assert.equal(h.manager.entries.filter(e => e.type === "usage").length, 1);
+	} finally { await h.cleanup(); }
+});
+
+test("cancelling a waiting parent immediately aborts its warm and does not re-arm at settlement", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("1"); h.setIdle(false);
+		let resolve!: (result: any) => void;
+		h.setResult(new Promise(r => { resolve = r; }));
+		h.warmer.start(h.request, () => true); await responseEnded(h);
+		const old = h.warmer.run;
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 1);
+		h.parentController.abort();
+		assert.equal(old.controller.signal.aborted, true);
+		assert.equal(h.warmer.run, undefined);
+		resolve({ stopReason: "aborted" }); await flush();
+		h.setIdle(true); h.warmer.onAgentSettled();
+		t.mock.timers.tick(120_000); await flush();
+		assert.equal(h.calls.length, 1);
+		assert.equal(h.manager.entries.filter(e => e.type === "usage").length, 0);
+	} finally { await h.cleanup(); }
+});
+
+test("compaction, model/tree changes, off and shutdown invalidate a waiting snapshot", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("1"); h.setIdle(false);
+		for (const event of ["session_before_compact", "model_select", "session_tree", "session_shutdown"]) {
+			h.warmer.start(h.request, () => true); await responseEnded(h);
+			const old = h.warmer.run;
+			assert.equal(keepAliveLabel(h.manager), "KA 1|1", event);
+			await h.emit(event);
+			assert.equal(old.controller.signal.aborted, true, event);
+			t.mock.timers.tick(60_000); await flush();
+			assert.equal(h.calls.length, 0, event);
+		}
+		await h.begin();
+		h.warmer.start(h.request, () => true); await responseEnded(h);
+		await h.command("off");
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 0);
+	} finally { await h.cleanup(); }
+});
+
+test("failed parent responses and context rewrites cannot become replayable at settlement", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("1");
+		for (const stopReason of ["error", "aborted"]) {
+			h.warmer.start(h.request, () => true); await responseEnded(h, stopReason);
+			h.warmer.onAgentSettled();
+			t.mock.timers.tick(60_000); await flush();
+			assert.equal(h.calls.length, 0);
+		}
+		h.warmer.start(h.request, () => true); await responseEnded(h);
+		h.manager.entries.push({ id: "edit", type: "context_edit", targetId: "original", replacement: null });
+		h.warmer.onAgentSettled();
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 0, "settlement must not bless a rewritten prefix by replacing the snapshot path");
+	} finally { await h.cleanup(); }
+});
+
+test("a decision pending during tool wait cannot send after a new request or compaction", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin(); await h.command("1"); h.setIdle(false);
+		let release!: () => void;
+		h.registerHook("cache_warming_decision", () => new Promise(resolve => { release = () => resolve({ action: "warm" }); }));
+		for (const event of ["request", "turn_start", "session_before_compact"]) {
+			h.warmer.start(h.request, () => true); await responseEnded(h);
+			t.mock.timers.tick(60_000); await flush();
+			assert.equal(typeof release, "function", "the post-response countdown must reach the decision hook");
+			if (event === "request") h.warmer.start(h.request, () => true);
+			else await h.emit(event);
+			release(); await flush();
+			t.mock.timers.tick(120_000); await flush(); // A slow request-preparation hook must not keep the old timer alive.
+			assert.equal(h.calls.length, 0);
+		}
+	} finally { await h.cleanup(); }
+});
+
 test("branch/model/compaction/input invalidate while preserving session choice", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
 		await h.begin(); await h.command("1");
-		for (const event of ["input", "before_agent_start", "model_select", "session_tree", "session_before_compact"]) {
+		for (const event of ["input", "before_agent_start", "turn_start", "model_select", "session_tree", "session_before_compact"]) {
 			h.warmer.start(h.request, () => true); h.warmer.onAgentSettled();
 			await h.emit(event);
 			t.mock.timers.tick(60_000); await flush();

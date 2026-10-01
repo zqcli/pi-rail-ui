@@ -165,7 +165,7 @@ Only `wss:` endpoints ending in `/responses` are accepted. Models not listed in 
 
 ### `/rail-ui`
 
-Toggles the extension on or off for the current UI session.
+Toggles the extension on or off. It requires the interactive TUI (elsewhere it only prints a warning). The toggle is not persistent: `/new`, `/resume` and `/reload` reset it to on.
 
 ### `/rail-oai-compaction`
 
@@ -188,8 +188,10 @@ Duplicates the current session as a sibling session (sharing the same parent).
 The new session:
 - Inherits all conversation history, compaction records, model changes, and thinking level changes from the source session.
 - Shares the same `parentSession` as the source, making it a sibling rather than a child.
-- Appears above the source session in `/resume` (sorted by creation time).
-- Can be switched to using `/resume <session-id>`.
+- Opens at the latest entry of the source session, not at the position currently selected with `/tree`.
+- Is not switched to automatically; pick it from Pi's `/resume` session picker (Pi has no `/resume <session-id>`).
+
+Before the first assistant reply there is nothing to duplicate (Pi has not written the session file yet), and the command says so.
 
 This is useful for exploring alternative approaches or experimenting with different continuations from the same conversation state.
 
@@ -209,7 +211,7 @@ Rail reuses Pi 0.87.1's live session CacheWarmer, its provider request with a on
 
 ### `/rail-session`
 
-Shows the current Rail session in a Pi-native overlay that refreshes every second: **Now** (model and thinking level, context usage, keep-alive `KA N|M` with its state, queued messages), **Usage** (messages, tokens, cache hit rate, cost), **Workspace** (directory and branch, session ID, full session file path), every active **Tool**, and each **Extension** status. Wide terminals put Now and Usage side by side; when the content is taller than the terminal, scroll with ↑/↓, j/k, PgUp/PgDn, Space, Home/End. Esc, Enter or q closes it.
+Shows the current Rail session in a Pi-native overlay that refreshes every second: **Now** (model and thinking level, context usage, keep-alive `KA N|M` with its state, queued messages), **Usage** (messages, tokens, cache hit rate, cost), **Workspace** (directory and branch, session ID, full session file path), every active **Tool**, and each **Extension** status. Wide terminals put Now and Usage side by side; when the content is taller than the terminal, scroll with ↑/↓, j/k, PgUp/PgDn, Space, Home/End. Esc, Enter or q closes it. The overlay follows terminal resizes while it is open.
 
 ### `/rail-oai-fast`
 

@@ -50,6 +50,19 @@ async function runDuplicate(manager: SessionManager, sessionDir: string, beforeF
 	return { notifications, newFilePath: join(sessionDir, added!), ctx };
 }
 
+test("duplicate before the first assistant reply explains why there is nothing to copy", async (t) => {
+	const sessionDir = await makeSessionDir(t);
+	const source = SessionManager.create(join(sessionDir, "project"), sessionDir);
+	source.appendMessage({ role: "user", content: "first prompt", timestamp: 1 });
+	const notifications: Array<[string, string]> = [];
+	const ctx: any = { sessionManager: source, ui: { notify: (text: string, level: string) => notifications.push([text, level]) } };
+
+	await handleDuplicateCommand(ctx);
+
+	assert.deepEqual(notifications, [["Nothing to duplicate yet: the session has no assistant reply.", "warning"]]);
+	assert.deepEqual(await readdir(sessionDir), []);
+});
+
 test("duplicate of a child session creates a sibling under the same original parent", async (t) => {
 	const sessionDir = await makeSessionDir(t);
 	const cwd = join(sessionDir, "project");

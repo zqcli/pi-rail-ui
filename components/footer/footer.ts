@@ -7,17 +7,16 @@ import { keepAliveLabel, keepAliveStatus, onKeepAliveChange } from "../../comman
 import { railOaiSearchFooterLabel } from "../../commands/rail-oai-search";
 import {
 	collectFooterLiveState,
-	collectFooterUsageStats,
 	collectRailSessionSnapshot,
 	footerUsageEntries,
 	formatCost,
 	formatNum,
-	renderRailSessionContent,
 	usageStatsFromEntries,
 	type FooterLiveState,
 	type FooterUsageStats,
 	type RailSessionSnapshot,
-} from "./footer-session-presenter";
+} from "./footer-session-snapshot";
+import { pad, renderRailSessionContent } from "./rail-session-presenter";
 
 type FooterStore = {
 	turnStartTime?: number | undefined;
@@ -26,8 +25,8 @@ type FooterStore = {
 };
 
 const FOOTER_STORE_KEY = Symbol.for("pi-rail-ui.footer-state");
-const MODAL_MIN_WIDTH = 56;
-const MODAL_MAX_WIDTH = 120;
+/** Pi's overlay layout clamps this to the live terminal minus the margin on every frame. */
+const MODAL_OVERLAY_OPTIONS = { anchor: "center", width: 120, maxHeight: "100%", margin: 1 } as const;
 /** The open panel re-reads the session this often so countdowns, context and statuses stay current. */
 const MODAL_REFRESH_MS = 1000;
 
@@ -168,41 +167,6 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 	return [fitAligned(left, fittedRight, width)];
 }
 
-type RailSessionOverlayOptions = {
-	anchor: "center";
-	width: number;
-	maxHeight: number;
-	margin: number;
-};
-
-function resolveRailSessionOverlayOptions(): RailSessionOverlayOptions {
-	const terminalWidth =
-		typeof process.stdout.columns === "number" && Number.isFinite(process.stdout.columns)
-			? process.stdout.columns
-			: 120;
-	const terminalHeight =
-		typeof process.stdout.rows === "number" && Number.isFinite(process.stdout.rows)
-			? process.stdout.rows
-			: 36;
-
-	const margin = 1;
-	const availableWidth = Math.max(MODAL_MIN_WIDTH, terminalWidth - margin * 2);
-	const width = Math.max(MODAL_MIN_WIDTH, Math.min(MODAL_MAX_WIDTH, availableWidth));
-	const availableHeight = Math.max(12, terminalHeight - margin * 2);
-	const maxHeight = availableHeight;
-
-	return { anchor: "center", width, maxHeight, margin };
-}
-
-function modalFit(text: string, width: number): string {
-	return truncateToWidth(text, Math.max(0, width), "…", true);
-}
-
-function modalPad(text: string, width: number): string {
-	const fitted = modalFit(text, width);
-	return `${fitted}${" ".repeat(Math.max(0, width - visibleWidth(fitted)))}`;
-}
-
 export class RailSessionModal implements Component {
 	private scroll = 0;
 	private lastPage = 1;
@@ -229,7 +193,7 @@ export class RailSessionModal implements Component {
 		const innerWidth = Math.max(1, frameWidth - 2);
 		const contentWidth = Math.max(1, innerWidth - 2);
 		const border = (text: string) => this.theme.fg("border", text);
-		const row = (content: string) => `${border("│")}${modalPad(` ${content}`, innerWidth)}${border("│")}`;
+		const row = (content: string) => `${border("│")}${pad(` ${content}`, innerWidth)}${border("│")}`;
 		const content = renderRailSessionContent(this.snapshot, this.theme, contentWidth);
 		const page = Math.max(1, (typeof this.maxHeight === "function" ? this.maxHeight() : this.maxHeight) - 4);
 		this.lastPage = page;
@@ -278,7 +242,6 @@ export async function openRailSessionModal(ctx: ExtensionCommandContext, pi: Ext
 		return;
 	}
 
-	const overlayOptions = resolveRailSessionOverlayOptions();
 	let stop = () => {};
 	try {
 		await ctx.ui.custom<void>(
@@ -287,7 +250,7 @@ export async function openRailSessionModal(ctx: ExtensionCommandContext, pi: Ext
 				let unsubscribe = () => {};
 				stop = () => { clearInterval(timer); unsubscribe(); };
 				const modal = new RailSessionModal(railSessionSnapshot(ctx, pi), theme,
-					() => resolveRailSessionOverlayOptions().maxHeight, () => done(), () => stop());
+					() => tui.terminal.rows - 2 * MODAL_OVERLAY_OPTIONS.margin, () => done(), () => stop());
 				const refresh = () => {
 					// A reload or session switch can hide the panel without closing it; its ctx is then stale.
 					try { modal.update(railSessionSnapshot(ctx, pi)); } catch { stop(); return; }
@@ -298,22 +261,11 @@ export async function openRailSessionModal(ctx: ExtensionCommandContext, pi: Ext
 				unsubscribe = onKeepAliveChange(ctx.sessionManager, refresh);
 				return modal;
 			},
-			{ overlay: true, overlayOptions },
+			{ overlay: true, overlayOptions: MODAL_OVERLAY_OPTIONS },
 		);
 	} finally {
 		stop();
 	}
-}
-
-export function renderFooter(
-	width: number,
-	ctx: ExtensionContext,
-	pi: ExtensionAPI,
-	footerData: ReadonlyFooterDataProvider,
-	stats: FooterUsageStats = collectFooterUsageStats(ctx),
-	style: FooterStyle = RAIL_FOOTER_STYLE,
-): string[] {
-	return renderSimpleFooter(width, collectFooterLiveState(ctx, pi, footerData), stats, style, keepAliveLabel(ctx.sessionManager));
 }
 
 class RailFooterComponent {

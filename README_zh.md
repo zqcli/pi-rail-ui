@@ -164,7 +164,7 @@ Rail 可按 provider/model 白名单把 HTTP SSE 替换为原生 Responses WebSo
 
 ### `/rail-ui`
 
-用于在当前 UI 会话中启用或禁用该扩展。
+用于启用或禁用该扩展，需要交互式 TUI（其他模式下只会给出警告）。开关不持久：`/new`、`/resume` 和 `/reload` 都会将其重置为开启。
 
 ### `/rail-oai-compaction`
 
@@ -187,8 +187,10 @@ Rail 可按 provider/model 白名单把 HTTP SSE 替换为原生 Responses WebSo
 新 session 的特点：
 - 继承源 session 的所有会话历史、compaction 记录、model 切换、thinking level 切换。
 - 和源 session 共享相同的 `parentSession`，因此是同级关系而非父子关系。
-- 在 `/resume` 中排在源 session 上方（按创建时间排序）。
-- 可通过 `/resume <session-id>` 切换到新 session。
+- 打开时位于源 session 的最新 entry，而不是当前在 `/tree` 中选中的位置。
+- 不会自动切换过去；请在 Pi 的 `/resume` session 选择器中选择它（Pi 没有 `/resume <session-id>`）。
+
+在第一条 assistant 回复之前没有可复制的内容（Pi 尚未写入 session 文件），命令会明确提示。
 
 该命令适用于从相同会话状态探索不同方案或实验不同的后续对话。
 
@@ -208,7 +210,7 @@ Rail 复用 Pi 0.87.1 当前实例的 CacheWarmer、以一 token 为*输出预�
 
 ### `/rail-session`
 
-使用 Pi 原生 overlay 显示当前 Rail session，每秒自动刷新：**Now**（模型与思考级别、上下文占用、keep-alive `KA N|M` 及其状态、排队消息）、**Usage**（消息、token、缓存命中率、费用）、**Workspace**（目录与分支、session ID、完整 session 文件路径），以及全部已启用的 **Tools** 和每条 **Extension** 状态。宽终端下 Now 与 Usage 并排显示；内容超过终端高度时可用 ↑/↓、j/k、PgUp/PgDn、空格、Home/End 滚动。Esc、Enter 或 q 关闭。
+使用 Pi 原生 overlay 显示当前 Rail session，每秒自动刷新：**Now**（模型与思考级别、上下文占用、keep-alive `KA N|M` 及其状态、排队消息）、**Usage**（消息、token、缓存命中率、费用）、**Workspace**（目录与分支、session ID、完整 session 文件路径），以及全部已启用的 **Tools** 和每条 **Extension** 状态。宽终端下 Now 与 Usage 并排显示；内容超过终端高度时可用 ↑/↓、j/k、PgUp/PgDn、空格、Home/End 滚动。Esc、Enter 或 q 关闭。打开期间会随终端尺寸变化自动调整。
 
 ### `/rail-oai-fast`
 

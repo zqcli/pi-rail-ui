@@ -40,7 +40,7 @@ function fit(text: string, width: number): string {
 	return truncateToWidth(text, Math.max(0, width), "…", true);
 }
 
-function pad(text: string, width: number): string {
+export function pad(text: string, width: number): string {
 	const fitted = fit(text, width);
 	return `${fitted}${" ".repeat(Math.max(0, width - visibleWidth(fitted)))}`;
 }

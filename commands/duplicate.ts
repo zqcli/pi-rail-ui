@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
@@ -9,17 +9,19 @@ export async function handleDuplicateCommand(ctx: ExtensionContext): Promise<voi
 		return;
 	}
 
+	// Pi writes the session file only once the first assistant message arrives.
+	if (!existsSync(currentSessionFile)) {
+		ctx.ui.notify("Nothing to duplicate yet: the session has no assistant reply.", "warning");
+		return;
+	}
+
 	try {
 		const currentCwd = ctx.sessionManager.getCwd();
 		const sessionDir = ctx.sessionManager.getSessionDir();
 		const parentSession = ctx.sessionManager.getHeader()?.parentSession;
 
 		const newSessionManager = SessionManager.forkFrom(currentSessionFile, currentCwd, sessionDir);
-		const newSessionFile = newSessionManager.getSessionFile();
-		if (!newSessionFile) {
-			ctx.ui.notify("Failed to create session file", "error");
-			return;
-		}
+		const newSessionFile = newSessionManager.getSessionFile()!;
 
 		// forkFrom points parentSession at the source, which would make the copy
 		// a child. Rewrite the header so the copy shares the source's parent and

@@ -62,11 +62,10 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		await installCommandOutputRail();
 	}
 
-	function uninstall(ctx: ExtensionContext) {
-		if (ctx.mode !== "tui") return;
+	// Pi owns session replacement, terminal input, and renderer cleanup. Rail
+	// only tears down its style and narrow interaction patches.
+	function uninstallRails() {
 		setRailUiActive(false);
-		ctx.ui.setEditorComponent(undefined);
-		ctx.ui.setFooter(undefined);
 		uninstallGutter();
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();
@@ -75,9 +74,19 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		uninstallCommandOutputRail();
 	}
 
+	function uninstall(ctx: ExtensionContext) {
+		uninstallRails();
+		ctx.ui.setEditorComponent(undefined);
+		ctx.ui.setFooter(undefined);
+	}
+
 	pi.registerCommand("rail-ui", {
 		description: "Toggle Pi rail UI",
 		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/rail-ui requires interactive TUI mode.", "warning");
+				return;
+			}
 			enabled = !enabled;
 			if (enabled) {
 				await install(ctx);
@@ -140,15 +149,7 @@ export default async function piRailUi(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event) => {
-		setRailUiActive(false);
-		// Pi owns session replacement, terminal input, and renderer cleanup. Rail
-		// only tears down its style and narrow interaction patches.
-		uninstallGutter();
-		uninstallAssistantMessageRail();
-		uninstallUserMessageRail();
-		uninstallExecutionRails();
-		uninstallResourceStatusRail();
-		uninstallCommandOutputRail();
+		uninstallRails();
 		enabled = true;
 	});
 

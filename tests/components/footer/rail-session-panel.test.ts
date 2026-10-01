@@ -93,6 +93,32 @@ test("rail session overlay scrolls to the rows that no longer fit instead of dro
 	assert.match(resized.render(92).join("\n"), /1-20\/\d+ · ↑↓/);
 });
 
+test("the panel opens with constant overlay options and sizes its page from the live terminal rows", async (t) => {
+	t.mock.timers.enable({ apis: ["setInterval"] });
+	const ctx: any = {
+		mode: "tui", cwd: "/tmp/project", model: { id: "m", provider: "p" }, modelRegistry: { isUsingOAuth: () => false },
+		getContextUsage: () => ({ tokens: 1, contextWindow: 10, percent: 10 }), isIdle: () => true, hasPendingMessages: () => false,
+		sessionManager: { getCwd: () => "/tmp/project", getSessionId: () => "s", getSessionFile: () => undefined, getSessionName: () => undefined, getBranch: () => [], getEntries: () => [] },
+		ui: { custom: undefined as any },
+	};
+	const pi: any = { getThinkingLevel: () => "off", getActiveTools: () => [], getAllTools: () => [] };
+	let options: any;
+	let panel: any;
+	const terminal = { rows: 20 };
+	ctx.ui.custom = (factory: any, custom: any) => new Promise<void>((resolve) => {
+		options = custom;
+		panel = factory({ requestRender: () => {}, terminal }, theme, undefined, () => { panel.dispose(); resolve(); });
+	});
+	const opened = openRailSessionModal(ctx, pi);
+	// Pi re-resolves these against the live terminal each frame, so nothing is frozen at open time.
+	assert.deepEqual(options, { overlay: true, overlayOptions: { anchor: "center", width: 120, maxHeight: "100%", margin: 1 } });
+	assert.equal(panel.render(92).length, 18);
+	terminal.rows = 14;
+	assert.equal(panel.render(92).length, 12);
+	panel.handleInput("q");
+	await opened;
+});
+
 test("the open panel refreshes each second and stops when closed or when its session goes stale", async (t) => {
 	t.mock.timers.enable({ apis: ["setInterval"] });
 	let stale = false;

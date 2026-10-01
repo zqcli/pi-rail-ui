@@ -122,10 +122,8 @@ function assertBoundTeamHelper(observed: ObservedRegistrations): void {
 	assert.equal(observed.activeTools.includes("subagent"), false);
 	assert.equal(observed.activeTools.includes("subagent_team"), false);
 	const team = observedTool(observed, "team");
-	const fields = Object.keys((team.parameters["properties"] as object | undefined) ?? {});
-	assert.equal(team.parameters["type"], "object");
-	assert.ok(["action", "command", "waitingFor", "resultRefs"].every((field) => fields.includes(field)), "the child helper registers the flat v2 action object");
-	assert.equal(fields.includes("afterSeq"), false);
+	const actions = (team.parameters["anyOf"] as any[] | undefined)?.map((branch) => branch?.properties?.action?.const);
+	assert.deepEqual([...new Set(actions)].sort(), ["control", "reply", "request", "status", "yield"], "the child helper registers only the v2 action union");
 	assert.match(team.description, /reply, yield, and close_team must be the only tool call in their finalized assistant batch/u);
 	assert.match(team.description, /Team v2 work ledger/u);
 }

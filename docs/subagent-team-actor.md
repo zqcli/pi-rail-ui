@@ -40,7 +40,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 
 ## 3. 成员工具 `team`
 
-它的 schema 是一个扁平对象（`action` 必填，其余字段可选；provider 只发送顶层 `properties`），各动作的字段归属与互斥由 codec 和 Runtime 校验，只在 Team 绑定期间可用。Manager 只装载 `team`；worker 保留宿主允许的基础工具，但不能使用 `subagent` 和 `subagent_team`。旧动作 `send`/`report`/`wait`/`finish`/`afterSeq`/`supersedes` 会返回迁移错误。
+这是一个判别联合，只在 Team 绑定期间可用。Manager 只装载 `team`；worker 保留宿主允许的基础工具，但不能使用 `subagent` 和 `subagent_team`。旧动作 `send`/`report`/`wait`/`finish`/`afterSeq`/`supersedes` 会返回迁移错误。
 
 ```json
 {"action":"request","to":"review","task":"核对错误路径","inputRefs":[]}

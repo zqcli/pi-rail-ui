@@ -4,11 +4,11 @@ import { Check } from "typebox/value";
 import {
 	errorReply, jsonBytes, jsonTextBytes, normalizeTeamAction, parseParentCommand, parseTeamReply,
 	projectActivationInput, projectErrorText, projectOwnedChildren, projectWorkChildren, projectWorkError,
-	TEAM_ACTION_FIELDS, TEAM_TOOL_SCHEMA, TeamProtocolError,
+	TEAM_TOOL_SCHEMA, TeamProtocolError,
 } from "../../tools/subagents/team-codec";
 import {
 	TEAM_MAX_ACTION_BYTES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_FRAME_BYTES, TEAM_MAX_NOTE_BYTES,
-	TEAM_MAX_OWNED_CHILD_PREVIEWS, TEAM_MAX_PUBLIC_CHILDREN, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_STATUS_MAX_LIMIT,
+	TEAM_MAX_OWNED_CHILD_PREVIEWS, TEAM_MAX_PUBLIC_CHILDREN, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_STATUS_MAX_LIMIT,
 	type ActivationInput, type BindingV2, type ParentCommand, type TeamWorkSummary, type TeamWorkView, type WorkRef,
 } from "../../tools/subagents/team-protocol";
 
@@ -148,43 +148,13 @@ test("activation projection budgets combined errors and previews, without droppi
 	assert.throws(() => projectActivationInput(impossible), (error: unknown) => error instanceof TeamProtocolError && error.code === "INPUT_BUDGET_EXCEEDED");
 });
 
-test("the model-facing schema is one flat object that leaves cross-field rules to the codec and Runtime", () => {
-	const schema = TEAM_TOOL_SCHEMA as any;
-	assert.equal(schema.type, "object");
-	assert.deepEqual(schema.required, ["action"]);
-	assert.deepEqual(Object.keys(schema.properties).sort(), ["action", ...TEAM_ACTION_FIELDS].sort());
-	assert.ok(Buffer.byteLength(JSON.stringify(schema)) < 6 * 1024, "the schema is sent on every member request");
+test("the model-facing schema requires a checkpoint on work yields, as the Runtime does", () => {
 	const ref = { workId: "work:1", revision: 1 };
-	for (const action of [
-		{ action: "request", to: "w1", task: "do it", inputRefs: ["result:1"] },
-		{ action: "reply", result: { status: "succeeded", summary: "done", evidence: [{ source: "a", basis: "observed" }] } },
-		{ action: "yield", waitingFor: [ref], checkpoint: "step 1 done" },
-		{ action: "yield", attention: "decide scope", checkpoint: "step 1 done" },
-		{ action: "yield" },
-		{ action: "status" },
-		{ action: "status", view: "work", id: "work:1", limit: 5 },
-		{ action: "status", view: "result", cursor: "c1" },
-		{ action: "control", command: "pause_member", memberId: "w1" },
-		{ action: "control", command: "resume_member", memberId: "w1" },
-		{ action: "control", command: "revise_work", workId: "work:1", expectedRevision: 1, task: "redo", inputRefs: ["result:1"] },
-		{ action: "control", command: "cancel_work", workId: "work:1", expectedRevision: 1, reason: "duplicate" },
-		{ action: "control", command: "resume_work", workId: "work:1", expectedRevision: 1, incidentId: "incident:1", instruction: "retry" },
-		{ action: "control", command: "accept_result", work: ref, disposition: "waived", reason: "duplicate" },
-		{ action: "control", command: "close_member", memberId: "w1" },
-		{ action: "control", command: "close_team", resultRefs: ["result:1"], outcome: "succeeded" },
-	]) {
-		assert.equal(Check(schema, action), true, JSON.stringify(action));
-		assert.doesNotThrow(() => normalizeTeamAction(action), JSON.stringify(action));
-	}
-	assert.equal(Check(schema, { action: "yield", waitingFor: [ref] }), true, "a missing checkpoint is the Runtime's message to give");
-	assert.equal(Check(schema, { action: "send", to: "w1", task: "x" }), true, "legacy actions reach the codec's migration message");
-	assert.equal(Check(schema, { action: "request", message: "hi" }), true, "legacy fields reach the codec's migration message");
-	assert.equal(Check(schema, { to: "w1", task: "x" }), false);
-	assert.equal(Check(schema, { action: "request", to: "w1", task: "x".repeat(TEAM_MAX_TASK_BYTES + 1) }), false);
-	assert.equal(Check(schema, { action: "status", limit: TEAM_STATUS_MAX_LIMIT + 1 }), false);
-	assert.equal(Check(schema, { action: "status", view: "everything" }), false);
-	assert.equal(Check(schema, { action: "control", command: "close_team", outcome: "great" }), false);
-	assert.equal(Check(schema, { action: "yield", waitingFor: [{ workId: "work:1", revision: 0 }] }), false);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", waitingFor: [ref] }), false);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", attention: "decide scope" }), false);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", waitingFor: [ref], checkpoint: "step 1 done" }), true);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield", attention: "decide scope", checkpoint: "step 1 done" }), true);
+	assert.equal(Check(TEAM_TOOL_SCHEMA, { action: "yield" }), true, "the Manager's plain yield stays valid");
 });
 
 test("schema-valid ~1.32 MB result is INVALID_ARGUMENT before a private frame can be built", () => {

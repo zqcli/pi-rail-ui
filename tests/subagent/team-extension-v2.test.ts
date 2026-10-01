@@ -5,7 +5,6 @@ import install from "../../tools/subagents/team-extension-v2";
 import { TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_DESCRIPTION, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
 import type { BindingV2, ParentCommand, PrivateReply } from "../../tools/subagents/team-protocol";
 import { jsonBytes, parseChildFrame, TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "../../tools/subagents/team-codec";
-import { validateToolArguments } from "@earendil-works/pi-ai";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import { TeamRpcV2Connection } from "../../tools/subagents/team-rpc-v2";
 import type { RpcEvent, RpcTransport } from "../../tools/subagents/rpc-worker";
@@ -96,11 +95,10 @@ async function waitForRequest(h: ReturnType<typeof harness>, action: string, aft
 	throw new Error(`No private request for ${action}`);
 }
 
-test("Team v2 tool schema is one flat object and bind selects role-specific tools", async () => {
-	// Providers such as anthropic-messages send only top-level `properties`/`required`.
-	assert.equal((TEAM_TOOL_SCHEMA as any).type, "object");
-	assert.ok(Object.keys((TEAM_TOOL_SCHEMA as any).properties).length > 20);
-	assert.equal((TEAM_TOOL_SCHEMA as any).anyOf, undefined);
+test("Team v2 tool schema is a strict action union and bind selects role-specific tools", async () => {
+	const variants = (TEAM_TOOL_SCHEMA as any).anyOf;
+	assert.ok(Array.isArray(variants) && variants.length >= 20);
+	assert.ok(variants.every((variant: any) => variant.type === "object" && variant.additionalProperties === false));
 	assert.match(TEAM_TOOL_DESCRIPTION, /pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team/u);
 
 	const worker = harness("worker");
@@ -257,59 +255,6 @@ test("execute rejects malformed and oversized business arguments locally, and th
 	assert.equal(result.details.ok, true);
 	assert.equal(result.terminate, undefined);
 	assert.equal(h.aborts(), 0);
-});
-
-/** The model path: Pi validates the arguments against the registered schema, then the extension's execute runs. */
-async function modelCall(h: ReturnType<typeof harness>, id: string, args: unknown): Promise<{ ok: true; result: any } | { ok: false; message: string }> {
-	const tool = h.tools.get("team");
-	const validated = validateToolArguments(tool, { type: "toolCall", id, name: "team", arguments: args } as any);
-	h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name: "team" }] } });
-	const answered = h.privateFrames().filter((frame) => frame.kind === "request").length;
-	const settled = tool.execute(id, validated, h.ctx.signal, () => undefined, h.ctx)
-		.then((result: unknown) => ({ ok: true as const, result }), (error: Error) => ({ ok: false as const, message: error.message }));
-	const frame = await waitForRequest(h, "business", answered).catch(() => undefined);
-	if (frame) {
-		const reply = h.runtime.handleAction(frame.binding, frame.activation, frame.sequence, frame.rpcRequestId, frame.request.args, frame.request.toolCallId);
-		await replyToRequest(h, frame, { kind: "business", reply }, `reply-${id}`);
-	}
-	return settled;
-}
-
-async function readyHarness(role: BindingV2["role"]) {
-	const h = harness(role);
-	await h.command(bindCommand(h));
-	await h.command(activateCommand(h));
-	assert.equal(h.runtime.inputReady(h.binding, h.activation.scope.activationId, h.activation.deliveryId).ok, true);
-	return h;
-}
-
-test("common model mistakes reach the codec and Runtime messages through Pi's validator", async () => {
-	const worker = await readyHarness("worker");
-	const manager = await readyHarness("manager");
-	const failure = async (h: typeof worker, id: string, args: unknown) => {
-		const outcome = await modelCall(h, id, args);
-		assert.equal(outcome.ok, false, JSON.stringify(args));
-		return outcome.ok ? undefined! : JSON.parse(outcome.message) as { code: string; message: string };
-	};
-	const noCheckpoint = await failure(worker, "yield-1", { action: "yield", waitingFor: [{ workId: "work:1", revision: 1 }] });
-	assert.deepEqual(noCheckpoint, { code: "INVALID_ARGUMENT", message: "Work yield requires waitingFor and checkpoint, or attention and checkpoint" });
-	const legacyAction = await failure(manager, "send-1", { action: "send", to: "w1", task: "x" });
-	assert.deepEqual(legacyAction, { code: "INVALID_ARGUMENT", message: "send was replaced by request {to, task}; a reply never creates a new request" });
-	const legacyField = await failure(manager, "message-1", { action: "request", to: "w1", task: "x", message: "hi" });
-	assert.deepEqual(legacyField, { code: "INVALID_ARGUMENT", message: "message was removed: use request.task, reply.result or yield.attention" });
-	const noResultRefs = await failure(manager, "close-1", { action: "control", command: "close_team", outcome: "succeeded" });
-	assert.equal(noResultRefs.code, "INVALID_TEAM_OUTCOME");
-	assert.match(noResultRefs.message, /at least one final resultRef/u);
-	const wrongField = await failure(manager, "field-1", { action: "status", workId: "work:1" });
-	assert.deepEqual(wrongField, { code: "INVALID_ARGUMENT", message: "workId is not used by status; omit it or pass null" });
-	assert.equal(manager.aborts() + worker.aborts(), 0);
-});
-
-test("null for an unused optional field is treated as omitted before the codec", async () => {
-	const h = await readyHarness("manager");
-	const outcome = await modelCall(h, "status-null", { action: "status", view: null, id: null, cursor: null, limit: null, to: null, result: null });
-	assert.equal(outcome.ok, true);
-	if (outcome.ok) assert.equal(outcome.result.details.ok, true);
 });
 
 test("child validation keeps flat control wire arguments for independent parent normalization", async () => {

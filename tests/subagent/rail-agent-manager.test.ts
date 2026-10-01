@@ -147,6 +147,19 @@ test("safe session linking selects a Pi model and defaults to fork", async () =>
 	assert.equal(state.editorText, `@agent/${state.attached[0].alias} `);
 });
 
+test("default alias uses the random tail of a time-ordered session id", async () => {
+	const aliases: string[] = [];
+	for (const id of ["01890a5d-ac96-774b-bcce-b302099a8057", "01890a5d-ac96-774b-bcce-b302099a9999"]) {
+		const { ctx, runtime, state } = rpcSetup((title, options) => {
+			if (title === "Rail agents") return options.find((option) => option.startsWith("Link saved session"));
+			return options[0];
+		});
+		await runRailAgentManager(ctx as any, runtime as any, { listSessions: async () => [{ ...savedSession, id }] });
+		aliases.push(state.attached[0].alias);
+	}
+	assert.deepEqual(aliases, ["gpt-5.6-sol-9a8057", "gpt-5.6-sol-9a9999"]);
+});
+
 test("starting a persistent session selects a model and defers creation until task submission", async () => {
 	const { ctx, runtime, state } = rpcSetup(
 		(title, options) => title === "Rail agents" ? options.find((item) => item.startsWith("Start persistent")) : options[0],

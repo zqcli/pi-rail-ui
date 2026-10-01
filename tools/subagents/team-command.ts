@@ -41,7 +41,7 @@ export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionH
 }
 
 export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: ExtensionCommandContext): Promise<void> {
-	if (!args.trim() && ctx.hasUI) {
+	if (!args.trim() && ctx.mode === "tui") {
 		const choice = await showTeamOverlay(ctx, host);
 		if (!choice) return;
 		let text = "";

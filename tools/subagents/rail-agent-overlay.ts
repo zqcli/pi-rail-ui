@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { ExtensionCommandContext, KeybindingsManager, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
-import { Input, Key, matchesKey, stripTerminalSequences, truncateToWidth, type Focusable, type TUI } from "@earendil-works/pi-tui";
+import { Input, Key, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import type { RailAgentManager, RailAgentManagerSnapshot, RailAgentPhase, RailAgentView } from "./agent-manager";
 import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { assertValidAgentAlias } from "./identity";
@@ -14,12 +14,14 @@ import {
 } from "./models";
 
 const MAX_VISIBLE_ROWS = 8;
+const FAST_MODE_UNSUPPORTED = "Fast mode requires a GPT model using a supported native OpenAI API";
 const TABS = ["current", "all", "create"] as const;
 type OverlayTab = typeof TABS[number];
 type EditField = "alias" | "cwd" | "task";
 type Picker =
 	| { kind: "model"; targetAgentId?: string; query: Input; selected: number }
 	| { kind: "session"; query: Input; selected: number };
+type Confirmation = { title: string; detail: string; action: () => Promise<void> };
 type ControlComposer = {
 	agentId: string;
 	alias: string;
@@ -50,12 +52,12 @@ interface CreateForm {
 
 function compact(value: string, maxLength = 80): string {
 	const oneLine = stripTerminalSequences(value).replace(/\s+/gu, " ").trim();
-	return oneLine.length <= maxLength ? oneLine : `${oneLine.slice(0, maxLength - 3)}...`;
+	return truncateToWidth(oneLine, maxLength, "...");
 }
 
 function defaultAlias(modelId: string, seed: string): string {
 	const base = modelId.replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^[._-]+|[._-]+$/gu, "").slice(0, 36) || "model";
-	const suffix = seed.replace(/[^A-Za-z0-9]+/gu, "").slice(0, 6).toLowerCase() || Date.now().toString(36).slice(-6);
+	const suffix = seed.replace(/[^A-Za-z0-9]+/gu, "").slice(-6).toLowerCase() || Date.now().toString(36).slice(-6);
 	return `${base}-${suffix}`;
 }
 
@@ -97,13 +99,14 @@ function fit(content: string, width: number): string {
 
 export class RailAgentOverlayComponent implements Focusable {
 	private snapshot: RailAgentManagerSnapshot;
-	private tab: OverlayTab;
+	private tab: OverlayTab = "current";
 	private selectedIndex = 0;
 	private readonly searchInput = new Input();
 	private searching = false;
 	private picker: Picker | undefined;
 	private edit: { field: EditField; input: Input } | undefined;
 	private control: ControlComposer | undefined;
+	private confirmation: Confirmation | undefined;
 	private form: CreateForm;
 	private formIndex = 0;
 	private aliasEdited = false;
@@ -127,10 +130,8 @@ export class RailAgentOverlayComponent implements Focusable {
 		private readonly ctx: ExtensionCommandContext,
 		private readonly options: RailAgentOverlayOptions,
 		initialSnapshot: RailAgentManagerSnapshot,
-		initialTab: OverlayTab = "current",
 	) {
 		this.snapshot = initialSnapshot;
-		this.tab = initialTab;
 		this.sessions = options.sessions ?? [];
 		this.sessionsLoaded = options.sessions !== undefined;
 		const model = options.models[0] ?? { provider: "unavailable", modelId: "no-authenticated-model" };
@@ -169,6 +170,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			this.renderSoon();
 			return;
 		}
+		if (this.confirmation) return this.handleConfirmInput(data);
 		if (this.picker) return this.handlePickerInput(data);
 		if (this.edit) return this.handleEditInput(data);
 		if (this.control) return this.handleControlInput(data);
@@ -197,12 +199,13 @@ export class RailAgentOverlayComponent implements Focusable {
 		lines.push(line(` ${this.theme.fg("accent", this.theme.bold("Rail Agents"))}  ${this.renderTabs()}`));
 		lines.push(line(` ${this.theme.fg("dim", this.summaryText())}`));
 		lines.push(line());
-		if (this.picker) lines.push(...this.renderPicker(innerWidth).map(line));
+		if (this.confirmation) lines.push(...this.renderConfirmation(innerWidth).map(line));
+		else if (this.picker) lines.push(...this.renderPicker(innerWidth).map(line));
 		else if (this.tab === "create") lines.push(...this.renderForm(innerWidth).map(line));
 		else lines.push(...this.renderAgents(innerWidth).map(line));
 		const notice = this.busy ? this.notice : this.refreshError ?? this.notice;
 		if (notice) lines.push(line(` ${this.theme.fg("warning", compact(notice, innerWidth - 2))}`));
-		lines.push(line(` ${this.theme.fg("dim", this.helpText())}`));
+		for (const help of this.helpLines()) lines.push(line(` ${this.theme.fg("dim", help)}`));
 		lines.push(border(`╰${"─".repeat(innerWidth)}╯`));
 		return lines;
 	}
@@ -300,6 +303,14 @@ export class RailAgentOverlayComponent implements Focusable {
 		return lines;
 	}
 
+	private renderConfirmation(innerWidth: number): string[] {
+		const { title, detail } = this.confirmation!;
+		return [
+			` ${this.theme.fg("warning", this.theme.bold(title))}`,
+			...detail.split("\n").flatMap((row) => wrapTextWithAnsi(row, Math.max(1, innerWidth - 2)).map((part) => ` ${part}`)),
+		];
+	}
+
 	private renderPicker(innerWidth: number): string[] {
 		const picker = this.picker!;
 		const models = picker.kind === "model" ? this.filteredModels(picker.query.getValue()) : [];
@@ -337,19 +348,23 @@ export class RailAgentOverlayComponent implements Focusable {
 		}
 		fields.push(
 			{ id: "cwd", label: "Cwd", value: this.form.cwd },
-			{ id: "task", label: this.form.mode === "new" ? "First task" : "First task", value: this.form.task || (this.form.mode === "new" ? "(required)" : "(optional)") },
+			{ id: "task", label: "First task", value: this.form.task || (this.form.mode === "new" ? "(required)" : "(optional)") },
 			{ id: "fastMode", label: "Fast", value: this.form.fastMode ? "On" : "Off" },
 			{ id: "submit", label: "Action", value: this.form.mode === "new" || this.form.task.trim() ? "Create & Run" : "Adopt & Link" },
 		);
 		return fields;
 	}
 
-	private helpText(): string {
-		if (this.picker) return "type to filter · ↑↓ navigate · enter select · esc back";
-		if (this.edit) return "enter apply · esc cancel";
-		if (this.control) return "type message · enter send · esc cancel";
-		if (this.tab === "create") return "↑↓ fields · enter edit/open · shift+f fast · ←→ or tab switch tabs · esc close";
-		return "/ search · ↑↓ select · enter continue/link · g steer · f follow-up · shift+f fast · m model · t thinking · s stop · d detach · x delete · n new";
+	private helpLines(): string[] {
+		if (this.confirmation) return ["y confirm · n/esc cancel"];
+		if (this.picker) return ["type to filter · ↑↓ navigate · enter select · esc back"];
+		if (this.edit) return ["enter apply · esc cancel"];
+		if (this.control) return ["type message · enter send · esc cancel"];
+		if (this.tab === "create") return ["↑↓ fields · enter edit/open · shift+f fast · ←→/tab switch tabs · esc close"];
+		return [
+			"↑↓ select · enter continue · / search · g steer · f follow-up · n new",
+			"s stop · d detach · x delete · m model · t thinking · shift+f fast",
+		];
 	}
 
 	private handleAgentInput(data: string): void {
@@ -372,7 +387,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			const selected = agents[this.selectedIndex];
 			if (!selected) return;
 			if (this.keybindings.matches(data, "tui.select.confirm")) void this.continueAgent(selected);
-			else if (data === "F") void this.toggleFastMode(selected);
+			else if (matchesKey(data, "shift+f")) void this.toggleFastMode(selected);
 			else if (matchesKey(data, "m")) {
 				if (this.options.models.length === 0) {
 					this.notice = "No authenticated Pi models are available";
@@ -386,19 +401,16 @@ export class RailAgentOverlayComponent implements Focusable {
 			else if (matchesKey(data, "t")) void this.cycleAgentThinking(selected);
 			else if (matchesKey(data, "g")) this.startControl(selected, "steer");
 			else if (matchesKey(data, "f")) this.startControl(selected, "followUp");
-			else if (matchesKey(data, "s")) void this.stopAgent(selected);
-			else if (matchesKey(data, "d") && selected.linkedToCurrentSession) void this.detachAgent(selected);
-			else if (matchesKey(data, "x")) void this.deleteAgent(selected);
+			else if (matchesKey(data, "s")) this.stopAgent(selected);
+			else if (matchesKey(data, "d") && selected.linkedToCurrentSession) this.detachAgent(selected);
+			else if (matchesKey(data, "x")) this.deleteAgent(selected);
 		}
 		this.renderSoon();
 	}
 
 	private handleFormInput(data: string): void {
 		const fields = this.formFields();
-		if (data === "F") {
-			if (!this.fastModeEligible(this.form.model)) this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
-			else this.form.fastMode = !this.form.fastMode;
-		}
+		if (matchesKey(data, "shift+f")) this.toggleFormFastMode();
 		else if (this.keybindings.matches(data, "tui.select.up")) this.formIndex = Math.max(0, this.formIndex - 1);
 		else if (this.keybindings.matches(data, "tui.select.down")) this.formIndex = Math.min(fields.length - 1, this.formIndex + 1);
 		else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.space)) this.activateFormField(fields[this.formIndex]!.id);
@@ -416,11 +428,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		}
 		if (field === "model") return this.openModelPicker();
 		if (field === "thinking") return this.cycleFormThinking();
-		if (field === "fastMode") {
-			if (!this.fastModeEligible(this.form.model)) this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
-			else this.form.fastMode = !this.form.fastMode;
-			return;
-		}
+		if (field === "fastMode") return this.toggleFormFastMode();
 		if (field === "session") {
 			void this.openSessionPicker();
 			return;
@@ -439,15 +447,26 @@ export class RailAgentOverlayComponent implements Focusable {
 			this.renderSoon();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.select.up") || this.keybindings.matches(data, "tui.select.down")) {
+		const confirm = this.keybindings.matches(data, "tui.select.confirm");
+		if (confirm || this.keybindings.matches(data, "tui.select.up") || this.keybindings.matches(data, "tui.select.down")) {
 			this.searching = false;
-			this.handleAgentInput(data);
 			this.syncInputFocus();
+			if (confirm) this.handleAgentInput(data);
+			else this.renderSoon();
 			return;
 		}
 		const previous = this.searchInput.getValue();
 		this.searchInput.handleInput(data);
 		if (previous !== this.searchInput.getValue()) this.selectedIndex = 0;
+		this.renderSoon();
+	}
+
+	private handleConfirmInput(data: string): void {
+		const { action } = this.confirmation!;
+		if (matchesKey(data, "y")) {
+			this.confirmation = undefined;
+			void action();
+		} else if (matchesKey(data, "n") || this.isCancel(data)) this.confirmation = undefined;
 		this.renderSoon();
 	}
 
@@ -591,7 +610,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		}
 		const next = agent.instance.fastMode !== true;
 		if (next && !this.fastModeEligible(agent.instance.model)) {
-			this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
+			this.notice = FAST_MODE_UNSUPPORTED;
 			this.renderSoon();
 			return;
 		}
@@ -601,47 +620,52 @@ export class RailAgentOverlayComponent implements Focusable {
 		});
 	}
 
-	private async stopAgent(agent: RailAgentView): Promise<void> {
+	private toggleFormFastMode(): void {
+		if (this.form.fastMode || this.fastModeEligible(this.form.model)) this.form.fastMode = !this.form.fastMode;
+		else this.notice = FAST_MODE_UNSUPPORTED;
+	}
+
+	private confirm(title: string, detail: string, action: () => Promise<void>): void {
+		this.confirmation = { title, detail, action };
+		this.renderSoon();
+	}
+
+	private stopAgent(agent: RailAgentView): void {
 		if (agent.phase === "stopped" || agent.phase === "in-use-elsewhere") {
 			this.notice = agent.phase === "stopped" ? "Worker is already stopped" : "A worker owned by another process cannot be stopped here";
 			this.renderSoon();
 			return;
 		}
-		const approved = await this.ctx.ui.confirm("Stop subagent worker?", `${agent.instance.alias}\nThe persistent session and current link will be kept.`);
-		if (!approved) return;
-		await this.runOperation("Stopping worker...", async () => {
+		this.confirm("Stop subagent worker?", `${agent.instance.alias}\nThe persistent session and current link will be kept.`, () => this.runOperation("Stopping worker...", async () => {
 			await this.options.manager.stop(agent.instance.agentId);
 			this.notice = `Stopped ${agent.instance.alias}; session retained`;
-		});
+		}));
 	}
 
-	private async detachAgent(agent: RailAgentView): Promise<void> {
+	private detachAgent(agent: RailAgentView): void {
 		const alias = agent.linkedAliases[0] ?? agent.instance.alias;
-		const approved = await this.ctx.ui.confirm("Detach persistent agent?", `${alias}\nThe child JSONL will be retained and can be linked again.`);
-		if (!approved) return;
-		await this.runOperation("Detaching agent...", async () => {
+		this.confirm("Detach persistent agent?", `${alias}\nThe child JSONL will be retained and can be linked again.`, () => this.runOperation("Detaching agent...", async () => {
 			await this.options.manager.detach(alias);
 			this.notice = `Detached ${alias}; child session retained`;
-		});
+		}));
 	}
 
-	private async deleteAgent(agent: RailAgentView): Promise<void> {
+	private deleteAgent(agent: RailAgentView): void {
 		if (agent.phase === "in-use-elsewhere" || agent.phase === "unknown") {
 			this.notice = "A session owned by another process cannot be deleted here";
 			this.renderSoon();
 			return;
 		}
 		const alias = agent.linkedAliases[0] ?? agent.instance.alias;
-		const approved = await this.ctx.ui.confirm(
+		this.confirm(
 			"Delete persistent agent permanently?",
 			`${alias}\n${agent.instance.sessionFile}\n\nThis deletes the child JSONL and Rail descriptor. Other parent sessions are not rewritten; future calls from them will fail.`,
+			() => this.runOperation("Deleting persistent agent...", async () => {
+				await this.options.manager.delete(agent.instance.agentId);
+				this.notice = `Deleted ${alias} and its child JSONL`;
+				this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			}),
 		);
-		if (!approved) return;
-		await this.runOperation("Deleting persistent agent...", async () => {
-			await this.options.manager.delete(agent.instance.agentId);
-			this.notice = `Deleted ${alias} and its child JSONL`;
-			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
-		});
 	}
 
 	private async cycleAgentThinking(agent: RailAgentView): Promise<void> {
@@ -696,17 +720,22 @@ export class RailAgentOverlayComponent implements Focusable {
 			return;
 		}
 		if (!managed && this.form.fastMode && !this.fastModeEligible(this.form.model)) {
-			this.notice = "Fast mode requires a GPT model using a supported native OpenAI API";
+			this.notice = FAST_MODE_UNSUPPORTED;
 			this.renderSoon();
 			return;
 		}
 		if (this.form.mode === "adopt" && this.form.adoptMode === "exclusive") {
-			const approved = await this.ctx.ui.confirm(
+			this.confirm(
 				"Use saved session in place?",
 				"Only continue if no other Pi process has this session open. Safe copy is recommended.",
+				() => this.runSubmit(managed),
 			);
-			if (!approved) return;
+			return;
 		}
+		await this.runSubmit(managed);
+	}
+
+	private async runSubmit(managed: RailAgentView | undefined): Promise<void> {
 		const model = { ...this.form.model, thinkingLevel: this.form.thinkingLevel };
 		await this.runOperation(this.form.mode === "new" ? "Creating and running agent..." : "Adopting saved session...", async (signal) => {
 			if (this.form.mode === "adopt") {
@@ -882,7 +911,7 @@ export class RailAgentOverlayComponent implements Focusable {
 
 	private maxVisibleRows(): number {
 		const rows = this.tui.terminal?.rows ?? 30;
-		return Math.max(1, Math.min(MAX_VISIBLE_ROWS, rows - (this.control ? 16 : 13)));
+		return Math.max(1, Math.min(MAX_VISIBLE_ROWS, rows - (this.control ? 16 : 14)));
 	}
 
 	private compactControlLayout(): boolean {

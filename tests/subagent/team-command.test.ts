@@ -5,13 +5,13 @@ import type { SessionBroker } from "../../tools/subagents/session-broker";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import type { TeamOverlayComponent } from "../../tools/subagents/team-overlay";
 
-function setup(initialRequests: Array<{ to: string; task: string }> = []) {
+function setup(initialRequests: Array<{ to: string; task: string }> = [], budget?: "standard" | "long" | "unlimited") {
 	const broker = { assertAliasesAvailable: async () => undefined } as unknown as SessionBroker;
 	const host = new TeamSessionHost(broker, () => undefined, []);
 	const prepared = host.runtime.prepare({
 		manager: { alias: "lead", roleDescription: "Manage the Team." },
 		workers: [{ alias: "worker", roleDescription: "Complete assigned work." }],
-		brief: { goal: "Run host-control tests." }, initialRequests, timeoutSeconds: null,
+		brief: { goal: "Run host-control tests." }, initialRequests, timeoutSeconds: null, ...(budget ? { budget } : {}),
 	});
 	return { host, teamId: prepared.teamId };
 }
@@ -168,6 +168,45 @@ test("popup resume and grant enter the existing selection paths", async () => {
 	let title = "";
 	grant.ctx.ui.select = async (value: string) => { title = value; return undefined; };
 	await runTeamCommand(host, "", grant.ctx);
-	assert.equal(title, "Grant budget to");
+	assert.equal(title, "Raise Team budget");
 	assert.equal(grant.confirmations.length, 0);
+});
+
+test("interactive grants offer only higher presets, confirm their preview, and retain the custom flow", async () => {
+	const { host, teamId } = setup([], "standard");
+	host.runtime.launch(teamId);
+	for (const preset of ["long", "unlimited"] as const) {
+		const { ctx, confirmations } = commandContext();
+		ctx.ui.select = async (title: string, choices: string[]) => {
+			assert.equal(title, "Raise Team budget");
+			assert.deepEqual(choices, preset === "long" ? ["Raise to long", "Raise to unlimited", "Custom grant…"] : ["Raise to unlimited", "Custom grant…"]);
+			return `Raise to ${preset}`;
+		};
+		await runTeamCommand(host, `${teamId} grant`, ctx);
+		assert.match(confirmations[0]!.message, /teamWorks: used 0 · limit \d+ → \d+/u);
+		assert.match(confirmations[0]!.message, /Releases no held work/u);
+		assert.equal(host.runtime.inspectBudget(teamId).limits.teamActivations, preset === "long" ? 4096 : 1_000_000_000);
+	}
+	const custom = commandContext({ message: "approved" });
+	let selected = 0;
+	custom.ctx.ui.select = async (_title: string, choices: string[]) => {
+		assert.deepEqual(choices, selected++ === 0 ? ["Custom grant…"] : ["team"]);
+		return choices[0];
+	};
+	custom.ctx.ui.input = async (title: string) => title.startsWith("Increments") ? "teamActivations=+64" : "approved";
+	await runTeamCommand(host, `${teamId} grant`, custom.ctx);
+	assert.equal(selected, 2);
+	assert.equal(host.runtime.inspectBudget(teamId).limits.teamActivations, 1_000_000_064);
+	assert.match(custom.confirmations[0]!.message, /limit unlimited → unlimited/u);
+});
+
+test("declining a preset confirmation leaves all limits and grants unchanged", async () => {
+	const { host, teamId } = setup([], "standard");
+	host.runtime.launch(teamId);
+	const before = host.runtime.inspectBudget(teamId);
+	const { ctx, confirmations } = commandContext({ confirmation: false });
+	await runTeamCommand(host, `${teamId} grant`, ctx);
+	assert.equal(confirmations.length, 1);
+	assert.match(confirmations[0]!.message, /Reason: Raise to long/u);
+	assert.deepEqual(host.runtime.inspectBudget(teamId), before);
 });

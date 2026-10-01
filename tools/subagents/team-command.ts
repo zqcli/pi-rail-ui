@@ -3,8 +3,9 @@ import type { BudgetScope } from "./team-budget";
 import { previewText } from "./team-codec";
 import type { TeamSessionHost } from "./team-host";
 import { showTeamOverlay } from "./team-overlay";
-import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, workRefKey } from "./team-protocol";
-import { formatHistoryEntry, formatHistorySummary, formatTeamView } from "./team-tool";
+import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, workRefKey } from "./team-protocol";
+import type { GrantPreview } from "./team-runtime";
+import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView } from "./team-tool";
 
 const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message"] as const;
 const USAGE = "Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>";
@@ -198,6 +199,20 @@ async function grantBudget(host: TeamSessionHost, teamId: string, args: string[]
 	requireUi(ctx);
 	let [scopeArg, ...rest] = args;
 	if (!scopeArg) {
+		const limits = host.runtime.inspectBudget(teamId).limits;
+		const presets = (["long", "unlimited"] as const).filter((preset) => Object.entries(TEAM_BUDGET_PRESETS[preset])
+			.some(([counter, value]) => value > limits[counter as keyof typeof limits]));
+		const labels = presets.map((preset) => `Raise to ${preset}`);
+		const choice = await ctx.ui.select("Raise Team budget", [...labels, "Custom grant…"]);
+		if (choice === undefined) return;
+		if (choice !== "Custom grant…") {
+			const preset = presets[labels.indexOf(choice)]!;
+			const preview = host.runtime.previewRaiseBudget(teamId, preset);
+			if (!await confirmBudgetGrant(host, teamId, preview, `Raise to ${preset}`, ctx)) return;
+			const receipt = host.runtime.raiseBudget(teamId, preset);
+			ctx.ui.notify(`Budget raised to ${preset}${"released" in receipt ? `; released ${receipt.released.length} hold(s)` : ""}`, "info");
+			return;
+		}
 		const roots = host.runtime.inspectBudget(teamId).roots.map((root) => `root:${root.rootId}`);
 		scopeArg = await ctx.ui.select("Grant budget to", ["team", ...roots]);
 		if (scopeArg === undefined) return;
@@ -224,6 +239,13 @@ async function grantBudget(host: TeamSessionHost, teamId: string, args: string[]
 		if (!reason) return;
 	}
 	const preview = host.runtime.previewGrant(teamId, scope, increments);
+	if (!await confirmBudgetGrant(host, teamId, preview, reason, ctx)) return;
+	const receipt = host.runtime.grantBudget(teamId, scope, increments, reason);
+	ctx.ui.notify(`Budget granted${"released" in receipt ? `; released ${receipt.released.length} hold(s)` : ""}`, "info");
+}
+
+async function confirmBudgetGrant(host: TeamSessionHost, teamId: string, preview: GrantPreview, reason: string, ctx: ExtensionCommandContext): Promise<boolean> {
+	const scope = preview.scope;
 	const holds = host.runtime.listHolds(teamId);
 	const released = preview.released.map((work) => {
 		const hold = holds.find((item) => item.work.workId === work.workId && item.work.revision === work.revision);
@@ -232,16 +254,14 @@ async function grantBudget(host: TeamSessionHost, teamId: string, args: string[]
 	const remaining = holds.filter((hold) => !preview.released.some((work) => work.workId === hold.work.workId && work.revision === hold.work.revision));
 	const detail = [
 		`Scope: ${scope.kind === "team" ? `Team ${teamId}` : `root ${scope.rootId}`}`,
-		...preview.changes.map((change) => `  ${change.counter}: used ${change.used} · limit ${change.limit} → ${change.proposed}`),
+		...preview.changes.map((change) => `  ${change.counter}: used ${change.used} · limit ${formatBudgetLimit(change.limit)} → ${formatBudgetLimit(change.proposed)}`),
 		`Reason: ${previewText(reason, 200)}`,
 		released.length ? `Releases ${released.length} budget hold(s):` : "Releases no held work (it only raises the limits).",
 		...released,
 		...(remaining.length ? [`Stays held: ${remaining.map((hold) => `${workRefKey(hold.work)} (${hold.reason})`).join(", ")}`] : []),
 		"Usage never resets; limits only grow.",
 	].join("\n");
-	if (!await ctx.ui.confirm("Grant this budget?", detail)) return;
-	const receipt = host.runtime.grantBudget(teamId, scope, increments, reason);
-	ctx.ui.notify(`Budget granted${"released" in receipt ? `; released ${receipt.released.length} hold(s)` : ""}`, "info");
+	return ctx.ui.confirm("Grant this budget?", detail);
 }
 
 function requireUi(ctx: ExtensionCommandContext): void {

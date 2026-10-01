@@ -58,6 +58,29 @@ const prepareArgs = {
 	timeoutSeconds: null,
 };
 
+test("prepare selects per-Team presets, defaults to long, and prints unlimited limits in all parent views", async () => {
+	for (const budget of [undefined, null, "standard", "long", "unlimited"] as const) {
+		const { host, tool } = setup();
+		const prepared = await tool.execute("prepare", { ...prepareArgs, budget }, undefined, undefined, context());
+		const teamId = prepared.details.view.teamId;
+		const selected = budget ?? "long";
+		const activations = selected === "standard" ? 512 : selected === "long" ? 4096 : 1_000_000_000;
+		assert.equal(host.runtime.inspectBudget(teamId).limits.teamActivations, activations);
+		const printed = selected === "unlimited" ? "unlimited" : String(activations);
+		assert.ok(prepared.content[0].text.includes(`Budget (${selected}): activations ${printed}`));
+		const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
+		assert.ok(status.content[0].text.includes(`activations 0/${printed}`));
+		host.driver.openAndLaunch = async () => { host.runtime.launch(teamId); return { lifetime: Promise.resolve(terminal(teamId)) }; };
+		const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
+		assert.ok(result.content[0].text.includes(`Budget: activations ${printed}`));
+		assert.match(result.content[0].text, /cancelled\/superseded 0/u);
+	}
+	const { tool } = setup();
+	await assert.rejects(tool.execute("bad", { ...prepareArgs, budget: "huge" }, undefined, undefined, context()), /budget must be/u);
+	assert.throws(() => tool.prepareArguments({ action: "launch", teamId: "any", budget: "long" }), /does not accept.*budget/u);
+	assert.equal(teamTool.formatBudgetLimit(1_000_000_001), "unlimited");
+});
+
 function terminal(teamId: string): TeamResult {
 	return {
 		version: 2, teamId, lifecycle: "closed", outcome: "succeeded", finalResultRefs: [], roots: [],

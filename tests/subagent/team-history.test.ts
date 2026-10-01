@@ -48,6 +48,27 @@ test("history retains bounded worker-authored ResultRecords and validates termin
 	assert.deepEqual(restored.teams[0]?.results, [result], "history keeps the actual result facts, not only a count or summary snapshot");
 });
 
+test("unlimited history accepts 20000 results and roots beyond the old count and byte caps, with old launch records", () => {
+	const results = Array.from({ length: 20000 }, (_, index): ResultRecord => ({ ...result,
+		id: `result-${index}`, work: { workId: `work-${index}`, revision: 1 }, result: { status: "succeeded", summary: "x".repeat(1000) },
+	}));
+	const allRoots: TeamResult["roots"] = results.map((record) => ({ work: record.work, state: "resolved", resultRef: record.id, review: { disposition: "accepted" } }));
+	const finalResultRefs = results.slice(0, 32).map((record) => record.id);
+	const journal = entries();
+	const close = journal.at(-2)!.data;
+	const done = journal.at(-1)!.data;
+	const restored = restoreTeamHistory([
+		journal[0]!, // old launched records carry neither a plan nor a budget field
+		...results.map((record) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "result", teamId, at: 2, result: record } })),
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { ...close, roots: allRoots, resultRefs: finalResultRefs } },
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { ...done, result: { ...terminal(), roots: allRoots, finalResultRefs } } },
+	]);
+	assert.equal(restored.skipped, 0);
+	assert.equal(restored.teams[0]!.results.length, 20000);
+	assert.equal(restored.teams[0]!.lifecycle, "closed");
+	assert.equal(restored.teams[0]!.finalResultRefs.length, 32);
+});
+
 test("a close decision with a mismatched terminal closeId remains interrupted", () => {
 	const records = entries();
 	const terminalRecord = records.at(-1)!.data as Record<string, unknown>;

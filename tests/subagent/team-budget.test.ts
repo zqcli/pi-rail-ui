@@ -11,15 +11,18 @@ import {
 	type GateDecision, type TeamBudgetLimits, type TeamTeamView, type WorkRef,
 } from "../../tools/subagents/team-protocol";
 import type { SubagentUsage } from "../../tools/subagents/session-broker";
+import * as protocol from "../../tools/subagents/team-protocol";
+import { normalizeTeamPlan, parseTeamReply } from "../../tools/subagents/team-codec";
 
 interface Setup {
+	budget?: "standard" | "long" | "unlimited";
 	limits?: Partial<TeamBudgetLimits>;
 	initialRequests?: Array<{ to: string; task: string }>;
 	journal?: TeamJournalGeneration;
 	launch?: boolean;
 }
 
-function makeRuntime({ limits = {}, initialRequests = [], journal, launch = true }: Setup = {}) {
+function makeRuntime({ limits = {}, initialRequests = [], journal, launch = true, budget }: Setup = {}) {
 	let ids = 0;
 	let time = 1_700_000_000_000;
 	const runtime = new TeamRuntime({ now: () => time++, createId: () => `budget-${++ids}`, limits, ...(journal ? { journal } : {}) });
@@ -27,12 +30,105 @@ function makeRuntime({ limits = {}, initialRequests = [], journal, launch = true
 		manager: { alias: "lead", roleDescription: "Manage work, review roots and close the Team." },
 		workers: [{ alias: "w1", roleDescription: "Perform work." }, { alias: "w2", roleDescription: "Perform work." }],
 		brief: { goal: "Exercise cumulative budgets." },
+		...(budget ? { budget } : {}),
 		initialRequests,
 		timeoutSeconds: null,
 	});
 	if (launch) runtime.launch(teamId);
 	return { runtime, teamId };
 }
+
+test("presets preserve standard safeguards, default to long, and apply runtime overrides per Team", () => {
+	const { standard, long, unlimited } = protocol.TEAM_BUDGET_PRESETS;
+	assert.equal(protocol.DEFAULT_TEAM_BUDGET, long);
+	assert.equal(protocol.TEAM_BUDGET_UNLIMITED, 1_000_000_000);
+	assert.deepEqual(standard, {
+		workerPermits: 4, memberUnresolvedWork: 64, teamWorks: 512, rootChildren: 64, depth: 8, workRevisions: 32,
+		rootActivations: 128, teamActivations: 512, managerActivations: 128, activationModelRequests: 64,
+		rootModelRequests: 256, teamModelRequests: 1024, activationToolCalls: 256, rootToolCalls: 1024,
+		teamToolCalls: 4096, emergencyManagerActivations: 3, reservedResultBytes: 16 * 1024 * 1024,
+	});
+	assert.deepEqual(long, { ...standard, teamActivations: 4096, managerActivations: 1024, teamModelRequests: 8192,
+		teamToolCalls: 32768, teamWorks: 4096, rootChildren: 512, rootActivations: 1024, rootModelRequests: 2048,
+		rootToolCalls: 8192, workRevisions: 128, reservedResultBytes: 64 * 1024 * 1024 });
+	assert.deepEqual(unlimited, { ...standard, teamActivations: 1_000_000_000, managerActivations: 1_000_000_000,
+		teamModelRequests: 1_000_000_000, teamToolCalls: 1_000_000_000, rootActivations: 1_000_000_000,
+		rootModelRequests: 1_000_000_000, rootToolCalls: 1_000_000_000, teamWorks: 20000, rootChildren: 2048,
+		workRevisions: 512, reservedResultBytes: 256 * 1024 * 1024 });
+	const runtime = new TeamRuntime({ limits: { workerPermits: 2, teamActivations: 42 } });
+	const oldPlan = { manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }], brief: { goal: "Presets." } };
+	assert.equal(normalizeTeamPlan(oldPlan).budget, undefined, "old plans need no budget field");
+	for (const preset of [undefined, "standard", "unlimited"] as const) {
+		const view = runtime.prepare({ ...oldPlan, ...(preset ? { budget: preset } : {}) });
+		assert.deepEqual(view.budget.limits, { ...protocol.TEAM_BUDGET_PRESETS[preset ?? "long"], workerPermits: 2, teamActivations: 42 });
+		assert.deepEqual(parseTeamReply({ ok: true, from: "@hub", to: "lead", data: view }), { ok: true, from: "@hub", to: "lead", data: view });
+	}
+});
+
+test("preset raises preview and journal all limits, release only satisfied budget holds, and never lower grants", () => {
+	const records: TeamJournalRecord[] = [];
+	const journal = new TeamJournalGeneration((record) => records.push(record));
+	const { runtime, teamId } = makeRuntime({ budget: "standard", limits: { teamActivations: 1 }, initialRequests: [{ to: "w1", task: "held root" }], journal });
+	const manager = takeManager(runtime, teamId);
+	end(runtime, manager, yieldNow);
+	nextWork(runtime, teamId);
+	assert.equal(runtime.listHolds(teamId)[0]?.reason, "budget");
+	const before = runtime.inspectBudget(teamId);
+	const journalLength = records.length;
+	const preview = runtime.previewRaiseBudget(teamId, "long");
+	assert.deepEqual(runtime.inspectBudget(teamId), before);
+	assert.equal(records.length, journalLength, "preview does not journal");
+	assert.equal(preview.released.length, 1);
+	for (const counter of ["teamWorks", "rootChildren", "workRevisions", "reservedResultBytes", "rootActivations", "rootModelRequests", "rootToolCalls"]) {
+		assert.ok(preview.changes.some((change) => change.counter === counter), counter);
+	}
+	const receipt = runtime.raiseBudget(teamId, "long");
+	assert.ok("released" in receipt);
+	assert.deepEqual(receipt.released, preview.released);
+	const after = runtime.inspectBudget(teamId);
+	assert.deepEqual(after.limits, protocol.TEAM_BUDGET_PRESETS.long);
+	assert.deepEqual(after.used, before.used);
+	assert.equal(after.roots[0]!.limits.rootActivations, 1024);
+	assert.equal(runtime.listHolds(teamId).length, 0);
+	const grant = records.findLast((record) => record.kind === "grant");
+	assert.equal(grant?.grant.preset, "long");
+	assert.equal(grant?.grant.increments.teamWorks, 4096 - 512);
+	assert.equal(restoreTeamHistory(records.map((data) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data }))).skipped, 0);
+	const eventBatch = takeManager(runtime, teamId);
+	assert.ok(eventBatch.input.scope.kind === "management" && eventBatch.input.scope.events.some((event) => event.kind === "USER_COMMAND" && event.message?.includes("Raise to long")));
+	const count = records.length;
+	assert.equal(runtime.raiseBudget(teamId, "standard").status, "unchanged");
+	assert.deepEqual(runtime.previewRaiseBudget(teamId, "long").changes, []);
+	assert.equal(records.length, count);
+	runtime.grantBudget(teamId, { kind: "team" }, { teamActivations: 1_000_000_000 }, "extra");
+	runtime.raiseBudget(teamId, "unlimited");
+	assert.equal(runtime.inspectBudget(teamId).limits.teamActivations, 1_000_004_096);
+	assert.equal(runtime.inspectBudget(teamId).roots[0]!.limits.rootModelRequests, 1_000_000_000);
+	assert.deepEqual(parseTeamReply({ ok: true, from: "@hub", to: "lead", data: runtime.getTeam(teamId) }), { ok: true, from: "@hub", to: "lead", data: runtime.getTeam(teamId) });
+});
+
+test("a preset raise fails closed before mutating limits when its grant journal fails", () => {
+	const { runtime, teamId } = makeRuntime({ budget: "standard", journal: new TeamJournalGeneration((record) => {
+		if (record.kind === "grant") throw new Error("fake disk failure");
+	}) });
+	const limits = runtime.inspectBudget(teamId).limits;
+	assert.throws(() => runtime.raiseBudget(teamId, "long"), /journal/u);
+	assert.deepEqual(runtime.inspectBudget(teamId).limits, limits);
+	assert.equal(runtime.inspectBudget(teamId).grants.length, 0);
+});
+
+test("a preset raise rejects effective-root overflow before applying or journaling any limit", () => {
+	const records: TeamJournalRecord[] = [];
+	const { runtime, teamId } = makeRuntime({ budget: "standard", initialRequests: [{ to: "w1", task: "root" }], journal: new TeamJournalGeneration((record) => records.push(record)) });
+	const rootId = runtime.listWorks(teamId)[0]!.work.workId;
+	runtime.grantBudget(teamId, { kind: "root", rootId }, { rootModelRequests: Number.MAX_SAFE_INTEGER - 256 }, "near the safe limit");
+	const before = runtime.inspectBudget(teamId);
+	const count = records.length;
+	assert.throws(() => runtime.previewRaiseBudget(teamId, "long"), /safe integer/u);
+	assert.throws(() => runtime.raiseBudget(teamId, "long"), /safe integer/u);
+	assert.deepEqual(runtime.inspectBudget(teamId), before);
+	assert.equal(records.length, count);
+});
 
 let calls = 0;
 function act(runtime: TeamRuntime, activation: RuntimeActivation, args: unknown) {

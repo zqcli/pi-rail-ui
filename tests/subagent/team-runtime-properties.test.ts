@@ -1129,7 +1129,7 @@ test("19.1: the Team status text shows lifecycle, health, member activity/pause,
 	assert.match(text, /FAST off · SEARCH off/u);
 	assert.match(text, /Holds: .*attention \(w2\)/u);
 	assert.match(text, /Incident .*\[WORK_HELD\]|Incident .*\[ATTENTION/u);
-	assert.match(text, /Budget: activations \d+\/512/u);
+	assert.match(text, /Budget: activations \d+\/4096/u);
 	assert.doesNotMatch(text, /completed|workers completed/iu, "idle is never presented as a finished Team");
 });
 

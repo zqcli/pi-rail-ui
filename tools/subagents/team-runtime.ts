@@ -3,16 +3,16 @@ import {
 	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_PROTOCOL_VERSION,
-	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, DEFAULT_TEAM_BUDGET, isTerminalWorkState, sameWorkRef,
+	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, isTerminalWorkState, sameWorkRef,
 	workRefKey, shortWorkRef, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type ActivationInput, type ActivationScope, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
 	type ManagerEventView, type MemberRecord, type OutcomeView, type ResultRecord,
 	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle, type GateDecision,
-	type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamTeamView,
+	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamTeamView,
 	type TeamWorkSummary, type TeamWorkView, type WorkError, type WorkRecord, type WorkRef, type WorkResult, type WorkVersion,
 } from "./team-protocol";
 import {
-	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeTeamAction, normalizeTeamPlan, parseActivationScope, parseBinding, sameScope,
+	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeTeamAction, normalizeTeamPlan, normalizeTeamBudgetPreset, parseActivationScope, parseBinding, sameScope,
 	okReply, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
 import { WorkLedger } from "./team-work-ledger";
@@ -342,7 +342,7 @@ export class TeamRuntime {
 	private readonly createId: () => string;
 	/** Without an injected createId (tests), model-visible IDs are short random codes. */
 	private readonly shortIds: boolean;
-	private readonly limits: TeamBudgetLimits;
+	private readonly limitOverrides: Partial<TeamBudgetLimits>;
 	private readonly activationStopTimeoutMs: number;
 	private readonly journalGeneration: TeamJournalGeneration | undefined;
 	private journalRetiredForHostTransition = false;
@@ -352,10 +352,10 @@ export class TeamRuntime {
 		this.now = options.now ?? Date.now;
 		this.createId = options.createId ?? randomUUID;
 		this.shortIds = !options.createId;
-		this.limits = { ...DEFAULT_TEAM_BUDGET, ...options.limits };
+		this.limitOverrides = { ...options.limits };
 		this.activationStopTimeoutMs = options.activationStopTimeoutMs ?? 5000;
 		if (!Number.isSafeInteger(this.activationStopTimeoutMs) || this.activationStopTimeoutMs < 1) throw new Error("Invalid activation stop timeout");
-		for (const [key, value] of Object.entries(this.limits)) {
+		for (const [key, value] of Object.entries(this.limitOverrides)) {
 			if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid Team budget ${key}`);
 		}
 	}
@@ -373,6 +373,7 @@ export class TeamRuntime {
 	 */
 	prepare(rawPlan: unknown, resolvedPolicies?: ReadonlyMap<string, TeamMemberPolicy>): TeamTeamView {
 		const plan = normalizeTeamPlan(rawPlan);
+		const limits = { ...TEAM_BUDGET_PRESETS[plan.budget ?? "long"], ...this.limitOverrides };
 		if (resolvedPolicies) {
 			for (const member of [plan.manager, ...plan.workers]) {
 				const policy = resolvedPolicies.get(member.alias);
@@ -386,8 +387,8 @@ export class TeamRuntime {
 		const unresolvedInitial = new Map<string, number>();
 		for (const initial of plan.initialRequests) {
 			const count = (unresolvedInitial.get(initial.to) ?? 0) + 1;
-			if (count > this.limits.memberUnresolvedWork) {
-				fail("REQUEST_QUEUE_FULL", `Initial requests exceed ${initial.to}'s unresolved-work limit (${this.limits.memberUnresolvedWork})`);
+			if (count > limits.memberUnresolvedWork) {
+				fail("REQUEST_QUEUE_FULL", `Initial requests exceed ${initial.to}'s unresolved-work limit (${limits.memberUnresolvedWork})`);
 			}
 			unresolvedInitial.set(initial.to, count);
 		}
@@ -396,7 +397,7 @@ export class TeamRuntime {
 		if (this.teams.has(id)) fail("TEAM_CAPACITY", "Team ID collision");
 		const initialCount = plan.initialRequests.length;
 		const reserved = initialCount * TEAM_MAX_RESULT_BYTES;
-		if (initialCount > this.limits.teamWorks || reserved > this.limits.reservedResultBytes) {
+		if (initialCount > limits.teamWorks || reserved > limits.reservedResultBytes) {
 			fail("TEAM_CAPACITY", "Initial requests exceed Team work/result capacity");
 		}
 		const members = new Map<string, RuntimeMember>();
@@ -415,7 +416,7 @@ export class TeamRuntime {
 				usage: emptySubagentUsage(),
 			});
 		}
-		const budget = new TeamBudget({ ...this.limits });
+		const budget = new TeamBudget(limits);
 		const team: TeamState = {
 			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt,
 			deadline: null,
@@ -763,19 +764,44 @@ export class TeamRuntime {
 	 * whose scope is now within limits are released. Attention, pause and Manager-fault holds stay.
 	 */
 	grantBudget(teamId: string, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>, reasonValue: string): HostControlReceipt {
+		return this.applyBudgetGrant(teamId, scopeValue, incrementsValue, reasonValue);
+	}
+
+	/** Raise all preset limits monotonically, using the same journal and hold-release path as grants. */
+	raiseBudget(teamId: string, preset: TeamBudgetPreset): HostControlReceipt {
+		const increments = this.presetIncrements(teamId, preset);
+		if (!Object.keys(increments).length) return { actor: "@host", status: "unchanged", teamId, lifecycle: this.team(teamId).lifecycle };
+		return this.applyBudgetGrant(teamId, { kind: "team" }, increments, `Raise to ${preset}`, preset);
+	}
+
+	previewRaiseBudget(teamId: string, preset: TeamBudgetPreset): GrantPreview {
+		const increments = this.presetIncrements(teamId, preset);
+		return Object.keys(increments).length ? this.previewBudgetGrant(teamId, { kind: "team" }, increments, preset)
+			: { scope: { kind: "team" }, changes: [], released: [] };
+	}
+
+	private presetIncrements(teamId: string, preset: TeamBudgetPreset): Partial<TeamBudgetLimits> {
+		const team = this.team(teamId);
+		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
+		const target = TEAM_BUDGET_PRESETS[normalizeTeamBudgetPreset(preset)];
+		return Object.fromEntries((Object.keys(target) as Array<keyof TeamBudgetLimits>)
+			.filter((key) => target[key] > team.limits[key]).map((key) => [key, target[key] - team.limits[key]]));
+	}
+
+	private applyBudgetGrant(teamId: string, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>, reasonValue: string, preset?: TeamBudgetPreset): HostControlReceipt {
 		const team = this.team(teamId);
 		const reason = this.hostText(reasonValue, "grant reason");
 		if (Buffer.byteLength(reason, "utf8") > TEAM_MAX_GRANT_REASON_BYTES) fail("INVALID_ARGUMENT", `grant reason exceeds ${TEAM_MAX_GRANT_REASON_BYTES} bytes`);
 		const at = this.timestamp();
 		const id = this.id("grant");
 		// Validate the whole grant first, so journal and apply are atomic.
-		const scope = this.validateHostGrant(team, scopeValue, incrementsValue, { id, reason, at });
-		const grant = { id, actor: "@host" as const, scope, increments: copy(incrementsValue), reason, at };
+		const scope = this.validateHostGrant(team, scopeValue, incrementsValue, { id, reason, at, ...(preset ? { preset } : {}) });
+		const grant = { id, actor: "@host" as const, scope, increments: copy(incrementsValue), reason, at, ...(preset ? { preset } : {}) };
 		if (!this.tryJournal(team, { version: 2, kind: "grant", teamId, at, grant })) {
 			this.applyJournalFailure(team);
 			fail("PROTOCOL_FAILURE", "Budget grant could not be written to the Team journal");
 		}
-		team.budget.grant({ id, scope, increments: copy(incrementsValue), reason, at });
+		team.budget.grant(grant);
 		const released = this.releaseBudgetHolds(team);
 		this.addEvent(team, { key: `host-grant:${id}`, kind: "USER_COMMAND", actor: "@host",
 			message: `Host granted budget for ${scope.kind === "team" ? "the Team" : `root ${scope.rootId}`}: ${reason}` });
@@ -790,14 +816,30 @@ export class TeamRuntime {
 	 * requeue. Nothing is applied or journaled; attention/protocol/pause holds are never listed.
 	 */
 	previewGrant(teamId: string, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>): GrantPreview {
+		return this.previewBudgetGrant(teamId, scopeValue, incrementsValue);
+	}
+
+	private previewBudgetGrant(teamId: string, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>, preset?: TeamBudgetPreset): GrantPreview {
 		const team = this.team(teamId);
-		const record = { id: "preview", reason: "preview", at: this.timestamp() };
+		const record = { id: "preview", reason: "preview", at: this.timestamp(), ...(preset ? { preset } : {}) };
 		const scope = this.validateHostGrant(team, scopeValue, incrementsValue, record);
 		const proposed = team.budget.clone();
 		proposed.grant({ ...record, scope, increments: copy(incrementsValue) });
 		const rootUsed = scope.kind === "root" ? { ...team.budget.rootUsed(scope.rootId), rootChildren: this.rootChildCount(team, scope.rootId) } : undefined;
+		const budget = this.inspectBudget(teamId);
+		const records = team.ledger.order.map((id) => team.ledger.get(id)!.record);
+		const members = [...team.members.values()];
+		const used: Partial<TeamBudgetLimits> = { ...budget.used,
+			workRevisions: Math.max(0, ...records.map((record) => record.versions.length)),
+			depth: Math.max(0, ...records.map((record) => record.depth)),
+			workerPermits: this.usedWorkerPermits(team),
+			memberUnresolvedWork: Math.max(0, ...members.map((member) => records.filter((record) => record.assignee === member.id && !isTerminalWorkState(currentVersion(record).state)).length)),
+			activationModelRequests: Math.max(0, ...members.map((member) => member.active?.budget.modelRequests ?? 0)),
+			activationToolCalls: Math.max(0, ...members.map((member) => member.active?.budget.toolCalls ?? 0)),
+		};
+		for (const counter of ROOT_GRANTABLE_COUNTERS) used[counter] = Math.max(0, ...budget.roots.map((root) => root.used[counter]));
 		const changes = Object.keys(incrementsValue).map((counter) => scope.kind === "team"
-			? { counter, used: counter in team.budget.used ? team.budget.used[counter as keyof typeof team.budget.used] : 0,
+			? { counter, used: used[counter as keyof TeamBudgetLimits] ?? 0,
 				limit: team.limits[counter as keyof TeamBudgetLimits], proposed: proposed.limits[counter as keyof TeamBudgetLimits] }
 			: { counter, used: rootUsed![counter as keyof typeof rootUsed & string] ?? 0,
 				limit: team.budget.rootLimit(scope.rootId, counter as RootGrantCounter), proposed: proposed.rootLimit(scope.rootId, counter as RootGrantCounter) });
@@ -843,7 +885,7 @@ export class TeamRuntime {
 	}
 
 	private validateHostGrant(team: TeamState, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>,
-		record: { id: string; reason: string; at: number }): BudgetScope {
+		record: { id: string; reason: string; at: number; preset?: TeamBudgetPreset }): BudgetScope {
 		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
 		let scope: BudgetScope;
 		if (scopeValue?.kind === "team") scope = { kind: "team" };
@@ -1668,7 +1710,7 @@ export class TeamRuntime {
 			activations: team.budget.used.teamActivations + team.budget.used.emergencyManagerActivations,
 			modelTurns: team.usage.turns, dependencyWaits: team.dependencyWaits, questions: team.questions,
 			revisions: records.reduce((sum, record) => sum + record.versions.length - 1, 0),
-			cancelled: records.reduce((sum, record) => sum + record.versions.filter((version) => version.state === "cancelled").length, 0),
+			cancelled: records.filter((record) => ["cancelled", "superseded"].includes(currentVersion(record).state)).length,
 			toolErrors: team.toolErrors, memberActivations,
 		};
 	}

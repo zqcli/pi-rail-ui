@@ -1,6 +1,6 @@
 import { TEAM_JOURNAL_ENTRY_TYPE } from "./team-journal";
 import {
-	TEAM_MAX_RESERVED_RESULT_BYTES, TEAM_MAX_WORKERS,
+	TEAM_MAX_RESERVED_RESULT_BYTES, TEAM_MAX_RESULT_RECORDS, TEAM_MAX_WORKERS,
 	type ResultRecord, type TeamLifecycle, type TeamOutcome, type TeamResult, type WorkRef,
 } from "./team-protocol";
 import {
@@ -14,7 +14,7 @@ export const LEGACY_TEAM_HISTORY_TYPE = "rail-subagent-team";
 const LEGACY_TERMINAL = ["completed", "failed", "cancelled", "interrupted"] as const;
 /** Retired v1 phases that had no terminal record; they are displayed as interrupted, never resumed. */
 const LEGACY_UNFINISHED = ["prepared", "running", "finalizing"] as const;
-const MAX_HISTORY_RESULTS = 16_384;
+const MAX_HISTORY_RESULTS = TEAM_MAX_RESULT_RECORDS;
 
 /**
  * Display-only history of one Team on the current branch. Nothing here can be resumed: a Team whose
@@ -114,7 +114,8 @@ function applyJournalRecord(
 			const result = normalizeResultRecord(data["result"]);
 			if (![current.manager, ...current.workers].includes(result.author)) return false;
 			const records = resultsByTeam.get(teamId)!;
-			const bytes = jsonBytes(result);
+			// Runtime reserves one WorkResult slot per revision; record metadata is separately bounded.
+			const bytes = jsonBytes(result.result);
 			if (records.has(result.id) || current.results.length >= MAX_HISTORY_RESULTS
 				|| resultBytesByTeam.get(teamId)! + bytes > TEAM_MAX_RESERVED_RESULT_BYTES) return false;
 			records.set(result.id, result);

@@ -39,6 +39,30 @@ function workView(): TeamWorkView {
 const protocolFailure = (error: unknown) => error instanceof TeamProtocolError && error.code === "PROTOCOL_FAILURE";
 const invalidArgument = (error: unknown) => error instanceof TeamProtocolError && error.code === "INVALID_ARGUMENT";
 
+test("revise_work description explains superseded sub-tasks without changing its fields", () => {
+	assert.match(JSON.stringify(TEAM_TOOL_SCHEMA), /its unfinished sub-tasks become superseded/u);
+	assert.deepEqual(normalizeTeamAction({ action: "control", command: "revise_work", workId: "root", expectedRevision: 1, task: "redo" }), {
+		action: "control", control: { command: "revise_work", workId: "root", expectedRevision: 1, task: "redo", inputRefs: [] },
+	});
+});
+
+test("work view accepts accumulated outcomes beyond 512 while child previews stay bounded", () => {
+	const view = workView();
+	view.current.observedOutcomes = Array.from({ length: 2048 }, (_, index) => ({ workId: `child-${index}`, revision: 1 }));
+	const reply = { ok: true, from: "@hub", to: "owner", data: view };
+	assert.deepEqual(parseTeamReply(reply), reply);
+});
+
+test("work view parses 512 revisions and their rejected candidates under the unlimited preset", () => {
+	const view = workView();
+	view.currentRevision = 512;
+	view.current.revision = 512;
+	view.revisions = Array.from({ length: 512 }, (_, index) => ({ revision: index + 1, state: "failed" }));
+	view.rejectedCandidates = view.revisions.map(({ revision }) => ({ revision, reason: "policy_superseded", summary: "Old candidate." }));
+	const reply = { ok: true, from: "@hub", to: "owner", data: view };
+	assert.deepEqual(parseTeamReply(reply), reply);
+});
+
 test("6 KiB provider/host errors need bounded output projection, not relaxed private validation", () => {
 	for (const message of ["proxy failure: " + "x".repeat(6000), "代理错误😀\n".repeat(1200), "\u0000".repeat(2000), "\ud800", "  "]) {
 		const raw = { code: "NATIVE_FAILURE", message, outcomeUnknown: true };

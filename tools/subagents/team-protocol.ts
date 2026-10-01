@@ -51,7 +51,9 @@ export const TEAM_VIEW_MAX_BUDGET_ROOTS = 32;
 export const TEAM_VIEW_MAX_GRANTS = 16;
 export const TEAM_MAX_INITIAL_REQUESTS = 8;
 export const TEAM_MAX_LIVE_TEAMS = 32;
-export const TEAM_MAX_RESERVED_RESULT_BYTES = 16 * 1024 * 1024;
+export const TEAM_MAX_RESERVED_RESULT_BYTES = 256 * 1024 * 1024;
+/** One result slot per accepted work revision, including superseded revisions. */
+export const TEAM_MAX_RESULT_RECORDS = Math.floor(TEAM_MAX_RESERVED_RESULT_BYTES / TEAM_MAX_RESULT_BYTES);
 export const TEAM_MAX_TIMEOUT_SECONDS = 86400;
 /** Completed idempotency entries kept per active member; pending entries are never evicted. */
 export const TEAM_COMMAND_CACHE = 128;
@@ -170,6 +172,7 @@ export interface TeamMemberPlan {
 }
 export interface TeamInitialRequest { to: string; task: string; inputRefs: string[] }
 export interface TeamPlan {
+	budget?: TeamBudgetPreset;
 	manager: TeamMemberPlan;
 	workers: TeamMemberPlan[];
 	brief: TeamBrief;
@@ -200,7 +203,8 @@ export interface TeamBudgetLimits {
 	emergencyManagerActivations: number;
 	reservedResultBytes: number;
 }
-export const DEFAULT_TEAM_BUDGET: Readonly<TeamBudgetLimits> = Object.freeze({
+export const TEAM_BUDGET_UNLIMITED = 1_000_000_000;
+const STANDARD_TEAM_BUDGET: Readonly<TeamBudgetLimits> = Object.freeze({
 	workerPermits: 4,
 	memberUnresolvedWork: 64,
 	teamWorks: 512,
@@ -217,8 +221,24 @@ export const DEFAULT_TEAM_BUDGET: Readonly<TeamBudgetLimits> = Object.freeze({
 	rootToolCalls: 1024,
 	teamToolCalls: 4096,
 	emergencyManagerActivations: 3,
-	reservedResultBytes: TEAM_MAX_RESERVED_RESULT_BYTES,
+	reservedResultBytes: 16 * 1024 * 1024,
 });
+export const TEAM_BUDGET_PRESETS = Object.freeze({
+	standard: STANDARD_TEAM_BUDGET,
+	long: Object.freeze({ ...STANDARD_TEAM_BUDGET,
+		teamActivations: 4096, managerActivations: 1024, teamModelRequests: 8192, teamToolCalls: 32768,
+		teamWorks: 4096, rootChildren: 512, rootActivations: 1024, rootModelRequests: 2048, rootToolCalls: 8192,
+		workRevisions: 128, reservedResultBytes: 64 * 1024 * 1024,
+	}),
+	unlimited: Object.freeze({ ...STANDARD_TEAM_BUDGET,
+		teamActivations: TEAM_BUDGET_UNLIMITED, managerActivations: TEAM_BUDGET_UNLIMITED,
+		teamModelRequests: TEAM_BUDGET_UNLIMITED, teamToolCalls: TEAM_BUDGET_UNLIMITED,
+		rootActivations: TEAM_BUDGET_UNLIMITED, rootModelRequests: TEAM_BUDGET_UNLIMITED, rootToolCalls: TEAM_BUDGET_UNLIMITED,
+		teamWorks: 20000, rootChildren: 2048, workRevisions: 512, reservedResultBytes: TEAM_MAX_RESERVED_RESULT_BYTES,
+	}),
+});
+export type TeamBudgetPreset = keyof typeof TEAM_BUDGET_PRESETS;
+export const DEFAULT_TEAM_BUDGET: Readonly<TeamBudgetLimits> = TEAM_BUDGET_PRESETS.long;
 /** Counters a host grant may raise for the whole team. */
 export const TEAM_GRANTABLE_COUNTERS = ["teamActivations", "managerActivations", "teamModelRequests", "teamToolCalls", "emergencyManagerActivations"] as const;
 /** Counters a host grant may raise for one root. */
@@ -474,7 +494,9 @@ export interface TeamBudgetGrantView {
 	id: string;
 	actor: "@host";
 	scope: { kind: "team" } | { kind: "root"; rootId: string };
-	increments: Partial<Record<TeamGrantCounter | RootGrantCounter, number>>;
+	/** Preset raises may include any Team limit; ordinary grants keep their scope-specific counters. */
+	preset?: TeamBudgetPreset;
+	increments: Partial<TeamBudgetLimits>;
 	reason: string;
 	at: number;
 }

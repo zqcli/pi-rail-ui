@@ -8,8 +8,8 @@ import type { TeamHistoryEntry } from "./team-history";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
-	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
-	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, sameWorkRef, shortWorkRef,
+	TEAM_BUDGET_UNLIMITED, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
+	workRefKey, type TeamBudgetLimits, type TeamBudgetPreset, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, sameWorkRef, shortWorkRef,
 } from "./team-protocol";
 import { capped, TEAM_TIMELINE_HEAD, type TeamRuntime } from "./team-runtime";
 import {
@@ -65,6 +65,7 @@ type Params = {
 	brief?: unknown;
 	initialRequests?: unknown;
 	timeoutSeconds?: number | null;
+	budget?: TeamBudgetPreset | null;
 	reason?: string | null;
 	cursor?: string | null;
 	resultRef?: string | null;
@@ -98,7 +99,9 @@ export class TeamLaunchWaitAbortedError extends Error {
 // Bounded text views shared by the tool panel, tool results and /rail-team.
 
 const upper = (value: string) => value.replaceAll("_", " ").toUpperCase();
-const limit = (used: number, max: number) => `${used}/${max}`;
+export const formatBudgetLimit = (value: number): string => value >= TEAM_BUDGET_UNLIMITED ? "unlimited" : String(value);
+const limit = (used: number, max: number) => `${used}/${formatBudgetLimit(max)}`;
+const budgetLimitsText = (limits: TeamBudgetLimits) => `activations ${formatBudgetLimit(limits.teamActivations)} · manager ${formatBudgetLimit(limits.managerActivations)} · model requests ${formatBudgetLimit(limits.teamModelRequests)} · tool calls ${formatBudgetLimit(limits.teamToolCalls)} · works ${formatBudgetLimit(limits.teamWorks)}`;
 
 type PanelFacts = ReturnType<TeamRuntime["panelFacts"]>;
 
@@ -303,11 +306,11 @@ function hasPayload(value: unknown): boolean {
 
 /** Enforce the action whitelist before projecting parameters into the shared plan codec. */
 function assertActionParams(params: Params, action: Params["action"]): void {
-	const known = ["action", "teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds", "reason", "cursor", "resultRef"];
+	const known = ["action", "teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds", "budget", "reason", "cursor", "resultRef"];
 	const unknown = Object.keys(params).filter((key) => !known.includes(key));
 	if (unknown.length) throw new Error(`${action} contains unsupported field(s): ${unknown.join(", ")}`);
 	const allowed: Record<Params["action"], readonly string[]> = {
-		prepare: ["action", "teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds"],
+		prepare: ["action", "teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds", "budget"],
 		launch: ["action", "teamId"],
 		status: ["action", "teamId", "cursor", "resultRef"],
 		cancel: ["action", "teamId", "reason"],
@@ -342,8 +345,9 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		"Process:",
 		`- works ${stats.works} (${stats.roots} roots, ${stats.works - stats.roots} sub-tasks) · results ${stats.results}`,
 		`- activations ${stats.activations} · model turns ${stats.modelTurns} · dependency waits ${stats.dependencyWaits} · questions to the Manager ${stats.questions}`,
-		`- revisions ${stats.revisions} · cancelled ${stats.cancelled} · tool errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
+		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · tool errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
 		`- tokens input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
+		`- Budget: ${budgetLimitsText(view.budget.limits)}`,
 		"Members:",
 		...view.members.map((member) => {
 			const activity = host.driver.memberActivity(result.teamId, member.id);
@@ -399,7 +403,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		if (!host.active) throw new Error("The Team runtime for this session branch has ended; nothing was prepared");
 		if (params.teamId?.trim()) throw new Error("prepare creates a new Team and does not accept teamId");
 		const raw: Record<string, unknown> = {};
-		for (const key of ["manager", "workers", "brief", "initialRequests", "timeoutSeconds"] as const) {
+		for (const key of ["manager", "workers", "brief", "initialRequests", "timeoutSeconds", "budget"] as const) {
 			if (params[key] !== undefined) raw[key] = params[key];
 		}
 		const plan = normalizeTeamPlan(raw);
@@ -431,7 +435,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			}),
 			`Initial work: ${works.map((work) => `${workRefKey(work.work)} → ${work.assignee}`).join(" · ") || "none (workers start idle; the Manager assigns work)"}`,
 			`Deadline: ${plan.timeoutSeconds === null ? "no Team deadline" : `${plan.timeoutSeconds}s from launch`}`,
-			`Budget: activations ${view.budget.limits.teamActivations} · manager ${view.budget.limits.managerActivations} · model requests ${view.budget.limits.teamModelRequests} · tool calls ${view.budget.limits.teamToolCalls} · works ${view.budget.limits.teamWorks}; the host can grant more with /rail-team.`,
+			`Budget (${plan.budget ?? "long"}): ${budgetLimitsText(view.budget.limits)}; the host can grant more with /rail-team.`,
 			`Next: in your next message call subagent_team {"action":"launch","teamId":"${view.teamId}"}. It returns when the whole Team has ended. Do not start members with the subagent tool.`,
 		];
 		return textResult(lines.join("\n"), { view, works });
@@ -594,11 +598,13 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			+ "(1) prepare {\"action\":\"prepare\",\"manager\":{\"alias\":\"lead\",\"roleDescription\":\"...\"},\"workers\":[{\"alias\":\"review\",\"roleDescription\":\"...\"}],\"brief\":{\"goal\":\"...\"},\"initialRequests\":[{\"to\":\"review\",\"task\":\"...\"}],\"timeoutSeconds\":null} "
 			+ "validates and pins every member's model, cwd, Fast/Search and context budget, and returns the plan, initial WorkRefs and budget without starting anything. "
 			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with deliverables, process counts, per-member totals and the full text of every worker result the Manager selected, so no status call is needed to read them. "
+			+ "Choose budget unlimited only when the user asks for an open-ended or loop run; use long (default) for long runs. "
 			+ "status (teamId optional) lists Teams; status with teamId returns the Team view and timeline; cursor pages resultRefs, or resultRef fetches one full worker ResultRecord. cancel (teamId, reason) inspects or stops a Team. The Manager assigns, reviews and closes; it does not write a final summary. "
 			+ "The parent model is not woken while launch waits; budget grants and hold releases are host-only (/rail-team).",
 		promptGuidelines: [
 			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected worker results in full; use status afterwards for the timeline or results it names as truncated or unselected.",
 			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
+			"Choose unlimited only when the user asks for an open-ended or loop run; use long (default) for long runs.",
 			"Role-only workers are valid: they stay idle until the Manager assigns work. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
 			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",
 		],
@@ -612,6 +618,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			workers: nullable(Type.Array(MemberSchema, { minItems: 1, maxItems: TEAM_MAX_WORKERS })),
 			brief: nullable(BriefSchema),
 			initialRequests: nullable(Type.Array(InitialRequestSchema, { maxItems: TEAM_MAX_INITIAL_REQUESTS })),
+			budget: nullable(StringEnum(["standard", "long", "unlimited"], { description: "prepare: execution budget preset; defaults to long" })),
 			timeoutSeconds: nullable(Type.Number({ exclusiveMinimum: 0, maximum: TEAM_MAX_TIMEOUT_SECONDS, description: "null = no Team deadline. Only for a user-requested deadline, counted from launch." })),
 			reason: nullable(Type.String({ description: "cancel: why the Team is cancelled" })),
 		}, { additionalProperties: false }),

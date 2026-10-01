@@ -106,7 +106,7 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 成员通过 `team` 工具协作：`request`（同步接受并返回 WorkRef，不等待接收者运行）、`reply`（只为当前 WorkRef 暂存结果，原生收尾和清理后才提交）、`yield`（等待具体 WorkRef、请求 Manager 决策，或让 Manager 本批 idle；等待会结束本次原生运行，不占住成员）、只读 `status`，以及 Manager 专用的扁平 `control`（`{"action":"control","command":"close_team","resultRefs":["<resultRef>"],"outcome":"succeeded"}`；另有 `pause_member`、`resume_member`、`revise_work`、`cancel_work`、`resume_work`、`accept_result`、`close_member`）。`reply`、`yield`、`close_team` 必须是最终 assistant 批次中唯一的工具调用。业务错误以带 `code` 的结构化工具错误返回。结果未知（传输丢失、清理未确认等）的依赖不会自动唤醒下游，而是挂起并等待 Manager/宿主明确处置。全员 idle 是正常状态，不会自动失败或关闭；没有模型轮询。
 
-执行预算（默认：4 个 worker 执行许可加 Manager 独立许可、Team 512 次 activation、1024 次模型请求、4096 次工具调用等）从 launch 起累计，修订、新 ID 或 idle 都不重置；模型不能给自己加额度，只有宿主可以 grant。
+`subagent_team prepare` 支持 `budget: "standard" | "long" | "unlimited"`（默认 `long`：Team 4096 次 activation、8192 次模型请求、32768 次工具调用）；仅用户要求开放式/循环任务时选 `unlimited`。预算累计不重置，只有宿主可经 `/rail-team <id> grant` 提额，各档均保留 4 个 worker 许可与 Manager 独立许可。
 
 `/rail-team` 打开实时弹窗，包含 Overview、Members、Tasks 和 Timeline 四个视图（Tab 切换，方向键导航），支持经确认的 cancel/resume/grant/message 操作及只读历史。`/rail-team list`（或无 UI 时不带参数）保留文本列表；`/rail-team <teamId> …` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、resume（解除 attention/protocol hold）、grant 和 cancel。模型工具 `subagent_team status` 以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。历史只读：跨 session branch 或重启不恢复旧 Promise 或继续运行，未结束的 Team 显示为 interrupted；旧 v1 Team 记录只读映射为 legacy。
 

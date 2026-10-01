@@ -13,13 +13,13 @@ import {
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_WORKERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
-	TEAM_STATUS_MAX_LIMIT, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
+	TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_MAX_RESULT_RECORDS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
 	MANAGER_EVENT_KINDS,
 	type ActivationInput, type ActivationScope, type BindingV2, type ChildFrame, type GateDecision, type ParentCommand,
 	type Health, type HoldReason, type MemberActivity, type MemberLifecycle, type MemberRole, type ManagerEventView, type OutcomeView, type PauseState, type PrivateAction,
 	type PrivateReply, type ResourceState, type TeamAction, type TeamBrief, type TeamControl, type TeamError,
 	type TeamBudgetLimits, type TeamErrorCode, type TeamEvidence, type TeamIncidentView, type TeamMemberPlan,
-	type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReceipt, type TeamReply, type TeamReplyData,
+	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReceipt, type TeamReply, type TeamReplyData,
 	type TeamStatusPage, type TeamTeamView, type TeamWorkSummary, type TeamWorkView, type MemberRecord, type ResultRecord,
 	type WorkError, type WorkRef, type WorkResult, type WorkState, type WorkVersion, type TeamBudgetGrantView, type TeamRootBudgetView,
 	type TeamResult,
@@ -330,13 +330,18 @@ function normalizeMemberPlan(value: unknown, field: string): TeamMemberPlan {
 }
 
 /** Normalize a `subagent_team.prepare` plan. Model/cwd resolution is the launcher's job. */
+export function normalizeTeamBudgetPreset(value: unknown): TeamBudgetPreset {
+	if (value !== "standard" && value !== "long" && value !== "unlimited") return invalid("budget must be standard, long or unlimited");
+	return value;
+}
+
 export function normalizeTeamPlan(value: unknown): TeamPlan {
 	assertJsonValue(value, new Set());
 	if (!isRecord(value)) return invalid("prepare expects {manager, workers, brief, initialRequests?, timeoutSeconds?}");
 	if (value["coordinator"] !== undefined && value["coordinator"] !== null) {
 		return invalid("coordinator was replaced by manager {alias, roleDescription, ...}; the manager does not write the final summary");
 	}
-	onlyKeys(value, ["manager", "workers", "brief", "initialRequests", "timeoutSeconds", "coordinator"], "prepare");
+	onlyKeys(value, ["manager", "workers", "brief", "initialRequests", "timeoutSeconds", "budget", "coordinator"], "prepare");
 	const manager = normalizeMemberPlan(value["manager"], "manager");
 	const rawWorkers = array(value["workers"], "workers", TEAM_MAX_WORKERS);
 	if (rawWorkers.length < 1) return invalid(`workers must list 1-${TEAM_MAX_WORKERS} members`);
@@ -363,7 +368,8 @@ export function normalizeTeamPlan(value: unknown): TeamPlan {
 		}
 		timeoutSeconds = seconds;
 	}
-	return { manager, workers, brief, initialRequests, timeoutSeconds };
+	return { manager, workers, brief, initialRequests, timeoutSeconds,
+		...(value["budget"] == null ? {} : { budget: normalizeTeamBudgetPreset(value["budget"]) }) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -448,7 +454,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	controlAction("revise_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
 		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
-	}, "Manager only: replace the exact current work revision; preserve its workId and result history."),
+	}, "Manager only: replace the exact current work revision; preserve its workId and result history; its unfinished sub-tasks become superseded."),
 	controlAction("cancel_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		reason: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
 	}, "Manager only: cancel the exact current work subtree; cleanup uncertainty remains visible."),
@@ -804,7 +810,7 @@ function parseWorkVersion(value: unknown, field: string): WorkVersion {
 		revision: safeInteger(value["revision"], `${field}.revision`, 1), task: text(value["task"], `${field}.task`, TEAM_MAX_TASK_BYTES),
 		inputRefs: idList(value["inputRefs"], `${field}.inputRefs`, TEAM_MAX_INPUT_REFS), state: state as WorkState,
 		waitingFor: parseRefs(value["waitingFor"], `${field}.waitingFor`, TEAM_MAX_WAITING_FOR),
-		observedOutcomes: parseRefs(value["observedOutcomes"], `${field}.observedOutcomes`, 512),
+		observedOutcomes: parseRefs(value["observedOutcomes"], `${field}.observedOutcomes`, TEAM_MAX_RESULT_RECORDS),
 		...(checkpoint !== undefined ? { checkpoint } : {}), ...(resumeInstruction !== undefined ? { resumeInstruction } : {}),
 		...(hold ? { hold } : {}), ...(resultRef ? { resultRef } : {}), ...(review ? { review } : {}), ...(error ? { error } : {}),
 		createdAt, updatedAt,
@@ -875,7 +881,7 @@ export function normalizeTeamResult(value: unknown, field = "terminal.result"): 
 }
 
 export function normalizeTeamResultRoots(value: unknown, field = "roots"): TeamResult["roots"] {
-	if (!Array.isArray(value) || value.length > 512) return protocol(`${field} is invalid or exceeds capacity`);
+	if (!Array.isArray(value) || value.length > TEAM_BUDGET_PRESETS.unlimited.teamWorks) return protocol(`${field} is invalid or exceeds capacity`);
 	return value.map((raw, index) => {
 		const rootField = `${field}[${index}]`;
 		if (!isRecord(raw)) return protocol(`${rootField} must be an object`);
@@ -944,7 +950,7 @@ function parseTeamWorkView(value: unknown): TeamWorkView {
 	frameKeys(value, ["id", "requester", "assignee", "rootId", "parent", "depth", "currentRevision", "current", "children", "childrenOmitted", "revisions", "rejectedCandidates"], "work view");
 	const childrenOmitted = value["childrenOmitted"] === undefined ? undefined : safeInteger(value["childrenOmitted"], "work view.childrenOmitted", 0);
 	const children = array(value["children"], "work view.children", TEAM_MAX_PUBLIC_CHILDREN).map((item, index) => normalizeWorkRef(item, `work view.children[${index}]`));
-	const revisions = array(value["revisions"], "work view.revisions", 32).map((item, index) => {
+	const revisions = array(value["revisions"], "work view.revisions", TEAM_BUDGET_PRESETS.unlimited.workRevisions).map((item, index) => {
 		const field = `work view.revisions[${index}]`;
 		if (!isRecord(item)) return protocol(`${field} must be an object`);
 		frameKeys(item, ["revision", "state", "resultRef"], field);
@@ -952,7 +958,7 @@ function parseTeamWorkView(value: unknown): TeamWorkView {
 		return { revision: safeInteger(item["revision"], `${field}.revision`, 1), state: item["state"] as WorkState,
 			...(item["resultRef"] !== undefined ? { resultRef: frameId(item["resultRef"], `${field}.resultRef`) } : {}) };
 	});
-	const rejectedCandidates = value["rejectedCandidates"] === undefined ? undefined : array(value["rejectedCandidates"], "work view.rejectedCandidates", 32).map((item, index) => {
+	const rejectedCandidates = value["rejectedCandidates"] === undefined ? undefined : array(value["rejectedCandidates"], "work view.rejectedCandidates", TEAM_BUDGET_PRESETS.unlimited.workRevisions).map((item, index) => {
 		const field = `work view.rejectedCandidates[${index}]`;
 		if (!isRecord(item)) return protocol(`${field} must be an object`);
 		frameKeys(item, ["revision", "reason", "summary"], field);
@@ -1102,7 +1108,7 @@ export function normalizeTeamBudgetGrantRecord(value: unknown, field = "journal 
 
 function parseGrant(value: unknown, field: string): TeamBudgetGrantView {
 	if (!isRecord(value)) return protocol(`${field} must be an object`);
-	frameKeys(value, ["id", "actor", "scope", "increments", "reason", "at"], field);
+	frameKeys(value, ["id", "actor", "scope", "increments", "reason", "at", "preset"], field);
 	if (value["actor"] !== "@host") return protocol(`${field}.actor must be @host`);
 	const scope = value["scope"];
 	if (!isRecord(scope)) return protocol(`${field}.scope must be an object`);
@@ -1112,11 +1118,14 @@ function parseGrant(value: unknown, field: string): TeamBudgetGrantView {
 	else return protocol(`${field}.scope.kind is invalid`);
 	const increments = value["increments"];
 	if (!isRecord(increments)) return protocol(`${field}.increments must be an object`);
-	const allowed: readonly string[] = parsedScope.kind === "team" ? TEAM_GRANTABLE_COUNTERS : ROOT_GRANTABLE_COUNTERS;
+	const preset = value["preset"] === undefined ? undefined : normalizeTeamBudgetPreset(value["preset"]);
+	if (preset && parsedScope.kind !== "team") return protocol(`${field}.preset requires Team scope`);
+	const allowed: readonly string[] = preset ? Object.keys(TEAM_BUDGET_PRESETS[preset])
+		: parsedScope.kind === "team" ? TEAM_GRANTABLE_COUNTERS : ROOT_GRANTABLE_COUNTERS;
 	frameKeys(increments, allowed, `${field}.increments`);
 	const parsedIncrements: TeamBudgetGrantView["increments"] = {};
 	for (const [key, raw] of Object.entries(increments)) (parsedIncrements as Record<string, number>)[key] = safeInteger(raw, `${field}.increments.${key}`, 1);
-	return { id: frameId(value["id"], `${field}.id`), actor: "@host", scope: parsedScope, increments: parsedIncrements,
+	return { id: frameId(value["id"], `${field}.id`), actor: "@host", scope: parsedScope, increments: parsedIncrements, ...(preset ? { preset } : {}),
 		reason: text(value["reason"], `${field}.reason`, 512), at: safeInteger(value["at"], `${field}.at`, 0) };
 }
 

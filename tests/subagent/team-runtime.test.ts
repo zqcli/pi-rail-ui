@@ -1459,6 +1459,26 @@ test("W: revising a resolved root preserves its committed result and old review"
 	runtime.assertInvariants(teamId);
 });
 
+test("processStats cancelled matches current cancelled/superseded works, not historical revisions", () => {
+	const { runtime, teamId } = makeRuntime();
+	const manager = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, manager);
+	const parent = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, parent);
+	assert.equal(action(runtime, parent, 1, "child", { action: "request", to: "w2", task: "unfinished child" }).ok, true);
+	const root = workRef(parent);
+	assert.equal(action(runtime, manager, 1, "revise-parent", {
+		action: "control", command: "revise_work", workId: root.workId, expectedRevision: 1, task: "replacement",
+	}).ok, true);
+	assert.equal(runtime.processStats(teamId).cancelled, 1, "only the child's CURRENT superseded version counts");
+	assert.equal(runtime.processStats(teamId).cancelled, runtime.getTeam(teamId).works.cancelled);
+	assert.equal(action(runtime, manager, 2, "cancel-parent", {
+		action: "control", command: "cancel_work", workId: root.workId, expectedRevision: 2, reason: "stop",
+	}).ok, true);
+	assert.equal(runtime.processStats(teamId).cancelled, 2);
+	assert.equal(runtime.processStats(teamId).cancelled, runtime.getTeam(teamId).works.cancelled);
+});
+
 test("W: cancelled dependency is not deliverable until the old activation cleanup is confirmed", () => {
 	const { runtime, teamId } = makeRuntime();
 	const manager = runtime.takeNextActivation(teamId)!;

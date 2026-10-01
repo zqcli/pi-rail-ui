@@ -1,6 +1,6 @@
 import {
-	ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
-	type ActivationBudgetSummary, type RootGrantCounter, type TeamBudgetGrantView, type TeamBudgetLimits, type TeamGrantCounter, type TeamRootBudgetView,
+	ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS,
+	type ActivationBudgetSummary, type RootGrantCounter, type TeamBudgetGrantView, type TeamBudgetLimits, type TeamRootBudgetView,
 } from "./team-protocol";
 
 /**
@@ -146,7 +146,7 @@ export class TeamBudget {
 	grant(record: Omit<BudgetGrantRecord, "actor">): BudgetGrantRecord {
 		const entries = this.validateGrant(record);
 		for (const [counter, increment] of entries) {
-			if (record.scope.kind === "team") this.limits[counter as TeamGrantCounter] += increment;
+			if (record.scope.kind === "team") this.limits[counter as keyof TeamBudgetLimits] += increment;
 			else {
 				const grants = this.rootGrants.get(record.scope.rootId) ?? {};
 				grants[counter as RootGrantCounter] = (grants[counter as RootGrantCounter] ?? 0) + increment;
@@ -165,16 +165,23 @@ export class TeamBudget {
 	 */
 	validateGrant(record: Omit<BudgetGrantRecord, "actor">): Array<[string, number]> {
 		if (this.grants.length >= TEAM_MAX_BUDGET_GRANTS) throw new RangeError(`At most ${TEAM_MAX_BUDGET_GRANTS} budget grants are retained per Team`);
-		const allowed: readonly string[] = record.scope.kind === "team" ? TEAM_GRANTABLE_COUNTERS : ROOT_GRANTABLE_COUNTERS;
+		if (record.preset && record.scope.kind !== "team") throw new RangeError("Preset raises require Team scope");
+		const allowed: readonly string[] = record.preset ? Object.keys(TEAM_BUDGET_PRESETS[record.preset])
+			: record.scope.kind === "team" ? TEAM_GRANTABLE_COUNTERS : ROOT_GRANTABLE_COUNTERS;
 		const entries = Object.entries(record.increments);
 		if (!entries.length) throw new RangeError("A grant needs at least one counter increment");
 		const checked: Array<[string, number]> = [];
 		for (const [counter, increment] of entries) {
 			if (!allowed.includes(counter)) throw new RangeError(`${counter} is not grantable for a ${record.scope.kind} scope`);
 			if (typeof increment !== "number" || !Number.isSafeInteger(increment) || increment < 1) throw new RangeError(`${counter} increment must be a positive safe integer`);
-			const current = record.scope.kind === "team" ? this.limits[counter as TeamGrantCounter]
+			const current = record.scope.kind === "team" ? this.limits[counter as keyof TeamBudgetLimits]
 				: this.rootLimit(record.scope.rootId, counter as RootGrantCounter);
 			if (!Number.isSafeInteger(current + increment)) throw new RangeError(`${counter} limit would exceed a safe integer`);
+			if (record.scope.kind === "team") {
+				for (const grants of this.rootGrants.values()) {
+					if (!Number.isSafeInteger(current + increment + (grants[counter as RootGrantCounter] ?? 0))) throw new RangeError(`${counter} root limit would exceed a safe integer`);
+				}
+			}
 			checked.push([counter, increment]);
 		}
 		return checked;

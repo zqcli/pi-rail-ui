@@ -281,7 +281,7 @@ test("launch final output carries deliverables, process, members and selected re
 	};
 	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
 	const text: string = result.content[0].text;
-	assert.match(text, /^Members:\n- lead · manager · .* · works done 0 · activations 9 · active 0:00\n- worker · worker · .* · works done 8 · activations 8 · active 0:00$/mu);
+	assert.match(text, /^Members:\n- lead · manager · .* · results 0 · activations 9 · active 0:00\n- worker · worker · .* · results 8 · activations 8 · active 0:00$/mu);
 	assert.match(text, /^Deliverables \(8 roots · 0 accepted · 0 waived\):/mu);
 	assert.match(text, /^Process:\n- works 8 \(8 roots, 0 sub-tasks\) · results 8/mu);
 	assert.match(text, /^Final results selected by the Manager \(in full\):/mu);
@@ -434,7 +434,7 @@ test("launch panel titles each task with who asked and which work, says where a 
 	now = await panel();
 	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef({ workId: writerRef.workId, revision: 2 })} · revised`);
 	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the task text is the current revision's");
-	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · superseded by @2", "the current revision has no resultRef yet");
+	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress · @1 result superseded", "the current revision is in progress and the shown result is from @1");
 	const revised = activate(host, teamId);
 	endActivation(host, revised, { action: "reply", result: { status: "succeeded", summary: "Tests added." } });
 	const waive = { ...accept, work: revised.scope.work, disposition: "waived", reason: "Accepted with limitations." };

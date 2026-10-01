@@ -194,10 +194,10 @@ function taskLabel(work: TeamWorkSummary, manager: string): string {
 /** Destination of the shown task, never the result of a different work. */
 function resultTarget(work: TeamWorkSummary, latest?: ResultRecord): string {
 	const superseded = latest?.work.workId === work.work.workId && latest.work.revision < work.work.revision;
-	const fate = superseded ? `superseded by @${work.work.revision}`
-		: work.review ?? (work.resultRef ? work.parent ? "" : "awaiting review"
-			: work.state === "cancelled" || work.state === "failed" ? work.state : "in progress");
-	return `↳ result → ${work.requester}${fate ? ` · ${fate}` : ""}${work.resultRef ? ` · ${work.resultRef}` : ""}`;
+	const fate = work.review ?? (work.resultRef ? work.parent ? "" : "awaiting review"
+		: work.state === "cancelled" || work.state === "failed" ? work.state : "in progress");
+	return `↳ result → ${work.requester}${fate ? ` · ${fate}` : ""}${work.resultRef ? ` · ${work.resultRef}` : ""}`
+		+ (superseded ? ` · @${latest.work.revision} result superseded` : "");
 }
 
 /**
@@ -348,7 +348,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		...view.members.map((member) => {
 			const activity = host.driver.memberActivity(result.teamId, member.id);
 			return `- ${member.id} · ${member.role} · ${member.policy.model ?? "model ?"}${member.policy.fastMode ? " +FAST" : ""}`
-				+ ` · works done ${facts.results.get(member.id)?.count ?? 0} · activations ${stats.memberActivations.get(member.id) ?? 0} · active ${clock(activity?.durationMs ?? 0)}`;
+				+ ` · results ${facts.results.get(member.id)?.count ?? 0} · activations ${stats.memberActivations.get(member.id) ?? 0} · active ${clock(activity?.durationMs ?? 0)}`;
 		}),
 	];
 	for (const incident of result.unresolvedIncidents.slice(0, 5)) lines.push(`Unresolved ${incident.code}: ${previewText(incident.message, 200)}`);

@@ -2,13 +2,11 @@ import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earend
 import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import type { TeamSessionHost } from "./team-host";
 import type { TeamHistoryEntry } from "./team-history";
-import { isTerminalWorkState, shortWorkRef, workRefKey, type TeamMemberView, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
+import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, shortWorkRef, workRefKey, type TeamMemberView, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { statusColor } from "./transcript";
 
 const TABS = ["Overview", "Members", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
-// Local until TEAM_BUDGET_UNLIMITED is available at merge.
-const UNLIMITED = 1_000_000_000;
 export interface TeamOverlayAction { teamId: string; action: "cancel" | "resume" | "grant" | "message" }
 type Facts = ReturnType<TeamSessionHost["runtime"]["panelFacts"]>;
 type Row = { text: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string };
@@ -216,7 +214,8 @@ export class TeamOverlayComponent implements Focusable {
 		this.selected = Math.max(0, Math.min(this.selected, rows.length - 1));
 		this.timelineCursor = rows[this.selected]?.milestone;
 		const live = !!team && writable(team) && this.host.active;
-		const notice = facts?.waitingFor?.startsWith("Manager decision") ? `Waiting for: ${facts.waitingFor}`
+		// Overview already shows Waiting for in its body.
+		const notice = this.tab !== 0 && facts?.waitingFor?.startsWith("Manager decision") ? `Waiting for: ${facts.waitingFor}`
 			: this.notice || (live ? "c cancel · r resume · g grant · m message" : "");
 		const omitted = this.tab === 3 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
@@ -286,7 +285,7 @@ export class TeamOverlayComponent implements Focusable {
 		counters.forEach(([label, key], index) => {
 			const value = used[key], limit = limits[key];
 			const cells = limit ? Math.min(6, Math.floor(value / limit * 6)) : 6;
-			const meter = limit >= UNLIMITED ? `${value} · unlimited` : this.theme.fg(value >= limit ? "error" : value / limit >= 0.8 ? "warning" : "muted", `${"█".repeat(cells)}${"░".repeat(6 - cells)}  ${value}/${limit}`);
+			const meter = limit >= TEAM_BUDGET_UNLIMITED ? `${value} · unlimited` : this.theme.fg(value >= limit ? "error" : value / limit >= 0.8 ? "warning" : "muted", `${"█".repeat(cells)}${"░".repeat(6 - cells)}  ${value}/${limit}`);
 			add(index ? "" : "Budget", `${label.padEnd(15)} ${meter}`);
 		});
 		this.timeline(facts).slice(-5).forEach((row, index) => add(index ? "" : "Recent", row.text));

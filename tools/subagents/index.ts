@@ -39,6 +39,8 @@ interface SubagentRuntime {
 	manager: RailAgentManager;
 }
 
+const ROSTER_SECTION = "rail_model_sessions";
+
 function unique<T>(values: T[]): T[] {
 	return [...new Set(values)];
 }
@@ -332,8 +334,10 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		if (!active) return;
 		const mentions = extractSubagentMentions(event.prompt);
 		const prompt = buildSubagentRosterPrompt(await active.broker.listLinked(), mentions);
-		if (!prompt) return;
-		return { systemPrompt: `${event.systemPrompt}\n\n${prompt}` };
+		// A section (not a returned systemPrompt, which Pi forces as the leading prompt) lets Pi append
+		// a small system delta when the roster changes instead of invalidating the whole cached prefix.
+		if (prompt) event.systemPromptOptions.sections[ROSTER_SECTION] = prompt;
+		else delete event.systemPromptOptions.sections[ROSTER_SECTION];
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {

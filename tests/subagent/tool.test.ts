@@ -859,6 +859,25 @@ test("renderCall owns task-free dispatch metadata and single results do not repe
 	}
 });
 
+test("confirmSessionAttach=false cannot skip the dialog with a UI and is the headless opt-in", async () => {
+	const { tool, broker } = setupTool();
+	const args = { model: "cus-resp/gpt-5.6-sol", alias: "attached", task: "resume", session: { mode: "fork" as const, path: "/tmp/existing.jsonl" }, confirmSessionAttach: false };
+	const prompts: string[] = [];
+	const ui = { ...context(), ui: { confirm: async (title: string) => { prompts.push(title); return false; } } };
+
+	await assert.rejects(() => tool.execute("attach-denied", args, undefined, undefined, ui), /was not approved/);
+	assert.equal(prompts.length, 1);
+	assert.equal(broker.requests.length, 0);
+
+	const headless = { ...context(), hasUI: false };
+	await tool.execute("attach-headless", args, undefined, undefined, headless);
+	assert.equal(broker.requests.length, 1);
+	await assert.rejects(
+		() => tool.execute("attach-headless-default", { ...args, confirmSessionAttach: undefined }, undefined, undefined, headless),
+		/requires UI confirmation/,
+	);
+});
+
 test("control failures retain an explicit unknown-delivery result for the panel", async () => {
 	const { tool, broker, hook } = setupTool();
 	broker.controlError = new WorkerControlError("Subagent control delivery outcome is unknown", "unknown");

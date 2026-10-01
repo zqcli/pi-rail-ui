@@ -152,15 +152,12 @@ function compactText(value: string, maxLength = 120): string {
 export function buildSubagentRosterPrompt(instances: AgentInstance[], mentions: SubagentMentions): string {
 	if (instances.length === 0 && mentions.targets.length === 0 && mentions.models.length === 0) return "";
 	const lines = [
-		"## Persistent Rail Model Sessions",
-		"",
 		"Use the subagent tool with `target` to continue a linked session, or `model` plus `alias` to create one.",
 	];
 	for (const instance of instances) {
 		lines.push(
-			`- ${instance.alias} (${instance.agentId}) [${compactText(railModelReference(instance.model))}, idle]`,
+			`- ${instance.alias} (${instance.agentId}) [${compactText(railModelReference(instance.model))}]`,
 			`  CWD: ${compactText(instance.cwd)}`,
-			`  Last task: ${compactText(instance.lastTask)}`,
 		);
 	}
 	if (mentions.targets.length > 0 || mentions.models.length > 0) {

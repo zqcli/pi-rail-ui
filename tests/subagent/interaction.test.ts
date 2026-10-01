@@ -173,7 +173,7 @@ test("buildSubagentRosterPrompt exposes model-bound sessions and makes explicit 
 	);
 
 	assert.match(prompt, /auth-review \(agt_auth\).*cus-resp\/gpt-5\.6-sol:xhigh/);
-	assert.match(prompt, /Last task: Review auth concurrency/);
+	assert.doesNotMatch(prompt, /Last task|Review auth concurrency|idle/);
 	assert.match(prompt, /must call subagent with target="auth-review"/);
 	assert.doesNotMatch(prompt, /sessionFile|systemPrompt|profile/);
 });

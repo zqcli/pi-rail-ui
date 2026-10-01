@@ -8,6 +8,67 @@ import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
 const bundle = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", import.meta.url));
 const fixture = fileURLToPath(new URL("../fixtures/bundle-keep-alive-probe.ts", import.meta.url));
 
+test("real Pi tool wait: warm a busy parent, keep the deadline across sibling results and steering, then resume", { timeout: 30_000 }, async (t) => {
+	const root = join(process.cwd(), ".tmp");
+	await mkdir(root, { recursive: true });
+	const dir = await mkdtemp(join(root, "ka-tools-"));
+	const output = join(dir, "result.json");
+	const log = join(dir, "provider.jsonl");
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundle, "--mode", "rpc", "--no-session", "--model", "rail-ka-local/local", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline", "-e", fixture],
+		cwd: process.cwd(),
+		env: { ...process.env, HOME: join(dir, "home"), PI_CODING_AGENT_DIR: join(dir, "agent"), PI_OFFLINE: "1", KA_WAIT_TEST: "1", KA_PROBE_OUTPUT: output, KA_PROBE_LOG: log },
+	});
+	t.after(async () => { await transport.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+	await transport.start();
+	const command = (message: string) => transport.request({ type: "prompt", message });
+	const status = async () => {
+		await command("/ka-wait-status");
+		return JSON.parse(await readFile(output, "utf8"));
+	};
+	const waitForPending = async (count: number) => {
+		for (let i = 0; i < 100; i++) {
+			const s = await status();
+			if (s.pending.length === count) return s;
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		throw new Error(`pending tool count did not reach ${count}`);
+	};
+	await command("/rail-keep-alive 1");
+	await command("hold two tools");
+	const before = await waitForPending(2);
+	assert.equal(before.idle, false);
+	assert.equal(before.label, "KA 1|1", "the response arms a countdown before agent_settled");
+	await transport.request({ type: "steer", message: "queued until the tools finish" });
+	await command("/ka-release a");
+	const partial = await waitForPending(1);
+	assert.equal(partial.idle, false);
+	assert.equal(partial.nextWarmAt, before.nextWarmAt, "partial tool completion and steering do not reset the interval");
+	// Unit tests advance actual timers. This probe dispatches the scheduled native refresh now,
+	// with real AgentSession/tool lifecycle state, without waiting a minute in the default suite.
+	await command("/ka-probe");
+	const warmed = await status();
+	assert.equal(warmed.idle, false);
+	assert.equal(warmed.usage, 1);
+	assert.equal(warmed.label, "KA 1|1");
+	const requests = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+	assert.equal(requests.length, 2);
+	assert.equal(requests[1].maxTokens, 1);
+	assert.deepEqual(requests[1].payload, requests[0].payload, "warm the exact parent prefix, without partial results or queued text");
+	const settled = new Promise<void>(resolve => {
+		const off = transport.onEvent(e => { if (e.type === "agent_settled") { off(); resolve(); } });
+	});
+	await command("/ka-release b");
+	await settled;
+	const after = await status();
+	assert.equal(after.idle, true);
+	assert.equal(after.usage, 1);
+	assert.equal(after.label, "KA 1|1");
+	assert.doesNotMatch(after.status, /waiting for tools/);
+	assert.equal((await readFile(log, "utf8")).trim().split("\n").length, 3, "only one parent continuation after both tools return");
+});
+
 test("bundled CLI: capture the actual warmer through public AgentSession without a provider call", { timeout: 30_000 }, async (t) => {
 	const root = join(process.cwd(), ".tmp");
 	await mkdir(root, { recursive: true });

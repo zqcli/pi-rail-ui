@@ -1,5 +1,5 @@
 import { appendFile, readFile, writeFile } from "node:fs/promises";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
 import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installRailKeepAlive, keepAliveLabel, keepAliveStatus } from "../../commands/rail-keep-alive";
 
@@ -16,13 +16,18 @@ export default function probe(pi: ExtensionAPI) {
 				await options?.onResponse?.({ status: 200, headers: {} }, model);
 				await appendFile(process.env["KA_PROBE_LOG"]!, JSON.stringify({ maxTokens: options?.maxTokens, payload, headers,
 					hasPayloadHook: !!options?.onPayload, hasResponseHook: !!options?.onResponse, hasHeadersHook: headers?.["x-ka-probe"] === "yes" }) + "\n");
-				const message = { role: "assistant" as const, content: [{ type: "text" as const, text: "local only" }], api: model.api,
+				const waiting = process.env["KA_WAIT_TEST"] === "1" && options?.maxTokens !== 1
+					&& !context.messages.some(message => message.role === "toolResult");
+				const message = { role: "assistant" as const, content: waiting
+					? ["a", "b"].map(id => ({ type: "toolCall" as const, id, name: "ka_wait", arguments: { id } }))
+					: [{ type: "text" as const, text: "local only" }], api: model.api,
 					provider: model.provider, model: model.id, stopReason: "stop" as const, timestamp: Date.now(),
 					usage: { input: 3, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 4,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-				stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
-				stream.push({ type: "done", reason: "stop", message });
-				stream.end(message);
+				const finalized = { ...message, stopReason: waiting ? "toolUse" as const : "stop" as const };
+				stream.push({ type: "start", partial: { ...finalized, content: [], stopReason: "pending" } });
+				stream.push({ type: "done", reason: finalized.stopReason, message: finalized });
+				stream.end(finalized);
 			})().catch(() => stream.end());
 			return stream;
 		},
@@ -47,6 +52,31 @@ export default function probe(pi: ExtensionAPI) {
 		return original.apply(this, args as [string]);
 	};
 	installRailKeepAlive(pi);
+	const pending = new Map<string, () => void>();
+	if (process.env["KA_WAIT_TEST"] === "1") {
+		pi.registerTool({
+			name: "ka_wait", label: "Wait", description: "Local-only controlled long-running tool",
+			parameters: Type.Object({ id: Type.String() }), executionMode: "parallel",
+			async execute(_id, args, signal, onUpdate) {
+				onUpdate?.({ content: [{ type: "text", text: "still working" }], details: undefined });
+				await new Promise<void>(resolve => {
+					const finish = () => { signal?.removeEventListener("abort", finish); pending.delete(args.id); resolve(); };
+					pending.set(args.id, finish);
+					if (signal?.aborted) finish();
+					else signal?.addEventListener("abort", finish, { once: true });
+				});
+				return { content: [{ type: "text", text: "released" }], details: undefined };
+			},
+		});
+		pi.registerCommand("ka-release", { handler: async (id) => { pending.get(id.trim())?.(); } });
+		pi.registerCommand("ka-wait-status", { handler: async (_args, ctx) => {
+			await writeFile(process.env["KA_PROBE_OUTPUT"]!, JSON.stringify({
+				label: keepAliveLabel(ctx.sessionManager), status: keepAliveStatus(ctx.sessionManager),
+				idle: ctx.isIdle(), pending: [...pending.keys()], nextWarmAt: live?._cacheWarmer.run?.nextWarmAt,
+				usage: ctx.sessionManager.getEntries().filter(e => e.type === "usage" && e.kind === "cache_warm").length,
+			}));
+		} });
+	}
 	// Registered after Rail's handler: records what the footer shows right after /reload, before any prompt.
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason !== "reload" || !process.env["KA_RELOAD_OUTPUT"]) return;

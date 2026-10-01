@@ -598,13 +598,12 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			+ "(1) prepare {\"action\":\"prepare\",\"manager\":{\"alias\":\"lead\",\"roleDescription\":\"...\"},\"workers\":[{\"alias\":\"review\",\"roleDescription\":\"...\"}],\"brief\":{\"goal\":\"...\"},\"initialRequests\":[{\"to\":\"review\",\"task\":\"...\"}],\"timeoutSeconds\":null} "
 			+ "validates and pins every member's model, cwd, Fast/Search and context budget, and returns the plan, initial WorkRefs and budget without starting anything. "
 			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with deliverables, process counts, per-member totals and the full text of every worker result the Manager selected, so no status call is needed to read them. "
-			+ "Choose budget unlimited only when the user asks for an open-ended or loop run; use long (default) for long runs. "
 			+ "status (teamId optional) lists Teams; status with teamId returns the Team view and timeline; cursor pages resultRefs, or resultRef fetches one full worker ResultRecord. cancel (teamId, reason) inspects or stops a Team. The Manager assigns, reviews and closes; it does not write a final summary. "
 			+ "The parent model is not woken while launch waits; budget grants and hold releases are host-only (/rail-team).",
 		promptGuidelines: [
 			"Run a Team with two subagent_team calls in consecutive messages: prepare with manager, workers (alias + roleDescription each), brief.goal and optional initialRequests to workers; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected worker results in full; use status afterwards for the timeline or results it names as truncated or unselected.",
 			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
-			"Choose unlimited only when the user asks for an open-ended or loop run; use long (default) for long runs.",
+			"Leave budget null (long, sized for multi-hour runs); set unlimited only when the user asks for an open-ended or loop run.",
 			"Role-only workers are valid: they stay idle until the Manager assigns work. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
 			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",
 		],
@@ -618,7 +617,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			workers: nullable(Type.Array(MemberSchema, { minItems: 1, maxItems: TEAM_MAX_WORKERS })),
 			brief: nullable(BriefSchema),
 			initialRequests: nullable(Type.Array(InitialRequestSchema, { maxItems: TEAM_MAX_INITIAL_REQUESTS })),
-			budget: nullable(StringEnum(["standard", "long", "unlimited"], { description: "prepare: execution budget preset; defaults to long" })),
+			budget: nullable(StringEnum(["standard", "long", "unlimited"], { description: "prepare: null = long. unlimited removes activation, model-request and tool-call caps (works stay capped at 20000)." })),
 			timeoutSeconds: nullable(Type.Number({ exclusiveMinimum: 0, maximum: TEAM_MAX_TIMEOUT_SECONDS, description: "null = no Team deadline. Only for a user-requested deadline, counted from launch." })),
 			reason: nullable(Type.String({ description: "cancel: why the Team is cancelled" })),
 		}, { additionalProperties: false }),

@@ -70,7 +70,7 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		const entry = host.history.teams.find((team) => team.teamId === teamId);
 		if (!entry) throw new Error(`Unknown teamId ${teamId}. ${USAGE}`);
 		if (subcommand === "status" || subcommand === "results") {
-			ctx.ui.notify(formatHistoryEntry(entry, subcommand === "results" ? text || undefined : text || undefined), "info");
+			ctx.ui.notify(formatHistoryEntry(entry, text || undefined), "info");
 			return;
 		}
 		if (subcommand === "result") {
@@ -166,11 +166,11 @@ function budgetLines(host: TeamSessionHost, teamId: string): string[] {
 	const budget = host.runtime.inspectBudget(teamId);
 	const { limits, used } = budget;
 	const lines = [`Team ${teamId} budget`,
-		...TEAM_GRANTABLE_COUNTERS.map((counter) => `  ${counter}: ${used[counter]}/${limits[counter]}`),
-		`  teamWorks: ${used.teamWorks}/${limits.teamWorks}`,
+		...TEAM_GRANTABLE_COUNTERS.map((counter) => `  ${counter}: ${used[counter]}/${formatBudgetLimit(limits[counter])}`),
+		`  teamWorks: ${used.teamWorks}/${formatBudgetLimit(limits.teamWorks)}`,
 		`Roots (${budget.roots.length}):`];
 	for (const root of budget.roots) {
-		lines.push(`  ${root.rootId}: activations ${root.used.rootActivations}/${root.limits.rootActivations} · model requests ${root.used.rootModelRequests}/${root.limits.rootModelRequests} · tool calls ${root.used.rootToolCalls}/${root.limits.rootToolCalls} · children ${root.used.rootChildren}/${root.limits.rootChildren}`);
+		lines.push(`  ${root.rootId}: activations ${root.used.rootActivations}/${formatBudgetLimit(root.limits.rootActivations)} · model requests ${root.used.rootModelRequests}/${formatBudgetLimit(root.limits.rootModelRequests)} · tool calls ${root.used.rootToolCalls}/${formatBudgetLimit(root.limits.rootToolCalls)} · children ${root.used.rootChildren}/${formatBudgetLimit(root.limits.rootChildren)}`);
 	}
 	if (budget.grants.length) lines.push(`Grants (${budget.grants.length}):`, ...budget.grants.map((grant) =>
 		`  ${grant.id} · ${grant.scope.kind === "team" ? "team" : `root ${grant.scope.rootId}`} · ${Object.entries(grant.increments).map(([key, value]) => `${key}+${value}`).join(", ")} · ${previewText(grant.reason, 120)}`));

@@ -108,7 +108,7 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 执行预算（默认：4 个 worker 执行许可加 Manager 独立许可、Team 512 次 activation、1024 次模型请求、4096 次工具调用等）从 launch 起累计，修订、新 ID 或 idle 都不重置；模型不能给自己加额度，只有宿主可以 grant。
 
-`/rail-team` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、resume（解除 attention/protocol hold）、grant 和 cancel。模型工具 `subagent_team status` 以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。历史只读：跨 session branch 或重启不恢复旧 Promise 或继续运行，未结束的 Team 显示为 interrupted；旧 v1 Team 记录只读映射为 legacy。
+`/rail-team` 打开实时弹窗，包含 Overview、Members、Tasks 和 Timeline 四个视图（Tab 切换，方向键导航），支持经确认的 cancel/resume/grant/message 操作及只读历史。`/rail-team list`（或无 UI 时不带参数）保留文本列表；`/rail-team <teamId> …` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、resume（解除 attention/protocol hold）、grant 和 cancel。模型工具 `subagent_team status` 以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。历史只读：跨 session branch 或重启不恢复旧 Promise 或继续运行，未结束的 Team 显示为 interrupted；旧 v1 Team 记录只读映射为 legacy。
 
 在 `/rail-agent` 面板选中成员后按 `s` 停止、按 `x` 删除。对 Team worker，Stop 只停止该成员，并将其运行中 work 记录为 outcome unknown；同 Team 其他 worker/root 与无关 Team 不会被一并取消。停止 Manager 会标记 `MANAGER_UNAVAILABLE` 并暂停 worker，Team 保持可由宿主管理。Delete 只有在成员原生进程实际退出得到确认后才删除 session 与 descriptor；退出未知时保留资源所有权并拒绝删除。
 

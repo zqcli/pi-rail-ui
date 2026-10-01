@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import type { BudgetScope } from "./team-budget";
 import { previewText } from "./team-codec";
 import type { TeamSessionHost } from "./team-host";
+import { showTeamOverlay } from "./team-overlay";
 import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, workRefKey } from "./team-protocol";
 import { formatHistoryEntry, formatHistorySummary, formatTeamView } from "./team-tool";
 
@@ -39,6 +40,17 @@ export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionH
 }
 
 export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: ExtensionCommandContext): Promise<void> {
+	if (!args.trim() && ctx.hasUI) {
+		const choice = await showTeamOverlay(ctx, host);
+		if (!choice) return;
+		let text = "";
+		if (choice.action === "message") {
+			text = (await ctx.ui.input("Message the Manager", "What should the Manager know?"))?.trim() ?? "";
+			if (!text) return;
+		}
+		await runTeamCommand(host, `${choice.teamId} ${choice.action}${text ? ` ${text}` : ""}`, ctx);
+		return;
+	}
 	const [teamId, subcommand = "status", ...rest] = args.split(/\s+/u).filter(Boolean);
 	if (!teamId || teamId === "list") {
 		const teams = host.runtime.listTeams();

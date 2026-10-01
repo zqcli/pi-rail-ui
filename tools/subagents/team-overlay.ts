@@ -216,7 +216,7 @@ export class TeamOverlayComponent implements Focusable {
 		const live = !!team && writable(team) && this.host.active;
 		// Overview already shows Waiting for in its body.
 		const notice = this.tab !== 0 && facts?.waitingFor?.startsWith("Manager decision") ? `Waiting for: ${facts.waitingFor}`
-			: this.notice || (live ? "c cancel · r resume · g grant · m message" : "");
+			: this.notice;
 		const omitted = this.tab === 3 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
 		const available = Math.max(1, height - 7 - (notice ? 1 : 0) - (omitted ? 1 : 0));
@@ -273,7 +273,7 @@ export class TeamOverlayComponent implements Focusable {
 			lines.push(color ? this.theme.fg(color, text) : text);
 		};
 		wrapTextWithAnsi(oneLine(team.brief.goal), Math.max(1, width - labelWidth)).slice(0, 3).forEach((line, index) => add(index ? "" : "Goal", line));
-		add("Progress", `${progress(works)} · ${team.works.cancelled} cancelled`);
+		add("Progress", `${progress(works)} · ${team.works.cancelled} cancelled/superseded`);
 		add("Waiting for", facts.waitingFor ?? "—", facts.waitingFor?.startsWith("Manager decision") ? "warning" : undefined);
 		const holds = this.host.runtime.listHolds(team.teamId);
 		const incidents = team.incidents.filter((incident) => incident.state === "open");

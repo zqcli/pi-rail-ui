@@ -42,7 +42,7 @@ const TEAM_MAX_GRANT_REASON_BYTES = 512;
 const TEAM_MAX_TIMELINE = 100;
 const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work. "
 	+ "If it needs another member's conclusion first, yield {waitingFor:[that member's WorkRef from status work], checkpoint}, "
-	+ "or request it from that member and wait on the returned WorkRef, or ask the Manager with yield {attention, checkpoint}. Read a full result with status(result).";
+	+ "or request it from that member and wait on the returned WorkRef, or ask the Manager with yield {attention, checkpoint}. An outcome's preview is only its status and summary; read its findings and evidence with status(result) before relying on them.";
 const MANAGEMENT_NOTICE = "Management activation: there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
 	+ "New results, failures and incidents start the next management activation automatically; do not poll status to wait. "
 	+ "A WORK_HELD event is a member asking for input: answer with resume_work {workId, expectedRevision, incidentId, instruction} "
@@ -255,6 +255,9 @@ interface TeamState {
 	closeDecision?: CloseDecision;
 	usage: ReturnType<typeof emptySubagentUsage>;
 }
+
+/** A full-looking `result:`/`work:` ID in text; a bare 8-hex prefix has no dash group and is not checked. */
+const QUOTED_ID = /\b(?:result|work):[0-9a-f]{8}(?:-[0-9a-f]+)+/gu;
 
 const copy = <T>(value: T): T => structuredClone(value);
 const currentVersion = (record: WorkRecord): WorkVersion => record.versions[record.currentRevision - 1]!;
@@ -1823,8 +1826,27 @@ export class TeamRuntime {
 		return okReply(requester.id, { receipt: { status: "accepted", work: { workId: work.id, revision: 1 }, recipient: recipient.id, ...(recipient.pause !== "none" ? { paused: true } : {}) } });
 	}
 
+	/**
+	 * A reply is final, so an ID mistyped in its text would reach the Manager as a dead reference. Models
+	 * keep the first group and garble the rest, so a token that shares its 8-hex prefix with a ledger ID
+	 * but is not one is rejected while the model can still fix it. IDs from elsewhere (another Team, a log
+	 * under review) share no prefix and pass.
+	 */
+	private requireQuotedIds(team: TeamState, result: WorkResult): void {
+		// IDs are lowercase, so a quote in another case still names the same ID.
+		const sharing = (token: string) => (token.startsWith("result:") ? team.ledger.resultOrder : team.ledger.order)
+			.filter((id) => id.startsWith(token.slice(0, token.indexOf(":") + 9)));
+		const mistyped = [...new Set(formatWorkResult(result).toLowerCase().match(QUOTED_ID))]
+			.flatMap((token) => { const near = sharing(token); return near.length && !near.includes(token) ? [{ token, near }] : []; });
+		if (!mistyped.length) return;
+		fail(mistyped.some(({ token }) => token.startsWith("result:")) ? "UNKNOWN_RESULT" : "UNKNOWN_WORK",
+			`The reply quotes IDs that do not exist: ${mistyped.map(({ token, near }) => `${token}${near.length === 1 ? ` (did you mean ${near[0]}?)` : ""}`).join(", ")}. `
+			+ "Nothing was staged: copy each ID exactly as status returned it, then reply again.");
+	}
+
 	private stageReply(team: TeamState, member: RuntimeMember, active: ActiveActivation, result: WorkResult, toolCallId: string): TeamReply {
 		const ref = this.requireWorkScope(team, member, active);
+		this.requireQuotedIds(team, result);
 		const version = team.ledger.version(ref)!;
 		const openChildren = team.ledger.openSubtree(ref);
 		const cleanupPending = team.ledger.ownedChildren(ref).filter((child) => team.ledger.cleanupPending.has(workRefKey(child)));

@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
 import { test } from "node:test";
-import { installTeamTool, TeamLaunchWaitAbortedError } from "../../tools/subagents/team-tool";
+import { formatTeamView, installTeamTool, TeamLaunchWaitAbortedError } from "../../tools/subagents/team-tool";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import type { SessionBroker } from "../../tools/subagents/session-broker";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
-import { shortWorkRef, type ResultRecord, type TeamResult } from "../../tools/subagents/team-protocol";
+import { shortWorkRef, workRefKey, type ResultRecord, type TeamResult } from "../../tools/subagents/team-protocol";
 import type { RuntimeActivation } from "../../tools/subagents/team-runtime";
 
 const nativeModel: any = {
@@ -445,6 +445,33 @@ test("launch panel keeps the generic wait text while every dependency is termina
 	endActivation(host, manager, { action: "yield" }, 2);
 	resolveLifetime(terminal(teamId));
 	await pending;
+});
+
+test("launch final text keeps the Manager's verdict: the waive reason, the whole close reason, and `waived` beside the worker's own status", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	// More than 400 bytes of CJK whose last sentence used to be cut off.
+	const reason = `${"界".repeat(150)}。最后一句必须保留。`;
+	const waiveReason = "Quoted three result IDs that do not exist; the content itself was verified separately.";
+	let root: TeamResult["roots"][number]["work"] | undefined;
+	host.driver.openAndLaunch = async () => {
+		host.runtime.launch(teamId);
+		const [ref] = completeRoots(host, teamId, () => ({ status: "succeeded", summary: "Worker says everything is done." }));
+		root = host.runtime.listWorks(teamId)[0]!.work;
+		return { lifetime: Promise.resolve({ ...terminal(teamId), outcome: "partial", reason, finalResultRefs: [ref!],
+			roots: [{ work: root, state: "resolved", resultRef: ref!, review: { disposition: "waived", reason: waiveReason } }] }) };
+	};
+	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
+	const text: string = result.content[0].text;
+	const key = workRefKey(root!);
+	assert.match(text, new RegExp(`^Team ${teamId} CLOSED · outcome partial · ${reason}$`, "mu"), "the close reason is printed whole");
+	assert.match(text, new RegExp(`^Roots: ${key} resolved \\(waived: ${waiveReason}\\)$`, "mu"), "a waived root says why");
+	assert.match(text, new RegExp(`^### worker · ${key} · succeeded · waived · result:`, "mu"), "the worker's own status is not the final verdict on the root");
+
+	const header = formatTeamView({ ...host.runtime.getTeam(teamId), reason }, [], 0).find((line) => line.startsWith("Reason:"));
+	assert.equal(header, `Reason: ${reason}`, "the Team header's Reason line is not cut at 400 bytes either");
+	assert.ok(Buffer.byteLength(reason, "utf8") > 400);
 });
 
 test("launch panel reuses grouped subagent panels per member, live and after the Team ends", async () => {

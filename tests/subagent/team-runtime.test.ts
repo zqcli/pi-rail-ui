@@ -9,10 +9,10 @@ import {
 } from "../../tools/subagents/team-protocol";
 
 function makeRuntime(initialRequests: Array<{ to: string; task: string }> = [{ to: "w1", task: "root work" }],
-	{ extraWorkers = [], limits = {} }: { extraWorkers?: string[]; limits?: Partial<TeamBudgetLimits> } = {}) {
+	{ extraWorkers = [], limits = {}, createId }: { extraWorkers?: string[]; limits?: Partial<TeamBudgetLimits>; createId?: (count: number) => string } = {}) {
 	let ids = 0;
 	let time = 1_700_000_000_000;
-	const runtime = new TeamRuntime({ now: () => time++, createId: () => `id${++ids}`, limits });
+	const runtime = new TeamRuntime({ now: () => time++, createId: () => createId ? createId(++ids) : `id${++ids}`, limits });
 	const prepared = runtime.prepare({
 		manager: { alias: "lead", roleDescription: "Manage work, review roots and close the Team." },
 		workers: [
@@ -130,6 +130,8 @@ test("Manager guidance: management input says to yield instead of polling, and h
 
 	const work = runtime.takeNextActivation(teamId)!;
 	assert.match(work.input.notice, /Only the current WorkRef is authorized/u);
+	assert.match(work.input.notice, /An outcome's preview is only its status and summary; read its findings and evidence with status\(result\) before relying on them\./u,
+		"a woken worker is told a preview is not the dependency's full result");
 	assert.match(work.input.notice, /needs another member's conclusion.*yield \{waitingFor:.*request it from that member.*yield \{attention, checkpoint\}/u,
 		"a worker learns the peer-dependency paths");
 	reply(runtime, work, "w1-reply", "first result");
@@ -253,6 +255,81 @@ function request(runtime: TeamRuntime, activation: RuntimeActivation, sequence: 
 	assert.ok(ref);
 	return ref;
 }
+
+/** UUID-shaped IDs whose first group counts up, so every ID has its own 8-hex prefix. */
+const uniquePrefixIds = (count: number) => `${count.toString(16).padStart(8, "0")}-e7fa-44e8-bb5a-ffd2bed74350`;
+
+test("reply: an ID mistyped in the text is rejected with the one it likely meant, nothing is staged, and the corrected reply commits", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "needs w2's conclusion" }, { to: "w2", task: "conclude" }, { to: "w3", task: "free text" }],
+		{ extraWorkers: ["w3"], createId: uniquePrefixIds });
+	finishManagerBoot(runtime, teamId);
+	const writer = runtime.takeNextActivation(teamId)!;
+	const source = runtime.takeNextActivation(teamId)!;
+	const natural = runtime.takeNextActivation(teamId)!;
+	reply(runtime, source, "w2-reply", "w2 conclusion");
+	const resultId = runtime.getWork(teamId, workRef(source))!.current.resultRef!;
+	const sourceId = workRef(source).workId;
+	// The live splice: one UUID group replaced by a plausible-looking other one.
+	const mistyped = (id: string) => id.replace("-bb5a-", "-b5ba-");
+	assert.notEqual(mistyped(resultId), resultId);
+
+	inputReady(runtime, writer);
+	const before = businessSnapshot(runtime, teamId, [workRef(writer)]);
+	let sequence = 0;
+	const send = (result: Record<string, unknown>) => action(runtime, writer, ++sequence, `reply-${sequence}`, { action: "reply", result: { status: "succeeded", summary: "done", ...result } });
+
+	const rejected = send({ summary: `Based on ${mistyped(resultId)} and ${resultId}.` });
+	assert.equal(code(rejected), "UNKNOWN_RESULT");
+	assert.match(rejected.ok ? "" : rejected.error.message, new RegExp(`${mistyped(resultId)} \\(did you mean ${resultId}\\?\\)`, "u"));
+	assert.doesNotMatch(rejected.ok ? "" : rejected.error.message, new RegExp(`${resultId}[^?]`, "u"), "the correct ID quoted next to it is not listed as unknown");
+	const badWork = send({ findings: [`Produced by ${mistyped(sourceId)}`] });
+	assert.equal(code(badWork), "UNKNOWN_WORK", "a mistyped work ID is rejected with the existing unknown-work code");
+	assert.match(badWork.ok ? "" : badWork.error.message, new RegExp(`${mistyped(sourceId)} \\(did you mean ${sourceId}\\?\\)`, "u"));
+	const both = send({ artifacts: [mistyped(sourceId), mistyped(resultId)] });
+	assert.equal(code(both), "UNKNOWN_RESULT", "a wrong result ID decides the code when both kinds are wrong");
+	assert.match(both.ok ? "" : both.error.message, new RegExp(`${mistyped(sourceId)}.*${mistyped(resultId)}`, "u"), "every unknown token is listed");
+	for (const carrier of [{ limitations: [mistyped(resultId)] }, { evidence: [{ source: mistyped(resultId), basis: "observed" }] },
+		{ evidence: [{ source: "status", locator: mistyped(resultId), basis: "observed" }] }]) {
+		assert.equal(code(send(carrier)), "UNKNOWN_RESULT", JSON.stringify(carrier));
+	}
+	assert.deepEqual(businessSnapshot(runtime, teamId, [workRef(writer)]), before, "a rejected reply changes no work, result or Team state");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.activity, "running", "and the activation is not ending");
+
+	// Correct IDs, bare prefixes (no dash group) and IDs from elsewhere (no ledger ID shares their prefix) pass.
+	const prefix = resultId.slice(0, "result:".length + 8);
+	const foreign = "result:9ce10099-0fac-48ff-9b00-e78f26233979";
+	const committed = send({ summary: `Based on ${resultId} (${prefix}) from ${sourceId}, and work:${sourceId.slice(5, 13)}; an older run cited ${foreign}.` });
+	assert.equal(committed.ok, true, JSON.stringify(committed));
+	settle(runtime, writer, `reply-${sequence}`);
+	assert.equal(runtime.getWork(teamId, workRef(writer))?.current.state, "resolved");
+
+	// Only an explicit reply is checked: a natural final answer is committed as the model wrote it.
+	inputReady(runtime, natural);
+	settle(runtime, natural, undefined, `Natural final quoting ${mistyped(resultId)}.`);
+	assert.equal(runtime.getWork(teamId, workRef(natural))?.current.state, "resolved");
+	runtime.assertInvariants(teamId);
+});
+
+test("reply: with several results sharing an 8-hex prefix no ID is guessed, and the mistyped one is still rejected", () => {
+	// Every ID starts with the same 8 hex; they differ only in the last group.
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "writer" }, { to: "w2", task: "first source" }, { to: "w3", task: "second source" }],
+		{ extraWorkers: ["w3"], createId: (count) => `abcdef01-0000-4000-8000-${count.toString(16).padStart(12, "0")}` });
+	finishManagerBoot(runtime, teamId);
+	const writer = runtime.takeNextActivation(teamId)!;
+	const first = runtime.takeNextActivation(teamId)!;
+	const second = runtime.takeNextActivation(teamId)!;
+	reply(runtime, first, "first-reply", "first");
+	inputReady(runtime, writer);
+	const firstResult = runtime.getWork(teamId, workRef(first))!.current.resultRef!;
+	const wrong = firstResult.slice(0, -1) + "f";
+	const oneResult = action(runtime, writer, 1, "one", { action: "reply", result: { status: "succeeded", summary: `See ${wrong}` } });
+	assert.match(oneResult.ok ? "" : oneResult.error.message, new RegExp(`${wrong} \\(did you mean ${firstResult}\\?\\)`, "u"), "one result with that prefix: it is the likely one");
+	reply(runtime, second, "second-reply", "second");
+	const twoResults = action(runtime, writer, 2, "two", { action: "reply", result: { status: "succeeded", summary: `See ${wrong}` } });
+	assert.equal(code(twoResults), "UNKNOWN_RESULT");
+	assert.match(twoResults.ok ? "" : twoResults.error.message, new RegExp(`${wrong}\\.`, "u"), "two results share the prefix: the token is listed without a guess");
+	assert.doesNotMatch(twoResults.ok ? "" : twoResults.error.message, /did you mean/u);
+});
 
 test("panel facts name who a blocked member waits on: a peer with its state, at most three names, and the timeline says who", () => {
 	{

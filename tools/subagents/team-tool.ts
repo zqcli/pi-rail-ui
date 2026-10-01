@@ -8,8 +8,8 @@ import type { TeamHistoryEntry } from "./team-history";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
-	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
-	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, shortWorkRef,
+	TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WORKERS,
+	workRefKey, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, sameWorkRef, shortWorkRef,
 } from "./team-protocol";
 import { capped, type TeamRuntime } from "./team-runtime";
 import {
@@ -137,7 +137,8 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 		`Team ${view.teamId} · ${upper(view.lifecycle)} · ${health}${view.outcome ? ` · outcome ${view.outcome}` : ""}`,
 		`Goal: ${previewText(view.brief.goal, 240)}`,
 	];
-	if (view.reason) lines.push(`Reason: ${previewText(view.reason, 400)}`);
+	// Whole: the close reason is already bounded by the note limit (one line; the collapsed panel cuts it to a row).
+	if (view.reason) lines.push(`Reason: ${previewText(view.reason, TEAM_MAX_NOTE_BYTES)}`);
 	const w = view.works;
 	lines.push(`Works: ${w.total} total · queued ${w.queued} · running ${w.running} · blocked ${w.blocked} · held ${w.held} · resolved ${w.resolved} · failed ${w.failed} · cancelled/superseded ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`);
 	if (waitingFor) lines.push(`Waiting for: ${waitingFor}`);
@@ -308,8 +309,8 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 	const facts = host.runtime.panelFacts(result.teamId);
 	const w = view.works;
 	const lines = [
-		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""}${result.reason ? ` · ${previewText(result.reason, 400)}` : ""}`,
-		`Roots: ${result.roots.map((root) => `${workRefKey(root.work)} ${root.state}${root.review ? ` (${root.review.disposition})` : ""}`).join(" · ") || "none"}`,
+		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""}${result.reason ? ` · ${previewText(result.reason, TEAM_MAX_NOTE_BYTES)}` : ""}`,
+		`Roots: ${result.roots.map((root) => `${workRefKey(root.work)} ${root.state}${root.review ? ` (${root.review.disposition}${root.review.disposition === "waived" && root.review.reason ? `: ${previewText(root.review.reason, 300)}` : ""})` : ""}`).join(" · ") || "none"}`,
 		`Works: ${w.total} total · resolved ${w.resolved} · failed ${w.failed} · cancelled/superseded ${w.cancelled} · roots reviewed ${w.rootsReviewed}/${w.roots}`,
 		"Members:",
 		...view.members.map((member) => {
@@ -330,7 +331,9 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 	}
 	const blocks = result.finalResultRefs.map((ref) => {
 		const record = host.runtime.getResult(result.teamId, ref);
-		const heading = record ? `### ${record.author} · ${workRefKey(record.work)} · ${record.result.status} · ${ref}` : `### ${ref} · result not retained in this runtime`;
+		// The worker's own status says nothing about the Manager's verdict on a root.
+		const review = record && result.roots.find((root) => sameWorkRef(root.work, record.work))?.review?.disposition;
+		const heading = record ? `### ${record.author} · ${workRefKey(record.work)} · ${record.result.status}${review ? ` · ${review}` : ""} · ${ref}` : `### ${ref} · result not retained in this runtime`;
 		const body = record ? formatWorkResult(record.result) : "";
 		const truncated = `[Result truncated for the parent; full record: subagent_team status resultRef ${ref}]`;
 		// Fixed cost of a block: blank separator, heading, and room for the truncation note.

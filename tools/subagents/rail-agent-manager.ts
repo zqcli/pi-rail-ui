@@ -39,7 +39,7 @@ function sessionLabel(info: SessionInfo, index: number, currentCwd: string): str
 
 function defaultAlias(modelId: string, seed: string): string {
 	const base = modelId.replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^[._-]+|[._-]+$/gu, "").slice(0, 40) || "model";
-	const suffix = seed.replace(/[^A-Za-z0-9]+/gu, "").slice(0, 6).toLowerCase() || Date.now().toString(36).slice(-6);
+	const suffix = seed.replace(/[^A-Za-z0-9]+/gu, "").slice(-6).toLowerCase() || Date.now().toString(36).slice(-6);
 	return `${base}-${suffix}`;
 }
 

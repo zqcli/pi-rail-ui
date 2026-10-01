@@ -16,12 +16,13 @@ function setup(initialRequests: Array<{ to: string; task: string }> = [], budget
 	return { host, teamId: prepared.teamId };
 }
 
-function commandContext(options: { hasUI?: boolean; confirmation?: boolean; overlayKey?: string; message?: string } = {}) {
+function commandContext(options: { hasUI?: boolean; mode?: "tui" | "rpc"; confirmation?: boolean; overlayKey?: string; message?: string } = {}) {
 	const notifications: Array<{ text: string; type: string }> = [];
 	const confirmations: Array<{ title: string; message: string }> = [];
 	const overlays: Array<{ output: string; options: any; disposed: boolean }> = [];
 	const ctx = {
 		hasUI: options.hasUI ?? true,
+		mode: options.mode ?? "tui",
 		ui: {
 			notify: (text: string, type: string) => notifications.push({ text, type }),
 			confirm: async (title: string, message: string) => { confirmations.push({ title, message }); return options.confirmation ?? true; },
@@ -122,7 +123,7 @@ test("cancel of a prepared Team is explicitly confirmed and closes resources wit
 	assert.match(notifications.at(-1)?.text ?? "", /all member exits are confirmed/u);
 });
 
-test("no arguments opens the Team popup with UI; headless and explicit list keep text output", async () => {
+test("no arguments opens the Team popup in the TUI; RPC, headless and explicit list keep text output", async () => {
 	const { host, teamId } = setup();
 	const interactive = commandContext();
 	await runTeamCommand(host, "", interactive.ctx);
@@ -131,8 +132,8 @@ test("no arguments opens the Team popup with UI; headless and explicit list keep
 	assert.equal(interactive.overlays[0]!.options.overlayOptions.width, "92%");
 	assert.match(interactive.overlays[0]!.output, /\[Overview\]/u);
 	assert.equal(interactive.notifications.length, 0);
-	for (const [args, hasUI] of [["", false], ["list", true]] as const) {
-		const context = commandContext({ hasUI });
+	for (const [args, options] of [["", { hasUI: false, mode: "rpc" }], ["", { mode: "rpc" }], ["list", {}]] as const) {
+		const context = commandContext(options);
 		await runTeamCommand(host, args, context.ctx);
 		assert.equal(context.overlays.length, 0);
 		assert.ok(context.notifications[0]!.text.includes(teamId));

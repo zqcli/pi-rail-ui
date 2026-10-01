@@ -85,7 +85,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 			find: (provider: string, id: string) => [piModel, deepseekModel].find((model) => model.provider === provider && model.id === id),
 		},
 		sessionManager: { getSessionId: () => "parent-session" },
-		ui: { confirm: async () => true },
+		ui: { confirm: async () => { throw new Error("native confirm renders under the overlay"); } },
 	};
 	const keybindings = {
 		matches: (data: string, id: string) => {
@@ -319,6 +319,10 @@ for (const mode of ["fork", "exclusive"] as const) test(`${mode} ${mode === "for
 		if (mode === "exclusive") ui.handleInput("\r");
 		for (let index = 0; index < 4; index++) ui.handleInput("\u001b[B");
 		ui.handleInput("\r");
+		if (mode === "exclusive") {
+			assert.match(ui.render(100).join("\n"), /Use saved session in place\?/);
+			ui.handleInput("y");
+		}
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(adopted.length, mode === "fork" ? 1 : 0);
 		assert.equal(linked, mode === "exclusive" ? 1 : 0);
@@ -785,4 +789,119 @@ test("showRailAgentOverlay keeps rejecting on the initial snapshot error without
 		/initial snapshot failed/,
 	);
 	assert.equal(opened, 0);
+});
+
+for (const [key, title, method] of [
+	["s", "Stop subagent worker?", "stop"],
+	["d", "Detach persistent agent?", "detach"],
+	["x", "Delete persistent agent permanently?", "delete"],
+] as const) test(`${method} asks inline inside the overlay and only y confirms`, async () => {
+	const state = setup();
+	const calls: string[] = [];
+	(state.manager as any)[method] = async () => { calls.push(method); return snapshot.agents[0]!.instance; };
+	try {
+		for (const cancel of ["n", "\u001b"]) {
+			state.component.handleInput(key);
+			const text = state.component.render(100).join("\n");
+			assert.match(text, new RegExp(title.replace("?", "\\?")));
+			assert.match(text, /y confirm · n\/esc cancel/);
+			state.component.handleInput(cancel);
+			assert.doesNotMatch(state.component.render(100).join("\n"), /y confirm/);
+			assert.deepEqual(calls, []);
+			assert.equal(state.closed, false);
+		}
+		state.component.handleInput(key);
+		state.component.handleInput("y");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(calls, [method]);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("every action key stays visible in the help rows at 80 columns", () => {
+	const state = setup();
+	try {
+		const agentHelp = state.component.render(80).join("\n");
+		for (const label of ["↑↓ select", "enter continue", "/ search", "g steer", "f follow-up", "n new", "s stop", "d detach", "x delete", "m model", "t thinking", "shift+f fast"]) {
+			assert.ok(agentHelp.includes(label), label);
+		}
+		state.component.handleInput("n");
+		const createHelp = state.component.render(80).join("\n");
+		for (const label of ["↑↓ fields", "enter edit/open", "shift+f fast", "switch tabs", "esc close"]) assert.ok(createHelp.includes(label), label);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("search mode: enter acts on the first match and down keeps the first match selected", async () => {
+	const state = setup();
+	state.snapshot.agents = ["alpha", "beta"].map((alias) => ({
+		...structuredClone(snapshot.agents[0]!),
+		instance: { ...structuredClone(snapshot.agents[0]!.instance), alias, agentId: `agt_${alias}` },
+		linkedAliases: [alias],
+	}));
+	try {
+		const ui = state.component;
+		ui.handleInput("/");
+		ui.handleInput("project");
+		ui.handleInput("\u001b[B");
+		assert.match(ui.render(100).join("\n"), /→ alpha/);
+		ui.handleInput("\u001b[B");
+		assert.match(ui.render(100).join("\n"), /→ beta/);
+
+		ui.handleInput("/");
+		ui.handleInput("\r");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(state.mentions, ["beta"]);
+		assert.equal(state.closed, true);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("default alias uses the random tail of a time-ordered session id", () => {
+	const state = setup();
+	const component = state.component as any;
+	try {
+		const aliases = ["01890a5d-ac96-774b-bcce-b302099a8057", "01890a5d-ac96-774b-bcce-b302099a9999"].map((id) => {
+			component.ctx.sessionManager.getSessionId = () => id;
+			component.setFormModel(models[0]);
+			return component.form.alias;
+		});
+		assert.deepEqual(aliases, ["gpt-5.6-sol-9a8057", "gpt-5.6-sol-9a9999"]);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("Shift+F is recognized from modifyOtherKeys and kitty sequences", async () => {
+	const state = setup();
+	try {
+		state.component.handleInput("\u001b[27;2;70~");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(state.snapshot.agents[0]!.instance.fastMode, true);
+		state.component.handleInput("\u001b[102;2u");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(state.snapshot.agents[0]!.instance.fastMode, false);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("Fast can always be turned off in the form even when the model is not eligible", () => {
+	const state = setup();
+	const component = state.component as any;
+	try {
+		component.handleInput("n");
+		component.form.model = models[1];
+		component.form.fastMode = true;
+		component.handleInput("F");
+		assert.equal(component.form.fastMode, false);
+		component.handleInput("F");
+		assert.equal(component.form.fastMode, false);
+		assert.match(component.render(100).join("\n"), /requires a GPT model/);
+	} finally {
+		state.component.dispose();
+	}
 });

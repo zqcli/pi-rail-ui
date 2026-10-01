@@ -400,79 +400,59 @@ const schemaObject = (properties: Record<string, unknown>, description?: string)
 	additionalProperties: false,
 	...(description ? { description } : {}),
 });
-const aliasSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ALIAS_LENGTH, description: "Exact alias from the Team roster." });
-const idSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH, description: "Opaque ID returned by Team status or a receipt." });
-const resultIdSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH, description: "A result ID (result:…), never a work ID; a work's result ID is its resultRef in outcomes, events or status." });
-const workRefSchema = schemaObject({ workId: idSchema, revision: Type.Integer({ minimum: 1 }) }, "An immutable work version reference.");
+const aliasSchema = (description: string) => Type.String({ minLength: 1, maxLength: TEAM_MAX_ALIAS_LENGTH, description });
+const noteSchema = (description: string) => Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES, description });
+const idSchema = (description: string) => Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH, description });
+const resultIdSchema = Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH });
+const workRefSchema = (description?: string) => schemaObject({
+	workId: Type.String({ minLength: 1, maxLength: TEAM_MAX_ID_LENGTH }), revision: Type.Integer({ minimum: 1 }),
+}, description);
 const resultSchema = schemaObject({
-	status: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
+	status: Type.Enum(["succeeded", "partial", "failed"]),
 	summary: Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }),
 	findings: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }), { maxItems: TEAM_MAX_RESULT_ITEMS })),
 	evidence: Type.Optional(Type.Array(schemaObject({
 		source: Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }),
 		locator: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES })),
-		basis: Type.Union([Type.Literal("observed"), Type.Literal("verified"), Type.Literal("inferred"), Type.Literal("unverified")]),
+		basis: Type.Enum(["observed", "verified", "inferred", "unverified"]),
 	}), { maxItems: TEAM_MAX_RESULT_ITEMS })),
 	limitations: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }), { maxItems: TEAM_MAX_RESULT_ITEMS })),
 	artifacts: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: TEAM_MAX_TEXT_ITEM_BYTES }), { maxItems: TEAM_MAX_RESULT_ITEMS })),
-}, "Immutable candidate result for the current WorkRef; reply does not create new work.");
-const controlAction = (command: string, properties: Record<string, unknown>, description: string) => schemaObject({
-	action: Type.Literal("control"), command: Type.Literal(command), ...properties,
-}, description);
+}, "reply: immutable candidate result for the current WorkRef; it commits after native settlement and cleanup, and does not create new work.");
 
-/** Strict model-facing discriminated union. Runtime normalization remains authoritative. */
-export const TEAM_TOOL_SCHEMA = Type.Union([
-	schemaObject({ action: Type.Literal("request"), to: aliasSchema,
-		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
-		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
-	}, "Accept a child request for an exact recipient. A reply never creates a request."),
-	schemaObject({ action: Type.Literal("reply"), result: resultSchema }, "Stage a result for only the current WorkRef; it commits after native settlement and cleanup."),
-	schemaObject({ action: Type.Literal("yield"), waitingFor: Type.Array(workRefSchema, { minItems: 1, maxItems: TEAM_MAX_WAITING_FOR }),
-		checkpoint: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Work activations only: end this work activation while waiting for the listed immutable WorkRefs."),
-	schemaObject({ action: Type.Literal("yield"), attention: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-		checkpoint: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Hold this work for explicit Manager or host attention."),
-	schemaObject({ action: Type.Literal("yield"), checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })) },
-		"Manager-only: end this management activation. The Manager never waits in-run; new results, failures and incidents start its next activation automatically."),
-	schemaObject({ action: Type.Literal("status"), view: Type.Optional(Type.Literal("team")),
-		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
-	"Read the bounded Team summary. Team view does not accept an id or cursor."),
-	...(["work", "result", "incident"] as const).flatMap((view) => [
-		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view),
-			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
-		`Read a bounded ${view} page; status(result) is read-only and does not acknowledge child-result observation.`),
-		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), id: idSchema,
-			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
-		`Read one exact ${view} id${view === "work" ? "; a worker sees only the summary of another member's work" : ""}.`),
-		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), cursor: idSchema,
-			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
-		`Continue a ${view} page from its opaque cursor.`),
-	]),
-	controlAction("pause_member", { memberId: aliasSchema }, "Manager only: prevent new worker side effects and park at the next provider-safe point; already approved tools and valid end intents may finish."),
-	controlAction("resume_member", { memberId: aliasSchema }, "Manager only: resume the same parked WorkRef after it reacquires a worker permit; dependencies and budget holds remain."),
-	controlAction("revise_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
-		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
-		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
-	}, "Manager only: replace the exact current work revision; preserve its workId and result history; its unfinished sub-tasks become superseded."),
-	controlAction("cancel_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
-		reason: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Manager only: cancel the exact current work subtree; cleanup uncertainty remains visible."),
-	controlAction("resume_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
-		incidentId: idSchema, instruction: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Manager only: explicitly resume a held work revision after addressing its incident."),
-	controlAction("accept_result", { work: workRefSchema,
-		disposition: Type.Union([Type.Literal("accepted"), Type.Literal("waived")]),
-		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
-	}, "Manager only: explicitly accept a successful root or waive a terminal outcome with a reason."),
-	controlAction("close_member", { memberId: aliasSchema }, "Manager only: close an idle worker with no unresolved obligations."),
-	controlAction("close_team", { resultRefs: Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
-		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
-		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
-	}, "Manager only: close the Team after all roots and member resources are explicitly settled."),
-]);
+/**
+ * Strict model-facing shape: one flat object, because providers send only top-level `properties`.
+ * `action` and `command` stay plain strings so legacy names reach normalizeTeamAction's migration
+ * messages; unknown top-level fields likewise reach it. Per-action field ownership, exclusivity and
+ * required fields are the codec's and Runtime's to enforce, not the schema's.
+ */
+export const TEAM_TOOL_SCHEMA = Type.Object({
+	action: Type.String({ description: "request {to, task, inputRefs?} | reply {result} | yield {waitingFor, checkpoint} or {attention, checkpoint} (work), {checkpoint?} (Manager) | status {view?, id or cursor?, limit?} | control {command, ...}." }),
+	to: Type.Optional(aliasSchema("request: exact recipient alias. A reply never creates a request.")),
+	task: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES, description: "request: the work to do; revise_work: the replacement." })),
+	inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS, description: "request, revise_work: result IDs (result:…, never work IDs) to read; a work's is its resultRef." })),
+	result: Type.Optional(resultSchema),
+	waitingFor: Type.Optional(Type.Array(workRefSchema(), { maxItems: TEAM_MAX_WAITING_FOR, description: "yield (work): WorkRefs to wait for, with checkpoint; not with attention. Never for a Manager." })),
+	checkpoint: Type.Optional(noteSchema("yield: progress note; required with waitingFor or attention.")),
+	attention: Type.Optional(noteSchema("yield (work): hold this work for Manager or host attention, with checkpoint; not with waitingFor.")),
+	view: Type.Optional(Type.Enum(["team", "work", "result", "incident"], { description: "status: default team. status(result) is read-only and does not acknowledge child results." })),
+	id: Type.Optional(idSchema("status: one exact id (not with cursor); a worker sees only the summary of another member's work.")),
+	cursor: Type.Optional(idSchema("status: continue a page (not with id).")),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT, description: "status: page size." })),
+	command: Type.Optional(Type.String({ description: "control, Manager only. pause_member {memberId}: park the worker at the next provider-safe point; approved tools and valid end intents may finish. resume_member {memberId}: resume the same parked WorkRef; dependencies and budget holds remain. revise_work {workId, expectedRevision, task, inputRefs?}: replace the exact current revision, keeping workId and result history; its unfinished sub-tasks become superseded. cancel_work {workId, expectedRevision, reason}: cancel the current work subtree. resume_work {workId, expectedRevision, incidentId, instruction}: resume held work after addressing its incident. accept_result {work, disposition, reason?}: accept a successful root or waive a terminal outcome. close_member {memberId}: close an idle worker with no unresolved obligations. close_team {resultRefs, outcome, reason?}: close the Team once all roots and member resources are settled." })),
+	memberId: Type.Optional(aliasSchema("pause_member, resume_member, close_member: member alias.")),
+	workId: Type.Optional(idSchema("revise_work, cancel_work, resume_work: work ID.")),
+	expectedRevision: Type.Optional(Type.Integer({ minimum: 1, description: "revise_work, cancel_work, resume_work: exact current revision." })),
+	reason: Type.Optional(noteSchema("required by cancel_work, accept_result waived, close_team partial or failed.")),
+	incidentId: Type.Optional(idSchema("resume_work: the incident being addressed.")),
+	instruction: Type.Optional(noteSchema("resume_work: what the resumed work should do.")),
+	work: Type.Optional(workRefSchema("accept_result: the root WorkRef.")),
+	disposition: Type.Optional(Type.Enum(["accepted", "waived"], { description: "accept_result: accepted, or waived (needs reason)." })),
+	resultRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS, description: "close_team: final result IDs (result:…); at least one for succeeded or partial." })),
+	outcome: Type.Optional(Type.Enum(["succeeded", "partial", "failed"], { description: "close_team: the final outcome." })),
+});
 
-export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or ends a Manager activation (a Manager never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new events); status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and Manager messages are separate host APIs, not model actions.";
+export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Pass only the fields the chosen action or command uses. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or ends a Manager activation (a Manager never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new events); status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and Manager messages are separate host APIs, not model actions.";
 
 const LEGACY_ACTIONS: Record<string, string> = {
 	send: "send was replaced by request {to, task}; a reply never creates a new request",

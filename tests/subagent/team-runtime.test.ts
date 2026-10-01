@@ -9,10 +9,13 @@ import {
 } from "../../tools/subagents/team-protocol";
 
 function makeRuntime(initialRequests: Array<{ to: string; task: string }> = [{ to: "w1", task: "root work" }],
-	{ extraWorkers = [], limits = {}, createId }: { extraWorkers?: string[]; limits?: Partial<TeamBudgetLimits>; createId?: (count: number) => string } = {}) {
+	{ extraWorkers = [], limits = {}, createId, defaultIds = false }: {
+		extraWorkers?: string[]; limits?: Partial<TeamBudgetLimits>; createId?: (count: number) => string; defaultIds?: boolean;
+	} = {}) {
 	let ids = 0;
 	let time = 1_700_000_000_000;
-	const runtime = new TeamRuntime({ now: () => time++, createId: () => createId ? createId(++ids) : `id${++ids}`, limits });
+	// An injected createId (the deterministic `id1`... by default) is used for every kind of ID; `defaultIds` runs the production generators.
+	const runtime = new TeamRuntime({ now: () => time++, ...(defaultIds ? {} : { createId: () => createId ? createId(++ids) : `id${++ids}` }), limits });
 	const prepared = runtime.prepare({
 		manager: { alias: "lead", roleDescription: "Manage work, review roots and close the Team." },
 		workers: [
@@ -256,12 +259,17 @@ function request(runtime: TeamRuntime, activation: RuntimeActivation, sequence: 
 	return ref;
 }
 
-/** UUID-shaped IDs whose first group counts up, so every ID has its own 8-hex prefix. */
-const uniquePrefixIds = (count: number) => `${count.toString(16).padStart(8, "0")}-e7fa-44e8-bb5a-ffd2bed74350`;
+/** Deterministic 4-character codes, any two differing in at least two positions, so none is a one-slip typo of another. */
+const ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
+const spacedCode = (count: number) => [count % 8, (count * 7 + 3) % 31, Math.floor(count / 8) % 31, (Math.floor(count / 8) * 5 + 1) % 31]
+	.map((index) => ALPHABET.charAt(index)).join("");
+/** The same ID with one code character replaced, and with two adjacent code characters swapped. */
+const substituted = (id: string) => `${id.slice(0, -2)}${id.at(-2) === "z" ? "y" : "z"}${id.at(-1)}`;
+const transposed = (id: string) => `${id.slice(0, -2)}${id.at(-1)}${id.at(-2)}`;
 
-test("reply: an ID mistyped in the text is rejected with the one it likely meant, nothing is staged, and the corrected reply commits", () => {
+test("quoted IDs: a mistyped short ID in a reply is rejected with the one it is a typo of, nothing is staged, and the corrected reply commits", () => {
 	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "needs w2's conclusion" }, { to: "w2", task: "conclude" }, { to: "w3", task: "free text" }],
-		{ extraWorkers: ["w3"], createId: uniquePrefixIds });
+		{ extraWorkers: ["w3"], createId: spacedCode });
 	finishManagerBoot(runtime, teamId);
 	const writer = runtime.takeNextActivation(teamId)!;
 	const source = runtime.takeNextActivation(teamId)!;
@@ -269,66 +277,128 @@ test("reply: an ID mistyped in the text is rejected with the one it likely meant
 	reply(runtime, source, "w2-reply", "w2 conclusion");
 	const resultId = runtime.getWork(teamId, workRef(source))!.current.resultRef!;
 	const sourceId = workRef(source).workId;
-	// The live splice: one UUID group replaced by a plausible-looking other one.
-	const mistyped = (id: string) => id.replace("-bb5a-", "-b5ba-");
-	assert.notEqual(mistyped(resultId), resultId);
+	assert.match(resultId, /^result:[2-9a-hjkmnp-z]{4}$/u);
+	assert.match(sourceId, /^work:[2-9a-hjkmnp-z]{4}$/u);
+	assert.notEqual(transposed(resultId), resultId);
 
 	inputReady(runtime, writer);
 	const before = businessSnapshot(runtime, teamId, [workRef(writer)]);
 	let sequence = 0;
 	const send = (result: Record<string, unknown>) => action(runtime, writer, ++sequence, `reply-${sequence}`, { action: "reply", result: { status: "succeeded", summary: "done", ...result } });
+	const message = (replyValue: ReturnType<typeof send>) => replyValue.ok ? "" : replyValue.error.message;
 
-	const rejected = send({ summary: `Based on ${mistyped(resultId)} and ${resultId}.` });
-	assert.equal(code(rejected), "UNKNOWN_RESULT");
-	assert.match(rejected.ok ? "" : rejected.error.message, new RegExp(`${mistyped(resultId)} \\(did you mean ${resultId}\\?\\)`, "u"));
-	assert.doesNotMatch(rejected.ok ? "" : rejected.error.message, new RegExp(`${resultId}[^?]`, "u"), "the correct ID quoted next to it is not listed as unknown");
-	const badWork = send({ findings: [`Produced by ${mistyped(sourceId)}`] });
+	const slipped = send({ summary: `Based on ${substituted(resultId)} and ${resultId}.` });
+	assert.equal(code(slipped), "UNKNOWN_RESULT");
+	assert.match(message(slipped), new RegExp(`${substituted(resultId)} \\(did you mean ${resultId}\\?\\)`, "u"), "a substituted character names the ID it was copied from");
+	assert.doesNotMatch(message(slipped), new RegExp(`${resultId}[^?]`, "u"), "the correct ID quoted next to it is not listed as unknown");
+	const swapped = send({ findings: [`Based on ${transposed(resultId)}`] });
+	assert.match(message(swapped), new RegExp(`${transposed(resultId)} \\(did you mean ${resultId}\\?\\)`, "u"), "so does an adjacent transposition");
+	const badWork = send({ findings: [`Produced by ${substituted(sourceId)}`] });
 	assert.equal(code(badWork), "UNKNOWN_WORK", "a mistyped work ID is rejected with the existing unknown-work code");
-	assert.match(badWork.ok ? "" : badWork.error.message, new RegExp(`${mistyped(sourceId)} \\(did you mean ${sourceId}\\?\\)`, "u"));
-	const both = send({ artifacts: [mistyped(sourceId), mistyped(resultId)] });
+	assert.match(message(badWork), new RegExp(`${substituted(sourceId)} \\(did you mean ${sourceId}\\?\\)`, "u"));
+	const both = send({ artifacts: [substituted(sourceId), transposed(resultId)] });
 	assert.equal(code(both), "UNKNOWN_RESULT", "a wrong result ID decides the code when both kinds are wrong");
-	assert.match(both.ok ? "" : both.error.message, new RegExp(`${mistyped(sourceId)}.*${mistyped(resultId)}`, "u"), "every unknown token is listed");
-	for (const carrier of [{ limitations: [mistyped(resultId)] }, { evidence: [{ source: mistyped(resultId), basis: "observed" }] },
-		{ evidence: [{ source: "status", locator: mistyped(resultId), basis: "observed" }] }]) {
+	assert.match(message(both), new RegExp(`${substituted(sourceId)}.*${transposed(resultId)}`, "u"), "every unknown token is listed");
+	const far = send({ summary: "Based on result:zz9z." });
+	assert.equal(code(far), "UNKNOWN_RESULT");
+	assert.match(message(far), /result:zz9z\. /u, "an ID that is a typo of none is listed without a guess");
+	for (const carrier of [{ limitations: [substituted(resultId)] }, { evidence: [{ source: substituted(resultId), basis: "observed" }] },
+		{ evidence: [{ source: "status", locator: substituted(resultId), basis: "observed" }] }]) {
 		assert.equal(code(send(carrier)), "UNKNOWN_RESULT", JSON.stringify(carrier));
 	}
 	assert.deepEqual(businessSnapshot(runtime, teamId, [workRef(writer)]), before, "a rejected reply changes no work, result or Team state");
 	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.activity, "running", "and the activation is not ending");
 
-	// Correct IDs, bare prefixes (no dash group) and IDs from elsewhere (no ledger ID shares their prefix) pass.
-	const prefix = resultId.slice(0, "result:".length + 8);
+	// Correct IDs, other text that is not a short ID (an old UUID-format ID, a longer word) and prose pass.
 	const foreign = "result:9ce10099-0fac-48ff-9b00-e78f26233979";
-	const committed = send({ summary: `Based on ${resultId} (${prefix}) from ${sourceId}, and work:${sourceId.slice(5, 13)}; an older run cited ${foreign}.` });
+	const committed = send({ summary: `Based on ${resultId.toUpperCase()} from ${sourceId}; an older run cited ${foreign}; see work:${resultId.slice(7)}x and result:ab; result:pass is a word, not an ID.` });
 	assert.equal(committed.ok, true, JSON.stringify(committed));
 	settle(runtime, writer, `reply-${sequence}`);
 	assert.equal(runtime.getWork(teamId, workRef(writer))?.current.state, "resolved");
 
-	// Only an explicit reply is checked: a natural final answer is committed as the model wrote it.
+	// Only the text a member forwards is checked: a natural final answer is committed as the model wrote it.
 	inputReady(runtime, natural);
-	settle(runtime, natural, undefined, `Natural final quoting ${mistyped(resultId)}.`);
+	settle(runtime, natural, undefined, `Natural final quoting ${substituted(resultId)}.`);
 	assert.equal(runtime.getWork(teamId, workRef(natural))?.current.state, "resolved");
 	runtime.assertInvariants(teamId);
 });
 
-test("reply: with several results sharing an 8-hex prefix no ID is guessed, and the mistyped one is still rejected", () => {
-	// Every ID starts with the same 8 hex; they differ only in the last group.
-	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "writer" }, { to: "w2", task: "first source" }, { to: "w3", task: "second source" }],
-		{ extraWorkers: ["w3"], createId: (count) => `abcdef01-0000-4000-8000-${count.toString(16).padStart(12, "0")}` });
+test("quoted IDs: a request, a question and every Manager control text with an unknown ID is rejected and changes nothing", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "asks a question" }], { createId: spacedCode });
 	finishManagerBoot(runtime, teamId);
-	const writer = runtime.takeNextActivation(teamId)!;
-	const first = runtime.takeNextActivation(teamId)!;
-	const second = runtime.takeNextActivation(teamId)!;
-	reply(runtime, first, "first-reply", "first");
-	inputReady(runtime, writer);
-	const firstResult = runtime.getWork(teamId, workRef(first))!.current.resultRef!;
-	const wrong = firstResult.slice(0, -1) + "f";
-	const oneResult = action(runtime, writer, 1, "one", { action: "reply", result: { status: "succeeded", summary: `See ${wrong}` } });
-	assert.match(oneResult.ok ? "" : oneResult.error.message, new RegExp(`${wrong} \\(did you mean ${firstResult}\\?\\)`, "u"), "one result with that prefix: it is the likely one");
-	reply(runtime, second, "second-reply", "second");
-	const twoResults = action(runtime, writer, 2, "two", { action: "reply", result: { status: "succeeded", summary: `See ${wrong}` } });
-	assert.equal(code(twoResults), "UNKNOWN_RESULT");
-	assert.match(twoResults.ok ? "" : twoResults.error.message, new RegExp(`${wrong}\\.`, "u"), "two results share the prefix: the token is listed without a guess");
-	assert.doesNotMatch(twoResults.ok ? "" : twoResults.error.message, /did you mean/u);
+	const asker = runtime.takeNextActivation(teamId)!;
+	const ref = workRef(asker);
+	inputReady(runtime, asker);
+	const ghost = `Compare with ${substituted(ref.workId)}.`;
+	const asked = action(runtime, asker, 1, "ask-bad", { action: "yield", attention: ghost, checkpoint: "stopped" });
+	assert.equal(code(asked), "UNKNOWN_WORK", "a question forwarded to the Manager is checked");
+	assert.match(asked.ok ? "" : asked.error.message, new RegExp(`${substituted(ref.workId)} \\(did you mean ${ref.workId}\\?\\)`, "u"));
+	assert.equal(runtime.getWork(teamId, ref)?.current.state, "running", "nothing was staged, so the work is not held");
+	assert.equal(action(runtime, asker, 2, "ask-good", { action: "yield", attention: `Which approach for ${ref.workId}?`, checkpoint: "stopped" }).ok, true);
+	settle(runtime, asker, "ask-good");
+	const incidentId = runtime.getWork(teamId, ref)!.current.hold!.incidentId;
+	assert.match(incidentId, /^incident:[2-9a-hjkmnp-z]{4}$/u);
+
+	const manager = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, manager);
+	const total = () => runtime.getTeam(teamId).works.total;
+	const before = businessSnapshot(runtime, teamId, [ref]);
+	const bad = `see ${substituted(incidentId)}`;
+	let sequence = 0;
+	const attempts: Array<[string, Record<string, unknown>]> = [
+		["request.task", { action: "request", to: "w2", task: `Follow up on ${substituted(ref.workId)}` }],
+		["resume_work.instruction", { action: "control", command: "resume_work", workId: ref.workId, expectedRevision: 1, incidentId, instruction: `Use ${substituted(ref.workId)}` }],
+		["revise_work.task", { action: "control", command: "revise_work", workId: ref.workId, expectedRevision: 1, task: `Redo ${substituted(ref.workId)}`, inputRefs: [] }],
+		["cancel_work.reason", { action: "control", command: "cancel_work", workId: ref.workId, expectedRevision: 1, reason: bad }],
+		["accept_result.reason", { action: "control", command: "accept_result", work: ref, disposition: "waived", reason: bad }],
+		["close_team.reason", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: bad }],
+	];
+	for (const [field, args] of attempts) {
+		const rejected = action(runtime, manager, ++sequence, `bad-${sequence}`, args);
+		assert.equal(code(rejected), "UNKNOWN_WORK", field);
+		assert.match(rejected.ok ? "" : rejected.error.message, /did you mean (work|incident):[2-9a-hjkmnp-z]{4}\?/u, field);
+	}
+	assert.equal(total(), 1, "no work was created");
+	assert.deepEqual(businessSnapshot(runtime, teamId, [ref]), before, "the held work was not resumed, revised, cancelled, waived or closed");
+	assert.equal(runtime.getWork(teamId, ref)?.current.hold?.incidentId, incidentId);
+
+	const resumed = action(runtime, manager, ++sequence, "resume-good", { action: "control", command: "resume_work", workId: ref.workId, expectedRevision: 1,
+		incidentId, instruction: `Take the first approach for ${ref.workId} (${incidentId}).` });
+	assert.equal(resumed.ok, true, JSON.stringify(resumed));
+	assert.equal(runtime.getWork(teamId, ref)?.current.hold, undefined);
+	runtime.assertInvariants(teamId);
+});
+
+test("default IDs: work, result, incident and event IDs are 4-character codes from the unambiguous alphabet, unique in their Team", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "asks a question" }], { defaultIds: true });
+	const boot = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, boot);
+	for (let index = 0; index < 60; index++) assert.equal(action(runtime, boot, index + 1, `request-${index}`, { action: "request", to: "w2", task: `task ${index}` }).ok, true);
+	assert.equal(action(runtime, boot, 61, "boot-yield", { action: "yield" }).ok, true);
+	settle(runtime, boot, "boot-yield");
+	const asker = runtime.takeNextActivation(teamId)!;
+	const answerer = runtime.takeNextActivation(teamId)!;
+	yieldWork(runtime, asker, "ask", { attention: "which scope?", checkpoint: "stopped" });
+	reply(runtime, answerer, "reply", "done");
+	const manager = runtime.takeNextActivation(teamId)!;
+	const events = manager.input.scope.kind === "management" ? manager.input.scope.events.map((event) => event.id) : [];
+	const ids = {
+		work: runtime.listWorks(teamId).map((item) => item.work.workId),
+		result: runtime.listWorks(teamId).flatMap((item) => item.resultRef ? [item.resultRef] : []),
+		incident: runtime.getTeam(teamId).incidents.map((incident) => incident.id),
+		event: events,
+	};
+for (const [kind, list] of Object.entries(ids)) {
+		assert.ok(list.length > 0, `${kind} IDs were created`);
+		assert.ok(list.every((id) => new RegExp(`^${kind}:[2-9a-hjkmnp-z]{4}$`, "u").test(id)), `${kind}: ${list.join(", ")}`);
+		assert.equal(new Set(list).size, list.length, `${kind} IDs are unique`);
+		assert.ok(list.every((id) => /[2-9]/u.test(id.slice(kind.length + 1))), `${kind} codes all carry a digit`);
+		assert.ok(list.every((id, index) => list.every((other, at) => at === index
+			|| [...id].filter((char, position) => char !== other[position]).length >= 2)), `${kind}: no ID is one substitution from another`);
+	}
+	assert.equal(ids.work.length, 61);
+	assert.equal(shortWorkRef({ workId: ids.work[0]!, revision: 2 }), `work ${ids.work[0]!.slice(5)}@2`, "the display form shows the whole code");
+	assert.equal(shortWorkRef({ workId: "work:3f2a9b1c-0a1b-4c2d-8e3f-123456789abc", revision: 1 }), "work 3f2a9b1c@1", "and still the first 8 characters of an old UUID");
 });
 
 test("panel facts name who a blocked member waits on: a peer with its state, at most three names, and the timeline says who", () => {

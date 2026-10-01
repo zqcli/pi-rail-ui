@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import {
 	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_MANAGER_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
@@ -256,8 +256,39 @@ interface TeamState {
 	usage: ReturnType<typeof emptySubagentUsage>;
 }
 
-/** A full-looking `result:`/`work:` ID in text; a bare 8-hex prefix has no dash group and is not checked. */
-const QUOTED_ID = /\b(?:result|work):[0-9a-f]{8}(?:-[0-9a-f]+)+/gu;
+/**
+ * The IDs members and the Manager copy into text are `<kind>:<code>`, a 4-character random code that is
+ * unique within its Team. The alphabet leaves out 0/o/1/l/i, and sparse random codes (not a sequence)
+ * make a mistyped code almost never another valid ID.
+ */
+const ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
+type ModelIdKind = "work" | "result" | "incident" | "event";
+/**
+ * An ID in that form quoted in text. Every code has a digit, so a word such as `result:pass` is not read as
+ * an ID; longer (old UUID-format) IDs do not fit and are left alone.
+ */
+const QUOTED_ID = new RegExp(`\\b(?:work|result|incident|event):(?=[a-z]{0,3}[2-9])[${ID_ALPHABET}]{4}\\b`, "gu");
+
+/** One substitution or one adjacent transposition apart: the slips made when copying an ID. */
+function isTypo(left: string, right: string): boolean {
+	if (left.length !== right.length) return false;
+	const at = [...left].flatMap((char, index) => char === right[index] ? [] : [index]);
+	return at.length === 1 || (at.length === 2 && at[1] === at[0]! + 1 && left[at[0]!] === right[at[1]!] && left[at[1]!] === right[at[0]!]);
+}
+
+/** The model-written text of an action that the runtime hands on to another party; a checkpoint stays with its author. */
+function forwardedText(action: TeamAction): string | undefined {
+	switch (action.action) {
+		case "reply": return formatWorkResult(action.result);
+		case "request": return action.task;
+		case "yield": return action.attention;
+		case "status": return undefined;
+		case "control": {
+			const { control } = action;
+			return "task" in control ? control.task : "instruction" in control ? control.instruction : "reason" in control ? control.reason : undefined;
+		}
+	}
+}
 
 const copy = <T>(value: T): T => structuredClone(value);
 const currentVersion = (record: WorkRecord): WorkVersion => record.versions[record.currentRevision - 1]!;
@@ -298,6 +329,8 @@ export class TeamRuntime {
 	private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly now: () => number;
 	private readonly createId: () => string;
+	/** Without an injected createId (tests), model-visible IDs are short random codes. */
+	private readonly shortIds: boolean;
 	private readonly limits: TeamBudgetLimits;
 	private readonly activationStopTimeoutMs: number;
 	private readonly journalGeneration: TeamJournalGeneration | undefined;
@@ -307,6 +340,7 @@ export class TeamRuntime {
 		this.journalGeneration = options.journal;
 		this.now = options.now ?? Date.now;
 		this.createId = options.createId ?? randomUUID;
+		this.shortIds = !options.createId;
 		this.limits = { ...DEFAULT_TEAM_BUDGET, ...options.limits };
 		this.activationStopTimeoutMs = options.activationStopTimeoutMs ?? 5000;
 		if (!Number.isSafeInteger(this.activationStopTimeoutMs) || this.activationStopTimeoutMs < 1) throw new Error("Invalid activation stop timeout");
@@ -379,7 +413,7 @@ export class TeamRuntime {
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
 		};
 		for (const initial of plan.initialRequests) {
-			const record = this.makeWork(team.manager, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
+			const record = this.makeWork(team, team.manager, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
 			this.assertInputFits(team, team.members.get(initial.to)!, record);
 			team.ledger.add(record);
 			team.ready.push({ workId: record.id, revision: 1 });
@@ -1082,7 +1116,7 @@ export class TeamRuntime {
 		if (active.postIntentContinuations++ > 0) return;
 		const work = active.scope.kind === "work" ? active.scope.work : undefined;
 		const rootId = work ? team.ledger.get(work.workId)?.record.rootId : undefined;
-		team.incidents.push({ id: this.id("incident"), code: "POST_INTENT_CONTINUATION", state: "resolved", createdAt: this.timestamp(),
+		team.incidents.push({ id: this.modelId(team, "incident"), code: "POST_INTENT_CONTINUATION", state: "resolved", createdAt: this.timestamp(),
 			message: "A native continuation followed a staged end intent; business side effects were refused and the intent was kept",
 			...(work ? { work: copy(work) } : {}), ...(rootId ? { rootId } : {}), memberId: member.id });
 		this.changed(team);
@@ -1774,6 +1808,7 @@ export class TeamRuntime {
 			&& !(action.action === "control" && ["cancel_work", "accept_result", "close_member", "close_team"].includes(action.control.command))) {
 			fail("BUDGET_BLOCKED", "Emergency Manager activations cannot create or revise work; only status, cancel_work, accept_result, close_member, close_team and yield are allowed");
 		}
+		this.requireKnownIds(team, forwardedText(action));
 		switch (action.action) {
 			case "status": return this.status(team, member, action);
 			case "request": return this.acceptRequest(team, member, active, action);
@@ -1816,7 +1851,7 @@ export class TeamRuntime {
 		}
 		for (const resultRef of action.inputRefs) this.requireResult(team, resultRef);
 		const at = this.timestamp();
-		const work = this.makeWork(requester.id, recipient.id, action.task, action.inputRefs, parent, at, rootId, depth);
+		const work = this.makeWork(team, requester.id, recipient.id, action.task, action.inputRefs, parent, at, rootId, depth);
 		this.assertInputFits(team, recipient, work, parent);
 		team.ledger.add(work);
 		team.ready.push({ workId: work.id, revision: 1 });
@@ -1827,26 +1862,25 @@ export class TeamRuntime {
 	}
 
 	/**
-	 * A reply is final, so an ID mistyped in its text would reach the Manager as a dead reference. Models
-	 * keep the first group and garble the rest, so a token that shares its 8-hex prefix with a ledger ID
-	 * but is not one is rejected while the model can still fix it. IDs from elsewhere (another Team, a log
-	 * under review) share no prefix and pass.
+	 * Text that reaches another party must not carry a dead reference: an ID quoted in it that does not exist
+	 * in this Team is rejected while its author can still fix it, with the one existing ID it is a typo of.
 	 */
-	private requireQuotedIds(team: TeamState, result: WorkResult): void {
+	private requireKnownIds(team: TeamState, text: string | undefined): void {
 		// IDs are lowercase, so a quote in another case still names the same ID.
-		const sharing = (token: string) => (token.startsWith("result:") ? team.ledger.resultOrder : team.ledger.order)
-			.filter((id) => id.startsWith(token.slice(0, token.indexOf(":") + 9)));
-		const mistyped = [...new Set(formatWorkResult(result).toLowerCase().match(QUOTED_ID))]
-			.flatMap((token) => { const near = sharing(token); return near.length && !near.includes(token) ? [{ token, near }] : []; });
-		if (!mistyped.length) return;
-		fail(mistyped.some(({ token }) => token.startsWith("result:")) ? "UNKNOWN_RESULT" : "UNKNOWN_WORK",
-			`The reply quotes IDs that do not exist: ${mistyped.map(({ token, near }) => `${token}${near.length === 1 ? ` (did you mean ${near[0]}?)` : ""}`).join(", ")}. `
-			+ "Nothing was staged: copy each ID exactly as status returned it, then reply again.");
+		const kindOf = (token: string) => token.slice(0, token.indexOf(":")) as ModelIdKind;
+		const unknown = [...new Set(text?.toLowerCase().match(QUOTED_ID))].filter((token) => !this.modelIds(team, kindOf(token)).includes(token));
+		if (!unknown.length) return;
+		const quoted = unknown.map((token) => {
+			const near = this.modelIds(team, kindOf(token)).filter((id) => isTypo(token, id));
+			return near.length === 1 ? `${token} (did you mean ${near[0]}?)` : token;
+		});
+		fail(unknown.some((token) => token.startsWith("result:")) ? "UNKNOWN_RESULT" : "UNKNOWN_WORK",
+			`This action quotes IDs that do not exist in this Team: ${quoted.join(", ")}. `
+			+ "Nothing was changed: copy each ID exactly as you received it, then send the action again.");
 	}
 
 	private stageReply(team: TeamState, member: RuntimeMember, active: ActiveActivation, result: WorkResult, toolCallId: string): TeamReply {
 		const ref = this.requireWorkScope(team, member, active);
-		this.requireQuotedIds(team, result);
 		const version = team.ledger.version(ref)!;
 		const openChildren = team.ledger.openSubtree(ref);
 		const cleanupPending = team.ledger.ownedChildren(ref).filter((child) => team.ledger.cleanupPending.has(workRefKey(child)));
@@ -2597,7 +2631,7 @@ export class TeamRuntime {
 			this.holdWork(team, member, ref, "UNOBSERVED_CHILD_RESULTS", "Result commit was blocked by an unobserved child outcome", "protocol");
 			return;
 		}
-		const resultRef = this.id("result");
+		const resultRef = this.modelId(team, "result");
 		const committed: ResultRecord = { id: resultRef, work: copy(ref), author: member.id, result: copy(result), committedAt: this.timestamp(), source };
 		if (!this.tryJournal(team, { version: 2, kind: "result", teamId: team.id, at: committed.committedAt, result: copy(committed) })) {
 			// Never publish an unjournaled result; the Team is failed closed at the end of this transition.
@@ -2857,7 +2891,7 @@ export class TeamRuntime {
 		const current = team.incidents.find((incident) => incident.state === "open" && incident.code === code
 			&& incident.memberId === memberId && incident.rootId === rootId && (incident.work ? work && sameWorkRef(incident.work, work) : !work));
 		if (current) return current;
-		const incident: TeamIncidentView = { id: this.id("incident"), code, message, state: "open", createdAt: this.timestamp(),
+		const incident: TeamIncidentView = { id: this.modelId(team, "incident"), code, message, state: "open", createdAt: this.timestamp(),
 			...(work ? { work: copy(work) } : {}), ...(rootId ? { rootId } : {}), ...(memberId ? { memberId } : {}) };
 		team.incidents.push(incident);
 		this.addEvent(team, { key: `incident:${incident.id}`, kind, message, ...(work ? { work: copy(work) } : {}), ...(memberId ? { memberId } : {}), incidentId: incident.id });
@@ -2868,7 +2902,7 @@ export class TeamRuntime {
 	private addEvent(team: TeamState, event: Omit<InternalEvent, "id" | "processed">): InternalEvent {
 		const duplicate = team.events.find((item) => item.key === event.key);
 		if (duplicate) return duplicate;
-		const created: InternalEvent = { ...event, id: this.id("event"), processed: false };
+		const created: InternalEvent = { ...event, id: this.modelId(team, "event"), processed: false };
 		team.events.push(created);
 		team.eventSeq++;
 		this.changed(team);
@@ -3111,8 +3145,8 @@ export class TeamRuntime {
 		return { version: TEAM_PROTOCOL_VERSION, teamId: team.id, memberId: member.id, role: member.role, epoch: member.epoch };
 	}
 
-	private makeWork(requester: string, assignee: string, task: string, inputRefs: string[], parent: WorkRef | undefined, at: number, rootId?: string, depth = 0): WorkRecord {
-		const id = this.id("work");
+	private makeWork(team: TeamState, requester: string, assignee: string, task: string, inputRefs: string[], parent: WorkRef | undefined, at: number, rootId?: string, depth = 0): WorkRecord {
+		const id = this.modelId(team, "work");
 		const version = this.makeVersion(1, task, inputRefs, at);
 		return { id, requester, assignee, rootId: rootId ?? id, ...(parent ? { parent: copy(parent) } : {}), depth, currentRevision: 1, versions: [version] };
 	}
@@ -3270,8 +3304,32 @@ export class TeamRuntime {
 	}
 
 	private newId(): string { return this.createId(); }
+
+	/** Every ID of this kind in the Team, which a new or a quoted ID is checked against. */
+	private modelIds(team: TeamState, kind: ModelIdKind): readonly string[] {
+		switch (kind) {
+			case "work": return team.ledger.order;
+			case "result": return team.ledger.resultOrder;
+			case "incident": return team.incidents.map((incident) => incident.id);
+			case "event": return team.events.map((event) => event.id);
+		}
+	}
+
+	/**
+	 * A new code with a digit that is not one typo away from any ID of its kind in the Team, so a single
+	 * slip in a quoted ID never names another real one: it is always caught as unknown.
+	 */
+	private modelId(team: TeamState, kind: ModelIdKind): string {
+		if (!this.shortIds) return this.id(kind);
+		const existing = this.modelIds(team, kind);
+		for (;;) {
+			const id = `${kind}:${Array.from({ length: 4 }, () => ID_ALPHABET.charAt(randomInt(ID_ALPHABET.length))).join("")}`;
+			if (/[2-9]/u.test(id.slice(kind.length + 1)) && !existing.some((other) => other === id || isTypo(id, other))) return id;
+		}
+	}
+
 	private id(kind: string): string {
-		// Short opaque IDs: members copy them into tool calls, and every extra character is a chance to mistype.
+		// Internal IDs (activation, delivery, close, grant, Team) are never copied by members and may be looked up across Teams.
 		const id = `${kind}:${this.createId()}`;
 		if (id.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u.test(id)) fail("TEAM_CAPACITY", "ID generator returned an invalid identifier");
 		return id;

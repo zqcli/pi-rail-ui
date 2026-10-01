@@ -14,6 +14,10 @@
 
 权威状态只在 `TeamRuntime`（同步状态机）中；driver、UI 和 journal 都不直接修改账本。
 
+**ID 格式与文本中引用的 ID。** 成员和 Manager 会抄进文本、工具调用里的 ID（`work`、`result`、`incident`、`event`）是 `<kind>:<code>`，`code` 为 4 个字符，随机取自去掉易混淆字符（0/o/1/l/i）的字母表 `23456789abcdefghjkmnpqrstuvwxyz`，如 `work:k7m2`、`result:9xq4`、`incident:h3tp`、`event:2wfd`；同一 Team 内同类 ID 不重复；每个 code 至少含一个数字，且与同类已有 ID 至少相差两个字符（否则重新生成），因此单个字符抄错或相邻两字符颠倒永远不会变成另一个有效 ID，一定会被识别为未知 ID；文本里不含数字的 `result:pass` 这类词也不会被当成 ID。短是为了少抄错；随机而稀疏（不用递增编号）是为了让抄错几乎总是落到不存在的 ID，而不是悄悄变成另一个有效 ID（12→21 这类错误）。因此 ID 只在所属 Team 内唯一，父层 `status` 取结果时总是 `teamId` 加 `resultRef` 成对使用。teamId 与 activation、delivery、batch、close、grant 等内部 ID 仍是 UUID，不由模型抄写，且部分会跨 Team 查找。测试注入 `createId` 时所有 ID 都用注入值。旧 journal/history 中的 UUID 形式 ID 照常解析（codec 把 ID 当不透明字符串），`shortWorkRef` 显示完整 code（`work k7m2@1`），旧 UUID 仍显示前 8 位。
+
+Runtime 在动作进入状态转换前，检查模型写的、会被转交给另一方的文本里引用的 ID：`reply` 的结果文本（summary、findings、evidence 的 source/locator、limitations、artifacts）、`request.task`、`yield` 的 `attention`，以及 Manager 的 `revise_work.task`、`resume_work.instruction`、`cancel_work.reason`、`accept_result.reason`、`close_team.reason`（checkpoint 只留给作者自己，不检查）。文本转小写后，凡匹配 `(work|result|incident|event):` 加 4 个字母表字符的 token，必须是本 Team 中该类现存的 ID，否则整个动作以可纠正的工具错误拒绝，不暂存、不创建、不变更任何状态：引用的 result 不存在为 `UNKNOWN_RESULT`，否则为 `UNKNOWN_WORK`（`status(incident)` 查不到 incident 同样用它）；错误里逐个列出未知 token，且当同类现存 ID 中恰有一个与它只差一次字符替换或一次相邻交换时附 `did you mean <id>?`。模型改正后可在同一 activation 重新发出。旧格式的 UUID token 不符合 4 字符形态，不检查；自然终稿文本也不检查。此前基于 UUID 前缀的检查已由它取代。这源自 live run 中模型把 UUID 分组拼错、让 Manager 追查近百秒。
+
 ## 2. 父层工具 `subagent_team`
 
 动作：`prepare`、`launch`、`status`、`cancel`。未知字段会被拒绝；声明为可选的字段可以传 `null`，与省略等价。
@@ -48,7 +52,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 {"action":"reply","result":{"status":"partial","summary":"已核对主路径","evidence":[{"source":"npm test","basis":"verified"}],"limitations":["未做在线验收"]}}
 ```
 
-`reply` 只针对当前 WorkRef，返回 `receipt.status = "staged"` 和 `terminate:true`。只有在原生 `agent_settled`、工具结果证据和清理都确认后才提交；存在未完成或尚未交付的 child 时分别返回 `UNRESOLVED_CHILDREN` 或 `UNOBSERVED_CHILD_RESULTS`。暂存前还会扫描结果文本（summary、findings、evidence 的 source/locator、limitations、artifacts）里引用的完整 ID：形如 `result:` 或 `work:` 后接 8 位十六进制和至少一个 `-十六进制` 分组的 token，若与账本中某个同类 ID 的 8 位前缀相同却不是该 ID（模型抄错 UUID 的典型形态：保留首段、后段拼错），整个 reply 以可纠正的工具错误拒绝（引用 result 错误为 `UNKNOWN_RESULT`，只有 work 错误为 `UNKNOWN_WORK`；两种都有则为 `UNKNOWN_RESULT`），逐个列出未知 token，且当同类 ID 中恰有一个与其 8 位前缀相同时附 `did you mean <id>?`。拒绝时不暂存任何内容，模型可在同一 activation 改正后重新 reply；只含 8 位前缀、没有分组的 token，以及与账本 ID 前缀都不同的外部 ID（如审查旧运行日志时引用的 ID）不检查，自然终稿文本和 Manager 的动作也不检查。这是对 live run 中模型把 UUID 分组拼错、让 Manager 追查近百秒的修复。
+`reply` 只针对当前 WorkRef，返回 `receipt.status = "staged"` 和 `terminate:true`。只有在原生 `agent_settled`、工具结果证据和清理都确认后才提交；存在未完成或尚未交付的 child 时分别返回 `UNRESOLVED_CHILDREN` 或 `UNOBSERVED_CHILD_RESULTS`。暂存前还会校验模型写进文本的 ID，见下文“文本中引用的 ID”。
 
 ```json
 {"action":"yield","waitingFor":[{"workId":"team-1:work:abc","revision":1}],"checkpoint":"收到结果后继续"}

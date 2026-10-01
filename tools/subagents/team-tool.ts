@@ -335,7 +335,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		const review = record && result.roots.find((root) => sameWorkRef(root.work, record.work))?.review?.disposition;
 		const heading = record ? `### ${record.author} · ${workRefKey(record.work)} · ${record.result.status}${review ? ` · ${review}` : ""} · ${ref}` : `### ${ref} · result not retained in this runtime`;
 		const body = record ? formatWorkResult(record.result) : "";
-		const truncated = `[Result truncated for the parent; full record: subagent_team status resultRef ${ref}]`;
+		const truncated = `[Result truncated for the parent; full record: subagent_team status teamId ${result.teamId} resultRef ${ref}]`;
 		// Fixed cost of a block: blank separator, heading, and room for the truncation note.
 		return { heading, body, overhead: Buffer.byteLength(`\n\n${heading}\n\n${truncated}`, "utf8"), truncated };
 	});

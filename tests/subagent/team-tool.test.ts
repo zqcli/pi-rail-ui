@@ -268,14 +268,14 @@ test("launch final output carries every selected result in full with a timeline,
 	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
 	const text: string = result.content[0].text;
 	assert.match(text, /^Members:\n- lead · manager · .* · results 0\n- worker · worker · .* · results 8$/mu);
-	assert.match(text, /^Timeline \(m:ss from launch\):\n- 0:00 launch · initial (work [0-9a-f]{8}@1 → worker(, )?){8}\n- \d+:\d\d lead management activation \(BOOT\)\n- \d+:\d\d lead ended management activation \(manager idle\)\n- \d+:\d\d worker started work [0-9a-f]{8}@1\n- \d+:\d\d worker succeeded result for work [0-9a-f]{8}@1\n- \d+:\d\d lead management activation \(ROOT_RESULT_READY\)$/mu,
+	assert.match(text, /^Timeline \(m:ss from launch\):\n- 0:00 launch · initial (work [2-9a-hjkmnp-z]{4}@1 → worker(, )?){8}\n- \d+:\d\d lead management activation \(BOOT\)\n- \d+:\d\d lead ended management activation \(manager idle\)\n- \d+:\d\d worker started work [2-9a-hjkmnp-z]{4}@1\n- \d+:\d\d worker succeeded result for work [2-9a-hjkmnp-z]{4}@1\n- \d+:\d\d lead management activation \(ROOT_RESULT_READY\)$/mu,
 		"the timeline records dispatch, each activation and each result, from the Runtime launch");
 	assert.equal(text.match(/worker succeeded result for/gu)?.length, 8);
 	assert.doesNotMatch(text, /ended work \S+ \(reply\)/u, "a committed reply is shown once, as its result");
 	assert.match(text, /Part 1 summary\.\nFindings:\n- FINDING-1 x+\n- MORE-1 y+\nLimitations:\n- LIMIT-1/u, "a short result is included in full, not as a preview");
 	for (const ref of refs.slice(0, 4)) assert.doesNotMatch(text, new RegExp(`resultRef ${ref}`, "u"), "short results are never truncated");
 	assert.ok(Buffer.byteLength(text, "utf8") <= 48 * 1024, "the final text stays bounded");
-	assert.match(text, new RegExp(`\\[Result truncated for the parent; full record: subagent_team status resultRef ${refs[7]}\\]`, "u"),
+	assert.match(text, new RegExp(`\\[Result truncated for the parent; full record: subagent_team status teamId [^ ]+ resultRef ${refs[7]}\\]`, "u"),
 		"only an over-budget record is truncated, and it names the exact resultRef to read");
 	assert.equal(result.details.members[1].output.startsWith("result → lead · awaiting review\nPart 8 summary.\nFindings:"), true,
 		"the member panel's final answer is its full latest result, under one line saying where it went");

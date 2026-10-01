@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-	describeGptCompactionMode,
 	gptCompactionSettingsPath,
 	parseGptCompactionCommand,
 	readGptCompactionSettings,
@@ -21,7 +20,6 @@ test("GPT compaction settings default to off and persist outside session files",
 	assert.equal(saved.path, gptCompactionSettingsPath(agentDir));
 	assert.equal(readGptCompactionSettings(agentDir).mode, "on");
 	assert.match(await readFile(saved.path, "utf8"), /"remoteCompaction": "on"/);
-	assert.equal(describeGptCompactionMode("off"), "off — Pi native compaction");
 });
 
 test("GPT compaction command parsing is strict and supports menu, on, and off", () => {

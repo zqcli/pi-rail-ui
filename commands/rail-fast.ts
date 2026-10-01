@@ -1,7 +1,8 @@
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isGptModel } from "../openai/model-eligibility";
-import { rejectRailOaiCommandForModel } from "./rail-oai-command";
+import { claimSharedInstall, rejectRailOaiCommandForModel } from "./rail-oai-command";
+import { createStore } from "../core/patching";
 
 const STATUS_KEY = "rail-oai-fast";
 const INSTALL_EVENT = "rail-oai-fast:install";
@@ -24,17 +25,8 @@ let enabled = false;
 let activeForCurrentModel = false;
 let modelIsGpt = false;
 
-type InstallClaim = { claimed: boolean };
-
-function claimSharedInstall(pi: ExtensionAPI): boolean {
-	const claim: InstallClaim = { claimed: false };
-	pi.events.emit(INSTALL_EVENT, claim);
-	if (claim.claimed) return false;
-	pi.events.on(INSTALL_EVENT, (data) => {
-		if (data && typeof data === "object" && "claimed" in data) (data as InstallClaim).claimed = true;
-	});
-	return true;
-}
+// Pi re-imports extension modules on /reload, so module state alone would lose the session's setting.
+const reloaded = createStore("rail-oai-fast-reload", () => ({ enabled: false }));
 
 export function railFastExtensionPath(): string {
 	return fileURLToPath(new URL("./rail-fast-standalone.ts", import.meta.url));
@@ -94,7 +86,7 @@ function notifyStatus(ctx: ExtensionContext): void {
 }
 
 export function installRailFast(pi: ExtensionAPI): void {
-	if (!claimSharedInstall(pi)) return;
+	if (!claimSharedInstall(pi, INSTALL_EVENT)) return;
 	pi.registerFlag?.(RAIL_FAST_MODE_FLAG, {
 		description: "Enable Rail native fast mode for this child process",
 		type: "boolean",
@@ -107,9 +99,9 @@ export function installRailFast(pi: ExtensionAPI): void {
 				if (ctx.hasUI) ctx.ui.notify("Usage: /rail-oai-fast on|off|status", "warning");
 				return;
 			}
-			// `off` is always available so a stale policy can be cleared even on a
-			// non-GPT model. `on`/`status` cannot start or report a GPT-only policy.
-			if (action !== "off" && rejectRailOaiCommandForModel(ctx)) return;
+			// `off` and `status` are always available so a stale policy can be cleared
+			// and reported on a non-GPT model; only `on` starts a GPT-only policy.
+			if (action === "on" && rejectRailOaiCommandForModel(ctx)) return;
 			if (action === "on") enabled = true;
 			else if (action === "off") enabled = false;
 
@@ -118,8 +110,8 @@ export function installRailFast(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		enabled = pi.getFlag?.(RAIL_FAST_MODE_FLAG) === true;
+	pi.on("session_start", async (event, ctx) => {
+		enabled = event.reason === "reload" ? reloaded().enabled : pi.getFlag?.(RAIL_FAST_MODE_FLAG) === true;
 		updateStatus(ctx);
 	});
 
@@ -132,7 +124,8 @@ export function installRailFast(pi: ExtensionAPI): void {
 		return withNativeFastServiceTier(event.payload);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
+		if (event.reason === "reload") reloaded().enabled = enabled;
 		enabled = false;
 		activeForCurrentModel = false;
 		modelIsGpt = false;

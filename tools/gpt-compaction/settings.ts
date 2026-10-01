@@ -52,10 +52,6 @@ export function readGptCompactionSettings(agentDir?: string): GptCompactionSetti
 	}
 }
 
-export function readGptCompactionMode(agentDir?: string): GptCompactionMode {
-	return readGptCompactionSettings(agentDir).mode;
-}
-
 export function writeGptCompactionMode(mode: GptCompactionMode, agentDir?: string): GptCompactionSettings {
 	const path = gptCompactionSettingsPath(agentDir);
 	const payload: GptCompactionSettingsFile = {
@@ -79,16 +75,4 @@ export function parseGptCompactionCommand(args: string): GptCompactionCommand {
 		if (mode) return { operation: "set", mode };
 	}
 	throw new Error("Usage: /rail-oai-compaction [on|off]");
-}
-
-/**
- * Human-readable persistence scope, printed with every mode change so a user
- * never has to guess whether the switch is session-local or global.
- */
-export function gptCompactionSettingsScope(path: string = gptCompactionSettingsPath()): string {
-	return `global agent setting (${path})`;
-}
-
-export function describeGptCompactionMode(mode: GptCompactionMode): string {
-	return mode === "on" ? "on — GPT Responses models use Remote Compaction v2" : "off — Pi native compaction";
 }

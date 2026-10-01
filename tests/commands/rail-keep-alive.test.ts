@@ -191,6 +191,20 @@ test("command argument completions include common intervals, off and status", as
 	} finally { await h.cleanup(); }
 });
 
+test("command arguments are case-insensitive", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const h = harness();
+	try {
+		await h.begin();
+		await h.command("1");
+		await h.command("STATUS");
+		assert.doesNotMatch(h.notices.at(-1)!, /Usage/);
+		await h.command("OFF");
+		assert.equal(h.session.cacheWarmingStatus!.state, "inactive");
+		assert.match(h.notices.at(-1)!, /off for this session/);
+	} finally { await h.cleanup(); }
+});
+
 test("off aborts, stop veto wins, failed refresh pauses until fresh request", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();

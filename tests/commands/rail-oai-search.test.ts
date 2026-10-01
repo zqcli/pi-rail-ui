@@ -275,6 +275,81 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 	await handlers.get("session_shutdown")({}, ctx);
 });
 
+function setupSearch() {
+	let command: any;
+	const handlers = new Map<string, any>();
+	const providerConfigs = new Map<string, any>();
+	const provider = { streamSimple: () => ({}) };
+	const pi: any = {
+		events: eventBus(),
+		registerCommand: (_name: string, definition: any) => { command = definition; },
+		registerFlag: () => undefined,
+		getFlag: () => undefined,
+		on: (event: string, handler: any) => handlers.set(event, handler),
+		registerProvider: (providerId: string, config: any) => providerConfigs.set(providerId, config),
+		unregisterProvider: (providerId: string) => providerConfigs.delete(providerId),
+		appendEntry: () => undefined,
+	};
+	const ctx: any = {
+		hasUI: false,
+		model: { provider: "custom", api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6" },
+		waitForIdle: async () => undefined,
+		sessionManager: { getBranch: () => [] },
+		modelRegistry: {
+			getProvider: () => provider,
+			getRegisteredProviderConfig: (providerId: string) => providerConfigs.get(providerId),
+			getRegisteredNativeProvider: () => undefined,
+		},
+		ui: { setStatus: () => undefined },
+	};
+	installRailOaiSearch(pi);
+	return { command, handlers, ctx };
+}
+
+test("idle keep-alive refreshes keep hosted search and leave an armed probe for the next turn", async () => {
+	const { command, handlers, ctx } = setupSearch();
+	const request = () => ({ payload: { model: "gpt-5.6-sol", input: [], tools: [{ type: "function", name: "read" }] } });
+	await handlers.get("session_start")({ reason: "startup" }, ctx);
+	await handlers.get("turn_start")({}, ctx);
+	await handlers.get("turn_end")({}, ctx);
+
+	const idle = await handlers.get("before_provider_request")(request(), ctx);
+	assert.deepEqual(idle.tools.at(-1), { type: "web_search", external_web_access: true });
+
+	await command.handler("probe", ctx);
+	const idleWithProbe = await handlers.get("before_provider_request")(request(), ctx);
+	assert.deepEqual(idleWithProbe.tools.at(-1), { type: "web_search", external_web_access: true });
+	assert.equal(idleWithProbe.tool_choice, undefined, "an idle refresh must not consume the probe");
+
+	await handlers.get("turn_start")({}, ctx);
+	const probed = await handlers.get("before_provider_request")(request(), ctx);
+	assert.equal(probed.tool_choice.mode, "required");
+	await handlers.get("turn_end")({}, ctx);
+	await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+});
+
+test("/reload keeps the session's search mode while other session starts use the startup default", async () => {
+	const { command, handlers, ctx } = setupSearch();
+	const injectedAccess = async () => (await handlers.get("before_provider_request")({ payload: { input: [] } }, ctx))?.tools[0].external_web_access;
+	await handlers.get("session_start")({ reason: "startup" }, ctx);
+	await command.handler("cached", ctx);
+
+	await handlers.get("session_shutdown")({ reason: "reload" }, ctx);
+	await handlers.get("session_start")({ reason: "reload" }, ctx);
+	await handlers.get("turn_start")({}, ctx);
+	assert.equal(await injectedAccess(), false, "reload keeps cached");
+
+	await command.handler("off", ctx);
+	await handlers.get("session_shutdown")({ reason: "reload" }, ctx);
+	await handlers.get("session_start")({ reason: "reload" }, ctx);
+	assert.equal(await injectedAccess(), undefined, "reload keeps off");
+
+	await handlers.get("session_shutdown")({ reason: "new" }, ctx);
+	await handlers.get("session_start")({ reason: "new" }, ctx);
+	assert.equal(await injectedAccess(), true, "a new session returns to the live default");
+	await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+});
+
 test("persists observed search state before the assistant entry without requiring a response id", async () => {
 	let command: any;
 	let lastStreamOptions: any;

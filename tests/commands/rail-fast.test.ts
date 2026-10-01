@@ -104,6 +104,29 @@ test("/rail-oai-fast toggles request-time service_tier and status", async () => 
 	assert.equal(railFastFooterLabel(), undefined);
 });
 
+test("/rail-oai-fast status reports state on a non-GPT model and /reload keeps the session's policy", async () => {
+	const notices: string[] = [];
+	const { command, handlers } = setupFast();
+	const ctx = context({ api: "openai-responses", id: "gpt-5.6-sol" }, [], notices);
+	const payload = { model: "gpt-5.6-sol", input: [] };
+
+	await handlers.get("session_start")({ reason: "startup" }, ctx);
+	await command.handler("on", ctx);
+	await handlers.get("session_shutdown")({ reason: "reload" }, ctx);
+	await handlers.get("session_start")({ reason: "reload" }, ctx);
+	assert.deepEqual(await handlers.get("before_provider_request")({ payload }, ctx), { ...payload, service_tier: "priority" });
+
+	ctx.model = { api: "openai-responses", id: "deepseek-v4" };
+	await command.handler("status", ctx);
+	assert.equal(notices.at(-1), "Rail fast mode enabled (inactive for current model).");
+
+	await handlers.get("session_shutdown")({ reason: "new" }, ctx);
+	await handlers.get("session_start")({ reason: "new" }, ctx);
+	ctx.model = { api: "openai-responses", id: "gpt-5.6-sol" };
+	assert.equal(await handlers.get("before_provider_request")({ payload }, ctx), undefined, "a new session returns to the flag default");
+	await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
+});
+
 test("parent slash eligibility is GPT-only on supported APIs and never injects for non-GPT models", async () => {
 	const statuses: Array<string | undefined> = [];
 	const notices: string[] = [];

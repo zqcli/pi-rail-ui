@@ -6,7 +6,8 @@ import {
 	restoreHostedSearchActivities,
 } from "../openai/hosted-search-activity";
 import { isGptModel } from "../openai/model-eligibility";
-import { rejectRailOaiCommandForModel } from "./rail-oai-command";
+import { claimSharedInstall, rejectRailOaiCommandForModel } from "./rail-oai-command";
+import { createStore } from "../core/patching";
 
 const STATUS_KEY = "rail-oai-search";
 const INSTALL_EVENT = "rail-oai-search:install";
@@ -40,17 +41,8 @@ let turnActive = false;
 let searchRunning = false;
 let probeNextRequest = false;
 
-type InstallClaim = { claimed: boolean };
-
-function claimSharedInstall(pi: ExtensionAPI): boolean {
-	const claim: InstallClaim = { claimed: false };
-	pi.events.emit(INSTALL_EVENT, claim);
-	if (claim.claimed) return false;
-	pi.events.on(INSTALL_EVENT, (data) => {
-		if (data && typeof data === "object" && "claimed" in data) (data as InstallClaim).claimed = true;
-	});
-	return true;
-}
+// Pi re-imports extension modules on /reload, so module state alone would lose the session's mode.
+const reloaded = createStore<{ mode: RailOaiSearchMode }>("rail-oai-search-reload", () => ({ mode: "off" }));
 
 export function railOaiSearchExtensionPath(): string {
 	return fileURLToPath(new URL("./rail-oai-search-standalone.ts", import.meta.url));
@@ -180,7 +172,7 @@ function notifyStatus(ctx: ExtensionContext): void {
 }
 
 export function installRailOaiSearch(pi: ExtensionAPI): void {
-	if (!claimSharedInstall(pi)) return;
+	if (!claimSharedInstall(pi, INSTALL_EVENT)) return;
 	pi.registerFlag?.(RAIL_OAI_SEARCH_MODE_FLAG, {
 		description: "Set Rail native web search mode for this child process",
 		type: "string",
@@ -222,8 +214,8 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		mode = startupSearchMode(pi);
+	pi.on("session_start", async (event, ctx) => {
+		mode = event.reason === "reload" ? reloaded().mode : startupSearchMode(pi);
 		turnActive = false;
 		searchRunning = false;
 		probeNextRequest = false;
@@ -267,9 +259,11 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
-		const transformed = transformNativeSearchPayload(ctx.model, turnActive ? mode : "off", event.payload);
+		const transformed = transformNativeSearchPayload(ctx.model, mode, event.payload);
 		if (transformed === event.payload) return undefined;
-		if (!probeNextRequest || !isRecord(transformed)) return transformed;
+		// Idle keep-alive refreshes reuse the real request's cached prefix, so they keep
+		// the hosted tool; only a request inside a turn may consume the one-shot probe.
+		if (!turnActive || !probeNextRequest || !isRecord(transformed)) return transformed;
 		probeNextRequest = false;
 		updateStatus(ctx);
 		return {
@@ -282,7 +276,8 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
+		if (event.reason === "reload") reloaded().mode = mode;
 		mode = "off";
 		activeForCurrentModel = false;
 		modelIsGpt = false;

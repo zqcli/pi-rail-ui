@@ -305,9 +305,9 @@ test("invalid arguments keep their usage text instead of the GPT-only warning", 
 	await commands.get("rail-oai-compaction").handler("yes", ctx);
 	assert.match(notices.at(-1) ?? "", /Usage: \/rail-oai-compaction \[on\|off\]/);
 
-	// Fast `status` is also GPT-only in this contract.
+	// Fast `status` only reports state, so it is not GPT-gated.
 	await commands.get("rail-oai-fast").handler("status", ctx);
-	assert.equal(notices.at(-1), RAIL_OAI_GPT_ONLY_WARNING);
+	assert.equal(notices.at(-1), "Rail fast mode disabled.");
 	await harness.run("session_shutdown", {}, ctx);
 });
 

@@ -355,7 +355,7 @@ export function installRailKeepAlive(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const state = states().get(ctx.sessionManager);
 			if (!state) { ctx.ui.notify("Rail keep-alive unavailable: session not initialized", "warning"); return; }
-			const text = args.trim();
+			const text = args.trim().toLowerCase();
 			const unavailable = `Rail keep-alive unavailable: ${state.unsupported ?? "live Pi session not captured"}; cannot control native warming`;
 			if (!text || text === "status") {
 				const status = keepAliveStatus(ctx.sessionManager);

@@ -12,49 +12,25 @@ export const RESPONSES_COMPACTION_APIS = [
 ] as const;
 export type ResponsesCompactionApi = (typeof RESPONSES_COMPACTION_APIS)[number];
 
-export type RemoteCompactionUnsupportedReason =
-	| "missing-model"
-	| "unsupported-api"
-	| "not-gpt-model"
-	| "missing-base-url";
-
 export type RemoteCompactionSupport =
 	| { supported: true }
-	| { supported: false; reason: RemoteCompactionUnsupportedReason; detail: string };
-
-export interface CompactionModelDescriptor {
-	provider: string;
-	api: string;
-	id: string;
-	baseUrl: string;
-	name?: string;
-}
+	| { supported: false; detail: string };
 
 export function isResponsesCompactionApi(api: string): api is ResponsesCompactionApi {
 	return (RESPONSES_COMPACTION_APIS as readonly string[]).includes(api);
 }
 
-export function describeCompactionModel(model: Model<Api>): CompactionModelDescriptor {
-	return {
-		provider: model.provider,
-		api: model.api,
-		id: model.id,
-		baseUrl: model.baseUrl,
-		...(model.name ? { name: model.name } : {}),
-	};
-}
-
 export function modelSupportsRemoteCompaction(model: Model<Api> | undefined): RemoteCompactionSupport {
 	if (!model) {
-		return { supported: false, reason: "missing-model", detail: "no active model" };
+		return { supported: false, detail: "no active model" };
 	}
 	if (!isResponsesCompactionApi(model.api)) {
-		return { supported: false, reason: "unsupported-api", detail: `${model.provider}/${model.id} uses ${model.api}` };
+		return { supported: false, detail: `${model.provider}/${model.id} uses ${model.api}` };
 	}
 	// GPT matching is provider-independent; non-GPT Responses models must stay
 	// on Pi's native compaction.
 	if (!isGptModel(model)) {
-		return { supported: false, reason: "not-gpt-model", detail: `${model.provider}/${model.id} is not a GPT model` };
+		return { supported: false, detail: `${model.provider}/${model.id} is not a GPT model` };
 	}
 	return { supported: true };
 }

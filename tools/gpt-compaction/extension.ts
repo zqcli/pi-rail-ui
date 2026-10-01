@@ -21,10 +21,9 @@ import {
 import { resolveCompactionAuth } from "./auth";
 import { isRailCompactionEntry, materializeRailFreeProjection, rebuildNativeHistoryPrefix } from "./history";
 import { clearRequestContextCache } from "./request-context";
-import { rejectRailOaiCommandForModel } from "../../commands/rail-oai-command";
+import { claimSharedInstall, rejectRailOaiCommandForModel } from "../../commands/rail-oai-command";
 import { getGptCompactionDetails, isGptCompactionSummaryText, resolveSessionCheckpoint } from "./types";
 import {
-	gptCompactionSettingsScope,
 	parseGptCompactionCommand,
 	readGptCompactionSettings,
 	writeGptCompactionMode,
@@ -34,18 +33,6 @@ import {
 const STATUS_KEY = "rail-gpt-compaction";
 const MISSING_AUTH_FINGERPRINT = "missing-auth";
 const INSTALL_EVENT = "rail-gpt-compaction:install";
-
-type InstallClaim = { claimed: boolean };
-
-function claimSharedInstall(pi: ExtensionAPI): boolean {
-	const claim: InstallClaim = { claimed: false };
-	pi.events.emit(INSTALL_EVENT, claim);
-	if (claim.claimed) return false;
-	pi.events.on(INSTALL_EVENT, (data) => {
-		if (data && typeof data === "object" && "claimed" in data) (data as InstallClaim).claimed = true;
-	});
-	return true;
-}
 
 export function gptCompactionExtensionPath(): string {
 	return fileURLToPath(new URL("./standalone-extension.ts", import.meta.url));
@@ -176,7 +163,7 @@ function markBlocked(signal: AbortSignal | undefined, reason: string, blocked: M
 
 /** Install Rail's GPT-only remote compaction seam in every Pi run mode. */
 export function installGptCompaction(pi: ExtensionAPI): void {
-	if (!claimSharedInstall(pi)) return;
+	if (!claimSharedInstall(pi, INSTALL_EVENT)) return;
 	let mode: GptCompactionMode = readGptCompactionSettings().mode;
 	const blockedRequests = new Map<AbortSignal, string>();
 	let pendingNativeRepair: PendingNativeRepair | undefined;
@@ -333,13 +320,6 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 			let selectedMode: GptCompactionMode;
 
 			if (command.operation === "menu") {
-				const settings = readGptCompactionSettings();
-				mode = settings.mode;
-				ctx.ui.notify(`GPT Remote Compaction v2 is ${mode} (${gptCompactionSettingsScope(settings.path)}).`, "info");
-				if (!ctx.hasUI) {
-					updateStatus(mode, ctx);
-					return;
-				}
 				const selected = await ctx.ui.select(`GPT Remote Compaction v2 — currently ${mode}`, ["on", "off"]);
 				if (selected !== "on" && selected !== "off") return;
 				selectedMode = selected;
@@ -362,7 +342,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 				const saved = writeGptCompactionMode(selectedMode);
 				mode = saved.mode;
 				updateStatus(mode, ctx);
-				ctx.ui.notify(`GPT Remote Compaction v2 ${mode} (${gptCompactionSettingsScope(saved.path)}).`, "info");
+				ctx.ui.notify(`GPT Remote Compaction v2 ${mode} (global agent setting (${saved.path})).`, "info");
 				if (mode === "on") {
 					const support = modelSupportsRemoteCompaction(ctx.model);
 					if (!support.supported) ctx.ui.notify(`Remote v2 is inactive for the current model: ${support.detail}. Pi will use native compaction.`, "warning");

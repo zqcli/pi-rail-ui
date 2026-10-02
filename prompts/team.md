@@ -109,6 +109,14 @@ Last finished non-review work: {{last_finished}} · consecutive reviews without 
 Held works:
 {{held}}
 
+## review_retry_note
+
+A member shown as retrying is waiting out a temporary provider error; that is not a risk by itself.
+
+## transient_retry
+
+Your previous attempt stopped on a temporary provider error ({{error}}). Earlier tool results are still in this conversation: continue from where you stopped and do not repeat side effects that already completed.
+
 ## boot_outcome_rule
 
 Every root must end accepted with a succeeded result (close succeeded) or waived (close partial), so request only work you need; close_team itself closes idle members.

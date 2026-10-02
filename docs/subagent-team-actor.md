@@ -153,6 +153,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 
 - `pause_member` 立即置为 `requested`；只在 provider 安全点确认（`confirmed`）。已放行的工具会正常完成，未放行的得到完整的 blocked 工具结果。停驻期间释放许可，resume 时重新获取。已暂存的 reply/yield 照常提交。
 - revise/cancel 先向原生运行发送 activation-only abort，等待收尾与清理；超过 `activationStopTimeoutMs`（默认 5000 ms）仍未收敛时终止成员进程，并以真实退出结果结清。清理确认前，下游拿不到 outcome。
+- 临时 provider/传输错误（原生 assistant `stopReason:"error"` 且 `isRetryableAssistantError` 为真，完成证据 `error.transient`；额度/鉴权/400、`length`、abort 和传输丢失不算）不立即故障：未暂存结束意图、成员 open 且 Team active 时，成员保持 open，`member.retry` 记录次数与下次时间，原 work 回到 `queued`（重试 activation 的 `notice` 附带说明：上次因临时错误中断、已有工具结果仍在会话里、勿重复已完成的副作用；`member.retry` 存在期间才附带，不改动 `resumeInstruction`），lead 的 events 批次不消费、整批重新投递；等待 10/30/60/120/300 秒后在同一原生会话上重新 activation，期间该成员不被调度，其余成员照常运行，lead 不置 faulted、不暂停其他成员。Worker 最多重试 5 次；lead 前 5 次后每 300 秒一次，自首次错误起 30 分钟后放弃。成功完成即清除 `retry`；用尽后走下面的故障路径。每次重试写入时间线（`transient error (...); retry n in Ns`），成员状态显示 `retrying n/5 · next Ns · error`，Team 计数 `transientRetries`，结果的 Process 行在大于 0 时显示 `transient retries N`。
 - 非 lead 成员的 provider/传输/协议故障只隔离该成员：它名下的工作显式 failed（未开始的记为 `MEMBER_UNAVAILABLE`，正在运行的记为 outcome unknown），无关工作继续。
 
 ## 8. 关闭

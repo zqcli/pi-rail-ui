@@ -459,7 +459,7 @@ test("processStats counts committed waits/questions, versions, results, activati
 	const stats = runtime.processStats(teamId);
 	assert.deepEqual(stats, {
 		works: 2, roots: 1, results: 0, activations: 4, modelTurns: 0,
-		dependencyWaits: 1, questions: 1, revisions: 1, cancelled: 0, toolErrors: 1,
+		dependencyWaits: 1, questions: 1, revisions: 1, cancelled: 0, toolErrors: 1, transientRetries: 0,
 		memberActivations: new Map([["lead", 1], ["w1", 2], ["w2", 1]]),
 	});
 	assert.equal(action(runtime, manager, 3, "malformed", { action: "unknown" }).ok, false);

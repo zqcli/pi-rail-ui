@@ -43,6 +43,9 @@ const TEAM_MAX_GRANT_REASON_BYTES = 512;
 const TEAM_MAX_TIMELINE = 1000;
 /** Once the timeline is full its first entries stay (a long run keeps its start); the oldest after them go. */
 export const TEAM_TIMELINE_HEAD = 30;
+/** Waits before each in-place retry of a transient provider error; the lead keeps retrying every 5 minutes until its window ends. */
+const RETRY_DELAYS_MS = [10_000, 30_000, 60_000, 120_000, 300_000];
+const LEAD_RETRY_WINDOW_MS = 30 * 60_000;
 /** Names the exact work, because a member's session outlives its works and a model may answer an earlier one. */
 /** Events that only advise the lead: they never block close_team and are marked processed when the Team closes. */
 const ADVISORY_EVENTS: readonly string[] = ["REVIEW_READY", "TEAM_QUIESCENT"];
@@ -62,7 +65,7 @@ export interface NativeCompletion {
 	pendingToolCalls?: boolean;
 	/** The exact staged end-intent tool result observed in the settled native transcript. */
 	appliedToolCallId?: string;
-	error?: WorkError;
+	error?: WorkError & { transient?: true };
 	/** Usage observed from this send's own native events, frozen at agent_settled. */
 	usage?: SubagentUsage;
 }
@@ -206,6 +209,8 @@ interface RuntimeMember extends MemberRecord {
 	active?: ActiveActivation;
 	lastActivation?: CompletedActivationTombstone;
 	lastLostActivation?: { activationId: string; error: WorkError; resourceReleased: boolean; reason: ActivationCompletionReason };
+	/** Transient provider errors since the last successful completion; nothing is scheduled for this member before `nextAt`. */
+	retry?: { attempts: number; firstAt: number; nextAt: number; error: string };
 	closeId?: string;
 	/** A driver was issued this prepared member's binding and may hold a native lifetime. */
 	nativeClaimed?: boolean;
@@ -274,6 +279,7 @@ interface TeamState {
 	dependencyWaits: number;
 	questions: number;
 	toolErrors: number;
+	transientRetries: number;
 	outcome?: "succeeded" | "partial" | "failed";
 	reason?: string;
 	closeDecision?: CloseDecision;
@@ -369,6 +375,7 @@ export class TeamRuntime {
 	private readonly completionWaiters = new Map<string, Set<(result: TeamResult) => void>>();
 	private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly reviewTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly now: () => number;
 	private readonly createId: () => string;
 	/** Without an injected createId (tests), model-visible IDs are short random codes. */
@@ -455,7 +462,7 @@ export class TeamRuntime {
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
 			review: { schedule: copy(plan.review), nextAt: null, startedAt: createdAt, signature: "", finished: new Set(), wall: 0, records: [] },
-			dependencyWaits: 0, questions: 0, toolErrors: 0,
+			dependencyWaits: 0, questions: 0, toolErrors: 0, transientRetries: 0,
 		};
 		for (const initial of plan.initialRequests) {
 			const record = this.makeWork(team, team.lead, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
@@ -981,7 +988,7 @@ export class TeamRuntime {
 		};
 		const members = [...team.members.values()].map((member) => {
 			const last = Math.max(0, ...records.filter((record) => record.assignee === member.id).map((record) => currentVersion(record).updatedAt));
-			const doing = member.lifecycle !== "open" ? member.lifecycle : member.currentWork ? `running ${workRefKey(member.currentWork)}` : facts.stalled.get(member.id) ?? "idle";
+			const doing = member.lifecycle !== "open" ? member.lifecycle : member.currentWork ? `running ${workRefKey(member.currentWork)}` : facts.retrying.get(member.id) ?? facts.stalled.get(member.id) ?? "idle";
 			return `- ${member.id}${member.id === team.lead ? " (lead)" : ""} · ${doing} · ${last ? `last activity ${minutes(now - last)} ago` : "no work yet"}`;
 		});
 		const incidents = team.incidents.filter((incident) => incident.state === "open");
@@ -1010,6 +1017,7 @@ export class TeamRuntime {
 			`Open incidents: ${incidents.length ? "" : "none"}${incidents.slice(0, 5).map((incident) => `\n- ${incident.id} [${incident.code}]${incident.work ? ` ${workRefKey(incident.work)}` : ""}: ${previewText(incident.message, 160)}`).join("")}`,
 			`Budget: ${snapshot.budget.map(({ counter, used, limit }) => `${counter} ${limit >= TEAM_BUDGET_UNLIMITED ? `${used} (unlimited)` : `${Math.round(100 * used / limit)}% (${used}/${limit})`}`).join(" · ")}`,
 			signals,
+			...(facts.retrying.size ? [prompt("team", "review_retry_note")] : []),
 			`Previous review: ${previous ? `${previous.verdict?.replace("_", " ").toUpperCase() ?? "no verdict"} — ${previewText(previous.summary, 400)}` : "none"}`,
 			"Timeline since the last review (m:ss from launch):", ...timeline.map((line) => previewText(line, 200)),
 			"", prompt("team", "review_instructions"),
@@ -1271,7 +1279,7 @@ export class TeamRuntime {
 		if (team.lifecycle !== "active") return undefined;
 		const lead = team.members.get(team.lead)!;
 		if (lead.lifecycle !== "open") return undefined;
-		if (!lead.active && lead.pause === "none") {
+		if (!lead.active && lead.pause === "none" && !this.retryWaitMs(lead)) {
 			const pendingEvents = () => team.events.map((event, index) => ({ event, index }))
 				.filter(({ event }) => !event.processed && event.batchId === undefined)
 				.sort((left, right) => this.eventPriority(left.event.kind) - this.eventPriority(right.event.kind)
@@ -1301,7 +1309,7 @@ export class TeamRuntime {
 				continue;
 			}
 			const member = team.members.get(entry.record.assignee)!;
-			if (member.lifecycle !== "open" || member.pause !== "none" || member.active) continue;
+			if (member.lifecycle !== "open" || member.pause !== "none" || member.active || this.retryWaitMs(member)) continue;
 			if (workPermits >= team.limits.workPermits) continue;
 			const exhausted = team.budget.exhausted(entry.record.rootId, member.id === team.lead);
 			if (exhausted) {
@@ -1633,12 +1641,17 @@ export class TeamRuntime {
 		delete active.stopTimer;
 	}
 
-	/** The deadline and the review timer both end with the Team. */
+	/** The deadline, the review timer and the retry timers all end with the Team. */
 	private clearDeadline(teamId: string): void {
 		const timer = this.deadlineTimers.get(teamId);
 		if (timer) clearTimeout(timer);
 		this.deadlineTimers.delete(teamId);
-		this.clearReview(this.team(teamId));
+		const team = this.team(teamId);
+		this.clearReview(team);
+		for (const memberId of team.members.keys()) {
+			clearTimeout(this.retryTimers.get(`${teamId}\0${memberId}`));
+			this.retryTimers.delete(`${teamId}\0${memberId}`);
+		}
 	}
 
 	/** Validate identity, activation-local order, idempotency and public action before transition. */
@@ -1720,6 +1733,7 @@ export class TeamRuntime {
 		}
 		if (completion.usage !== undefined) this.validUsage(completion.usage);
 		active.native = copy(completion);
+		if (completion.status === "success") delete member.retry;
 		// Usage is folded exactly once, at the first accepted settlement of this activation.
 		if (completion.usage) this.foldUsage(team, member, completion.usage);
 		// A still-parked provider gate belongs to a native run that has now ended; release its private request.
@@ -1987,7 +2001,7 @@ export class TeamRuntime {
 			modelTurns: team.usage.turns, dependencyWaits: team.dependencyWaits, questions: team.questions,
 			revisions: records.reduce((sum, record) => sum + record.versions.length - 1, 0),
 			cancelled: records.filter((record) => ["cancelled", "superseded"].includes(currentVersion(record).state)).length,
-			toolErrors: team.toolErrors, memberActivations,
+			toolErrors: team.toolErrors, transientRetries: team.transientRetries, memberActivations,
 		};
 	}
 
@@ -1997,6 +2011,8 @@ export class TeamRuntime {
 		results: Map<string, { count: number; latest: ResultRecord }>;
 		/** Per member with blocked or held work: what it waits on, or why it is held. */
 		stalled: Map<string, string>;
+		/** Per member waiting to retry a transient provider error: attempt, time left and error. */
+		retrying: Map<string, string>;
 		/** While the lead runs an events activation: the event kinds of its batch. */
 		leadHandling?: string;
 		/** Active Team only: the one reason most worth showing for why it has not finished. */
@@ -2026,7 +2042,11 @@ export class TeamRuntime {
 		// In the batch's own (priority) order, like the activation input.
 		const handling = (leadBatch ? team.eventBatches.get(leadBatch)?.eventIds ?? [] : []).map((id) => team.events.find((event) => event.id === id)!);
 		const waitingFor = team.lifecycle === "active" ? this.teamWaitingFor(team, holds, oldestHolds, waits) : undefined;
-		return { pendingEvents, results, stalled, ...(handling.length ? { leadHandling: handlingText(handling) } : {}),
+		const retrying = new Map([...team.members.values()].flatMap((member) => {
+			const text = this.retryText(team, member);
+			return text ? [[member.id, text] as const] : [];
+		}));
+		return { pendingEvents, results, stalled, retrying, ...(handling.length ? { leadHandling: handlingText(handling) } : {}),
 			...(waitingFor ? { waitingFor } : {}), timeline: copy(team.timeline), timelineOmitted: team.timelineOmitted };
 	}
 
@@ -2790,6 +2810,8 @@ export class TeamRuntime {
 		};
 		const projected = projectActivationInput(result);
 		if (projected.childIssues) projected.notice += ` ${prompt("team", "child_issue_notice")}`;
+		// Set from a transient error until the member's next success: exactly the retry activations carry it.
+		if (member.retry) projected.notice += ` ${prompt("team", "transient_retry", { error: member.retry.error })}`;
 		return projected;
 	}
 
@@ -2860,6 +2882,56 @@ export class TeamRuntime {
 		this.finishTeamCloseIfReady(team);
 	}
 
+	/**
+	 * A transient provider error (no end intent staged, member open, Team active) keeps the member open for another
+	 * activation of the same session after a wait. False when retries are exhausted or not applicable: the caller faults as usual.
+	 */
+	private scheduleRetry(team: TeamState, member: RuntimeMember, active: ActiveActivation): boolean {
+		const error = active.native?.status === "error" ? active.native.error : undefined;
+		if (!error?.transient || active.intent || member.lifecycle !== "open" || team.lifecycle !== "active") return false;
+		const now = this.timestamp();
+		const previous = member.retry;
+		const attempts = previous?.attempts ?? 0;
+		const firstAt = previous?.firstAt ?? now;
+		if (attempts >= RETRY_DELAYS_MS.length && (member.id !== team.lead || now - firstAt >= LEAD_RETRY_WINDOW_MS)) {
+			delete member.retry;
+			return false;
+		}
+		const delay = RETRY_DELAYS_MS[Math.min(attempts, RETRY_DELAYS_MS.length - 1)]!;
+		member.retry = { attempts: attempts + 1, firstAt, nextAt: now + delay, error: previewText(error.message, 120) };
+		team.transientRetries++;
+		this.note(team, `${member.id} transient error (${member.retry.error}); retry ${member.retry.attempts} in ${delay / 1000}s`);
+		this.armRetry(team, member);
+		return true;
+	}
+
+	/** Wake the scheduler when the member's wait ends. */
+	private armRetry(team: TeamState, member: RuntimeMember): void {
+		const key = `${team.id}\0${member.id}`;
+		clearTimeout(this.retryTimers.get(key));
+		const timer = setTimeout(() => {
+			this.retryTimers.delete(key);
+			// A timer may fire slightly before the Runtime clock reaches nextAt.
+			if (this.retryWaitMs(member)) this.armRetry(team, member);
+			else this.requestDrain(team.id);
+		}, this.retryWaitMs(member));
+		// A retry timer alone never keeps the process alive.
+		timer.unref();
+		this.retryTimers.set(key, timer);
+	}
+
+	private retryWaitMs(member: RuntimeMember): number {
+		return member.retry ? Math.max(0, member.retry.nextAt - this.timestamp()) : 0;
+	}
+
+	/** Panel words while the member waits to retry; the lead's count has no limit after the worker's 5. */
+	private retryText(team: TeamState, member: RuntimeMember): string | undefined {
+		const wait = this.retryWaitMs(member);
+		if (!wait) return undefined;
+		const { attempts, error } = member.retry!;
+		return `retrying ${attempts}${member.id === team.lead && attempts > RETRY_DELAYS_MS.length ? "" : `/${RETRY_DELAYS_MS.length}`} · next ${Math.ceil(wait / 1000)}s · ${error}`;
+	}
+
 	private finishWork(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
 		const ref = active.scope.work!;
 		const version = team.ledger.version(ref);
@@ -2873,6 +2945,13 @@ export class TeamRuntime {
 			&& ["policy_pause", "policy_superseded", "policy_cancelled", "budget_hold"].includes(completionReason);
 		if (active.native?.status !== "success" && !controlledAbort) {
 			delete team.ledger.get(ref.workId)!.stagedWait;
+			if (!active.stopReason && version.state === "running" && this.scheduleRetry(team, member, active)) {
+				version.state = "queued";
+				version.updatedAt = this.timestamp();
+				if (!team.ready.some((queued) => sameWorkRef(queued, ref))) team.ready.push(copy(ref));
+				this.wakeWaiters(team);
+				return;
+			}
 			const error = active.native?.error ?? { code: active.native?.status === "length" ? "NATIVE_LENGTH" : "NATIVE_FAILURE",
 				message: `Native activation ended with ${active.native?.status ?? "unknown"}` };
 			if (!isTerminalWorkState(version.state)) {
@@ -2977,6 +3056,12 @@ export class TeamRuntime {
 			// is not replayed automatically. The deduplicated budget incident drives any emergency activation.
 			this.consumeBatch(team, active.scope.eventBatchId);
 			this.budgetIncident(team, active.budgetStop ?? { scope: { kind: "team" }, counter: "teamModelRequests" });
+			return;
+		}
+		if (this.scheduleRetry(team, member, active)) {
+			// The batch is not consumed: its events are delivered again after the wait.
+			for (const event of team.events) if (event.batchId === active.scope.eventBatchId) delete event.batchId;
+			team.eventBatches.delete(active.scope.eventBatchId!);
 			return;
 		}
 		// A legal end intent already confirmed in the transcript survives a later budget stop of a continuation.

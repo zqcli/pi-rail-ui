@@ -121,8 +121,11 @@ test("a tick creates a review work for the reviewer, requested by the lead, with
 	assert.match(task, /Works \(reviews excluded\): 1 total · resolved 0 · running 0/u);
 	assert.match(task, /- w1 · /u);
 	assert.match(task, /Previous review: none/u);
-	assert.match(task, /Budget: teamActivations \d+\/\d+/u);
+	assert.match(task, /Budget: teamActivations \d+% \(\d+\/\d+\)/u);
 	assert.match(task, /You only advise: do not request or control work\..*summary must start with 'ON TRACK:', 'AT RISK:' or 'OFF TRACK:'/su);
+	assert.match(task, /- ON TRACK: .*no lead action is needed\.\n- AT RISK: a concrete problem .*budget above 80%.*\n- OFF TRACK: the work contradicts the brief's constraints/u);
+	assert.match(task, /Not a risk: planned waits, a result just committed/u);
+	assert.match(task, /Without concrete evidence report ON TRACK\./u);
 	assert.equal(runtime.listWorks(teamId).find((item) => item.work.workId === ref.workId)?.kind, "review");
 	runtime.assertInvariants(teamId);
 });
@@ -213,7 +216,7 @@ test("a committed review sends REVIEW_READY with the full result to the lead and
 	assert.deepEqual(events[0]!.work, ref);
 	assert.match(events[0]!.message, /Periodic review .* from w2, result .* It is advice only:/u);
 	assert.match(events[0]!.message, /at risk: w1 has not reported\.[\s\S]*Ask w1 for a checkpoint[\s\S]*Could not read its files\./u);
-	assert.match(lead.input.notice, /A REVIEW_READY event is advice from the reviewer: decide whether to act on it \(request, revise_work, cancel_work, or nothing\); it needs no reply\./u);
+	assert.match(lead.input.notice, /A REVIEW_READY event is advice from the reviewer about a risk or an unclear review \(an ON TRACK review sends none\): decide whether to act on it \(request, revise_work, cancel_work, or nothing\); it needs no reply\./u);
 	assert.equal(eventsOf(lead).some((event) => event.kind === "ROOT_RESULT_READY"), false, "a review is not a root result");
 	assert.equal(act(runtime, lead, { action: "status", view: "work", id: ref.workId }).ok, true);
 	end(runtime, lead, { action: "yield" });
@@ -288,7 +291,7 @@ test("review works are not deliverables: root counts, Waiting for, process stats
 	const reviewRef = runtime.listWorks(teamId).find((work) => work.kind === "review")!.work;
 	const reviewer = takeFor(runtime, teamId, "w2");
 	assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead review of 1 result", "a running review is not what the Team waits for");
-	end(runtime, reviewer, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: ok." } });
+	end(runtime, reviewer, { action: "reply", result: { status: "succeeded", summary: "AT RISK: w1 is slow." } });
 	assert.equal(runtime.processStats(teamId).results, stats.results, "the review result is not a deliverable result");
 	const lead = takeFor(runtime, teamId, "lead");
 	const refused = errorOf(act(runtime, lead, { action: "control", command: "accept_result", work: reviewRef, disposition: "accepted" }));
@@ -354,4 +357,79 @@ test("the journal gives history the reviews and the schedule of a closed Team", 
 	// A damaged review record is skipped without losing the rest of the history.
 	const damaged = records.map((data) => data.kind === "review" ? { ...data, review: { ...data.review, by: "stranger" } } : data);
 	assert.equal(restoreTeamHistory(damaged.map((data) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data }))).skipped, 1);
+});
+
+test("only AT RISK, OFF TRACK, a review without a verdict or a failed review wake the lead; ON TRACK is only recorded", () => {
+	const { runtime, teamId } = world();
+	bootIdle(runtime, teamId);
+	runtime.reviewNow(teamId);
+	answerReview(runtime, teamId, "ON TRACK: all planned waits.");
+	assert.equal(runtime.listReviews(teamId)[0]!.verdict, "on_track", "the ON TRACK review is recorded");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "and creates no lead event");
+	const wakes = [["succeeded", "AT RISK: w1 has been held for 40 min."], ["succeeded", "OFF TRACK: no work covers the goal."],
+		["succeeded", "No verdict at all."], ["failed", "ON TRACK: contradicts its own status."]] as const;
+	for (const [status, summary] of wakes) {
+		runtime.reviewNow(teamId);
+		end(runtime, takeFor(runtime, teamId, "w2"), { action: "reply", result: { status, summary } });
+		const lead = take(runtime, teamId);
+		assert.deepEqual(eventsOf(lead).map((event) => event.kind), ["REVIEW_READY"], summary);
+		end(runtime, lead, { action: "yield" });
+	}
+});
+
+test("the review snapshot carries hold age, lead state, queued events, progress counters and the snapshot time", () => {
+	const quiet = world({ initial: [{ to: "w1", task: "Build it." }] });
+	bootIdle(quiet.runtime, quiet.teamId);
+	end(quiet.runtime, take(quiet.runtime, quiet.teamId), { action: "yield", attention: "Which repo?", checkpoint: "asked" });
+	quiet.advance(7 * 60_000);
+	const task = (runtime: TeamRuntime, teamId: string, ref: WorkRef) => runtime.getWork(teamId, ref)!.current.task;
+	const held = task(quiet.runtime, quiet.teamId, quiet.runtime.reviewNow(quiet.teamId).work);
+	assert.match(held, /Snapshot taken at \d{4}-\d\d-\d\dT[\d:.]+Z\. It may be older than your activation; status shows the current state\./u);
+	assert.match(held, /Lead: idle · Team events queued for the lead: 2\n/u);
+	assert.match(held, /Held works:\n- \S+ w1 held 7 min \(attention\): .*Which repo\?/u);
+	assert.match(held, /Last finished non-review work: none yet · consecutive reviews without finished work, including this one: 1\n/u);
+
+	const busy = world({ initial: [{ to: "w1", task: "Build it." }] });
+	bootIdle(busy.runtime, busy.teamId);
+	finishRoot(busy.runtime, busy.teamId);
+	busy.advance(3 * 60_000);
+	const lead = take(busy.runtime, busy.teamId);
+	assert.equal(lead.scope.kind, "events");
+	const progress = task(busy.runtime, busy.teamId, busy.runtime.reviewNow(busy.teamId).work);
+	assert.match(progress, /Lead: active · Team events queued for the lead: 0\n/u);
+	assert.match(progress, /Last finished non-review work: 3 min ago · consecutive reviews without finished work, including this one: 0\n/u);
+	assert.match(progress, /Held works:\nnone/u);
+
+	const idle = world();
+	bootIdle(idle.runtime, idle.teamId);
+	idle.runtime.reviewNow(idle.teamId);
+	answerReview(idle.runtime, idle.teamId, "ON TRACK: nothing to do.");
+	assert.match(task(idle.runtime, idle.teamId, idle.runtime.reviewNow(idle.teamId).work), /including this one: 2\n/u, "two consecutive reviews without a finished work");
+});
+
+test("review.focus is appended after the criteria, bounded to 1 KiB, and kept by review every", () => {
+	const { runtime, teamId } = world({ initial: [{ to: "w1", task: "Build it." }], review: { by: "w2", everyMinutes: 60, focus: "  Watch the migration risk.  " } });
+	bootIdle(runtime, teamId);
+	assert.deepEqual(runtime.reviewSchedule(teamId), { by: "w2", everyMinutes: 60, focus: "Watch the migration risk.", nextAt: 1_700_000_000_000 + 60 * 60_000 });
+	const task = runtime.getWork(teamId, runtime.reviewNow(teamId).work)!.current.task;
+	assert.match(task, /Without concrete evidence report ON TRACK\.[\s\S]*\n\nGuidance from the Team's plan for this review[^\n]*\nWatch the migration risk\.$/u);
+	assert.equal(runtime.setReview(teamId, { everyMinutes: 30 }).status, "applied");
+	assert.equal(runtime.reviewSchedule(teamId)?.focus, "Watch the migration risk.", "review every N keeps the focus");
+	assert.throws(() => new TeamRuntime().prepare({ members: MEMBERS, lead: "lead", brief: { goal: "g" }, review: { by: "w2", everyMinutes: 5, focus: "x".repeat(1025) } }), /focus/u);
+	assert.equal(new TeamRuntime().prepare({ members: MEMBERS, lead: "lead", brief: { goal: "g" }, review: { by: "w2", everyMinutes: 5, focus: null } }).teamId.length > 0, true);
+});
+
+test("an unprocessed REVIEW_READY never blocks close_team", () => {
+	const { runtime, teamId } = world({ initial: [{ to: "w1", task: "Build it." }] });
+	bootIdle(runtime, teamId);
+	const root = finishRoot(runtime, teamId);
+	const resultRef = runtime.getWork(teamId, root)!.current.resultRef!;
+	const lead = take(runtime, teamId);
+	assert.equal(act(runtime, lead, { action: "control", command: "accept_result", work: root, disposition: "accepted" }).ok, true);
+	runtime.reviewNow(teamId);
+	end(runtime, take(runtime, teamId), { action: "reply", result: { status: "succeeded", summary: "AT RISK: arrived while the lead was already closing." } });
+	assert.equal(runtime.panelFacts(teamId).pendingEvents, 1, "the REVIEW_READY is queued outside the lead's batch");
+	const closed = act(runtime, lead, { action: "control", command: "close_team", resultRefs: [resultRef], outcome: "succeeded" });
+	assert.equal(closed.ok, true, JSON.stringify(closed));
+	assert.equal(runtime.getTeam(teamId).lifecycle, "closing");
 });

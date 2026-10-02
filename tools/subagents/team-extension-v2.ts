@@ -3,12 +3,29 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_CACHE, TEAM_COMMAND_DESCRIPTION,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_PRIVATE_ENTRY_TYPE, TEAM_RESERVED_TOOLS,
-	type ActivationInput, type ActivationScope, type BindingV2, type ChildRequestFrame, type ParentCommand,
+	type ActivationInput, type ActivationScope, type BindingV2, type ChildRequestFrame, type MemberLoadout, type ParentCommand,
 	type PrivateAction, type PrivateReply, type TeamReply,
 } from "./team-protocol";
 import { prompt } from "../../core/prompts";
 import { TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "./team-codec";
 import { canonicalJson, errorReply, isRecord, normalizeTeamAction, parseParentCommand, projectErrorText, sameBinding, sameScope, TeamProtocolError } from "./team-codec";
+
+/** Pi wraps a system prompt section as <name>...</name>; the activation notice points at this name. */
+const TEAM_BRIEF_SECTION = "team_brief";
+
+/** The member's static Team brief; lead status and member lifecycles stay in the live activation input. */
+export function renderTeamBrief(memberId: string, loadout: MemberLoadout): string {
+	const none = prompt("team", "team_brief_none");
+	const bullets = (items: readonly string[] | undefined) => items?.length ? items.map((item) => `- ${item}`).join("\n") : none;
+	const { brief } = loadout;
+	const own = brief.authorizations?.find((item) => item.member === memberId);
+	return prompt("team", "team_brief", {
+		member: memberId, goal: brief.goal, target: brief.target ?? none,
+		acceptance: bullets(brief.acceptanceCriteria), constraints: bullets(brief.constraints),
+		authorization: own ? prompt("team", "team_brief_authorization", { allowed: bullets(own.allowed), forbidden: bullets(own.forbidden) }) : none,
+		roster: loadout.roster.map((item) => `- ${item.id}: ${item.rolePreview}`).join("\n"),
+	});
+}
 
 interface ActiveActivation {
 	scope: ActivationScope;
@@ -90,6 +107,7 @@ function stagedReply(reply: TeamReply): boolean {
 
 export default function install(pi: ExtensionAPI): void {
 	let binding: BindingV2 | undefined;
+	let teamBrief = "";
 	let active: ActiveActivation | undefined;
 	let previousTools: string[] = [];
 	let registered = false;
@@ -232,6 +250,7 @@ export default function install(pi: ExtensionAPI): void {
 						const available = allowed ? new Set(pi.getAllTools().map((tool) => tool.name)) : undefined;
 						const memberTools = (available ? allowed!.filter((name) => available.has(name)) : previousTools).filter((name) => !TEAM_RESERVED_TOOLS.includes(name));
 						pi.setActiveTools([...memberTools, "team"]);
+						teamBrief = renderTeamBrief(binding.memberId, command.loadout);
 						break;
 					}
 					case "activate": {
@@ -282,6 +301,7 @@ export default function install(pi: ExtensionAPI): void {
 						pi.setActiveTools(previousTools.filter((name) => name !== "team"));
 						unboundBinding = binding;
 						binding = undefined;
+						teamBrief = "";
 						break;
 				}
 			} catch (error) {
@@ -312,8 +332,9 @@ export default function install(pi: ExtensionAPI): void {
 			details: activationDetails(binding, active),
 		};
 		active.customMessageCreated = true;
-		return { ...(message ? { message } : {}),
-			systemPrompt: `${event.systemPrompt}\n\n${prompt("team", "member_system_prompt", { member: binding.memberId })}` };
+		// A section (not a forced systemPrompt) keeps Pi's default prompt, tools and caching intact.
+		event.systemPromptOptions.sections[TEAM_BRIEF_SECTION] = teamBrief;
+		return message ? { message } : undefined;
 	});
 
 	pi.on("context", async (event, ctx) => {

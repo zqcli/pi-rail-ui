@@ -66,6 +66,7 @@ export const TEAM_MAX_RESULT_RECORDS = Math.floor(TEAM_MAX_RESERVED_RESULT_BYTES
 export const TEAM_MAX_TIMEOUT_SECONDS = 86400;
 /** Periodic review interval bound, and the newest reviews kept per Team. */
 export const TEAM_MAX_REVIEW_MINUTES = 1440;
+export const TEAM_MAX_REVIEW_FOCUS_BYTES = 1024;
 export const TEAM_MAX_REVIEWS = 200;
 /** Completed idempotency entries kept per active member; pending entries are never evicted. */
 export const TEAM_COMMAND_CACHE = 128;
@@ -207,7 +208,12 @@ export interface TeamPlan {
 	/** Periodic progress review by a non-lead member; null = none. */
 	review: TeamReviewPlan | null;
 }
-export interface TeamReviewPlan { by: string; everyMinutes: number }
+export interface TeamReviewPlan {
+	by: string;
+	everyMinutes: number;
+	/** Lead-chosen guidance for the reviewer, appended after the review criteria. */
+	focus?: string;
+}
 
 export const REVIEW_VERDICTS = { "ON TRACK": "on_track", "AT RISK": "at_risk", "OFF TRACK": "off_track" } as const;
 export type TeamReviewVerdict = typeof REVIEW_VERDICTS[keyof typeof REVIEW_VERDICTS];
@@ -402,7 +408,15 @@ export type ParentCommand =
 	| { version: 2; commandId: string; operation: "unbind"; binding: BindingV2 };
 
 /** `tools` is the base-tool allowlist (null = all base tools); `team` is always added. */
-export interface MemberLoadout { tools: string[] | null; teamTool: true }
+/** What a member's child needs at bind: its tool allowlist and the static Team brief for its system prompt. */
+export interface MemberLoadout {
+	tools: string[] | null;
+	teamTool: true;
+	brief: TeamBrief;
+	roster: Array<{ id: string; rolePreview: string }>;
+}
+/** The loadout fields the launcher supplies; the protocol adds `teamTool`. */
+export type MemberLoadoutRequest = Omit<MemberLoadout, "teamTool">;
 
 export type GateDecision =
 	| { allow: true }
@@ -455,8 +469,9 @@ export interface ActivationInput {
 	teamId: string;
 	deliveryId: string;
 	member: { id: string; lead: boolean; roleDescription: string };
-	brief: TeamBrief;
-	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle; rolePreview: string }>;
+	/** The full brief is in the member's system prompt (bind loadout); only the goal repeats here. */
+	goal: string;
+	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle }>;
 	scope:
 		| {
 			kind: "work";

@@ -166,7 +166,7 @@ for (const maximal of [false, true]) test(`Runtime: ${maximal ? "maximal inputs 
 		active = h.nextWork(false)!;
 		assert.deepEqual(active.scope.work, parentRef);
 		assert.ok(jsonBytes(active.input) <= TEAM_MAX_ACTIVATION_INPUT_BYTES);
-		assert.deepEqual(active.input.brief, h.brief);
+		assert.equal(active.input.goal, h.brief.goal);
 		assert.equal(active.input.member.roleDescription, h.role);
 		assert.equal(active.input.scope.kind === "work" && active.input.scope.task, h.task);
 		assert.equal(active.input.ownedChildren.length + active.input.ownedChildrenOmitted!, count);
@@ -306,7 +306,7 @@ test("Runtime: many cleanup-failure notices with maximal brief/roles are sealed 
 	while (next?.scope.kind === "events") {
 		assert.ok(batches++ < 10);
 		assert.ok(next.input.scope.kind === "events");
-		assert.deepEqual(next.input.brief, h.brief);
+		assert.equal(next.input.goal, h.brief.goal);
 		for (const event of next.input.scope.events) {
 			assert.ok(!eventIds.has(event.id), "a byte-limited batch must not consume or replay other pending events");
 			eventIds.add(event.id);

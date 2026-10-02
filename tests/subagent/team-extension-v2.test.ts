@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import install from "../../tools/subagents/team-extension-v2";
+import install, { renderTeamBrief } from "../../tools/subagents/team-extension-v2";
 import { TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_DESCRIPTION, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
 import type { ParentCommand, PrivateReply } from "../../tools/subagents/team-protocol";
 import { jsonBytes, parseChildFrame, TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "../../tools/subagents/team-codec";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import { TeamRpcV2Connection } from "../../tools/subagents/team-rpc-v2";
 import type { RpcEvent, RpcTransport } from "../../tools/subagents/rpc-worker";
+import { loadoutFor } from "../fixtures/team-loadout";
 
 function nativeActivation(who: "lead" | "member") {
 	const runtime = new TeamRuntime();
@@ -62,7 +63,7 @@ function harness(who: "lead" | "member" = "lead") {
 }
 
 function bindCommand(h: ReturnType<typeof harness>, commandId = "bind-1", binding = h.binding, tools: string[] | null = null): ParentCommand {
-	return { version: 2, commandId, operation: "bind", binding, loadout: { tools, teamTool: true } };
+	return { version: 2, commandId, operation: "bind", binding, loadout: { ...loadoutFor(binding.memberId, tools), teamTool: true } };
 }
 
 function activateCommand(h: ReturnType<typeof harness>, commandId = "activate-1"): ParentCommand {
@@ -167,7 +168,11 @@ test("native custom activation is persisted and verified before input_ready/prov
 	await h.command(activateCommand(h, "activate-retry"));
 	assert.equal(h.lastPrivate().ok, true, "same activation under a new command id is idempotent");
 
-	const before = await h.handlers.get("before_agent_start")!({ prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native system" }, h.ctx);
+	const sections: Record<string, string> = {};
+	const before = await h.handlers.get("before_agent_start")!({ prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native system", systemPromptOptions: { sections } }, h.ctx);
+	assert.equal(before.systemPrompt, undefined, "the brief is a system prompt section, never a forced systemPrompt");
+	assert.match(sections["team_brief"]!, /^Team member: lead\./u);
+	assert.match(sections["team_brief"]!, /### Goal\nTest goal\./u);
 	assert.equal(before.message.customType, TEAM_ACTIVATION_MESSAGE_TYPE);
 	assert.equal(before.message.display, false);
 	assert.deepEqual(JSON.parse(before.message.content), h.activation.input);
@@ -203,7 +208,7 @@ test("wrong native context aborts before private readiness or provider continuat
 	const h = harness();
 	await h.command(bindCommand(h));
 	await h.command(activateCommand(h));
-	const before = await h.handlers.get("before_agent_start")!({ prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native" }, h.ctx);
+	const before = await h.handlers.get("before_agent_start")!({ prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native", systemPromptOptions: { sections: {} } }, h.ctx);
 	const messages = appendNativeActivation(h, before);
 	h.branch[h.branch.length - 1].content = "forged input";
 	await h.handlers.get("context")!({ messages }, h.ctx);
@@ -318,7 +323,7 @@ test("oversized local reply can be corrected in the same connected scope and com
 		},
 		async stop() { stops++; promptDone.reject(new Error("synthetic transport stopped")); },
 	};
-	const connection = new TeamRpcV2Connection(transport, h.binding, (error) => failures.push(error));
+	const connection = new TeamRpcV2Connection(transport, h.binding, loadoutFor(h.binding.memberId), (error: Error) => failures.push(error));
 	const running = connection.sendActivation(h.activation, async (frame, intentId) => {
 		assert.equal(frame.request.action, "business");
 		if (frame.request.action !== "business") throw new Error("Expected business request");
@@ -358,4 +363,17 @@ test("oversized local reply can be corrected in the same connected scope and com
 	assert.equal(stops, 0);
 	assert.equal(h.aborts(), 0);
 	await connection.close();
+});
+
+test("team_brief renders only the member's own authorization and fills absent parts with none", () => {
+	const brief = { goal: "Ship it.", acceptanceCriteria: ["Tests pass"], constraints: ["No new deps", "Keep API"],
+		authorizations: [{ member: "dev", allowed: ["edit src"], forbidden: ["git push"] }, { member: "qa", allowed: ["run tests"] }] };
+	const roster = [{ id: "lead", rolePreview: "Coordinates." }, { id: "dev", rolePreview: "Implements." }, { id: "qa", rolePreview: "Tests." }];
+	const dev = renderTeamBrief("dev", { tools: null, teamTool: true, brief, roster });
+	assert.match(dev, /### Acceptance criteria\n- Tests pass\n\n### Constraints\n- No new deps\n- Keep API\n\n### Your authorization\nAllowed:\n- edit src\nForbidden:\n- git push\n\n### Team roster\n- lead: Coordinates\.\n- dev: Implements\.\n- qa: Tests\./u);
+	assert.doesNotMatch(dev, /run tests/u);
+	assert.match(dev, /### Target\nnone\n/u);
+	const lead = renderTeamBrief("lead", { tools: null, teamTool: true, brief: { goal: "G" }, roster });
+	assert.match(lead, /### Acceptance criteria\nnone\n\n### Constraints\nnone\n\n### Your authorization\nnone\n/u);
+	assert.match(renderTeamBrief("qa", { tools: null, teamTool: true, brief, roster }), /Allowed:\n- run tests\nForbidden:\nnone/u);
 });

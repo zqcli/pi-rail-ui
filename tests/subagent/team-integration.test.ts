@@ -4,14 +4,14 @@ import type { AgentInstance, SessionBroker } from "../../tools/subagents/session
 import type { RailModelRef } from "../../tools/subagents/models";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import type { TeamJournalRecord } from "../../tools/subagents/team-journal";
-import { TEAM_MAX_LIVE_TEAMS, type BindingV2 } from "../../tools/subagents/team-protocol";
+import { TEAM_MAX_LIVE_TEAMS, type BindingV2, type MemberLoadoutRequest } from "../../tools/subagents/team-protocol";
 
 const model: RailModelRef = { provider: "test-provider", modelId: "test-model", thinkingLevel: "medium" };
 
-function fakeBroker(onClose: (memberId: string) => void, opened: Array<{ binding: BindingV2; tools?: string[] | null }> = []): SessionBroker {
+function fakeBroker(onClose: (memberId: string) => void, opened: Array<{ binding: BindingV2; loadout: MemberLoadoutRequest }> = []): SessionBroker {
 	let nextAgent = 0;
 	return {
-		async openTeamMember(request: { binding: BindingV2; tools?: string[] | null }) {
+		async openTeamMember(request: { binding: BindingV2; loadout: MemberLoadoutRequest }) {
 			const { binding } = request;
 			opened.push(request);
 			const instance = {
@@ -148,7 +148,7 @@ test("the driver forgets member activity of Teams the Runtime has evicted", asyn
 });
 
 test("a member's tools allowlist reaches the Broker when its lifetime opens; members without one keep every base tool", async () => {
-	const opened: Array<{ binding: BindingV2; tools?: string[] | null }> = [];
+	const opened: Array<{ binding: BindingV2; loadout: MemberLoadoutRequest }> = [];
 	const host = new TeamSessionHost(fakeBroker(() => {}, opened), () => {}, []);
 	const prepared = host.runtime.prepare({
 		members: [{ alias: "lead", roleDescription: "Coordinate." }, { alias: "reader", roleDescription: "Read only.", tools: ["read"] }, { alias: "bare", roleDescription: "No base tools.", tools: [] }],
@@ -156,6 +156,8 @@ test("a member's tools allowlist reaches the Broker when its lifetime opens; mem
 	});
 	assert.deepEqual(prepared.members.map((member) => [member.id, member.policy.tools]), [["lead", undefined], ["reader", ["read"]], ["bare", []]]);
 	for (const memberId of ["lead", "reader", "bare"]) await host.driver.openMember({ teamId: prepared.teamId, memberId, model });
-	assert.deepEqual(opened.map(({ binding, tools }) => [binding.memberId, tools]), [["lead", null], ["reader", ["read"]], ["bare", []]]);
+	assert.deepEqual(opened.map(({ binding, loadout }) => [binding.memberId, loadout.tools]), [["lead", null], ["reader", ["read"]], ["bare", []]]);
+	assert.ok(opened.every(({ loadout }) => loadout.brief.goal === "Restrict base tools." && loadout.roster.map((item) => item.id).join() === "lead,reader,bare"), "the brief and roster travel with the bind loadout");
+	assert.equal(opened[1]!.loadout.roster[1]!.rolePreview, "Read only.");
 	await host.driver.stopTeam(prepared.teamId, "done");
 });

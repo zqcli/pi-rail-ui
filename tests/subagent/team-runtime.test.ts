@@ -654,7 +654,7 @@ test("panel facts: an active Team waits for questions, then Manager review, then
 		accept(first, 1);
 		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead review of 1 result");
 		accept(second, 2);
-		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead to close the Team");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead: all roots accepted; decide the next step or close");
 		const resultRefs = [first, second].map((activation) => runtime.getWork(teamId, workRef(activation))!.current.resultRef!);
 		assert.equal(action(runtime, manager, 3, "close", { action: "control", command: "close_team", resultRefs, outcome: "succeeded" }).ok, true);
 		assert.equal(runtime.getTeam(teamId).lifecycle, "closing");

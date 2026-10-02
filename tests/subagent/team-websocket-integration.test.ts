@@ -68,7 +68,8 @@ function payloadText(body: Payload): string {
 }
 
 function memberFromPayload(body: Payload): Member | undefined {
-	const match = payloadText(body).match(/TEAM_MEMBER_(A|B[12])\b/u);
+	// The team_brief roster in the system prompt names every member; only the activation's own member carries a roleDescription.
+	const match = payloadText(body).match(/roleDescription\\*":\\*"TEAM_MEMBER_(A|B[12])\b/u);
 	return match?.[1] as Member | undefined;
 }
 

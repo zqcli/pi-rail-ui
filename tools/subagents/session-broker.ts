@@ -1,4 +1,4 @@
-import type { BindingV2, ChildRequestFrame, PrivateReply } from "./team-protocol";
+import type { BindingV2, ChildRequestFrame, MemberLoadoutRequest, PrivateReply } from "./team-protocol";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { ContextProtocolError, ContextWindowValidationError, createChildContextSettings, normalizeContextWindow, resolveChildContextCwd, validateContextWindowReserve } from "./context-window";
@@ -107,7 +107,7 @@ export interface SessionWorker {
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult>;
 	control?(request: WorkerControlRequest): Promise<void>;
 	setModel?(model: RailModelRef): Promise<RailModelRef>;
-	openTeamMemberV2?(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void, tools?: string[] | null): Promise<TeamMemberProtocolSession>;
+	openTeamMemberV2?(binding: BindingV2, loadout: MemberLoadoutRequest, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession>;
 	isReusable?(): boolean;
 	stop(): Promise<void>;
 }
@@ -203,8 +203,8 @@ export interface TeamMemberOpenRequest {
 	cwd?: string;
 	fastMode?: boolean;
 	contextWindow?: number;
-	/** Base-tool allowlist of this member; null/absent keeps every base tool. */
-	tools?: string[] | null;
+	/** Base-tool allowlist (null keeps every base tool) and the static brief for the member's system prompt. */
+	loadout: MemberLoadoutRequest;
 	/** Display-only native events of this member's activations. */
 	onActivity?: (event: RpcEvent) => void;
 }
@@ -613,10 +613,10 @@ export class SessionBroker {
 			state = this.workers.get(instance.agentId);
 			if (!state || !state.worker.openTeamMemberV2) throw new Error("Team v2 session worker capability is unavailable");
 			this.teamMemberHandles.set(instance.agentId, { owner, alias, teamId: binding.teamId, memberId: binding.memberId });
-			protocol = await state.worker.openTeamMemberV2(binding, (error) => {
+			protocol = await state.worker.openTeamMemberV2(binding, request.loadout, (error) => {
 				this.runtimeErrors.set(instance!.agentId, error.message);
 				this.emitRuntimeChange();
-			}, request.onActivity, request.tools ?? null);
+			}, request.onActivity);
 			if (this.shuttingDown) throw new Error("Broker shut down during Team member startup");
 			const ownedProtocol = protocol;
 			const ownedState = state;

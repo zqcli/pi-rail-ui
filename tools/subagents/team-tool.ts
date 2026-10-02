@@ -9,7 +9,7 @@ import { prompt, promptList } from "../../core/prompts";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
-	TEAM_BUDGET_UNLIMITED, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_REVIEW_MINUTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_MEMBERS, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_RESERVED_TOOLS,
+	TEAM_BUDGET_UNLIMITED, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_REVIEW_FOCUS_BYTES, TEAM_MAX_REVIEW_MINUTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_MEMBERS, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_RESERVED_TOOLS,
 	workRefKey, type TeamBudgetLimits, type TeamBudgetPreset, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, reviewAssessment, sameWorkRef, shortWorkRef,
 } from "./team-protocol";
 import { capped, clock, formatTimeline, type TeamRuntime } from "./team-runtime";
@@ -440,7 +440,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			`Initial work: ${works.map((work) => `${workRefKey(work.work)} → ${work.assignee}`).join(" · ") || "none (members start idle; the lead assigns work)"}`,
 			`Deadline: ${plan.timeoutSeconds === null ? "no Team deadline" : `${plan.timeoutSeconds}s from launch`}`,
 			`Budget (${plan.budget ?? "long"}): ${budgetLimitsText(view.budget.limits)}; the host can grant more with /rail-team.`,
-			`Review: ${plan.review ? `${plan.review.by} every ${plan.review.everyMinutes} min` : "none"}`,
+			`Review: ${plan.review ? `${plan.review.by} every ${plan.review.everyMinutes} min${plan.review.focus ? ` · focus: ${previewText(plan.review.focus, 200)}` : ""}` : "none"}`,
 			`Next: in your next message call subagent_team {"action":"launch","teamId":"${view.teamId}"}. It returns when the whole Team has ended. Do not start members with the subagent tool.`,
 		];
 		return textResult(lines.join("\n"), { view, works });
@@ -615,6 +615,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			review: nullable(Type.Object({
 				by: Type.String({ minLength: 1, maxLength: 64, description: "A member alias other than the lead" }),
 				everyMinutes: Type.Integer({ minimum: 1, maximum: TEAM_MAX_REVIEW_MINUTES }),
+				focus: nullable(Type.String({ maxLength: TEAM_MAX_REVIEW_FOCUS_BYTES, description: "Optional guidance for the reviewer, at most 1 KiB, added after the review criteria" })),
 			}, { additionalProperties: false, description: "prepare: periodic progress review by that member, reported to the lead; null = none" })),
 			timeoutSeconds: nullable(Type.Number({ exclusiveMinimum: 0, maximum: TEAM_MAX_TIMEOUT_SECONDS, description: "null = no Team deadline. Only for a user-requested deadline, counted from launch." })),
 			reason: nullable(Type.String({ description: "cancel: why the Team is cancelled" })),

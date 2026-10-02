@@ -118,34 +118,19 @@ export default async function piRailUi(pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		setTurnStartTime(Date.now());
-		if (ctx.mode === "tui" && enabled) {
-			installFooter(ctx);
-			refreshUserMessageTimestamps(ctx);
-		}
+		if (ctx.mode === "tui" && enabled) refreshUserMessageTimestamps(ctx);
 	});
 
 	pi.on("message_start", async (event, _ctx) => {
 		rememberUserMessageTimestamp(event.message);
 	});
 
-	pi.on("message_end", async (event, ctx) => {
+	pi.on("message_end", async (event) => {
 		rememberUserMessageTimestamp(event.message);
-		if (event.message.role === "assistant" && ctx.mode === "tui" && enabled) {
-			installFooter(ctx);
-		}
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async () => {
 		setTurnEndTime();
-		if (ctx.mode === "tui" && enabled) installFooter(ctx);
-	});
-
-	pi.on("model_select", async (_event, ctx) => {
-		if (ctx.mode === "tui" && enabled) installFooter(ctx);
-	});
-
-	pi.on("thinking_level_select", async (_event, ctx) => {
-		if (ctx.mode === "tui" && enabled) installFooter(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event) => {

@@ -120,10 +120,11 @@ function memberStateText(member: TeamTeamView["members"][number], works: readonl
 		? "IDLE · no assigned work"
 		: `${upper(member.activity)}${member.currentWork ? ` ${refText(member.currentWork)}` : ""}${current ? ` "${previewText(current.taskPreview, 80)}"` : ""} · queued ${member.queued} · blocked ${member.blocked} · held ${member.held}`;
 	const pause = member.pause === "none" ? "" : ` · pause ${member.pause}`;
+	const retrying = facts?.retrying.get(member.id);
 	const events = facts && member.id === lead ? ` · pending events ${facts.pendingEvents}` : "";
 	const results = facts?.results.get(member.id)?.count;
 	const error = member.error ? ` · ${member.error.code}: ${previewText(member.error.message, 160)}` : "";
-	return `${upper(member.lifecycle)} · ${activity}${pause}${events}${results ? ` · results ${results}` : ""}${error}`;
+	return `${upper(member.lifecycle)} · ${activity}${pause}${retrying ? ` · ${retrying}` : ""}${events}${results ? ` · results ${results}` : ""}${error}`;
 }
 
 export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSummary[] = [], totalHolds = works.filter((work) => work.hold).length,
@@ -180,6 +181,7 @@ export function memberDetail(member: TeamTeamView["members"][number], facts: Pan
 	const resultText = results ? `${results} ${results === 1 ? "result" : "results"}` : "";
 	if (member.lifecycle === "closed") return ["closed", resultText].filter(Boolean).join(" · ");
 	const now = member.currentWork ? `running ${shortWorkRef(member.currentWork)}`
+		: facts.retrying.has(member.id) ? facts.retrying.get(member.id)!
 		: member.id === lead && facts.leadHandling ? facts.leadHandling
 			: member.held || member.blocked ? facts.stalled.get(member.id) ?? "waiting on other work"
 				: member.queued ? "queued for a work slot"
@@ -338,7 +340,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		"Process:",
 		`- works ${stats.works} (${stats.roots} roots, ${stats.works - stats.roots} sub-tasks) · results ${stats.results}`,
 		`- activations ${stats.activations} · model turns ${stats.modelTurns} · dependency waits ${stats.dependencyWaits} · questions ${stats.questions}`,
-		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · team action errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
+		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · team action errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})${stats.transientRetries ? ` · transient retries ${stats.transientRetries}` : ""}`,
 		`- tokens input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 		`- Budget: ${budgetLimitsText(view.budget.limits)}`,
 		...(lastReview ? [`- Last review ${clock(lastReview.snapshot.elapsedMs)} ${lastReview.verdict?.replace("_", " ") ?? "no verdict"}: ${previewText(reviewAssessment(lastReview.summary), 160)}`] : []),

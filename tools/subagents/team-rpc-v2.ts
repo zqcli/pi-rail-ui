@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { RpcEvent, RpcTransport } from "./rpc-worker";
 import {
 	TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_CACHE, TEAM_COMMAND_DESCRIPTION, TEAM_MAX_FRAME_BYTES,
@@ -154,7 +155,9 @@ function completionFor(run: ActiveRun): NativeCompletion {
 		...(pendingToolCalls ? { pendingToolCalls: true } : {}),
 		...(appliedToolCallId ? { appliedToolCallId } : {}),
 		// Completion is private evidence. Runtime projects its public views without changing duplicate detection.
-		...(status === "error" ? { error: { code: "NATIVE_FAILURE", message: nativeErrorMessage ?? "Pi assistant turn failed" } } : {}),
+		...(status === "error" ? { error: { code: "NATIVE_FAILURE", message: nativeErrorMessage ?? "Pi assistant turn failed",
+			// A temporary provider/transport error: the same session can be activated again.
+			...(stopReason === "error" && isRetryableAssistantError(message as AssistantMessage) ? { transient: true as const } : {}) } } : {}),
 	};
 }
 

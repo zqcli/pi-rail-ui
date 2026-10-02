@@ -200,6 +200,19 @@ test("native 6 KiB proxy failures retain private evidence and project bounded pu
 	await connection.close();
 });
 
+test("native errors are marked transient only when the provider error is retryable", async () => {
+	for (const [message, transient] of [["503 service unavailable", true], ["WebSocket closed 1006", true], ["insufficient_quota", undefined], ["400 invalid request", undefined]] as const) {
+		const transport = new FakeTransport();
+		transport.nativeErrorMessage = message;
+		const { connection, run } = await startConnection(transport, async () => ({ kind: "ack" }));
+		const completion = await run;
+		assert.equal(completion.status, "error");
+		assert.equal(completion.error?.transient, transient, message);
+		await connection.deactivate(activation());
+		await connection.close();
+	}
+});
+
 test("private frame size includes the native tool-call evidence stripped before core codec parsing", async () => {
 	const transport = new FakeTransport();
 	transport.triggerDelayMs = 60000;

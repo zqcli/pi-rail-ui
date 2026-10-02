@@ -227,9 +227,11 @@ export default function install(pi: ExtensionAPI): void {
 						previousTools = pi.getActiveTools();
 						registerTeamTool();
 						binding = command.binding;
-						const memberTools = previousTools.filter((name) => !TEAM_RESERVED_TOOLS.includes(name));
 						const allowed = command.loadout.tools;
-						pi.setActiveTools([...(allowed ? memberTools.filter((name) => allowed.includes(name)) : memberTools), "team"]);
+						// An allowlist may name any available tool (prepare validates against getAllTools), not only the default-active ones.
+						const available = allowed ? new Set(pi.getAllTools().map((tool) => tool.name)) : undefined;
+						const memberTools = (available ? allowed!.filter((name) => available.has(name)) : previousTools).filter((name) => !TEAM_RESERVED_TOOLS.includes(name));
+						pi.setActiveTools([...memberTools, "team"]);
 						break;
 					}
 					case "activate": {

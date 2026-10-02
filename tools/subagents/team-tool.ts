@@ -338,7 +338,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		"Process:",
 		`- works ${stats.works} (${stats.roots} roots, ${stats.works - stats.roots} sub-tasks) · results ${stats.results}`,
 		`- activations ${stats.activations} · model turns ${stats.modelTurns} · dependency waits ${stats.dependencyWaits} · questions ${stats.questions}`,
-		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · tool errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
+		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · team action errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
 		`- tokens input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 		`- Budget: ${budgetLimitsText(view.budget.limits)}`,
 		...(lastReview ? [`- Last review ${clock(lastReview.snapshot.elapsedMs)} ${lastReview.verdict?.replace("_", " ") ?? "no verdict"}: ${previewText(reviewAssessment(lastReview.summary), 160)}`] : []),

@@ -44,7 +44,7 @@ function harness(who: "lead" | "member" = "lead") {
 		on: (name: string, handler: any) => handlers.set(name, handler),
 		registerCommand: (name: string, definition: any) => commands.set(name, definition),
 		registerTool: (definition: any) => tools.set(definition.name, definition),
-		getAllTools: () => [...tools.values()],
+		getAllTools: () => [...["read", "bash", "grep", "find", "ls", "subagent", "subagent_team"].map((name) => ({ name })), ...tools.values()],
 		getActiveTools: () => [...activeTools],
 		setActiveTools: (names: string[]) => { activeTools = [...names]; activeToolUpdates.push([...names]); },
 		appendEntry: (customType: string, data: unknown) => {
@@ -114,6 +114,9 @@ test("Team v2 tool schema is a strict action union and bind gives every member b
 	const restricted = harness("member");
 	await restricted.command(bindCommand(restricted, "bind-1", restricted.binding, ["read", "write"]));
 	assert.deepEqual(restricted.activeTools(), ["read", "team"], "a tools allowlist restricts the base tools; names the session lacks are simply absent");
+	const readOnly = harness("member");
+	await readOnly.command(bindCommand(readOnly, "bind-1", readOnly.binding, ["read", "grep", "find", "ls", "subagent", "missing"]));
+	assert.deepEqual(readOnly.activeTools(), ["read", "grep", "find", "ls", "team"], "an allowlist activates available tools that are not active by default, minus reserved names");
 	const teamOnly = harness("lead");
 	await teamOnly.command(bindCommand(teamOnly, "bind-1", teamOnly.binding, []));
 	assert.deepEqual(teamOnly.activeTools(), ["team"], "an empty allowlist leaves only the team tool");

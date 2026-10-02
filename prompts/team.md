@@ -10,7 +10,7 @@ Run a Team: 2-9 members, all new persistent aliases with the same capabilities (
 - Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.
 - Leave budget null (long, sized for multi-hour runs); set unlimited only when the user asks for an open-ended or loop run.
 - For a long or open-ended run set review {by, everyMinutes} naming a member whose roleDescription covers progress review; it only advises the lead.
-- Role-only members are valid: they stay idle until they are assigned work. Give a member tools only to restrict its base tools (null = all); the lead gets the same tools as everyone else; a lead that should only coordinate can have tools []. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.
+- Role-only members are valid: they stay idle until they are assigned work. Give a member tools only to restrict its base tools (null = all); the lead gets the same tools as everyone else; a lead that should only coordinate can have tools []; read-only investigators usually get tools ["read","grep","find","ls"]. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.
 - If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.
 
 ## tool_description

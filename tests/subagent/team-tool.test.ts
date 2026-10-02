@@ -355,6 +355,7 @@ test("launch final output carries deliverables, process, members and selected re
 	assert.match(text, /^Members:\n- lead \(lead\) · .* · results 0 · activations 9 · active 0:00\n- worker · .* · results 8 · activations 8 · active 0:00$/mu);
 	assert.match(text, /^Deliverables \(8 roots · 0 accepted · 0 waived\):/mu);
 	assert.match(text, /^Process:\n- works 8 \(8 roots, 0 sub-tasks\) · results 8/mu);
+	assert.match(text, /^- revisions \d+ · cancelled\/superseded \d+ · team action errors \d+ \(/mu);
 	assert.match(text, /^Final results selected by the lead \(in full\):/mu);
 	assert.match(text, /^Details on demand: subagent_team status .*resultRef.*reads any result in full.*Team view and the timeline\./mu);
 	assert.doesNotMatch(text, /Timeline \(m:ss|worker succeeded result for/u);

@@ -463,6 +463,7 @@ These sections control specialized details of the other major UI surfaces. For n
 pi-rail-ui/
 ├── index.ts                         # Extension entry point, command, and feature install/uninstall glue
 ├── ui-style.json                    # Centralized visual configuration
+├── prompts/                         # Model-facing instruction texts (Markdown, overridable in <agent-dir>/rail-prompts/)
 ├── config/
 │   ├── index.ts                     # Config parsing and resolved style/layout exports
 │   ├── colors.ts                    # Theme/color resolution helpers

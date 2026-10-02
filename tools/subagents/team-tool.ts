@@ -5,6 +5,7 @@ import { Type, type TSchema } from "typebox";
 import type { SessionBroker } from "./session-broker";
 import { formatWorkResult, jsonTextBytes, normalizeTeamPlan, previewText, TEAM_PLAN_MIGRATION, truncateText } from "./team-codec";
 import type { TeamHistoryEntry } from "./team-history";
+import { prompt, promptList } from "../../core/prompts";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
@@ -598,20 +599,8 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 	pi.registerTool({
 		name: "subagent_team",
 		label: "Subagent Team",
-		description: "Run a Team: 2-9 members, all new persistent aliases with the same capabilities (what a member does comes only from its roleDescription and the work it receives), coordinated through a shared work ledger; one member is the lead, who handles Team events, assigns and reviews work and closes the Team. "
-			+ "(1) prepare {\"action\":\"prepare\",\"members\":[{\"alias\":\"lead\",\"roleDescription\":\"...\"},{\"alias\":\"review\",\"roleDescription\":\"...\",\"tools\":[\"read\"]}],\"lead\":\"lead\",\"brief\":{\"goal\":\"...\"},\"initialRequests\":[{\"to\":\"review\",\"task\":\"...\"}],\"timeoutSeconds\":null} "
-			+ "validates and pins every member's model, cwd, Fast/Search and context budget, and returns the plan, initial WorkRefs and budget without starting anything. "
-			+ "(2) launch {\"action\":\"launch\",\"teamId\":\"<teamId>\"} starts all members and returns only when the whole Team has ended, with deliverables, process counts, per-member totals and the full text of every result the lead selected, so no status call is needed to read them. "
-			+ "status (teamId optional) lists Teams; status with teamId returns the Team view and timeline; cursor pages resultRefs, or resultRef fetches one full ResultRecord. cancel (teamId, reason) inspects or stops a Team. The lead assigns, reviews and closes; it does not write a final summary. "
-			+ "The parent model is not woken while launch waits; budget grants and hold releases are host-only (/rail-team).",
-		promptGuidelines: [
-			"Run a Team with two subagent_team calls in consecutive messages: prepare with members (alias + roleDescription each), lead (the alias of one member), brief.goal and optional initialRequests to members other than the lead; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected results in full; use status afterwards for the timeline or results it names as truncated or unselected.",
-			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
-			"Leave budget null (long, sized for multi-hour runs); set unlimited only when the user asks for an open-ended or loop run.",
-			"For a long or open-ended run set review {by, everyMinutes} naming a member whose roleDescription covers progress review; it only advises the lead.",
-			"Role-only members are valid: they stay idle until they are assigned work. Give a member tools only to restrict its base tools (null = all); the lead gets the same tools as everyone else; a lead that should only coordinate can have tools []. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
-			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",
-		],
+		description: prompt("team", "subagent_team_description"),
+		promptGuidelines: promptList("team", "subagent_team_guidelines"),
 		executionMode: "parallel",
 		parameters: Type.Object({
 			action: StringEnum(["prepare", "launch", "status", "cancel"]),

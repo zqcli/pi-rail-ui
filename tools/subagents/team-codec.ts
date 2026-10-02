@@ -4,6 +4,7 @@
  * checked by TeamRuntime. Must not depend on the runtime, RPC transport or extension install code.
  */
 import { Type } from "typebox";
+import { prompt } from "../../core/prompts";
 import { isValidAgentAlias } from "./identity";
 import {
 	TEAM_ERROR_CODES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_ALIAS_LENGTH, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_FRAME_BYTES,
@@ -496,7 +497,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Lead only: close the Team after all roots and member resources are explicitly settled."),
 ]);
 
-export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control: revise_work, cancel_work, resume_work and accept_result are for the work's requester or the lead (never for your own current work); pause_member, resume_member, close_member and close_team are lead only. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.";
+export const TEAM_TOOL_DESCRIPTION = prompt("team", "tool_description");
 
 const LEGACY_ACTIONS: Record<string, string> = {
 	send: "send was replaced by request {to, task}; a reply never creates a new request",

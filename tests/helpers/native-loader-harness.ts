@@ -28,7 +28,7 @@ export interface RpcSequenceResult extends ChildResult {
 }
 
 export const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
-export const PRODUCTION_ENTRIES = ["index.ts", "components", "commands", "config", "core", "openai", "rail", "tools"];
+export const PRODUCTION_ENTRIES = ["index.ts", "components", "commands", "config", "core", "openai", "prompts", "rail", "tools"];
 export const DEEP_IMPORT_FAILURE = /Cannot find module '@earendil-works\/pi-ai\/(?:api|utils)\//u;
 
 export function bundledCli(runtime: RuntimePackage): string {

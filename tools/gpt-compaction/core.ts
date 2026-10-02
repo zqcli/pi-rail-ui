@@ -12,6 +12,7 @@ import {
 	type SessionBeforeCompactEvent,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { prompt } from "../../core/prompts";
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth, resolveSessionId } from "./auth";
 import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, projectHistoryRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
 import { compactionIdentity, identitiesMatch, type CompactionIdentity } from "./model-eligibility";
@@ -185,7 +186,7 @@ function mergeCompactionInstructions(systemPrompt: string, customInstructions: s
 	const custom = customInstructions?.trim();
 	if (!custom) return systemPrompt;
 	if (!systemPrompt.trim()) return custom;
-	return `${systemPrompt}\n\nAdditional instructions for this compaction only:\n${custom}`;
+	return `${systemPrompt}\n\n${prompt("gpt-compaction", "custom_instructions", { instructions: custom })}`;
 }
 
 /** Run remote v2 compaction for one `session_before_compact` event. */

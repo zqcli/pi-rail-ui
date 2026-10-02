@@ -1,14 +1,15 @@
 /**
  * Team actor protocol v2: public tool actions, private frames, ledger records and limits.
- * Pure contract module: no runtime state, no I/O. Validation lives in team-codec.ts.
+ * Pure contract module: no runtime state, no I/O beyond loading the trigger text. Validation lives in team-codec.ts.
  */
+import { prompt } from "../../core/prompts";
 import type { SubagentUsage } from "./session-broker";
 
 export const TEAM_PROTOCOL_VERSION = 2 as const;
 export const TEAM_COMMAND = "rail-subagent-team-protocol";
 export const TEAM_COMMAND_DESCRIPTION = "Rail private team protocol v2";
 export const TEAM_ACTIVATION_MESSAGE_TYPE = "rail-team-activation";
-export const TEAM_ACTIVATION_TRIGGER = "Process the current Rail Team input.";
+export const TEAM_ACTIVATION_TRIGGER = prompt("team", "activation_trigger");
 export const TEAM_PRIVATE_ENTRY_TYPE = "rail-subagent-team-protocol-v2";
 
 // Size limits (UTF-8 bytes of the JSON serialization unless noted).

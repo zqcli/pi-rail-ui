@@ -1,5 +1,6 @@
 import type { ExtensionContext, InputEvent, InputEventResult } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem, AutocompleteSuggestions } from "@earendil-works/pi-tui";
+import { prompt } from "../../core/prompts";
 import { isValidAgentAlias } from "./identity";
 import { railModelReference } from "./models";
 import type { AgentInstance, WorkerControlDelivery, WorkerControlRequest } from "./session-broker";
@@ -152,7 +153,7 @@ function compactText(value: string, maxLength = 120): string {
 export function buildSubagentRosterPrompt(instances: AgentInstance[], mentions: SubagentMentions): string {
 	if (instances.length === 0 && mentions.targets.length === 0 && mentions.models.length === 0) return "";
 	const lines = [
-		"Use the subagent tool with `target` to continue a linked session, or `model` plus `alias` to create one.",
+		prompt("subagent", "roster_intro"),
 	];
 	for (const instance of instances) {
 		lines.push(
@@ -161,14 +162,14 @@ export function buildSubagentRosterPrompt(instances: AgentInstance[], mentions: 
 		);
 	}
 	if (mentions.targets.length > 0 || mentions.models.length > 0) {
-		lines.push("", "Explicit routing from the current user message:");
+		lines.push("", prompt("subagent", "roster_routing_header"));
 		for (const target of mentions.targets) {
-			lines.push(`- The user named @agent/${target}; you must call subagent with target="${target}" and must not substitute another session.`);
+			lines.push(prompt("subagent", "roster_target", { target }));
 		}
 		for (const model of mentions.models) {
-			lines.push(`- The user named @new/${model}; create a persistent model session with model="${model}" and a concise unique alias.`);
+			lines.push(prompt("subagent", "roster_model", { model }));
 		}
 	}
-	lines.push("", "For follow-up work on the same files or topic, prefer the same target instead of creating a new session.");
+	lines.push("", prompt("subagent", "roster_follow_up"));
 	return lines.join("\n");
 }

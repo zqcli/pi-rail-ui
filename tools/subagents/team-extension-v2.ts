@@ -6,6 +6,7 @@ import {
 	type ActivationInput, type ActivationScope, type BindingV2, type ChildRequestFrame, type ParentCommand,
 	type PrivateAction, type PrivateReply, type TeamReply,
 } from "./team-protocol";
+import { prompt } from "../../core/prompts";
 import { TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "./team-codec";
 import { canonicalJson, errorReply, isRecord, normalizeTeamAction, parseParentCommand, projectErrorText, sameBinding, sameScope, TeamProtocolError } from "./team-codec";
 
@@ -158,7 +159,7 @@ export default function install(pi: ExtensionAPI): void {
 		pi.registerTool({
 			name: "team",
 			label: "Team",
-			description: `${TEAM_TOOL_DESCRIPTION} reply, yield, and close_team must be the only tool call in their finalized assistant batch.`,
+			description: `${TEAM_TOOL_DESCRIPTION} ${prompt("team", "member_tool_description_suffix")}`,
 			parameters: TEAM_TOOL_SCHEMA,
 			executionMode: "sequential",
 			async execute(toolCallId, params, signal, _update, ctx) {
@@ -310,7 +311,7 @@ export default function install(pi: ExtensionAPI): void {
 		};
 		active.customMessageCreated = true;
 		return { ...(message ? { message } : {}),
-			systemPrompt: `${event.systemPrompt}\n\nTeam member: ${binding.memberId}. The rail-team-activation custom message is authoritative for this activation. Use the team tool for Team operations. A successful reply, yield, or close_team ends this native activation; each end intent must be the sole tool call in the finalized assistant batch. Do not claim a result unless the runtime accepts the team reply.` };
+			systemPrompt: `${event.systemPrompt}\n\n${prompt("team", "member_system_prompt", { member: binding.memberId })}` };
 	});
 
 	pi.on("context", async (event, ctx) => {

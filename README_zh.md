@@ -462,6 +462,7 @@ ui-style.json
 pi-rail-ui/
 ├── index.ts                         # 扩展入口、命令、功能 install/uninstall 编排
 ├── ui-style.json                    # 集中的视觉配置
+├── prompts/                         # 面向模型的指令文本（Markdown，可在 <agent-dir>/rail-prompts/ 覆盖）
 ├── config/
 │   ├── index.ts                     # 配置解析和解析后的样式/布局导出
 │   ├── colors.ts                    # 主题/颜色解析辅助

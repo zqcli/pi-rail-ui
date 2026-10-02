@@ -51,8 +51,8 @@ async function resolveRuntimeIdentity(ctx: ExtensionContext): Promise<Compaction
 	return auth.ok ? auth.identity : safeIdentity(ctx);
 }
 
-function statusText(mode: GptCompactionMode, ctx: ExtensionContext): string {
-	if (mode === "off") return "GPT compact: native";
+function statusText(mode: GptCompactionMode, ctx: ExtensionContext): string | undefined {
+	if (mode === "off") return undefined;
 	// Non-GPT models use native compaction even while the global switch is on.
 	if (!isGptModel(ctx.model)) return "GPT compact: native";
 	const support = modelSupportsRemoteCompaction(ctx.model);

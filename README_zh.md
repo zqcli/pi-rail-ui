@@ -178,7 +178,7 @@ Rail 可按 provider/model 白名单把 HTTP SSE 替换为原生 Responses WebSo
 
 不带参数时，在 TUI 中会打开带当前状态标题的菜单。`on`/`off` 也会通过 slash command completion 提供补全。设置保存在 `getAgentDir()/rail-gpt-compaction/settings.json`，默认是 `off`，并由 TUI、RPC、JSON 以及 Rail 子进程共享。旧的 `/rail-gpt-compaction` 名称不再保留为别名；只有持久化设置目录仍沿用旧的 `rail-gpt-compaction` 名称。远程压缩目前只对名称包含 GPT 的 `openai-responses` 和 `openai-codex-responses` 生效；Azure OpenAI Responses 暂不属于 v2 支持范围，待 endpoint、query 和认证行为有对应实现与测试后再启用。不符合条件的模型继续使用 Pi 原生压缩。全局开关为 `on` 时，生产 stateless GPT dispatch 会加载独立压缩 helper，并只在本次调用期间使用临时 session；正常完成、初始化失败或子进程失败都会清理临时目录。开关为 `off` 或模型不是 GPT 时，stateless dispatch 仍保持 Pi 原本的 `--no-session` 路径。persistent RPC worker 始终加载 helper，但开关关闭时其压缩 hook 不会生效。
 
-在当前模型非 GPT 或缺失时，执行该命令（`on` 或无参数菜单）会在打开菜单前被拒绝：统一输出 GPT-only warning，且不写入任何全局设置。`off` 不受当前模型限制，仍保留既有的原生历史修复安全检查。GPT 模型但 API 不属于 v2 范围时保持原行为——命令成功、设置保存、状态显示 `GPT compact: native (inactive — …)`；非 GPT 模型则直接显示 `GPT compact: native`。
+在当前模型非 GPT 或缺失时，执行该命令（`on` 或无参数菜单）会在打开菜单前被拒绝：统一输出 GPT-only warning，且不写入任何全局设置。`off` 不受当前模型限制，仍保留既有的原生历史修复安全检查。GPT 模型但 API 不属于 v2 范围时保持原行为——命令成功、设置保存、状态显示 `GPT compact: native (inactive — …)`；非 GPT 模型则直接显示 `GPT compact: native`。模式为 off 时不显示任何状态。
 
 ### `/rail-duplicate`
 

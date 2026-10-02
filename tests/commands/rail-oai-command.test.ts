@@ -141,7 +141,7 @@ test("/rail-oai-* commands share one GPT-only rejection and mutate no state", as
 	assert.equal(harness.waitForIdleCalls(), 0, "a rejected command never waits for idle");
 	assert.equal(lastStatus(statusWrites, "rail-oai-fast"), undefined);
 	assert.equal(lastStatus(statusWrites, "rail-oai-search"), undefined);
-	assert.equal(lastStatus(statusWrites, "rail-gpt-compaction"), "GPT compact: native");
+	assert.equal(lastStatus(statusWrites, "rail-gpt-compaction"), undefined);
 	assert.equal(readGptCompactionSettings(agentDir).mode, "off", "a rejected on writes no global setting");
 	assert.equal(
 		await readFile(gptCompactionSettingsPath(agentDir), "utf8").catch(() => undefined),
@@ -223,7 +223,7 @@ test("off is always available on a non-GPT model and clears the policy", async (
 	await commands.get("rail-oai-compaction").handler("off", ctx);
 	assert.doesNotMatch(notices.at(-1) ?? "", /GPT models only/);
 	assert.equal(readGptCompactionSettings(agentDir).mode, "off", "off clears the previously enabled global switch");
-	assert.equal(lastStatus(statusWrites, "rail-gpt-compaction"), "GPT compact: native");
+	assert.equal(lastStatus(statusWrites, "rail-gpt-compaction"), undefined, "off clears the compaction status");
 	ctx.model = { ...GPT_MODEL };
 	await harness.run("model_select", {}, ctx);
 	await harness.run("turn_start", {}, ctx);

@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import type { ExtensionCommandContext, KeybindingsManager, SessionInfo, Theme } from "@earendil-works/pi-coding-agent";
 import { Input, Key, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi, type Focusable, type TUI } from "@earendil-works/pi-tui";
-import type { RailAgentManager, RailAgentManagerSnapshot, RailAgentPhase, RailAgentView } from "./agent-manager";
+import type { CreateRailAgentRequest, RailAgentManager, RailAgentManagerSnapshot, RailAgentPhase, RailAgentView } from "./agent-manager";
 import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { assertValidAgentAlias } from "./identity";
 import { statusColor } from "./transcript";
@@ -758,14 +758,32 @@ export class RailAgentOverlayComponent implements Focusable {
 				}
 				this.notice = `Adopted ${this.form.alias} as ${this.form.adoptMode === "fork" ? "a safe copy" : "an exclusive session"}`;
 			} else {
-				await this.options.manager.create({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, fastMode: this.form.fastMode, signal });
-				this.notice = `Created ${this.form.alias}`;
+				await this.startInBackground({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, fastMode: this.form.fastMode });
+				this.notice = `Started ${this.form.alias}; its first task is running`;
 			}
 			this.tab = "current";
 			this.selectedIndex = 0;
 			this.form.task = "";
 			this.aliasEdited = false;
 			this.form.alias = defaultAlias(this.form.model.modelId, Date.now().toString(36));
+		});
+	}
+
+	/** Resolves once the instance exists; the first run settles later, independent of the popup, and reports via notify. */
+	private startInBackground(request: CreateRailAgentRequest): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			let started = false;
+			this.options.manager.create({ ...request, onUpdate: () => { started = true; resolve(); } }).then(
+				(result) => {
+					resolve();
+					const answer = compact(result.run.output);
+					this.ctx.ui.notify(`Agent ${request.alias} finished its first task${answer ? `: ${answer}` : ""}`, "info");
+				},
+				(error) => {
+					if (!started) return reject(error);
+					this.ctx.ui.notify(`Agent ${request.alias} failed its first task: ${error instanceof Error ? error.message : String(error)}`, "error");
+				},
+			).catch(() => undefined); // notify throws once the session context is stale
 		});
 	}
 

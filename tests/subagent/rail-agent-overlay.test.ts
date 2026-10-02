@@ -55,6 +55,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	currentSnapshot.counts.running = phase === "running" ? 1 : 0;
 	currentSnapshot.counts.idle = phase === "idle" ? 1 : 0;
 	const controls: unknown[] = [];
+	const notifications: Array<{ message: string; type: string | undefined }> = [];
 	const availableModels = structuredClone(models);
 	const mentions: string[] = [];
 	const sessions = [{
@@ -85,7 +86,10 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 			find: (provider: string, id: string) => [piModel, deepseekModel].find((model) => model.provider === provider && model.id === id),
 		},
 		sessionManager: { getSessionId: () => "parent-session" },
-		ui: { confirm: async () => { throw new Error("native confirm renders under the overlay"); } },
+		ui: {
+			confirm: async () => { throw new Error("native confirm renders under the overlay"); },
+			notify: (message: string, type?: string) => { notifications.push({ message, type }); },
+		},
 	};
 	const keybindings = {
 		matches: (data: string, id: string) => {
@@ -111,7 +115,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 		},
 		currentSnapshot,
 	);
-	return { component, controls, manager, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
+	return { component, controls, ctx, manager, notifications, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
 }
 
 test("agent filtering preserves fields, input order, current-tab scope, selection, and fresh snapshots", async () => {
@@ -355,6 +359,99 @@ test("Create & Run displays a provider failure instead of reporting success", as
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.match(ui.render(100).join("\n"), /HTTP 401/);
 		assert.doesNotMatch(ui.render(100).join("\n"), /Created /);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+function startBackgroundCreate(state: ReturnType<typeof setup>) {
+	const run = Promise.withResolvers<any>();
+	const requests: any[] = [];
+	state.manager.create = ((request: any) => {
+		requests.push(request);
+		state.snapshot.agents.unshift({
+			...structuredClone(state.snapshot.agents[0]),
+			instance: { ...state.snapshot.agents[0]!.instance, agentId: "agt_new", alias: request.alias },
+			linkedAliases: [request.alias],
+			phase: "running",
+		});
+		request.onUpdate?.({ instance: state.snapshot.agents[0]!.instance, run: { output: "(starting...)" } });
+		return run.promise;
+	}) as typeof state.manager.create;
+	const ui = state.component;
+	ui.handleInput("n");
+	for (let index = 0; index < 5; index++) ui.handleInput("\u001b[B");
+	ui.handleInput("\r");
+	ui.handleInput("review");
+	ui.handleInput("\r");
+	ui.handleInput("\u001b[B");
+	ui.handleInput("\u001b[B");
+	ui.handleInput("\r");
+	return { run, requests };
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("Create & Run returns control while the first task runs and notifies when it finishes", async () => {
+	const state = setup();
+	const { run, requests } = startBackgroundCreate(state);
+	try {
+		await tick();
+		const screen = state.component.render(100).join("\n");
+		assert.match(screen, new RegExp(`Started ${requests[0].alias}`));
+		assert.match(screen, new RegExp(`${requests[0].alias}.*RUNNING`));
+		assert.deepEqual(state.notifications, []);
+		state.component.handleInput("\u001b");
+		assert.equal(state.closed, true, "popup is not locked by the first run");
+
+		run.resolve({ instance: state.snapshot.agents[0].instance, run: { output: "All\ngood" } });
+		await tick();
+		assert.deepEqual(state.notifications, [{ message: `Agent ${requests[0].alias} finished its first task: All good`, type: "info" }]);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("closing the popup does not abort the background first run", async () => {
+	const state = setup();
+	const { run, requests } = startBackgroundCreate(state);
+	await tick();
+	state.component.handleInput("\u001b");
+	state.component.dispose();
+	assert.equal(requests[0].signal, undefined);
+	run.resolve({ instance: state.snapshot.agents[0].instance, run: { output: "" } });
+	await tick();
+	assert.deepEqual(state.notifications, [{ message: `Agent ${requests[0].alias} finished its first task`, type: "info" }]);
+});
+
+test("a throwing notify after a background first run cannot cause an unhandled rejection", async () => {
+	const state = setup();
+	const { run, requests } = startBackgroundCreate(state);
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		await tick();
+		state.ctx.ui.notify = () => { throw new Error("stale ctx"); };
+		run.reject(new Error("HTTP 401"));
+		await tick();
+		await tick();
+		assert.deepEqual(unhandled, []);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+		state.component.dispose();
+	}
+	assert.equal(requests.length, 1);
+});
+
+test("a failed background first run notifies the error message", async () => {
+	const state = setup();
+	const { run, requests } = startBackgroundCreate(state);
+	try {
+		await tick();
+		run.reject(new Error("HTTP 401"));
+		await tick();
+		assert.deepEqual(state.notifications, [{ message: `Agent ${requests[0].alias} failed its first task: HTTP 401`, type: "error" }]);
 	} finally {
 		state.component.dispose();
 	}

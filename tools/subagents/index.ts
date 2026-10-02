@@ -358,7 +358,6 @@ export * from "./identity";
 export * from "./agent-manager";
 export * from "./instance-store";
 export * from "./interaction";
-export * from "./model-picker";
 export * from "./models";
 export * from "./rpc-transport";
 export * from "./rpc-worker";

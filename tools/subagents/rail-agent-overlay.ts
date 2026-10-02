@@ -777,11 +777,16 @@ export class RailAgentOverlayComponent implements Focusable {
 				(result) => {
 					resolve();
 					const answer = compact(result.run.output);
+					this.notice = `${request.alias} finished its first task`;
+					this.renderSoon();
 					this.ctx.ui.notify(`Agent ${request.alias} finished its first task${answer ? `: ${answer}` : ""}`, "info");
 				},
 				(error) => {
 					if (!started) return reject(error);
-					this.ctx.ui.notify(`Agent ${request.alias} failed its first task: ${error instanceof Error ? error.message : String(error)}`, "error");
+					const message = `Agent ${request.alias} failed its first task: ${error instanceof Error ? error.message : String(error)}`;
+					this.notice = message;
+					this.renderSoon();
+					this.ctx.ui.notify(message, "error");
 				},
 			).catch(() => undefined); // notify throws once the session context is stale
 		});

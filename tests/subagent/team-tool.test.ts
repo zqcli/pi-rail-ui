@@ -377,6 +377,11 @@ test("prepare takes review {by, everyMinutes}, prints it, and the final text sho
 	await assert.rejects(tool.execute("bad", { ...prepareArgs, review: { by: "lead", everyMinutes: 30 } }, undefined, undefined, context()), /review\.by must name a member other than the lead/u);
 	await assert.rejects(tool.execute("bad", { ...prepareArgs, review: { by: "worker", everyMinutes: 0 } }, undefined, undefined, context()), /review\.everyMinutes must be an integer from 1 to 1440/u);
 	assert.throws(() => tool.prepareArguments({ action: "launch", teamId: "any", review: { by: "worker", everyMinutes: 30 } }), /does not accept.*review/u);
+	const withFocus = setup();
+	const focused = await withFocus.tool.execute("prepare", { ...prepareArgs, review: { by: "worker", everyMinutes: 30, focus: "Check the acceptance criteria." } }, undefined, undefined, context());
+	assert.match(focused.content[0].text, /^Review: worker every 30 min · focus: Check the acceptance criteria\.$/mu);
+	assert.equal(withFocus.host.runtime.reviewSchedule(focused.details.view.teamId)?.focus, "Check the acceptance criteria.");
+	assert.match(tool.promptGuidelines.join("\n"), /brief\.goal: one or two sentences; put details in acceptanceCriteria and constraints\./u);
 	assert.match(tool.promptGuidelines.join("\n"), /set review \{by, everyMinutes\} naming a member whose roleDescription covers progress review/u);
 
 	const { host, tool: second } = setup();

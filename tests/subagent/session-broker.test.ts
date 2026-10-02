@@ -23,6 +23,7 @@ import {
 import type { RailModelRef } from "../../tools/subagents/models";
 import { RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 import type { BindingV2 } from "../../tools/subagents/team-protocol";
+import { loadoutFor } from "../fixtures/team-loadout";
 
 // createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
 let isolatedAgentDir = "";
@@ -242,9 +243,9 @@ test("Team v2 open reserves one alias across startup and competing opens cannot 
 		return worker;
 	} });
 	try {
-		const opening = broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		const opening = broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") });
 		await started.promise;
-		await assert.rejects(broker.openTeamMember({ binding: { ...teamBinding("member-a"), teamId: "team-other" }, model: reviewerModel(), cwd: root }), /already owned/u);
+		await assert.rejects(broker.openTeamMember({ binding: { ...teamBinding("member-a"), teamId: "team-other" }, model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") }), /already owned/u);
 		await assert.rejects(broker.dispatch({ model: reviewerModel(), alias: "member-a", task: "intrude" }), /alias already exists/u);
 		release.resolve();
 		const handle = await opening;
@@ -272,7 +273,7 @@ test("Team v2 startup cancelled by broker shutdown retains the persistent sessio
 	};
 	const broker = new SessionBroker({ store, roster, defaultCwd: root, workerFactory: async () => worker });
 	try {
-		const opening = broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		const opening = broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") });
 		await openingProtocol.promise;
 		await broker.shutdown();
 		releaseProtocol.resolve();
@@ -301,7 +302,7 @@ test("Team v2 close preserves descriptor and ownership until an exit timeout's r
 		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
 	} });
 	try {
-		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") });
 		await assert.rejects(handle.close(), /not reaped/u);
 		assert.ok(await store.get(handle.instance.agentId), "uncertain close keeps the descriptor");
 		assert.equal(roster.resolve("member-a"), handle.instance.agentId, "uncertain close keeps the persistent alias");
@@ -335,7 +336,7 @@ test("failed Team v2 binding keeps ownership until process exit, then permits an
 		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
 	} });
 	try {
-		await assert.rejects(broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root }), /bind rejected/u);
+		await assert.rejects(broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") }), /bind rejected/u);
 		const saved = (await store.list()).find((instance) => instance.alias === "member-a")!;
 		assert.ok(saved, "failed binding never deletes the persistent descriptor");
 		await assert.rejects(broker.dispatch({ target: "member-a", task: "must wait for native exit" }), /active team operation/u);
@@ -363,7 +364,7 @@ test("Team v2 terminated member with a confirmed exit releases ownership once an
 		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
 	} });
 	try {
-		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") });
 		await assert.rejects(broker.dispatch({ target: "member-a", task: "must not interleave" }), /active team operation/u);
 		const first = await handle.close();
 		assert.deepEqual(first, { protocolError: "Team v2 connection terminated" }, "released, but never reported as a clean close");
@@ -394,7 +395,7 @@ test("Team v2 unclean unbind with an unknown exit keeps ownership; a late exit r
 		return new FakeWorker(saved!.sessionId, spec.sessionPath!);
 	} });
 	try {
-		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root });
+		const handle = await broker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") });
 		await assert.rejects(handle.close(), /exit unknown/u);
 		await assert.rejects(broker.dispatch({ target: "member-a", task: "must not reopen" }), /active team operation/u);
 		exited.resolve();

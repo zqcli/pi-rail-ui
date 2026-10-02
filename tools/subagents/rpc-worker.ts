@@ -29,7 +29,7 @@ import type {
 	WorkerControlRequest,
 	WorkerStartSpec,
 } from "./session-broker";
-import type { BindingV2 } from "./team-protocol";
+import type { BindingV2, MemberLoadoutRequest } from "./team-protocol";
 import { isSharedImmediateEvent, RunResultCollector, assistantText } from "./run-result";
 
 export interface RpcEvent {
@@ -430,16 +430,16 @@ export class RpcSessionWorker implements SessionWorker {
 		await this.transport.stop();
 	}
 
-	async openTeamMemberV2(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void, tools: string[] | null = null): Promise<TeamMemberProtocolSession> {
+	async openTeamMemberV2(binding: BindingV2, loadout: MemberLoadoutRequest, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession> {
 		if (this.unusable) throw new ContextProtocolError("Subagent RPC worker is not reusable after a context protocol failure");
 		if (this.teamSession || this.runInFlight || this.modelChangeInFlight) throw new ContextProtocolError("Team lifetime bind requires an idle, unbound RPC worker");
 		const state = await this.state();
 		this.assertModelState(state);
 		if (state.isStreaming === true || state.isCompacting === true) throw new ContextProtocolError("Team lifetime bind requires an idle native session");
-		const connection = new TeamRpcV2Connection(this.transport, binding, (error) => {
+		const connection = new TeamRpcV2Connection(this.transport, binding, loadout, (error) => {
 			this.unusable = true;
 			onFailure(error);
-		}, onActivity, tools);
+		}, onActivity);
 		await connection.bind();
 		let session!: TeamMemberProtocolSession;
 		session = {

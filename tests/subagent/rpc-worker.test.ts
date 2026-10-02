@@ -21,6 +21,7 @@ import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools
 import { gptCompactionExtensionPath } from "../../tools/gpt-compaction/extension";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
+import { loadoutFor } from "../fixtures/team-loadout";
 
 // createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
 let isolatedAgentDir = "";
@@ -290,7 +291,7 @@ test("Team v2 restores the pre-activation context window after native compaction
 	runtime.launch(prepared.teamId);
 	const activation = runtime.takeNextActivation(prepared.teamId)!;
 	const worker = await RpcSessionWorker.connect(spec("new"), transport);
-	const session = await worker.openTeamMemberV2(activation.binding, () => undefined);
+	const session = await worker.openTeamMemberV2(activation.binding, loadoutFor(activation.binding.memberId), () => undefined);
 	let completion: string | undefined;
 	await session.runActivation(activation, async () => ({ kind: "ack" }), 64000, (native) => { completion = native.status; });
 	assert.equal(completion, "success");

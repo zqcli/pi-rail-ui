@@ -17,10 +17,10 @@ const work: WorkRef = { workId: "root", revision: 1 };
 function input(): ActivationInput {
 	return {
 		version: 2, teamId: "team", deliveryId: "delivery", member: { id: "owner", lead: false, roleDescription: "Do the work." },
-		brief: { goal: "Keep all accepted work." },
+		goal: "Keep all accepted work.",
 		roster: [
-			{ id: "lead", lead: true, lifecycle: "open", rolePreview: "Manage." },
-			{ id: "owner", lifecycle: "open", rolePreview: "Work." },
+			{ id: "lead", lead: true, lifecycle: "open" },
+			{ id: "owner", lifecycle: "open" },
 		],
 		scope: { kind: "work", work, task: "Required task", requester: "lead", rootId: "root", depth: 0, inputRefs: [], waitingFor: [] },
 		outcomes: [], omittedOutcomes: 0, ownedChildren: [],
@@ -129,14 +129,14 @@ test("activation projection budgets combined errors and previews, without droppi
 	const original = input();
 	original.scope = { ...original.scope, kind: "work", work, requester: "lead", rootId: "root", depth: 0, inputRefs: [], waitingFor: [],
 		task: "T".repeat(8192), previous: { revision: 1, state: "failed", error: { code: "HOST_FAILURE", message: "x".repeat(6000), outcomeUnknown: true } } };
-	original.brief = { goal: "G".repeat(8192), constraints: ["C".repeat(8192), "D".repeat(8192)] };
+	original.goal = "G".repeat(8192);
 	original.ownedChildren = Array.from({ length: 65 }, (_, i) => ({ work: { workId: `child-${i}`, revision: 1 }, state: "failed" }));
 	original.outcomes = original.ownedChildren.slice(0, 32).map(({ work }) => ({ work, state: "failed",
 		error: { code: "NATIVE_FAILURE", message: "X".repeat(6000), outcomeUnknown: true }, preview: { status: "failed", summary: "failure" } }));
 	const projected = projectActivationInput(original);
 	assert.ok(jsonBytes(projected) <= TEAM_MAX_ACTIVATION_INPUT_BYTES);
 	assert.equal(projected.scope.kind === "work" && projected.scope.task, "T".repeat(8192));
-	assert.deepEqual(projected.brief, original.brief);
+	assert.equal(projected.goal, original.goal);
 	assert.ok(projected.outcomes.length > 0 && projected.omittedOutcomes > 0);
 	assert.equal(projected.outcomes.length + projected.omittedOutcomes, original.outcomes.length);
 	assert.equal(projected.ownedChildren.length + projected.ownedChildrenOmitted!, 65);

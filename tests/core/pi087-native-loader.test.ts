@@ -153,7 +153,7 @@ async function runTeamHelperProbe(
 	const unboundPath = join(cases.root, `team-helper-${label}-unbound.json`);
 	const binding = { version: 2, teamId: "native-loader-team", memberId: "B1", epoch: "native-loader-epoch" };
 	const command = (operation: "bind" | "unbind", commandId: string) => `/${TEAM_COMMAND} ${JSON.stringify({
-		version: 2, commandId, operation, binding, ...(operation === "bind" ? { loadout: { tools: null, teamTool: true } } : {}),
+		version: 2, commandId, operation, binding, ...(operation === "bind" ? { loadout: { tools: null, teamTool: true, brief: { goal: "Loader goal." }, roster: [{ id: "B1", rolePreview: "Loader member." }] } } : {}),
 	})}`;
 	const result = await runRpcSequence(process.execPath, [cli, ...extensionArgs(helperPath, observerPath)], {
 		HOME: cases.home,

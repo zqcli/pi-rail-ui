@@ -44,7 +44,9 @@ const TEAM_MAX_TIMELINE = 1000;
 /** Once the timeline is full its first entries stay (a long run keeps its start); the oldest after them go. */
 export const TEAM_TIMELINE_HEAD = 30;
 /** Names the exact work, because a member's session outlives its works and a model may answer an earlier one. */
-const workNotice = (work: WorkRef): string => prompt("team", "work_notice", { work: workRefKey(work) });
+/** Events that only advise the lead: they never block close_team and are marked processed when the Team closes. */
+const ADVISORY_EVENTS: readonly string[] = ["REVIEW_READY", "TEAM_QUIESCENT"];
+const workNotice = (work: WorkRef): string => `${prompt("team", "work_notice", { work: workRefKey(work) })} ${prompt("team", "brief_pointer")}`;
 
 export interface RuntimeActivation {
 	binding: BindingV2;
@@ -831,7 +833,7 @@ export class TeamRuntime {
 	}
 
 	/** The current periodic-review schedule (nextAt: when the timer fires next, null while it is not running); undefined without one. */
-	reviewSchedule(teamId: string): { by: string; everyMinutes: number; nextAt: number | null } | undefined {
+	reviewSchedule(teamId: string): (TeamReviewPlan & { nextAt: number | null }) | undefined {
 		const { schedule, nextAt } = this.team(teamId).review;
 		return schedule ? { ...schedule, nextAt } : undefined;
 	}
@@ -847,7 +849,7 @@ export class TeamRuntime {
 		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
 		const by = value?.by ?? team.review.schedule?.by;
 		if (value && !by) fail("INVALID_ARGUMENT", "Name the reviewer: review every <N> by <alias>");
-		const schedule = value ? normalizeReviewPlan({ by, everyMinutes: value.everyMinutes }, "review", [...team.members.keys()], team.lead) : null;
+		const schedule = value ? normalizeReviewPlan({ by, everyMinutes: value.everyMinutes, focus: team.review.schedule?.focus }, "review", [...team.members.keys()], team.lead) : null;
 		if (canonicalJson(schedule) === canonicalJson(team.review.schedule)) return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle };
 		this.writeJournal(team, { version: 2, kind: "review_schedule", teamId, at: this.timestamp(), review: copy(schedule) });
 		team.review.schedule = schedule;
@@ -984,6 +986,19 @@ export class TeamRuntime {
 		});
 		const incidents = team.incidents.filter((incident) => incident.state === "open");
 		const previous = team.review.records.at(-1);
+		const finishedAt = Math.max(0, ...records.filter((record) => isTerminalWorkState(currentVersion(record).state)).map((record) => currentVersion(record).updatedAt));
+		let stale = fresh.length === 0 ? 1 : 0;
+		if (stale) for (const record of team.review.records.toReversed()) if (record.snapshot.finishedSinceLast === 0) stale++; else break;
+		const held = records.flatMap((record) => {
+			const version = currentVersion(record);
+			const incident = version.hold && team.incidents.find((item) => item.id === version.hold!.incidentId);
+			return incident ? [`- ${workRefKey({ workId: record.id, revision: record.currentRevision })} ${record.assignee} held ${minutes(now - incident.createdAt)} (${version.hold!.reason}): ${previewText(incident.message, 120)}`] : [];
+		});
+		const signals = prompt("team", "review_signals", {
+			taken: new Date().toISOString(), lead: team.members.get(team.lead)!.activity === "idle" ? "idle" : "active", queued: String(facts.pendingEvents),
+			last_finished: finishedAt ? `${minutes(now - finishedAt)} ago` : "none yet", stale: String(stale),
+			held: held.length ? `${held.slice(0, 8).join("\n")}${held.length > 8 ? `\n+${held.length - 8} more` : ""}` : "none",
+		});
 		const timeline = formatTimeline(facts.timeline.filter((entry) => entry.at > team.review.wall).slice(-25), 0, facts.timeline[0]?.at ?? 0);
 		return [
 			`Team progress review · elapsed ${minutes(snapshot.elapsedMs)}`,
@@ -993,10 +1008,12 @@ export class TeamRuntime {
 			`Finished since the last review (${fresh.length}):`, ...fresh.slice(0, 12).map(outcome), ...(fresh.length > 12 ? [`+${fresh.length - 12} more`] : []),
 			"Members:", ...members,
 			`Open incidents: ${incidents.length ? "" : "none"}${incidents.slice(0, 5).map((incident) => `\n- ${incident.id} [${incident.code}]${incident.work ? ` ${workRefKey(incident.work)}` : ""}: ${previewText(incident.message, 160)}`).join("")}`,
-			`Budget: ${snapshot.budget.map(({ counter, used, limit }) => `${counter} ${used}/${limit >= TEAM_BUDGET_UNLIMITED ? "unlimited" : limit}`).join(" · ")}`,
+			`Budget: ${snapshot.budget.map(({ counter, used, limit }) => `${counter} ${limit >= TEAM_BUDGET_UNLIMITED ? `${used} (unlimited)` : `${Math.round(100 * used / limit)}% (${used}/${limit})`}`).join(" · ")}`,
+			signals,
 			`Previous review: ${previous ? `${previous.verdict?.replace("_", " ").toUpperCase() ?? "no verdict"} — ${previewText(previous.summary, 400)}` : "none"}`,
 			"Timeline since the last review (m:ss from launch):", ...timeline.map((line) => previewText(line, 200)),
 			"", prompt("team", "review_instructions"),
+			...(team.review.schedule?.focus ? ["", prompt("team", "review_focus", { focus: team.review.schedule.focus })] : []),
 		].join("\n");
 	}
 
@@ -2073,7 +2090,7 @@ export class TeamRuntime {
 		const { roots, blockers } = this.rootObligations(team);
 		if (roots.length && !blockers.some((blocker) => blocker.kind === "root_work")) {
 			const unreviewed = blockers.filter((blocker) => blocker.kind === "root_review").length;
-			return unreviewed ? `Lead review of ${unreviewed} result${plural(unreviewed)}` : "Lead to close the Team";
+			return unreviewed ? `Lead review of ${unreviewed} result${plural(unreviewed)}` : "Lead: all roots accepted; decide the next step or close";
 		}
 		const running = [...team.members.values()].filter((member) => member.activity !== "idle" && !this.isReview(team, member.currentWork)).map((member) => member.id);
 		// Members that are not running: what each waits on, or (a hold outranks a wait) why its work is held.
@@ -2577,7 +2594,7 @@ export class TeamRuntime {
 		for (const delivery of team.deliveries.values()) if (delivery.state !== "delivered" && delivery.state !== "cancelled" && delivery.activationId !== active.scope.activationId && !this.isReview(team, delivery.work)) {
 			blockers.push({ kind: "delivery", id: delivery.memberId, reason: "required input is in flight" });
 		}
-		for (const event of team.events) if (!event.processed && event.kind !== "TEAM_QUIESCENT" && event.batchId !== active.scope.eventBatchId) {
+		for (const event of team.events) if (!event.processed && !ADVISORY_EVENTS.includes(event.kind) && event.batchId !== active.scope.eventBatchId) {
 			blockers.push({ kind: "team_event", id: event.id, reason: "an unprocessed Team event is outside the closing activation batch; end this activation with yield to receive it, then close" });
 		}
 		// An exhausted-budget notice that holds no work is not an unresolved obligation; held work blocks on its own.
@@ -2637,7 +2654,7 @@ export class TeamRuntime {
 		active.intent = { kind: "close_team", closeId, toolCallId };
 		lead.activity = "settling";
 		this.consumeBatch(team, active.scope.eventBatchId);
-		for (const event of team.events) if (event.kind === "TEAM_QUIESCENT" && !event.processed) {
+		for (const event of team.events) if (ADVISORY_EVENTS.includes(event.kind) && !event.processed) {
 			event.processed = true;
 			delete event.batchId;
 		}
@@ -2766,10 +2783,10 @@ export class TeamRuntime {
 		const result: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
 			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription },
-			brief: copy(team.plan.brief),
+			goal: team.plan.brief.goal,
 			roster: this.roster(team),
 			scope: copy(scope), outcomes, omittedOutcomes: 0, ...(childIssues.length ? { childIssues: copy(childIssues) } : {}),
-			ownedChildren, budget, notice: scope.kind === "work" ? workNotice(scope.work) : prompt("team", "events_notice"),
+			ownedChildren, budget, notice: scope.kind === "work" ? workNotice(scope.work) : `${prompt("team", "events_notice")} ${prompt("team", "brief_pointer")}`,
 		};
 		const projected = projectActivationInput(result);
 		if (projected.childIssues) projected.notice += ` ${prompt("team", "child_issue_notice")}`;
@@ -3019,7 +3036,8 @@ export class TeamRuntime {
 		version.updatedAt = committed.committedAt;
 		if (record.kind === "review") {
 			this.recordReview(team, member, ref, resultRef, result);
-			this.addEvent(team, { key: `review:${resultRef}`, kind: "REVIEW_READY", work: ref, resultRef,
+			// An ON TRACK review is only recorded; anything else (a risk, no verdict, a failed review) reaches the lead.
+			if (reviewVerdict(result.summary) !== "on_track" || result.status === "failed") this.addEvent(team, { key: `review:${resultRef}`, kind: "REVIEW_READY", work: ref, resultRef,
 				message: prompt("team", "event_review_ready", { work: workRefKey(ref), member: member.id, result_ref: resultRef, result: formatWorkResult(result) }) });
 		} else if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY",
 			message: prompt("team", "event_root_result_ready", { work: workRefKey(ref), status: result.status, result_ref: resultRef, member: member.id, result: formatWorkResult(result) }), work: ref, resultRef });
@@ -3560,13 +3578,13 @@ export class TeamRuntime {
 
 	private roster(team: TeamState): ActivationInput["roster"] {
 		return [...team.members.values()].map((item) => ({ id: item.id, ...(item.id === team.lead ? { lead: true as const } : {}),
-			lifecycle: item.lifecycle, rolePreview: previewText(item.roleDescription, 512) }));
+			lifecycle: item.lifecycle }));
 	}
 
 	private previewInput(team: TeamState, member: RuntimeMember, deliveryId: string, scope: WorkScope): ActivationInput {
 		const input: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
-			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription }, brief: copy(team.plan.brief),
+			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription }, goal: team.plan.brief.goal,
 			roster: this.roster(team),
 			scope, outcomes: [], omittedOutcomes: 0, ownedChildren: [],
 			// Size check only: the largest possible budget summary.

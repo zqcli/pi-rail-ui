@@ -3,7 +3,7 @@ import type { RpcEvent, RpcTransport } from "./rpc-worker";
 import {
 	TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_CACHE, TEAM_COMMAND_DESCRIPTION, TEAM_MAX_FRAME_BYTES,
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_PENDING_OPERATIONS, TEAM_PRIVATE_ENTRY_TYPE,
-	type BindingV2, type ChildRequestFrame, type ParentCommand, type PrivateReply, type TeamErrorCode,
+	type BindingV2, type ChildRequestFrame, type MemberLoadoutRequest, type ParentCommand, type PrivateReply, type TeamErrorCode,
 } from "./team-protocol";
 import type { NativeCompletion, RuntimeActivation } from "./team-runtime";
 import { canonicalJson, jsonBytes, parseChildFrame, parseParentCommand, sameBinding, sameScope } from "./team-codec";
@@ -177,11 +177,11 @@ export class TeamRpcV2Connection {
 	constructor(
 		private readonly transport: RpcTransport,
 		private readonly binding: BindingV2,
+		/** Base-tool allowlist (null keeps every base tool) and the static Team brief for the member's system prompt. */
+		private readonly loadout: MemberLoadoutRequest,
 		private readonly onFailure: (error: Error) => void,
 		/** Display-only observer of native events inside an activation; it never affects the protocol. */
 		private readonly onActivity?: (event: RpcEvent) => void,
-		/** Base-tool allowlist of this member; null keeps every base tool. */
-		private readonly tools: string[] | null = null,
 	) {}
 
 	get diagnosticCount(): number { return this.diagnostics; }
@@ -194,7 +194,7 @@ export class TeamRpcV2Connection {
 		try {
 			this.unsubscribe = this.transport.onEvent((event) => this.onEvent(event));
 			await this.command({ version: 2, commandId: randomUUID(), operation: "bind", binding: this.binding,
-				loadout: { tools: this.tools, teamTool: true } });
+				loadout: { ...this.loadout, teamTool: true } });
 			this.bound = true;
 		} catch (error) {
 			this.fail(error);

@@ -5,7 +5,7 @@ import { TeamMemberOpenError, type BrokeredTeamMemberHandle, type SessionBroker,
 import type { RpcEvent } from "./rpc-worker";
 import { assistantText, RunResultCollector } from "./run-result";
 import { shortWorkRef, workRefKey, type ChildRequestFrame, type PrivateReply, type TeamResult } from "./team-protocol";
-import { sameBinding, sameScope } from "./team-codec";
+import { previewText, sameBinding, sameScope } from "./team-codec";
 import { TeamRuntime, handlingText, type ActivationCompletionReason, type NativeCompletion, type RuntimeActivation, type TeamRuntimeExecutor } from "./team-runtime";
 import { TeamActivationFailure } from "./team-rpc-v2";
 import { SubagentTranscript, type SubagentTranscriptSnapshot } from "./transcript";
@@ -148,7 +148,8 @@ export class TeamMemberDriver {
 	}
 
 	async openMember(request: OpenTeamMemberRequest): Promise<BrokeredTeamMemberHandle> {
-		const planned = this.runtime.getTeam(request.teamId).members.find((member) => member.id === request.memberId);
+		const team = this.runtime.getTeam(request.teamId);
+		const planned = team.members.find((member) => member.id === request.memberId);
 		if (!planned) throw new Error(`Unknown Team member ${request.memberId}`);
 		if (planned.policy.model && planned.policy.model !== railModelReference(request.model)) {
 			throw new Error(`Team member ${request.memberId} model does not match its prepared policy`);
@@ -178,7 +179,8 @@ export class TeamMemberDriver {
 			...(cwd ? { cwd } : {}),
 			...(fastMode !== undefined ? { fastMode } : {}),
 			...(contextWindow !== undefined ? { contextWindow } : {}),
-			tools: planned.policy.tools ?? null,
+			loadout: { tools: planned.policy.tools ?? null, brief: team.brief,
+				roster: team.members.map((member) => ({ id: member.id, rolePreview: previewText(member.roleDescription, 512) })) },
 			onActivity: (event) => this.recordActivity(request.teamId, activity, event),
 		});
 		this.opening.set(id, opened);

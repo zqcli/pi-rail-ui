@@ -16,7 +16,7 @@ import {
 	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_EVENT_BATCH,
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
 	TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_MAX_RESULT_RECORDS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
-	TEAM_EVENT_KINDS, TEAM_MAX_REVIEW_MINUTES, REVIEW_VERDICTS,
+	TEAM_EVENT_KINDS, TEAM_MAX_REVIEW_MINUTES, TEAM_MAX_REVIEW_FOCUS_BYTES, REVIEW_VERDICTS,
 	type ActivationInput, type ActivationScope, type BindingV2, type ChildFrame, type ChildIssue, type GateDecision, type ParentCommand,
 	type Health, type HoldReason, type MemberActivity, type MemberLifecycle, type TeamEventView, type OutcomeView, type PauseState, type PrivateAction,
 	type PrivateReply, type ResourceState, type TeamAction, type TeamBrief, type TeamControl, type TeamError,
@@ -353,10 +353,11 @@ export function normalizeTeamBudgetPreset(value: unknown): TeamBudgetPreset {
 /** `by` must name a member other than the lead; the interval is whole minutes. */
 export function normalizeReviewPlan(value: unknown, field: string, roster: readonly string[], lead: string): TeamReviewPlan {
 	if (!isRecord(value)) return invalid(`${field} must be {by, everyMinutes} or null`);
-	onlyKeys(value, ["by", "everyMinutes"], field);
+	onlyKeys(value, ["by", "everyMinutes", "focus"], field);
 	const by = normalizeAlias(value["by"], `${field}.by`);
+	const focus = optionalText(value["focus"], `${field}.focus`, TEAM_MAX_REVIEW_FOCUS_BYTES)?.trim();
 	if (!roster.includes(by) || by === lead) return invalid(`${field}.by must name a member other than the lead`);
-	return { by, everyMinutes: safeInteger(value["everyMinutes"], `${field}.everyMinutes`, 1, TEAM_MAX_REVIEW_MINUTES) };
+	return { by, everyMinutes: safeInteger(value["everyMinutes"], `${field}.everyMinutes`, 1, TEAM_MAX_REVIEW_MINUTES), ...(focus ? { focus } : {}) };
 }
 
 export function normalizeTeamPlan(value: unknown): TeamPlan {
@@ -1280,7 +1281,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (!isRecord(value) || value["version"] !== TEAM_PROTOCOL_VERSION || value["teamId"] !== binding.teamId || value["deliveryId"] !== deliveryId) {
 		return protocol("activation input does not match its binding/delivery");
 	}
-	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "childIssues", "childIssuesOmitted", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
+	frameKeys(value, ["version", "teamId", "deliveryId", "member", "goal", "roster", "scope", "outcomes", "omittedOutcomes", "childIssues", "childIssuesOmitted", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
 	const member = value["member"];
 	if (!isRecord(member)) return protocol("activation input member is malformed");
 	frameKeys(member, ["id", "lead", "roleDescription"], "activation input member");
@@ -1291,16 +1292,15 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	const roster = array(value["roster"], "activation input.roster", TEAM_MAX_MEMBERS).map((raw, index) => {
 		const field = `activation input.roster[${index}]`;
 		if (!isRecord(raw)) return protocol(`${field} must be an object`);
-		frameKeys(raw, ["id", "lead", "lifecycle", "rolePreview"], field);
+		frameKeys(raw, ["id", "lead", "lifecycle"], field);
 		if (raw["lead"] !== undefined && raw["lead"] !== true) return protocol(`${field}.lead must be true when present`);
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(raw["lifecycle"]))) return protocol(`${field}.lifecycle is invalid`);
-		return { id: normalizeAlias(raw["id"], `${field}.id`), ...(raw["lead"] === true ? { lead: true as const } : {}), lifecycle: raw["lifecycle"] as MemberLifecycle,
-			rolePreview: text(raw["rolePreview"], `${field}.rolePreview`, TEAM_MAX_ROLE_BYTES) };
+		return { id: normalizeAlias(raw["id"], `${field}.id`), ...(raw["lead"] === true ? { lead: true as const } : {}), lifecycle: raw["lifecycle"] as MemberLifecycle };
 	});
 	const rosterIds = roster.map((item) => item.id);
 	if (!rosterIds.includes(binding.memberId) || new Set(rosterIds).size !== rosterIds.length || roster.filter((item) => item.lead).length !== 1
 		|| roster.find((item) => item.id === binding.memberId)?.lead !== (lead || undefined)) return protocol("activation input roster is inconsistent");
-	const brief = normalizeBrief(value["brief"], rosterIds);
+	const goal = text(value["goal"], "activation input.goal", TEAM_MAX_TEXT_ITEM_BYTES);
 	const rawScope = value["scope"];
 	if (!isRecord(rawScope)) return protocol("activation input scope is malformed");
 	let scope: ActivationInput["scope"];
@@ -1398,7 +1398,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 		toolCalls: safeInteger(rawBudget["toolCalls"], "activation input budget.toolCalls", 0),
 		activations: safeInteger(rawBudget["activations"], "activation input budget.activations", 0) };
 	const input: ActivationInput = { version: TEAM_PROTOCOL_VERSION, teamId: binding.teamId, deliveryId,
-		member: { id: binding.memberId, lead, roleDescription }, brief, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
+		member: { id: binding.memberId, lead, roleDescription }, goal, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
 		...(childIssues ? { childIssues } : {}), ...(childIssuesOmitted !== undefined ? { childIssuesOmitted } : {}),
 		...(ownedChildrenOmitted !== undefined ? { ownedChildrenOmitted } : {}),
 		notice: text(value["notice"], "activation input.notice", TEAM_MAX_NOTE_BYTES) };
@@ -1418,9 +1418,17 @@ function parseParentCommandInternal(value: unknown): ParentCommand {
 			frameKeys(value, ["version", "commandId", "operation", "binding", "loadout"], "bind");
 			const loadout = value["loadout"];
 			if (!isRecord(loadout) || loadout["teamTool"] !== true) return protocol("bind.loadout is invalid");
-			frameKeys(loadout, ["tools", "teamTool"], "bind.loadout");
+			frameKeys(loadout, ["tools", "teamTool", "brief", "roster"], "bind.loadout");
+			const roster = array(loadout["roster"], "bind.loadout.roster", TEAM_MAX_MEMBERS).map((raw, index) => {
+				const field = `bind.loadout.roster[${index}]`;
+				if (!isRecord(raw)) return protocol(`${field} must be an object`);
+				frameKeys(raw, ["id", "rolePreview"], field);
+				return { id: normalizeAlias(raw["id"], `${field}.id`), rolePreview: text(raw["rolePreview"], `${field}.rolePreview`, TEAM_MAX_ROLE_BYTES) };
+			});
+			if (!roster.some((item) => item.id === binding.memberId)) return protocol("bind.loadout.roster must include the bound member");
 			return { version: TEAM_PROTOCOL_VERSION, commandId, operation: "bind", binding,
-				loadout: { tools: loadout["tools"] === null ? null : toolNames(loadout["tools"], "bind.loadout.tools"), teamTool: true } };
+				loadout: { tools: loadout["tools"] === null ? null : toolNames(loadout["tools"], "bind.loadout.tools"), teamTool: true,
+					brief: normalizeBrief(loadout["brief"], roster.map((item) => item.id)), roster } };
 		}
 		case "activate": {
 			frameKeys(value, ["version", "commandId", "operation", "binding", "activation", "deliveryId", "input"], "activate");

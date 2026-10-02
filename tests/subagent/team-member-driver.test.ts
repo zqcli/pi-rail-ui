@@ -335,6 +335,9 @@ test("real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settl
 		const providerCalls = entries.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider");
 		const turnsByDelivery = new Map<string, number>();
 		for (const call of providerCalls) {
+			// The bind-time brief reaches every provider request as a <team_brief> section of Pi's own system prompt.
+			assert.match(call.data.systemPrompt, new RegExp(`<team_brief>\\nTeam member: ${memberId}\\.[\\s\\S]*### Goal\\nVerify same-session Team v2 activation and result settlement\\.[\\s\\S]*### Team roster\\n- lead: [\\s\\S]*</team_brief>`, "u"));
+			assert.match(call.data.systemPrompt, /You are an expert coding assistant/u, "Pi's default system prompt is kept, not replaced");
 			const input = call.data.messages.map((message: any) => {
 				if (message.role !== "user") return undefined;
 				const text = typeof message.content === "string" ? message.content : (message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");

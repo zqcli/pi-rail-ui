@@ -7,6 +7,7 @@ import type { BindingV2, ChildRequestFrame, ParentCommand, PrivateReply } from "
 import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 import { TeamActivationFailure, TeamRpcV2Connection } from "../../tools/subagents/team-rpc-v2";
 import { jsonBytes, jsonTextBytes, parseParentCommand, parseTeamReply, projectActivationInput } from "../../tools/subagents/team-codec";
+import { loadoutFor } from "../fixtures/team-loadout";
 
 const runtime = new TeamRuntime();
 const prepared = runtime.prepare({
@@ -158,7 +159,7 @@ function replyCount(transport: FakeTransport): number {
 
 async function startConnection(transport: FakeTransport, onRequest: (frame: ChildRequestFrame, intentId?: string) => Promise<PrivateReply>, onFailure: (error: Error) => void = () => undefined,
 	signal?: AbortSignal) {
-	const connection = new TeamRpcV2Connection(transport, binding, onFailure);
+	const connection = new TeamRpcV2Connection(transport, binding, loadoutFor(binding.memberId), onFailure);
 	const run = connection.sendActivation(activation(), onRequest, signal);
 	await transport.triggerStarted.promise;
 	return { connection, run };
@@ -261,7 +262,7 @@ test("parent Runtime revalidates business input independently, with no business 
 test("Team command application ACK still fails closed at the independent five-second timeout", { timeout: 10000 }, async () => {
 	const transport = new FakeTransport();
 	transport.ackCommands = false;
-	const connection = new TeamRpcV2Connection(transport, binding, () => undefined);
+	const connection = new TeamRpcV2Connection(transport, binding, loadoutFor(binding.memberId), () => undefined);
 	await assert.rejects(connection.bind(), /application ACK timed out/u);
 	assert.equal(transport.stopCalls, 1);
 });
@@ -499,7 +500,7 @@ test("a stop/exit failure propagates from send and close instead of reporting a 
 	const exit = Promise.withResolvers<void>();
 	transport.triggerFailure = new Error("native prompt rejected");
 	transport.stopFailure = new RpcProcessExitTimeoutError("native process exit unknown", exit.promise);
-	const connection = new TeamRpcV2Connection(transport, binding, () => undefined);
+	const connection = new TeamRpcV2Connection(transport, binding, loadoutFor(binding.memberId), () => undefined);
 	let caught: unknown;
 	try { await connection.sendActivation(activation(), async () => ({ kind: "ack" })); }
 	catch (error) { caught = error; }

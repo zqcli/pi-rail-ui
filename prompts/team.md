@@ -7,9 +7,10 @@ Run a Team: 2-9 members, all new persistent aliases with the same capabilities (
 ## subagent_team_guidelines
 
 - Run a Team with two subagent_team calls in consecutive messages: prepare with members (alias + roleDescription each), lead (the alias of one member), brief.goal and optional initialRequests to members other than the lead; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected results in full; use status afterwards for the timeline or results it names as truncated or unselected.
+- brief.goal: one or two sentences; put details in acceptanceCriteria and constraints. The goal is repeated in every activation; the rest of the brief is in each member's system prompt.
 - Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.
 - Leave budget null (long, sized for multi-hour runs); set unlimited only when the user asks for an open-ended or loop run.
-- For a long or open-ended run set review {by, everyMinutes} naming a member whose roleDescription covers progress review; it only advises the lead.
+- For a long or open-ended run set review {by, everyMinutes} naming a member whose roleDescription covers progress review; it only advises the lead, and only AT RISK, OFF TRACK or verdict-less reviews wake the lead. Optional review.focus (up to 1 KiB) adds your own guidance for the reviewer.
 - Role-only members are valid: they stay idle until they are assigned work. Give a member tools only to restrict its base tools (null = all); the lead gets the same tools as everyone else; a lead that should only coordinate can have tools []. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.
 - If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.
 
@@ -21,9 +22,48 @@ Team v2 work ledger. Actions: request creates owned work; reply stages the curre
 
 reply, yield, and close_team must be the only tool call in their finalized assistant batch.
 
-## member_system_prompt
+## team_brief
 
-Team member: {{member}}. The rail-team-activation custom message is authoritative for this activation. Use the team tool for Team operations. A successful reply, yield, or close_team ends this native activation; each end intent must be the sole tool call in the finalized assistant batch. Do not claim a result unless the runtime accepts the team reply.
+Team member: {{member}}. You are one member of a Team that coordinates through a shared work ledger. This section is the Team brief as of your start; it does not change.
+
+### Goal
+{{goal}}
+
+### Target
+{{target}}
+
+### Acceptance criteria
+{{acceptance}}
+
+### Constraints
+{{constraints}}
+
+### Your authorization
+{{authorization}}
+
+### Team roster
+{{roster}}
+
+### Rules
+- The rail-team-activation custom message decides what to do now. It also says whether you are the lead and the current lead and member states, which change during the run; the roster above does not.
+- Constraints and your authorization are hard limits. If they conflict with each other or with the task, yield attention to ask instead of choosing.
+- Use the team tool for Team operations. A successful reply, yield, or close_team ends this native activation; each end intent must be the sole tool call in the finalized assistant batch.
+- Do not claim a result unless the runtime accepts the team reply.
+
+## team_brief_none
+
+none
+
+## team_brief_authorization
+
+Allowed:
+{{allowed}}
+Forbidden:
+{{forbidden}}
+
+## brief_pointer
+
+Full Team brief: see <team_brief> in the system prompt (Acceptance criteria, Constraints, Your authorization).
 
 ## activation_trigger
 
@@ -39,11 +79,35 @@ A sub-task you requested is held (see childIssues): answer it with resume_work {
 
 ## events_notice
 
-Events activation: you are the Team's lead and there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). New results, failures and incidents start the next events activation automatically; do not poll status to wait. A WORK_HELD event is a member asking for input: answer with resume_work {workId, expectedRevision, incidentId, instruction} (for example naming the resultRef or WorkRef it needs), or revise_work/cancel_work. close_team checks every root itself and names any blocker, so no status check is needed before it. A REVIEW_READY event is advice from the reviewer: decide whether to act on it (request, revise_work, cancel_work, or nothing); it needs no reply.
+Events activation: you are the Team's lead and there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). New results, failures and incidents start the next events activation automatically; do not poll status to wait. A WORK_HELD event is a member asking for input: answer with resume_work {workId, expectedRevision, incidentId, instruction} (for example naming the resultRef or WorkRef it needs), or revise_work/cancel_work. close_team checks every root itself and names any blocker, so no status check is needed before it. A REVIEW_READY event is advice from the reviewer about a risk or an unclear review (an ON TRACK review sends none): decide whether to act on it (request, revise_work, cancel_work, or nothing); it needs no reply.
 
 ## review_instructions
 
-You are reviewing the Team's progress against the goal. You only advise: do not request or control work. Use status and read tools if needed. Reply with reply {result}: summary must start with 'ON TRACK:', 'AT RISK:' or 'OFF TRACK:' followed by a one-paragraph assessment; findings are risks and concrete recommendations that name members/WorkRefs; limitations what you could not verify.
+You are reviewing the Team's progress against the goal and the brief. You only advise: do not request or control work. Use status and read tools if needed, and judge from the snapshot above.
+
+Verdicts:
+- ON TRACK: the Team is progressing toward the goal; waits are planned or already being handled; no lead action is needed.
+- AT RISK: a concrete problem that will delay or fail the goal unless the lead acts, for example a hold unanswered for a long time, no work finished across two consecutive reviews while work exists, the same work failing or being revised repeatedly, budget above 80%, a result clearly not meeting the acceptance criteria, or a faulted member.
+- OFF TRACK: the work contradicts the brief's constraints, a key part of the goal is covered by no work, the critical path failed without recovery, or budget or deadline clearly cannot suffice.
+
+Not a risk: planned waits, a result just committed and waiting for the lead's next activation, and events queued for or being handled by the lead.
+
+AT RISK and OFF TRACK must cite concrete evidence (member, WorkRef, how long) and a recommendation for the lead. Without concrete evidence report ON TRACK.
+
+Reply with reply {result}: summary must start with 'ON TRACK:', 'AT RISK:' or 'OFF TRACK:' followed by a one-paragraph assessment; findings are risks and concrete recommendations that name members/WorkRefs; limitations what you could not verify. An ON TRACK review is only recorded; the lead is woken only for AT RISK, OFF TRACK or a review without a verdict.
+
+## review_focus
+
+Guidance from the Team's plan for this review, in addition to the criteria above:
+{{focus}}
+
+## review_signals
+
+Snapshot taken at {{taken}}. It may be older than your activation; status shows the current state.
+Lead: {{lead}} · Team events queued for the lead: {{queued}}
+Last finished non-review work: {{last_finished}} · consecutive reviews without finished work, including this one: {{stale}}
+Held works:
+{{held}}
 
 ## boot_outcome_rule
 

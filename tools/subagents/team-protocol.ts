@@ -211,10 +211,13 @@ export interface TeamReviewPlan { by: string; everyMinutes: number }
 export const REVIEW_VERDICTS = { "ON TRACK": "on_track", "AT RISK": "at_risk", "OFF TRACK": "off_track" } as const;
 export type TeamReviewVerdict = typeof REVIEW_VERDICTS[keyof typeof REVIEW_VERDICTS];
 /** The verdict a review's summary starts with, if any. */
+const VERDICT_PREFIX = /^\s*(ON TRACK|AT RISK|OFF TRACK):\s*/iu;
 export function reviewVerdict(summary: string): TeamReviewVerdict | undefined {
-	const match = /^\s*(ON TRACK|AT RISK|OFF TRACK):/iu.exec(summary);
+	const match = VERDICT_PREFIX.exec(summary);
 	return match ? REVIEW_VERDICTS[match[1]!.toUpperCase() as keyof typeof REVIEW_VERDICTS] : undefined;
 }
+/** The assessment without its verdict prefix, for lines that already show the verdict. */
+export const reviewAssessment = (summary: string): string => summary.replace(VERDICT_PREFIX, "");
 
 export interface TeamReviewRecord {
 	/** Team-local short id "review:xxxx". */

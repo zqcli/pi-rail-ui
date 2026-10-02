@@ -393,7 +393,7 @@ test("prepare takes review {by, everyMinutes}, prints it, and the final text sho
 	const text: string = (await second.execute("launch", { action: "launch", teamId }, undefined, undefined, context())).content[0].text;
 	assert.match(text, /^Deliverables \(1 roots · 0 accepted · 0 waived\):/mu);
 	assert.match(text, /^Process:\n- works 1 \(1 roots, 0 sub-tasks\) · results 1/mu);
-	assert.match(text, /^- Last review \d+:\d\d at risk: AT RISK: nobody has accepted the root\.$/mu);
+	assert.match(text, /^- Last review \d+:\d\d at risk: nobody has accepted the root\.$/mu);
 });
 
 /** Reserve the next activation and acknowledge its input, as a native member would. */

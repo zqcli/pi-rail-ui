@@ -2,7 +2,7 @@ import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earend
 import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import type { TeamSessionHost } from "./team-host";
 import type { TeamHistoryEntry } from "./team-history";
-import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, shortWorkRef, workRefKey, type TeamMemberView, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
+import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, shortWorkRef, workRefKey, type TeamMemberView, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
 
@@ -390,7 +390,7 @@ export class TeamOverlayComponent implements Focusable {
 		return newest.map((review) => {
 			const [label, color] = verdictOf(review);
 			const prefix = `${clock(review.snapshot.elapsedMs).padStart(clockWidth)}  ${column(review.by, byWidth)}  ${this.theme.fg(color, column(label, 10))}  `;
-			return { review: review.id, text: `${prefix}${compact(review.summary.replace(/^\s*(ON TRACK|AT RISK|OFF TRACK):\s*/iu, ""), width - visibleWidth(prefix))}` };
+			return { review: review.id, text: `${prefix}${compact(reviewAssessment(review.summary), width - visibleWidth(prefix))}` };
 		});
 	}
 

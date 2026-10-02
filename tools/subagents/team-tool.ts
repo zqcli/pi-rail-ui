@@ -9,7 +9,7 @@ import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
 	TEAM_BUDGET_UNLIMITED, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_REVIEW_MINUTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_MEMBERS, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_RESERVED_TOOLS,
-	workRefKey, type TeamBudgetLimits, type TeamBudgetPreset, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, sameWorkRef, shortWorkRef,
+	workRefKey, type TeamBudgetLimits, type TeamBudgetPreset, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, reviewAssessment, sameWorkRef, shortWorkRef,
 } from "./team-protocol";
 import { capped, clock, formatTimeline, type TeamRuntime } from "./team-runtime";
 
@@ -340,7 +340,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · tool errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
 		`- tokens input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 		`- Budget: ${budgetLimitsText(view.budget.limits)}`,
-		...(lastReview ? [`- Last review ${clock(lastReview.snapshot.elapsedMs)} ${lastReview.verdict?.replace("_", " ") ?? "no verdict"}: ${previewText(lastReview.summary, 160)}`] : []),
+		...(lastReview ? [`- Last review ${clock(lastReview.snapshot.elapsedMs)} ${lastReview.verdict?.replace("_", " ") ?? "no verdict"}: ${previewText(reviewAssessment(lastReview.summary), 160)}`] : []),
 		"Members:",
 		...view.members.map((member) => {
 			const activity = host.driver.memberActivity(result.teamId, member.id);
@@ -609,7 +609,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
 			"Leave budget null (long, sized for multi-hour runs); set unlimited only when the user asks for an open-ended or loop run.",
 			"For a long or open-ended run set review {by, everyMinutes} naming a member whose roleDescription covers progress review; it only advises the lead.",
-			"Role-only members are valid: they stay idle until they are assigned work. Give a member tools only to restrict its base tools (null = all); the lead gets the same tools as everyone else. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
+			"Role-only members are valid: they stay idle until they are assigned work. Give a member tools only to restrict its base tools (null = all); the lead gets the same tools as everyone else; a lead that should only coordinate can have tools []. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
 			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",
 		],
 		executionMode: "parallel",

@@ -459,7 +459,7 @@ test("launch panel says who a waiting member waits on, what a held one asks, and
 	assert.match(panel, /held · asks: "Which fixture should I use\?" · queued for lead/u);
 	assert.match(panel, /waiting on source \(held work /u);
 	assert.ok(render({ ...update.details, waitingFor: "Lead decisions on 3 questions" }).includes("{warning|Waiting for: Lead decisions on 3 questions}"));
-	for (const text of ["Lead review of 2 results", "Lead to close the Team", "source, writer (running) · review (waiting on source)"]) {
+	for (const text of ["Lead review of 2 results", "Lead: all roots accepted; decide the next step or close", "source, writer (running) · review (waiting on source)"]) {
 		assert.ok(render({ ...update.details, waitingFor: text }).includes(`{dim|Waiting for: ${text}}`), `${text} is not a warning`);
 	}
 	const { waitingFor: _omitted, ...withoutReason } = update.details;

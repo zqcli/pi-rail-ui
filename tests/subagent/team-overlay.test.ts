@@ -343,21 +343,22 @@ test("Tasks align WorkRef, route and state before preview, with full selected de
 	assert.match(ui.text(100), /Task: Check child 1/u);
 });
 
-test("Overview aligns labels and renders six-cell budget bars, warning/exhaustion, and unlimited", (t) => {
+test("Overview aligns labels and renders budget bars, small shares, warning/exhaustion, and unlimited", (t) => {
 	const { host, teamId } = fixture();
 	const budget = host.runtime.inspectBudget(teamId);
-	Object.assign(budget.used, { teamActivations: 50, leadActivations: 80, teamModelRequests: 100, teamToolCalls: 156, teamWorks: 7 });
-	Object.assign(budget.limits, { teamActivations: 100, leadActivations: 100, teamModelRequests: 100, teamToolCalls: 1_000_000_000, teamWorks: 2_000_000_000 });
+	Object.assign(budget.used, { teamActivations: 50, leadActivations: 80, teamModelRequests: 100, teamToolCalls: 156, teamWorks: 30 });
+	Object.assign(budget.limits, { teamActivations: 100, leadActivations: 100, teamModelRequests: 100, teamToolCalls: 1_000_000_000, teamWorks: 4096 });
 	host.runtime.inspectBudget = () => budget;
 	const tagged = taggingTheme();
 	const ui = overlay(host, { theme: tagged.theme });
 	t.after(() => ui.component.dispose());
 	const text = stripTerminalSequences(ui.text(100));
-	assert.match(text, /activations\s+███░░░  50\/100/u);
-	assert.ok(tagged.calls.some(({ color, text }) => color === "warning" && text.endsWith("80/100")));
-	assert.ok(tagged.calls.some(({ color, text }) => color === "error" && text === "██████  100/100"));
+	assert.match(text, /activations\s+█{10}░{10}  50\/100 · 50%/u);
+	assert.ok(tagged.calls.some(({ color, text }) => color === "warning" && text === "█".repeat(16)));
+	assert.ok(tagged.calls.some(({ color, text }) => color === "error" && text === "█".repeat(20)));
+	// 30 of 4096 is under one cell: still a visible sliver, not an empty bar.
+	assert.match(text, /works\s+▏░{19}  30\/4096 · 0%/u);
 	assert.match(text, /tool calls\s+156 · unlimited/u);
-	assert.match(text, /works\s+7 · unlimited/u);
 	assert.doesNotMatch(text.split("\n").find((line) => line.includes("156 · unlimited"))!, /[█░]/u);
 	for (const label of ["Goal", "Progress", "Waiting for", "Attention", "Budget", "Recent"]) {
 		const line = text.split("\n").find((line) => line.startsWith(`│ ${label}:`))!;

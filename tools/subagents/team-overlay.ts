@@ -283,13 +283,19 @@ export class TeamOverlayComponent implements Focusable {
 		return [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? ["c/r/g/m actions"] : ["read-only"]), ...(!this.detail ? ["esc close"] : [])].join(" · ");
 	}
 
-	private budget(teamId: string): Array<{ label: string; meter: string }> {
+	/** Budget meters: a bar with eighth-cell resolution, so even a small share of a large limit is visible. */
+	private budget(teamId: string, cells: number): Array<{ label: string; meter: string }> {
 		const { used, limits } = this.host.runtime.inspectBudget(teamId);
 		const counters = [["activations", "teamActivations"], ["lead", "leadActivations"], ["model requests", "teamModelRequests"], ["tool calls", "teamToolCalls"], ["works", "teamWorks"]] as const;
 		return counters.map(([label, key]) => {
 			const value = used[key], limit = limits[key];
-			const cells = limit ? Math.min(6, Math.floor(value / limit * 6)) : 6;
-			return { label, meter: limit >= TEAM_BUDGET_UNLIMITED ? `${value} · unlimited` : this.theme.fg(value >= limit ? "error" : value / limit >= 0.8 ? "warning" : "muted", `${"█".repeat(cells)}${"░".repeat(6 - cells)}  ${value}/${limit}`) };
+			if (limit >= TEAM_BUDGET_UNLIMITED) return { label, meter: `${value} · unlimited` };
+			const share = limit ? Math.min(1, value / limit) : 1;
+			const eighths = value > 0 ? Math.max(1, Math.round(share * cells * 8)) : 0;
+			const full = Math.floor(eighths / 8), partial = eighths % 8;
+			const bar = `${"█".repeat(full)}${partial ? "▏▎▍▌▋▊▉"[partial - 1] : ""}`;
+			const color = share >= 1 ? "error" : share >= 0.8 ? "warning" : "accent";
+			return { label, meter: `${this.theme.fg(color, bar)}${this.theme.fg("dim", "░".repeat(cells - full - (partial ? 1 : 0)))}  ${value}/${limit} · ${Math.floor(share * 100)}%` };
 		});
 	}
 
@@ -308,7 +314,7 @@ export class TeamOverlayComponent implements Focusable {
 		add("Attention", holds.length || incidents.length ? `${holds.length} open holds · ${incidents.length} open incidents` : "none", holds.length || incidents.length ? "warning" : undefined);
 		for (const hold of holds) add("", `${hold.assignee} · ${shortWorkRef(hold.work)} · ${oneLine(hold.message)}`, "warning");
 		for (const incident of incidents) if (!holds.some((hold) => hold.incidentId === incident.id)) add("", `${incident.code}: ${oneLine(incident.message)}`, "warning");
-		this.budget(team.teamId).forEach(({ label, meter }, index) => add(index ? "" : "Budget", `${label.padEnd(15)} ${meter}`));
+		this.budget(team.teamId, Math.max(6, Math.min(20, width - labelWidth - 16 - 22))).forEach(({ label, meter }, index) => add(index ? "" : "Budget", `${label.padEnd(15)} ${meter}`));
 		this.timeline(facts).slice(-5).forEach((row, index) => add(index ? "" : "Recent", row.text));
 		return lines.map((text) => ({ text }));
 	}
@@ -372,7 +378,7 @@ export class TeamOverlayComponent implements Focusable {
 		lines.push(schedule ? `Review: ${schedule.by} every ${schedule.everyMinutes} min${next}` : "Review: off");
 		if (team) {
 			const budget: string[] = [];
-			for (const { label, meter } of this.budget(team.teamId)) {
+			for (const { label, meter } of this.budget(team.teamId, 10)) {
 				const cell = `${label} ${meter}`, last = budget.at(-1);
 				if (last && visibleWidth(last) + 2 + visibleWidth(cell) <= width - 8) budget[budget.length - 1] = `${last}  ${cell}`;
 				else budget.push(cell);

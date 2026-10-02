@@ -108,6 +108,30 @@ test("host messages are confirmed and become explicitly attributed Manager event
 	assert.match(notifications.at(-1)?.text ?? "", /Lead message applied/u);
 });
 
+test("/rail-team lead hands the Team to another member after confirmation and completes member aliases", async () => {
+	const { host, teamId } = setup();
+	host.runtime.launch(teamId);
+	let command: any;
+	installTeamCommand({ registerCommand: (_name: string, value: any) => { command = value; } } as any, () => host);
+	assert.ok(command.getArgumentCompletions(`${teamId} le`).some((item: any) => item.label === "lead"));
+	assert.deepEqual(command.getArgumentCompletions(`${teamId} lead `).map((item: any) => item.label), ["worker"], "only members other than the lead");
+
+	const declined = commandContext({ confirmation: false });
+	await runTeamCommand(host, `${teamId} lead worker`, declined.ctx);
+	assert.equal(host.runtime.getTeam(teamId).lead, "lead");
+
+	const { ctx, notifications, confirmations } = commandContext();
+	await runTeamCommand(host, `${teamId} lead worker Rotating the lead`, ctx);
+	assert.match(confirmations[0]!.title, /Make worker the lead/u);
+	assert.equal(host.runtime.getTeam(teamId).lead, "worker");
+	assert.match(notifications.at(-1)?.text ?? "", /worker is now the lead/u);
+	const events = host.runtime.takeNextActivation(teamId)!;
+	assert.equal(events.binding.memberId, "worker");
+	assert.ok(events.input.scope.kind === "events" && events.input.scope.events.some((event) => event.message === "Host made you the Team lead: Rotating the lead"));
+	await assert.rejects(runTeamCommand(host, `${teamId} lead`, ctx), /requires a member alias/u);
+	await assert.rejects(runTeamCommand(host, `${teamId} lead lead`, ctx), /Team events/u, "refused while worker handles events");
+});
+
 test("cancel of a prepared Team is explicitly confirmed and closes resources without a provider", async () => {
 	const { host, teamId } = setup([{ to: "worker", task: "never started" }]);
 	const noUi = commandContext({ hasUI: false });

@@ -106,6 +106,14 @@ function applyJournalRecord(
 			ended.add(teamId);
 			return true;
 		}
+		case "handover": {
+			onlyKeys(data, ["version", "kind", "teamId", "at", "lead"]);
+			if (!current || current.version !== 2 || ended.has(teamId)) return false;
+			const lead = normalizeAlias(data["lead"], "journal.handover.lead");
+			if (!current.members.includes(lead)) return false;
+			current.lead = lead;
+			return true;
+		}
 		case "result": {
 			onlyKeys(data, ["version", "kind", "teamId", "at", "result"]);
 			if (!current || current.version !== 2 || ended.has(teamId)) return false;

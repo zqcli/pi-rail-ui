@@ -525,7 +525,10 @@ test("X10 regression: cancelling or superseding held work clears its scheduling 
 		assert.equal(runtime.nativeSettled(worker.binding, worker.scope.activationId, { status: "success", finalAssistantText: "" }).ok, true);
 		assert.equal(runtime.cleanupFinished(worker.binding, worker.scope.activationId, { ok: true }).ok, true);
 		assert.equal(runtime.getWork(teamId, child.receipt.work)!.current.hold?.reason, "protocol");
+		// The held child's requester (its waiting parent) cancels it; the lead revises the parent from a message event.
+		if (command === "revise_parent") runtime.messageLead(teamId, "revise the parent");
 		const manager = start(runtime, teamId);
+		assert.equal(manager.scope.kind, command === "cancel_work" ? "work" : "events");
 		const control = command === "cancel_work"
 			? { action: "control", command, workId: child.receipt.work.workId, expectedRevision: 1, reason: "drop the held child" }
 			: { action: "control", command: "revise_work", workId: parent.scope.work!.workId, expectedRevision: 1, task: "parent, revised" };

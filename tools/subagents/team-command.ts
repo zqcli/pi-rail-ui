@@ -7,8 +7,8 @@ import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, 
 import type { GrantPreview } from "./team-runtime";
 import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView } from "./team-tool";
 
-const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message"] as const;
-const USAGE = "Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>";
+const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead"] as const;
+const USAGE = "Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]";
 
 /**
  * `/rail-team`: the user-facing HostControl entry. It is a host command, never a model action:
@@ -16,7 +16,7 @@ const USAGE = "Usage: /rail-team [list] | /rail-team <teamId> status|results [pa
  */
 export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionHost | undefined): void {
 	pi.registerCommand("rail-team", {
-		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message)",
+		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead)",
 		getArgumentCompletions: (prefix) => {
 			const host = getHost();
 			if (!host) return null;
@@ -28,6 +28,11 @@ export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionH
 			if (parts.length === 2) {
 				const subs = SUBCOMMANDS.filter((sub) => sub.startsWith(parts[1] ?? ""));
 				return subs.length ? subs.map((sub) => ({ value: `${parts[0]} ${sub}`, label: sub })) : null;
+			}
+			if (parts.length === 3 && parts[1] === "lead") {
+				const team = host.runtime.listTeams().find((item) => item.teamId === parts[0]);
+				const aliases = (team?.members ?? []).filter((member) => member.id !== team!.lead && member.id.startsWith(parts[2] ?? "")).map((member) => member.id);
+				return aliases.length ? aliases.map((alias) => ({ value: `${parts[0]} lead ${alias}`, label: alias })) : null;
 			}
 			return null;
 		},
@@ -141,6 +146,16 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; held work cannot be resumed.`);
 			await resumeHold(host, teamId, text, ctx);
 			return;
+		case "lead": {
+			const [alias, ...reasonWords] = rest;
+			if (!alias) throw new Error("lead requires a member alias: /rail-team <teamId> lead <alias> [reason]");
+			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; the lead cannot be changed.`);
+			const reason = reasonWords.join(" ");
+			if (!await confirm(ctx, `Make ${alias} the lead of ${teamId}?`, `${liveTeam.lead} stays a member. Unprocessed Team events go to ${alias}; after a lead failure its incidents resolve and the other members resume.`)) return;
+			host.runtime.handoverLead(teamId, alias, reason || undefined);
+			ctx.ui.notify(`${alias} is now the lead of ${teamId}`, "info");
+			return;
+		}
 		case "grant":
 			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; budget cannot be granted.`);
 			await grantBudget(host, teamId, rest, ctx);

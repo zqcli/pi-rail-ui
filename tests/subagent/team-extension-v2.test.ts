@@ -98,7 +98,7 @@ test("Team v2 tool schema is a strict action union and bind gives every member b
 	const variants = (TEAM_TOOL_SCHEMA as any).anyOf;
 	assert.ok(Array.isArray(variants) && variants.length >= 20);
 	assert.ok(variants.every((variant: any) => variant.type === "object" && variant.additionalProperties === false));
-	assert.match(TEAM_TOOL_DESCRIPTION, /pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team/u);
+	assert.match(TEAM_TOOL_DESCRIPTION, /revise_work, cancel_work, resume_work and accept_result are for the work's requester or the lead.*pause_member, resume_member, close_member and close_team are lead only/u);
 
 	const member = harness("member");
 	assert.equal(member.handlers.get("cache_warming_decision")!(), undefined);

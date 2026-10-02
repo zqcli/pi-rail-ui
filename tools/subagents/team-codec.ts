@@ -8,6 +8,7 @@ import { isValidAgentAlias } from "./identity";
 import {
 	TEAM_ERROR_CODES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_ALIAS_LENGTH, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_FRAME_BYTES,
 	TEAM_MAX_ACTION_BYTES, TEAM_MAX_PUBLIC_CHILDREN, TEAM_MAX_OWNED_CHILD_PREVIEWS,
+	TEAM_MAX_CHILD_ISSUES, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES,
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_INPUT_REFS, TEAM_MAX_MEMBERS, TEAM_MAX_NOTE_BYTES,
 	TEAM_MAX_EVENT_MESSAGE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
@@ -15,7 +16,7 @@ import {
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
 	TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_MAX_RESULT_RECORDS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
 	TEAM_EVENT_KINDS,
-	type ActivationInput, type ActivationScope, type BindingV2, type ChildFrame, type GateDecision, type ParentCommand,
+	type ActivationInput, type ActivationScope, type BindingV2, type ChildFrame, type ChildIssue, type GateDecision, type ParentCommand,
 	type Health, type HoldReason, type MemberActivity, type MemberLifecycle, type TeamEventView, type OutcomeView, type PauseState, type PrivateAction,
 	type PrivateReply, type ResourceState, type TeamAction, type TeamBrief, type TeamControl, type TeamError,
 	type TeamBudgetLimits, type TeamErrorCode, type TeamEvidence, type TeamIncidentView, type TeamMemberPlan,
@@ -445,7 +446,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Work activations only: end this work activation while waiting for the listed immutable WorkRefs."),
 	schemaObject({ action: Type.Literal("yield"), attention: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
 		checkpoint: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Hold this work for explicit lead or host attention."),
+	}, "Hold this work and ask for input: the member that requested a sub-task answers it (with resume_work, revise_work or cancel_work); the lead or host answers a root."),
 	schemaObject({ action: Type.Literal("yield"), checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })) },
 		"Lead only: end this events activation. The lead never waits in-run; new Team events start its next activation automatically."),
 	schemaObject({ action: Type.Literal("status"), view: Type.Optional(Type.Literal("team")),
@@ -467,17 +468,17 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	controlAction("revise_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
 		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
-	}, "Lead only: replace the exact current work revision; preserve its workId and result history; its unfinished sub-tasks become superseded."),
+	}, "Work's requester or the lead: replace the exact current work revision; preserve its workId and result history; its unfinished sub-tasks become superseded."),
 	controlAction("cancel_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		reason: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Lead only: cancel the exact current work subtree; cleanup uncertainty remains visible."),
+	}, "Work's requester or the lead: cancel the exact current work subtree; cleanup uncertainty remains visible."),
 	controlAction("resume_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		incidentId: idSchema, instruction: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Lead only: explicitly resume a held work revision after addressing its incident."),
+	}, "Work's requester or the lead: explicitly resume a held work revision after addressing its incident."),
 	controlAction("accept_result", { work: workRefSchema,
 		disposition: Type.Union([Type.Literal("accepted"), Type.Literal("waived")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
-	}, "Lead only: explicitly accept a successful root or waive a terminal outcome with a reason."),
+	}, "Root's requester or the lead: explicitly accept a successful root or waive a terminal outcome with a reason."),
 	controlAction("close_member", { memberId: aliasSchema }, "Lead only: close an idle member with no unresolved obligations."),
 	controlAction("close_team", { resultRefs: Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
 		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
@@ -485,7 +486,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Lead only: close the Team after all roots and member resources are explicitly settled."),
 ]);
 
-export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control is lead-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.";
+export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control: revise_work, cancel_work, resume_work and accept_result are for the work's requester or the lead (never for your own current work); pause_member, resume_member, close_member and close_team are lead only. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.";
 
 const LEGACY_ACTIONS: Record<string, string> = {
 	send: "send was replaced by request {to, task}; a reply never creates a new request",
@@ -783,7 +784,7 @@ function parseTeamError(value: unknown): TeamError {
 
 function parseWorkVersion(value: unknown, field: string): WorkVersion {
 	if (!isRecord(value)) return protocol(`${field} must be a work version`);
-	frameKeys(value, ["revision", "task", "inputRefs", "state", "waitingFor", "observedOutcomes", "checkpoint", "resumeInstruction", "hold", "resultRef", "review", "error", "createdAt", "updatedAt"], field);
+	frameKeys(value, ["revision", "task", "inputRefs", "state", "waitingFor", "observedOutcomes", "childIssues", "checkpoint", "resumeInstruction", "hold", "resultRef", "review", "error", "createdAt", "updatedAt"], field);
 	const state = value["state"];
 	if (!(WORK_STATES as readonly unknown[]).includes(state)) return protocol(`${field}.state is invalid`);
 	const parseRefs = (raw: unknown, name: string, max: number): WorkRef[] => {
@@ -811,6 +812,7 @@ function parseWorkVersion(value: unknown, field: string): WorkVersion {
 		review = { disposition: raw["disposition"], ...(reason !== undefined ? { reason } : {}) };
 	}
 	const error = value["error"] === undefined ? undefined : parseWorkError(value["error"], `${field}.error`);
+	const childIssues = value["childIssues"] === undefined ? undefined : parseChildIssues(value["childIssues"], `${field}.childIssues`, TEAM_MAX_PUBLIC_CHILDREN);
 	const resultRef = value["resultRef"] === undefined ? undefined : frameId(value["resultRef"], `${field}.resultRef`);
 	const createdAt = value["createdAt"];
 	const updatedAt = value["updatedAt"];
@@ -821,10 +823,23 @@ function parseWorkVersion(value: unknown, field: string): WorkVersion {
 		inputRefs: idList(value["inputRefs"], `${field}.inputRefs`, TEAM_MAX_INPUT_REFS), state: state as WorkState,
 		waitingFor: parseRefs(value["waitingFor"], `${field}.waitingFor`, TEAM_MAX_WAITING_FOR),
 		observedOutcomes: parseRefs(value["observedOutcomes"], `${field}.observedOutcomes`, TEAM_MAX_RESULT_RECORDS),
+		...(childIssues?.length ? { childIssues } : {}),
 		...(checkpoint !== undefined ? { checkpoint } : {}), ...(resumeInstruction !== undefined ? { resumeInstruction } : {}),
 		...(hold ? { hold } : {}), ...(resultRef ? { resultRef } : {}), ...(review ? { review } : {}), ...(error ? { error } : {}),
 		createdAt, updatedAt,
 	};
+}
+
+function parseChildIssues(value: unknown, field: string, max: number): ChildIssue[] {
+	return array(value, field, max).map((raw, index): ChildIssue => {
+		const name = `${field}[${index}]`;
+		if (!isRecord(raw)) return protocol(`${name} must be an object`);
+		frameKeys(raw, ["work", "assignee", "incidentId", "reason", "message"], name);
+		if (raw["reason"] !== "attention" && raw["reason"] !== "protocol") return protocol(`${name}.reason is invalid`);
+		return { work: normalizeWorkRef(raw["work"], `${name}.work`), assignee: normalizeAlias(raw["assignee"], `${name}.assignee`),
+			incidentId: frameId(raw["incidentId"], `${name}.incidentId`), reason: raw["reason"],
+			message: text(raw["message"], `${name}.message`, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES) };
+	});
 }
 
 function parseIncident(value: unknown, field = "incident"): TeamIncidentView {
@@ -1216,7 +1231,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (!isRecord(value) || value["version"] !== TEAM_PROTOCOL_VERSION || value["teamId"] !== binding.teamId || value["deliveryId"] !== deliveryId) {
 		return protocol("activation input does not match its binding/delivery");
 	}
-	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
+	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "childIssues", "childIssuesOmitted", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
 	const member = value["member"];
 	if (!isRecord(member)) return protocol("activation input member is malformed");
 	frameKeys(member, ["id", "lead", "roleDescription"], "activation input member");
@@ -1321,6 +1336,9 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (new Set(ownedChildren.map((child) => workRefKey(child.work))).size !== ownedChildren.length) return protocol("activation ownedChildren contains duplicates");
 	if (scope.kind === "events" && (ownedChildren.length || ownedChildrenOmitted)) return protocol("events activation cannot have owned children");
 	const omittedOutcomes = safeInteger(value["omittedOutcomes"], "activation input.omittedOutcomes", 0);
+	const childIssues = value["childIssues"] === undefined ? undefined : parseChildIssues(value["childIssues"], "activation input.childIssues", TEAM_MAX_CHILD_ISSUES);
+	const childIssuesOmitted = value["childIssuesOmitted"] === undefined ? undefined : safeInteger(value["childIssuesOmitted"], "activation input.childIssuesOmitted", 0);
+	if (scope.kind === "events" && (childIssues?.length || childIssuesOmitted)) return protocol("events activation cannot have child issues");
 	const rawBudget = value["budget"];
 	if (!isRecord(rawBudget)) return protocol("activation input budget must be an object");
 	frameKeys(rawBudget, ["emergency", "modelRequests", "toolCalls", "activations"], "activation input budget");
@@ -1332,6 +1350,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 		activations: safeInteger(rawBudget["activations"], "activation input budget.activations", 0) };
 	const input: ActivationInput = { version: TEAM_PROTOCOL_VERSION, teamId: binding.teamId, deliveryId,
 		member: { id: binding.memberId, lead, roleDescription }, brief, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
+		...(childIssues ? { childIssues } : {}), ...(childIssuesOmitted !== undefined ? { childIssuesOmitted } : {}),
 		...(ownedChildrenOmitted !== undefined ? { ownedChildrenOmitted } : {}),
 		notice: text(value["notice"], "activation input.notice", TEAM_MAX_NOTE_BYTES) };
 	if (jsonBytes(input) > TEAM_MAX_ACTIVATION_INPUT_BYTES) return protocol("activation input exceeds its size limit");
@@ -1408,6 +1427,12 @@ export function projectActivationInput(input: ActivationInput): ActivationInput 
 		for (const event of projected.scope.events) event.message = projectErrorText(event.message, TEAM_MAX_EVENT_MESSAGE_BYTES);
 	}
 	for (const outcome of projected.outcomes) if (outcome.error) outcome.error = projectWorkError(outcome.error);
+	if (projected.childIssues) {
+		const omitted = (input.childIssuesOmitted ?? 0) + Math.max(0, projected.childIssues.length - TEAM_MAX_CHILD_ISSUES);
+		projected.childIssues = projected.childIssues.slice(0, TEAM_MAX_CHILD_ISSUES)
+			.map((issue) => ({ ...issue, message: projectErrorText(issue.message, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES) }));
+		if (omitted) projected.childIssuesOmitted = omitted;
+	}
 	projected.omittedOutcomes += Math.max(0, projected.outcomes.length - TEAM_MAX_DELIVERED_OUTCOMES);
 	projected.outcomes = projected.outcomes.slice(0, TEAM_MAX_DELIVERED_OUTCOMES);
 	// The preview budget includes its outcome metadata (including any failure diagnostic).

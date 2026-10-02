@@ -37,6 +37,9 @@ export const TEAM_MAX_ACTION_BYTES = 64 * 1024;
 /** Public previews are independent of host-grantable ledger capacity. */
 export const TEAM_MAX_PUBLIC_CHILDREN = 64;
 export const TEAM_MAX_OWNED_CHILD_PREVIEWS = 8;
+/** Held sub-tasks reported to their parent per activation, and the stored message size of each. */
+export const TEAM_MAX_CHILD_ISSUES = 8;
+export const TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES = 512;
 export const TEAM_MAX_DEPENDENCY_PREVIEW_BYTES = 4 * 1024;
 export const TEAM_MAX_DEPENDENCY_PREVIEWS = 8;
 export const TEAM_MAX_DELIVERED_OUTCOMES = 32;
@@ -119,6 +122,8 @@ export interface WorkVersion {
 	state: WorkState;
 	waitingFor: WorkRef[];
 	observedOutcomes: WorkRef[];
+	/** Held sub-tasks not yet delivered to the owner of this work; an issue ends when its incident is resolved. */
+	childIssues?: ChildIssue[];
 	checkpoint?: string;
 	resumeInstruction?: string;
 	hold?: { reason: HoldReason; incidentId: string };
@@ -137,6 +142,14 @@ export interface WorkRecord {
 	depth: number;
 	currentRevision: number;
 	versions: WorkVersion[];
+}
+/** A sub-task held for its requester (the parent's owner) instead of the lead. */
+export interface ChildIssue {
+	work: WorkRef;
+	assignee: string;
+	incidentId: string;
+	reason: "attention" | "protocol";
+	message: string;
 }
 export interface MemberRecord {
 	id: string;
@@ -419,6 +432,10 @@ export interface ActivationInput {
 	outcomes: OutcomeView[];
 	/** Outcomes that did not fit this input; they stay undelivered for a later activation. */
 	omittedOutcomes: number;
+	/** Held sub-tasks of this work (work scopes only); the owner answers with resume_work, revise_work or cancel_work. */
+	childIssues?: ChildIssue[];
+	/** Issues that did not fit; they stay undelivered for a later activation. */
+	childIssuesOmitted?: number;
 	/** Bounded preview, not the authoritative set of completion obligations. */
 	ownedChildren: Array<{ work: WorkRef; state: WorkState }>;
 	/** Remaining children are discoverable via status(work) pages and their exact parent WorkRef. */
@@ -443,6 +460,7 @@ export interface DeliveryRecord {
 	eventIds?: string[];
 	state: "in_flight" | "delivered" | "cancelled" | "unknown";
 	dependencyOutcomes: WorkRef[];
+	childIssueIds?: string[];
 }
 
 // ---------------------------------------------------------------------------------------------

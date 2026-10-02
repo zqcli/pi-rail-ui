@@ -104,7 +104,9 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 中止 launch 的等待不会取消 Team：工具返回明确错误，Team 仍由宿主管理，可用 `/rail-team <teamId> status` 检查或显式 cancel。不要用普通 `subagent` 工具启动 Team 成员；Team 成员不能递归创建 subagent。
 
-成员通过 `team` 工具协作：`request`（同步接受并返回 WorkRef，不等待接收者运行）、`reply`（只为当前 WorkRef 暂存结果，原生收尾和清理后才提交）、`yield`（等待具体 WorkRef、请求 lead 决策，或让 lead 本批 Team 事件 idle；等待会结束本次原生运行，不占住成员）、只读 `status`，以及 lead 专用的扁平 `control`（`{"action":"control","command":"close_team","resultRefs":["<resultRef>"],"outcome":"succeeded"}`；另有 `pause_member`、`resume_member`、`revise_work`、`cancel_work`、`resume_work`、`accept_result`、`close_member`）。`reply`、`yield`、`close_team` 必须是最终 assistant 批次中唯一的工具调用。业务错误以带 `code` 的结构化工具错误返回。结果未知（传输丢失、清理未确认等）的依赖不会自动唤醒下游，而是挂起并等待 lead/宿主明确处置。全员 idle 是正常状态，不会自动失败或关闭；没有模型轮询。
+成员通过 `team` 工具协作：`request`（同步接受并返回 WorkRef，不等待接收者运行）、`reply`（只为当前 WorkRef 暂存结果，原生收尾和清理后才提交）、`yield`（等待具体 WorkRef、请求 lead 决策，或让 lead 本批 Team 事件 idle；等待会结束本次原生运行，不占住成员）、只读 `status`，以及扁平的 `control`（`revise_work`、`cancel_work`、`resume_work`、`accept_result` 归该 work 的请求者或 lead，成员不能控制自己的当前工作；`pause_member`、`resume_member`、`close_member`、`close_team` 只限 lead；例如 `{"action":"control","command":"close_team","resultRefs":["<resultRef>"],"outcome":"succeeded"}`)。`reply`、`yield`、`close_team` 必须是最终 assistant 批次中唯一的工具调用。业务错误以带 `code` 的结构化工具错误返回。结果未知（传输丢失、清理未确认等）的依赖不会自动唤醒下游，而是挂起并等待 lead/宿主明确处置。全员 idle 是正常状态，不会自动失败或关闭；没有模型轮询。
+
+子任务被 held（提问或协议 hold）时不再升级给 lead，而是唤醒它的请求者：其下一次 activation 带 `childIssues` 和 notice，用 `resume_work`、`revise_work` 或 `cancel_work` 回答后再次等待（答不了就 yield attention 向上升级）。root 与 Team 级 incident 仍以 `WORK_HELD` 等事件交给 lead。宿主可用 `/rail-team <teamId> lead <alias> [reason]` 更换 lead：未处理的 Team 事件归新 lead，lead 故障后其余成员恢复运行。
 
 `subagent_team prepare` 支持 `budget: "standard" | "long" | "unlimited"`（默认 `long`：Team 4096 次 activation、8192 次模型请求、32768 次工具调用）；仅用户要求开放式/循环任务时选 `unlimited`。预算累计不重置，只有宿主可经 `/rail-team <id> grant` 提额，各档均保留 4 个 work 许可（`workPermits`，任何成员的 work activation 都计入，lead 的也算）与 lead 处理 Team 事件的独立槽位。
 

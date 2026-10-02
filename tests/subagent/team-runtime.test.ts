@@ -447,7 +447,10 @@ test("processStats counts committed waits/questions, versions, results, activati
 	inputReady(runtime, peer);
 	assert.equal(action(runtime, peer, 1, "question", { action: "yield", attention: "Which input?", checkpoint: "paused" }).ok, true);
 	settle(runtime, peer, "question");
+	// The held sub-task wakes its waiting parent, which answers it by revising the child.
 	const manager = runtime.takeNextActivation(teamId)!;
+	assert.equal(manager.scope.kind, "work");
+	assert.equal(manager.input.childIssues?.[0]?.work.workId, child.workId);
 	inputReady(runtime, manager);
 	const bad = { action: "request", to: "missing", task: "bad" };
 	assert.equal(action(runtime, manager, 1, "bad", bad).ok, false);
@@ -457,13 +460,13 @@ test("processStats counts committed waits/questions, versions, results, activati
 	assert.deepEqual(stats, {
 		works: 2, roots: 1, results: 0, activations: 4, modelTurns: 0,
 		dependencyWaits: 1, questions: 1, revisions: 1, cancelled: 0, toolErrors: 1,
-		memberActivations: new Map([["lead", 2], ["w1", 1], ["w2", 1]]),
+		memberActivations: new Map([["lead", 1], ["w1", 2], ["w2", 1]]),
 	});
 	assert.equal(action(runtime, manager, 3, "malformed", { action: "unknown" }).ok, false);
 	assert.equal(runtime.processStats(teamId).toolErrors, 2, "codec errors also produce error replies");
-	assert.equal(action(runtime, manager, 4, "idle", { action: "yield" }).ok, true);
+	assert.equal(action(runtime, manager, 4, "wait-again", { action: "yield", waitingFor: [{ workId: child.workId, revision: 2 }], checkpoint: "revised" }).ok, true);
 	runtime.nativeSettled(manager.binding, manager.scope.activationId, {
-		status: "success", appliedToolCallId: "idle",
+		status: "success", appliedToolCallId: "wait-again",
 		usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 2 },
 	});
 	runtime.cleanupFinished(manager.binding, manager.scope.activationId, { ok: true });
@@ -519,7 +522,7 @@ test("panel facts name who a blocked member waits on: a peer with its state, at 
 	}
 });
 
-test("panel facts: a parent lists its unresolved sub-tasks, and a question shows what it asks and where the Manager stands", () => {
+test("panel facts: a parent lists its unresolved sub-tasks, and a question shows what it asks and who answers it", () => {
 	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "parent" }], { extraWorkers: ["w3"] });
 	finishManagerBoot(runtime, teamId);
 	const parent = runtime.takeNextActivation(teamId)!;
@@ -533,25 +536,31 @@ test("panel facts: a parent lists its unresolved sub-tasks, and a question shows
 	const second = runtime.takeNextActivation(teamId)!;
 	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "waiting on 2 sub-tasks: w2 (running), w3 (running)");
 	yieldWork(runtime, second, "w3-asks", { attention: "Which branch\nshould I diff?", checkpoint: "stopped before diffing" });
-	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "waiting on 2 sub-tasks: w2 (running), w3 (held)");
-	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · queued for lead',
-		"a question nobody has picked up yet is queued for the Manager, on one line");
+	assert.equal(runtime.panelFacts(teamId).stalled.has("w1"), false, "the parent is queued to answer the held sub-task, no longer stalled");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · for w1',
+		"a sub-task's question is answered by its requester, on one line");
+	yieldWork(runtime, first, "w2-asks", { attention: "Need credentials for the staging cluster. ".repeat(6), checkpoint: "stopped before deploying" });
+	const long = runtime.panelFacts(teamId).stalled.get("w2")!;
+	assert.match(long, /^held · asks: "Need credentials for the staging cluster\. .*…" · for w1$/u);
+	assert.ok(long.length < 130, "a long question is cut to about 80 characters");
+	assert.equal(runtime.takeNextActivation(teamId)!.scope.kind, "work", "the waiting parent, not the lead, is woken for both questions");
+});
 
+test("panel facts: a root's question is queued for the lead, then handled, then left open", () => {
+	const { runtime, teamId } = makeRuntime();
+	finishManagerBoot(runtime, teamId);
+	yieldWork(runtime, runtime.takeNextActivation(teamId)!, "w1-asks", { attention: "Which branch\nshould I diff?", checkpoint: "stopped before diffing" });
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), 'held · asks: "Which branch should I diff?" · queued for lead',
+		"a question nobody has picked up yet is queued for the lead, on one line");
 	const manager = runtime.takeNextActivation(teamId)!;
 	assert.equal(manager.scope.kind, "events");
 	inputReady(runtime, manager);
-	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · lead handling',
-		"the Manager's current activation holds the WORK_HELD event");
-	yieldWork(runtime, first, "w2-asks", { attention: "Need credentials for the staging cluster. ".repeat(6), checkpoint: "stopped before deploying" });
-	const long = runtime.panelFacts(teamId).stalled.get("w2")!;
-	assert.match(long, /^held · asks: "Need credentials for the staging cluster\. .*…" · queued for lead$/u);
-	assert.ok(long.length < 130, "a long question is cut to about 80 characters");
-
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), 'held · asks: "Which branch should I diff?" · lead handling',
+		"the lead's current activation holds the WORK_HELD event");
 	assert.equal(action(runtime, manager, 1, "manager-yield", { action: "yield" }).ok, true);
 	settle(runtime, manager, "manager-yield");
-	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?"',
-		"a question the Manager has already seen and left open is not called queued");
-	assert.match(runtime.panelFacts(teamId).stalled.get("w2")!, / · queued for lead$/u, "an event outside that batch is still queued");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), 'held · asks: "Which branch should I diff?"',
+		"a question the lead has already seen and left open is not called queued");
 });
 
 test("panel facts: budget, protocol and Manager-unavailable holds say why they are held", () => {

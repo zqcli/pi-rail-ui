@@ -107,7 +107,7 @@ export interface SessionWorker {
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult>;
 	control?(request: WorkerControlRequest): Promise<void>;
 	setModel?(model: RailModelRef): Promise<RailModelRef>;
-	openTeamMemberV2?(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession>;
+	openTeamMemberV2?(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void, tools?: string[] | null): Promise<TeamMemberProtocolSession>;
 	isReusable?(): boolean;
 	stop(): Promise<void>;
 }
@@ -203,6 +203,8 @@ export interface TeamMemberOpenRequest {
 	cwd?: string;
 	fastMode?: boolean;
 	contextWindow?: number;
+	/** Base-tool allowlist of this member; null/absent keeps every base tool. */
+	tools?: string[] | null;
 	/** Display-only native events of this member's activations. */
 	onActivity?: (event: RpcEvent) => void;
 }
@@ -614,7 +616,7 @@ export class SessionBroker {
 			protocol = await state.worker.openTeamMemberV2(binding, (error) => {
 				this.runtimeErrors.set(instance!.agentId, error.message);
 				this.emitRuntimeChange();
-			}, request.onActivity);
+			}, request.onActivity, request.tools ?? null);
 			if (this.shuttingDown) throw new Error("Broker shut down during Team member startup");
 			const ownedProtocol = protocol;
 			const ownedState = state;

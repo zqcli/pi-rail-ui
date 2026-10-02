@@ -66,8 +66,8 @@ export interface SubagentTranscriptRun {
 	contextWindowText?: string;
 	fastModeText?: "on" | "off";
 	searchModeText?: "on" | "off";
-	/** Grouped identity label replacing persistent/one-off (for example a Team role). */
-	role?: string;
+	/** A Team member: shown as `alias`, or `alias (lead)`, instead of the persistent/one-off kind. */
+	member?: { lead: boolean };
 	/** Extra state line under the header (for example a Team member's lifecycle and work). */
 	detail?: string;
 }
@@ -847,7 +847,8 @@ function identityText(run: SubagentTranscriptRun, layout: "grouped" | "control",
 	// A one-off alias is "<model> #N"; the model follows anyway, so only the slot number is kept.
 	const model = run.model ?? "model unavailable";
 	const name = !run.persistent && run.alias.startsWith(`${model.split(":")[0]} #`) ? run.alias.slice(run.alias.lastIndexOf("#")) : run.alias;
-	return `${step}${name} · ${run.role ?? (run.persistent ? "persistent" : "one-off")} · ${model}`;
+	return run.member ? `${step}${name}${run.member.lead ? " (lead)" : ""} · ${model}`
+		: `${step}${name} · ${run.persistent ? "persistent" : "one-off"} · ${model}`;
 }
 
 /** Static dispatch policy, after the live metrics so a narrow terminal truncates it first. */

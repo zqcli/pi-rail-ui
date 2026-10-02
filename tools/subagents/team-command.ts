@@ -46,7 +46,7 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		if (!choice) return;
 		let text = "";
 		if (choice.action === "message") {
-			text = (await ctx.ui.input("Message the Manager", "What should the Manager know?"))?.trim() ?? "";
+			text = (await ctx.ui.input("Message the lead", "What should the lead know?"))?.trim() ?? "";
 			if (!text) return;
 		}
 		await runTeamCommand(host, `${choice.teamId} ${choice.action}${text ? ` ${text}` : ""}`, ctx);
@@ -57,7 +57,7 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		const teams = host.runtime.listTeams();
 		const liveIds = new Set(teams.map((team) => team.teamId));
 		const lines = [
-			...teams.map((team) => `${team.teamId} · ${team.lifecycle.toUpperCase()} · ${team.health === "ok" ? "ok" : "needs attention"} · manager ${team.manager} · works ${team.works.total}`),
+			...teams.map((team) => `${team.teamId} · ${team.lifecycle.toUpperCase()} · ${team.health === "ok" ? "ok" : "needs attention"} · lead ${team.lead} · works ${team.works.total}`),
 			...host.history.teams.filter((entry) => !liveIds.has(entry.teamId)).map(formatHistorySummary),
 			...(host.history.skipped ? [`${host.history.skipped} malformed Team history entries skipped`] : []),
 		];
@@ -130,11 +130,11 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			return;
 		}
 		case "message": {
-			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; a Manager message requires an active Team.`);
+			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; a lead message requires an active Team.`);
 			if (!text) throw new Error("message requires text: /rail-team <teamId> message <text>");
-			if (!await confirm(ctx, `Message the Manager of ${teamId}?`, `${previewText(text, 1024)}\n\nThis becomes a USER_COMMAND event for the Manager; it grants no budget or tool permission.`)) return;
-			const receipt = host.runtime.messageManager(teamId, text);
-			ctx.ui.notify(`Manager message ${receipt.status}`, "info");
+			if (!await confirm(ctx, `Message the lead of ${teamId}?`, `${previewText(text, 1024)}\n\nThis becomes a USER_COMMAND event for the lead; it grants no budget or tool permission.`)) return;
+			const receipt = host.runtime.messageLead(teamId, text);
+			ctx.ui.notify(`Lead message ${receipt.status}`, "info");
 			return;
 		}
 		case "resume":

@@ -82,7 +82,7 @@ function assignedWork(member: TeamMemberView, works: readonly TeamWorkSummary[])
 }
 
 function memberRoute(member: TeamMemberView, work: TeamWorkSummary | undefined): string {
-	return member.role === "manager" || !work ? "—" : `${work.requester} → ${member.id} → ${work.requester}`;
+	return !work ? "—" : `${work.requester} → ${member.id} → ${work.requester}`;
 }
 
 function latestResult(memberId: string, works: TeamWorkSummary[], facts: Facts): string {
@@ -217,7 +217,7 @@ export class TeamOverlayComponent implements Focusable {
 		this.timelineCursor = rows[this.selected]?.milestone;
 		const live = !!team && writable(team) && this.host.active;
 		// Overview already shows Waiting for in its body.
-		const notice = this.tab !== 0 && facts?.waitingFor?.startsWith("Manager decision") ? `Waiting for: ${facts.waitingFor}`
+		const notice = this.tab !== 0 && facts?.waitingFor?.startsWith("Lead decision") ? `Waiting for: ${facts.waitingFor}`
 			: this.notice;
 		const omitted = this.tab === 3 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
@@ -281,14 +281,14 @@ export class TeamOverlayComponent implements Focusable {
 		};
 		wrapTextWithAnsi(oneLine(team.brief.goal), Math.max(1, width - labelWidth)).slice(0, 3).forEach((line, index) => add(index ? "" : "Goal", line));
 		add("Progress", `${progress(works)} · ${team.works.cancelled} cancelled/superseded`);
-		add("Waiting for", facts.waitingFor ?? "—", facts.waitingFor?.startsWith("Manager decision") ? "warning" : undefined);
+		add("Waiting for", facts.waitingFor ?? "—", facts.waitingFor?.startsWith("Lead decision") ? "warning" : undefined);
 		const holds = this.host.runtime.listHolds(team.teamId);
 		const incidents = team.incidents.filter((incident) => incident.state === "open");
 		add("Attention", holds.length || incidents.length ? `${holds.length} open holds · ${incidents.length} open incidents` : "none", holds.length || incidents.length ? "warning" : undefined);
 		for (const hold of holds) add("", `${hold.assignee} · ${shortWorkRef(hold.work)} · ${oneLine(hold.message)}`, "warning");
 		for (const incident of incidents) if (!holds.some((hold) => hold.incidentId === incident.id)) add("", `${incident.code}: ${oneLine(incident.message)}`, "warning");
 		const { used, limits } = this.host.runtime.inspectBudget(team.teamId);
-		const counters = [["activations", "teamActivations"], ["manager", "managerActivations"], ["model requests", "teamModelRequests"], ["tool calls", "teamToolCalls"], ["works", "teamWorks"]] as const;
+		const counters = [["activations", "teamActivations"], ["lead", "leadActivations"], ["model requests", "teamModelRequests"], ["tool calls", "teamToolCalls"], ["works", "teamWorks"]] as const;
 		counters.forEach(([label, key], index) => {
 			const value = used[key], limit = limits[key];
 			const cells = limit ? Math.min(6, Math.floor(value / limit * 6)) : 6;
@@ -301,13 +301,14 @@ export class TeamOverlayComponent implements Focusable {
 
 	private members(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
 		const rows = team.members.map((member) => ({ member, route: memberRoute(member, assignedWork(member, works)), time: clock(this.host.driver.memberActivity(team.teamId, member.id)?.durationMs ?? 0) }));
-		const aliasWidth = Math.min(Math.floor(width * 0.2), Math.max(...rows.map(({ member }) => visibleWidth(member.id))));
+		const label = (member: TeamMemberView) => member.id === team.lead ? `${member.id} (lead)` : member.id;
+		const aliasWidth = Math.min(Math.floor(width * 0.2), Math.max(...rows.map(({ member }) => visibleWidth(label(member)))));
 		const routeWidth = Math.min(Math.floor(width * 0.4), Math.max(...rows.map(({ route }) => visibleWidth(route))));
 		const timeWidth = Math.max(...rows.map(({ time }) => time.length));
 		const stateWidth = Math.max(1, width - aliasWidth - routeWidth - timeWidth - 8);
 		return rows.map(({ member, route, time }) => {
 			const status = memberStatus(member);
-			return { member: member.id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${column(member.id, aliasWidth)}  ${column(oneLine(memberDetail(member, facts, works)), stateWidth)}  ${column(route, routeWidth)}  ${time.padStart(timeWidth)}` };
+			return { member: member.id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${column(label(member), aliasWidth)}  ${column(oneLine(memberDetail(member, facts, works, team.lead)), stateWidth)}  ${column(route, routeWidth)}  ${time.padStart(timeWidth)}` };
 		});
 	}
 
@@ -318,7 +319,7 @@ export class TeamOverlayComponent implements Focusable {
 		if (this.tab === 1 && row?.member) {
 			const member = team.members.find((member) => member.id === row.member)!;
 			const work = assignedWork(member, works);
-			return [title(member.id), dim(`Task: ${work ? this.host.runtime.getWork(team.teamId, work.work)!.current.task : member.role === "manager" ? team.brief.goal : "No assigned work"}`),
+			return [title(member.id), dim(`Task: ${work ? this.host.runtime.getWork(team.teamId, work.work)!.current.task : member.id === team.lead ? team.brief.goal : "No assigned work"}`),
 				dim(`Route: ${memberRoute(member, work)}`), dim(latestResult(member.id, works, facts))];
 		}
 		if (this.tab === 2 && row?.work) {
@@ -333,7 +334,7 @@ export class TeamOverlayComponent implements Focusable {
 		const member = team.members.find((member) => member.id === this.detail)!;
 		const work = assignedWork(member, works);
 		const task = work ? this.host.runtime.getWork(team.teamId, work.work)?.current.task : undefined;
-		const lines = [`Member ${member.id} · Esc back`, `Task: ${task ?? (member.role === "manager" ? team.brief.goal : "No assigned work")}`, "Outbound works:",
+		const lines = [`Member ${member.id} · Esc back`, `Task: ${task ?? (member.id === team.lead ? team.brief.goal : "No assigned work")}`, "Outbound works:",
 			...works.filter((work) => work.requester === member.id).map((work) => `  ${shortWorkRef(work.work)} → ${work.assignee} · ${work.hold ? "held" : work.state}`)];
 		const latest = facts.results.get(member.id)?.latest;
 		if (latest) lines.push(`Latest result: ${latest.result.status} · ${latest.id}`, latestResult(member.id, works, facts), latest.result.summary);
@@ -349,7 +350,7 @@ export class TeamOverlayComponent implements Focusable {
 	private historyRows(entry: TeamHistoryEntry, width: number): Row[] {
 		const heading = `Team ${entry.teamId} · ${entry.lifecycle.toUpperCase()} · ${entry.version === 1 ? "legacy · " : ""}history (read-only)`;
 		const lines = this.tab === 0 ? [heading, `Goal: ${entry.goal ?? "not retained"}`, `Outcome: ${entry.outcome ?? entry.lifecycle}`, entry.reason ?? "", `${entry.results.length} retained results`]
-			: this.tab === 1 ? [heading, ...[entry.manager, ...entry.workers].filter(Boolean).map((name) => `${name} · ${entry.results.filter((result) => result.author === name).length} results · activity not retained`)]
+			: this.tab === 1 ? [heading, ...entry.members.map((name) => `${name} · ${entry.results.filter((result) => result.author === name).length} results · activity not retained`)]
 				: this.tab === 2 ? [heading, "Work ledger not retained; retained results:", ...entry.results.map((result) => `${shortWorkRef(result.work)} · ${result.author} · ${result.result.status} · ${result.id}: ${oneLine(result.result.summary)}`)]
 					: [heading, "Timeline not retained in history"];
 		return lines.flatMap((text) => wrapTextWithAnsi(oneLine(text), width).map((text) => ({ text })));

@@ -20,8 +20,8 @@ function terminal(): TeamResult {
 		version: 2, teamId, lifecycle: "closed", outcome: "failed", reason: "Host selected a failed close",
 		finalResultRefs: [result.id], roots,
 		members: [
-			{ id: "lead", role: "manager", lifecycle: "closed", resourceState: "released" },
-			{ id: "worker", role: "worker", lifecycle: "closed", resourceState: "released" },
+			{ id: "lead", lifecycle: "closed", resourceState: "released" },
+			{ id: "worker", lifecycle: "closed", resourceState: "released" },
 		],
 		usage: { input: 5, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 8, turns: 2 },
 		unresolvedIncidents: [],
@@ -30,7 +30,7 @@ function terminal(): TeamResult {
 
 function entries(extra: Array<Record<string, unknown>> = [], closeId = "close-1") {
 	return [
-		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "launched", teamId, at: 1, roster: { manager: "lead", workers: ["worker"] }, goal: "Retain history facts" } },
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "launched", teamId, at: 1, roster: { lead: "lead", members: ["lead", "worker"] }, goal: "Retain history facts" } },
 		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "result", teamId, at: 2, result } },
 		...extra.map((data) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data })),
 		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "close_decision", teamId, at: 3, closeId, outcome: "failed", resultRefs: [result.id], roots, reason: "Host selected a failed close" } },
@@ -98,7 +98,8 @@ test("U08: retired v1 snapshots and launched v2 Teams without a terminal are rea
 	for (const id of ["v1-running", "v1-finalizing", "v1-prepared"]) {
 		assert.equal(byId.get(id)?.lifecycle, "interrupted", `${id} is never shown as live or resumable`);
 		assert.equal(byId.get(id)?.version, 1);
-		assert.equal(byId.get(id)?.manager, "coord", "the retired coordinator is displayed as the manager");
+		assert.equal(byId.get(id)?.lead, "coord", "the retired coordinator is displayed as the lead");
+		assert.deepEqual(byId.get(id)?.members, ["coord", "B1", "B2"]);
 	}
 	assert.equal(byId.get("v1-done")?.lifecycle, "completed");
 	assert.equal(byId.get("v2-open")?.lifecycle, "interrupted", "a v2 Team without a terminal record is interrupted, not closed success");
@@ -122,4 +123,34 @@ test("interrupted history never accepts a later terminal or malformed grant", ()
 	assert.equal(restored.teams[0]?.reason, "branch changed");
 	assert.equal(restored.teams[0]?.finalResultRefs.length, 0);
 	assert.ok(restored.skipped >= 2, "invalid grant and late terminal are counted without reviving the Team");
+});
+
+test("a journal written before the lead model (manager/workers roster, member roles, old budget counters) still loads and displays with the lead", async () => {
+	const { formatHistorySummary } = await import("../../tools/subagents/team-tool");
+	const oldTerminal = { ...terminal(), members: [
+		{ id: "lead", role: "manager", lifecycle: "closed", resourceState: "released" },
+		{ id: "worker", role: "worker", lifecycle: "closed", resourceState: "released" },
+	] };
+	const oldGrant = { id: "g1", actor: "@host", scope: { kind: "team" }, increments: { managerActivations: 64, emergencyManagerActivations: 1 }, reason: "raise", at: 2 };
+	const oldPresetGrant = { id: "g2", actor: "@host", scope: { kind: "team" }, preset: "long", increments: { workerPermits: 4, teamToolCalls: 100 }, reason: "Raise to long", at: 2 };
+	const records = entries([{ version: 2, kind: "grant", teamId, at: 2, grant: oldGrant }, { version: 2, kind: "grant", teamId, at: 2, grant: oldPresetGrant }]) as any[];
+	records[0].data.roster = { manager: "lead", workers: ["worker"] };
+	records[records.length - 1].data.result = oldTerminal;
+	const restored = restoreTeamHistory(records);
+	assert.equal(restored.skipped, 0, "no old record is dropped");
+	const entry = restored.teams[0]!;
+	assert.equal(entry.lifecycle, "closed");
+	assert.equal(entry.lead, "lead", "the old manager is the lead");
+	assert.deepEqual(entry.members, ["lead", "worker"]);
+	assert.deepEqual(entry.results.map((record) => record.id), [result.id]);
+	assert.deepEqual(entry.finalResultRefs, [result.id]);
+	assert.match(formatHistorySummary(entry), /lead lead · members lead, worker · 1 results/u);
+
+	// The same Team written by the current code displays identically.
+	const current = restoreTeamHistory(entries()).teams[0]!;
+	assert.deepEqual([current.lead, current.members, current.lifecycle], [entry.lead, entry.members, entry.lifecycle]);
+	// A damaged roster (the lead missing from the members) is still skipped.
+	const damaged = entries() as any[];
+	damaged[0].data.roster = { lead: "ghost", members: ["lead", "worker"] };
+	assert.equal(restoreTeamHistory(damaged).teams.length, 0);
 });

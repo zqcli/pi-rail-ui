@@ -6,7 +6,7 @@ import { TEAM_JOURNAL_ENTRY_TYPE, TeamJournalGeneration, type TeamJournalRecord 
 import { restoreTeamHistory } from "../../tools/subagents/team-history";
 import { TeamRuntime, type NativeCompletion, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 import {
-	TEAM_MAX_FRAME_BYTES, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_MAX_WORKERS, TEAM_STATUS_MAX_LIMIT,
+	TEAM_MAX_FRAME_BYTES, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_MAX_MEMBERS, TEAM_STATUS_MAX_LIMIT,
 	TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type GateDecision, type TeamBudgetLimits, type TeamTeamView, type WorkRef,
 } from "../../tools/subagents/team-protocol";
@@ -27,8 +27,7 @@ function makeRuntime({ limits = {}, initialRequests = [], journal, launch = true
 	let time = 1_700_000_000_000;
 	const runtime = new TeamRuntime({ now: () => time++, createId: () => `budget-${++ids}`, limits, ...(journal ? { journal } : {}) });
 	const { teamId } = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work, review roots and close the Team." },
-		workers: [{ alias: "w1", roleDescription: "Perform work." }, { alias: "w2", roleDescription: "Perform work." }],
+		members: [{ alias: "lead", roleDescription: "Manage work, review roots and close the Team." }, { alias: "w1", roleDescription: "Perform work." }, { alias: "w2", roleDescription: "Perform work." }], lead: "lead",
 		brief: { goal: "Exercise cumulative budgets." },
 		...(budget ? { budget } : {}),
 		initialRequests,
@@ -43,24 +42,24 @@ test("presets preserve standard safeguards, default to long, and apply runtime o
 	assert.equal(protocol.DEFAULT_TEAM_BUDGET, long);
 	assert.equal(protocol.TEAM_BUDGET_UNLIMITED, 1_000_000_000);
 	assert.deepEqual(standard, {
-		workerPermits: 4, memberUnresolvedWork: 64, teamWorks: 512, rootChildren: 64, depth: 8, workRevisions: 32,
-		rootActivations: 128, teamActivations: 512, managerActivations: 128, activationModelRequests: 64,
+		workPermits: 4, memberUnresolvedWork: 64, teamWorks: 512, rootChildren: 64, depth: 8, workRevisions: 32,
+		rootActivations: 128, teamActivations: 512, leadActivations: 128, activationModelRequests: 64,
 		rootModelRequests: 256, teamModelRequests: 1024, activationToolCalls: 256, rootToolCalls: 1024,
-		teamToolCalls: 4096, emergencyManagerActivations: 3, reservedResultBytes: 16 * 1024 * 1024,
+		teamToolCalls: 4096, emergencyLeadActivations: 3, reservedResultBytes: 16 * 1024 * 1024,
 	});
-	assert.deepEqual(long, { ...standard, teamActivations: 4096, managerActivations: 1024, teamModelRequests: 8192,
+	assert.deepEqual(long, { ...standard, teamActivations: 4096, leadActivations: 1024, teamModelRequests: 8192,
 		teamToolCalls: 32768, teamWorks: 4096, rootChildren: 512, rootActivations: 1024, rootModelRequests: 2048,
 		rootToolCalls: 8192, workRevisions: 128, reservedResultBytes: 64 * 1024 * 1024 });
-	assert.deepEqual(unlimited, { ...standard, teamActivations: 1_000_000_000, managerActivations: 1_000_000_000,
+	assert.deepEqual(unlimited, { ...standard, teamActivations: 1_000_000_000, leadActivations: 1_000_000_000,
 		teamModelRequests: 1_000_000_000, teamToolCalls: 1_000_000_000, rootActivations: 1_000_000_000,
 		rootModelRequests: 1_000_000_000, rootToolCalls: 1_000_000_000, teamWorks: 20000, rootChildren: 2048,
 		workRevisions: 512, reservedResultBytes: 256 * 1024 * 1024 });
-	const runtime = new TeamRuntime({ limits: { workerPermits: 2, teamActivations: 42 } });
-	const oldPlan = { manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }], brief: { goal: "Presets." } };
+	const runtime = new TeamRuntime({ limits: { workPermits: 2, teamActivations: 42 } });
+	const oldPlan = { members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead", brief: { goal: "Presets." } };
 	assert.equal(normalizeTeamPlan(oldPlan).budget, undefined, "old plans need no budget field");
 	for (const preset of [undefined, "standard", "unlimited"] as const) {
 		const view = runtime.prepare({ ...oldPlan, ...(preset ? { budget: preset } : {}) });
-		assert.deepEqual(view.budget.limits, { ...protocol.TEAM_BUDGET_PRESETS[preset ?? "long"], workerPermits: 2, teamActivations: 42 });
+		assert.deepEqual(view.budget.limits, { ...protocol.TEAM_BUDGET_PRESETS[preset ?? "long"], workPermits: 2, teamActivations: 42 });
 		assert.deepEqual(parseTeamReply({ ok: true, from: "@hub", to: "lead", data: view }), { ok: true, from: "@hub", to: "lead", data: view });
 	}
 });
@@ -95,7 +94,7 @@ test("preset raises preview and journal all limits, release only satisfied budge
 	assert.equal(grant?.grant.increments.teamWorks, 4096 - 512);
 	assert.equal(restoreTeamHistory(records.map((data) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data }))).skipped, 0);
 	const eventBatch = takeManager(runtime, teamId);
-	assert.ok(eventBatch.input.scope.kind === "management" && eventBatch.input.scope.events.some((event) => event.kind === "USER_COMMAND" && event.message?.includes("Raise to long")));
+	assert.ok(eventBatch.input.scope.kind === "events" && eventBatch.input.scope.events.some((event) => event.kind === "USER_COMMAND" && event.message?.includes("Raise to long")));
 	const count = records.length;
 	assert.equal(runtime.raiseBudget(teamId, "standard").status, "unchanged");
 	assert.deepEqual(runtime.previewRaiseBudget(teamId, "long").changes, []);
@@ -185,7 +184,7 @@ function nextWork(runtime: TeamRuntime, teamId: string, manager?: (activation: R
 
 function takeManager(runtime: TeamRuntime, teamId: string): RuntimeActivation {
 	const activation = runtime.takeNextActivation(teamId);
-	assert.equal(activation?.scope.kind, "management");
+	assert.equal(activation?.scope.kind, "events");
 	ready(runtime, activation!);
 	return activation!;
 }
@@ -287,14 +286,14 @@ test("G07/G09: new roots cannot evade the Team budget; the Manager gets bounded 
 	end(runtime, r2, replyWith("r2 done"));
 
 	const emergency = takeManager(runtime, teamId);
-	assert.equal(emergency.input.scope.kind === "management" && emergency.input.scope.emergency, true);
+	assert.equal(emergency.input.scope.kind === "events" && emergency.input.scope.emergency, true);
 	assert.equal(runtime.takeNextActivation(teamId), undefined, "a fresh root still waits on the exhausted Team budget");
 	let team = runtime.getTeam(teamId);
 	assert.equal(runtime.getWork(teamId, roots[2]!)!.current.hold?.reason, "budget");
 	assert.equal(openBudgetIncidents(team).length, 1);
 	assert.equal(openBudgetIncidents(team)[0]!.rootId, undefined, "Team exhaustion is attributed to the Team");
 	assert.equal(team.budget.used.teamActivations, 3);
-	assert.equal(team.budget.used.emergencyManagerActivations, 1);
+	assert.equal(team.budget.used.emergencyLeadActivations, 1);
 	assert.equal(errorCode(runtime, emergency, { action: "request", to: "w1", task: "new root" }), "BUDGET_BLOCKED");
 	assert.equal(errorCode(runtime, emergency, { action: "control", command: "revise_work", workId: roots[0]!.workId, expectedRevision: 1, task: "redo", inputRefs: [] }), "BUDGET_BLOCKED");
 	ok(runtime, emergency, { action: "status", view: "team" });
@@ -303,29 +302,29 @@ test("G07/G09: new roots cannot evade the Team budget; the Manager gets bounded 
 	assert.throws(() => normalizeTeamAction({ action: "control", command: "grant_budget", scope: "team" }), TeamProtocolError, "the model has no grant action");
 
 	for (let used = 2; used <= 3; used++) {
-		runtime.hostControl(teamId).message_manager(`emergency ${used}`);
+		runtime.hostControl(teamId).message_lead(`emergency ${used}`);
 		const next = takeManager(runtime, teamId);
-		assert.equal(next.input.scope.kind === "management" && next.input.scope.emergency, true);
+		assert.equal(next.input.scope.kind === "events" && next.input.scope.emergency, true);
 		end(runtime, next, yieldNow);
 	}
-	runtime.hostControl(teamId).message_manager("no more automatic Manager calls");
+	runtime.hostControl(teamId).message_lead("no more automatic Manager calls");
 	assert.equal(runtime.takeNextActivation(teamId), undefined, "exhausted emergency budget leaves only host control");
 	team = runtime.getTeam(teamId);
-	assert.equal(team.budget.used.emergencyManagerActivations, 3);
+	assert.equal(team.budget.used.emergencyLeadActivations, 3);
 	assert.equal(team.budget.used.teamActivations, 3, "emergency activations are counted separately");
 
 	const grant = runtime.hostControl(teamId).grant({ kind: "team" }, { teamActivations: 2 }, "continue after review");
 	assert.ok(grant.status === "applied" && "released" in grant);
 	assert.deepEqual(grant.released, [roots[2]]);
 	const normal = takeManager(runtime, teamId);
-	assert.equal(normal.input.scope.kind === "management" && normal.input.scope.emergency, false);
+	assert.equal(normal.input.scope.kind === "events" && normal.input.scope.emergency, false);
 	end(runtime, normal, yieldNow);
 	const r3 = runtime.takeNextActivation(teamId)!;
 	assert.deepEqual(r3.scope.work, roots[2]);
 	team = runtime.getTeam(teamId);
 	assert.equal(team.budget.limits.teamActivations, 5);
 	assert.equal(team.budget.used.teamActivations, 5);
-	assert.equal(team.budget.used.emergencyManagerActivations, 3, "a grant never resets used counters");
+	assert.equal(team.budget.used.emergencyLeadActivations, 3, "a grant never resets used counters");
 	runtime.assertInvariants(teamId);
 });
 
@@ -417,14 +416,14 @@ test("C04: a parked pause resumed after exhaustion stops at budget, and grants n
 	const attention = nextWork(runtime, teamId)!;
 	end(runtime, attention, { action: "yield", attention: "needs a human check", checkpoint: "stopped" });
 	assert.deepEqual(runtime.gate(paused.binding, paused.scope, "provider_gate"), { allow: true });
-	runtime.hostControl(teamId).message_manager("pause w1");
+	runtime.hostControl(teamId).message_lead("pause w1");
 	const pauseManager = takeManager(runtime, teamId);
 	ok(runtime, pauseManager, { action: "control", command: "pause_member", memberId: "w1" });
 	end(runtime, pauseManager, yieldNow);
 	const parked = runtime.waitAtProviderGate(paused.binding, paused.scope);
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.pause, "confirmed");
-	runtime.hostControl(teamId).message_manager("resume w1");
+	runtime.hostControl(teamId).message_lead("resume w1");
 	const resumeManager = takeManager(runtime, teamId);
 	ok(runtime, resumeManager, { action: "control", command: "resume_member", memberId: "w1" });
 	end(runtime, resumeManager, yieldNow);
@@ -479,7 +478,7 @@ test("X08: host cancel of a budget-held Team explains both causes and later gran
 	const first = nextWork(runtime, teamId)!;
 	assert.equal(runtime.takeNextActivation(teamId), undefined, "the second root waits on the exhausted Team budget");
 	const emergency = runtime.takeNextActivation(teamId)!;
-	assert.equal(emergency.input.scope.kind === "management" && emergency.input.scope.emergency, true, "the budget incident reaches the Manager once");
+	assert.equal(emergency.input.scope.kind === "events" && emergency.input.scope.emergency, true, "the budget incident reaches the Manager once");
 	ready(runtime, emergency);
 	const page = ok(runtime, emergency, { action: "status", view: "work" }).reply;
 	const items = page.ok && page.data && "view" in page.data && page.data.view === "work" ? page.data.items : [];
@@ -559,7 +558,7 @@ test("journal: bounded critical facts only, written before publish, terminal wri
 	generation.deactivate();
 	assert.equal(generation.active, false);
 	assert.throws(() => generation.write({ version: 2, kind: "launched", teamId, at: 0,
-		roster: { manager: "lead", workers: ["w1", "w2"] }, goal: "journaled" }), /inactive/);
+		roster: { lead: "lead", members: ["lead", "w1", "w2"] }, goal: "journaled" }), /inactive/);
 	runtime.assertInvariants(teamId);
 });
 
@@ -679,7 +678,7 @@ test("usage: loss keeps observed cost once; settle/lost races and repeats never 
 });
 
 test("9.4: activation input carries the tightest current scope budget summary", () => {
-	const { runtime, teamId } = makeRuntime({ limits: { rootActivations: 2, rootModelRequests: 5, activationModelRequests: 3, managerActivations: 2 },
+	const { runtime, teamId } = makeRuntime({ limits: { rootActivations: 2, rootModelRequests: 5, activationModelRequests: 3, leadActivations: 2 },
 		initialRequests: [{ to: "w1", task: "summarised" }] });
 	const boot = takeManager(runtime, teamId);
 	assert.deepEqual(boot.input.budget, { emergency: false, modelRequests: 3, toolCalls: 256, activations: 1 });
@@ -696,7 +695,7 @@ test("9.4: activation input carries the tightest current scope budget summary", 
 	assert.deepEqual(again.input.budget, { emergency: false, modelRequests: 2, toolCalls: 256, activations: 1 }, "root model requests left: 5 - 3; root activations left: 3 - 2");
 	const hold = { action: "yield", attention: "stop here", checkpoint: "held" };
 	end(runtime, again, hold);
-	runtime.hostControl(teamId).message_manager("status");
+	runtime.hostControl(teamId).message_lead("status");
 	const emergency = takeManager(runtime, teamId);
 	assert.deepEqual(emergency.input.budget, { emergency: true, modelRequests: 3, toolCalls: 256, activations: 2 });
 });
@@ -776,9 +775,9 @@ test("G09: a Manager stopped mid-activation by budget does not replay its batch;
 	const boot = takeManager(runtime, teamId);
 	assert.deepEqual(runtime.gate(boot.binding, boot.scope, "provider_gate"), { allow: true });
 	end(runtime, boot, yieldNow);
-	runtime.hostControl(teamId).message_manager("please review");
+	runtime.hostControl(teamId).message_lead("please review");
 	const manager = takeManager(runtime, teamId);
-	assert.ok(manager.input.scope.kind === "management" && manager.input.scope.events.some((event) => event.message === "please review"));
+	assert.ok(manager.input.scope.kind === "events" && manager.input.scope.events.some((event) => event.message === "please review"));
 	assert.deepEqual(runtime.gate(manager.binding, manager.scope, "provider_gate"), { allow: true });
 	ok(runtime, manager, { action: "status", view: "team" });
 	assert.deepEqual(runtime.gate(manager.binding, manager.scope, "provider_gate"), { allow: true });
@@ -789,20 +788,20 @@ test("G09: a Manager stopped mid-activation by budget does not replay its batch;
 
 	const kinds: string[][] = [];
 	for (let round = 0; round < 3; round++) {
-		if (round > 0) runtime.hostControl(teamId).message_manager(`round ${round}`);
+		if (round > 0) runtime.hostControl(teamId).message_lead(`round ${round}`);
 		const emergency = takeManager(runtime, teamId);
-		assert.equal(emergency.input.scope.kind === "management" && emergency.input.scope.emergency, true);
-		kinds.push(emergency.input.scope.kind === "management" ? emergency.input.scope.events.map((event) => event.message) : []);
+		assert.equal(emergency.input.scope.kind === "events" && emergency.input.scope.emergency, true);
+		kinds.push(emergency.input.scope.kind === "events" ? emergency.input.scope.events.map((event) => event.message) : []);
 		assert.deepEqual(runtime.gate(emergency.binding, emergency.scope, "provider_gate"), { allow: true }, "emergency ignores the exhausted Team counter");
 		end(runtime, emergency, yieldNow);
 	}
 	assert.ok(kinds.flat().every((message) => message !== "please review"), "the stopped batch is not replayed");
 	assert.equal(kinds[0]!.length, 1, "the first emergency sees only the deduplicated budget incident");
-	runtime.hostControl(teamId).message_manager("no more");
+	runtime.hostControl(teamId).message_lead("no more");
 	assert.equal(runtime.takeNextActivation(teamId), undefined);
 	team = runtime.getTeam(teamId);
-	assert.equal(team.budget.used.emergencyManagerActivations, 3);
-	assert.equal(team.budget.used.managerActivations, 2);
+	assert.equal(team.budget.used.emergencyLeadActivations, 3);
+	assert.equal(team.budget.used.leadActivations, 2);
 	runtime.assertInvariants(teamId);
 });
 
@@ -810,16 +809,16 @@ test("team view and status pages stay inside one private reply frame with maxima
 	const wide = (bytes: number) => "界".repeat(Math.floor(bytes / 3) - 2);
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `size-${++ids}` });
-	const workers = Array.from({ length: TEAM_MAX_WORKERS }, (_, index) => ({ alias: `w${index + 1}`, roleDescription: wide(TEAM_MAX_ROLE_BYTES) }));
+	const workers = Array.from({ length: TEAM_MAX_MEMBERS - 1 }, (_, index) => ({ alias: `w${index + 1}`, roleDescription: wide(TEAM_MAX_ROLE_BYTES) }));
 	const { teamId } = runtime.prepare({
-		manager: { alias: "lead", roleDescription: wide(TEAM_MAX_ROLE_BYTES) }, workers,
+		members: [{ alias: "lead", roleDescription: wide(TEAM_MAX_ROLE_BYTES) }, ...workers], lead: "lead",
 		brief: { goal: wide(TEAM_MAX_TEXT_ITEM_BYTES), target: wide(TEAM_MAX_TEXT_ITEM_BYTES), constraints: [wide(TEAM_MAX_TEXT_ITEM_BYTES)] },
 		initialRequests: [], timeoutSeconds: null,
 	});
 	runtime.launch(teamId);
 	const boot = takeManager(runtime, teamId);
 	const rootCount = 64;
-	for (let index = 0; index < rootCount; index++) ok(runtime, boot, { action: "request", to: `w${(index % TEAM_MAX_WORKERS) + 1}`, task: `root ${index}` });
+	for (let index = 0; index < rootCount; index++) ok(runtime, boot, { action: "request", to: `w${(index % (TEAM_MAX_MEMBERS - 1)) + 1}`, task: `root ${index}` });
 	end(runtime, boot, yieldNow);
 	// Every root runs once and holds with a maximal multi-byte attention note: each is an open incident.
 	for (let index = 0; index < rootCount; index++) {
@@ -832,7 +831,7 @@ test("team view and status pages stay inside one private reply frame with maxima
 		host.grant(index % 2 ? { kind: "team" } : { kind: "root", rootId: rootIds[index % rootIds.length]! }, index % 2 ? { teamToolCalls: 1 } : { rootToolCalls: 1 }, wide(512));
 	}
 	assert.throws(() => host.grant({ kind: "team" }, { teamToolCalls: 1 }, "one too many"), TeamProtocolError);
-	host.message_manager(wide(TEAM_MAX_NOTE_BYTES));
+	host.message_lead(wide(TEAM_MAX_NOTE_BYTES));
 	const manager = takeManager(runtime, teamId);
 	const frameBytes = (reply: ReturnType<typeof act>["reply"], rpcRequestId: string) => {
 		const frame = { version: 2, commandId: `cmd-${rpcRequestId}`, operation: "reply", binding: manager.binding, activation: manager.scope,

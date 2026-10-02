@@ -178,6 +178,7 @@ export class TeamMemberDriver {
 			...(cwd ? { cwd } : {}),
 			...(fastMode !== undefined ? { fastMode } : {}),
 			...(contextWindow !== undefined ? { contextWindow } : {}),
+			tools: planned.policy.tools ?? null,
 			onActivity: (event) => this.recordActivity(request.teamId, activity, event),
 		});
 		this.opening.set(id, opened);
@@ -290,7 +291,7 @@ export class TeamMemberDriver {
 	}
 
 	/**
-	 * Lifecycle routers (stop/delete/shutdown) use this instead of waiting for a Manager turn. A prepared
+	 * Lifecycle routers (stop/delete/shutdown) use this instead of waiting for a lead turn. A prepared
 	 * Team is cancelled without launching any provider; only native lifetimes actually claimed are closed.
 	 */
 	stopTeam(teamId: string, reason: string, mode: "cancel" | "interrupt" = "cancel"): Promise<TeamResult> {
@@ -361,7 +362,7 @@ export class TeamMemberDriver {
 			activity.startedAt = Date.now();
 			// The transcript spans activations; this marks where the next piece of work begins.
 			const { scope } = activation.input;
-			if (scope.kind === "management") activity.transcript.mark(`── ${handlingText(scope.events)}`);
+			if (scope.kind === "events") activity.transcript.mark(`── ${handlingText(scope.events)}`);
 			else {
 				const seen = activity.works.has(workRefKey(scope.work));
 				activity.works.add(workRefKey(scope.work));

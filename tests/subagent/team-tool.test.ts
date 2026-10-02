@@ -45,14 +45,13 @@ function setup(branch: any[] = []) {
 	const broker = { assertAliasesAvailable: async () => undefined } as unknown as SessionBroker;
 	const host = new TeamSessionHost(broker, () => undefined, branch);
 	let tool: any;
-	installTeamTool({ registerTool: (definition: any) => { tool = definition; } } as any, { host: () => host, broker: () => broker });
+	installTeamTool({ registerTool: (definition: any) => { tool = definition; }, getAllTools: () => ["read", "bash", "edit", "write", "subagent", "subagent_team", "team"].map((name) => ({ name })) } as any, { host: () => host, broker: () => broker });
 	return { host, broker, tool };
 }
 
 const prepareArgs = {
 	action: "prepare",
-	manager: { alias: "lead", roleDescription: "Coordinate the review.", model: null, cwd: null, fastMode: null, contextWindow: null },
-	workers: [{ alias: "worker", roleDescription: "Inspect the assigned scope.", model: null, cwd: null, fastMode: null, contextWindow: null }],
+	members: [{ alias: "lead", roleDescription: "Coordinate the review.", model: null, cwd: null, fastMode: null, contextWindow: null }, { alias: "worker", roleDescription: "Inspect the assigned scope.", model: null, cwd: null, fastMode: null, contextWindow: null }], lead: "lead",
 	brief: { goal: "Review the requested change.", acceptanceCriteria: ["Report evidence and limitations."], constraints: null },
 	initialRequests: [{ to: "worker", task: "Inspect the changed files.", inputRefs: null }],
 	timeoutSeconds: null,
@@ -85,8 +84,8 @@ function terminal(teamId: string): TeamResult {
 	return {
 		version: 2, teamId, lifecycle: "closed", outcome: "succeeded", finalResultRefs: [], roots: [],
 		members: [
-			{ id: "lead", role: "manager", lifecycle: "closed", resourceState: "released" },
-			{ id: "worker", role: "worker", lifecycle: "closed", resourceState: "released" },
+			{ id: "lead", lifecycle: "closed", resourceState: "released" },
+			{ id: "worker", lifecycle: "closed", resourceState: "released" },
 		],
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		unresolvedIncidents: [],
@@ -122,6 +121,55 @@ test("prepare validates and pins the complete member policy without starting a p
 	assert.equal(host.pinnedPolicies(teamId)?.size, 2, "invalid launch/status payloads do not consume the prepared policy");
 });
 
+test("prepare takes members plus lead and refuses manager/workers with the migration message; nothing is reserved", async () => {
+	const { host, tool } = setup();
+	const legacy = { ...prepareArgs, members: undefined, lead: undefined, manager: prepareArgs.members[0], workers: [prepareArgs.members[1]] };
+	const migration = /manager\/workers were replaced by members plus lead: <alias>/u;
+	assert.throws(() => tool.prepareArguments(legacy), migration);
+	await assert.rejects(tool.execute("legacy", legacy, undefined, undefined, context()), migration);
+	await assert.rejects(tool.execute("mixed", { ...prepareArgs, workers: [prepareArgs.members[1]] }, undefined, undefined, context()), migration);
+	await assert.rejects(tool.execute("no-lead", { ...prepareArgs, lead: null }, undefined, undefined, context()), /lead/u);
+	await assert.rejects(tool.execute("bad-lead", { ...prepareArgs, lead: "nobody" }, undefined, undefined, context()), /lead must be the alias of one of the members/u);
+	await assert.rejects(tool.execute("lead-task", { ...prepareArgs, initialRequests: [{ to: "lead", task: "x", inputRefs: null }] }, undefined, undefined, context()), /must not be the lead/u);
+	assert.equal(host.runtime.listTeams().length, 0);
+
+	const properties = tool.parameters.properties;
+	assert.ok(properties.members && properties.lead);
+	assert.equal(Object.hasOwn(properties, "manager") || Object.hasOwn(properties, "workers"), false);
+	assert.match(tool.description, /2-9 members/u);
+
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const view = host.runtime.getTeam(prepared.details.view.teamId);
+	assert.equal(view.lead, "lead");
+	assert.deepEqual(view.members.map((member) => member.id), ["lead", "worker"]);
+	assert.match(prepared.content[0].text, /- lead \(lead\) · /u);
+	assert.match(prepared.content[0].text, /- worker · /u);
+	assert.doesNotMatch(prepared.content[0].text, /manager|worker \(|\(worker\)/iu);
+	assert.match(prepared.content[0].text, /Lead lead handles Team events/u);
+});
+
+test("a member's tools allowlist is validated against the parent's base tools at prepare, and pinned in its policy", async () => {
+	const { host, tool } = setup();
+	const withTools = (workerTools: unknown, leadTools: unknown = null) => ({ ...prepareArgs, members: [{ ...prepareArgs.members[0], tools: leadTools }, { ...prepareArgs.members[1], tools: workerTools }] });
+	await assert.rejects(tool.execute("unknown", withTools(["read", "grep"]), undefined, undefined, context()), /worker: unknown tool name\(s\) grep; available base tools: read, bash, edit, write/u);
+	for (const reserved of ["subagent", "subagent_team", "team"]) {
+		await assert.rejects(tool.execute("reserved", withTools([reserved]), undefined, undefined, context()), new RegExp(`unknown tool name\\(s\\) ${reserved}`, "u"));
+	}
+	await assert.rejects(tool.execute("lead-unknown", withTools(null, ["nope"]), undefined, undefined, context()), /lead: unknown tool name\(s\) nope/u);
+	await assert.rejects(tool.execute("duplicate", withTools(["read", "read"]), undefined, undefined, context()), /duplicate tool names/u);
+	assert.equal(host.runtime.listTeams().length, 0, "a rejected plan reserves nothing");
+
+	const prepared = await tool.execute("prepare", withTools(["read", "bash"]), undefined, undefined, context());
+	const view = host.runtime.getTeam(prepared.details.view.teamId);
+	assert.deepEqual(view.members.map((member) => member.policy.tools), [undefined, ["read", "bash"]], "the lead has every base tool unless it is restricted too");
+	assert.match(prepared.content[0].text, /- lead \(lead\) · [^\n]*tools all \+ team/u);
+	assert.match(prepared.content[0].text, /- worker · [^\n]*tools read, bash \+ team/u);
+	const second = setup();
+	const teamOnly = await second.tool.execute("team-only", withTools([], []), undefined, undefined, context());
+	assert.deepEqual(second.host.runtime.getTeam(teamOnly.details.view.teamId).members.map((member) => member.policy.tools), [[], []]);
+	assert.match(teamOnly.content[0].text, /tools none \+ team/u);
+});
+
 test("N09 resolves native/default and trust-aware context reserves, pins policy, and refuses drift before opening", async () => {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-policy-"));
 	const agentDir = join(root, "agent");
@@ -137,7 +185,7 @@ test("N09 resolves native/default and trust-aware context reserves, pins policy,
 		process.env["PI_CODING_AGENT_DIR"] = agentDir;
 		const trust = new ProjectTrustStore(agentDir);
 		const { host, tool } = setup();
-		const args = { ...prepareArgs, workers: [{ ...prepareArgs.workers[0], contextWindow: 32_000 }] };
+		const args = { ...prepareArgs, members: [prepareArgs.members[0], { ...prepareArgs.members[1], contextWindow: 32_000 }] };
 		trust.set(root, true);
 		await assert.rejects(tool.execute("prepare-trusted", args, undefined, undefined, context(project)), /contextWindow.*reserve|reserve.*contextWindow/u);
 		assert.equal(host.runtime.listTeams().length, 0, "trusted project reserve rejects the plan before reserving a Team");
@@ -280,7 +328,7 @@ function completeRoots(host: TeamSessionHost, teamId: string, result: (index: nu
 	for (let activation = host.runtime.takeNextActivation(teamId); activation; activation = host.runtime.takeNextActivation(teamId)) {
 		assert.equal(host.runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
 		const call = `call-${index}`;
-		const args = activation.scope.kind === "management" ? { action: "yield" } : { action: "reply", result: result(index++) };
+		const args = activation.scope.kind === "events" ? { action: "yield" } : { action: "reply", result: result(index++) };
 		assert.equal(host.runtime.handleAction(activation.binding, activation.scope, 1, call, args, call).ok, true);
 		host.runtime.nativeSettled(activation.binding, activation.scope.activationId, { status: "success", appliedToolCallId: call });
 		host.runtime.cleanupFinished(activation.binding, activation.scope.activationId, { ok: true });
@@ -304,10 +352,10 @@ test("launch final output carries deliverables, process, members and selected re
 	};
 	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
 	const text: string = result.content[0].text;
-	assert.match(text, /^Members:\n- lead · manager · .* · results 0 · activations 9 · active 0:00\n- worker · worker · .* · results 8 · activations 8 · active 0:00$/mu);
+	assert.match(text, /^Members:\n- lead \(lead\) · .* · results 0 · activations 9 · active 0:00\n- worker · .* · results 8 · activations 8 · active 0:00$/mu);
 	assert.match(text, /^Deliverables \(8 roots · 0 accepted · 0 waived\):/mu);
 	assert.match(text, /^Process:\n- works 8 \(8 roots, 0 sub-tasks\) · results 8/mu);
-	assert.match(text, /^Final results selected by the Manager \(in full\):/mu);
+	assert.match(text, /^Final results selected by the lead \(in full\):/mu);
 	assert.match(text, /^Details on demand: subagent_team status .*resultRef.*reads any result in full.*Team view and the timeline\./mu);
 	assert.doesNotMatch(text, /Timeline \(m:ss|worker succeeded result for/u);
 	assert.doesNotMatch(text, /ended work \S+ \(reply\)/u, "a committed reply is shown once, as its result");
@@ -337,7 +385,7 @@ function endActivation(host: TeamSessionHost, activation: RuntimeActivation, arg
 
 const sourceWriterArgs = {
 	...prepareArgs,
-	workers: ["source", "writer"].map((alias) => ({ ...prepareArgs.workers[0]!, alias })),
+	members: [prepareArgs.members[0]!, ...["source", "writer"].map((alias) => ({ ...prepareArgs.members[1]!, alias }))],
 	initialRequests: [{ to: "source", task: "Find the fixture.", inputRefs: null }, { to: "writer", task: "Write the change.", inputRefs: null }],
 };
 
@@ -363,21 +411,21 @@ test("launch panel says who a waiting member waits on, what a held one asks, and
 
 	const update = updates.at(-1);
 	const detail = (alias: string): string => update.details.members.find((member: any) => member.alias === alias).detail;
-	assert.equal(detail("source"), 'held · asks: "Which fixture should I use?" · queued for Manager');
+	assert.equal(detail("source"), 'held · asks: "Which fixture should I use?" · queued for lead');
 	assert.equal(detail("writer"), `waiting on source (held ${shortWorkRef(source.scope.work!)})`);
-	assert.equal(update.details.waitingFor, "Manager decision on source's question");
-	assert.match(update.content[0].text, /^Works: [^\n]*\nWaiting for: Manager decision on source's question\n/mu, "the Team header carries the reason under the work counts");
+	assert.equal(update.details.waitingFor, "Lead decision on source's question");
+	assert.match(update.content[0].text, /^Works: [^\n]*\nWaiting for: Lead decision on source's question\n/mu, "the Team header carries the reason under the work counts");
 	const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
-	assert.match(status.content[0].text, /^Waiting for: Manager decision on source's question$/mu);
+	assert.match(status.content[0].text, /^Waiting for: Lead decision on source's question$/mu);
 
 	const tagged = { fg: (color: string, text: string) => `{${color}|${text}}`, bold: (text: string) => text };
 	const render = (details: unknown) => tool.renderResult({ ...update, details }, { expanded: false, isPartial: true }, tagged).render(200).join("\n");
 	const panel = render(update.details);
-	assert.match(panel, /\{warning\|Waiting for: Manager decision on source's question\}/u, "a question for the Manager is colored as a warning");
-	assert.match(panel, /held · asks: "Which fixture should I use\?" · queued for Manager/u);
+	assert.match(panel, /\{warning\|Waiting for: Lead decision on source's question\}/u, "a question for the Manager is colored as a warning");
+	assert.match(panel, /held · asks: "Which fixture should I use\?" · queued for lead/u);
 	assert.match(panel, /waiting on source \(held work /u);
-	assert.ok(render({ ...update.details, waitingFor: "Manager decisions on 3 questions" }).includes("{warning|Waiting for: Manager decisions on 3 questions}"));
-	for (const text of ["Manager review of 2 results", "Manager to close the Team", "source, writer (running) · review (waiting on source)"]) {
+	assert.ok(render({ ...update.details, waitingFor: "Lead decisions on 3 questions" }).includes("{warning|Waiting for: Lead decisions on 3 questions}"));
+	for (const text of ["Lead review of 2 results", "Lead to close the Team", "source, writer (running) · review (waiting on source)"]) {
 		assert.ok(render({ ...update.details, waitingFor: text }).includes(`{dim|Waiting for: ${text}}`), `${text} is not a warning`);
 	}
 	const { waitingFor: _omitted, ...withoutReason } = update.details;
@@ -521,9 +569,9 @@ test("launch panel keeps the generic wait text while every dependency is termina
 	const detail = (alias: string): string => updates.at(-1).details.members.find((member: any) => member.alias === alias).detail;
 	assert.equal(detail("writer"), `waiting on source (running ${shortWorkRef(source.scope.work!)})`);
 
-	host.runtime.hostControl(teamId).message_manager("Drop the source work.");
+	host.runtime.hostControl(teamId).message_lead("Drop the source work.");
 	const manager = activate(host, teamId);
-	assert.equal(manager.scope.kind, "management");
+	assert.equal(manager.scope.kind, "events");
 	const cancel = { action: "control", command: "cancel_work", workId: source.scope.work!.workId, expectedRevision: 1, reason: "Not needed." };
 	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "cancel-source", cancel, "cancel-source").ok, true);
 	await new Promise((resolve) => setTimeout(resolve, 300));
@@ -623,19 +671,19 @@ test("launch panel reuses grouped subagent panels per member, live and after the
 
 	const update = updates.at(-1);
 	const [lead, worker] = update.details.members;
-	assert.deepEqual([lead.alias, lead.role, worker.alias, worker.role], ["lead", "manager", "worker", "worker"]);
+	assert.deepEqual([lead.alias, lead.member?.lead, worker.alias, worker.member?.lead], ["lead", true, "worker", false]);
 	assert.equal(worker.usage.input, 7, "in-flight native usage is shown before Runtime folds it");
 	assert.equal(worker.transcript.entries[0].text, "Inspect the changed files.", "the member's current work is its initial task");
 	assert.equal(lead.transcript.entries.some((entry: any) => entry.initial), false, "the Manager's goal is in the Team header, not repeated as its task");
 	assert.match(lead.detail, /^dispatched: worker \(queued\) · \d+ pending events$/u, "the Manager's own dispatch is still open");
 	assert.equal(worker.status, "waiting", "queued work that has not started yet is waiting, not idle");
-	assert.match(worker.detail, /^queued for a worker slot$/u);
-	assert.match(update.content[0].text, /lead\s+manager · .*pending events/u);
+	assert.match(worker.detail, /^queued for a work slot$/u);
+	assert.match(update.content[0].text, /lead \(lead\) +· .*pending events/u);
 	const livePanel = tool.renderResult(update, { expanded: false, isPartial: true }, theme).render(160).join("\n");
 	assert.match(livePanel, new RegExp(`Team ${teamId} · ACTIVE`, "u"));
 	assert.match(livePanel, /2 members · 0 complete · 0 running · 1 waiting · 1 idle · 0 failed/u);
-	assert.match(livePanel, /lead · manager · /u);
-	assert.match(livePanel, /worker · worker · [^\n]*\n[^\n]*FAST off/u);
+	assert.match(livePanel, /lead \(lead\) · /u);
+	assert.match(livePanel, /worker · [^\n]*\n[^\n]*FAST off/u);
 	const tagged = { fg: (color: string, text: string) => `{${color}|${text}}`, bold: (text: string) => text };
 	const troubled = structuredClone(update);
 	troubled.details.view.health = "needs_attention";
@@ -652,8 +700,8 @@ test("launch panel reuses grouped subagent panels per member, live and after the
 	assert.match(result.content[0].text, new RegExp(`Team ${teamId} CLOSED`, "u"), "the model still receives the bounded TeamResult text");
 	assert.equal(result.details.members.length, 2, "the finished panel keeps every member panel");
 	const finalPanel = tool.renderResult(result, { expanded: false, isPartial: false }, theme).render(160).join("\n");
-	assert.match(finalPanel, /lead · manager/u);
-	assert.match(finalPanel, /worker · worker/u);
+	assert.match(finalPanel, /lead \(lead\)/u);
+	assert.match(finalPanel, /worker · /u);
 	assert.ok(JSON.parse(JSON.stringify(result.details)).members.length === 2, "details stay serializable for session reload");
 });
 
@@ -684,7 +732,7 @@ test("runtime launch abort is a structured tool error, preserves host control, a
 	assert.equal(host.runtime.getTeam(teamId).lifecycle, "active", "unknown abort cause does not cancel the Team");
 	assert.equal(host.pinnedPolicies(teamId), undefined, "runtime abort occurs only after launch admission");
 	const initialUpdateCount = updates.length;
-	host.runtime.messageManager(teamId, "late host observation");
+	host.runtime.messageLead(teamId, "late host observation");
 	await new Promise((resolve) => setTimeout(resolve, 275));
 	assert.equal(updates.length, initialUpdateCount, "a settled launch call receives no late progress callback");
 	await host.close("Retire after launch detaches");

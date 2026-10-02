@@ -12,9 +12,12 @@ export const TEAM_ACTIVATION_TRIGGER = "Process the current Rail Team input.";
 export const TEAM_PRIVATE_ENTRY_TYPE = "rail-subagent-team-protocol-v2";
 
 // Size limits (UTF-8 bytes of the JSON serialization unless noted).
-export const TEAM_MAX_WORKERS = 8;
-export const TEAM_MAX_MEMBERS = TEAM_MAX_WORKERS + 1;
+export const TEAM_MIN_MEMBERS = 2;
+export const TEAM_MAX_MEMBERS = 9;
 export const TEAM_MAX_ALIAS_LENGTH = 64;
+export const TEAM_MAX_TOOL_NAMES = 64;
+/** Tools no member may use as a base tool: Team members cannot spawn subagents, and `team` is added by the Team itself. */
+export const TEAM_RESERVED_TOOLS: readonly string[] = ["subagent", "subagent_team", "team"];
 export const TEAM_MAX_ID_LENGTH = 256;
 export const TEAM_MAX_TASK_BYTES = 8 * 1024;
 export const TEAM_MAX_ROLE_BYTES = 4 * 1024;
@@ -22,7 +25,7 @@ export const TEAM_MAX_BRIEF_BYTES = 32 * 1024;
 export const TEAM_MAX_NOTE_BYTES = 4 * 1024; // checkpoint, attention, resume instruction, reasons
 export const TEAM_MAX_TEXT_ITEM_BYTES = 8 * 1024;
 export const TEAM_MAX_RESULT_BYTES = 12 * 1024;
-/** A Manager event may carry one complete root result plus its heading. */
+/** A Team event may carry one complete root result plus its heading. */
 export const TEAM_MAX_EVENT_MESSAGE_BYTES = TEAM_MAX_RESULT_BYTES + TEAM_MAX_NOTE_BYTES;
 export const TEAM_MAX_RESULT_ITEMS = 32;
 export const TEAM_MAX_INPUT_REFS = 32;
@@ -37,7 +40,7 @@ export const TEAM_MAX_OWNED_CHILD_PREVIEWS = 8;
 export const TEAM_MAX_DEPENDENCY_PREVIEW_BYTES = 4 * 1024;
 export const TEAM_MAX_DEPENDENCY_PREVIEWS = 8;
 export const TEAM_MAX_DELIVERED_OUTCOMES = 32;
-export const TEAM_MAX_MANAGER_EVENT_BATCH = 16;
+export const TEAM_MAX_EVENT_BATCH = 16;
 export const TEAM_STATUS_DEFAULT_LIMIT = 20;
 export const TEAM_STATUS_MAX_LIMIT = 50;
 /**
@@ -68,7 +71,6 @@ export const TEAM_ERROR_CODES = [
 ] as const;
 export type TeamErrorCode = typeof TEAM_ERROR_CODES[number];
 
-export type MemberRole = "manager" | "worker";
 export type MemberLifecycle = "starting" | "open" | "closing" | "closed" | "faulted";
 export type MemberActivity = "idle" | "running" | "settling";
 export type PauseState = "none" | "requested" | "confirmed";
@@ -78,7 +80,7 @@ export type WorkState = typeof WORK_STATES[number];
 export const TERMINAL_WORK_STATES: readonly WorkState[] = ["resolved", "failed", "cancelled", "superseded"];
 export type TeamLifecycle = "prepared" | "active" | "closing" | "closed" | "failed" | "cancelled" | "interrupted";
 export type Health = "ok" | "needs_attention";
-export type HoldReason = "attention" | "budget" | "protocol" | "manager_unavailable";
+export type HoldReason = "attention" | "budget" | "protocol" | "lead_unavailable";
 export type TeamOutcome = "succeeded" | "partial" | "failed";
 
 export interface WorkRef { workId: string; revision: number }
@@ -138,7 +140,6 @@ export interface WorkRecord {
 }
 export interface MemberRecord {
 	id: string;
-	role: MemberRole;
 	roleDescription: string;
 	lifecycle: MemberLifecycle;
 	activity: MemberActivity;
@@ -164,6 +165,8 @@ export interface TeamMemberPolicy {
 	fastMode?: boolean;
 	searchMode?: string;
 	contextWindow?: number;
+	/** Allowlist of base tool names; absent = every base tool. `team` is always added. */
+	tools?: string[];
 }
 export interface TeamMemberPlan {
 	alias: string;
@@ -173,8 +176,9 @@ export interface TeamMemberPlan {
 export interface TeamInitialRequest { to: string; task: string; inputRefs: string[] }
 export interface TeamPlan {
 	budget?: TeamBudgetPreset;
-	manager: TeamMemberPlan;
-	workers: TeamMemberPlan[];
+	members: TeamMemberPlan[];
+	/** Alias of the member that handles Team events and requests the initial work. */
+	lead: string;
 	brief: TeamBrief;
 	initialRequests: TeamInitialRequest[];
 	/** null = no team-wide deadline. */
@@ -185,7 +189,7 @@ export interface TeamPlan {
 // Budgets. Host configuration only; the model-facing schema never exposes a way to raise them.
 
 export interface TeamBudgetLimits {
-	workerPermits: number;
+	workPermits: number;
 	memberUnresolvedWork: number;
 	teamWorks: number;
 	rootChildren: number;
@@ -193,19 +197,19 @@ export interface TeamBudgetLimits {
 	workRevisions: number;
 	rootActivations: number;
 	teamActivations: number;
-	managerActivations: number;
+	leadActivations: number;
 	activationModelRequests: number;
 	rootModelRequests: number;
 	teamModelRequests: number;
 	activationToolCalls: number;
 	rootToolCalls: number;
 	teamToolCalls: number;
-	emergencyManagerActivations: number;
+	emergencyLeadActivations: number;
 	reservedResultBytes: number;
 }
 export const TEAM_BUDGET_UNLIMITED = 1_000_000_000;
 const STANDARD_TEAM_BUDGET: Readonly<TeamBudgetLimits> = Object.freeze({
-	workerPermits: 4,
+	workPermits: 4,
 	memberUnresolvedWork: 64,
 	teamWorks: 512,
 	rootChildren: 64,
@@ -213,25 +217,25 @@ const STANDARD_TEAM_BUDGET: Readonly<TeamBudgetLimits> = Object.freeze({
 	workRevisions: 32,
 	rootActivations: 128,
 	teamActivations: 512,
-	managerActivations: 128,
+	leadActivations: 128,
 	activationModelRequests: 64,
 	rootModelRequests: 256,
 	teamModelRequests: 1024,
 	activationToolCalls: 256,
 	rootToolCalls: 1024,
 	teamToolCalls: 4096,
-	emergencyManagerActivations: 3,
+	emergencyLeadActivations: 3,
 	reservedResultBytes: 16 * 1024 * 1024,
 });
 export const TEAM_BUDGET_PRESETS = Object.freeze({
 	standard: STANDARD_TEAM_BUDGET,
 	long: Object.freeze({ ...STANDARD_TEAM_BUDGET,
-		teamActivations: 4096, managerActivations: 1024, teamModelRequests: 8192, teamToolCalls: 32768,
+		teamActivations: 4096, leadActivations: 1024, teamModelRequests: 8192, teamToolCalls: 32768,
 		teamWorks: 4096, rootChildren: 512, rootActivations: 1024, rootModelRequests: 2048, rootToolCalls: 8192,
 		workRevisions: 128, reservedResultBytes: 64 * 1024 * 1024,
 	}),
 	unlimited: Object.freeze({ ...STANDARD_TEAM_BUDGET,
-		teamActivations: TEAM_BUDGET_UNLIMITED, managerActivations: TEAM_BUDGET_UNLIMITED,
+		teamActivations: TEAM_BUDGET_UNLIMITED, leadActivations: TEAM_BUDGET_UNLIMITED,
 		teamModelRequests: TEAM_BUDGET_UNLIMITED, teamToolCalls: TEAM_BUDGET_UNLIMITED,
 		rootActivations: TEAM_BUDGET_UNLIMITED, rootModelRequests: TEAM_BUDGET_UNLIMITED, rootToolCalls: TEAM_BUDGET_UNLIMITED,
 		teamWorks: 20000, rootChildren: 2048, workRevisions: 512, reservedResultBytes: TEAM_MAX_RESERVED_RESULT_BYTES,
@@ -240,7 +244,7 @@ export const TEAM_BUDGET_PRESETS = Object.freeze({
 export type TeamBudgetPreset = keyof typeof TEAM_BUDGET_PRESETS;
 export const DEFAULT_TEAM_BUDGET: Readonly<TeamBudgetLimits> = TEAM_BUDGET_PRESETS.long;
 /** Counters a host grant may raise for the whole team. */
-export const TEAM_GRANTABLE_COUNTERS = ["teamActivations", "managerActivations", "teamModelRequests", "teamToolCalls", "emergencyManagerActivations"] as const;
+export const TEAM_GRANTABLE_COUNTERS = ["teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "emergencyLeadActivations"] as const;
 /** Counters a host grant may raise for one root. */
 export const ROOT_GRANTABLE_COUNTERS = ["rootChildren", "rootActivations", "rootModelRequests", "rootToolCalls"] as const;
 export type TeamGrantCounter = typeof TEAM_GRANTABLE_COUNTERS[number];
@@ -293,15 +297,14 @@ export interface BindingV2 {
 	version: 2;
 	teamId: string;
 	memberId: string;
-	role: MemberRole;
 	epoch: string;
 }
 export interface ActivationScope {
 	activationId: string;
-	kind: "work" | "management";
-	/** Required for kind=work, forbidden for management. */
+	kind: "work" | "events";
+	/** Required for kind=work, forbidden for events. */
 	work?: WorkRef;
-	/** Required for kind=management. */
+	/** Required for kind=events (the lead's Team events). */
 	eventBatchId?: string;
 }
 
@@ -341,7 +344,8 @@ export type ParentCommand =
 	| { version: 2; commandId: string; operation: "deactivate"; binding: BindingV2; activation: ActivationScope }
 	| { version: 2; commandId: string; operation: "unbind"; binding: BindingV2 };
 
-export interface MemberLoadout { role: MemberRole; teamTool: true }
+/** `tools` is the base-tool allowlist (null = all base tools); `team` is always added. */
+export interface MemberLoadout { tools: string[] | null; teamTool: true }
 
 export type GateDecision =
 	| { allow: true }
@@ -355,9 +359,9 @@ export type PrivateReply =
 // ---------------------------------------------------------------------------------------------
 // Activation input and end intents.
 
-export interface ManagerEventView {
+export interface TeamEventView {
 	id: string;
-	kind: ManagerEventKind;
+	kind: TeamEventKind;
 	message: string;
 	actor?: "@host";
 	work?: WorkRef;
@@ -365,9 +369,9 @@ export interface ManagerEventView {
 	incidentId?: string;
 	resultRef?: string;
 }
-export const MANAGER_EVENT_KINDS = ["BOOT", "USER_COMMAND", "ROOT_RESULT_READY", "DECISION_REQUEST", "WORK_HELD", "MEMBER_FAULTED",
+export const TEAM_EVENT_KINDS = ["BOOT", "USER_COMMAND", "ROOT_RESULT_READY", "WORK_HELD", "MEMBER_FAULTED",
 	"MEMBER_CLOSED", "DEPENDENCY_UNAVAILABLE", "BUDGET_HIT", "TEAM_QUIESCENT"] as const;
-export type ManagerEventKind = typeof MANAGER_EVENT_KINDS[number];
+export type TeamEventKind = typeof TEAM_EVENT_KINDS[number];
 
 export interface OutcomeView {
 	work: WorkRef;
@@ -379,7 +383,7 @@ export interface OutcomeView {
 
 /**
  * Steps this activation may take and what its scope has left after it (spec 9.4). Values are the
- * tightest applicable limit; emergency Manager activations are bounded by activation and emergency counts only.
+ * tightest applicable limit; emergency lead activations are bounded by activation and emergency counts only.
  */
 export interface ActivationBudgetSummary {
 	emergency: boolean;
@@ -393,9 +397,9 @@ export interface ActivationInput {
 	version: 2;
 	teamId: string;
 	deliveryId: string;
-	member: { id: string; role: MemberRole; roleDescription: string };
+	member: { id: string; lead: boolean; roleDescription: string };
 	brief: TeamBrief;
-	roster: Array<{ id: string; role: MemberRole; lifecycle: MemberLifecycle; rolePreview: string }>;
+	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle; rolePreview: string }>;
 	scope:
 		| {
 			kind: "work";
@@ -411,7 +415,7 @@ export interface ActivationInput {
 			resumeInstruction?: string;
 			previous?: { revision: number; state: WorkState; checkpoint?: string; resultRef?: string; error?: WorkError };
 		}
-		| { kind: "management"; eventBatchId: string; events: ManagerEventView[]; checkpoint?: string; emergency: boolean };
+		| { kind: "events"; eventBatchId: string; events: TeamEventView[]; checkpoint?: string; emergency: boolean };
 	outcomes: OutcomeView[];
 	/** Outcomes that did not fit this input; they stay undelivered for a later activation. */
 	omittedOutcomes: number;
@@ -427,7 +431,7 @@ export type EndIntent =
 	| { kind: "reply"; work: WorkRef; result: WorkResult; toolCallId: string }
 	| { kind: "yield_dependencies"; work: WorkRef; waitingFor: WorkRef[]; checkpoint: string; toolCallId: string }
 	| { kind: "yield_attention"; work: WorkRef; attention: string; checkpoint: string; toolCallId: string }
-	| { kind: "manager_idle"; checkpoint?: string; toolCallId: string }
+	| { kind: "idle"; checkpoint?: string; toolCallId: string }
 	| { kind: "close_team"; closeId: string; toolCallId: string };
 
 export interface DeliveryRecord {
@@ -510,10 +514,10 @@ export interface TeamBudgetView {
 	used: {
 		teamWorks: number;
 		teamActivations: number;
-		managerActivations: number;
+		leadActivations: number;
 		teamModelRequests: number;
 		teamToolCalls: number;
-		emergencyManagerActivations: number;
+		emergencyLeadActivations: number;
 		reservedResultBytes: number;
 	};
 	exhausted: boolean;
@@ -531,7 +535,7 @@ export interface TeamTeamView {
 	health: Health;
 	stateVersion: number;
 	eventSeq: number;
-	manager: string;
+	lead: string;
 	timeoutSeconds: number | null;
 	deadline: number | null;
 	brief: TeamBrief;
@@ -541,7 +545,7 @@ export interface TeamTeamView {
 	incidents: TeamIncidentView[];
 	incidentsOmitted: number;
 	budget: TeamBudgetView;
-	/** Team total of settled native usage (Manager plus workers). */
+	/** Team total of settled native usage (all members). */
 	usage: SubagentUsage;
 	outcome?: TeamOutcome;
 	reason?: string;
@@ -566,7 +570,7 @@ export interface TeamResult {
 		resultRef?: string;
 		review?: { disposition: "accepted" | "waived"; reason?: string };
 	}>;
-	members: Array<{ id: string; role: MemberRole; lifecycle: MemberLifecycle; resourceState: ResourceState }>;
+	members: Array<{ id: string; lifecycle: MemberLifecycle; resourceState: ResourceState }>;
 	usage: SubagentUsage;
 	unresolvedIncidents: Array<{ id: string; code: string; message: string }>;
 	unresolvedIncidentsOmitted?: number;

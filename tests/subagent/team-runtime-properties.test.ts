@@ -5,7 +5,7 @@ import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-
 import {
 	TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_NOTE_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS,
 	TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_FRAME_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES,
-	TEAM_MAX_WORKERS, type TeamReply, type WorkRef,
+	TEAM_MAX_MEMBERS, type TeamReply, type WorkRef,
 } from "../../tools/subagents/team-protocol";
 
 /** Small deterministic PRNG (mulberry32) so every failing trace replays from its seed. */
@@ -25,8 +25,7 @@ function runtimeFor(workers: string[], initialRequests: Array<{ to: string; task
 	let time = 1_700_000_000_000;
 	const runtime = new TeamRuntime({ now: () => time++, createId: () => `id${++ids}`, limits });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage, review and close." },
-		workers: workers.map((alias) => ({ alias, roleDescription: `Worker ${alias}.` })),
+		members: [{ alias: "lead", roleDescription: "Manage, review and close." }, ...workers.map((alias) => ({ alias, roleDescription: `Worker ${alias}.` }))], lead: "lead",
 		brief: { goal: "Property-test the Team Runtime." }, initialRequests, timeoutSeconds: null,
 	});
 	runtime.launch(prepared.teamId);
@@ -128,7 +127,7 @@ function runSeed(seed: number, steps: number): string[] {
 		const scope = flight.activation.scope;
 		const input = flight.activation.input;
 		const roll = random();
-		if (scope.kind === "management") {
+		if (scope.kind === "events") {
 			const works = runtime.listWorks(teamId);
 			const target = pick(works);
 			if (roll < 0.25) act(flight, { action: "request", to: pick(workers)!, task: `root ${calls}` });
@@ -158,7 +157,7 @@ function runSeed(seed: number, steps: number): string[] {
 
 	const settle = (flight: Flight) => {
 		const { binding, scope } = flight.activation;
-		if (random() < 0.06 && binding.role === "worker") {
+		if (random() < 0.06 && binding.memberId !== "lead") {
 			// Transport loss before agent_settled: outcome unknown, only this member is isolated.
 			const exitConfirmed = random() < 0.5;
 			const lost = runtime.activationLost(binding, scope.activationId, { code: "PROTOCOL_FAILURE", message: "injected transport loss", outcomeUnknown: true }, exitConfirmed);
@@ -168,7 +167,7 @@ function runSeed(seed: number, steps: number): string[] {
 			closed.push(flight);
 			return;
 		}
-		const failure = random() < 0.03 && binding.role === "worker";
+		const failure = random() < 0.03 && binding.memberId !== "lead";
 		const completion = failure ? { status: "error" as const, error: { code: "PROVIDER_ERROR", message: "injected native failure" } }
 			: { status: "success" as const, ...(flight.intentCallId ? { appliedToolCallId: flight.intentCallId } : {}), finalAssistantText: random() < 0.5 ? `natural ${calls}` : "" };
 		trace.push(`${flight.label} settling ${completion.status}`);
@@ -248,7 +247,7 @@ function runSeed(seed: number, steps: number): string[] {
 			const memberId = unconfirmedExits.shift()!;
 			trace.push(`exit confirmed ${memberId} -> ${runtime.memberExitConfirmed(runtime.bindingForDriver(teamId, memberId)).ok}`);
 		} else {
-			runtime.messageManager(teamId, `host note ${step % 3}`);
+			runtime.messageLead(teamId, `host note ${step % 3}`);
 			trace.push(`host message ${step % 3}`);
 		}
 		check(`step ${step}`);
@@ -265,7 +264,7 @@ function runSeed(seed: number, steps: number): string[] {
 		flights.push(flight);
 		trace.push(`${flight.label} reserved`);
 		withTrace("drain input", () => advance(flight));
-		if (activation.scope.kind === "management") act(flight, { action: "yield" });
+		if (activation.scope.kind === "events") act(flight, { action: "yield" });
 		else {
 			const reply = act(flight, { action: "reply", result: { status: "succeeded", summary: "drain" } });
 			if (!reply.ok) {
@@ -383,7 +382,7 @@ test("W02: an unresolved request far behind many newer events remains addressabl
 	settleClean(runtime, boot, "boot-yield");
 	for (let index = 0; index < 70; index++) {
 		const noise = start(runtime, teamId);
-		if (noise.scope.kind === "management") {
+		if (noise.scope.kind === "events") {
 			assert.equal(call(runtime, noise, 1, `m-${index}`, { action: "yield" }).ok, true);
 			settleClean(runtime, noise, `m-${index}`);
 			index--;
@@ -439,13 +438,12 @@ test("D07/X04: a maximal roster with maximal multi-byte, escape-heavy inputs fit
 		while (jsonBytes(`${text}a`) - 2 <= bytes) text += "a";
 		return text;
 	};
-	const workers = Array.from({ length: TEAM_MAX_WORKERS }, (_value, index) => `w${index + 1}`);
+	const workers = Array.from({ length: TEAM_MAX_MEMBERS - 1 }, (_value, index) => `w${index + 1}`);
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `max${++ids}` });
 	const briefGoal = fill(TEAM_MAX_BRIEF_BYTES - 64);
 	const plan = {
-		manager: { alias: "lead", roleDescription: fill(TEAM_MAX_ROLE_BYTES) },
-		workers: workers.map((alias) => ({ alias, roleDescription: fill(TEAM_MAX_ROLE_BYTES) })),
+		members: [{ alias: "lead", roleDescription: fill(TEAM_MAX_ROLE_BYTES) }, ...workers.map((alias) => ({ alias, roleDescription: fill(TEAM_MAX_ROLE_BYTES) }))], lead: "lead",
 		brief: { goal: briefGoal },
 		initialRequests: workers.map((to) => ({ to, task: fill(TEAM_MAX_TASK_BYTES) })),
 		timeoutSeconds: null,
@@ -579,7 +577,7 @@ function parentWaitingForTwo() {
 
 function managerStep(runtime: TeamRuntime, teamId: string, actions: Array<Record<string, unknown>>): TeamReply[] {
 	const manager = start(runtime, teamId);
-	assert.equal(manager.scope.kind, "management");
+	assert.equal(manager.scope.kind, "events");
 	const replies = actions.map((args, index) => call(runtime, manager, index + 1, `m-${manager.scope.activationId}-${index}`, args));
 	assert.equal(call(runtime, manager, actions.length + 1, `m-${manager.scope.activationId}-yield`, { action: "yield" }).ok, true);
 	settleClean(runtime, manager, `m-${manager.scope.activationId}-yield`);
@@ -712,7 +710,7 @@ test("13.5: releasing an unrelated protocol hold does not acknowledge an unknown
 test("13.3: a normal cancel_work whose native cleanup is confirmed stays a known, automatically deliverable outcome", () => {
 	const { runtime, teamId, parent, b, childA, childB } = parentWaitingForTwo();
 	for (const child of [childA, childB]) assert.equal(runtime.inputReady(child.binding, child.scope.activationId, child.deliveryId).ok, true);
-	assert.equal(runtime.messageManager(teamId, "Cancel child B").status, "applied");
+	assert.equal(runtime.messageLead(teamId, "Cancel child B").status, "applied");
 	const [cancel] = managerStep(runtime, teamId, [{ action: "control", command: "cancel_work", workId: b.workId, expectedRevision: 1, reason: "no longer needed" }]);
 	assert.equal(cancel?.ok, true);
 	assert.equal(runtime.nativeSettled(childB.binding, childB.scope.activationId, { status: "aborted" }).ok, true);
@@ -771,16 +769,16 @@ test("X07: a Manager event arriving at any latch of a management activation join
 	for (const latch of LATCHES) {
 		const { runtime, teamId } = runtimeFor(["w1"], []);
 		const boot = runtime.takeNextActivation(teamId)!;
-		assert.equal(boot.scope.kind, "management");
-		const sealed = boot.input.scope.kind === "management" ? boot.input.scope.events.map((event) => event.id) : [];
+		assert.equal(boot.scope.kind, "events");
+		const sealed = boot.input.scope.kind === "events" ? boot.input.scope.events.map((event) => event.id) : [];
 		const finish = toLatch(runtime, boot, latch, { action: "yield" }, `boot-${latch}`);
-		const receipt = runtime.messageManager(teamId, `arrived at ${latch}`);
+		const receipt = runtime.messageLead(teamId, `arrived at ${latch}`);
 		assert.equal(receipt.status, "applied");
 		assert.equal(runtime.takeNextActivation(teamId), undefined, "no second Manager activation while one is in flight");
 		finish();
 		const next = runtime.takeNextActivation(teamId)!;
-		assert.equal(next.scope.kind, "management");
-		const events = next.input.scope.kind === "management" ? next.input.scope.events : [];
+		assert.equal(next.scope.kind, "events");
+		const events = next.input.scope.kind === "events" ? next.input.scope.events : [];
 		assert.deepEqual(events.filter((event) => event.kind !== "TEAM_QUIESCENT").map((event) => event.kind), ["USER_COMMAND"],
 			`the new event, not the sealed BOOT batch, forms the next batch (${latch})`);
 		assert.equal(events.some((event) => sealed.includes(event.id)), false, "the sealed batch is never redelivered");
@@ -820,7 +818,7 @@ test("P02/P07: forged identity fields and illegal combinations are refused befor
 	assert.equal(errorCode(() => call(runtime, worker, 2, "worker-control", { action: "control", command: "pause_member", memberId: "w2" })), "FORBIDDEN_ACTION");
 	assert.equal(errorCode(() => call(runtime, worker, 3, "self", { action: "request", to: "w1", task: "self" })), "SELF_REQUEST");
 	assert.equal(errorCode(() => call(runtime, worker, 4, "unknown", { action: "request", to: "nobody", task: "x" })), "UNKNOWN_MEMBER");
-	const forgedRole = { ...worker.binding, role: "manager" as const };
+	const forgedRole = { ...worker.binding, lead: true };
 	assert.ok(errorCode(() => runtime.handleAction(forgedRole, worker.scope, 5, "forged-role", { action: "control", command: "pause_member", memberId: "w2" }, "forged-role")));
 	const staleEpoch = { ...worker.binding, epoch: "not-the-lifetime-epoch" };
 	assert.ok(errorCode(() => runtime.handleAction(staleEpoch, worker.scope, 5, "stale-epoch", { action: "request", to: "w2", task: "t" }, "stale-epoch")));
@@ -836,7 +834,7 @@ test("P02/P07: forged identity fields and illegal combinations are refused befor
 test("P09: two Teams with the same aliases cannot reference each other's work or results; the other Team is unchanged", () => {
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `x${++ids}` });
-	const plan = (goal: string) => ({ manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+	const plan = (goal: string) => ({ members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal }, initialRequests: [{ to: "w1", task: goal }], timeoutSeconds: null });
 	const a = runtime.prepare(plan("Team A")).teamId;
 	const b = runtime.prepare(plan("Team B")).teamId;
@@ -1034,7 +1032,7 @@ test("L04/L06/L07/L08: outgoing obligations block close_member, the Manager cann
 	assert.ok(child.ok && child.receipt?.status === "accepted");
 	assert.equal(call(runtime, root, 2, "wait", { action: "yield", waitingFor: [child.receipt.work], checkpoint: "c" }).ok, true);
 	settleClean(runtime, root, "wait");
-	assert.equal(runtime.messageManager(teamId, "try closing").status, "applied");
+	assert.equal(runtime.messageLead(teamId, "try closing").status, "applied");
 	const manager = start(runtime, teamId);
 	const w1Close = call(runtime, manager, 1, "close-w1", { action: "control", command: "close_member", memberId: "w1" });
 	assert.equal(!w1Close.ok && w1Close.error.code, "CLOSE_BLOCKED", "w1 still owns work and awaits its outgoing child");
@@ -1062,7 +1060,7 @@ test("L04/L06/L07/L08: outgoing obligations block close_member, the Manager cann
 	assert.ok(closing.ok && closing.receipt?.status === "closing");
 	const worksBefore = runtime.listWorks(teamId).length;
 	assert.ok(["ACTIVATION_ENDING", "INTENT_CONFLICT"].includes(errorCode(() => call(runtime, final, 6, "after-close", { action: "request", to: "w2", task: "after close" }))));
-	assert.throws(() => runtime.messageManager(teamId, "after close"), /current lifecycle/u, "no new Manager work after the close decision");
+	assert.throws(() => runtime.messageLead(teamId, "after close"), /current lifecycle/u, "no new Manager work after the close decision");
 	assert.equal(runtime.listWorks(teamId).length, worksBefore, "no work is accepted after the linearized close_team");
 	runtime.assertInvariants(teamId);
 });
@@ -1076,7 +1074,7 @@ test("G02/G03/G04: duplicate result/incident facts raise one Manager event; stat
 	// Late duplicate evidence of the same commit is idempotent and cannot produce a second ROOT_RESULT_READY.
 	assert.equal(runtime.cleanupFinished(worker.binding, worker.scope.activationId, { ok: true }).ok, true);
 	const manager = start(runtime, teamId);
-	const events = manager.input.scope.kind === "management" ? manager.input.scope.events : [];
+	const events = manager.input.scope.kind === "events" ? manager.input.scope.events : [];
 	assert.equal(events.filter((event) => event.kind === "ROOT_RESULT_READY").length, 1);
 	const noops = [
 		{ action: "status", view: "team" },
@@ -1090,7 +1088,7 @@ test("G02/G03/G04: duplicate result/incident facts raise one Manager event; stat
 	assert.equal(call(runtime, manager, 9, "idle", { action: "yield" }).ok, true);
 	settleClean(runtime, manager, "idle");
 	assert.equal(runtime.takeNextActivation(teamId), undefined, "the handled batch is not requeued and no-op actions made no new event");
-	assert.equal(runtime.liveEffects(teamId).unprocessedManagerEvents, 0);
+	assert.equal(runtime.liveEffects(teamId).unprocessedEvents, 0);
 	assert.equal(runtime.getTeam(teamId).lifecycle, "active", "an idle, unclosed Team stays active without polling or failure");
 	runtime.assertInvariants(teamId);
 });
@@ -1122,9 +1120,9 @@ test("19.1: the Team status text shows lifecycle, health, member activity/pause,
 	settleClean(runtime, other, "attention");
 	const text = formatTeamView(runtime.getTeam(teamId), runtime.listWorks(teamId)).join("\n");
 	assert.match(text, /ACTIVE · needs attention 1/u);
-	assert.match(text, new RegExp(`w1 +worker +· OPEN · RUNNING ${running.scope.work!.workId}@1 "Review the protocol codec" · queued 0 · blocked 0 · held 0`, "u"));
-	assert.match(text, /w2 +worker +· OPEN · IDLE · queued 0 · blocked 1 · held 1/u);
-	assert.match(text, /lead +manager +· OPEN/u);
+	assert.match(text, new RegExp(`w1 +· OPEN · RUNNING ${running.scope.work!.workId}@1 "Review the protocol codec" · queued 0 · blocked 0 · held 0`, "u"));
+	assert.match(text, /w2 +· OPEN · IDLE · queued 0 · blocked 1 · held 1/u);
+	assert.match(text, /lead \(lead\) +· OPEN/u);
 	assert.match(text, /FAST off · SEARCH off/u);
 	assert.match(text, /Holds: .*attention \(w2\)/u);
 	assert.match(text, /Incident .*\[WORK_HELD\]|Incident .*\[ATTENTION/u);
@@ -1243,13 +1241,13 @@ test("P05/P06: late frames from a finished activation never touch the current wo
 test("A08/G01: a Manager natural answer leaves the Team active with an idle Manager, no summary, no close and no polling activation", () => {
 	const { runtime, teamId } = runtimeFor(["w1"], []);
 	const boot = start(runtime, teamId);
-	assert.equal(boot.scope.kind, "management");
+	assert.equal(boot.scope.kind, "events");
 	assert.equal(runtime.nativeSettled(boot.binding, boot.scope.activationId, { status: "success", finalAssistantText: "Everything looks done; here is my summary." }).ok, true);
 	assert.equal(runtime.cleanupFinished(boot.binding, boot.scope.activationId, { ok: true }).ok, true);
 	// At most one semantic TEAM_QUIESCENT batch for this state version; then nothing, however often the drain runs.
 	const quiescent = runtime.takeNextActivation(teamId);
 	if (quiescent) {
-		assert.deepEqual(quiescent.input.scope.kind === "management" && quiescent.input.scope.events.map((event) => event.kind), ["TEAM_QUIESCENT"]);
+		assert.deepEqual(quiescent.input.scope.kind === "events" && quiescent.input.scope.events.map((event) => event.kind), ["TEAM_QUIESCENT"]);
 		assert.equal(runtime.inputReady(quiescent.binding, quiescent.scope.activationId, quiescent.deliveryId).ok, true);
 		assert.equal(runtime.nativeSettled(quiescent.binding, quiescent.scope.activationId, { status: "success", finalAssistantText: "Still nothing to do." }).ok, true);
 		assert.equal(runtime.cleanupFinished(quiescent.binding, quiescent.scope.activationId, { ok: true }).ok, true);
@@ -1306,7 +1304,7 @@ test("P08: every retired v1 action and field returns its migration error from th
 		[{ action: "send", to: "w2" }, /send was replaced by request \{to, task\}/u],
 		[{ action: "report", result: { status: "succeeded", summary: "x" } }, /report was replaced by reply/u],
 		[{ action: "wait" }, /wait was replaced by yield \{waitingFor/u],
-		[{ action: "finish" }, /finish was replaced by reply \{result\} \(worker\) or control close_team/u],
+		[{ action: "finish" }, /finish was replaced by reply \{result\} for the current work, or control close_team/u],
 		[{ action: "request", to: "w2", task: "t", afterSeq: 3 }, /afterSeq was removed/u],
 		[{ action: "control", command: "revise_work", workId: "x", expectedRevision: 1, task: "t", supersedes: "old" }, /supersedes was removed/u],
 		[{ action: "reply", result: { status: "succeeded", summary: "x" }, replyTo: "m1" }, /replyTo was removed/u],

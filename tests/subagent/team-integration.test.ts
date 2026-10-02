@@ -8,10 +8,12 @@ import { TEAM_MAX_LIVE_TEAMS, type BindingV2 } from "../../tools/subagents/team-
 
 const model: RailModelRef = { provider: "test-provider", modelId: "test-model", thinkingLevel: "medium" };
 
-function fakeBroker(onClose: (memberId: string) => void): SessionBroker {
+function fakeBroker(onClose: (memberId: string) => void, opened: Array<{ binding: BindingV2; tools?: string[] | null }> = []): SessionBroker {
 	let nextAgent = 0;
 	return {
-		async openTeamMember({ binding }: { binding: BindingV2 }) {
+		async openTeamMember(request: { binding: BindingV2; tools?: string[] | null }) {
+			const { binding } = request;
+			opened.push(request);
 			const instance = {
 				version: 2,
 				agentId: `agt_test${++nextAgent}`,
@@ -42,8 +44,7 @@ async function createActiveHost(branch: string, records: Array<{ branch: string;
 	const broker = fakeBroker(onClose);
 	const host = new TeamSessionHost(broker, (record) => records.push({ branch, record }), []);
 	const prepared = host.runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage the Team." },
-		workers: [{ alias: "worker", roleDescription: "Complete assigned work." }],
+		members: [{ alias: "lead", roleDescription: "Manage the Team." }, { alias: "worker", roleDescription: "Complete assigned work." }], lead: "lead",
 		brief: { goal: "Exercise the branch-owned Team lifecycle." },
 		initialRequests: [],
 		timeoutSeconds: null,
@@ -95,8 +96,7 @@ test("interruption journal write failure is surfaced as a host diagnostic while 
 		records.push({ branch: "current", record });
 	}, []);
 	const prepared = host.runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage the Team." },
-		workers: [{ alias: "worker", roleDescription: "Complete assigned work." }],
+		members: [{ alias: "lead", roleDescription: "Manage the Team." }, { alias: "worker", roleDescription: "Complete assigned work." }], lead: "lead",
 		brief: { goal: "Surface missing interruption history." }, initialRequests: [], timeoutSeconds: null,
 	});
 	for (const memberId of ["lead", "worker"]) await host.driver.openMember({ teamId: prepared.teamId, memberId, model });
@@ -132,8 +132,7 @@ test("the driver forgets member activity of Teams the Runtime has evicted", asyn
 	const teamIds: string[] = [];
 	for (let index = 0; index < TEAM_MAX_LIVE_TEAMS + 1; index++) {
 		const prepared = host.runtime.prepare({
-			manager: { alias: `lead-${index}`, roleDescription: "Manage the Team." },
-			workers: [{ alias: `worker-${index}`, roleDescription: "Complete assigned work." }],
+			members: [{ alias: `lead-${index}`, roleDescription: "Manage the Team." }, { alias: `worker-${index}`, roleDescription: "Complete assigned work." }], lead: `lead-${index}`,
 			brief: { goal: "Exercise driver bookkeeping." },
 			initialRequests: [],
 			timeoutSeconds: null,
@@ -146,4 +145,17 @@ test("the driver forgets member activity of Teams the Runtime has evicted", asyn
 	assert.equal(host.runtime.listTeams().some((team) => team.teamId === teamIds[0]), false, "the Runtime evicted the oldest ended Team");
 	assert.equal(host.driver.memberActivity(teamIds[0]!, "lead-0"), undefined, "its member activity is released with it");
 	assert.ok(host.driver.memberActivity(teamIds.at(-1)!, `lead-${TEAM_MAX_LIVE_TEAMS}`), "retained Teams keep their activity");
+});
+
+test("a member's tools allowlist reaches the Broker when its lifetime opens; members without one keep every base tool", async () => {
+	const opened: Array<{ binding: BindingV2; tools?: string[] | null }> = [];
+	const host = new TeamSessionHost(fakeBroker(() => {}, opened), () => {}, []);
+	const prepared = host.runtime.prepare({
+		members: [{ alias: "lead", roleDescription: "Coordinate." }, { alias: "reader", roleDescription: "Read only.", tools: ["read"] }, { alias: "bare", roleDescription: "No base tools.", tools: [] }],
+		lead: "lead", brief: { goal: "Restrict base tools." }, initialRequests: [], timeoutSeconds: null,
+	});
+	assert.deepEqual(prepared.members.map((member) => [member.id, member.policy.tools]), [["lead", undefined], ["reader", ["read"]], ["bare", []]]);
+	for (const memberId of ["lead", "reader", "bare"]) await host.driver.openMember({ teamId: prepared.teamId, memberId, model });
+	assert.deepEqual(opened.map(({ binding, tools }) => [binding.memberId, tools]), [["lead", null], ["reader", ["read"]], ["bare", []]]);
+	await host.driver.stopTeam(prepared.teamId, "done");
 });

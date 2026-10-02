@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_CACHE, TEAM_COMMAND_DESCRIPTION,
-	TEAM_MAX_PENDING_OPERATIONS, TEAM_PRIVATE_ENTRY_TYPE,
+	TEAM_MAX_PENDING_OPERATIONS, TEAM_PRIVATE_ENTRY_TYPE, TEAM_RESERVED_TOOLS,
 	type ActivationInput, type ActivationScope, type BindingV2, type ChildRequestFrame, type ParentCommand,
 	type PrivateAction, type PrivateReply, type TeamReply,
 } from "./team-protocol";
@@ -226,8 +226,9 @@ export default function install(pi: ExtensionAPI): void {
 						previousTools = pi.getActiveTools();
 						registerTeamTool();
 						binding = command.binding;
-						const memberTools = previousTools.filter((name) => !["subagent", "subagent_team", "team"].includes(name));
-						pi.setActiveTools(command.loadout.role === "manager" ? ["team"] : [...memberTools, "team"]);
+						const memberTools = previousTools.filter((name) => !TEAM_RESERVED_TOOLS.includes(name));
+						const allowed = command.loadout.tools;
+						pi.setActiveTools([...(allowed ? memberTools.filter((name) => allowed.includes(name)) : memberTools), "team"]);
 						break;
 					}
 					case "activate": {
@@ -309,7 +310,7 @@ export default function install(pi: ExtensionAPI): void {
 		};
 		active.customMessageCreated = true;
 		return { ...(message ? { message } : {}),
-			systemPrompt: `${event.systemPrompt}\n\nTeam member: ${binding.memberId} (${binding.role}). The rail-team-activation custom message is authoritative for this activation. Use the team tool for Team operations. A successful reply, yield, or close_team ends this native activation; each end intent must be the sole tool call in the finalized assistant batch. Do not claim a result unless the runtime accepts the team reply.` };
+			systemPrompt: `${event.systemPrompt}\n\nTeam member: ${binding.memberId}. The rail-team-activation custom message is authoritative for this activation. Use the team tool for Team operations. A successful reply, yield, or close_team ends this native activation; each end intent must be the sole tool call in the finalized assistant batch. Do not claim a result unless the runtime accepts the team reply.` };
 	});
 
 	pi.on("context", async (event, ctx) => {

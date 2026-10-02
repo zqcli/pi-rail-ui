@@ -105,14 +105,15 @@ function assertParentTeamRegistration(observed: ObservedRegistrations): void {
 	assert.ok(observed.activeTools.includes("subagent_team"), "the Team parent tool must be active");
 	const team = observedTool(observed, "subagent_team");
 	assert.deepEqual(observedEnum(team, "action"), ["prepare", "launch", "status", "cancel"]);
-	for (const property of ["teamId", "manager", "workers", "brief", "initialRequests", "timeoutSeconds", "reason"]) {
+	for (const property of ["teamId", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "reason"]) {
 		assert.ok(Object.hasOwn(team.parameters["properties"], property), `subagent_team.${property} must be registered`);
 	}
 	assert.equal(Object.hasOwn(team.parameters["properties"], "coordinator"), false, "the retired v1 coordinator field is absent");
 	assert.equal(Object.hasOwn(team.parameters["properties"], "searchMode"), false, "Search remains host policy");
 	assert.equal(team.parameters["additionalProperties"], false, "Team actions reject unknown fields before projection");
 	assert.match(team.description, /\{"action":"launch","teamId":"<teamId>"\}/u);
-	assert.match(team.description, /Manager assigns, reviews and closes; it does not write a final summary/u);
+	assert.match(team.description, /The lead assigns, reviews and closes; it does not write a final summary/u);
+	for (const retired of ["manager", "workers"]) assert.equal(Object.hasOwn(team.parameters["properties"], retired), false, `the retired  field is absent`);
 }
 
 function assertBoundTeamHelper(observed: ObservedRegistrations): void {
@@ -150,9 +151,9 @@ async function runTeamHelperProbe(
 	const startupPath = join(cases.root, `team-helper-${label}-startup.json`);
 	const boundPath = join(cases.root, `team-helper-${label}-bound.json`);
 	const unboundPath = join(cases.root, `team-helper-${label}-unbound.json`);
-	const binding = { version: 2, teamId: "native-loader-team", memberId: "B1", role: "worker", epoch: "native-loader-epoch" };
+	const binding = { version: 2, teamId: "native-loader-team", memberId: "B1", epoch: "native-loader-epoch" };
 	const command = (operation: "bind" | "unbind", commandId: string) => `/${TEAM_COMMAND} ${JSON.stringify({
-		version: 2, commandId, operation, binding, ...(operation === "bind" ? { loadout: { role: "worker", teamTool: true } } : {}),
+		version: 2, commandId, operation, binding, ...(operation === "bind" ? { loadout: { tools: null, teamTool: true } } : {}),
 	})}`;
 	const result = await runRpcSequence(process.execPath, [cli, ...extensionArgs(helperPath, observerPath)], {
 		HOME: cases.home,

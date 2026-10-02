@@ -32,6 +32,7 @@ async function navigationHarness(t: TestContext) {
 			const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list);
 		},
 		registerTool(tool: any) { if (tool.name === "subagent_team") teamTool = tool; },
+		getAllTools: () => [{ name: "read" }, { name: "bash" }],
 		registerCommand() {},
 		appendEntry: (kind: string, data: unknown) => manager.appendCustomEntry(kind, data),
 	};
@@ -107,8 +108,7 @@ async function navigationHarness(t: TestContext) {
 	const prepare = async () => {
 		const prefix = `attempt${++serial}`;
 		const result = await teamTool.execute("prepare", {
-			action: "prepare", manager: { alias: `${prefix}_lead`, roleDescription: "Manage." },
-			workers: [{ alias: `${prefix}_worker`, roleDescription: "Work." }],
+			action: "prepare", members: [{ alias: `${prefix}_lead`, roleDescription: "Manage." }, { alias: `${prefix}_worker`, roleDescription: "Work." }], lead: `${prefix}_lead`,
 			brief: { goal: "Native navigation regression." }, timeoutSeconds: null,
 		}, undefined, undefined, runner.createContext());
 		return { host: hosts.at(-1)!, teamId: result.details.view.teamId as string };

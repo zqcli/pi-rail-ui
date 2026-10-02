@@ -180,6 +180,8 @@ export class TeamRpcV2Connection {
 		private readonly onFailure: (error: Error) => void,
 		/** Display-only observer of native events inside an activation; it never affects the protocol. */
 		private readonly onActivity?: (event: RpcEvent) => void,
+		/** Base-tool allowlist of this member; null keeps every base tool. */
+		private readonly tools: string[] | null = null,
 	) {}
 
 	get diagnosticCount(): number { return this.diagnostics; }
@@ -192,7 +194,7 @@ export class TeamRpcV2Connection {
 		try {
 			this.unsubscribe = this.transport.onEvent((event) => this.onEvent(event));
 			await this.command({ version: 2, commandId: randomUUID(), operation: "bind", binding: this.binding,
-				loadout: { role: this.binding.role, teamTool: true } });
+				loadout: { tools: this.tools, teamTool: true } });
 			this.bound = true;
 		} catch (error) {
 			this.fail(error);

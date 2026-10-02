@@ -83,6 +83,7 @@ test("installRailSubagent lifecycle hooks seal each generation and suppress late
 	let teamTool: any;
 	const pi: any = {
 		registerTool(definition: any) { if (definition.name === "subagent_team") teamTool = definition; },
+		getAllTools: () => [{ name: "read" }, { name: "bash" }],
 		registerCommand() {},
 		on(name: string, handler: (...args: any[]) => unknown) {
 			const list = handlers.get(name) ?? [];
@@ -125,8 +126,7 @@ test("installRailSubagent lifecycle hooks seal each generation and suppress late
 		assert.ok(teamTool, "the real Team tool registration is installed");
 		const prepared = await teamTool.execute("prepare", {
 			action: "prepare",
-			manager: { alias: "lead", roleDescription: "Manage lifecycle cleanup.", model: null, cwd: null, fastMode: null, contextWindow: null },
-			workers: [{ alias: "worker", roleDescription: "Wait for the host lifecycle transition.", model: null, cwd: null, fastMode: null, contextWindow: null }],
+			members: [{ alias: "lead", roleDescription: "Manage lifecycle cleanup.", model: null, cwd: null, fastMode: null, contextWindow: null }, { alias: "worker", roleDescription: "Wait for the host lifecycle transition.", model: null, cwd: null, fastMode: null, contextWindow: null }], lead: "lead",
 			brief: { goal: "Verify index-registered branch lifecycle hooks.", acceptanceCriteria: null, constraints: null },
 			initialRequests: [], timeoutSeconds: null,
 		}, undefined, undefined, ctx);

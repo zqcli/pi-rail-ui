@@ -226,7 +226,7 @@ function brokerOwnedV2Worker(sessionId: string, sessionFile: string, close: () =
 }
 
 function teamBinding(memberId: string): BindingV2 {
-	return { version: 2, teamId: "team-v2", memberId, role: "worker", epoch: "epoch-v2" };
+	return { version: 2, teamId: "team-v2", memberId, epoch: "epoch-v2" };
 }
 
 test("Team v2 open reserves one alias across startup and competing opens cannot remove the owner's lock", async () => {

@@ -74,7 +74,7 @@ const A09_CONTINUATION = "third-party boundary continuation";
 
 function actionFor(scenario, input, replies, turn, messages = [], activationIndex = 0) {
 	if (scenario === "n08-cache-warming") {
-		if (input.scope.kind === "management") return [call(`n08-manager-yield-${turn}`, { action: "yield" })];
+		if (input.scope.kind === "events") return [call(`n08-manager-yield-${turn}`, { action: "yield" })];
 		// Keep the native run active past the 1s warming delay so Pi reaches its refresh decision while bound.
 		if (!messages.some((message) => message?.role === "toolResult" && message.toolCallId === "n08-bound-wait")) {
 			return [{ type: "toolCall", id: "n08-bound-wait", name: "bash", arguments: { command: "sleep 2.5; printf bound-wait-done" } }];
@@ -83,7 +83,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 	}
 	if (scenario === "n01-role-only") {
 		// The Manager never assigns the role-only writer; any writer activation is a failure of N01.
-		if (input.scope.kind === "management") return [call(`n01-manager-yield-${turn}`, { action: "yield" })];
+		if (input.scope.kind === "events") return [call(`n01-manager-yield-${turn}`, { action: "yield" })];
 		if (input.member.id !== "w1") throw new Error(`N01 role-only member ${input.member.id} received a provider request`);
 		return [call("n01-initial-reply", { action: "reply", result: {
 			status: "succeeded", summary: "The initial review completed while the role-only writer stayed idle.",
@@ -102,7 +102,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 		if (!eighth) throw new Error(`N03 worker could not read the eighth WorkRef: ${JSON.stringify(status.data)}`);
 		return [call(`n03-yield-${input.member.id}`, { action: "yield", waitingFor: [eighth.work], checkpoint: "Waiting for the eighth worker's explicit result." })];
 	}
-	if (scenario === "n03-eight" && input.scope.kind === "management") return [call(`n03-manager-yield-${turn}`, { action: "yield" })];
+	if (scenario === "n03-eight" && input.scope.kind === "events") return [call(`n03-manager-yield-${turn}`, { action: "yield" })];
 	if (scenario === "n06-context-edit" && input.scope.kind === "work") {
 		if (input.scope.task === "N06 peer verification") return [call("n06-peer-reply", { action: "reply", result: {
 			status: "succeeded", summary: "Canonical peer result: the requested verification passed.",
@@ -123,7 +123,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 		} })];
 	}
 	if (scenario === "n10-writer") {
-		if (input.scope.kind === "management") {
+		if (input.scope.kind === "events") {
 			const root = input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY");
 			if (!root?.work || !root.resultRef) return [{ type: "text", text: "Manager is waiting for a root result." }];
 			const result = replies.find((reply) => reply.data?.id === root.resultRef);
@@ -193,7 +193,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 		if (replies.length === 1) return [call("tool-budget-idle-yield", { action: "yield" })];
 		return [call("tool-budget-reply", { action: "reply", result: { status: "succeeded", summary: "Finished with the final attempt." } })];
 	}
-	if (scenario === "manager-midstop" && input.scope.kind === "management") {
+	if (scenario === "manager-midstop" && input.scope.kind === "events") {
 		// The BOOT batch keeps reading status until the Team model budget stops it mid-activation.
 		if (input.scope.events.some((event) => event.kind === "BOOT")) return [call(`midstop-status-${turn}`, { action: "status", view: "team" })];
 		return [{ type: "text", text: `Emergency checkpoint: ${input.scope.events.map((event) => event.kind).join(",")}` }];
@@ -208,7 +208,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 		if (replies.length === 1) return [call("manager-budget-accept", { action: "control", command: "accept_result", work: root.work, disposition: "accepted" })];
 		return [call("manager-budget-close", { action: "control", command: "close_team", resultRefs: [root.resultRef], outcome: "succeeded" })];
 	}
-	if (["pause-mixed", "revise-live", "cancel-live"].includes(scenario) && input.scope.kind === "management") {
+	if (["pause-mixed", "revise-live", "cancel-live"].includes(scenario) && input.scope.kind === "events") {
 		const userCommand = input.scope.events.find((event) => event.kind === "USER_COMMAND");
 		if (userCommand) {
 			const completed = replies.some((reply) => reply.receipt?.status === "applied"
@@ -302,7 +302,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 			status: "succeeded", summary: "Unrelated same-member root continued after cancellation cleanup.",
 		} })];
 	}
-	if (scenario === "close-mixed" && input.scope.kind === "management") {
+	if (scenario === "close-mixed" && input.scope.kind === "events") {
 		if (replies.length === 0) return [
 			call("mixed-close-team", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "synthetic mixed batch" }),
 			call("mixed-sibling-status", { action: "status", view: "team" }),
@@ -310,7 +310,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 		return [{ type: "text", text: "The mixed close_team batch was rejected; Team remains open." }];
 	}
 	if (scenario === "close-loop") {
-		if (input.scope.kind === "management") {
+		if (input.scope.kind === "events") {
 			const events = input.scope.events;
 			const hostPause = events.find((event) => event.kind === "USER_COMMAND" && event.message === "pause w1");
 			if (hostPause) return replies.some((reply) => reply.receipt?.command === "pause_member")

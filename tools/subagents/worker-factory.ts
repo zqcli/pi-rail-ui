@@ -83,9 +83,9 @@ class LeasedSessionWorker implements SessionWorker {
 		return this.worker.setModel(model);
 	}
 
-	openTeamMemberV2(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession> {
+	openTeamMemberV2(binding: BindingV2, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void, tools: string[] | null = null): Promise<TeamMemberProtocolSession> {
 		if (this.stopped || !this.worker.openTeamMemberV2) return Promise.reject(new Error("Subagent worker does not support Team v2 lifetimes"));
-		return this.worker.openTeamMemberV2(binding, onFailure, onActivity);
+		return this.worker.openTeamMemberV2(binding, onFailure, onActivity, tools);
 	}
 
 	isReusable(): boolean {

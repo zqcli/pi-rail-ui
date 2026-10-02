@@ -24,10 +24,10 @@ export type { ActivationBudgetSummary };
 
 export interface TeamBudgetUsed {
 	teamActivations: number;
-	managerActivations: number;
+	leadActivations: number;
 	teamModelRequests: number;
 	teamToolCalls: number;
-	emergencyManagerActivations: number;
+	emergencyLeadActivations: number;
 }
 
 interface RootCounters { rootActivations: number; rootModelRequests: number; rootToolCalls: number }
@@ -35,7 +35,7 @@ interface RootCounters { rootActivations: number; rootModelRequests: number; roo
 export const TEAM_MAX_BUDGET_GRANTS = 128;
 
 export class TeamBudget {
-	readonly used: TeamBudgetUsed = { teamActivations: 0, managerActivations: 0, teamModelRequests: 0, teamToolCalls: 0, emergencyManagerActivations: 0 };
+	readonly used: TeamBudgetUsed = { teamActivations: 0, leadActivations: 0, teamModelRequests: 0, teamToolCalls: 0, emergencyLeadActivations: 0 };
 	readonly grants: BudgetGrantRecord[] = [];
 	private readonly roots = new Map<string, RootCounters>();
 	private readonly rootGrants = new Map<string, Partial<Record<RootGrantCounter, number>>>();
@@ -52,14 +52,14 @@ export class TeamBudget {
 	}
 
 	/** Why normal (non-emergency) execution cannot start or continue; undefined when it can. */
-	exhausted(rootId: string | undefined, manager: boolean): BudgetExhaustion | undefined {
-		return this.teamExhausted(manager) ?? (rootId === undefined ? undefined : this.rootExhausted(rootId));
+	exhausted(rootId: string | undefined, lead: boolean): BudgetExhaustion | undefined {
+		return this.teamExhausted(lead) ?? (rootId === undefined ? undefined : this.rootExhausted(rootId));
 	}
 
-	teamExhausted(manager: boolean): BudgetExhaustion | undefined {
+	teamExhausted(lead: boolean): BudgetExhaustion | undefined {
 		const team = { kind: "team" } as const;
 		if (this.used.teamActivations >= this.limits.teamActivations) return { scope: team, counter: "teamActivations" };
-		if (manager && this.used.managerActivations >= this.limits.managerActivations) return { scope: team, counter: "managerActivations" };
+		if (lead && this.used.leadActivations >= this.limits.leadActivations) return { scope: team, counter: "leadActivations" };
 		if (this.used.teamModelRequests >= this.limits.teamModelRequests) return { scope: team, counter: "teamModelRequests" };
 		if (this.used.teamToolCalls >= this.limits.teamToolCalls) return { scope: team, counter: "teamToolCalls" };
 		return undefined;
@@ -74,14 +74,14 @@ export class TeamBudget {
 	}
 
 	emergencyAvailable(): boolean {
-		return this.used.emergencyManagerActivations < this.limits.emergencyManagerActivations;
+		return this.used.emergencyLeadActivations < this.limits.emergencyLeadActivations;
 	}
 
-	recordActivation(rootId: string | undefined, manager: boolean, emergency: boolean): ActivationBudget {
-		if (emergency) this.used.emergencyManagerActivations++;
+	recordActivation(rootId: string | undefined, lead: boolean, emergency: boolean): ActivationBudget {
+		if (emergency) this.used.emergencyLeadActivations++;
 		else {
 			this.used.teamActivations++;
-			if (manager) this.used.managerActivations++;
+			if (lead) this.used.leadActivations++;
 			if (rootId !== undefined) this.root(rootId).rootActivations++;
 		}
 		return { modelRequests: 0, toolCalls: 0, emergency };
@@ -121,17 +121,17 @@ export class TeamBudget {
 	}
 
 	/** Model-facing summary for a new activation, computed before it is recorded (spec 9.4). */
-	inputSummary(rootId: string | undefined, manager: boolean, emergency: boolean): ActivationBudgetSummary {
+	inputSummary(rootId: string | undefined, lead: boolean, emergency: boolean): ActivationBudgetSummary {
 		const left = (limit: number, used: number) => Math.max(0, limit - used);
 		let modelRequests = this.limits.activationModelRequests;
 		let toolCalls = this.limits.activationToolCalls;
 		let activations: number;
-		if (emergency) activations = left(this.limits.emergencyManagerActivations, this.used.emergencyManagerActivations + 1);
+		if (emergency) activations = left(this.limits.emergencyLeadActivations, this.used.emergencyLeadActivations + 1);
 		else {
 			modelRequests = Math.min(modelRequests, left(this.limits.teamModelRequests, this.used.teamModelRequests));
 			toolCalls = Math.min(toolCalls, left(this.limits.teamToolCalls, this.used.teamToolCalls));
 			activations = left(this.limits.teamActivations, this.used.teamActivations + 1);
-			if (manager) activations = Math.min(activations, left(this.limits.managerActivations, this.used.managerActivations + 1));
+			if (lead) activations = Math.min(activations, left(this.limits.leadActivations, this.used.leadActivations + 1));
 			if (rootId !== undefined) {
 				const used = this.rootUsed(rootId);
 				modelRequests = Math.min(modelRequests, left(this.rootLimit(rootId, "rootModelRequests"), used.rootModelRequests));

@@ -12,15 +12,15 @@ import {
 	type ActivationInput, type BindingV2, type ParentCommand, type TeamWorkSummary, type TeamWorkView, type WorkRef,
 } from "../../tools/subagents/team-protocol";
 
-const binding: BindingV2 = { version: 2, teamId: "team", memberId: "owner", role: "worker", epoch: "epoch" };
+const binding: BindingV2 = { version: 2, teamId: "team", memberId: "owner", epoch: "epoch" };
 const work: WorkRef = { workId: "root", revision: 1 };
 function input(): ActivationInput {
 	return {
-		version: 2, teamId: "team", deliveryId: "delivery", member: { id: "owner", role: "worker", roleDescription: "Do the work." },
+		version: 2, teamId: "team", deliveryId: "delivery", member: { id: "owner", lead: false, roleDescription: "Do the work." },
 		brief: { goal: "Keep all accepted work." },
 		roster: [
-			{ id: "lead", role: "manager", lifecycle: "open", rolePreview: "Manage." },
-			{ id: "owner", role: "worker", lifecycle: "open", rolePreview: "Work." },
+			{ id: "lead", lead: true, lifecycle: "open", rolePreview: "Manage." },
+			{ id: "owner", lifecycle: "open", rolePreview: "Work." },
 		],
 		scope: { kind: "work", work, task: "Required task", requester: "lead", rootId: "root", depth: 0, inputRefs: [], waitingFor: [] },
 		outcomes: [], omittedOutcomes: 0, ownedChildren: [],

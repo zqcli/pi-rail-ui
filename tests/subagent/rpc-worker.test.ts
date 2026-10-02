@@ -284,8 +284,7 @@ test("Team v2 restores the pre-activation context window after native compaction
 	withTeamV2Ack(transport);
 	const runtime = new TeamRuntime();
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage the Team." },
-		workers: [{ alias: "w1", roleDescription: "Complete assigned work." }],
+		members: [{ alias: "lead", roleDescription: "Manage the Team." }, { alias: "w1", roleDescription: "Complete assigned work." }], lead: "lead",
 		brief: { goal: "Check context restoration after native compaction." }, timeoutSeconds: null,
 	});
 	runtime.launch(prepared.teamId);

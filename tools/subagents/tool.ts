@@ -59,7 +59,7 @@ const SUBAGENT_DESCRIPTION = [
 	"- Write self-contained tasks: a one-off helper does not see this conversation. A target or forked session keeps its own history.",
 	"- contextWindow: omit it for the native default. Set a positive integer only when the user asks for a specific budget, on the single call or on each tasks/chain item.",
 	"- fastMode: true only when the user asks for fast mode, on a one-off or new persistent helper (each item in tasks/chain). Ignored on non-GPT models; not allowed with target or control.",
-	"- Teams (a manager coordinating workers) use the subagent_team tool, never subagent. Helpers cannot call subagent themselves.",
+	"- Teams (members coordinated through a shared work ledger, one of them the lead) use the subagent_team tool, never subagent. Helpers cannot call subagent themselves.",
 ].join("\n");
 
 const SessionSourceSchema = Type.Object({
@@ -372,7 +372,7 @@ function validateFastModePlacement(item: TaskParams): void {
 
 function filterParamsForMode(params: SubagentParamsValue, mode: SubagentMode): SubagentParamsValue {
 	if (nonEmpty(params.teamId ?? undefined)) {
-		throw new Error("subagent no longer starts Team members: teamId is retired. Run a Team with subagent_team prepare (manager, workers, brief, initialRequests) and then launch with the returned teamId.");
+		throw new Error("subagent no longer starts Team members: teamId is retired. Run a Team with subagent_team prepare (members, lead, brief, initialRequests) and then launch with the returned teamId.");
 	}
 	if (mode !== "single" && normalizeContextWindow(params.contextWindow) !== undefined) {
 		throw new Error("contextWindow is only supported on the single task or on each parallel/chain item");

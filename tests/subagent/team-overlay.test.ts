@@ -16,8 +16,7 @@ function fixture(children = 1) {
 	let time = 1_700_000_000_000;
 	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `id${++id}`, now: () => time += 1000 });
 	const { teamId } = host.runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." },
-		workers: ["runner", "waiter", "held"].map((alias) => ({ alias, roleDescription: "Work." })),
+		members: [{ alias: "lead", roleDescription: "Manage." }, ...["runner", "waiter", "held"].map((alias) => ({ alias, roleDescription: "Work." }))], lead: "lead",
 		brief: { goal: "Ship the local Team popup." }, timeoutSeconds: null,
 		initialRequests: [{ to: "runner", task: "Implement the popup" }, { to: "waiter", task: "Review the work\nKeep every detail of this task." }, { to: "held", task: "Check requirements" }],
 	});
@@ -66,7 +65,7 @@ test("four views show real running, waiting and held work, routes and attention"
 	t.after(() => ui.component.dispose());
 	assert.match(ui.text(), /ACTIVE · needs attention · \d+:\d\d/u);
 	assert.match(ui.text(), /Progress:\s+roots 0\/3 accepted · works 0\/4 done · 0 cancelled/u);
-	assert.match(ui.text(), /Waiting for: Manager decision/u);
+	assert.match(ui.text(), /Waiting for: Lead decision/u);
 	assert.match(ui.text(), /Attention:\s+1 open holds/u);
 	assert.match(ui.text(), /Budget:\s+activations/u);
 	ui.key("tab");
@@ -132,7 +131,7 @@ test("runtime and driver subscriptions request renders and are released on dispo
 	host.driver.onActivity = (listener) => { activity = () => listener(teamId); return () => { removed++; }; };
 	const ui = overlay(host);
 	const before = ui.renders();
-	host.runtime.messageManager(teamId, "New review instruction");
+	host.runtime.messageLead(teamId, "New review instruction");
 	await Promise.resolve();
 	assert.ok(ui.renders() > before);
 	const changed = ui.renders();
@@ -140,7 +139,7 @@ test("runtime and driver subscriptions request renders and are released on dispo
 	assert.equal(ui.renders(), changed + 1);
 	ui.component.dispose(); ui.component.dispose();
 	assert.equal(removed, 1);
-	host.runtime.messageManager(teamId, "After dispose"); activity!();
+	host.runtime.messageLead(teamId, "After dispose"); activity!();
 	await Promise.resolve();
 	assert.equal(ui.renders(), changed + 1);
 });
@@ -209,9 +208,9 @@ test("Timeline shows retained omission notice and updates after runtime change",
 
 test("Team selector defaults to active, orders recent history last, and prevents history actions", (t) => {
 	const { host, teamId } = fixture();
-	host.runtime.prepare({ manager: { alias: "other", roleDescription: "Manage." }, workers: [{ alias: "worker", roleDescription: "Work." }], brief: { goal: "Prepared" }, timeoutSeconds: null });
-	host.history.teams.push({ teamId: "old", version: 2, lifecycle: "interrupted", manager: "lead", workers: ["worker"], results: [], finalResultRefs: [], at: 1 },
-		{ teamId: "recent", version: 2, lifecycle: "closed", manager: "lead", workers: ["worker"], goal: "Historic goal", results: [], finalResultRefs: [], at: 2 });
+	host.runtime.prepare({ members: [{ alias: "other", roleDescription: "Manage." }, { alias: "worker", roleDescription: "Work." }], lead: "other", brief: { goal: "Prepared" }, timeoutSeconds: null });
+	host.history.teams.push({ teamId: "old", version: 2, lifecycle: "interrupted", lead: "lead", members: ["lead", "worker"], results: [], finalResultRefs: [], at: 1 },
+		{ teamId: "recent", version: 2, lifecycle: "closed", lead: "lead", members: ["lead", "worker"], goal: "Historic goal", results: [], finalResultRefs: [], at: 2 });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	assert.match(ui.text(), new RegExp(`‹ 1/4 › ${teamId}`, "u"));
@@ -290,7 +289,7 @@ test("Rail Team frame, title, tabs, summary, and selection use Rail Agent theme 
 test("summary omits zero activity counts and header selector shows only eight ID characters", (t) => {
 	let id = 0;
 	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `long-team-id-${++id}` });
-	for (let index = 0; index < 2; index++) host.runtime.prepare({ manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "worker", roleDescription: "Work." }], brief: { goal: "Test" }, timeoutSeconds: null });
+	for (let index = 0; index < 2; index++) host.runtime.prepare({ members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "worker", roleDescription: "Work." }], lead: "lead", brief: { goal: "Test" }, timeoutSeconds: null });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	const lines = ui.component.render(100);
@@ -345,8 +344,8 @@ test("Tasks align WorkRef, route and state before preview, with full selected de
 test("Overview aligns labels and renders six-cell budget bars, warning/exhaustion, and unlimited", (t) => {
 	const { host, teamId } = fixture();
 	const budget = host.runtime.inspectBudget(teamId);
-	Object.assign(budget.used, { teamActivations: 50, managerActivations: 80, teamModelRequests: 100, teamToolCalls: 156, teamWorks: 7 });
-	Object.assign(budget.limits, { teamActivations: 100, managerActivations: 100, teamModelRequests: 100, teamToolCalls: 1_000_000_000, teamWorks: 2_000_000_000 });
+	Object.assign(budget.used, { teamActivations: 50, leadActivations: 80, teamModelRequests: 100, teamToolCalls: 156, teamWorks: 7 });
+	Object.assign(budget.limits, { teamActivations: 100, leadActivations: 100, teamModelRequests: 100, teamToolCalls: 1_000_000_000, teamWorks: 2_000_000_000 });
 	host.runtime.inspectBudget = () => budget;
 	const tagged = taggingTheme();
 	const ui = overlay(host, { theme: tagged.theme });
@@ -422,7 +421,7 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 
 test("arrows switch views, brackets switch Teams, and configurable select keys are honored", (t) => {
 	const { host } = fixture();
-	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", workers: [], results: [], finalResultRefs: [], at: 1 });
+	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: [], results: [], finalResultRefs: [], at: 1 });
 	const ui = overlay(host, { bindings: { "tui.select.up": "k", "tui.select.down": "j", "tui.select.confirm": "e", "tui.select.cancel": "q" } });
 	t.after(() => ui.component.dispose());
 	ui.key("right");

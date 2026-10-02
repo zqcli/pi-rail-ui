@@ -813,9 +813,9 @@ test("grouped panels retain child identity, explicit dispatch policy, and chain 
 
 test("grouped panels show a live idle member as idle, never completed, with its role and state line", () => {
 	const runs: SubagentTranscriptRun[] = [
-		{ alias: "lead", role: "manager", model: "provider/gpt", status: "running", output: "", persistent: true,
+		{ alias: "lead", member: { lead: true }, model: "provider/gpt", status: "running", output: "", persistent: true,
 			detail: "OPEN · RUNNING · pending events 2", transcript: { entries: [], omittedEntries: 0 } },
-		{ alias: "writer", role: "worker", model: "provider/gpt", status: "idle", output: "Earlier summary", persistent: true,
+		{ alias: "writer", member: { lead: false }, model: "provider/gpt", status: "idle", output: "Earlier summary", persistent: true,
 			detail: "OPEN · IDLE · no assigned work · results 1", transcript: { entries: [], omittedEntries: 0 } },
 	];
 	const text = renderSubagentTranscript(runs, false, theme as any, { mode: "parallel" }).render(120).join("\n");
@@ -823,10 +823,10 @@ test("grouped panels show a live idle member as idle, never completed, with its 
 	assert.match(renderSubagentTranscript([...runs, { ...runs[1]!, alias: "held-worker", status: "held" }, { ...runs[1]!, alias: "waiting-worker", status: "waiting" }],
 		false, theme as any, { mode: "parallel", unit: "member" }).render(120).join("\n"),
 		/4 members · 0 complete · 1 running · 1 held · 1 waiting · 1 idle · 0 failed[\s\S]*⏸ held-worker[\s\S]*⧗ waiting-worker/u);
-	assert.match(text, /▶ lead · manager · provider\/gpt/);
+	assert.match(text, /▶ lead \(lead\) · provider\/gpt/);
 	assert.doesNotMatch(renderSubagentTranscript([{ ...runs[1]!, output: "", status: "held" }], true, theme as any, { mode: "parallel" }).render(120).join("\n"),
 		/no output|Latest output/u, "a live member with nothing to show adds no placeholder");
-	assert.match(text, /○ writer · worker · provider\/gpt/);
+	assert.match(text, /○ writer · provider\/gpt/);
 	assert.match(text, /OPEN · RUNNING · pending events 2/);
 	assert.match(text, /OPEN · IDLE · no assigned work · results 1/);
 	assert.match(text, /Earlier summary/);
@@ -1173,7 +1173,7 @@ test("grouped aggregate usage sums hosted search counts while child panels stay 
 test("a Team task entry titles itself, ordinary panels keep 'initial task', and a note is one dim separator line", () => {
 	const tagged = { fg: (color: string, text: string) => `{${color}|${text}}`, bold: (text: string) => text };
 	const team: SubagentTranscriptRun = {
-		alias: "writer", role: "worker", model: "provider/gpt", status: "running", output: "", persistent: true,
+		alias: "writer", member: { lead: false }, model: "provider/gpt", status: "running", output: "", persistent: true,
 		transcript: { omittedEntries: 12, entries: [
 			{ id: "initial-task", kind: "user", initial: true, label: "task from lead · work 98d1acb8@2 · revised", text: "Write the change.", order: 0 },
 			{ id: "assistant:0:0", kind: "assistant", text: "Earlier work step", order: 1 },

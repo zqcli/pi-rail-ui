@@ -3,27 +3,26 @@ import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import install from "../../tools/subagents/team-extension-v2";
 import { TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_DESCRIPTION, TEAM_PRIVATE_ENTRY_TYPE } from "../../tools/subagents/team-protocol";
-import type { BindingV2, ParentCommand, PrivateReply } from "../../tools/subagents/team-protocol";
+import type { ParentCommand, PrivateReply } from "../../tools/subagents/team-protocol";
 import { jsonBytes, parseChildFrame, TEAM_TOOL_DESCRIPTION, TEAM_TOOL_SCHEMA } from "../../tools/subagents/team-codec";
 import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import { TeamRpcV2Connection } from "../../tools/subagents/team-rpc-v2";
 import type { RpcEvent, RpcTransport } from "../../tools/subagents/rpc-worker";
 
-function nativeActivation(role: BindingV2["role"]) {
+function nativeActivation(who: "lead" | "member") {
 	const runtime = new TeamRuntime();
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage the Team." },
-		workers: [{ alias: "w1", roleDescription: "Do assigned work." }],
+		members: [{ alias: "lead", roleDescription: "Manage the Team." }, { alias: "w1", roleDescription: "Do assigned work." }], lead: "lead",
 		brief: { goal: "Verify the private activation bridge." }, timeoutSeconds: null,
-		initialRequests: role === "worker" ? [{ to: "w1", task: "Return a valid result." }] : [],
+		initialRequests: who === "member" ? [{ to: "w1", task: "Return a valid result." }] : [],
 	});
 	runtime.launch(prepared.teamId);
-	const manager = runtime.takeNextActivation(prepared.teamId)!;
-	return { runtime, activation: role === "manager" ? manager : runtime.takeNextActivation(prepared.teamId)! };
+	const lead = runtime.takeNextActivation(prepared.teamId)!;
+	return { runtime, activation: who === "lead" ? lead : runtime.takeNextActivation(prepared.teamId)! };
 }
 
-function harness(role: BindingV2["role"] = "manager") {
-	const { runtime, activation } = nativeActivation(role);
+function harness(who: "lead" | "member" = "lead") {
+	const { runtime, activation } = nativeActivation(who);
 	const binding = activation.binding;
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const commands = new Map<string, any>();
@@ -62,8 +61,8 @@ function harness(role: BindingV2["role"] = "manager") {
 		activeTools: () => activeTools, activeToolUpdates, aborts: () => aborts };
 }
 
-function bindCommand(h: ReturnType<typeof harness>, commandId = "bind-1", binding = h.binding): ParentCommand {
-	return { version: 2, commandId, operation: "bind", binding, loadout: { role: binding.role, teamTool: true } };
+function bindCommand(h: ReturnType<typeof harness>, commandId = "bind-1", binding = h.binding, tools: string[] | null = null): ParentCommand {
+	return { version: 2, commandId, operation: "bind", binding, loadout: { tools, teamTool: true } };
 }
 
 function activateCommand(h: ReturnType<typeof harness>, commandId = "activate-1"): ParentCommand {
@@ -95,22 +94,29 @@ async function waitForRequest(h: ReturnType<typeof harness>, action: string, aft
 	throw new Error(`No private request for ${action}`);
 }
 
-test("Team v2 tool schema is a strict action union and bind selects role-specific tools", async () => {
+test("Team v2 tool schema is a strict action union and bind gives every member base tools plus team, restricted by its tools allowlist", async () => {
 	const variants = (TEAM_TOOL_SCHEMA as any).anyOf;
 	assert.ok(Array.isArray(variants) && variants.length >= 20);
 	assert.ok(variants.every((variant: any) => variant.type === "object" && variant.additionalProperties === false));
 	assert.match(TEAM_TOOL_DESCRIPTION, /pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team/u);
 
-	const worker = harness("worker");
-	assert.equal(worker.handlers.get("cache_warming_decision")!(), undefined);
-	await worker.command(bindCommand(worker));
-	assert.deepEqual(worker.activeTools(), ["read", "bash", "team"]);
-	assert.deepEqual(worker.handlers.get("cache_warming_decision")!(), { action: "stop" });
+	const member = harness("member");
+	assert.equal(member.handlers.get("cache_warming_decision")!(), undefined);
+	await member.command(bindCommand(member));
+	assert.deepEqual(member.activeTools(), ["read", "bash", "team"]);
+	assert.deepEqual(member.handlers.get("cache_warming_decision")!(), { action: "stop" });
 
-	const manager = harness("manager");
-	await manager.command(bindCommand(manager));
-	assert.deepEqual(manager.activeTools(), ["team"], "Manager gets no filesystem, shell, or subagent tools");
-	assert.match(manager.tools.get("team").description, /reply, yield, and close_team must be the only tool call/u);
+	const lead = harness("lead");
+	await lead.command(bindCommand(lead));
+	assert.deepEqual(lead.activeTools(), ["read", "bash", "team"], "the lead gets the same base tools plus team, never subagent tools");
+	assert.match(lead.tools.get("team").description, /reply, yield, and close_team must be the only tool call/u);
+
+	const restricted = harness("member");
+	await restricted.command(bindCommand(restricted, "bind-1", restricted.binding, ["read", "write"]));
+	assert.deepEqual(restricted.activeTools(), ["read", "team"], "a tools allowlist restricts the base tools; names the session lacks are simply absent");
+	const teamOnly = harness("lead");
+	await teamOnly.command(bindCommand(teamOnly, "bind-1", teamOnly.binding, []));
+	assert.deepEqual(teamOnly.activeTools(), ["team"], "an empty allowlist leaves only the team tool");
 });
 
 test("flat close_team control is rejected before RPC when its native assistant batch has another tool", async () => {
@@ -149,7 +155,7 @@ test("native custom activation is persisted and verified before input_ready/prov
 	const conflictingBind = bindCommand(h, "bind-1", { ...h.binding, teamId: "other-team" });
 	await h.command(conflictingBind);
 	assert.equal(h.lastPrivate().ok, false, "same command id with different canonical content is rejected");
-	assert.equal(h.activeTools().join(","), "team");
+	assert.equal(h.activeTools().join(","), "read,bash,team");
 
 	await h.command(activateCommand(h));
 	const activateAck = h.lastPrivate();
@@ -283,7 +289,7 @@ test("host API exceptions produce bounded valid negative command ACKs", async ()
 });
 
 test("oversized local reply can be corrected in the same connected scope and committed through Runtime", async () => {
-	const h = harness("worker");
+	const h = harness("member");
 	const listeners = new Set<(event: RpcEvent) => void>();
 	const emit = (event: RpcEvent) => { for (const listener of listeners) listener(event); };
 	h.entryListeners.add((entry) => emit({ type: "entry_appended", entry }));

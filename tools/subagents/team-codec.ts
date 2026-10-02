@@ -1,6 +1,6 @@
 /**
  * Team v2 codec: public action normalization, private frame validation, size limits and
- * public projections. Shape and size only — roles, state, ownership, versions and budgets are
+ * public projections. Shape and size only — state, ownership, versions and budgets are
  * checked by TeamRuntime. Must not depend on the runtime, RPC transport or extension install code.
  */
 import { Type } from "typebox";
@@ -11,12 +11,12 @@ import {
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_INPUT_REFS, TEAM_MAX_MEMBERS, TEAM_MAX_NOTE_BYTES,
 	TEAM_MAX_EVENT_MESSAGE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
-	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_WORKERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_MANAGER_EVENT_BATCH,
+	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_EVENT_BATCH,
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
 	TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_MAX_RESULT_RECORDS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
-	MANAGER_EVENT_KINDS,
+	TEAM_EVENT_KINDS,
 	type ActivationInput, type ActivationScope, type BindingV2, type ChildFrame, type GateDecision, type ParentCommand,
-	type Health, type HoldReason, type MemberActivity, type MemberLifecycle, type MemberRole, type ManagerEventView, type OutcomeView, type PauseState, type PrivateAction,
+	type Health, type HoldReason, type MemberActivity, type MemberLifecycle, type TeamEventView, type OutcomeView, type PauseState, type PrivateAction,
 	type PrivateReply, type ResourceState, type TeamAction, type TeamBrief, type TeamControl, type TeamError,
 	type TeamBudgetLimits, type TeamErrorCode, type TeamEvidence, type TeamIncidentView, type TeamMemberPlan,
 	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReceipt, type TeamReply, type TeamReplyData,
@@ -124,7 +124,7 @@ export function previewText(value: string, maxBytes: number): string {
 	return result + TRUNCATED;
 }
 
-/** A complete worker result as text: summary, findings, evidence, limitations and artifacts. */
+/** A complete member result as text: summary, findings, evidence, limitations and artifacts. */
 export function formatWorkResult(result: WorkResult): string {
 	return [
 		result.summary,
@@ -304,12 +304,24 @@ export function normalizeBrief(value: unknown, roster: readonly string[]): TeamB
 	return brief;
 }
 
+export const TEAM_PLAN_MIGRATION = "manager/workers were replaced by members plus lead: <alias>. List every member in members [{alias, roleDescription, ...}] and name the one that handles Team events with lead.";
+
+/** A base-tool allowlist: unique tool names, empty means only the team tool. */
+export function toolNames(value: unknown, field: string): string[] {
+	const names = array(value, field, TEAM_MAX_TOOL_NAMES).map((name, index) => {
+		if (typeof name !== "string" || !name.trim() || name.length > 128) return invalid(`${field}[${index}] must be a tool name`);
+		return name.trim();
+	});
+	if (new Set(names).size !== names.length) return invalid(`${field} contains duplicate tool names`);
+	return names;
+}
+
 function normalizeMemberPlan(value: unknown, field: string): TeamMemberPlan {
-	if (!isRecord(value)) return invalid(`${field} must be an object {alias, roleDescription, model?, cwd?, fastMode?, contextWindow?}`);
+	if (!isRecord(value)) return invalid(`${field} must be an object {alias, roleDescription, model?, cwd?, fastMode?, contextWindow?, tools?}`);
 	if (value["task"] !== undefined && value["task"] !== null) {
 		return invalid(`${field}.task is no longer supported: put the role in roleDescription and initial work in initialRequests`);
 	}
-	onlyKeys(value, ["alias", "roleDescription", "model", "cwd", "fastMode", "contextWindow", "task"], field);
+	onlyKeys(value, ["alias", "roleDescription", "model", "cwd", "fastMode", "contextWindow", "tools", "task"], field);
 	const policy: TeamMemberPolicy = {};
 	const model = optionalText(value["model"], `${field}.model`, 512);
 	const cwd = optionalText(value["cwd"], `${field}.cwd`, 4096);
@@ -322,6 +334,7 @@ function normalizeMemberPlan(value: unknown, field: string): TeamMemberPlan {
 	if (value["contextWindow"] !== undefined && value["contextWindow"] !== null) {
 		policy.contextWindow = safeInteger(value["contextWindow"], `${field}.contextWindow`, 1);
 	}
+	if (value["tools"] !== undefined && value["tools"] !== null) policy.tools = toolNames(value["tools"], `${field}.tools`);
 	return {
 		alias: normalizeAlias(value["alias"], `${field}.alias`),
 		roleDescription: text(value["roleDescription"], `${field}.roleDescription`, TEAM_MAX_ROLE_BYTES),
@@ -337,17 +350,16 @@ export function normalizeTeamBudgetPreset(value: unknown): TeamBudgetPreset {
 
 export function normalizeTeamPlan(value: unknown): TeamPlan {
 	assertJsonValue(value, new Set());
-	if (!isRecord(value)) return invalid("prepare expects {manager, workers, brief, initialRequests?, timeoutSeconds?}");
-	if (value["coordinator"] !== undefined && value["coordinator"] !== null) {
-		return invalid("coordinator was replaced by manager {alias, roleDescription, ...}; the manager does not write the final summary");
-	}
-	onlyKeys(value, ["manager", "workers", "brief", "initialRequests", "timeoutSeconds", "budget", "coordinator"], "prepare");
-	const manager = normalizeMemberPlan(value["manager"], "manager");
-	const rawWorkers = array(value["workers"], "workers", TEAM_MAX_WORKERS);
-	if (rawWorkers.length < 1) return invalid(`workers must list 1-${TEAM_MAX_WORKERS} members`);
-	const workers = rawWorkers.map((worker, index) => normalizeMemberPlan(worker, `workers[${index}]`));
-	const roster = [manager.alias, ...workers.map((worker) => worker.alias)];
+	if (!isRecord(value)) return invalid("prepare expects {members, lead, brief, initialRequests?, timeoutSeconds?}");
+	if (present(value["manager"]) || present(value["workers"]) || present(value["coordinator"])) return invalid(TEAM_PLAN_MIGRATION);
+	onlyKeys(value, ["members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget"], "prepare");
+	const rawMembers = array(value["members"], "members", TEAM_MAX_MEMBERS);
+	if (rawMembers.length < TEAM_MIN_MEMBERS) return invalid(`members must list ${TEAM_MIN_MEMBERS}-${TEAM_MAX_MEMBERS} members`);
+	const members = rawMembers.map((member, index) => normalizeMemberPlan(member, `members[${index}]`));
+	const roster = members.map((member) => member.alias);
 	if (new Set(roster).size !== roster.length) return invalid("member aliases must be unique");
+	const lead = normalizeAlias(value["lead"], "lead");
+	if (!roster.includes(lead)) return invalid("lead must be the alias of one of the members");
 	const brief = normalizeBrief(value["brief"], roster);
 	const initialRequests = (value["initialRequests"] === undefined || value["initialRequests"] === null ? []
 		: array(value["initialRequests"], "initialRequests", TEAM_MAX_INITIAL_REQUESTS)).map((raw, index) => {
@@ -355,7 +367,8 @@ export function normalizeTeamPlan(value: unknown): TeamPlan {
 		if (!isRecord(raw)) return invalid(`${name} must be {to, task, inputRefs?}`);
 		onlyKeys(raw, ["to", "task", "inputRefs"], name);
 		const to = normalizeAlias(raw["to"], `${name}.to`);
-		if (!workers.some((worker) => worker.alias === to)) return invalid(`${name}.to must name a worker of this team`);
+		if (to === lead) return invalid(`${name}.to must not be the lead (the lead requests the initial work)`);
+		if (!roster.includes(to)) return invalid(`${name}.to must name a member of this team`);
 		const inputRefs = idList(raw["inputRefs"], `${name}.inputRefs`, TEAM_MAX_INPUT_REFS);
 		if (inputRefs.length) return invalid(`${name}.inputRefs must be empty: a new team has no results to reference`);
 		return { to, task: text(raw["task"], `${name}.task`, TEAM_MAX_TASK_BYTES), inputRefs };
@@ -368,7 +381,7 @@ export function normalizeTeamPlan(value: unknown): TeamPlan {
 		}
 		timeoutSeconds = seconds;
 	}
-	return { manager, workers, brief, initialRequests, timeoutSeconds,
+	return { members, lead, brief, initialRequests, timeoutSeconds,
 		...(value["budget"] == null ? {} : { budget: normalizeTeamBudgetPreset(value["budget"]) }) };
 }
 
@@ -432,9 +445,9 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Work activations only: end this work activation while waiting for the listed immutable WorkRefs."),
 	schemaObject({ action: Type.Literal("yield"), attention: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
 		checkpoint: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Hold this work for explicit Manager or host attention."),
+	}, "Hold this work for explicit lead or host attention."),
 	schemaObject({ action: Type.Literal("yield"), checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })) },
-		"Manager-only: end this management activation. The Manager never waits in-run; new results, failures and incidents start its next activation automatically."),
+		"Lead only: end this events activation. The lead never waits in-run; new Team events start its next activation automatically."),
 	schemaObject({ action: Type.Literal("status"), view: Type.Optional(Type.Literal("team")),
 		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
 	"Read the bounded Team summary. Team view does not accept an id or cursor."),
@@ -444,46 +457,46 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 		`Read a bounded ${view} page; status(result) is read-only and does not acknowledge child-result observation.`),
 		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), id: idSchema,
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
-		`Read one exact ${view} id${view === "work" ? "; a worker sees only the summary of another member's work" : ""}.`),
+		`Read one exact ${view} id${view === "work" ? "; a member sees only the summary of another member's work" : ""}.`),
 		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view), cursor: idSchema,
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
 		`Continue a ${view} page from its opaque cursor.`),
 	]),
-	controlAction("pause_member", { memberId: aliasSchema }, "Manager only: prevent new worker side effects and park at the next provider-safe point; already approved tools and valid end intents may finish."),
-	controlAction("resume_member", { memberId: aliasSchema }, "Manager only: resume the same parked WorkRef after it reacquires a worker permit; dependencies and budget holds remain."),
+	controlAction("pause_member", { memberId: aliasSchema }, "Lead only: prevent new member side effects and park at the next provider-safe point; already approved tools and valid end intents may finish."),
+	controlAction("resume_member", { memberId: aliasSchema }, "Lead only: resume the same parked WorkRef after it reacquires a work permit; dependencies and budget holds remain."),
 	controlAction("revise_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
 		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
-	}, "Manager only: replace the exact current work revision; preserve its workId and result history; its unfinished sub-tasks become superseded."),
+	}, "Lead only: replace the exact current work revision; preserve its workId and result history; its unfinished sub-tasks become superseded."),
 	controlAction("cancel_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		reason: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Manager only: cancel the exact current work subtree; cleanup uncertainty remains visible."),
+	}, "Lead only: cancel the exact current work subtree; cleanup uncertainty remains visible."),
 	controlAction("resume_work", { workId: idSchema, expectedRevision: Type.Integer({ minimum: 1 }),
 		incidentId: idSchema, instruction: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
-	}, "Manager only: explicitly resume a held work revision after addressing its incident."),
+	}, "Lead only: explicitly resume a held work revision after addressing its incident."),
 	controlAction("accept_result", { work: workRefSchema,
 		disposition: Type.Union([Type.Literal("accepted"), Type.Literal("waived")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
-	}, "Manager only: explicitly accept a successful root or waive a terminal outcome with a reason."),
-	controlAction("close_member", { memberId: aliasSchema }, "Manager only: close an idle worker with no unresolved obligations."),
+	}, "Lead only: explicitly accept a successful root or waive a terminal outcome with a reason."),
+	controlAction("close_member", { memberId: aliasSchema }, "Lead only: close an idle member with no unresolved obligations."),
 	controlAction("close_team", { resultRefs: Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
 		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
-	}, "Manager only: close the Team after all roots and member resources are explicitly settled."),
+	}, "Lead only: close the Team after all roots and member resources are explicitly settled."),
 ]);
 
-export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or ends a Manager activation (a Manager never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new events); status reads Team/work/result/incident state; control is Manager-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and Manager messages are separate host APIs, not model actions.";
+export const TEAM_TOOL_DESCRIPTION = "Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control is lead-only for pause_member, resume_member, revise_work, cancel_work, resume_work, accept_result, close_member, and close_team. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.";
 
 const LEGACY_ACTIONS: Record<string, string> = {
 	send: "send was replaced by request {to, task}; a reply never creates a new request",
 	report: "report was replaced by reply {result} for the current work",
 	wait: "wait was replaced by yield {waitingFor:[WorkRef], checkpoint}; waiting ends the native run instead of holding the member",
-	finish: "finish was replaced by reply {result} (worker) or control close_team (manager)",
+	finish: "finish was replaced by reply {result} for the current work, or control close_team for the lead",
 	checkpoint: "checkpoint is internal to the runtime and not a model action",
 };
 const LEGACY_FIELDS: Record<string, string> = {
 	afterSeq: "afterSeq was removed: deliveries are acknowledged by the runtime, not by a model cursor",
-	supersedes: "supersedes was removed: the manager revises work with control revise_work",
+	supersedes: "supersedes was removed: the lead revises work with control revise_work",
 	replyTo: "replyTo was removed: reply is bound to the current work automatically",
 	message: "message was removed: use request.task, reply.result or yield.attention",
 	wait: "wait was removed: use yield {waitingFor}",
@@ -623,11 +636,9 @@ function blockerId(value: unknown, field: string): string {
 export function parseBinding(value: unknown): BindingV2 {
 	if (!isRecord(value)) return protocol("binding must be an object");
 	frameVersion(value);
-	frameKeys(value, ["version", "teamId", "memberId", "role", "epoch"], "binding");
-	const role = value["role"];
-	if (role !== "manager" && role !== "worker") return protocol("binding.role must be manager or worker");
+	frameKeys(value, ["version", "teamId", "memberId", "epoch"], "binding");
 	if (typeof value["memberId"] !== "string" || !isValidAgentAlias(value["memberId"])) return protocol("binding.memberId is invalid");
-	return { version: TEAM_PROTOCOL_VERSION, teamId: frameId(value["teamId"], "binding.teamId"), memberId: value["memberId"], role,
+	return { version: TEAM_PROTOCOL_VERSION, teamId: frameId(value["teamId"], "binding.teamId"), memberId: value["memberId"],
 		epoch: frameId(value["epoch"], "binding.epoch") };
 }
 
@@ -641,16 +652,15 @@ export function parseActivationScope(value: unknown): ActivationScope {
 		try { work = normalizeWorkRef(value["work"], "activation.work"); } catch { return protocol("work activation requires a valid work reference"); }
 		return { activationId, kind: "work", work };
 	}
-	if (value["kind"] === "management") {
-		if (value["work"] !== undefined) return protocol("management activation cannot carry work");
-		return { activationId, kind: "management", eventBatchId: frameId(value["eventBatchId"], "activation.eventBatchId") };
+	if (value["kind"] === "events") {
+		if (value["work"] !== undefined) return protocol("events activation cannot carry work");
+		return { activationId, kind: "events", eventBatchId: frameId(value["eventBatchId"], "activation.eventBatchId") };
 	}
-	return protocol("activation.kind must be work or management");
+	return protocol("activation.kind must be work or events");
 }
 
 export function sameBinding(left: BindingV2, right: BindingV2): boolean {
-	return left.version === right.version && left.teamId === right.teamId && left.memberId === right.memberId
-		&& left.role === right.role && left.epoch === right.epoch;
+	return left.version === right.version && left.teamId === right.teamId && left.memberId === right.memberId && left.epoch === right.epoch;
 }
 
 export function sameScope(left: ActivationScope, right: ActivationScope): boolean {
@@ -788,7 +798,7 @@ function parseWorkVersion(value: unknown, field: string): WorkVersion {
 		const raw = value["hold"];
 		if (!isRecord(raw)) return protocol(`${field}.hold must be an object`);
 		frameKeys(raw, ["reason", "incidentId"], `${field}.hold`);
-		if (!["attention", "budget", "protocol", "manager_unavailable"].includes(String(raw["reason"]))) return protocol(`${field}.hold.reason is invalid`);
+		if (!["attention", "budget", "protocol", "lead_unavailable"].includes(String(raw["reason"]))) return protocol(`${field}.hold.reason is invalid`);
 		hold = { reason: raw["reason"] as HoldReason, incidentId: frameId(raw["incidentId"], `${field}.hold.incidentId`) };
 	}
 	let review: WorkVersion["review"];
@@ -911,18 +921,14 @@ function parseTerminalMembers(value: unknown, field: string): TeamResult["member
 	const parsed = members.map((raw, index) => {
 		const memberField = `${field}[${index}]`;
 		if (!isRecord(raw)) return protocol(`${memberField} must be an object`);
-		frameKeys(raw, ["id", "role", "lifecycle", "resourceState"], memberField);
-		const role = raw["role"];
+		frameKeys(raw, ["id", "lifecycle", "resourceState"], memberField);
 		const lifecycle = raw["lifecycle"];
 		const resourceState = raw["resourceState"];
-		if (role !== "manager" && role !== "worker") return protocol(`${memberField}.role is invalid`);
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(lifecycle))) return protocol(`${memberField}.lifecycle is invalid`);
 		if (!["starting", "owned", "stopping", "released", "cleanup_failed"].includes(String(resourceState))) return protocol(`${memberField}.resourceState is invalid`);
-		return { id: normalizeAlias(raw["id"], `${memberField}.id`), role: role as MemberRole, lifecycle: lifecycle as MemberLifecycle, resourceState: resourceState as ResourceState };
+		return { id: normalizeAlias(raw["id"], `${memberField}.id`), lifecycle: lifecycle as MemberLifecycle, resourceState: resourceState as ResourceState };
 	});
-	if (new Set(parsed.map((member) => member.id)).size !== parsed.length || parsed.filter((member) => member.role === "manager").length !== 1) {
-		return protocol(`${field} must contain unique IDs and exactly one Manager`);
-	}
+	if (new Set(parsed.map((member) => member.id)).size !== parsed.length) return protocol(`${field} must contain unique IDs`);
 	return parsed;
 }
 
@@ -932,7 +938,7 @@ function parseWorkSummary(value: unknown): TeamWorkSummary {
 	const state = value["state"];
 	if (!(WORK_STATES as readonly unknown[]).includes(state)) return protocol("work summary state is invalid");
 	const hold = value["hold"];
-	if (hold !== undefined && !["attention", "budget", "protocol", "manager_unavailable"].includes(String(hold))) return protocol("work summary hold is invalid");
+	if (hold !== undefined && !["attention", "budget", "protocol", "lead_unavailable"].includes(String(hold))) return protocol("work summary hold is invalid");
 	const review = value["review"];
 	if (review !== undefined && review !== "accepted" && review !== "waived") return protocol("work summary review is invalid");
 	return { work: normalizeWorkRef(value["work"], "work summary.work"),
@@ -978,7 +984,7 @@ function parseTeamWorkView(value: unknown): TeamWorkView {
 
 function parsePolicy(value: unknown, field: string): TeamMemberPolicy {
 	if (!isRecord(value)) return protocol(`${field} must be a policy object`);
-	frameKeys(value, ["model", "cwd", "fastMode", "searchMode", "contextWindow"], field);
+	frameKeys(value, ["model", "cwd", "fastMode", "searchMode", "contextWindow", "tools"], field);
 	const policy: TeamMemberPolicy = {};
 	for (const key of ["model", "cwd", "searchMode"] as const) {
 		if (value[key] !== undefined) policy[key] = text(value[key], `${field}.${key}`, 4096);
@@ -988,26 +994,25 @@ function parsePolicy(value: unknown, field: string): TeamMemberPolicy {
 		policy.fastMode = value["fastMode"];
 	}
 	if (value["contextWindow"] !== undefined) policy.contextWindow = safeInteger(value["contextWindow"], `${field}.contextWindow`, 1);
+	if (value["tools"] !== undefined) policy.tools = toolNames(value["tools"], `${field}.tools`);
 	return policy;
 }
 
 function parseTeamTeamView(value: unknown): TeamTeamView {
 	if (!isRecord(value)) return protocol("team view must be an object");
-	frameKeys(value, ["version", "teamId", "lifecycle", "health", "stateVersion", "eventSeq", "manager", "timeoutSeconds", "deadline", "brief", "members", "works", "incidents", "incidentsOmitted", "budget", "usage", "outcome", "reason"], "team view");
+	frameKeys(value, ["version", "teamId", "lifecycle", "health", "stateVersion", "eventSeq", "lead", "timeoutSeconds", "deadline", "brief", "members", "works", "incidents", "incidentsOmitted", "budget", "usage", "outcome", "reason"], "team view");
 	if (value["version"] !== TEAM_PROTOCOL_VERSION) return protocol("team view version is invalid");
 	const lifecycle = value["lifecycle"];
 	if (!["prepared", "active", "closing", "closed", "failed", "cancelled", "interrupted"].includes(String(lifecycle))) return protocol("team view lifecycle is invalid");
 	const health = value["health"];
 	if (health !== "ok" && health !== "needs_attention") return protocol("team view health is invalid");
-	const manager = normalizeAlias(value["manager"], "team view.manager");
+	const lead = normalizeAlias(value["lead"], "team view.lead");
 	const rawMembers = array(value["members"], "team view.members", TEAM_MAX_MEMBERS);
-	if (rawMembers.length < 2) return protocol("team view must contain the Manager and at least one worker");
+	if (rawMembers.length < 2) return protocol("team view must contain at least two members");
 	const members: TeamMemberView[] = rawMembers.map((item, index) => {
 		const field = `team view.members[${index}]`;
 		if (!isRecord(item)) return protocol(`${field} must be an object`);
-		frameKeys(item, ["id", "role", "roleDescription", "lifecycle", "activity", "pause", "currentWork", "resourceState", "error", "queued", "blocked", "held", "policy", "usage"], field);
-		const role = item["role"];
-		if (role !== "manager" && role !== "worker") return protocol(`${field}.role is invalid`);
+		frameKeys(item, ["id", "roleDescription", "lifecycle", "activity", "pause", "currentWork", "resourceState", "error", "queued", "blocked", "held", "policy", "usage"], field);
 		const memberLifecycle = item["lifecycle"];
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(memberLifecycle))) return protocol(`${field}.lifecycle is invalid`);
 		const activity = item["activity"];
@@ -1021,7 +1026,7 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 			const parsed = parseWorkError(item["error"], `${field}.error`);
 			error = { code: parsed.code, message: parsed.message };
 		}
-		return { id: normalizeAlias(item["id"], `${field}.id`), role, roleDescription: text(item["roleDescription"], `${field}.roleDescription`, TEAM_MAX_ROLE_BYTES),
+		return { id: normalizeAlias(item["id"], `${field}.id`), roleDescription: text(item["roleDescription"], `${field}.roleDescription`, TEAM_MAX_ROLE_BYTES),
 			lifecycle: memberLifecycle as MemberLifecycle, activity: activity as MemberActivity, pause: pause as PauseState,
 			...(item["currentWork"] !== undefined ? { currentWork: normalizeWorkRef(item["currentWork"], `${field}.currentWork`) } : {}),
 			resourceState: resourceState as ResourceState, ...(error ? { error } : {}),
@@ -1029,8 +1034,7 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 			policy: parsePolicy(item["policy"], `${field}.policy`), usage: parseUsage(item["usage"], `${field}.usage`) };
 	});
 	const roster = members.map((member) => member.id);
-	if (new Set(roster).size !== roster.length || !roster.includes(manager) || members.filter((member) => member.role === "manager").length !== 1
-		|| members.find((member) => member.id === manager)?.role !== "manager") return protocol("team view roster/Manager identity is inconsistent");
+	if (new Set(roster).size !== roster.length || !roster.includes(lead)) return protocol("team view roster/lead identity is inconsistent");
 	const brief = normalizeBrief(value["brief"], roster);
 	const works = value["works"];
 	if (!isRecord(works)) return protocol("team view works must be an object");
@@ -1048,8 +1052,8 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 	const limits = {} as TeamBudgetLimits;
 	for (const key of Object.keys(DEFAULT_TEAM_BUDGET) as Array<keyof TeamBudgetLimits>) limits[key] = safeInteger(rawBudget["limits"][key], `team view budget.limits.${key}`, 0);
 	if (!isRecord(rawBudget["used"])) return protocol("team view budget.used must be an object");
-	frameKeys(rawBudget["used"], ["teamWorks", "teamActivations", "managerActivations", "teamModelRequests", "teamToolCalls", "emergencyManagerActivations", "reservedResultBytes"], "team view budget.used");
-	const usedKeys = ["teamWorks", "teamActivations", "managerActivations", "teamModelRequests", "teamToolCalls", "emergencyManagerActivations", "reservedResultBytes"] as const;
+	frameKeys(rawBudget["used"], ["teamWorks", "teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "emergencyLeadActivations", "reservedResultBytes"], "team view budget.used");
+	const usedKeys = ["teamWorks", "teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "emergencyLeadActivations", "reservedResultBytes"] as const;
 	const used = {} as TeamTeamView["budget"]["used"];
 	for (const key of usedKeys) used[key] = safeInteger(rawBudget["used"][key], `team view budget.used.${key}`, 0);
 	if (typeof rawBudget["exhausted"] !== "boolean") return protocol("team view budget.exhausted must be boolean");
@@ -1062,7 +1066,7 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 	if (deadline !== null && (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline < 0)) return protocol("team view deadline is invalid");
 	return { version: TEAM_PROTOCOL_VERSION, teamId: frameId(value["teamId"], "team view.teamId"), lifecycle: lifecycle as TeamTeamView["lifecycle"], health: health as Health,
 		stateVersion: safeInteger(value["stateVersion"], "team view.stateVersion", 0), eventSeq: safeInteger(value["eventSeq"], "team view.eventSeq", 0),
-		manager, timeoutSeconds, deadline, brief, members, works: counts,
+		lead, timeoutSeconds, deadline, brief, members, works: counts,
 		incidents: array(value["incidents"], "team view.incidents", TEAM_VIEW_MAX_INCIDENTS).map((incident, index) => parseIncident(incident, `team view.incidents[${index}]`)),
 		incidentsOmitted: safeInteger(value["incidentsOmitted"], "team view.incidentsOmitted", 0),
 		budget: { limits, used, exhausted: rawBudget["exhausted"],
@@ -1160,7 +1164,7 @@ function parseReceipt(value: unknown): TeamReceipt {
 		case "staged": {
 			frameKeys(value, ["status", "intent", "work"], "staged receipt");
 			const intent = value["intent"];
-			if (!["reply", "yield_dependencies", "yield_attention", "manager_idle", "close_team"].includes(String(intent))) return protocol("staged receipt intent is invalid");
+			if (!["reply", "yield_dependencies", "yield_attention", "idle", "close_team"].includes(String(intent))) return protocol("staged receipt intent is invalid");
 			return { status: "staged", intent: intent as Extract<TeamReceipt, { status: "staged" }>["intent"], ...(value["work"] !== undefined ? { work: normalizeWorkRef(value["work"], "receipt.work") } : {}) };
 		}
 		case "applied": case "unchanged": {
@@ -1215,24 +1219,23 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	frameKeys(value, ["version", "teamId", "deliveryId", "member", "brief", "roster", "scope", "outcomes", "omittedOutcomes", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
 	const member = value["member"];
 	if (!isRecord(member)) return protocol("activation input member is malformed");
-	frameKeys(member, ["id", "role", "roleDescription"], "activation input member");
-	if (member["id"] !== binding.memberId || member["role"] !== binding.role) {
-		return protocol("activation input member does not match binding");
-	}
-	const role = member["role"];
-	if (role !== "manager" && role !== "worker") return protocol("activation input member role is invalid");
+	frameKeys(member, ["id", "lead", "roleDescription"], "activation input member");
+	if (member["id"] !== binding.memberId) return protocol("activation input member does not match binding");
+	if (typeof member["lead"] !== "boolean") return protocol("activation input member lead must be boolean");
+	const lead = member["lead"];
 	const roleDescription = text(member["roleDescription"], "activation input member.roleDescription", TEAM_MAX_ROLE_BYTES);
 	const roster = array(value["roster"], "activation input.roster", TEAM_MAX_MEMBERS).map((raw, index) => {
 		const field = `activation input.roster[${index}]`;
 		if (!isRecord(raw)) return protocol(`${field} must be an object`);
-		frameKeys(raw, ["id", "role", "lifecycle", "rolePreview"], field);
-		if (raw["role"] !== "manager" && raw["role"] !== "worker") return protocol(`${field}.role is invalid`);
+		frameKeys(raw, ["id", "lead", "lifecycle", "rolePreview"], field);
+		if (raw["lead"] !== undefined && raw["lead"] !== true) return protocol(`${field}.lead must be true when present`);
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(raw["lifecycle"]))) return protocol(`${field}.lifecycle is invalid`);
-		return { id: normalizeAlias(raw["id"], `${field}.id`), role: raw["role"] as MemberRole, lifecycle: raw["lifecycle"] as MemberLifecycle,
+		return { id: normalizeAlias(raw["id"], `${field}.id`), ...(raw["lead"] === true ? { lead: true as const } : {}), lifecycle: raw["lifecycle"] as MemberLifecycle,
 			rolePreview: text(raw["rolePreview"], `${field}.rolePreview`, TEAM_MAX_ROLE_BYTES) };
 	});
 	const rosterIds = roster.map((item) => item.id);
-	if (!rosterIds.includes(binding.memberId) || new Set(rosterIds).size !== rosterIds.length || roster.filter((item) => item.role === "manager").length !== 1) return protocol("activation input roster is inconsistent");
+	if (!rosterIds.includes(binding.memberId) || new Set(rosterIds).size !== rosterIds.length || roster.filter((item) => item.lead).length !== 1
+		|| roster.find((item) => item.id === binding.memberId)?.lead !== (lead || undefined)) return protocol("activation input roster is inconsistent");
 	const brief = normalizeBrief(value["brief"], rosterIds);
 	const rawScope = value["scope"];
 	if (!isRecord(rawScope)) return protocol("activation input scope is malformed");
@@ -1263,17 +1266,17 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 			inputRefs: idList(rawScope["inputRefs"], "activation input inputRefs", TEAM_MAX_INPUT_REFS), waitingFor,
 			...(checkpoint !== undefined ? { checkpoint } : {}), ...(resumeInstruction !== undefined ? { resumeInstruction } : {}),
 			...(previousView ? { previous: previousView } : {}) };
-	} else if (rawScope["kind"] === "management") {
-		if (binding.role !== "manager") return protocol("only the Manager may receive management activations");
-		frameKeys(rawScope, ["kind", "eventBatchId", "events", "checkpoint", "emergency"], "activation input management scope");
+	} else if (rawScope["kind"] === "events") {
+		if (!lead) return protocol("only the lead may receive events activations");
+		frameKeys(rawScope, ["kind", "eventBatchId", "events", "checkpoint", "emergency"], "activation input events scope");
 		if (typeof rawScope["emergency"] !== "boolean") return protocol("activation input emergency must be boolean");
-		const events = array(rawScope["events"], "activation input events", TEAM_MAX_MANAGER_EVENT_BATCH).map((raw, index): ManagerEventView => {
+		const events = array(rawScope["events"], "activation input events", TEAM_MAX_EVENT_BATCH).map((raw, index): TeamEventView => {
 			const field = `activation input events[${index}]`;
 			if (!isRecord(raw)) return protocol(`${field} must be an object`);
 			frameKeys(raw, ["id", "kind", "message", "actor", "work", "memberId", "incidentId", "resultRef"], field);
-			if (!(MANAGER_EVENT_KINDS as readonly unknown[]).includes(raw["kind"])) return protocol(`${field}.kind is invalid`);
+			if (!(TEAM_EVENT_KINDS as readonly unknown[]).includes(raw["kind"])) return protocol(`${field}.kind is invalid`);
 			if (raw["actor"] !== undefined && (raw["actor"] !== "@host" || raw["kind"] !== "USER_COMMAND")) return protocol(`${field}.actor is only valid as @host on USER_COMMAND`);
-			return { id: frameId(raw["id"], `${field}.id`), kind: raw["kind"] as ManagerEventView["kind"],
+			return { id: frameId(raw["id"], `${field}.id`), kind: raw["kind"] as TeamEventView["kind"],
 				message: text(raw["message"], `${field}.message`, TEAM_MAX_EVENT_MESSAGE_BYTES),
 				...(raw["actor"] === "@host" ? { actor: "@host" as const } : {}),
 				...(raw["work"] !== undefined ? { work: normalizeWorkRef(raw["work"], `${field}.work`) } : {}),
@@ -1281,9 +1284,9 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 				...(raw["incidentId"] !== undefined ? { incidentId: frameId(raw["incidentId"], `${field}.incidentId`) } : {}),
 				...(raw["resultRef"] !== undefined ? { resultRef: frameId(raw["resultRef"], `${field}.resultRef`) } : {}) };
 		});
-		if (events.length === 0 || new Set(events.map((event) => event.id)).size !== events.length) return protocol("management activation event batch must be non-empty and unique");
+		if (events.length === 0 || new Set(events.map((event) => event.id)).size !== events.length) return protocol("events activation batch must be non-empty and unique");
 		const checkpoint = rawScope["checkpoint"] === undefined ? undefined : text(rawScope["checkpoint"], "activation input checkpoint", TEAM_MAX_NOTE_BYTES);
-		scope = { kind: "management", eventBatchId: frameId(rawScope["eventBatchId"], "activation input eventBatchId"), events,
+		scope = { kind: "events", eventBatchId: frameId(rawScope["eventBatchId"], "activation input eventBatchId"), events,
 			...(checkpoint !== undefined ? { checkpoint } : {}), emergency: rawScope["emergency"] };
 	} else return protocol("activation input scope kind is invalid");
 	const outcomes = array(value["outcomes"], "activation input outcomes", TEAM_MAX_DELIVERED_OUTCOMES).map((raw, index): OutcomeView => {
@@ -1316,19 +1319,19 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 		return { work: normalizeWorkRef(raw["work"], `${field}.work`), state: raw["state"] as WorkState };
 	});
 	if (new Set(ownedChildren.map((child) => workRefKey(child.work))).size !== ownedChildren.length) return protocol("activation ownedChildren contains duplicates");
-	if (scope.kind === "management" && (ownedChildren.length || ownedChildrenOmitted)) return protocol("management activation cannot have owned children");
+	if (scope.kind === "events" && (ownedChildren.length || ownedChildrenOmitted)) return protocol("events activation cannot have owned children");
 	const omittedOutcomes = safeInteger(value["omittedOutcomes"], "activation input.omittedOutcomes", 0);
 	const rawBudget = value["budget"];
 	if (!isRecord(rawBudget)) return protocol("activation input budget must be an object");
 	frameKeys(rawBudget, ["emergency", "modelRequests", "toolCalls", "activations"], "activation input budget");
-	if (typeof rawBudget["emergency"] !== "boolean" || rawBudget["emergency"] !== (scope.kind === "management" && scope.emergency)) {
+	if (typeof rawBudget["emergency"] !== "boolean" || rawBudget["emergency"] !== (scope.kind === "events" && scope.emergency)) {
 		return protocol("activation input budget emergency must match its scope");
 	}
 	const budget = { emergency: rawBudget["emergency"], modelRequests: safeInteger(rawBudget["modelRequests"], "activation input budget.modelRequests", 0),
 		toolCalls: safeInteger(rawBudget["toolCalls"], "activation input budget.toolCalls", 0),
 		activations: safeInteger(rawBudget["activations"], "activation input budget.activations", 0) };
 	const input: ActivationInput = { version: TEAM_PROTOCOL_VERSION, teamId: binding.teamId, deliveryId,
-		member: { id: binding.memberId, role, roleDescription }, brief, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
+		member: { id: binding.memberId, lead, roleDescription }, brief, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
 		...(ownedChildrenOmitted !== undefined ? { ownedChildrenOmitted } : {}),
 		notice: text(value["notice"], "activation input.notice", TEAM_MAX_NOTE_BYTES) };
 	if (jsonBytes(input) > TEAM_MAX_ACTIVATION_INPUT_BYTES) return protocol("activation input exceeds its size limit");
@@ -1346,9 +1349,10 @@ function parseParentCommandInternal(value: unknown): ParentCommand {
 		case "bind": {
 			frameKeys(value, ["version", "commandId", "operation", "binding", "loadout"], "bind");
 			const loadout = value["loadout"];
-			if (!isRecord(loadout) || loadout["role"] !== binding.role || loadout["teamTool"] !== true) return protocol("bind.loadout is invalid");
-			frameKeys(loadout, ["role", "teamTool"], "bind.loadout");
-			return { version: TEAM_PROTOCOL_VERSION, commandId, operation: "bind", binding, loadout: { role: binding.role, teamTool: true } };
+			if (!isRecord(loadout) || loadout["teamTool"] !== true) return protocol("bind.loadout is invalid");
+			frameKeys(loadout, ["tools", "teamTool"], "bind.loadout");
+			return { version: TEAM_PROTOCOL_VERSION, commandId, operation: "bind", binding,
+				loadout: { tools: loadout["tools"] === null ? null : toolNames(loadout["tools"], "bind.loadout.tools"), teamTool: true } };
 		}
 		case "activate": {
 			frameKeys(value, ["version", "commandId", "operation", "binding", "activation", "deliveryId", "input"], "activate");
@@ -1356,7 +1360,7 @@ function parseParentCommandInternal(value: unknown): ParentCommand {
 			const deliveryId = frameId(value["deliveryId"], "deliveryId");
 			const input = parseActivationInput(value["input"], binding, deliveryId);
 			if ((activation.kind === "work" && (input.scope.kind !== "work" || !sameWorkRef(activation.work!, input.scope.work)))
-				|| (activation.kind === "management" && (input.scope.kind !== "management" || activation.eventBatchId !== input.scope.eventBatchId))) {
+				|| (activation.kind === "events" && (input.scope.kind !== "events" || activation.eventBatchId !== input.scope.eventBatchId))) {
 				return protocol("activation input scope does not match the activation frame");
 			}
 			return { version: TEAM_PROTOCOL_VERSION, commandId, operation: "activate", binding, activation, deliveryId,
@@ -1400,7 +1404,7 @@ export function projectActivationInput(input: ActivationInput): ActivationInput 
 	if (projected.scope.kind === "work" && projected.scope.previous?.error) {
 		projected.scope.previous.error = projectWorkError(projected.scope.previous.error);
 	}
-	if (projected.scope.kind === "management") {
+	if (projected.scope.kind === "events") {
 		for (const event of projected.scope.events) event.message = projectErrorText(event.message, TEAM_MAX_EVENT_MESSAGE_BYTES);
 	}
 	for (const outcome of projected.outcomes) if (outcome.error) outcome.error = projectWorkError(outcome.error);

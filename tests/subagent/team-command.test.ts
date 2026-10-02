@@ -9,8 +9,7 @@ function setup(initialRequests: Array<{ to: string; task: string }> = [], budget
 	const broker = { assertAliasesAvailable: async () => undefined } as unknown as SessionBroker;
 	const host = new TeamSessionHost(broker, () => undefined, []);
 	const prepared = host.runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage the Team." },
-		workers: [{ alias: "worker", roleDescription: "Complete assigned work." }],
+		members: [{ alias: "lead", roleDescription: "Manage the Team." }, { alias: "worker", roleDescription: "Complete assigned work." }], lead: "lead",
 		brief: { goal: "Run host-control tests." }, initialRequests, timeoutSeconds: null, ...(budget ? { budget } : {}),
 	});
 	return { host, teamId: prepared.teamId };
@@ -101,12 +100,12 @@ test("host messages are confirmed and become explicitly attributed Manager event
 	assert.equal(confirmations.length, 1);
 	assert.match(confirmations[0]!.message, /grants no budget or tool permission/u);
 	const activation = host.runtime.takeNextActivation(teamId);
-	assert.equal(activation?.scope.kind, "management");
-	const events = activation?.input.scope.kind === "management" ? activation.input.scope.events : [];
+	assert.equal(activation?.scope.kind, "events");
+	const events = activation?.input.scope.kind === "events" ? activation.input.scope.events : [];
 	const event = events.find((item) => item.kind === "USER_COMMAND");
 	assert.equal(event?.actor, "@host");
 	assert.equal(event?.message, "Recheck the evidence before closing.");
-	assert.match(notifications.at(-1)?.text ?? "", /Manager message applied/u);
+	assert.match(notifications.at(-1)?.text ?? "", /Lead message applied/u);
 });
 
 test("cancel of a prepared Team is explicitly confirmed and closes resources without a provider", async () => {
@@ -166,7 +165,7 @@ test("popup message gathers text then uses existing confirmation, or cancels wit
 	await runTeamCommand(host, "", context.ctx);
 	assert.equal(context.confirmations.length, 1);
 	assert.match(context.confirmations[0]!.message, /Review this work/u);
-	assert.match(context.notifications[0]!.text, /Manager message applied/u);
+	assert.match(context.notifications[0]!.text, /Lead message applied/u);
 });
 
 test("popup resume and grant enter the existing selection paths", async () => {

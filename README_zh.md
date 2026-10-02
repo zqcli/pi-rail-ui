@@ -88,15 +88,15 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 #### 协作 Team（按需启用）
 
-普通 subagent 模式不变。Team 的入口是 `subagent_team` 的 **prepare → launch**：固定一个 Manager 加 1–8 个 worker，全部使用全新且唯一的 persistent alias，每个成员是独立的原生 Pi session。成员完成一项工作后不退出，而是保持 open/idle 并可继续接收工作；只有 Manager 的条件式 `close_team`（或宿主取消、故障）结束 Team。Manager 负责分配、验收、处理阻塞和关闭，不撰写最终总结；总结是交给普通 worker 的一项工作。
+普通 subagent 模式不变。Team 的入口是 `subagent_team` 的 **prepare → launch**：由 2–9 个成员组成，全部使用全新且唯一的 persistent alias，每个成员是独立的原生 Pi session，且所有成员同型：配置项、基础工具和能力完全相同，成员做什么只取决于 `roleDescription` 和收到的工作。其中一个成员是 Team 的 **lead**（`lead: "<alias>"`，是职守而不是类型）：处理 Team 事件、请求初始工作、验收并关闭 Team，也可以像其他成员一样被请求工作。成员完成一项工作后不退出，而是保持 open/idle 并可继续接收工作；只有 lead 的条件式 `close_team`（或宿主取消、故障）结束 Team。lead 不撰写最终总结；总结是交给某个成员的一项工作。
 
-`prepare` 只校验并固定计划，不启动 provider 或工具：`manager`/`workers` 为 `{alias, roleDescription, model?, cwd?, fastMode?, contextWindow?}`，可选字段为 `null` 或省略即使用默认值；`brief.goal` 必填（可带 `acceptanceCriteria`、`constraints`、`authorizations`）；`initialRequests` 最多 8 条且只能指向 worker，只有角色、没有初始工作的 worker 合法且不会被调用；`timeoutSeconds` 为 `null`/省略表示没有 Team 总截止，正数（≤86400）从 launch 开始计时。模型、cwd、Fast/Search 与 contextWindow/compaction reserve 策略在 prepare 固定，launch 前再次核对，漂移时拒绝并保留 prepared Team。
+`prepare` 只校验并固定计划，不启动 provider 或工具：`members` 的每项为 `{alias, roleDescription, model?, cwd?, fastMode?, contextWindow?, tools?}`，`lead` 指向其中一个，可选字段为 `null` 或省略即使用默认值（`tools` 是基础工具名白名单，省略/`null` = 全部基础工具，`team` 总会加上，未知名字在 prepare 就被拒绝；旧的 `manager`/`workers` 字段会被拒绝并提示 `manager/workers were replaced by members plus lead: <alias>`）；`brief.goal` 必填（可带 `acceptanceCriteria`、`constraints`、`authorizations`）；`initialRequests` 最多 8 条且可指向除 lead 以外的任何成员，只有角色、没有初始工作的成员合法且不会被调用；`timeoutSeconds` 为 `null`/省略表示没有 Team 总截止，正数（≤86400）从 launch 开始计时。模型、cwd、Fast/Search 与 contextWindow/compaction reserve 策略在 prepare 固定，launch 前再次核对，漂移时拒绝并保留 prepared Team。
 
 ```json
-{"action":"prepare","manager":{"alias":"lead","roleDescription":"分配、验收、处理阻塞并关闭；不撰写最终报告","model":null,"cwd":null,"fastMode":null,"contextWindow":null},"workers":[{"alias":"review","roleDescription":"审查实现，不修改文件"},{"alias":"writer","roleDescription":"基于结果引用撰写报告，必要时向 review 补问"}],"brief":{"goal":"审查当前变更并提交有证据的报告","acceptanceCriteria":["标明测试范围与未验证项"]},"initialRequests":[{"to":"review","task":"审查本地变更","inputRefs":[]}],"timeoutSeconds":null}
+{"action":"prepare","members":[{"alias":"lead","roleDescription":"分配、验收、处理阻塞并关闭；不撰写最终报告","model":null,"cwd":null,"fastMode":null,"contextWindow":null},{"alias":"review","roleDescription":"审查实现，不修改文件","tools":["read","bash"]},{"alias":"writer","roleDescription":"基于结果引用撰写报告，必要时向 review 补问"}],"lead":"lead","brief":{"goal":"审查当前变更并提交有证据的报告","acceptanceCriteria":["标明测试范围与未验证项"]},"initialRequests":[{"to":"review","task":"审查本地变更","inputRefs":[]}],"timeoutSeconds":null}
 ```
 
-然后以返回的 `teamId` 启动；launch 持有整个 Team lifetime，Team 结束后直接返回结论、每个成员的统计、时间线，以及 Manager 选定的每份 worker 结果全文（不由 Manager 改写；总量上限 48 KiB，只有超出额度的结果被截断并注明其 `resultRef`），因此之后无需再调用 `status` 读取结果。launch 面板像 grouped subagent 一样为每个成员显示一个子面板。启动调用：
+然后以返回的 `teamId` 启动；launch 持有整个 Team lifetime，Team 结束后直接返回结论、每个成员的统计、时间线，以及 lead 选定的每份成员结果全文（不由 lead 改写；总量上限 48 KiB，只有超出额度的结果被截断并注明其 `resultRef`），因此之后无需再调用 `status` 读取结果。launch 面板像 grouped subagent 一样为每个成员显示一个子面板。启动调用：
 
 ```json
 {"action":"launch","teamId":"<teamId>"}
@@ -104,13 +104,13 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 中止 launch 的等待不会取消 Team：工具返回明确错误，Team 仍由宿主管理，可用 `/rail-team <teamId> status` 检查或显式 cancel。不要用普通 `subagent` 工具启动 Team 成员；Team 成员不能递归创建 subagent。
 
-成员通过 `team` 工具协作：`request`（同步接受并返回 WorkRef，不等待接收者运行）、`reply`（只为当前 WorkRef 暂存结果，原生收尾和清理后才提交）、`yield`（等待具体 WorkRef、请求 Manager 决策，或让 Manager 本批 idle；等待会结束本次原生运行，不占住成员）、只读 `status`，以及 Manager 专用的扁平 `control`（`{"action":"control","command":"close_team","resultRefs":["<resultRef>"],"outcome":"succeeded"}`；另有 `pause_member`、`resume_member`、`revise_work`、`cancel_work`、`resume_work`、`accept_result`、`close_member`）。`reply`、`yield`、`close_team` 必须是最终 assistant 批次中唯一的工具调用。业务错误以带 `code` 的结构化工具错误返回。结果未知（传输丢失、清理未确认等）的依赖不会自动唤醒下游，而是挂起并等待 Manager/宿主明确处置。全员 idle 是正常状态，不会自动失败或关闭；没有模型轮询。
+成员通过 `team` 工具协作：`request`（同步接受并返回 WorkRef，不等待接收者运行）、`reply`（只为当前 WorkRef 暂存结果，原生收尾和清理后才提交）、`yield`（等待具体 WorkRef、请求 lead 决策，或让 lead 本批 Team 事件 idle；等待会结束本次原生运行，不占住成员）、只读 `status`，以及 lead 专用的扁平 `control`（`{"action":"control","command":"close_team","resultRefs":["<resultRef>"],"outcome":"succeeded"}`；另有 `pause_member`、`resume_member`、`revise_work`、`cancel_work`、`resume_work`、`accept_result`、`close_member`）。`reply`、`yield`、`close_team` 必须是最终 assistant 批次中唯一的工具调用。业务错误以带 `code` 的结构化工具错误返回。结果未知（传输丢失、清理未确认等）的依赖不会自动唤醒下游，而是挂起并等待 lead/宿主明确处置。全员 idle 是正常状态，不会自动失败或关闭；没有模型轮询。
 
-`subagent_team prepare` 支持 `budget: "standard" | "long" | "unlimited"`（默认 `long`：Team 4096 次 activation、8192 次模型请求、32768 次工具调用）；仅用户要求开放式/循环任务时选 `unlimited`。预算累计不重置，只有宿主可经 `/rail-team <id> grant` 提额，各档均保留 4 个 worker 许可与 Manager 独立许可。
+`subagent_team prepare` 支持 `budget: "standard" | "long" | "unlimited"`（默认 `long`：Team 4096 次 activation、8192 次模型请求、32768 次工具调用）；仅用户要求开放式/循环任务时选 `unlimited`。预算累计不重置，只有宿主可经 `/rail-team <id> grant` 提额，各档均保留 4 个 work 许可（`workPermits`，任何成员的 work activation 都计入，lead 的也算）与 lead 处理 Team 事件的独立槽位。
 
 `/rail-team` 打开实时弹窗，包含 Overview、Members、Tasks 和 Timeline 四个视图（Tab 切换，方向键导航），支持经确认的 cancel/resume/grant/message 操作及只读历史。`/rail-team list`（或在非 TUI 模式如 RPC/headless 下不带参数）保留文本列表；`/rail-team <teamId> …` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、resume（解除 attention/protocol hold）、grant 和 cancel。模型工具 `subagent_team status` 以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。历史只读：跨 session branch 或重启不恢复旧 Promise 或继续运行，未结束的 Team 显示为 interrupted；旧 v1 Team 记录只读映射为 legacy。
 
-在 `/rail-agent` 面板选中成员后按 `s` 停止、按 `x` 删除。对 Team worker，Stop 只停止该成员，并将其运行中 work 记录为 outcome unknown；同 Team 其他 worker/root 与无关 Team 不会被一并取消。停止 Manager 会标记 `MANAGER_UNAVAILABLE` 并暂停 worker，Team 保持可由宿主管理。Delete 只有在成员原生进程实际退出得到确认后才删除 session 与 descriptor；退出未知时保留资源所有权并拒绝删除。
+在 `/rail-agent` 面板选中成员后按 `s` 停止、按 `x` 删除。对 Team 成员，Stop 只停止该成员，并将其运行中 work 记录为 outcome unknown；同 Team 其他成员/root 与无关 Team 不会被一并取消。停止 lead 会标记 `LEAD_UNAVAILABLE` 并暂停其他成员，Team 保持可由宿主管理。Delete 只有在成员原生进程实际退出得到确认后才删除 session 与 descriptor；退出未知时保留资源所有权并拒绝删除。
 
 完整协议、状态、错误码与限制见 [Team Actor v2](docs/subagent-team-actor.md)，100 项验收映射与本地证据见 [验证报告](docs/subagent-team-actor-validation.md)。这些是纯 Runtime、fake transport 与真实 Pi 0.87.1 + 本地合成 provider 的测试，不代表真实在线模型的决策质量，也不包含 TUI 人工验收和长时间、真实负载运行。缓存预热检查只覆盖运行中阶段的预热决策；idle 阶段预热在 rail 子进程中未能触发，原因未查明。
 

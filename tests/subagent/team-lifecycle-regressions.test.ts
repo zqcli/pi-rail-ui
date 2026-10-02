@@ -12,8 +12,7 @@ import { TeamRuntime } from "../../tools/subagents/team-runtime";
 
 const model = { provider: "synthetic", modelId: "offline" };
 const plan = {
-	manager: { alias: "lead", roleDescription: "Manage." },
-	workers: [{ alias: "worker", roleDescription: "Work." }],
+	members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "worker", roleDescription: "Work." }], lead: "lead",
 	brief: { goal: "Verify admission and confirmed exit without any provider." }, timeoutSeconds: null,
 };
 function deferred<T>() {

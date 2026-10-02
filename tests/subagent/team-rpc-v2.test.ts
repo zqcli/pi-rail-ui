@@ -10,8 +10,7 @@ import { jsonBytes, jsonTextBytes, parseParentCommand, parseTeamReply, projectAc
 
 const runtime = new TeamRuntime();
 const prepared = runtime.prepare({
-	manager: { alias: "lead", roleDescription: "Manage the Team." },
-	workers: [{ alias: "w1", roleDescription: "Do the assigned work." }],
+	members: [{ alias: "lead", roleDescription: "Manage the Team." }, { alias: "w1", roleDescription: "Do the assigned work." }], lead: "lead",
 	brief: { goal: "Complete the test work." }, timeoutSeconds: null,
 });
 runtime.launch(prepared.teamId);
@@ -218,8 +217,7 @@ test("private frame size includes the native tool-call evidence stripped before 
 
 test("parent Runtime revalidates business input independently, with no business state change or connection fault", async () => {
 	const local = new TeamRuntime();
-	const prepared = local.prepare({ manager: { alias: "lead", roleDescription: "Manage." },
-		workers: [{ alias: "w1", roleDescription: "Work." }], brief: { goal: "Validate locally." } });
+	const prepared = local.prepare({ members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead", brief: { goal: "Validate locally." } });
 	local.launch(prepared.teamId);
 	const current = local.takeNextActivation(prepared.teamId)!;
 	local.inputReady(current.binding, current.scope.activationId, current.deliveryId);

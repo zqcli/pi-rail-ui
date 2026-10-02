@@ -1,6 +1,6 @@
 import { TEAM_JOURNAL_ENTRY_TYPE } from "./team-journal";
 import {
-	TEAM_MAX_RESERVED_RESULT_BYTES, TEAM_MAX_RESULT_RECORDS, TEAM_MAX_WORKERS,
+	TEAM_MAX_MEMBERS, TEAM_MAX_RESERVED_RESULT_BYTES, TEAM_MAX_RESULT_RECORDS, TEAM_MIN_MEMBERS,
 	type ResultRecord, type TeamLifecycle, type TeamOutcome, type TeamResult, type WorkRef,
 } from "./team-protocol";
 import {
@@ -26,8 +26,9 @@ export interface TeamHistoryEntry {
 	lifecycle: TeamLifecycle | "completed";
 	outcome?: TeamOutcome;
 	reason?: string;
-	manager?: string;
-	workers: string[];
+	lead?: string;
+	/** Every member alias, the lead included. */
+	members: string[];
 	goal?: string;
 	results: ResultRecord[];
 	finalResultRefs: string[];
@@ -87,12 +88,9 @@ function applyJournalRecord(
 			if (current) return false;
 			const roster = data["roster"];
 			if (!isRecord(roster)) return false;
-			onlyKeys(roster, ["manager", "workers"]);
-			const manager = normalizeAlias(roster["manager"], "journal.roster.manager");
-			const workers = parseAliases(roster["workers"]);
-			if (workers.length < 1 || workers.length > TEAM_MAX_WORKERS || new Set([manager, ...workers]).size !== workers.length + 1) return false;
+			const { lead, members } = parseRoster(roster);
 			const goal = boundedText(data["goal"], 512, "journal.goal");
-			teams.set(teamId, { teamId, version: 2, lifecycle: "interrupted", manager, workers, goal, results: [], finalResultRefs: [], at });
+			teams.set(teamId, { teamId, version: 2, lifecycle: "interrupted", lead, members, goal, results: [], finalResultRefs: [], at });
 			resultsByTeam.set(teamId, new Map());
 			resultBytesByTeam.set(teamId, 0);
 			return true;
@@ -112,7 +110,7 @@ function applyJournalRecord(
 			onlyKeys(data, ["version", "kind", "teamId", "at", "result"]);
 			if (!current || current.version !== 2 || ended.has(teamId)) return false;
 			const result = normalizeResultRecord(data["result"]);
-			if (![current.manager, ...current.workers].includes(result.author)) return false;
+			if (!current.members.includes(result.author)) return false;
 			const records = resultsByTeam.get(teamId)!;
 			// Runtime reserves one WorkResult slot per revision; record metadata is separately bounded.
 			const bytes = jsonBytes(result.result);
@@ -149,7 +147,7 @@ function applyJournalRecord(
 		case "grant": {
 			onlyKeys(data, ["version", "kind", "teamId", "at", "grant"]);
 			if (!current || current.version !== 2 || ended.has(teamId)) return false;
-			normalizeTeamBudgetGrantRecord(data["grant"], "journal.grant");
+			normalizeTeamBudgetGrantRecord(legacyGrant(data["grant"]), "journal.grant");
 			return true;
 		}
 		case "terminal": {
@@ -158,7 +156,7 @@ function applyJournalRecord(
 			const close = closeByTeam.get(teamId);
 			const closeId = data["closeId"] === undefined ? undefined : normalizeId(data["closeId"], "journal.terminal.closeId");
 			if ((close && closeId !== close.closeId) || (!close && closeId !== undefined)) return false;
-			const result = parseTeamResult(data["result"]);
+			const result = parseTeamResult(legacyTerminalResult(data["result"]));
 			if (result.teamId !== teamId || !terminalMatchesHistory(result, current, resultsByTeam.get(teamId)!, close)) return false;
 			current.lifecycle = result.lifecycle;
 			if (result.outcome) current.outcome = result.outcome;
@@ -174,10 +172,7 @@ function applyJournalRecord(
 }
 
 function terminalMatchesHistory(result: TeamResult, history: TeamHistoryEntry, results: Map<string, ResultRecord>, close: CloseDecisionHistory | undefined): boolean {
-	if (![history.manager, ...history.workers].includes(result.members.find((member) => member.role === "manager")?.id ?? "")) return false;
-	if (result.members.length !== history.workers.length + 1) return false;
-	const roster = new Map([[history.manager!, "manager" as const], ...history.workers.map((worker) => [worker, "worker" as const] as const)]);
-	if (result.members.some((member) => roster.get(member.id) !== member.role)) return false;
+	if (result.members.length !== history.members.length || result.members.some((member) => !history.members.includes(member.id))) return false;
 	if (result.finalResultRefs.some((ref) => !results.has(ref))) return false;
 	if (!rootsMatchResults(result.roots, results)) return false;
 	if (result.lifecycle === "closed") {
@@ -185,7 +180,7 @@ function terminalMatchesHistory(result: TeamResult, history: TeamHistoryEntry, r
 			|| canonicalJson(result.roots) !== canonicalJson(close.roots) || result.reason !== close.reason
 			|| result.outcome === undefined
 			|| result.members.some((member) => member.resourceState !== "released"
-				|| (member.role === "manager" ? member.lifecycle !== "closed" : member.lifecycle !== "closed" && member.lifecycle !== "faulted"))) return false;
+				|| (member.id === history.lead ? member.lifecycle !== "closed" : member.lifecycle !== "closed" && member.lifecycle !== "faulted"))) return false;
 		return true;
 	}
 	if (close) {
@@ -229,9 +224,39 @@ function validCloseOutcome(outcome: TeamOutcome, roots: TeamResult["roots"], ref
 	return !!reason;
 }
 
-function parseAliases(value: unknown): string[] {
-	if (!Array.isArray(value) || value.length > TEAM_MAX_WORKERS) throw new Error("journal roster workers are invalid");
-	return value.map((item, index) => normalizeAlias(item, `journal.roster.workers[${index}]`));
+function parseAliases(value: unknown, field: string): string[] {
+	if (!Array.isArray(value) || value.length > TEAM_MAX_MEMBERS) throw new Error(`${field} is invalid`);
+	return value.map((item, index) => normalizeAlias(item, `${field}[${index}]`));
+}
+
+/** A launched roster: {lead, members}, or the retired {manager, workers} (the manager is the lead). */
+function parseRoster(roster: Record<string, unknown>): { lead: string; members: string[] } {
+	let lead: string;
+	let members: string[];
+	if ("manager" in roster) {
+		onlyKeys(roster, ["manager", "workers"]);
+		lead = normalizeAlias(roster["manager"], "journal.roster.manager");
+		members = [lead, ...parseAliases(roster["workers"], "journal.roster.workers")];
+	} else {
+		onlyKeys(roster, ["lead", "members"]);
+		lead = normalizeAlias(roster["lead"], "journal.roster.lead");
+		members = parseAliases(roster["members"], "journal.roster.members");
+	}
+	if (members.length < TEAM_MIN_MEMBERS || new Set(members).size !== members.length || !members.includes(lead)) throw new Error("journal roster is invalid");
+	return { lead, members };
+}
+
+/** Old grants named the Manager/worker counters; they are the lead/work counters now. */
+const LEGACY_COUNTERS: Record<string, string> = { managerActivations: "leadActivations", emergencyManagerActivations: "emergencyLeadActivations", workerPermits: "workPermits" };
+function legacyGrant(value: unknown): unknown {
+	if (!isRecord(value) || !isRecord(value["increments"])) return value;
+	return { ...value, increments: Object.fromEntries(Object.entries(value["increments"]).map(([key, amount]) => [LEGACY_COUNTERS[key] ?? key, amount])) };
+}
+
+/** Old terminal results tagged every member with a role. */
+function legacyTerminalResult(value: unknown): unknown {
+	if (!isRecord(value) || !Array.isArray(value["members"])) return value;
+	return { ...value, members: value["members"].map((member) => isRecord(member) ? Object.fromEntries(Object.entries(member).filter(([key]) => key !== "role")) : member) };
 }
 
 function parseIds(value: unknown, field: string): string[] {
@@ -262,17 +287,17 @@ function onlyKeys(value: Record<string, unknown>, keys: readonly string[]): void
 function applyLegacySnapshot(teams: Map<string, TeamHistoryEntry>, data: unknown): boolean {
 	if (!isRecord(data)) return false;
 	const teamId = typeof data["id"] === "string" ? normalizeId(data["id"], "legacy.teamId") : undefined;
-	const manager = typeof data["coordinator"] === "string" ? normalizeAlias(data["coordinator"], "legacy.coordinator") : undefined;
+	const coordinator = typeof data["coordinator"] === "string" ? normalizeAlias(data["coordinator"], "legacy.coordinator") : undefined;
 	const rawWorkers = data["workers"];
 	const phase = data["phase"];
-	if (!teamId || !manager || !Array.isArray(rawWorkers) || typeof phase !== "string") return false;
+	if (!teamId || !coordinator || !Array.isArray(rawWorkers) || typeof phase !== "string") return false;
 	const existing = teams.get(teamId);
 	if (existing && existing.version !== 1) return false;
 	if (!(LEGACY_TERMINAL as readonly string[]).includes(phase) && !(LEGACY_UNFINISHED as readonly string[]).includes(phase)) return false;
-	const workers = rawWorkers.map((item, index) => normalizeAlias(item, `legacy.workers[${index}]`));
-	if (workers.length < 1 || workers.length > TEAM_MAX_WORKERS || new Set([manager, ...workers]).size !== workers.length + 1) return false;
+	const members = [coordinator, ...rawWorkers.map((item, index) => normalizeAlias(item, `legacy.workers[${index}]`))];
+	if (members.length < TEAM_MIN_MEMBERS || members.length > TEAM_MAX_MEMBERS || new Set(members).size !== members.length) return false;
 	teams.set(teamId, {
-		teamId, version: 1, manager, workers,
+		teamId, version: 1, lead: coordinator, members,
 		lifecycle: (LEGACY_TERMINAL as readonly string[]).includes(phase) ? phase as TeamHistoryEntry["lifecycle"] : "interrupted",
 		results: [], finalResultRefs: [], at: validTime(data["createdAt"]) ? data["createdAt"] as number : 0,
 	});

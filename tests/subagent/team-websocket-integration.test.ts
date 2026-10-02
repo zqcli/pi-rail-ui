@@ -324,8 +324,7 @@ async function setupV2(t: TestContext, server: LoopbackResponsesServer, scenario
 	});
 	const runtime = new TeamRuntime();
 	const prepared = runtime.prepare({
-		manager: { alias: "A", roleDescription: "TEAM_MEMBER_A manages this Team.", model: "rail-team-ws/probe", cwd: sandbox, fastMode: false },
-		workers: [{ alias: "B1", roleDescription: "TEAM_MEMBER_B1 completes assigned work.", model: "rail-team-ws/probe", cwd: sandbox, fastMode: false }],
+		members: [{ alias: "A", roleDescription: "TEAM_MEMBER_A manages this Team.", model: "rail-team-ws/probe", cwd: sandbox, fastMode: false }, { alias: "B1", roleDescription: "TEAM_MEMBER_B1 completes assigned work.", model: "rail-team-ws/probe", cwd: sandbox, fastMode: false }], lead: "A",
 		brief: { goal: "Verify Stage B Team v2 over the configured Responses WebSocket." },
 		initialRequests: [{ to: "B1", task: "TEAM_MEMBER_B1 complete the native WebSocket work", inputRefs: [] }], timeoutSeconds: 45,
 	});

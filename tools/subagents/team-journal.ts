@@ -6,7 +6,7 @@ import type { ResultRecord, TeamResult, WorkRef } from "./team-protocol";
  * history, not a recovery log: it never contains the whole ledger, gates, ACKs or private frames.
  */
 export type TeamJournalRecord =
-	| { version: 2; kind: "launched"; teamId: string; at: number; roster: { manager: string; workers: string[] }; goal: string }
+	| { version: 2; kind: "launched"; teamId: string; at: number; roster: { lead: string; members: string[] }; goal: string }
 	| { version: 2; kind: "interrupted"; teamId: string; at: number; reason: string }
 	| { version: 2; kind: "result"; teamId: string; at: number; result: ResultRecord }
 	| { version: 2; kind: "decision"; teamId: string; at: number; decision: "revise_work" | "cancel_work"; work: WorkRef; reason?: string }

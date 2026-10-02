@@ -14,8 +14,7 @@ function makeRuntime(initialRequests: Array<{ to: string; task: string }>, optio
 	const runtime = new TeamRuntime({ now: () => time++, createId: () => `id${++ids}`, limits: options.limits ?? {},
 		...(options.checkInvariants === undefined ? {} : { checkInvariants: options.checkInvariants }) });
 	const { teamId } = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work, review roots and close the Team." },
-		workers: [{ alias: "w1", roleDescription: "Perform work." }, { alias: "w2", roleDescription: "Perform work." }],
+		members: [{ alias: "lead", roleDescription: "Manage work, review roots and close the Team." }, { alias: "w1", roleDescription: "Perform work." }, { alias: "w2", roleDescription: "Perform work." }], lead: "lead",
 		brief: { goal: "Exercise review fixes." }, initialRequests, timeoutSeconds: null,
 	});
 	if (options.claimW2) runtime.claimNativeLifetime(teamId, "w2");
@@ -62,21 +61,21 @@ test("checkInvariants:false skips the hot-path sweep but assertInvariants still 
 test("a repeated host message is a new request once the earlier one was processed, but pending duplicates collapse", () => {
 	const { runtime, teamId } = makeRuntime([]);
 	const boot = nextWorkless(runtime, teamId);
-	const first = runtime.messageManager(teamId, "continue");
+	const first = runtime.messageLead(teamId, "continue");
 	assert.equal(first.status, "applied");
-	const pending = runtime.messageManager(teamId, "continue");
+	const pending = runtime.messageLead(teamId, "continue");
 	assert.deepEqual([pending.status, "eventId" in pending && pending.eventId], ["unchanged", "eventId" in first && first.eventId]);
 	finish(runtime, boot);
 	const next = runtime.takeNextActivation(teamId)!;
-	assert.deepEqual(next.input.scope.kind === "management" && next.input.scope.events.filter((event) => event.kind === "USER_COMMAND").length, 1);
+	assert.deepEqual(next.input.scope.kind === "events" && next.input.scope.events.filter((event) => event.kind === "USER_COMMAND").length, 1);
 	ready(runtime, next);
 	runtime.handleAction(next.binding, next.scope, 1, "y", { action: "yield" }, "y");
 	settle(runtime, next, "", "y");
-	const again = runtime.messageManager(teamId, "continue");
+	const again = runtime.messageLead(teamId, "continue");
 	assert.equal(again.status, "applied", "the processed message does not swallow a later identical one");
 	assert.notEqual("eventId" in again && again.eventId, "eventId" in first && first.eventId);
 	const wake = runtime.takeNextActivation(teamId)!;
-	assert.deepEqual(wake.input.scope.kind === "management" && wake.input.scope.events.filter((event) => event.kind === "USER_COMMAND").map((event) => event.message), ["continue"]);
+	assert.deepEqual(wake.input.scope.kind === "events" && wake.input.scope.events.filter((event) => event.kind === "USER_COMMAND").map((event) => event.message), ["continue"]);
 	runtime.assertInvariants(teamId);
 });
 
@@ -109,7 +108,7 @@ test("releasing a budget hold keeps the Team flagged while a member is still fau
 
 test("quiescence events are keyed by a fixed-size digest, not the O(works) signature", () => {
 	const requests = Array.from({ length: 8 }, (_, index) => ({ to: index % 2 ? "w2" : "w1", task: `work ${index}` }));
-	const { runtime, teamId } = makeRuntime(requests, { limits: { workerPermits: 1 } });
+	const { runtime, teamId } = makeRuntime(requests, { limits: { workPermits: 1 } });
 	for (let index = 0; index < requests.length; index++) settle(runtime, nextWork(runtime, teamId), `done ${index}`);
 	for (let index = 0; index < 3; index++) {
 		const activation = runtime.takeNextActivation(teamId);

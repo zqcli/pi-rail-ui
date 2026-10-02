@@ -21,8 +21,7 @@ function setup(maximal = false, options: TeamRuntimeOptions = {}) {
 	const role = maximal ? fill(TEAM_MAX_ROLE_BYTES) : "Perform assigned work.";
 	const task = maximal ? fill(TEAM_MAX_TASK_BYTES) : "Collect every child outcome.";
 	const { teamId } = runtime.prepare({
-		manager: { alias: "lead", roleDescription: role },
-		workers: (maximal ? ["owner", "runner", "w3", "w4", "w5", "w6", "w7", "w8"] : ["owner", "runner"]).map((alias) => ({ alias, roleDescription: role })),
+		members: [{ alias: "lead", roleDescription: role }, ...(maximal ? ["owner", "runner", "w3", "w4", "w5", "w6", "w7", "w8"] : ["owner", "runner"]).map((alias) => ({ alias, roleDescription: role }))], lead: "lead",
 		brief, initialRequests: [{ to: "owner", task }],
 	});
 	runtime.launch(teamId);
@@ -114,7 +113,7 @@ test("Runtime: legal failed business result keeps its full 8 KiB summary, with b
 	const view = h.runtime.getWork(h.teamId, child)!;
 	assertError(view.current.error, "BUSINESS_FAILED");
 	assert.equal(h.runtime.getResult(h.teamId, view.current.resultRef!)?.result.summary, summary);
-	h.runtime.messageManager(h.teamId, "Inspect the failed child's complete work view.");
+	h.runtime.messageLead(h.teamId, "Inspect the failed child's complete work view.");
 	const manager = h.runtime.takeNextActivation(h.teamId)!;
 	h.ready(manager);
 	const workReply = h.call(manager, { action: "status", view: "work", id: child.workId });
@@ -207,7 +206,7 @@ test("Runtime: malformed-Unicode transport diagnostics preserve exact evidence; 
 	assert.equal(hold.reason, "attention");
 	assert.deepEqual(h.runtime.getWork(h.teamId, h.parent.scope.work!)!.current.observedOutcomes, []);
 	const manager = h.runtime.takeNextActivation(h.teamId)!;
-	assert.equal(manager.scope.kind, "management");
+	assert.equal(manager.scope.kind, "events");
 	h.ready(manager);
 	assert.equal(h.call(manager, { action: "status", view: "work", id: child.workId }).ok, true);
 	assert.equal(h.call(manager, { action: "status", view: "incident" }).ok, true);
@@ -263,8 +262,7 @@ test("Runtime: revised work projects its prior failure without changing the immu
 
 test("Runtime: long malformed-Unicode driver startup errors still consume the failed attempt and retain first-wins cleanup", () => {
 	const runtime = new TeamRuntime();
-	const { teamId } = runtime.prepare({ manager: { alias: "lead", roleDescription: "Manage." },
-		workers: [{ alias: "w1", roleDescription: "Work." }], brief: { goal: "Fail before launch." }, initialRequests: [{ to: "w1", task: "Not started." }] });
+	const { teamId } = runtime.prepare({ members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead", brief: { goal: "Fail before launch." }, initialRequests: [{ to: "w1", task: "Not started." }] });
 	const binding = runtime.claimNativeLifetime(teamId, "w1");
 	const reason = "Startup cause: \ud800" + fill(8000);
 	const receipt = runtime.failStartup(teamId, reason);
@@ -285,7 +283,7 @@ test("Runtime: long malformed-Unicode driver startup errors still consume the fa
 });
 
 test("Runtime: many cleanup-failure notices with maximal brief/roles are sealed into bounded exact Manager batches", () => {
-	const h = setup(true, { limits: { workerPermits: 8 } });
+	const h = setup(true, { limits: { workPermits: 8 } });
 	const children: WorkRef[] = [];
 	for (const to of ["runner", "w3", "w4", "w5", "w6", "w7", "w8"]) {
 		const reply = h.call(h.parent, { action: "request", to, task: "Fail independently." });
@@ -305,9 +303,9 @@ test("Runtime: many cleanup-failure notices with maximal brief/roles are sealed 
 	const eventIds = new Set<string>();
 	let batches = 0;
 	let next = h.runtime.takeNextActivation(h.teamId);
-	while (next?.scope.kind === "management") {
+	while (next?.scope.kind === "events") {
 		assert.ok(batches++ < 10);
-		assert.ok(next.input.scope.kind === "management");
+		assert.ok(next.input.scope.kind === "events");
 		assert.deepEqual(next.input.brief, h.brief);
 		for (const event of next.input.scope.events) {
 			assert.ok(!eventIds.has(event.id), "a byte-limited batch must not consume or replay other pending events");

@@ -17,12 +17,9 @@ function makeRuntime(initialRequests: Array<{ to: string; task: string }> = [{ t
 	// An injected createId (the deterministic `id1`... by default) is used for every kind of ID; `defaultIds` runs the production generators.
 	const runtime = new TeamRuntime({ now: () => time++, ...(defaultIds ? {} : { createId: () => createId ? createId(++ids) : `id${++ids}` }), limits });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work, review roots and close the Team." },
-		workers: [
-			{ alias: "w1", roleDescription: "Perform assigned work." },
+		members: [{ alias: "lead", roleDescription: "Manage work, review roots and close the Team." }, { alias: "w1", roleDescription: "Perform assigned work." },
 			{ alias: "w2", roleDescription: "Perform dependent work." },
-			...extraWorkers.map((alias) => ({ alias, roleDescription: "Perform assigned work." })),
-		],
+			...extraWorkers.map((alias) => ({ alias, roleDescription: "Perform assigned work." })),], lead: "lead",
 		brief: { goal: "Complete the test work." },
 		initialRequests,
 		timeoutSeconds: null,
@@ -55,7 +52,7 @@ function settle(runtime: TeamRuntime, activation: RuntimeActivation, toolCallId?
 
 function finishManagerBoot(runtime: TeamRuntime, teamId: string): void {
 	const activation = runtime.takeNextActivation(teamId)!;
-	assert.equal(activation.scope.kind, "management");
+	assert.equal(activation.scope.kind, "events");
 	inputReady(runtime, activation);
 	const staged = action(runtime, activation, 1, "boot-yield", { action: "yield" });
 	assert.equal(staged.ok, true);
@@ -103,11 +100,9 @@ test("P: v2 codec rejects v1 live frames, legacy actions, unknown fields and non
 	assert.equal(resume.action, "control");
 	if (resume.action === "control") assert.equal(resume.control.command, "resume_member");
 	assert.deepEqual(normalizeTeamPlan({
-		manager: { alias: "lead", roleDescription: "Manage." },
-		workers: [{ alias: "w1", roleDescription: "Work." }], brief: { goal: "Test." }, timeoutSeconds: null,
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead", brief: { goal: "Test." }, timeoutSeconds: null,
 	}), {
-		manager: { alias: "lead", roleDescription: "Manage.", policy: {} },
-		workers: [{ alias: "w1", roleDescription: "Work.", policy: {} }],
+		members: [{ alias: "lead", roleDescription: "Manage.", policy: {} }, { alias: "w1", roleDescription: "Work.", policy: {} }], lead: "lead",
 		brief: { goal: "Test." }, initialRequests: [], timeoutSeconds: null,
 	});
 });
@@ -115,19 +110,19 @@ test("P: v2 codec rejects v1 live frames, legacy actions, unknown fields and non
 test("Manager guidance: management input says to yield instead of polling, and host panel facts count events and results", () => {
 	const { runtime, teamId } = makeRuntime();
 	const boot = runtime.takeNextActivation(teamId)!;
-	assert.equal(boot.scope.kind, "management");
+	assert.equal(boot.scope.kind, "events");
 	assert.match(boot.input.notice, /no current WorkRef.*yield.*do not poll status/u);
 	assert.match(boot.input.notice, /WORK_HELD .*resume_work \{workId, expectedRevision, incidentId, instruction\}.*resultRef or WorkRef/u,
 		"the Manager learns how to hand a held member the conclusion it needs");
 	assert.match(boot.input.notice, /close_team checks every root itself/u);
-	const bootEvent = boot.input.scope.kind === "management" ? boot.input.scope.events[0]! : undefined;
+	const bootEvent = boot.input.scope.kind === "events" ? boot.input.scope.events[0]! : undefined;
 	assert.match(bootEvent?.message ?? "", /1 initial request\(s\) are already assigned.*w1 \S+@1 "root work".*Do not request them again/u,
 		"BOOT names the initialRequests that already run, so the Manager does not duplicate them");
-	assert.match(bootEvent?.message ?? "", /close_team itself closes idle workers/u);
+	assert.match(bootEvent?.message ?? "", /close_team itself closes idle members/u);
 	inputReady(runtime, boot);
 	const waiting = action(runtime, boot, 1, "manager-wait", { action: "yield", waitingFor: [{ workId: "any", revision: 1 }], checkpoint: "wait" });
 	assert.equal(code(waiting), "INVALID_ARGUMENT");
-	assert.match(waiting.ok ? "" : waiting.error.message, /never waits inside an activation.*start the next management activation automatically/u);
+	assert.match(waiting.ok ? "" : waiting.error.message, /never waits inside an activation.*start the next events activation automatically/u);
 	assert.equal(action(runtime, boot, 2, "boot-yield", { action: "yield" }).ok, true);
 	settle(runtime, boot, "boot-yield");
 
@@ -142,14 +137,14 @@ test("Manager guidance: management input says to yield instead of polling, and h
 		"a worker learns the peer-dependency paths");
 	reply(runtime, work, "w1-reply", "first result");
 	const facts = runtime.panelFacts(teamId);
-	assert.ok(facts.pendingManagerEvents >= 1, "the committed result waits as a Manager event");
+	assert.ok(facts.pendingEvents >= 1, "the committed result waits as a Manager event");
 	assert.equal(facts.results.get("w1")?.count, 1);
 	assert.equal(facts.results.get("w1")?.latest.result.summary, "first result");
 	assert.equal(facts.results.has("lead"), false);
 	const next = runtime.takeNextActivation(teamId)!;
-	assert.equal(next.scope.kind, "management");
-	assert.equal(runtime.panelFacts(teamId).pendingManagerEvents, 0, "events delivered to an activation are no longer pending");
-	const resultEvent = next.input.scope.kind === "management" ? next.input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY") : undefined;
+	assert.equal(next.scope.kind, "events");
+	assert.equal(runtime.panelFacts(teamId).pendingEvents, 0, "events delivered to an activation are no longer pending");
+	const resultEvent = next.input.scope.kind === "events" ? next.input.scope.events.find((event) => event.kind === "ROOT_RESULT_READY") : undefined;
 	assert.match(resultEvent?.message ?? "", /committed succeeded result \S+ from w1, in full below; review it .* without a status call:\n\nfirst result$/u);
 
 	// A duplicate root that the Manager cancels is named when a succeeded close is refused.
@@ -179,7 +174,7 @@ test("ROOT_RESULT_READY carries a maximum-size root result in full inside a vali
 	assert.equal(action(runtime, work, 1, "big", { action: "reply", result: { status: "succeeded", summary: "big", findings } }).ok, true);
 	settle(runtime, work, "big");
 	const manager = runtime.takeNextActivation(teamId)!;
-	const event = manager.input.scope.kind === "management" ? manager.input.scope.events.find((item) => item.kind === "ROOT_RESULT_READY") : undefined;
+	const event = manager.input.scope.kind === "events" ? manager.input.scope.events.find((item) => item.kind === "ROOT_RESULT_READY") : undefined;
 	assert.ok(event?.message.endsWith(`Findings:\n${findings.map((item) => `- ${item}`).join("\n")}`));
 	assert.doesNotThrow(() => parseParentCommand({ version: 2, commandId: "activate", operation: "activate", binding: manager.binding,
 		activation: manager.scope, deliveryId: manager.deliveryId, input: manager.input }));
@@ -199,7 +194,7 @@ test("peer dependency: a held worker gets another worker's resultRef from the Ma
 		assert.equal(action(runtime, first, 1, "w1-held", { action: "yield", attention: "need w2's conclusion", checkpoint: "step 1 done" }).ok, true);
 		settle(runtime, first, "w1-held");
 		const manager = runtime.takeNextActivation(teamId)!;
-		const events = manager.input.scope.kind === "management" ? manager.input.scope.events : [];
+		const events = manager.input.scope.kind === "events" ? manager.input.scope.events : [];
 		const held = events.find((event) => event.kind === "WORK_HELD")!;
 		const conclusion = events.find((event) => event.kind === "ROOT_RESULT_READY")!.resultRef!;
 		inputReady(runtime, manager);
@@ -384,7 +379,7 @@ test("default IDs: work, result, incident and event IDs are 4-character codes fr
 	yieldWork(runtime, asker, "ask", { attention: "which scope?", checkpoint: "stopped" });
 	reply(runtime, answerer, "reply", "done");
 	const manager = runtime.takeNextActivation(teamId)!;
-	const events = manager.input.scope.kind === "management" ? manager.input.scope.events.map((event) => event.id) : [];
+	const events = manager.input.scope.kind === "events" ? manager.input.scope.events.map((event) => event.id) : [];
 	const ids = {
 		work: runtime.listWorks(teamId).map((item) => item.work.workId),
 		result: runtime.listWorks(teamId).flatMap((item) => item.resultRef ? [item.resultRef] : []),
@@ -487,10 +482,10 @@ test("timeline: a management activation names each event kind once", () => {
 	reply(runtime, first, "first-reply", "first done");
 	reply(runtime, second, "second-reply", "second done");
 	const manager = runtime.takeNextActivation(teamId)!;
-	const kinds = manager.input.scope.kind === "management" ? manager.input.scope.events.map((event) => event.kind) : [];
+	const kinds = manager.input.scope.kind === "events" ? manager.input.scope.events.map((event) => event.kind) : [];
 	assert.equal(kinds.filter((kind) => kind === "ROOT_RESULT_READY").length, 2, "the batch carries two events of the same kind");
-	const note = runtime.panelFacts(teamId).timeline.findLast((entry) => entry.text.startsWith("lead management activation"))!.text;
-	assert.equal(note, `lead management activation (${[...new Set(kinds)].join(", ")})`);
+	const note = runtime.panelFacts(teamId).timeline.findLast((entry) => entry.text.startsWith("lead events activation"))!.text;
+	assert.equal(note, `lead events activation (${[...new Set(kinds)].join(", ")})`);
 	assert.doesNotMatch(note, /ROOT_RESULT_READY, ROOT_RESULT_READY/u);
 });
 
@@ -539,24 +534,24 @@ test("panel facts: a parent lists its unresolved sub-tasks, and a question shows
 	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "waiting on 2 sub-tasks: w2 (running), w3 (running)");
 	yieldWork(runtime, second, "w3-asks", { attention: "Which branch\nshould I diff?", checkpoint: "stopped before diffing" });
 	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "waiting on 2 sub-tasks: w2 (running), w3 (held)");
-	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · queued for Manager',
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · queued for lead',
 		"a question nobody has picked up yet is queued for the Manager, on one line");
 
 	const manager = runtime.takeNextActivation(teamId)!;
-	assert.equal(manager.scope.kind, "management");
+	assert.equal(manager.scope.kind, "events");
 	inputReady(runtime, manager);
-	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · Manager handling',
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?" · lead handling',
 		"the Manager's current activation holds the WORK_HELD event");
 	yieldWork(runtime, first, "w2-asks", { attention: "Need credentials for the staging cluster. ".repeat(6), checkpoint: "stopped before deploying" });
 	const long = runtime.panelFacts(teamId).stalled.get("w2")!;
-	assert.match(long, /^held · asks: "Need credentials for the staging cluster\. .*…" · queued for Manager$/u);
+	assert.match(long, /^held · asks: "Need credentials for the staging cluster\. .*…" · queued for lead$/u);
 	assert.ok(long.length < 130, "a long question is cut to about 80 characters");
 
 	assert.equal(action(runtime, manager, 1, "manager-yield", { action: "yield" }).ok, true);
 	settle(runtime, manager, "manager-yield");
 	assert.equal(runtime.panelFacts(teamId).stalled.get("w3"), 'held · asks: "Which branch should I diff?"',
 		"a question the Manager has already seen and left open is not called queued");
-	assert.match(runtime.panelFacts(teamId).stalled.get("w2")!, / · queued for Manager$/u, "an event outside that batch is still queued");
+	assert.match(runtime.panelFacts(teamId).stalled.get("w2")!, / · queued for lead$/u, "an event outside that batch is still queued");
 });
 
 test("panel facts: budget, protocol and Manager-unavailable holds say why they are held", () => {
@@ -612,18 +607,18 @@ test("panel facts: the Manager's current activation names the event kinds it is 
 	assert.equal(handlingText([{ kind: "A" }, { kind: "B" }, { kind: "A" }, { kind: "C" }, { kind: "D" }, { kind: "E" }]), "handling A, B, C +2 more",
 		"kinds are distinct and at most three are named");
 	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "first root" }, { to: "w2", task: "second root" }]);
-	assert.equal(runtime.panelFacts(teamId).managerHandling, undefined, "nothing is handled before an activation starts");
+	assert.equal(runtime.panelFacts(teamId).leadHandling, undefined, "nothing is handled before an activation starts");
 	const boot = runtime.takeNextActivation(teamId)!;
-	assert.equal(runtime.panelFacts(teamId).managerHandling, "handling BOOT");
+	assert.equal(runtime.panelFacts(teamId).leadHandling, "handling BOOT");
 	finishIdle(runtime, boot);
-	assert.equal(runtime.panelFacts(teamId).managerHandling, undefined, "and nothing once it has settled");
+	assert.equal(runtime.panelFacts(teamId).leadHandling, undefined, "and nothing once it has settled");
 	const first = runtime.takeNextActivation(teamId)!;
 	const second = runtime.takeNextActivation(teamId)!;
 	reply(runtime, first, "first-reply", "first done");
 	yieldWork(runtime, second, "second-asks", { attention: "which scope?", checkpoint: "stopped" });
 	const manager = runtime.takeNextActivation(teamId)!;
-	assert.equal(manager.scope.kind, "management");
-	assert.equal(runtime.panelFacts(teamId).managerHandling, "handling ROOT_RESULT_READY, WORK_HELD, TEAM_QUIESCENT");
+	assert.equal(manager.scope.kind, "events");
+	assert.equal(runtime.panelFacts(teamId).leadHandling, "handling ROOT_RESULT_READY, WORK_HELD, TEAM_QUIESCENT");
 });
 
 test("panel facts: an active Team waits for questions, then Manager review, then its close, else for whoever is working", () => {
@@ -641,16 +636,16 @@ test("panel facts: an active Team waits for questions, then Manager review, then
 		reply(runtime, first, "first-reply", "first done");
 		assert.equal(runtime.panelFacts(teamId).waitingFor, "w2 (running)", "a root is still open, so no review is due yet");
 		reply(runtime, second, "second-reply", "second done");
-		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager review of 2 results");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead review of 2 results");
 
 		const manager = runtime.takeNextActivation(teamId)!;
 		inputReady(runtime, manager);
 		const accept = (activation: RuntimeActivation, sequence: number) => assert.equal(action(runtime, manager, sequence, `accept-${sequence}`,
 			{ action: "control", command: "accept_result", work: workRef(activation), disposition: "accepted", reason: "ok" }).ok, true);
 		accept(first, 1);
-		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager review of 1 result");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead review of 1 result");
 		accept(second, 2);
-		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager to close the Team");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead to close the Team");
 		const resultRefs = [first, second].map((activation) => runtime.getWork(teamId, workRef(activation))!.current.resultRef!);
 		assert.equal(action(runtime, manager, 3, "close", { action: "control", command: "close_team", resultRefs, outcome: "succeeded" }).ok, true);
 		assert.equal(runtime.getTeam(teamId).lifecycle, "closing");
@@ -661,11 +656,11 @@ test("panel facts: an active Team waits for questions, then Manager review, then
 		finishManagerBoot(runtime, teamId);
 		const askers = [runtime.takeNextActivation(teamId)!, runtime.takeNextActivation(teamId)!, runtime.takeNextActivation(teamId)!];
 		yieldWork(runtime, askers[0]!, "ask-1", { attention: "scope?", checkpoint: "stopped" });
-		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager decision on w1's question");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead decision on w1's question");
 		yieldWork(runtime, askers[1]!, "ask-2", { attention: "gate?", checkpoint: "stopped" });
-		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager decisions on w1's and w2's questions");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead decisions on w1's and w2's questions");
 		yieldWork(runtime, askers[2]!, "ask-3", { attention: "budget?", checkpoint: "stopped" });
-		assert.equal(runtime.panelFacts(teamId).waitingFor, "Manager decisions on 3 questions");
+		assert.equal(runtime.panelFacts(teamId).waitingFor, "Lead decisions on 3 questions");
 	}
 	{
 		const { runtime, teamId } = makeRuntime([]);
@@ -678,14 +673,14 @@ test("P: prepare rejects initial per-member overflow before reserving a Team or 
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `prepare-${++ids}`, limits: { memberUnresolvedWork: 1 } });
 	const active = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "Existing Team." }, timeoutSeconds: null,
 	});
 	runtime.launch(active.teamId);
 	const before = runtime.getTeam(active.teamId);
 	const idsBefore = ids;
 	assert.throws(() => runtime.prepare({
-		manager: { alias: "other", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "other", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "other",
 		brief: { goal: "Too many initial assignments." }, timeoutSeconds: null,
 		initialRequests: [{ to: "w1", task: "one" }, { to: "w1", task: "two" }],
 	}), (error) => error instanceof TeamProtocolError && error.code === "REQUEST_QUEUE_FULL");
@@ -708,7 +703,7 @@ test("P: request admission is activation-idempotent and derives identity/root fr
 	assert.deepEqual(action(runtime, manager, 1, "request-1", args), accepted);
 	assert.equal(code(action(runtime, manager, 1, "request-1", { ...args, task: "different" })), "PROTOCOL_FAILURE");
 	assert.deepEqual(businessSnapshot(runtime, teamId, [acceptedWork]), afterAccept, "conflicting duplicate leaves authoritative business state unchanged");
-	const forged = { ...manager.binding, memberId: "w1", role: "worker" as const };
+	const forged = { ...manager.binding, memberId: "w1" };
 	assert.equal(runtime.handleAction(forged, manager.scope, 2, "forged", args).ok, false);
 	assert.deepEqual(businessSnapshot(runtime, teamId, [acceptedWork]), afterAccept, "forged binding leaves authoritative business state unchanged");
 	runtime.assertInvariants(teamId);
@@ -748,7 +743,7 @@ test("C01: an idle paused worker accepts new work without launching it, then res
 	]);
 	finishManagerBoot(runtime, teamId);
 	const host = runtime.hostControl(teamId);
-	assert.equal(host.message_manager("pause w1").actor, "@host");
+	assert.equal(host.message_lead("pause w1").actor, "@host");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	assert.equal(code(action(runtime, manager, 1, "pause-w1", { action: "control", command: "pause_member", memberId: "w1" })), undefined);
@@ -764,7 +759,7 @@ test("C01: an idle paused worker accepts new work without launching it, then res
 	assert.equal(independent.binding.memberId, "w2", "a paused worker does not hold an execution permit");
 	reply(runtime, independent, "independent-reply", "w2 completed");
 
-	host.message_manager("resume w1");
+	host.message_lead("resume w1");
 	const resumeManager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, resumeManager);
 	assert.equal(code(action(runtime, resumeManager, 1, "resume-w1", { action: "control", command: "resume_member", memberId: "w1" })), undefined);
@@ -780,10 +775,9 @@ test("C01: an idle paused worker accepts new work without launching it, then res
 
 test("C02/C03: pause waits for approved native tools, acknowledges every preflight result, and reacquires its permit", async () => {
 	let ids = 0;
-	const runtime = new TeamRuntime({ createId: () => `pause-${++ids}`, limits: { workerPermits: 1 } });
+	const runtime = new TeamRuntime({ createId: () => `pause-${++ids}`, limits: { workPermits: 1 } });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work." },
-		workers: [{ alias: "w1", roleDescription: "First worker." }, { alias: "w2", roleDescription: "Second worker." }],
+		members: [{ alias: "lead", roleDescription: "Manage work." }, { alias: "w1", roleDescription: "First worker." }, { alias: "w2", roleDescription: "Second worker." }], lead: "lead",
 		brief: { goal: "Exercise safe-point pause." },
 		initialRequests: [{ to: "w1", task: "latched work" }, { to: "w2", task: "permit waiter" }],
 		timeoutSeconds: null,
@@ -794,7 +788,7 @@ test("C02/C03: pause waits for approved native tools, acknowledges every preflig
 	assert.equal(first.binding.memberId, "w1");
 	inputReady(runtime, first);
 	assert.equal(runtime.gate(first.binding, first.scope, "tool_gate", "approved-read", "read").allow, true);
-	runtime.hostControl(prepared.teamId).message_manager("pause w1 at its next safe point");
+	runtime.hostControl(prepared.teamId).message_lead("pause w1 at its next safe point");
 	const manager = runtime.takeNextActivation(prepared.teamId)!;
 	inputReady(runtime, manager);
 	action(runtime, manager, 1, "request-pause", { action: "control", command: "pause_member", memberId: "w1" });
@@ -826,7 +820,7 @@ test("C02/C03: pause waits for approved native tools, acknowledges every preflig
 	const second = runtime.takeNextActivation(prepared.teamId)!;
 	assert.equal(second.binding.memberId, "w2", "the parked activation releases its sole worker permit");
 	inputReady(runtime, second);
-	runtime.hostControl(prepared.teamId).message_manager("resume w1 after w2 releases the permit");
+	runtime.hostControl(prepared.teamId).message_lead("resume w1 after w2 releases the permit");
 	const resumeManager = runtime.takeNextActivation(prepared.teamId)!;
 	inputReady(runtime, resumeManager);
 	action(runtime, resumeManager, 1, "queue-resume-w1", { action: "control", command: "resume_member", memberId: "w1" });
@@ -889,8 +883,7 @@ test("C04: member resume and hold-release APIs cannot bypass an exhausted budget
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `budget-hold-${++ids}`, limits: { teamActivations: 1 } });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work." },
-		workers: [{ alias: "w1", roleDescription: "Perform assigned work." }],
+		members: [{ alias: "lead", roleDescription: "Manage work." }, { alias: "w1", roleDescription: "Perform assigned work." }], lead: "lead",
 		brief: { goal: "Verify budget holds cannot be released by resume controls." },
 		initialRequests: [{ to: "w1", task: "budget-held root" }],
 		timeoutSeconds: null,
@@ -934,7 +927,7 @@ test("X02: a valid staged reply survives a concurrent pause and commits after cl
 	const worker = runtime.takeNextActivation(teamId)!;
 	const ref = workRef(worker);
 	inputReady(runtime, worker);
-	runtime.hostControl(teamId).message_manager("pause active w1");
+	runtime.hostControl(teamId).message_lead("pause active w1");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	assert.equal(action(runtime, manager, 1, "pause-active-w1", { action: "control", command: "pause_member", memberId: "w1" }).ok, true);
@@ -960,7 +953,7 @@ test("C10: a genuine native provider error outranks a simultaneous pause request
 	const worker = runtime.takeNextActivation(teamId)!;
 	const ref = workRef(worker);
 	inputReady(runtime, worker);
-	runtime.hostControl(teamId).message_manager("pause w1 while provider settles");
+	runtime.hostControl(teamId).message_lead("pause w1 while provider settles");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	action(runtime, manager, 1, "pause-before-provider-error", { action: "control", command: "pause_member", memberId: "w1" });
@@ -994,7 +987,7 @@ test("C05/C06: superseded reply evidence waits for cleanup, committed results su
 	assert.equal(action(runtime, old, 1, "old-staged-reply", {
 		action: "reply", result: { status: "succeeded", summary: "candidate from v1" },
 	}, "old-staged-reply").ok, true);
-	runtime.hostControl(teamId).message_manager("revise the active v1");
+	runtime.hostControl(teamId).message_lead("revise the active v1");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	const revision = action(runtime, manager, 1, "revise-active-v1", {
@@ -1021,7 +1014,7 @@ test("C05/C06: superseded reply evidence waits for cleanup, committed results su
 	inputReady(runtime, revisionTwo);
 	reply(runtime, revisionTwo, "reply-v2", "v2 committed");
 	const v2ResultManager = runtime.takeNextActivation(teamId)!;
-	assert.equal(v2ResultManager.scope.kind, "management");
+	assert.equal(v2ResultManager.scope.kind, "events");
 	inputReady(runtime, v2ResultManager);
 	action(runtime, v2ResultManager, 1, "v2-result-idle", { action: "yield" });
 	settle(runtime, v2ResultManager, "v2-result-idle");
@@ -1045,7 +1038,7 @@ test("C05/C06: superseded reply evidence waits for cleanup, committed results su
 	assert.equal(revised.currentRevision, 3);
 	assert.equal(revised.revisions[1]?.state, "resolved");
 	assert.equal(revised.revisions[1]?.resultRef, v2ResultRef, "a later revision does not erase committed prior evidence");
-	runtime.hostControl(teamId).message_manager("probe stale revision protection");
+	runtime.hostControl(teamId).message_lead("probe stale revision protection");
 	const staleManager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, staleManager);
 	assert.equal(code(action(runtime, staleManager, 1, "stale-v2-revision", {
@@ -1079,7 +1072,7 @@ test("C07/C08/C10: cancel only the selected subtree, keep same-member roots, and
 	assert.equal(childRequest.ok && childRequest.receipt?.status, "accepted");
 	const childRef = childRequest.ok && childRequest.receipt?.status === "accepted" ? childRequest.receipt.work : undefined;
 	assert.ok(childRef);
-	runtime.hostControl(teamId).message_manager("cancel only the selected root subtree");
+	runtime.hostControl(teamId).message_lead("cancel only the selected root subtree");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	const cancel = { action: "control", command: "cancel_work", workId: targetRef.workId, expectedRevision: 1, reason: "obsolete request" };
@@ -1133,7 +1126,7 @@ test("C09: pre-settlement worker transport loss isolates only that member and pr
 	assert.equal(runtime.gate(activation.binding, activation.scope, "tool_gate").allow, false);
 	runtime.assertInvariants(teamId);
 	const next = runtime.takeNextActivation(teamId);
-	assert.equal(next?.scope.kind, "management", "the manager can observe the incident; the failed worker is not stuck holding a permit");
+	assert.equal(next?.scope.kind, "events", "the manager can observe the incident; the failed worker is not stuck holding a permit");
 	inputReady(runtime, next!);
 	action(runtime, next!, 1, "fault-notice-yield", { action: "yield" });
 	settle(runtime, next!, "fault-notice-yield");
@@ -1147,7 +1140,7 @@ test("P: exhausted result slots reject request admission without ledger or budge
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `slot-${++ids}`, limits: { reservedResultBytes: TEAM_MAX_RESULT_BYTES } });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "One reserved result slot." }, timeoutSeconds: null,
 	});
 	runtime.launch(prepared.teamId);
@@ -1169,7 +1162,7 @@ test("P: revise_work capacity rejection preserves the current writer, revision a
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `rev-slot-${++ids}`, limits: { reservedResultBytes: TEAM_MAX_RESULT_BYTES } });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "One result slot only." }, initialRequests: [{ to: "w1", task: "current task" }], timeoutSeconds: null,
 	});
 	runtime.launch(prepared.teamId);
@@ -1276,7 +1269,7 @@ test("P: explicit deadline starts at launch admission, while prepare time is unb
 	let ids = 0;
 	const runtime = new TeamRuntime({ now: () => now, createId: () => `deadline-${++ids}` });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "Test deadline admission." }, timeoutSeconds: 12.5,
 	});
 	assert.equal(prepared.timeoutSeconds, 12.5);
@@ -1561,7 +1554,7 @@ test("W: native failure faults a worker and terminalizes its other assigned work
 	assert.equal(team.members.find((member) => member.id === "w1")?.lifecycle, "faulted");
 	assert.equal(team.works.failed, 2, "unstarted work assigned to a faulted worker is failed, not left runnable");
 	const manager = runtime.takeNextActivation(teamId)!;
-	assert.equal(manager.scope.kind, "management");
+	assert.equal(manager.scope.kind, "events");
 	inputReady(runtime, manager);
 	const before = businessSnapshot(runtime, teamId, [ref]);
 	assert.equal(code(action(runtime, manager, 1, "revise-faulted-assignee", {
@@ -1687,8 +1680,8 @@ test("A: oversized natural final is protocol-held after cleanup and remains mana
 	assert.equal(held?.resultRef, undefined);
 	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.activity, "idle");
 	const manager = runtime.takeNextActivation(teamId)!;
-	assert.equal(manager.scope.kind, "management");
-	const heldEvent = manager.input.scope.kind === "management" ? manager.input.scope.events.find((event) => event.incidentId) : undefined;
+	assert.equal(manager.scope.kind, "events");
+	const heldEvent = manager.input.scope.kind === "events" ? manager.input.scope.events.find((event) => event.incidentId) : undefined;
 	assert.equal(heldEvent?.kind, "WORK_HELD", "a protocol hold asks the Manager for a decision like any held work");
 	assert.match(heldEvent?.message ?? "", /without a valid reply or yield/u);
 	inputReady(runtime, manager);
@@ -1744,7 +1737,7 @@ test("L: close_team is a staged Manager decision and reports closed only after a
 	const resultRef = runtime.getWork(teamId, rootRef)?.current.resultRef;
 	assert.ok(resultRef);
 	const manager = runtime.takeNextActivation(teamId)!;
-	assert.equal(manager.scope.kind, "management");
+	assert.equal(manager.scope.kind, "events");
 	inputReady(runtime, manager);
 	assert.equal(action(runtime, manager, 1, "accept-root", { action: "control", command: "accept_result", work: rootRef, disposition: "accepted" }).ok, true);
 	const stagedClose = action(runtime, manager, 2, "close-team", {
@@ -1810,7 +1803,7 @@ function hostError(fn: () => unknown, expected: string): void {
 	assert.throws(fn, (error: unknown) => error instanceof TeamProtocolError && error.code === expected, `expected ${expected}`);
 }
 
-test("C04/G10: hold release rejects manager_unavailable and any release while the Manager is faulted, atomically", () => {
+test("C04/G10: hold release rejects lead_unavailable and any release while the Manager is faulted, atomically", () => {
 	const { runtime, teamId } = makeRuntime([
 		{ to: "w1", task: "attention root" },
 		{ to: "w2", task: "ask the Manager" },
@@ -1828,9 +1821,9 @@ test("C04/G10: hold release rejects manager_unavailable and any release while th
 	const requested = action(runtime, asker, 1, "ask-lead", { action: "request", to: "lead", task: "decide the approach" });
 	const managerWork = requested.ok && requested.receipt?.status === "accepted" ? requested.receipt.work : undefined;
 	assert.ok(managerWork);
-	runtime.hostControl(teamId).message_manager("review the held work");
+	runtime.hostControl(teamId).message_lead("review the held work");
 	const manager = runtime.takeNextActivation(teamId)!;
-	assert.equal(manager.scope.kind, "management");
+	assert.equal(manager.scope.kind, "events");
 	inputReady(runtime, manager);
 	runtime.nativeSettled(manager.binding, manager.scope.activationId, { status: "error", error: { code: "UPSTREAM", message: "Manager provider failed" } });
 	runtime.cleanupFinished(manager.binding, manager.scope.activationId, { ok: true });
@@ -1838,8 +1831,8 @@ test("C04/G10: hold release rejects manager_unavailable and any release while th
 	assert.equal(team.members.find((member) => member.id === "lead")?.lifecycle, "faulted");
 	assert.equal(team.members.find((member) => member.id === "w2")?.pause, "requested", "the running worker is safety-paused, not aborted");
 	const managerHold = runtime.getWork(teamId, managerWork)!.current.hold;
-	assert.equal(managerHold?.reason, "manager_unavailable");
-	assert.equal(runtime.panelFacts(teamId).stalled.get("lead"), "held · Manager unavailable");
+	assert.equal(managerHold?.reason, "lead_unavailable");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("lead"), "held · lead unavailable");
 	const before = businessSnapshot(runtime, teamId, [heldRef, managerWork]);
 	const host = runtime.hostControl(teamId);
 	hostError(() => host.release_hold(managerWork, managerHold!.incidentId, "continue without a Manager"), "MEMBER_UNAVAILABLE");
@@ -1852,10 +1845,9 @@ test("C04/G10: hold release rejects manager_unavailable and any release while th
 
 test("C01/C10: re-pausing a parked worker whose resume awaits a permit keeps it parked; repeated resume is a no-op", async () => {
 	let ids = 0;
-	const runtime = new TeamRuntime({ createId: () => `repause-${++ids}`, limits: { workerPermits: 1 } });
+	const runtime = new TeamRuntime({ createId: () => `repause-${++ids}`, limits: { workPermits: 1 } });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work." },
-		workers: [{ alias: "w1", roleDescription: "Parked worker." }, { alias: "w2", roleDescription: "Permit holder." }],
+		members: [{ alias: "lead", roleDescription: "Manage work." }, { alias: "w1", roleDescription: "Parked worker." }, { alias: "w2", roleDescription: "Permit holder." }], lead: "lead",
 		brief: { goal: "Exercise resume/pause races at a parked gate." },
 		initialRequests: [{ to: "w1", task: "parked work" }, { to: "w2", task: "permit work" }],
 		timeoutSeconds: null,
@@ -1865,7 +1857,7 @@ test("C01/C10: re-pausing a parked worker whose resume awaits a permit keeps it 
 	finishManagerBoot(runtime, teamId);
 	const parked = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, parked);
-	runtime.hostControl(teamId).message_manager("pause w1");
+	runtime.hostControl(teamId).message_lead("pause w1");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	let sequence = 0;
@@ -1900,7 +1892,7 @@ test("C08: native settlement releases a still-parked provider gate so cleanup ne
 	finishManagerBoot(runtime, teamId);
 	const worker = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, worker);
-	runtime.hostControl(teamId).message_manager("pause w1");
+	runtime.hostControl(teamId).message_lead("pause w1");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	action(runtime, manager, 1, "pause", { action: "control", command: "pause_member", memberId: "w1" });
@@ -1917,7 +1909,7 @@ test("C08: native settlement releases a still-parked provider gate so cleanup ne
 test("L10/X08: host cancel after a staged close_team keeps the close decision and does not stop the Manager settlement", () => {
 	const { runtime, teamId } = makeRuntime([]);
 	finishManagerBoot(runtime, teamId);
-	runtime.hostControl(teamId).message_manager("close now");
+	runtime.hostControl(teamId).message_lead("close now");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	const staged = action(runtime, manager, 1, "close", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "nothing to do" });
@@ -1941,7 +1933,7 @@ test("L10/X08: host cancel after a staged close_team keeps the close decision an
 test("P/6.1: an unclaimed prepared Team cancels without launch, provider or resource claims", async () => {
 	const runtime = new TeamRuntime();
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "Cancel before launch." }, initialRequests: [{ to: "w1", task: "never runs" }], timeoutSeconds: null,
 	});
 	const receipt = runtime.hostControl(prepared.teamId).cancel_team("re-prepare instead");
@@ -1964,7 +1956,7 @@ test("C10/12.5: a real native error after cancel_work is isolated as native_fail
 	const target = runtime.takeNextActivation(teamId)!;
 	const ref = workRef(target);
 	inputReady(runtime, target);
-	runtime.hostControl(teamId).message_manager("cancel the target");
+	runtime.hostControl(teamId).message_lead("cancel the target");
 	const manager = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, manager);
 	assert.equal(action(runtime, manager, 1, "cancel", { action: "control", command: "cancel_work", workId: ref.workId, expectedRevision: 1, reason: "obsolete" }).ok, true);
@@ -1978,4 +1970,119 @@ test("C10/12.5: a real native error after cancel_work is isolated as native_fail
 	assert.equal(team.members.find((member) => member.id === "w2")?.lifecycle, "open");
 	assert.ok(team.incidents.some((incident) => incident.code === "UPSTREAM"), "the provider error stays visible as an incident");
 	runtime.assertInvariants(teamId);
+});
+
+test("prepare takes members plus a lead pointer; the retired manager/workers shape is refused with a migration message", () => {
+	const members = [{ alias: "lead", roleDescription: "Coordinate." }, { alias: "w1", roleDescription: "Work." }];
+	const brief = { goal: "Plan shapes." };
+	// The lead is a pointer, not a position or a name.
+	const plan = normalizeTeamPlan({ members, lead: "w1", brief });
+	assert.equal(plan.lead, "w1");
+	assert.deepEqual(plan.members.map((member) => member.alias), ["lead", "w1"]);
+	assert.deepEqual(normalizeTeamPlan({ members: [{ ...members[0]!, tools: [] }, { ...members[1]!, tools: ["read"] }], lead: "lead", brief }).members.map((member) => member.policy.tools),
+		[[], ["read"]], "tools is an allowlist; an empty one is valid");
+
+	const migration = /manager\/workers were replaced by members plus lead: <alias>/u;
+	assert.throws(() => normalizeTeamPlan({ manager: members[0], workers: [members[1]], brief }), migration);
+	assert.throws(() => normalizeTeamPlan({ members, lead: "lead", workers: [], brief }), migration, "a leftover retired field is refused too");
+	assert.throws(() => normalizeTeamPlan({ coordinator: members[0], workers: [members[1]], brief }), migration);
+
+	assert.throws(() => normalizeTeamPlan({ members, brief }), /lead/u);
+	assert.throws(() => normalizeTeamPlan({ members, lead: "ghost", brief }), /lead must be the alias of one of the members/u);
+	assert.throws(() => normalizeTeamPlan({ members: [members[0]], lead: "lead", brief }), /members must list 2-9 members/u);
+	assert.throws(() => normalizeTeamPlan({ members: Array.from({ length: 10 }, (_, index) => ({ alias: `m${index}`, roleDescription: "Work." })), lead: "m0", brief }), /at most 9/u);
+	assert.throws(() => normalizeTeamPlan({ members: [members[0], { ...members[0]! }], lead: "lead", brief }), /unique/u);
+	assert.throws(() => normalizeTeamPlan({ members: [{ ...members[0]!, tools: ["read", "read"] }, members[1]], lead: "lead", brief }), /duplicate tool names/u);
+	assert.throws(() => normalizeTeamPlan({ members, lead: "lead", brief, initialRequests: [{ to: "lead", task: "x" }] }), /must not be the lead/u);
+	assert.throws(() => normalizeTeamPlan({ members, lead: "lead", brief, initialRequests: [{ to: "ghost", task: "x" }] }), /must name a member/u);
+	assert.equal(normalizeTeamPlan({ members, lead: "lead", brief, initialRequests: [{ to: "w1", task: "x" }] }).initialRequests[0]!.to, "w1");
+
+	// The runtime follows the pointer: the first member is not special, and the lead requests the initial work.
+	const runtime = new TeamRuntime({ createId: (() => { let count = 0; return () => `p${++count}`; })() });
+	const prepared = runtime.prepare({ members, lead: "w1", brief, initialRequests: [{ to: "lead", task: "Work for the member named lead." }] });
+	assert.equal(prepared.lead, "w1");
+	assert.equal(runtime.listWorks(prepared.teamId)[0]!.requester, "w1");
+	runtime.launch(prepared.teamId);
+	const boot = runtime.takeNextActivation(prepared.teamId)!;
+	assert.equal(boot.binding.memberId, "w1");
+	assert.equal(boot.scope.kind, "events");
+	assert.equal(boot.input.member.lead, true);
+	assert.deepEqual(boot.input.roster.map((entry) => [entry.id, entry.lead]), [["lead", undefined], ["w1", true]]);
+	inputReady(runtime, boot);
+	assert.equal(code(action(runtime, boot, 1, "pause-lead", { action: "control", command: "pause_member", memberId: "w1" })), "FORBIDDEN_ACTION", "the lead is never paused");
+	assert.equal(code(action(runtime, boot, 2, "close-lead", { action: "control", command: "close_member", memberId: "w1" })), "FORBIDDEN_ACTION");
+	assert.equal(code(action(runtime, boot, 3, "pause-ghost", { action: "control", command: "pause_member", memberId: "ghost" })), "UNKNOWN_MEMBER");
+	assert.equal(code(action(runtime, boot, 4, "pause-other", { action: "control", command: "pause_member", memberId: "lead" })), undefined, "any other member can be paused");
+});
+
+test("the lead takes a work request from another member as a work activation, and its pending Team events are processed first", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "first root" }, { to: "w2", task: "second root" }]);
+	finishManagerBoot(runtime, teamId);
+	const w1 = runtime.takeNextActivation(teamId)!;
+	const w2 = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, w1);
+	const asked = action(runtime, w1, 1, "ask-lead", { action: "request", to: "lead", task: "Decide which fixture to use." });
+	assert.ok(asked.ok && asked.receipt?.status === "accepted" && asked.receipt.recipient === "lead", JSON.stringify(asked));
+	const child = asked.receipt.work;
+	const record = runtime.getWork(teamId, child)!;
+	assert.deepEqual([record.requester, record.assignee, record.parent], ["w1", "lead", w1.scope.work], "the lead is an ordinary assignee of a sub-task");
+	assert.equal(action(runtime, w1, 2, "wait-lead", { action: "yield", waitingFor: [child], checkpoint: "waiting for the lead" }).ok, true);
+	settle(runtime, w1, "wait-lead");
+	reply(runtime, w2, "w2-reply", "second done");
+
+	// The lead has a queued work and a pending Team event (w2's root result): the event comes first.
+	const events = runtime.takeNextActivation(teamId)!;
+	assert.equal(events.scope.kind, "events");
+	assert.equal(events.binding.memberId, "lead");
+	assert.ok(events.input.scope.kind === "events" && events.input.scope.events.some((event) => event.kind === "ROOT_RESULT_READY"));
+	inputReady(runtime, events);
+	assert.equal(action(runtime, events, 1, "events-yield", { action: "yield" }).ok, true);
+	settle(runtime, events, "events-yield");
+	assert.equal(runtime.panelFacts(teamId).pendingEvents, 0, "the event batch was processed");
+
+	const work = runtime.takeNextActivation(teamId)!;
+	assert.equal(work.scope.kind, "work");
+	assert.equal(work.binding.memberId, "lead");
+	assert.equal(work.input.member.lead, true, "the lead is still the lead while it works");
+	assert.ok(work.input.scope.kind === "work" && work.input.scope.requester === "w1" && work.input.scope.task === "Decide which fixture to use."
+		&& work.input.scope.parent?.workId === w1.scope.work!.workId);
+	assert.match(work.input.notice, /^Current work: /u, "a work activation of the lead carries the work notice, not the events notice");
+	reply(runtime, work, "lead-reply", "Use fixture A.");
+	const woken = runtime.takeNextActivation(teamId)!;
+	assert.equal(woken.binding.memberId, "w1");
+	assert.deepEqual(woken.input.outcomes.map((outcome) => outcome.work), [child], "the requester receives the lead's result like any other member's");
+	runtime.assertInvariants(teamId);
+});
+
+test("workPermits bounds work activations of every member, the lead's included; the lead's event activation has its own slot", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "root" }], { limits: { workPermits: 1 } });
+	finishManagerBoot(runtime, teamId);
+	const w1 = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, w1);
+	const toLead = action(runtime, w1, 1, "to-lead", { action: "request", to: "lead", task: "lead sub-task" });
+	const toW2 = action(runtime, w1, 2, "to-w2", { action: "request", to: "w2", task: "w2 sub-task" });
+	assert.ok(toLead.ok && toLead.receipt?.status === "accepted" && toW2.ok && toW2.receipt?.status === "accepted");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "w1 holds the only work permit");
+
+	// An event for the lead does not need a work permit.
+	runtime.hostControl(teamId).message_lead("check in");
+	const events = runtime.takeNextActivation(teamId)!;
+	assert.equal(events.scope.kind, "events");
+	inputReady(runtime, events);
+	assert.equal(action(runtime, events, 1, "events-yield", { action: "yield" }).ok, true);
+	settle(runtime, events, "events-yield");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "still no permit for the queued sub-tasks");
+
+	assert.equal(action(runtime, w1, 3, "wait-both", { action: "yield", waitingFor: [toLead.receipt.work, toW2.receipt.work], checkpoint: "waiting" }).ok, true);
+	settle(runtime, w1, "wait-both");
+	const leadWork = runtime.takeNextActivation(teamId)!;
+	assert.equal(leadWork.scope.kind, "work");
+	assert.equal(leadWork.binding.memberId, "lead", "FIFO: the lead's sub-task was requested first");
+	inputReady(runtime, leadWork);
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "the lead's work activation holds the permit, so w2's work waits");
+	runtime.assertInvariants(teamId);
+	assert.equal(action(runtime, leadWork, 1, "lead-reply", { action: "reply", result: { status: "succeeded", summary: "done" } }).ok, true);
+	settle(runtime, leadWork, "lead-reply");
+	const w2Work = runtime.takeNextActivation(teamId)!;
+	assert.equal(w2Work.binding.memberId, "w2", "the permit freed by the lead's work goes to the next member");
 });

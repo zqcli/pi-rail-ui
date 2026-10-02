@@ -1,12 +1,12 @@
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import {
-	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_MANAGER_EVENT_BATCH,
+	TEAM_COMMAND_CACHE, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_PROTOCOL_VERSION,
 	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, isTerminalWorkState, sameWorkRef,
 	workRefKey, shortWorkRef, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type ActivationInput, type ActivationScope, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
-	type ManagerEventView, type MemberRecord, type OutcomeView, type ResultRecord,
+	type TeamEventView, type MemberRecord, type OutcomeView, type ResultRecord,
 	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle, type GateDecision,
 	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamTeamView,
 	type TeamWorkSummary, type TeamWorkView, type WorkError, type WorkRecord, type WorkRef, type WorkResult, type WorkVersion,
@@ -44,11 +44,11 @@ const TEAM_MAX_TIMELINE = 1000;
 export const TEAM_TIMELINE_HEAD = 30;
 const WORK_NOTICE = "Other queued work is not part of this activation. Only the current WorkRef is authorized for this work. "
 	+ "If it needs another member's conclusion first, yield {waitingFor:[that member's WorkRef from status work], checkpoint}, "
-	+ "or request it from that member and wait on the returned WorkRef, or ask the Manager with yield {attention, checkpoint}. An outcome's preview is only its status and summary; read its findings and evidence with status(result) before relying on them.";
+	+ "or request it from that member and wait on the returned WorkRef, or ask the lead with yield {attention, checkpoint}. An outcome's preview is only its status and summary; read its findings and evidence with status(result) before relying on them.";
 /** Names the exact work, because a member's session outlives its works and a model may answer an earlier one. */
 const workNotice = (work: WorkRef): string => `Current work: ${workRefKey(work)}. Earlier works in this session are finished; answer only this task, not a previous one. ${WORK_NOTICE}`;
-const MANAGEMENT_NOTICE = "Management activation: there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
-	+ "New results, failures and incidents start the next management activation automatically; do not poll status to wait. "
+const EVENTS_NOTICE = "Events activation: you are the Team's lead and there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
+	+ "New results, failures and incidents start the next events activation automatically; do not poll status to wait. "
 	+ "A WORK_HELD event is a member asking for input: answer with resume_work {workId, expectedRevision, incidentId, instruction} "
 	+ "(for example naming the resultRef or WorkRef it needs), or revise_work/cancel_work. close_team checks every root itself and names any blocker, so no status check is needed before it.";
 
@@ -133,7 +133,7 @@ export interface TeamHostControl {
 	/** Raise counted limits for the Team or one known root; never resets usage or releases other holds. */
 	grant(scope: BudgetScope, increments: Partial<Record<string, number>>, reason: string): HostControlReceipt;
 	release_hold(work: WorkRef, incidentId: string, instruction: string): HostControlReceipt;
-	message_manager(text: string): HostControlReceipt;
+	message_lead(text: string): HostControlReceipt;
 }
 
 interface CachedAction {
@@ -141,7 +141,7 @@ interface CachedAction {
 	reply: TeamReply;
 }
 
-interface InternalEvent extends ManagerEventView {
+interface InternalEvent extends TeamEventView {
 	key: string;
 	processed: boolean;
 	batchId?: string;
@@ -174,7 +174,7 @@ interface ActiveActivation {
 	cleanup?: CleanupCompletion;
 	stopReason?: "cancelled" | "superseded" | "team_cancelled";
 	completionReason?: ActivationCompletionReason;
-	workerPermitHeld: boolean;
+	workPermitHeld: boolean;
 	parked: boolean;
 	resumeRequested: boolean;
 	providerGatePending: boolean;
@@ -232,7 +232,7 @@ interface TeamState {
 	createdAt: number;
 	deadline: number | null;
 	plan: TeamPlan;
-	manager: string;
+	lead: string;
 	bootProcessed: boolean;
 	cancelRequested: boolean;
 	members: Map<string, RuntimeMember>;
@@ -268,7 +268,7 @@ interface TeamState {
 }
 
 /**
- * The IDs members and the Manager copy into text are `<kind>:<code>`, a 4-character random code that is
+ * The IDs members copy into text are `<kind>:<code>`, a 4-character random code that is
  * unique within its Team. The alphabet leaves out 0/o/1/l/i, and sparse random codes (not a sequence)
  * make a mistyped code almost never another valid ID.
  */
@@ -310,10 +310,10 @@ export const capped = (items: readonly string[], cap: number, separator = ", "):
 	items.slice(0, cap).join(separator) + (items.length > cap ? ` +${items.length - cap} more` : "");
 /** The distinct kinds of an event batch, at most three named. */
 const eventKinds = (events: readonly { kind: string }[]): string => capped([...new Set(events.map((event) => event.kind))], 3);
-/** Panel text for what the Manager is processing. */
+/** Panel text for what the lead is processing. */
 export const handlingText = (events: readonly { kind: string }[]): string => `handling ${eventKinds(events)}`;
-/** Short panel words for a hold that is not a question for the Manager. */
-const HELD_REASON = { budget: "budget exhausted", protocol: "protocol", manager_unavailable: "Manager unavailable" } as const;
+/** Short panel words for a hold that is not a question for the lead. */
+const HELD_REASON = { budget: "budget exhausted", protocol: "protocol", lead_unavailable: "lead unavailable" } as const;
 
 /** Panel phrase for what a member waits on; one dependency also shows its ref. */
 function waitingOnText(waits: readonly WaitedWork[]): string {
@@ -379,7 +379,7 @@ export class TeamRuntime {
 		const plan = normalizeTeamPlan(rawPlan);
 		const limits = { ...TEAM_BUDGET_PRESETS[plan.budget ?? "long"], ...this.limitOverrides };
 		if (resolvedPolicies) {
-			for (const member of [plan.manager, ...plan.workers]) {
+			for (const member of plan.members) {
 				const policy = resolvedPolicies.get(member.alias);
 				if (!policy) fail("INVALID_ARGUMENT", `No resolved policy for member ${member.alias}`);
 				member.policy = copy(policy);
@@ -405,11 +405,9 @@ export class TeamRuntime {
 			fail("TEAM_CAPACITY", "Initial requests exceed Team work/result capacity");
 		}
 		const members = new Map<string, RuntimeMember>();
-		const roster = [plan.manager, ...plan.workers];
-		for (const [index, memberPlan] of roster.entries()) {
+		for (const memberPlan of plan.members) {
 			members.set(memberPlan.alias, {
 				id: memberPlan.alias,
-				role: index === 0 ? "manager" : "worker",
 				roleDescription: memberPlan.roleDescription,
 				lifecycle: "starting",
 				activity: "idle",
@@ -424,13 +422,13 @@ export class TeamRuntime {
 		const team: TeamState = {
 			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt,
 			deadline: null,
-			plan: copy(plan), manager: plan.manager.alias, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
+			plan: copy(plan), lead: plan.lead, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
 			dependencyWaits: 0, questions: 0, toolErrors: 0,
 		};
 		for (const initial of plan.initialRequests) {
-			const record = this.makeWork(team, team.manager, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
+			const record = this.makeWork(team, team.lead, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
 			this.assertInputFits(team, team.members.get(initial.to)!, record);
 			team.ledger.add(record);
 			team.ready.push({ workId: record.id, revision: 1 });
@@ -451,7 +449,7 @@ export class TeamRuntime {
 		const launchAt = this.timestamp();
 		// History must record admission before any provider can run; a failed write fails startup closed.
 		if (!this.tryJournal(team, { version: 2, kind: "launched", teamId, at: launchAt,
-			roster: { manager: team.manager, workers: team.plan.workers.map((worker) => worker.alias) }, goal: previewText(team.plan.brief.goal, 512) })) {
+			roster: { lead: team.lead, members: team.plan.members.map((member) => member.alias) }, goal: previewText(team.plan.brief.goal, 512) })) {
 			const reason = team.journalFailure;
 			this.applyJournalFailure(team);
 			fail("PROTOCOL_FAILURE", `Team launch could not be journaled: ${reason}`);
@@ -535,13 +533,13 @@ export class TeamRuntime {
 			cancel_team: (reason: string) => this.cancelTeam(teamId, reason),
 			grant: (scope: BudgetScope, increments: Partial<Record<string, number>>, reason: string) => this.grantBudget(teamId, scope, increments, reason),
 			release_hold: (work: WorkRef, incidentId: string, instruction: string) => this.releaseHold(teamId, work, incidentId, instruction),
-			message_manager: (text: string) => this.messageManager(teamId, text),
+			message_lead: (text: string) => this.messageLead(teamId, text),
 		});
 	}
 
 	/**
-	 * Stop one Broker-owned member without widening the action to the Team. Workers lose only their
-	 * own work and descendants; an unavailable Manager holds Manager work and pauses workers.
+	 * Stop one Broker-owned member without widening the action to the Team. A member loses only its
+	 * own work and descendants; an unavailable lead holds its own work and pauses the other members.
 	 */
 	hostStopMember(teamId: string, memberId: string, reasonValue: string): BindingV2 {
 		const team = this.team(teamId);
@@ -558,10 +556,10 @@ export class TeamRuntime {
 		member.error = { code: "HOST_MEMBER_STOPPED", message: reason };
 		member.pause = "none";
 		team.health = "needs_attention";
-		if (member.role === "manager") {
-			this.holdManagerWork(team);
-			this.pauseWorkersForManagerFault(team);
-			this.createIncident(team, "MANAGER_UNAVAILABLE", reason, undefined, member.id);
+		if (member.id === team.lead) {
+			this.holdLeadWork(team);
+			this.pauseMembersForLeadFault(team);
+			this.createIncident(team, "LEAD_UNAVAILABLE", reason, undefined, member.id);
 		} else {
 			this.stopMemberWork(team, member, reason);
 		}
@@ -603,12 +601,12 @@ export class TeamRuntime {
 		return result.ok ? okReply(member.id) : errorReply(member.id, new TeamProtocolError("CLEANUP_FAILED", member.error?.message ?? "Member exit is not confirmed"));
 	}
 
-	/** Terminal host cancellation never asks the Manager model for permission. */
+	/** Terminal host cancellation never asks the lead model for permission. */
 	cancelTeam(teamId: string, reasonValue: string): HostControlReceipt {
 		const team = this.team(teamId);
 		const reason = this.hostText(reasonValue, "cancel reason");
 		if (team.closeDecision) {
-			// The committed close decision wins: do not abort the Manager's terminating settlement,
+			// The committed close decision wins: do not abort the lead's terminating settlement,
 			// but bound any activation still in flight so a hung close cannot outlive the host request.
 			if (team.lifecycle !== "closed") {
 				for (const member of team.members.values()) if (member.active) this.scheduleActivationStopExpiry(team, member, member.active);
@@ -749,12 +747,12 @@ export class TeamRuntime {
 		return { actor: "@host", status: "applied", teamId, work: ref };
 	}
 
-	/** Append a deduplicated, explicitly host-attributed event for a healthy Manager. */
-	messageManager(teamId: string, textValue: string): HostControlReceipt {
+	/** Append a deduplicated, explicitly host-attributed event for a healthy lead. */
+	messageLead(teamId: string, textValue: string): HostControlReceipt {
 		const team = this.team(teamId);
-		const text = this.hostText(textValue, "Manager message");
-		if (team.lifecycle !== "active" || team.members.get(team.manager)!.lifecycle !== "open") {
-			fail("MEMBER_UNAVAILABLE", "The Manager cannot receive a host message in its current lifecycle");
+		const text = this.hostText(textValue, "lead message");
+		if (team.lifecycle !== "active" || team.members.get(team.lead)!.lifecycle !== "open") {
+			fail("MEMBER_UNAVAILABLE", "The lead cannot receive a host message in its current lifecycle");
 		}
 		// Only a still-pending identical message is a duplicate; a later repeat ("continue") is a new request.
 		const pending = team.events.find((event) => !event.processed && event.kind === "USER_COMMAND" && event.actor === "@host" && event.message === text);
@@ -766,7 +764,7 @@ export class TeamRuntime {
 
 	/**
 	 * Host-only budget grant. Limits grow cumulatively and usage never resets; only budget holds
-	 * whose scope is now within limits are released. Attention, pause and Manager-fault holds stay.
+	 * whose scope is now within limits are released. Attention, pause and lead-fault holds stay.
 	 */
 	grantBudget(teamId: string, scopeValue: BudgetScope, incrementsValue: Partial<Record<string, number>>, reasonValue: string): HostControlReceipt {
 		return this.applyBudgetGrant(teamId, scopeValue, incrementsValue, reasonValue);
@@ -837,7 +835,7 @@ export class TeamRuntime {
 		const used: Partial<TeamBudgetLimits> = { ...budget.used,
 			workRevisions: Math.max(0, ...records.map((record) => record.versions.length)),
 			depth: Math.max(0, ...records.map((record) => record.depth)),
-			workerPermits: this.usedWorkerPermits(team),
+			workPermits: this.usedWorkPermits(team),
 			memberUnresolvedWork: Math.max(0, ...members.map((member) => records.filter((record) => record.assignee === member.id && !isTerminalWorkState(currentVersion(record).state)).length)),
 			activationModelRequests: Math.max(0, ...members.map((member) => member.active?.budget.modelRequests ?? 0)),
 			activationToolCalls: Math.max(0, ...members.map((member) => member.active?.budget.toolCalls ?? 0)),
@@ -848,7 +846,7 @@ export class TeamRuntime {
 				limit: team.limits[counter as keyof TeamBudgetLimits], proposed: proposed.limits[counter as keyof TeamBudgetLimits] }
 			: { counter, used: rootUsed![counter as keyof typeof rootUsed & string] ?? 0,
 				limit: team.budget.rootLimit(scope.rootId, counter as RootGrantCounter), proposed: proposed.rootLimit(scope.rootId, counter as RootGrantCounter) });
-		const released = this.budgetHeld(team).filter(({ rootId, manager }) => !proposed.exhausted(rootId, manager)).map(({ work }) => work);
+		const released = this.budgetHeld(team).filter(({ rootId, lead }) => !proposed.exhausted(rootId, lead)).map(({ work }) => work);
 		return { scope, changes, released };
 	}
 
@@ -908,12 +906,12 @@ export class TeamRuntime {
 		return scope;
 	}
 
-	private budgetHeld(team: TeamState): Array<{ work: WorkRef; rootId: string; manager: boolean }> {
+	private budgetHeld(team: TeamState): Array<{ work: WorkRef; rootId: string; lead: boolean }> {
 		return team.ledger.order.flatMap((id) => {
 			const entry = team.ledger.get(id)!;
 			const version = currentVersion(entry.record);
 			return version.state === "blocked" && version.hold?.reason === "budget"
-				? [{ work: { workId: id, revision: entry.record.currentRevision }, rootId: entry.record.rootId, manager: entry.record.assignee === team.manager }] : [];
+				? [{ work: { workId: id, revision: entry.record.currentRevision }, rootId: entry.record.rootId, lead: entry.record.assignee === team.lead }] : [];
 		});
 	}
 
@@ -932,8 +930,8 @@ export class TeamRuntime {
 			const ref = team.ledger.currentRef(id)!;
 			const version = team.ledger.version(ref)!;
 			if (version.state !== "blocked" || version.hold?.reason !== "budget") continue;
-			const manager = entry.record.assignee === team.manager;
-			if (team.budget.exhausted(entry.record.rootId, manager)) continue;
+			const lead = entry.record.assignee === team.lead;
+			if (team.budget.exhausted(entry.record.rootId, lead)) continue;
 			delete version.hold;
 			version.state = "queued";
 			version.updatedAt = this.timestamp();
@@ -1003,29 +1001,29 @@ export class TeamRuntime {
 	private reserveNextActivation(teamId: string): RuntimeActivation | undefined {
 		const team = this.team(teamId);
 		if (team.lifecycle !== "active") return undefined;
-		const manager = team.members.get(team.manager)!;
-		if (manager.lifecycle !== "open") return undefined;
-		if (!manager.active && manager.pause === "none") {
+		const lead = team.members.get(team.lead)!;
+		if (lead.lifecycle !== "open") return undefined;
+		if (!lead.active && lead.pause === "none") {
 			const pendingEvents = () => team.events.map((event, index) => ({ event, index }))
 				.filter(({ event }) => !event.processed && event.batchId === undefined)
-				.sort((left, right) => this.managerEventPriority(left.event.kind) - this.managerEventPriority(right.event.kind)
+				.sort((left, right) => this.eventPriority(left.event.kind) - this.eventPriority(right.event.kind)
 					|| left.index - right.index)
-				.slice(0, TEAM_MAX_MANAGER_EVENT_BATCH)
+				.slice(0, TEAM_MAX_EVENT_BATCH)
 				.map(({ event }) => event);
 			if (pendingEvents().length) {
 				const exhausted = team.budget.teamExhausted(true);
-				// An exhausted Manager gets a bounded number of restricted emergency activations; after
-				// that only the host can grant or cancel. Workers with remaining budget keep running.
+				// An exhausted lead gets a bounded number of restricted emergency activations; after
+				// that only the host can grant or cancel. Members with remaining budget keep running.
 				if (exhausted) this.budgetIncident(team, exhausted);
 				if (!exhausted || team.budget.emergencyAvailable()) {
-					const activation = this.reserveManagement(team, manager, pendingEvents(), exhausted !== undefined);
+					const activation = this.reserveEvents(team, lead, pendingEvents(), exhausted !== undefined);
 					this.check(team);
 					return activation;
 				}
 			}
 		}
 		this.holdUnknownDependencies(team);
-		const workerPermits = this.usedWorkerPermits(team);
+		const workPermits = this.usedWorkPermits(team);
 		for (let index = 0; index < team.ready.length; index++) {
 			const ref = team.ready[index]!;
 			const entry = team.ledger.get(ref.workId);
@@ -1036,8 +1034,8 @@ export class TeamRuntime {
 			}
 			const member = team.members.get(entry.record.assignee)!;
 			if (member.lifecycle !== "open" || member.pause !== "none" || member.active) continue;
-			if (member.role === "worker" && workerPermits >= team.limits.workerPermits) continue;
-			const exhausted = team.budget.exhausted(entry.record.rootId, member.role === "manager");
+			if (workPermits >= team.limits.workPermits) continue;
+			const exhausted = team.budget.exhausted(entry.record.rootId, member.id === team.lead);
 			if (exhausted) {
 				this.holdForBudget(team, ref, exhausted);
 				index--;
@@ -1052,8 +1050,8 @@ export class TeamRuntime {
 		return undefined;
 	}
 
-	private managerEventPriority(kind: ManagerEventView["kind"]): number {
-		if (kind === "MEMBER_FAULTED" || kind === "DECISION_REQUEST" || kind === "BUDGET_HIT") return 0;
+	private eventPriority(kind: TeamEventView["kind"]): number {
+		if (kind === "MEMBER_FAULTED" || kind === "BUDGET_HIT") return 0;
 		return kind === "USER_COMMAND" ? 1 : 2;
 	}
 
@@ -1170,7 +1168,7 @@ export class TeamRuntime {
 		return active.scope.kind === "work" ? team.ledger.get(active.scope.work!.workId)?.record.rootId : undefined;
 	}
 
-	/** Diagnostic only: resolved at creation, it neither wakes the Manager nor blocks a close. */
+	/** Diagnostic only: resolved at creation, it neither wakes the lead nor blocks a close. */
 	private recordPostIntentContinuation(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
 		if (active.postIntentContinuations++ > 0) return;
 		const work = active.scope.kind === "work" ? active.scope.work : undefined;
@@ -1181,7 +1179,7 @@ export class TeamRuntime {
 		this.changed(team);
 	}
 
-	/** Provider gates park a paused activation until resume has reacquired a worker permit. */
+	/** Provider gates park a paused activation until resume has reacquired a work permit. */
 	waitAtProviderGate(bindingValue: BindingV2, scopeValue: ActivationScope): Promise<GateDecision> {
 		const decision = this.gate(bindingValue, scopeValue, "provider_gate");
 		if (decision.allow || decision.reason !== "paused") return Promise.resolve(decision);
@@ -1192,7 +1190,7 @@ export class TeamRuntime {
 		const team = this.team(binding.teamId);
 		const member = this.authenticatedMember(binding);
 		const active = member.active;
-		if (!active || !sameScope(active.scope, scope) || member.role !== "worker") return Promise.resolve(decision);
+		if (!active || !sameScope(active.scope, scope) || active.scope.kind !== "work") return Promise.resolve(decision);
 		if (active.providerGatePromise) return active.providerGatePromise;
 		active.providerGatePending = true;
 		active.providerGatePromise = new Promise<GateDecision>((resolve) => { active.providerGateResolve = resolve; });
@@ -1251,7 +1249,7 @@ export class TeamRuntime {
 				return { allow: false, reason: "stale_scope", message: "The active WorkRef is no longer the current assigned revision" };
 			}
 		} else if (!team.eventBatches.has(scope.eventBatchId!)) {
-			return { allow: false, reason: "stale_scope", message: "The active Manager event batch is no longer current" };
+			return { allow: false, reason: "stale_scope", message: "The active Team event batch is no longer current" };
 		}
 		void phase;
 		return { allow: true };
@@ -1281,27 +1279,27 @@ export class TeamRuntime {
 		}
 		active.providerGatePending = false;
 		active.parked = true;
-		active.workerPermitHeld = false;
+		active.workPermitHeld = false;
 		member.pause = "confirmed";
 		this.changed(team);
 		this.requestDrain(team.id);
 	}
 
-	private usedWorkerPermits(team: TeamState): number {
-		return [...team.members.values()].filter((member) => member.role === "worker" && member.active?.workerPermitHeld).length;
+	private usedWorkPermits(team: TeamState): number {
+		return [...team.members.values()].filter((member) => member.active?.workPermitHeld).length;
 	}
 
-	/** Parked native gates have priority over new work when a worker permit becomes available. */
+	/** Parked native gates have priority over new work when a work permit becomes available. */
 	private resumeParkedActivations(team: TeamState): void {
-		if (team.lifecycle !== "active" || team.members.get(team.manager)?.lifecycle !== "open") return;
-		let permits = this.usedWorkerPermits(team);
+		if (team.lifecycle !== "active" || team.members.get(team.lead)?.lifecycle !== "open") return;
+		let permits = this.usedWorkPermits(team);
 		for (const member of team.members.values()) {
 			const active = member.active;
-			if (member.role !== "worker" || !active?.parked || !active.resumeRequested) continue;
+			if (!active?.parked || !active.resumeRequested) continue;
 			if (member.lifecycle !== "open" || active.stopReason) continue;
-			if (permits >= team.limits.workerPermits) break;
+			if (permits >= team.limits.workPermits) break;
 			permits++;
-			active.workerPermitHeld = true;
+			active.workPermitHeld = true;
 			active.parked = false;
 			active.resumeRequested = false;
 			member.pause = "none";
@@ -1330,7 +1328,7 @@ export class TeamRuntime {
 		}
 	}
 
-	/** Settle a parked/pending provider gate exactly once; it no longer holds a worker permit. */
+	/** Settle a parked/pending provider gate exactly once; it no longer holds a work permit. */
 	private resolveProviderGate(active: ActiveActivation, decision: GateDecision): void {
 		const resolve = active.providerGateResolve;
 		delete active.providerGateResolve;
@@ -1566,10 +1564,10 @@ export class TeamRuntime {
 			team.lifecycle = "failed";
 			team.reason = "Team member transport failed before native settlement";
 		}
-		if (member.role === "manager") {
-			this.holdManagerWork(team);
-			this.pauseWorkersForManagerFault(team);
-		} else if (ref) this.failWorkerWork(team, member, ref);
+		if (member.id === team.lead) {
+			this.holdLeadWork(team);
+			this.pauseMembersForLeadFault(team);
+		} else if (ref) this.failMemberWork(team, member, ref);
 		this.createIncident(team, resourceReleased ? "NATIVE_OUTCOME_UNKNOWN" : "CLEANUP_FAILED",
 			`${member.id} lost its native activation before settlement: ${error.message}`, ref, member.id);
 		this.changed(team);
@@ -1581,7 +1579,7 @@ export class TeamRuntime {
 		return okReply(member.id);
 	}
 
-	/** Explicit Manager-only host observation for the fakeable resource-close boundary. */
+	/** Explicit host observation for the fakeable resource-close boundary. */
 	memberReleased(bindingValue: BindingV2, closeId: string, result: CleanupCompletion): TeamReply {
 		const binding = this.validateBinding(bindingValue);
 		const team = this.team(binding.teamId);
@@ -1712,7 +1710,7 @@ export class TeamRuntime {
 		return {
 			works: records.length, roots: records.filter((record) => !record.parent).length,
 			results: team.ledger.results.size,
-			activations: team.budget.used.teamActivations + team.budget.used.emergencyManagerActivations,
+			activations: team.budget.used.teamActivations + team.budget.used.emergencyLeadActivations,
 			modelTurns: team.usage.turns, dependencyWaits: team.dependencyWaits, questions: team.questions,
 			revisions: records.reduce((sum, record) => sum + record.versions.length - 1, 0),
 			cancelled: records.filter((record) => ["cancelled", "superseded"].includes(currentVersion(record).state)).length,
@@ -1720,14 +1718,14 @@ export class TeamRuntime {
 		};
 	}
 
-	/** Host panel facts outside the member-facing view: waiting Manager events, each author's results, why work is stalled, the milestone timeline. */
+	/** Host panel facts outside the member-facing view: waiting Team events, each author's results, why work is stalled, the milestone timeline. */
 	panelFacts(teamId: string): {
-		pendingManagerEvents: number;
+		pendingEvents: number;
 		results: Map<string, { count: number; latest: ResultRecord }>;
 		/** Per member with blocked or held work: what it waits on, or why it is held. */
 		stalled: Map<string, string>;
-		/** While the Manager runs a management activation: the event kinds of its batch. */
-		managerHandling?: string;
+		/** While the lead runs an events activation: the event kinds of its batch. */
+		leadHandling?: string;
 		/** Active Team only: the one reason most worth showing for why it has not finished. */
 		waitingFor?: string;
 		timeline: Array<{ at: number; text: string }>;
@@ -1740,22 +1738,22 @@ export class TeamRuntime {
 			latest.set(author, { count: (latest.get(author)?.count ?? 0) + 1, id });
 		}
 		const results = new Map([...latest].map(([author, { count, id }]) => [author, { count, latest: copy(team.ledger.results.get(id)!) }]));
-		// After close, leftover notices (for example MEMBER_CLOSED) are no longer work for the Manager.
-		const pendingManagerEvents = team.lifecycle === "active"
+		// After close, leftover notices (for example MEMBER_CLOSED) are no longer work for the lead.
+		const pendingEvents = team.lifecycle === "active"
 			? team.events.filter((event) => !event.processed && event.batchId === undefined).length : 0;
 		const waits = this.memberWaits(team);
 		const holds = this.listHolds(teamId);
 		// A member's oldest hold speaks for it.
 		const oldestHolds = new Map<string, HostHoldView>();
 		for (const hold of holds) if (!oldestHolds.has(hold.assignee)) oldestHolds.set(hold.assignee, hold);
-		const managerBatch = team.members.get(team.manager)!.active?.scope.eventBatchId;
+		const leadBatch = team.members.get(team.lead)!.active?.scope.eventBatchId;
 		const stalled = new Map([...waits].map(([member, waited]) => [member, waitingOnText(waited)] as const));
 		// A hold outranks a wait.
-		for (const hold of oldestHolds.values()) stalled.set(hold.assignee, this.holdText(team, hold, managerBatch));
+		for (const hold of oldestHolds.values()) stalled.set(hold.assignee, this.holdText(team, hold, leadBatch));
 		// In the batch's own (priority) order, like the activation input.
-		const handling = (managerBatch ? team.eventBatches.get(managerBatch)?.eventIds ?? [] : []).map((id) => team.events.find((event) => event.id === id)!);
+		const handling = (leadBatch ? team.eventBatches.get(leadBatch)?.eventIds ?? [] : []).map((id) => team.events.find((event) => event.id === id)!);
 		const waitingFor = team.lifecycle === "active" ? this.teamWaitingFor(team, holds, oldestHolds, waits) : undefined;
-		return { pendingManagerEvents, results, stalled, ...(handling.length ? { managerHandling: handlingText(handling) } : {}),
+		return { pendingEvents, results, stalled, ...(handling.length ? { leadHandling: handlingText(handling) } : {}),
 			...(waitingFor ? { waitingFor } : {}), timeline: copy(team.timeline), timelineOmitted: team.timelineOmitted };
 	}
 
@@ -1786,21 +1784,21 @@ export class TeamRuntime {
 		return items.toSorted((left, right) => created(left) - created(right));
 	}
 
-	/** Panel text for one hold; for a question it also says whether the Manager is on it, has it queued, or has already seen it. */
-	private holdText(team: TeamState, hold: HostHoldView, managerBatch: string | undefined): string {
+	/** Panel text for one hold; for a question it also says whether the lead is on it, has it queued, or has already seen it. */
+	private holdText(team: TeamState, hold: HostHoldView, leadBatch: string | undefined): string {
 		switch (hold.reason) {
 			case "attention": {
 				const event = team.events.find((item) => item.incidentId === hold.incidentId)!;
-				const manager = event.batchId !== undefined && event.batchId === managerBatch ? " · Manager handling"
-					: event.processed ? "" : " · queued for Manager";
-				return `held · asks: "${previewText(hold.message, 80)}"${manager}`;
+				const handling = event.batchId !== undefined && event.batchId === leadBatch ? " · lead handling"
+					: event.processed ? "" : " · queued for lead";
+				return `held · asks: "${previewText(hold.message, 80)}"${handling}`;
 			}
 			case "budget": {
-				const exhausted = team.budget.exhausted(hold.rootId, hold.assignee === team.manager);
+				const exhausted = team.budget.exhausted(hold.rootId, hold.assignee === team.lead);
 				return `held · ${exhausted ? `budget ${exhausted.counter} exhausted` : HELD_REASON.budget}`;
 			}
 			case "protocol": return `held · ${HELD_REASON.protocol}: ${previewText(hold.message, 80)}`;
-			case "manager_unavailable": return `held · ${HELD_REASON.manager_unavailable}`;
+			case "lead_unavailable": return `held · ${HELD_REASON.lead_unavailable}`;
 		}
 	}
 
@@ -1811,13 +1809,13 @@ export class TeamRuntime {
 		if (questions.length) {
 			const askers = [...new Set(questions)];
 			const who = questions.length <= 2 && askers.length === questions.length ? askers.map((asker) => `${asker}'s`).join(" and ") : questions.length;
-			return `Manager decision${plural(questions.length)} on ${who} question${plural(questions.length)}`;
+			return `Lead decision${plural(questions.length)} on ${who} question${plural(questions.length)}`;
 		}
 		// A Team without roots has nothing to review or close yet.
 		const { roots, blockers } = this.rootObligations(team);
 		if (roots.length && !blockers.some((blocker) => blocker.kind === "root_work")) {
 			const unreviewed = blockers.filter((blocker) => blocker.kind === "root_review").length;
-			return unreviewed ? `Manager review of ${unreviewed} result${plural(unreviewed)}` : "Manager to close the Team";
+			return unreviewed ? `Lead review of ${unreviewed} result${plural(unreviewed)}` : "Lead to close the Team";
 		}
 		const running = [...team.members.values()].filter((member) => member.activity !== "idle").map((member) => member.id);
 		// Members that are not running: what each waits on, or (a hold outranks a wait) why its work is held.
@@ -1857,7 +1855,7 @@ export class TeamRuntime {
 				return { work: { workId: record.id, revision: record.currentRevision }, state: version.state,
 					...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: copy(version.review) } : {}) };
 			}),
-			members: [...team.members.values()].map(({ id, role, lifecycle, resourceState }) => ({ id, role, lifecycle, resourceState })),
+			members: [...team.members.values()].map(({ id, lifecycle, resourceState }) => ({ id, lifecycle, resourceState })),
 			usage: copy(team.usage),
 			unresolvedIncidents: unresolvedIncidents.slice(-TEAM_MAX_TERMINAL_INCIDENTS).map(({ id, code, message }) => ({ id, ...projectWorkError({ code, message }) })),
 			...(unresolvedIncidents.length > TEAM_MAX_TERMINAL_INCIDENTS
@@ -1871,7 +1869,7 @@ export class TeamRuntime {
 
 	/** Diagnostic count of Runtime-held effects for one Team; a converged terminal Team holds none. */
 	liveEffects(teamId: string): { executor: boolean; scheduledDrain: boolean; closingEffects: number; completionWaiters: number;
-		deadlineTimer: boolean; activeActivations: number; stopTimers: number; ready: number; unprocessedManagerEvents: number } {
+		deadlineTimer: boolean; activeActivations: number; stopTimers: number; ready: number; unprocessedEvents: number } {
 		const team = this.team(teamId);
 		const active = [...team.members.values()].flatMap((member) => member.active ? [member.active] : []);
 		return {
@@ -1879,15 +1877,15 @@ export class TeamRuntime {
 			closingEffects: [...this.closingEffects].filter((key) => key.startsWith(`${teamId}\0`)).length,
 			completionWaiters: this.completionWaiters.get(teamId)?.size ?? 0, deadlineTimer: this.deadlineTimers.has(teamId),
 			activeActivations: active.length, stopTimers: active.filter((activation) => activation.stopTimer).length, ready: team.ready.length,
-			unprocessedManagerEvents: team.events.filter((event) => !event.processed).length,
+			unprocessedEvents: team.events.filter((event) => !event.processed).length,
 		};
 	}
 
 	private applyAction(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: TeamAction, toolCallId: string): TeamReply {
-		// Emergency Manager activations may only diagnose, cancel, review/waive, close or yield.
+		// Emergency lead activations may only diagnose, cancel, review/waive, close or yield.
 		if (active.budget.emergency && action.action !== "status" && action.action !== "yield"
 			&& !(action.action === "control" && ["cancel_work", "accept_result", "close_member", "close_team"].includes(action.control.command))) {
-			fail("BUDGET_BLOCKED", "Emergency Manager activations cannot create or revise work; only status, cancel_work, accept_result, close_member, close_team and yield are allowed");
+			fail("BUDGET_BLOCKED", "Emergency lead activations cannot create or revise work; only status, cancel_work, accept_result, close_member, close_team and yield are allowed");
 		}
 		this.requireKnownIds(team, forwardedText(action));
 		switch (action.action) {
@@ -1983,12 +1981,12 @@ export class TeamRuntime {
 	}
 
 	private stageYield(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: Extract<TeamAction, { action: "yield" }>, toolCallId: string): TeamReply {
-		if (active.scope.kind === "management") {
-			if (action.waitingFor.length || action.attention !== undefined) fail("INVALID_ARGUMENT", "A Manager never waits inside an activation: end it with yield {checkpoint?} and no waitingFor/attention. New results, failures and incidents start the next management activation automatically; do not poll status to wait.");
-			active.intent = { kind: "manager_idle", ...(action.checkpoint ? { checkpoint: action.checkpoint } : {}), toolCallId };
+		if (active.scope.kind === "events") {
+			if (action.waitingFor.length || action.attention !== undefined) fail("INVALID_ARGUMENT", "The lead never waits inside an activation: end it with yield {checkpoint?} and no waitingFor/attention. New results, failures and incidents start the next events activation automatically; do not poll status to wait.");
+			active.intent = { kind: "idle", ...(action.checkpoint ? { checkpoint: action.checkpoint } : {}), toolCallId };
 			member.activity = "settling";
 			this.changed(team);
-			return okReply(member.id, { receipt: { status: "staged", intent: "manager_idle" } });
+			return okReply(member.id, { receipt: { status: "staged", intent: "idle" } });
 		}
 		const ref = this.requireWorkScope(team, member, active);
 		if (action.attention !== undefined) {
@@ -2021,7 +2019,7 @@ export class TeamRuntime {
 	}
 
 	private control(team: TeamState, member: RuntimeMember, active: ActiveActivation, control: NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, toolCallId: string): TeamReply {
-		if (member.role !== "manager") fail("FORBIDDEN_ACTION", "Only the Team Manager may control work or close members");
+		if (member.id !== team.lead) fail("FORBIDDEN_ACTION", "Only the Team lead may control work or close members");
 		switch (control.command) {
 			case "revise_work": return this.reviseWork(team, member, control);
 			case "cancel_work": return this.cancelWork(team, member, control);
@@ -2034,32 +2032,34 @@ export class TeamRuntime {
 		}
 	}
 
-	private pauseMember(team: TeamState, manager: RuntimeMember, memberId: string): TeamReply {
+	private pauseMember(team: TeamState, lead: RuntimeMember, memberId: string): TeamReply {
 		const target = team.members.get(memberId);
-		if (!target || target.role !== "worker") fail("UNKNOWN_MEMBER", `Unknown worker ${memberId}`);
-		if (target.lifecycle !== "open" || target.resourceState !== "owned") fail("MEMBER_UNAVAILABLE", `Worker ${memberId} is not available to pause`);
+		if (!target) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
+		if (target.id === lead.id) fail("FORBIDDEN_ACTION", "The lead cannot be paused");
+		if (target.lifecycle !== "open" || target.resourceState !== "owned") fail("MEMBER_UNAVAILABLE", `Member ${memberId} is not available to pause`);
 		if (target.pause !== "none") {
 			// A parked activation still waiting for a permit after resume stays parked when paused again.
 			const parked = target.active?.parked && target.active.resumeRequested ? target.active : undefined;
-			if (!parked) return okReply(manager.id, { receipt: { status: "unchanged", command: "pause_member", memberId } });
+			if (!parked) return okReply(lead.id, { receipt: { status: "unchanged", command: "pause_member", memberId } });
 			parked.resumeRequested = false;
 			target.pause = "confirmed";
 			this.changed(team);
-			return okReply(manager.id, { receipt: { status: "applied", command: "pause_member", memberId } });
+			return okReply(lead.id, { receipt: { status: "applied", command: "pause_member", memberId } });
 		}
 		target.pause = target.active ? "requested" : "confirmed";
 		this.changed(team);
 		this.requestDrain(team.id);
-		return okReply(manager.id, { receipt: { status: "applied", command: "pause_member", memberId } });
+		return okReply(lead.id, { receipt: { status: "applied", command: "pause_member", memberId } });
 	}
 
-	private resumeMember(team: TeamState, manager: RuntimeMember, memberId: string): TeamReply {
+	private resumeMember(team: TeamState, lead: RuntimeMember, memberId: string): TeamReply {
 		const target = team.members.get(memberId);
-		if (!target || target.role !== "worker") fail("UNKNOWN_MEMBER", `Unknown worker ${memberId}`);
-		if (target.lifecycle !== "open" || target.resourceState !== "owned") fail("MEMBER_UNAVAILABLE", `Worker ${memberId} cannot be resumed in its current lifecycle`);
+		if (!target) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
+		if (target.id === lead.id) fail("FORBIDDEN_ACTION", "The lead is never paused, so it cannot be resumed");
+		if (target.lifecycle !== "open" || target.resourceState !== "owned") fail("MEMBER_UNAVAILABLE", `Member ${memberId} cannot be resumed in its current lifecycle`);
 		const active = target.active;
 		if (target.pause === "none" || active?.resumeRequested) {
-			return okReply(manager.id, { receipt: { status: "unchanged", command: "resume_member", memberId } });
+			return okReply(lead.id, { receipt: { status: "unchanged", command: "resume_member", memberId } });
 		}
 		if (active?.parked) {
 			active.resumeRequested = true;
@@ -2071,10 +2071,10 @@ export class TeamRuntime {
 		}
 		this.changed(team);
 		this.requestDrain(team.id);
-		return okReply(manager.id, { receipt: { status: "applied", command: "resume_member", memberId } });
+		return okReply(lead.id, { receipt: { status: "applied", command: "resume_member", memberId } });
 	}
 
-	private resumeWork(team: TeamState, manager: RuntimeMember, workId: string, expectedRevision: number, incidentId: string, instruction: string): TeamReply {
+	private resumeWork(team: TeamState, lead: RuntimeMember, workId: string, expectedRevision: number, incidentId: string, instruction: string): TeamReply {
 		const entry = team.ledger.get(workId);
 		if (!entry) fail("UNKNOWN_WORK", `Unknown work ${workId}`);
 		if (entry.record.currentRevision !== expectedRevision) fail("STALE_REVISION", `Expected revision ${expectedRevision}, current revision is ${entry.record.currentRevision}`);
@@ -2083,14 +2083,14 @@ export class TeamRuntime {
 		if (version.hold?.incidentId !== incidentId) {
 			const incident = team.incidents.find((item) => item.id === incidentId && item.state === "resolved" && item.work && sameWorkRef(item.work, ref));
 			if (incident && version.resumeInstruction === instruction) {
-				return okReply(manager.id, { receipt: { status: "unchanged", command: "resume_work", work: ref } });
+				return okReply(lead.id, { receipt: { status: "unchanged", command: "resume_work", work: ref } });
 			}
 			fail("INVALID_ARGUMENT", "The current WorkRef is not held by this incident");
 		}
 		this.applyHoldRelease(team, ref, incidentId, instruction);
-		this.note(team, `${manager.id} resumed ${shortWorkRef(ref)}`);
+		this.note(team, `${lead.id} resumed ${shortWorkRef(ref)}`);
 		this.requestDrain(team.id);
-		return okReply(manager.id, { receipt: { status: "applied", command: "resume_work", work: ref } });
+		return okReply(lead.id, { receipt: { status: "applied", command: "resume_work", work: ref } });
 	}
 
 	private applyHoldRelease(team: TeamState, ref: WorkRef, incidentId: string, instruction: string): void {
@@ -2098,9 +2098,9 @@ export class TeamRuntime {
 		const entry = team.ledger.get(ref.workId)!;
 		const version = team.ledger.version(ref)!;
 		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
-		const manager = team.members.get(team.manager)!;
-		if (manager.lifecycle !== "open" || manager.resourceState !== "owned") {
-			fail("MEMBER_UNAVAILABLE", "The Manager is unavailable; a hold release cannot bypass the Manager-fault safety pause");
+		const lead = team.members.get(team.lead)!;
+		if (lead.lifecycle !== "open" || lead.resourceState !== "owned") {
+			fail("MEMBER_UNAVAILABLE", "The lead is unavailable; a hold release cannot bypass the lead-fault safety pause");
 		}
 		if (version.state !== "blocked" || version.hold?.incidentId !== incidentId) fail("INVALID_ARGUMENT", "The exact WorkRef is not held by this incident");
 		if (version.hold.reason === "budget") fail("BUDGET_BLOCKED", "A budget hold cannot be released without an explicit budget grant");
@@ -2137,7 +2137,7 @@ export class TeamRuntime {
 		this.holdUnknownDependencies(team);
 	}
 
-	private reviseWork(team: TeamState, manager: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "revise_work" }>): TeamReply {
+	private reviseWork(team: TeamState, lead: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "revise_work" }>): TeamReply {
 		const entry = team.ledger.get(control.workId);
 		if (!entry) fail("UNKNOWN_WORK", `Unknown work ${control.workId}`);
 		const current = currentVersion(entry.record);
@@ -2157,7 +2157,7 @@ export class TeamRuntime {
 		this.assertInputFits(team, assignee, { ...entry.record, currentRevision: nextRevision, versions: [...entry.record.versions, candidate] }, entry.record.parent);
 		const currentRef = { workId: entry.record.id, revision: entry.record.currentRevision };
 		this.writeJournal(team, { version: 2, kind: "decision", teamId: team.id, at: candidate.createdAt, decision: "revise_work", work: currentRef });
-		this.note(team, `${manager.id} revised ${shortWorkRef(currentRef)}`);
+		this.note(team, `${lead.id} revised ${shortWorkRef(currentRef)}`);
 		if (!isTerminalWorkState(current.state)) {
 			this.cancelDescendants(team, currentRef, "superseded");
 			current.state = "superseded";
@@ -2178,19 +2178,19 @@ export class TeamRuntime {
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
 		this.wakeWaiters(team);
 		this.changed(team);
-		return okReply(manager.id, { receipt: { status: "applied", command: "revise_work", work: { workId: entry.record.id, revision: nextRevision } } });
+		return okReply(lead.id, { receipt: { status: "applied", command: "revise_work", work: { workId: entry.record.id, revision: nextRevision } } });
 	}
 
-	private cancelWork(team: TeamState, manager: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "cancel_work" }>): TeamReply {
+	private cancelWork(team: TeamState, lead: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "cancel_work" }>): TeamReply {
 		const entry = team.ledger.get(control.workId);
 		if (!entry) fail("UNKNOWN_WORK", `Unknown work ${control.workId}`);
 		if (entry.record.currentRevision !== control.expectedRevision) fail("STALE_REVISION", `Expected revision ${control.expectedRevision}, current revision is ${entry.record.currentRevision}`);
 		const ref = { workId: entry.record.id, revision: entry.record.currentRevision };
 		if (isTerminalWorkState(currentVersion(entry.record).state)) {
-			return okReply(manager.id, { receipt: { status: "unchanged", command: "cancel_work", work: ref } });
+			return okReply(lead.id, { receipt: { status: "unchanged", command: "cancel_work", work: ref } });
 		}
 		this.writeJournal(team, { version: 2, kind: "decision", teamId: team.id, at: this.timestamp(), decision: "cancel_work", work: ref, reason: control.reason });
-		this.note(team, `${manager.id} cancelled ${shortWorkRef(ref)}`);
+		this.note(team, `${lead.id} cancelled ${shortWorkRef(ref)}`);
 		const affected = [ref, ...team.ledger.openSubtree(ref)];
 		for (const work of affected) {
 			const version = team.ledger.version(work)!;
@@ -2211,17 +2211,17 @@ export class TeamRuntime {
 		team.ready = team.ready.filter((queued) => !affected.some((item) => sameWorkRef(item, queued)));
 		this.wakeWaiters(team);
 		this.changed(team);
-		return okReply(manager.id, { receipt: { status: "applied", command: "cancel_work", work: ref } });
+		return okReply(lead.id, { receipt: { status: "applied", command: "cancel_work", work: ref } });
 	}
 
-	private acceptResult(team: TeamState, manager: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "accept_result" }>): TeamReply {
+	private acceptResult(team: TeamState, lead: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "accept_result" }>): TeamReply {
 		const entry = team.ledger.get(control.work.workId);
 		const version = team.ledger.version(control.work);
 		if (!entry || !version) fail("UNKNOWN_WORK", `Unknown work ${workRefKey(control.work)}`);
 		if (entry.record.parent || entry.record.currentRevision !== control.work.revision) fail("INVALID_ARGUMENT", "Only a current root work version can be reviewed");
 		if (version.review) {
 			if (version.review.disposition === control.disposition && version.review.reason === control.reason) {
-				return okReply(manager.id, { receipt: { status: "unchanged", command: "accept_result", work: control.work } });
+				return okReply(lead.id, { receipt: { status: "unchanged", command: "accept_result", work: control.work } });
 			}
 			fail("INTENT_CONFLICT", "This root already has a different review decision");
 		}
@@ -2233,19 +2233,19 @@ export class TeamRuntime {
 			fail("INVALID_TEAM_OUTCOME", "A non-terminal root must be cancelled or completed before it can be waived");
 		}
 		version.review = { disposition: control.disposition, ...(control.reason ? { reason: control.reason } : {}) };
-		this.note(team, `${manager.id} ${control.disposition} ${shortWorkRef(control.work)}`);
+		this.note(team, `${lead.id} ${control.disposition} ${shortWorkRef(control.work)}`);
 		version.updatedAt = this.timestamp();
 		this.changed(team);
-		return okReply(manager.id, { receipt: { status: "applied", command: "accept_result", work: control.work } });
+		return okReply(lead.id, { receipt: { status: "applied", command: "accept_result", work: control.work } });
 	}
 
-	private closeMember(team: TeamState, manager: RuntimeMember, memberId: string): TeamReply {
-		if (memberId === manager.id) fail("FORBIDDEN_ACTION", "Manager cannot close itself; use close_team");
+	private closeMember(team: TeamState, lead: RuntimeMember, memberId: string): TeamReply {
+		if (memberId === lead.id) fail("FORBIDDEN_ACTION", "The lead cannot close itself; use close_team");
 		const target = team.members.get(memberId);
-		if (!target || target.role !== "worker") fail("UNKNOWN_MEMBER", `Unknown worker ${memberId}`);
-		if (target.lifecycle === "closing" && target.closeId) return okReply(manager.id, { receipt: { status: "closing", command: "close_member", memberId, closeId: target.closeId } });
-		if (target.lifecycle === "closed") return okReply(manager.id, { receipt: { status: "applied", command: "close_member", memberId } });
-		if (target.lifecycle !== "open") fail("RECIPIENT_CLOSED", `Worker ${memberId} is ${target.lifecycle}`);
+		if (!target) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
+		if (target.lifecycle === "closing" && target.closeId) return okReply(lead.id, { receipt: { status: "closing", command: "close_member", memberId, closeId: target.closeId } });
+		if (target.lifecycle === "closed") return okReply(lead.id, { receipt: { status: "applied", command: "close_member", memberId } });
+		if (target.lifecycle !== "open") fail("RECIPIENT_CLOSED", `Member ${memberId} is ${target.lifecycle}`);
 		const blockers: Array<{ kind: string; id?: string; reason: string }> = [];
 		if (target.active) blockers.push({ kind: "activation", id: target.id, reason: "native activation or cleanup is still in flight" });
 		for (const workId of team.ledger.order) {
@@ -2264,7 +2264,7 @@ export class TeamRuntime {
 		target.closeId = closeId;
 		this.changed(team);
 		this.check(team);
-		return okReply(manager.id, { receipt: { status: "closing", command: "close_member", memberId, closeId } });
+		return okReply(lead.id, { receipt: { status: "closing", command: "close_member", memberId, closeId } });
 	}
 
 	/** The roots and what each still owes before close_team: to be terminal, then to be reviewed. */
@@ -2280,17 +2280,17 @@ export class TeamRuntime {
 		return { roots, blockers };
 	}
 
-	private closeTeam(team: TeamState, manager: RuntimeMember, active: ActiveActivation, resultRefs: string[], outcome: "succeeded" | "partial" | "failed", reason: string | undefined, toolCallId: string): TeamReply {
-		if (manager.id !== team.manager || active.scope.kind !== "management") fail("FORBIDDEN_ACTION", "close_team requires the Manager's management activation");
+	private closeTeam(team: TeamState, lead: RuntimeMember, active: ActiveActivation, resultRefs: string[], outcome: "succeeded" | "partial" | "failed", reason: string | undefined, toolCallId: string): TeamReply {
+		if (lead.id !== team.lead || active.scope.kind !== "events") fail("FORBIDDEN_ACTION", "close_team requires the lead's events activation");
 		const { roots, blockers } = this.rootObligations(team);
 		for (const id of team.ledger.order) {
 			const record = team.ledger.get(id)!.record;
 			const version = currentVersion(record);
 			if (!isTerminalWorkState(version.state)) blockers.push({ kind: "work", id: workRefKey({ workId: id, revision: record.currentRevision }), reason: `work is ${version.state}` });
 		}
-		for (const member of team.members.values()) if (member.id !== manager.id) {
+		for (const member of team.members.values()) if (member.id !== lead.id) {
 			if (member.active) blockers.push({ kind: "activation", id: member.id, reason: `${member.id} still has an active activation` });
-			if (member.role === "worker" && !((member.lifecycle === "open" && member.resourceState === "owned")
+			if (!((member.lifecycle === "open" && member.resourceState === "owned")
 				|| (member.resourceState === "released" && (member.lifecycle === "closed" || member.lifecycle === "faulted")))) {
 				blockers.push({ kind: "member_resource", id: member.id, reason: `${member.id} is ${member.lifecycle} with resources ${member.resourceState}` });
 			}
@@ -2299,7 +2299,7 @@ export class TeamRuntime {
 			blockers.push({ kind: "delivery", id: delivery.memberId, reason: "required input is in flight" });
 		}
 		for (const event of team.events) if (!event.processed && event.kind !== "TEAM_QUIESCENT" && event.batchId !== active.scope.eventBatchId) {
-			blockers.push({ kind: "manager_event", id: event.id, reason: "an unprocessed Manager event is outside the closing activation batch; end this activation with yield to receive it, then close" });
+			blockers.push({ kind: "team_event", id: event.id, reason: "an unprocessed Team event is outside the closing activation batch; end this activation with yield to receive it, then close" });
 		}
 		// An exhausted-budget notice that holds no work is not an unresolved obligation; held work blocks on its own.
 		const holdsWork = (incidentId: string) => team.ledger.order.some((id) => team.ledger.current(id)?.hold?.incidentId === incidentId);
@@ -2312,7 +2312,7 @@ export class TeamRuntime {
 			const unsuccessful = roots.filter((root) => currentVersion(root).review?.disposition !== "accepted"
 				|| team.ledger.results.get(currentVersion(root).resultRef ?? "")?.result.status !== "succeeded");
 			if (unsuccessful.length || resultRefs.length === 0) {
-				// Name every root that prevents success so the Manager can fix all of them in one step.
+				// Name every root that prevents success so the lead can fix all of them in one step.
 				fail("INVALID_TEAM_OUTCOME", "succeeded requires every current root accepted with a succeeded result and at least one final resultRef. "
 					+ "A cancelled, failed or waived root (for example a duplicate) can only close as partial: waive it with accept_result disposition waived and a reason.",
 				unsuccessful.slice(0, 32).map((root) => {
@@ -2325,7 +2325,7 @@ export class TeamRuntime {
 			if (!reason || resultRefs.length === 0) fail("INVALID_TEAM_OUTCOME", "partial requires a reason and at least one resultRef");
 		} else if (!reason) fail("INVALID_TEAM_OUTCOME", "failed requires a reason");
 		if (blockers.length) fail("CLOSE_BLOCKED", "Team close is blocked by unresolved obligations", blockers);
-		if (active.intent) fail("ACTIVATION_ENDING", "Manager activation already staged another intent");
+		if (active.intent) fail("ACTIVATION_ENDING", "Lead activation already staged another intent");
 		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
 		const closeId = this.id("close");
 		const rootSnapshot: TeamResult["roots"] = roots.map((root) => {
@@ -2335,13 +2335,13 @@ export class TeamRuntime {
 		});
 		this.writeJournal(team, { version: 2, kind: "close_decision", teamId: team.id, at: this.timestamp(), closeId, outcome,
 			resultRefs: copy(resultRefs), roots: copy(rootSnapshot), ...(reason ? { reason } : {}) });
-		this.note(team, `${manager.id} close_team ${outcome}`);
+		this.note(team, `${lead.id} close_team ${outcome}`);
 		team.closeDecision = { id: closeId, outcome, ...(reason ? { reason } : {}), resultRefs: copy(resultRefs), roots: copy(rootSnapshot) };
 		team.lifecycle = "closing";
 		team.outcome = outcome;
 		if (reason) team.reason = reason;
 		for (const target of team.members.values()) {
-			if (target.id === manager.id) {
+			if (target.id === lead.id) {
 				target.lifecycle = "closing";
 				target.resourceState = "stopping";
 				target.closeId = closeId;
@@ -2352,7 +2352,7 @@ export class TeamRuntime {
 			}
 		}
 		active.intent = { kind: "close_team", closeId, toolCallId };
-		manager.activity = "settling";
+		lead.activity = "settling";
 		this.consumeBatch(team, active.scope.eventBatchId);
 		for (const event of team.events) if (event.kind === "TEAM_QUIESCENT" && !event.processed) {
 			event.processed = true;
@@ -2360,7 +2360,7 @@ export class TeamRuntime {
 		}
 		this.changed(team);
 		this.check(team);
-		return okReply(manager.id, { receipt: { status: "closing", command: "close_team", closeId } });
+		return okReply(lead.id, { receipt: { status: "closing", command: "close_team", closeId } });
 	}
 
 	private status(team: TeamState, member: RuntimeMember, action: Extract<TeamAction, { action: "status" }>): TeamReply {
@@ -2369,7 +2369,7 @@ export class TeamRuntime {
 			if (action.view === "work") {
 				const entry = team.ledger.get(action.id);
 				if (!entry) fail("UNKNOWN_WORK", `Unknown work ${action.id}`);
-				if (member.role !== "manager" && entry.record.assignee !== member.id) {
+				if (member.id !== team.lead && entry.record.assignee !== member.id) {
 					const summary = this.workSummaries(team).find((item) => item.work.workId === action.id);
 					if (!summary) fail("UNKNOWN_WORK", `Unknown work ${action.id}`);
 					return okReply(member.id, { data: { view: "work", items: [summary], hasMore: false } });
@@ -2394,15 +2394,15 @@ export class TeamRuntime {
 		return okReply(member.id, { data: { view: action.view, items: pageItems, ...(next < items.length ? { cursor: `page:${next}` } : {}), hasMore: next < items.length } });
 	}
 
-	private reserveManagement(team: TeamState, member: RuntimeMember, events: InternalEvent[], emergency: boolean): RuntimeActivation {
+	private reserveEvents(team: TeamState, member: RuntimeMember, events: InternalEvent[], emergency: boolean): RuntimeActivation {
 		const batchId = this.id("batch");
-		const scope: ActivationScope = { activationId: this.id("activation"), kind: "management", eventBatchId: batchId };
+		const scope: ActivationScope = { activationId: this.id("activation"), kind: "events", eventBatchId: batchId };
 		const deliveryId = this.id("delivery");
 		let selected = events;
 		let input: ActivationInput;
 		for (;;) {
 			try {
-				input = this.activationInput(team, member, deliveryId, { kind: "management", eventBatchId: batchId,
+				input = this.activationInput(team, member, deliveryId, { kind: "events", eventBatchId: batchId,
 					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, ...view }) => view), emergency },
 				team.budget.inputSummary(undefined, true, emergency));
 				break;
@@ -2415,12 +2415,12 @@ export class TeamRuntime {
 		const eventBatch: EventBatch = { id: batchId, eventIds: selected.map((event) => event.id) };
 		for (const event of selected) event.batchId = batchId;
 		team.eventBatches.set(batchId, eventBatch);
-		const activation: ActiveActivation = { scope, deliveryId, inputReady: false, workerPermitHeld: false, parked: false, resumeRequested: false,
+		const activation: ActiveActivation = { scope, deliveryId, inputReady: false, workPermitHeld: false, parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(undefined, true, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
 		member.activity = "running";
-		this.note(team, `${member.id} management activation (${eventKinds(selected)})`);
+		this.note(team, `${member.id} events activation (${eventKinds(selected)})`);
 		this.addDelivery(team, member, scope, input, eventBatch.eventIds);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
@@ -2438,12 +2438,12 @@ export class TeamRuntime {
 			depth: team.ledger.get(ref.workId)!.record.depth, inputRefs: copy(version.inputRefs), waitingFor: copy(version.waitingFor),
 			...(version.checkpoint ? { checkpoint: version.checkpoint } : {}), ...(version.resumeInstruction ? { resumeInstruction: version.resumeInstruction } : {}),
 			...(ref.revision > 1 ? { previous: this.previousVersion(team, ref) } : {}),
-		}, team.budget.inputSummary(team.ledger.get(ref.workId)!.record.rootId, member.role === "manager", false));
+		}, team.budget.inputSummary(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false));
 		version.state = "running";
 		version.updatedAt = at;
-		member.active = { scope, deliveryId, inputReady: false, workerPermitHeld: member.role === "worker", parked: false, resumeRequested: false,
+		member.active = { scope, deliveryId, inputReady: false, workPermitHeld: true, parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
-			budget: team.budget.recordActivation(team.ledger.get(ref.workId)!.record.rootId, member.role === "manager", false),
+			budget: team.budget.recordActivation(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false),
 			budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.currentWork = copy(ref);
 		member.activity = "running";
@@ -2480,12 +2480,11 @@ export class TeamRuntime {
 		}
 		const result: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
-			member: { id: member.id, role: member.role, roleDescription: member.roleDescription },
+			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription },
 			brief: copy(team.plan.brief),
-			roster: [...team.members.values()].map((item) => ({ id: item.id, role: item.role, lifecycle: item.lifecycle,
-				rolePreview: previewText(item.roleDescription, 512) })),
+			roster: this.roster(team),
 			scope: copy(scope), outcomes, omittedOutcomes: 0,
-			ownedChildren, budget, notice: scope.kind === "work" ? workNotice(scope.work) : MANAGEMENT_NOTICE,
+			ownedChildren, budget, notice: scope.kind === "work" ? workNotice(scope.work) : EVENTS_NOTICE,
 		};
 		return projectActivationInput(result);
 	}
@@ -2522,10 +2521,10 @@ export class TeamRuntime {
 				}
 				delete team.ledger.get(scope.work!.workId)!.stagedWait;
 			}
-			if (member.role === "manager") {
-				this.holdManagerWork(team);
-				this.pauseWorkersForManagerFault(team);
-			} else if (scope.kind === "work") this.failWorkerWork(team, member, scope.work!);
+			if (member.id === team.lead) {
+				this.holdLeadWork(team);
+				this.pauseMembersForLeadFault(team);
+			} else if (scope.kind === "work") this.failMemberWork(team, member, scope.work!);
 			delivery.state = "unknown";
 			this.createIncident(team, "CLEANUP_FAILED", `${member.id} could not confirm activation cleanup: ${member.error.message}`,
 				scope.kind === "work" ? scope.work : undefined, member.id);
@@ -2536,7 +2535,7 @@ export class TeamRuntime {
 			return;
 		}
 		if (delivery.state === "in_flight") delivery.state = active.inputReady ? "delivered" : "unknown";
-		if (scope.kind === "management") this.finishManagement(team, member, active);
+		if (scope.kind === "events") this.finishEvents(team, member, active);
 		else this.finishWork(team, member, active);
 		// A committed reply already has its own result milestone.
 		if (!(active.intent?.kind === "reply" && team.ledger.version(scope.work!)?.resultRef)) {
@@ -2544,14 +2543,14 @@ export class TeamRuntime {
 			const ending = intent?.kind === "yield_dependencies"
 				? `waiting on ${capped([...new Set(this.byCreation(team, intent.waitingFor, (ref) => ref).map((ref) => team.ledger.get(ref.workId)!.record.assignee))], 3)}`
 				: intent?.kind.replaceAll("_", " ");
-			this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "management activation"}${ending ? ` (${ending})` : ""}`);
+			this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "events activation"}${ending ? ` (${ending})` : ""}`);
 		}
 		if (member.active === active) delete member.active;
 		delete member.currentWork;
 		member.activity = "idle";
 		this.resumeParkedActivations(team);
-		if (member.role === "worker" && member.lifecycle === "open" && member.pause === "requested") member.pause = "confirmed";
-		if (member.lifecycle === "closing" && member.id === team.manager) member.resourceState = "stopping";
+		if (member.id !== team.lead && member.lifecycle === "open" && member.pause === "requested") member.pause = "confirmed";
+		if (member.lifecycle === "closing" && member.id === team.lead) member.resourceState = "stopping";
 		this.changed(team);
 		this.updateQuiescence(team);
 		this.finishTeamCloseIfReady(team);
@@ -2585,10 +2584,10 @@ export class TeamRuntime {
 				member.lifecycle = "faulted";
 				member.resourceState = "owned";
 				this.addEvent(team, { key: `member-fault:${member.id}:${active.scope.activationId}`, kind: "MEMBER_FAULTED", message: `${member.id} failed during native activation`, memberId: member.id, work: ref });
-				if (member.role === "manager") {
-					this.holdManagerWork(team);
-					this.pauseWorkersForManagerFault(team);
-				} else this.failWorkerWork(team, member, ref);
+				if (member.id === team.lead) {
+					this.holdLeadWork(team);
+					this.pauseMembersForLeadFault(team);
+				} else this.failMemberWork(team, member, ref);
 			}
 			this.wakeWaiters(team);
 			return;
@@ -2651,9 +2650,9 @@ export class TeamRuntime {
 			this.holdWork(team, member, ref, "WORK_HELD", intent.attention, "attention");
 			version.checkpoint = intent.checkpoint;
 			version.waitingFor = [];
-		} else if (intent?.kind === "manager_idle") {
+		} else if (intent?.kind === "idle") {
 			version.state = "failed";
-			version.error = { code: "PROTOCOL_FAILURE", message: "A work activation cannot use a management-idle intent" };
+			version.error = { code: "PROTOCOL_FAILURE", message: "A work activation cannot use the events-activation idle intent" };
 			version.updatedAt = this.timestamp();
 		} else if (this.canCommitNaturalFinal(team, ref, active)) {
 			const result: WorkResult = { status: "succeeded", summary: active.native!.finalAssistantText!.trim() };
@@ -2664,12 +2663,12 @@ export class TeamRuntime {
 		this.wakeWaiters(team);
 	}
 
-	private finishManagement(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
+	private finishEvents(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
 		const intent = active.intent;
 		const intentApplied = !intent || active.native?.appliedToolCallId === intent.toolCallId;
 		const budgetStopped = active.native?.status === "aborted" && active.completion?.reason === "budget_hold";
 		if (budgetStopped && !intent) {
-			// The Manager's own budget stopped it before any decision. It stays open; the delivered batch
+			// The lead's own budget stopped it before any decision. It stays open; the delivered batch
 			// is not replayed automatically. The deduplicated budget incident drives any emergency activation.
 			this.consumeBatch(team, active.scope.eventBatchId);
 			this.budgetIncident(team, active.budgetStop ?? { scope: { kind: "team" }, counter: "teamModelRequests" });
@@ -2680,16 +2679,16 @@ export class TeamRuntime {
 			const closing = member.lifecycle === "closing";
 			if (team.lifecycle === "closing") {
 				team.lifecycle = "failed";
-				team.reason = `Manager close activation lacked confirmed native evidence (status=${active.native?.status ?? "missing"}, hasIntent=${!!intent}, hasAppliedId=${!!active.native?.appliedToolCallId}, intentApplied=${intentApplied})`;
+				team.reason = `Lead close activation lacked confirmed native evidence (status=${active.native?.status ?? "missing"}, hasIntent=${!!intent}, hasAppliedId=${!!active.native?.appliedToolCallId}, intentApplied=${intentApplied})`;
 			}
 			if (!closing) member.lifecycle = "faulted";
-			member.error = { code: active.native?.error?.code ?? (intentApplied ? "MANAGER_FAILURE" : "PROTOCOL_FAILURE"),
-				message: active.native?.error?.message ?? (intentApplied ? "Manager activation failed" : "Staged intent was not confirmed in the native transcript") };
+			member.error = { code: active.native?.error?.code ?? (intentApplied ? "LEAD_FAILURE" : "PROTOCOL_FAILURE"),
+				message: active.native?.error?.message ?? (intentApplied ? "Lead activation failed" : "Staged intent was not confirmed in the native transcript") };
 			if (!closing) member.resourceState = "owned";
 			team.health = "needs_attention";
-			this.addEvent(team, { key: `manager-fault:${active.scope.activationId}`, kind: "MEMBER_FAULTED", message: "Manager activation failed; no automatic successor is available", memberId: member.id });
-			this.holdManagerWork(team);
-			this.pauseWorkersForManagerFault(team);
+			this.addEvent(team, { key: `lead-fault:${active.scope.activationId}`, kind: "MEMBER_FAULTED", message: "Lead activation failed; no automatic successor is available", memberId: member.id });
+			this.holdLeadWork(team);
+			this.pauseMembersForLeadFault(team);
 			return;
 		}
 		this.consumeBatch(team, active.scope.eventBatchId);
@@ -2744,16 +2743,16 @@ export class TeamRuntime {
 		}
 	}
 
-	/** Tell the Manager which roots already run from initialRequests, so it never requests them again. */
+	/** Tell the lead which roots already run from initialRequests, so it never requests them again. */
 	private bootMessage(team: TeamState): string {
 		const initial = team.ledger.order.map((id) => team.ledger.get(id)!.record);
 		const outcomeRule = "Every root must end accepted with a succeeded result (close succeeded) or waived (close partial), so request only work you need; "
-			+ "close_team itself closes idle workers.";
+			+ "close_team itself closes idle members.";
 		if (!initial.length) {
-			return `Team is active. No work is assigned yet: request work from workers per the brief, then yield. ${outcomeRule} Close explicitly.`;
+			return `Team is active. No work is assigned yet: request work from the other members per the brief, then yield. ${outcomeRule} Close explicitly.`;
 		}
 		const assigned = initial.map((record) => `${record.assignee} ${workRefKey({ workId: record.id, revision: record.currentRevision })} "${previewText(currentVersion(record).task, 160)}"`);
-		return `Team is active. ${initial.length} initial request(s) are already assigned and run without Manager action: ${assigned.join("; ")}. `
+		return `Team is active. ${initial.length} initial request(s) are already assigned and run without lead action: ${assigned.join("; ")}. `
 			+ `Do not request them again; each root result arrives as an event. ${outcomeRule} Close explicitly.`;
 	}
 
@@ -2884,7 +2883,7 @@ export class TeamRuntime {
 		}
 	}
 
-	private failWorkerWork(team: TeamState, member: RuntimeMember, failedRef: WorkRef): void {
+	private failMemberWork(team: TeamState, member: RuntimeMember, failedRef: WorkRef): void {
 		this.cancelDescendants(team, failedRef, "cancelled");
 		for (const id of team.ledger.order) {
 			const entry = team.ledger.get(id)!;
@@ -2903,25 +2902,25 @@ export class TeamRuntime {
 		}
 	}
 
-	private pauseWorkersForManagerFault(team: TeamState): void {
+	private pauseMembersForLeadFault(team: TeamState): void {
 		for (const member of team.members.values()) {
-			if (member.role !== "worker" || member.lifecycle !== "open" || member.pause !== "none") continue;
+			if (member.id === team.lead || member.lifecycle !== "open" || member.pause !== "none") continue;
 			member.pause = member.active ? "requested" : "confirmed";
 			this.changed(team);
 		}
 	}
 
-	private holdManagerWork(team: TeamState): void {
+	private holdLeadWork(team: TeamState): void {
 		for (const id of team.ledger.order) {
 			const entry = team.ledger.get(id)!;
-			if (entry.record.assignee !== team.manager) continue;
+			if (entry.record.assignee !== team.lead) continue;
 			const ref = team.ledger.currentRef(id)!;
 			const version = team.ledger.version(ref)!;
 			if (isTerminalWorkState(version.state)) continue;
-			const incident = this.createIncident(team, "MANAGER_UNAVAILABLE", "Manager is unavailable; host cancellation or a new Team is required", ref, team.manager);
+			const incident = this.createIncident(team, "LEAD_UNAVAILABLE", "The lead is unavailable; host cancellation or a new Team is required", ref, team.lead);
 			version.state = "blocked";
 			version.waitingFor = [];
-			version.hold = { reason: "manager_unavailable", incidentId: incident.id };
+			version.hold = { reason: "lead_unavailable", incidentId: incident.id };
 			version.updatedAt = this.timestamp();
 			delete entry.stagedWait;
 			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
@@ -2946,7 +2945,7 @@ export class TeamRuntime {
 			: `Unknown result reference ${ref}`);
 	}
 
-	/** Ending held work (cancel, revise) is the Manager's answer to its attention/protocol incident. */
+	/** Ending held work (cancel, revise) is the lead's answer to its attention/protocol incident. */
 	private dropHold(team: TeamState, version: WorkVersion): void {
 		if (version.hold?.reason === "attention" || version.hold?.reason === "protocol") this.resolveIncident(team, version.hold.incidentId);
 		delete version.hold;
@@ -2963,7 +2962,7 @@ export class TeamRuntime {
 		if (!team.incidents.some((item) => item.state === "open") && ![...team.members.values()].some((member) => member.error)) team.health = "ok";
 	}
 
-	/** Hold a work version for a Manager decision, announced as WORK_HELD (answered by resume_work, revise or cancel). */
+	/** Hold a work version for a lead decision, announced as WORK_HELD (answered by resume_work, revise or cancel). */
 	private holdWork(team: TeamState, member: RuntimeMember, ref: WorkRef, code: string, message: string, reason: "attention" | "protocol"): void {
 		const incident = this.createIncident(team, code, message, ref, member.id, undefined, "WORK_HELD");
 		const version = team.ledger.version(ref)!;
@@ -2973,7 +2972,7 @@ export class TeamRuntime {
 	}
 
 	private createIncident(team: TeamState, code: string, message: string, work?: WorkRef, memberId?: string, scopeRootId?: string,
-		kind: ManagerEventView["kind"] = code === "BUDGET_HIT" || code === "DEPENDENCY_UNAVAILABLE" ? code : "MEMBER_FAULTED"): TeamIncidentView {
+		kind: TeamEventView["kind"] = code === "BUDGET_HIT" || code === "DEPENDENCY_UNAVAILABLE" ? code : "MEMBER_FAULTED"): TeamIncidentView {
 		const rootId = work ? team.ledger.get(work.workId)?.record.rootId : scopeRootId;
 		const current = team.incidents.find((incident) => incident.state === "open" && incident.code === code
 			&& incident.memberId === memberId && incident.rootId === rootId && (incident.work ? work && sameWorkRef(incident.work, work) : !work));
@@ -3013,7 +3012,7 @@ export class TeamRuntime {
 
 	private finishTeamCloseIfReady(team: TeamState): void {
 		if (team.lifecycle !== "closing" || !team.closeDecision) return;
-		if ([...team.members.values()].some((member) => member.id === team.manager
+		if ([...team.members.values()].some((member) => member.id === team.lead
 			? member.lifecycle !== "closed" || member.resourceState !== "released"
 			: !((member.lifecycle === "closed" || member.lifecycle === "faulted") && member.resourceState === "released"))) return;
 		team.lifecycle = "closed";
@@ -3042,7 +3041,7 @@ export class TeamRuntime {
 
 		if (team.lifecycle === "active") {
 			this.resumeParkedActivations(team);
-			for (let count = 0; count < team.limits.workerPermits + 1; count++) {
+			for (let count = 0; count < team.limits.workPermits + 1; count++) {
 				const activation = this.reserveNextActivation(teamId);
 				if (!activation) break;
 				void Promise.resolve().then(() => executor.runActivation(activation)).catch((error: unknown) => {
@@ -3058,10 +3057,10 @@ export class TeamRuntime {
 			}
 		}
 
-		// close_team must not stop even an idle worker until the Manager's own final activation
+		// close_team must not stop even an idle member until the lead's own final activation
 		// has crossed native settlement and cleanup. Individual close_member remains independent.
-		const manager = team.members.get(team.manager)!;
-		if (team.lifecycle === "closing" && manager.active) return;
+		const lead = team.members.get(team.lead)!;
+		if (team.lifecycle === "closing" && lead.active) return;
 		for (const member of team.members.values()) {
 			if ((member.lifecycle !== "closing" && member.lifecycle !== "faulted") || member.resourceState !== "stopping"
 				|| member.active || !member.closeId) continue;
@@ -3216,7 +3215,7 @@ export class TeamRuntime {
 	private authenticatedMember(binding: BindingV2): RuntimeMember {
 		const team = this.team(binding.teamId);
 		const member = team.members.get(binding.memberId);
-		if (!member || member.epoch !== binding.epoch || member.role !== binding.role) fail("PROTOCOL_FAILURE", "Binding does not match a member lifetime");
+		if (!member || member.epoch !== binding.epoch) fail("PROTOCOL_FAILURE", "Binding does not match a member lifetime");
 		return member;
 	}
 
@@ -3229,7 +3228,7 @@ export class TeamRuntime {
 	}
 
 	private binding(team: TeamState, member: RuntimeMember): BindingV2 {
-		return { version: TEAM_PROTOCOL_VERSION, teamId: team.id, memberId: member.id, role: member.role, epoch: member.epoch };
+		return { version: TEAM_PROTOCOL_VERSION, teamId: team.id, memberId: member.id, epoch: member.epoch };
 	}
 
 	private makeWork(team: TeamState, requester: string, assignee: string, task: string, inputRefs: string[], parent: WorkRef | undefined, at: number, rootId?: string, depth = 0): WorkRecord {
@@ -3251,11 +3250,16 @@ export class TeamRuntime {
 		this.previewInput(team, member, `input-check:${work.id}`, scope);
 	}
 
+	private roster(team: TeamState): ActivationInput["roster"] {
+		return [...team.members.values()].map((item) => ({ id: item.id, ...(item.id === team.lead ? { lead: true as const } : {}),
+			lifecycle: item.lifecycle, rolePreview: previewText(item.roleDescription, 512) }));
+	}
+
 	private previewInput(team: TeamState, member: RuntimeMember, deliveryId: string, scope: WorkScope): ActivationInput {
 		const input: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
-			member: { id: member.id, role: member.role, roleDescription: member.roleDescription }, brief: copy(team.plan.brief),
-			roster: [...team.members.values()].map((item) => ({ id: item.id, role: item.role, lifecycle: item.lifecycle, rolePreview: previewText(item.roleDescription, 512) })),
+			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription }, brief: copy(team.plan.brief),
+			roster: this.roster(team),
 			scope, outcomes: [], omittedOutcomes: 0, ownedChildren: [],
 			// Size check only: the largest possible budget summary.
 			budget: { emergency: false, modelRequests: Number.MAX_SAFE_INTEGER, toolCalls: Number.MAX_SAFE_INTEGER, activations: Number.MAX_SAFE_INTEGER },
@@ -3317,9 +3321,9 @@ export class TeamRuntime {
 			return okReply(member.id, { receipt: { status: "staged", intent: "reply", work: active.scope.work! } });
 		}
 		if (action.action === "yield") {
-			const expected: EndIntent | undefined = active.scope.kind === "management"
+			const expected: EndIntent | undefined = active.scope.kind === "events"
 				? action.waitingFor.length === 0 && action.attention === undefined
-					? { kind: "manager_idle", ...(action.checkpoint ? { checkpoint: action.checkpoint } : {}), toolCallId }
+					? { kind: "idle", ...(action.checkpoint ? { checkpoint: action.checkpoint } : {}), toolCallId }
 					: undefined
 				: action.attention !== undefined && action.checkpoint
 					? { kind: "yield_attention", work: active.scope.work!, attention: action.attention, checkpoint: action.checkpoint, toolCallId }
@@ -3341,7 +3345,7 @@ export class TeamRuntime {
 	private view(team: TeamState): TeamTeamView {
 		const current = team.ledger.order.map((id) => currentVersion(team.ledger.get(id)!.record));
 		const members: TeamMemberView[] = [...team.members.values()].map((member) => ({
-			id: member.id, role: member.role, roleDescription: member.roleDescription, lifecycle: member.lifecycle,
+			id: member.id, roleDescription: member.roleDescription, lifecycle: member.lifecycle,
 			activity: member.activity, pause: member.pause, ...(member.currentWork ? { currentWork: copy(member.currentWork) } : {}),
 			resourceState: member.resourceState,
 			...(member.error ? { error: projectWorkError(member.error) } : {}),
@@ -3370,7 +3374,7 @@ export class TeamRuntime {
 		const incidents = team.incidents.filter((incident) => selected.has(incident));
 		return {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, lifecycle: team.lifecycle, health: team.health, stateVersion: team.stateVersion,
-			eventSeq: team.eventSeq, manager: team.manager, timeoutSeconds: team.plan.timeoutSeconds, deadline: team.deadline, brief: copy(team.plan.brief), members,
+			eventSeq: team.eventSeq, lead: team.lead, timeoutSeconds: team.plan.timeoutSeconds, deadline: team.deadline, brief: copy(team.plan.brief), members,
 			works: { total: current.length, queued: current.filter((version) => version.state === "queued").length,
 				running: current.filter((version) => version.state === "running").length,
 				blocked: current.filter((version) => version.state === "blocked").length,
@@ -3498,7 +3502,7 @@ export class TeamRuntime {
 		if (new Set(team.ledger.order).size !== team.ledger.order.length || team.ledger.order.length !== team.ledger.works.size) {
 			throw new Error("Invariant I02: WorkLedger order and records are not one-to-one");
 		}
-		let workerActivations = 0;
+		let workActivations = 0;
 		for (const member of team.members.values()) {
 			if (member.active) {
 				if (member.activity === "idle") throw new Error(`Invariant I01: active member ${member.id} is idle`);
@@ -3520,7 +3524,7 @@ export class TeamRuntime {
 				}
 				if (member.active.native && member.activity !== "settling") throw new Error(`Invariant I01: settled activation ${member.id} is not settling`);
 				if (member.active.cleanup && !member.active.native) throw new Error(`Invariant I09: cleanup preceded native settlement for ${member.id}`);
-				if (member.role === "worker" && member.active.workerPermitHeld) workerActivations++;
+				if (member.active.workPermitHeld) workActivations++;
 			} else if (member.activity !== "idle" && member.lifecycle !== "faulted") {
 				throw new Error(`Invariant I01: inactive member ${member.id} is not idle`);
 			}
@@ -3533,16 +3537,16 @@ export class TeamRuntime {
 					if (record.assignee !== member.id) continue;
 					const version = currentVersion(record);
 					if (isTerminalWorkState(version.state)) continue;
-					const managerHold = member.role === "manager" && version.state === "blocked" && version.hold?.reason === "manager_unavailable";
-					if (!managerHold) throw new Error(`Invariant I17: faulted member ${member.id} still owns runnable work ${id}`);
+					const leadHold = member.id === team.lead && version.state === "blocked" && version.hold?.reason === "lead_unavailable";
+					if (!leadHold) throw new Error(`Invariant I17: faulted member ${member.id} still owns runnable work ${id}`);
 				}
 			}
 		}
-		if (workerActivations > team.limits.workerPermits) throw new Error("Invariant: worker activation permit limit exceeded");
+		if (workActivations > team.limits.workPermits) throw new Error("Invariant: work activation permit limit exceeded");
 		const budgetUsed = team.budget.used;
-		if (budgetUsed.teamActivations > team.limits.teamActivations || budgetUsed.managerActivations > team.limits.managerActivations
-			|| budgetUsed.managerActivations > budgetUsed.teamActivations
-			|| budgetUsed.emergencyManagerActivations > team.limits.emergencyManagerActivations || team.ledger.order.length > team.limits.teamWorks
+		if (budgetUsed.teamActivations > team.limits.teamActivations || budgetUsed.leadActivations > team.limits.leadActivations
+			|| budgetUsed.leadActivations > budgetUsed.teamActivations
+			|| budgetUsed.emergencyLeadActivations > team.limits.emergencyLeadActivations || team.ledger.order.length > team.limits.teamWorks
 			|| team.reservedResultBytes > team.limits.reservedResultBytes) throw new Error("Invariant I20/I24: Team budget or reserved result capacity exceeded");
 		let versionCount = 0;
 		for (const id of team.ledger.order) {
@@ -3596,14 +3600,14 @@ export class TeamRuntime {
 			}
 		}
 		if (team.lifecycle === "closed") {
-			if (!team.closeDecision || [...team.members.values()].some((member) => member.id === team.manager
+			if (!team.closeDecision || [...team.members.values()].some((member) => member.id === team.lead
 				? member.lifecycle !== "closed" || member.resourceState !== "released"
 				: !((member.lifecycle === "closed" || member.lifecycle === "faulted") && member.resourceState === "released"))) {
 				throw new Error("Invariant I28: Team cannot be closed before a committed close and release");
 			}
 		}
 		if (team.lifecycle === "closing" && (!team.closeDecision || [...team.members.values()].some((member) => member.active
-			&& (member.id !== team.manager || member.active.intent?.kind !== "close_team")))) throw new Error("Invariant I27: close_team has an unrelated active operation");
+			&& (member.id !== team.lead || member.active.intent?.kind !== "close_team")))) throw new Error("Invariant I27: close_team has an unrelated active operation");
 	}
 
 	private parseWorkRefKey(key: string): WorkRef {

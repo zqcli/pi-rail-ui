@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { TEAM_MAX_MANAGER_EVENT_BATCH } from "../../tools/subagents/team-protocol";
+import { TEAM_MAX_EVENT_BATCH } from "../../tools/subagents/team-protocol";
 import { TeamRuntime, type RuntimeActivation, type TeamRuntimeExecutor } from "../../tools/subagents/team-runtime";
 
 function deferred() {
@@ -13,8 +13,7 @@ function makeRuntime(requestCount: number) {
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `scheduler-${++ids}` });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work and close the Team." },
-		workers: [{ alias: "w1", roleDescription: "Complete assigned work." }],
+		members: [{ alias: "lead", roleDescription: "Manage work and close the Team." }, { alias: "w1", roleDescription: "Complete assigned work." }], lead: "lead",
 		brief: { goal: "Exercise Runtime-owned scheduling." },
 		initialRequests: Array.from({ length: requestCount }, (_, index) => ({ to: "w1", task: `root ${index + 1}` })),
 		timeoutSeconds: null,
@@ -59,8 +58,8 @@ test("Runtime event drain reserves one same-member activation and schedules the 
 			try {
 				const ready = runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId);
 				assert.equal(ready.ok, true, JSON.stringify(ready));
-				if (activation.scope.kind === "management") {
-					assert.equal(activation.input.scope.kind, "management");
+				if (activation.scope.kind === "events") {
+					assert.equal(activation.input.scope.kind, "events");
 					const events = activation.input.scope.events;
 					managerBatches.push(events.map(({ id, kind }) => ({ id, kind })));
 					const hasQuiescence = events.some((event) => event.kind === "TEAM_QUIESCENT");
@@ -132,8 +131,8 @@ test("Manager event batches are finite and semantic quiescence remains idle with
 			try {
 				const ready = runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId);
 				assert.equal(ready.ok, true, JSON.stringify(ready));
-				if (activation.scope.kind === "management") {
-					assert.equal(activation.input.scope.kind, "management");
+				if (activation.scope.kind === "events") {
+					assert.equal(activation.input.scope.kind, "events");
 					const events = activation.input.scope.events;
 					if (events.some((event) => event.kind === "BOOT")) {
 						assert.equal(requested, false);
@@ -185,8 +184,8 @@ test("Manager event batches are finite and semantic quiescence remains idle with
 
 	const eventBatches = managerBatches.slice(1);
 	assert.ok(eventBatches.length >= 2);
-	assert.ok(eventBatches.every((batch) => batch.length <= TEAM_MAX_MANAGER_EVENT_BATCH));
-	assert.ok(eventBatches.some((batch) => batch.length === TEAM_MAX_MANAGER_EVENT_BATCH), "pending events are split at the finite batch limit");
+	assert.ok(eventBatches.every((batch) => batch.length <= TEAM_MAX_EVENT_BATCH));
+	assert.ok(eventBatches.some((batch) => batch.length === TEAM_MAX_EVENT_BATCH), "pending events are split at the finite batch limit");
 	const deliveredEvents = managerBatches.flat().filter((event) => event.kind !== "BOOT");
 	assert.equal(new Set(deliveredEvents.map((event) => event.id)).size, deliveredEvents.length, "each Manager event is delivered in at most one batch");
 	assert.equal(deliveredEvents.filter((event) => event.kind === "TEAM_QUIESCENT").length, 1);
@@ -204,12 +203,9 @@ test("new Manager events stay in the next sealed batch and faults outrank incide
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `priority-${++ids}` });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage events." },
-		workers: [
-			{ alias: "w1", roleDescription: "Return one successful result." },
+		members: [{ alias: "lead", roleDescription: "Manage events." }, { alias: "w1", roleDescription: "Return one successful result." },
 			{ alias: "w2", roleDescription: "Inject a local worker fault." },
-			{ alias: "w3", roleDescription: "Inject another local worker fault." },
-		],
+			{ alias: "w3", roleDescription: "Inject another local worker fault." },], lead: "lead",
 		brief: { goal: "Verify sealed Manager batch ordering." },
 		initialRequests: [
 			{ to: "w1", task: "successful root" },
@@ -235,8 +231,8 @@ test("new Manager events stay in the next sealed batch and faults outrank incide
 			try {
 				const inputReady = runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId);
 				assert.equal(inputReady.ok, true, JSON.stringify(inputReady));
-				if (activation.scope.kind === "management") {
-					assert.equal(activation.input.scope.kind, "management");
+				if (activation.scope.kind === "events") {
+					assert.equal(activation.input.scope.kind, "events");
 					const events = activation.input.scope.events;
 					if (events.some((event) => event.kind === "BOOT")) {
 						apply(runtime, activation, 1, "boot-yield", { action: "yield" });
@@ -338,12 +334,11 @@ test("an internal memberReleased exception is observable as failed and does not 
 	runtime.assertInvariants(teamId);
 });
 
-test("G10: Manager native failure parks workers and HostControl cancels without another Manager activation", { timeout: 10000 }, async () => {
+test("G10: lead native failure parks the other members and HostControl cancels without another lead activation", { timeout: 10000 }, async () => {
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `manager-fault-${++ids}`, activationStopTimeoutMs: 250 });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work." },
-		workers: [{ alias: "w1", roleDescription: "First worker." }, { alias: "w2", roleDescription: "Second worker." }],
+		members: [{ alias: "lead", roleDescription: "Manage work." }, { alias: "w1", roleDescription: "First worker." }, { alias: "w2", roleDescription: "Second worker." }], lead: "lead",
 		brief: { goal: "Verify Manager fault containment." },
 		initialRequests: [{ to: "w1", task: "worker one" }, { to: "w2", task: "worker two" }],
 		timeoutSeconds: null,
@@ -357,10 +352,10 @@ test("G10: Manager native failure parks workers and HostControl cancels without 
 			try {
 				const ready = runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId);
 				assert.equal(ready.ok, true, JSON.stringify(ready));
-				if (activation.scope.kind === "management") {
+				if (activation.scope.kind === "events") {
 					managerRuns++;
 					assert.equal(runtime.nativeSettled(activation.binding, activation.scope.activationId, {
-						status: "error", error: { code: "SYNTHETIC_MANAGER_FAILURE", message: "Manager provider failed" },
+						status: "error", error: { code: "SYNTHETIC_LEAD_FAILURE", message: "Manager provider failed" },
 					}).ok, true);
 					assert.equal(runtime.cleanupFinished(activation.binding, activation.scope.activationId, { ok: true }).ok, true);
 					return;
@@ -383,18 +378,18 @@ test("G10: Manager native failure parks workers and HostControl cancels without 
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const members = runtime.getTeam(prepared.teamId).members;
 		if (members.find((member) => member.id === "lead")?.lifecycle === "faulted"
-			&& members.filter((member) => member.role === "worker").every((member) => member.pause === "confirmed")) break;
+			&& members.filter((member) => member.id !== "lead").every((member) => member.pause === "confirmed")) break;
 		await flushOneTurn();
 	}
 	const beforeCancel = runtime.getTeam(prepared.teamId);
 	assert.equal(beforeCancel.members.find((member) => member.id === "lead")?.lifecycle, "faulted");
-	assert.ok(beforeCancel.members.filter((member) => member.role === "worker").every((member) => member.pause === "confirmed"));
+	assert.ok(beforeCancel.members.filter((member) => member.id !== "lead").every((member) => member.pause === "confirmed"));
 	const receipt = runtime.hostControl(prepared.teamId).cancel_team("Host canceled after Manager fault");
 	assert.equal(receipt.actor, "@host");
 	const result = await lifetime;
 	assert.equal(result.lifecycle, "cancelled");
 	assert.equal(result.outcome, undefined, "host cancellation is not a business outcome");
-	assert.deepEqual(result.members.find((member) => member.id === "lead"), { id: "lead", role: "manager", lifecycle: "faulted", resourceState: "released" },
+	assert.deepEqual(result.members.find((member) => member.id === "lead"), { id: "lead", lifecycle: "faulted", resourceState: "released" },
 		"the faulted Manager's resource is released but its fault is not rewritten as a normal close");
 	assert.equal(managerRuns, 1, "host cancellation does not wait for a replacement/second Manager LLM turn");
 	assert.deepEqual(closeCalls.sort(), ["lead", "w1", "w2"]);
@@ -407,8 +402,7 @@ test("X08: deadline starts at launch, user cancellation wins later deadline, and
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `deadline-${++ids}` });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage and close." },
-		workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage and close." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "Verify launch-admitted deadline." },
 		timeoutSeconds: 1,
 	});
@@ -419,8 +413,8 @@ test("X08: deadline starts at launch, user cancellation wins later deadline, and
 		runActivation: async (activation) => {
 			const ready = runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId);
 			assert.equal(ready.ok, true, JSON.stringify(ready));
-			assert.equal(activation.scope.kind, "management");
-			if (activation.input.scope.kind !== "management") throw new Error("Expected Manager activation input");
+			assert.equal(activation.scope.kind, "events");
+			if (activation.input.scope.kind !== "events") throw new Error("Expected Manager activation input");
 			const quiescent = activation.input.scope.events.some((event) => event.kind === "TEAM_QUIESCENT");
 			const callId = `deadline-yield-${managerRuns++}`;
 			apply(runtime, activation, 1, callId, { action: "yield" });
@@ -448,7 +442,7 @@ test("X08: deadline starts at launch, user cancellation wins later deadline, and
 
 	const closeRuntime = new TeamRuntime();
 	const closing = closeRuntime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage and close." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage and close." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "Verify close wins the terminal decision." }, timeoutSeconds: null,
 	});
 	closeRuntime.launch(closing.teamId);
@@ -471,8 +465,7 @@ test("X09/13.3: host cancel interrupts a running approved tool at once, then ter
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `terminate-${++ids}`, activationStopTimeoutMs: 200 });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work." },
-		workers: [{ alias: "w1", roleDescription: "Runs a tool that ignores abort." }],
+		members: [{ alias: "lead", roleDescription: "Manage work." }, { alias: "w1", roleDescription: "Runs a tool that ignores abort." }], lead: "lead",
 		brief: { goal: "Verify interrupt-first cancellation and bounded process termination." },
 		initialRequests: [{ to: "w1", task: "hang in a tool" }],
 		timeoutSeconds: null,
@@ -485,7 +478,7 @@ test("X09/13.3: host cancel interrupts a running approved tool at once, then ter
 	const executor: TeamRuntimeExecutor = {
 		runActivation: async (activation) => {
 			assert.equal(runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
-			if (activation.scope.kind === "management") {
+			if (activation.scope.kind === "events") {
 				apply(runtime, activation, 1, "boot-yield", { action: "yield" });
 				finish(runtime, activation, "boot-yield");
 				return;
@@ -530,8 +523,7 @@ test("X09/13.3: host cancel interrupts a running approved tool at once, then ter
 test("6.1/6.3: prepared cancel closes only claimed lifetimes and keeps an unconfirmed exit as cleanup_failed", { timeout: 10000 }, async () => {
 	const runtime = new TeamRuntime();
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." },
-		workers: [{ alias: "w1", roleDescription: "Opened worker." }, { alias: "w2", roleDescription: "Never opened." }],
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Opened worker." }, { alias: "w2", roleDescription: "Never opened." }], lead: "lead",
 		brief: { goal: "Cancel a partially opened prepared Team." },
 		initialRequests: [{ to: "w1", task: "never starts" }],
 		timeoutSeconds: null,
@@ -566,8 +558,7 @@ test("14.4/19.2: a worker native_failure keeps faulted history when host cancel 
 	let ids = 0;
 	const runtime = new TeamRuntime({ createId: () => `worker-fault-${++ids}` });
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage work." },
-		workers: [{ alias: "w1", roleDescription: "Fails natively." }, { alias: "w2", roleDescription: "Healthy." }],
+		members: [{ alias: "lead", roleDescription: "Manage work." }, { alias: "w1", roleDescription: "Fails natively." }, { alias: "w2", roleDescription: "Healthy." }], lead: "lead",
 		brief: { goal: "Keep a faulted worker faulted through host cleanup." },
 		initialRequests: [{ to: "w1", task: "provider fails" }],
 		timeoutSeconds: null,
@@ -577,7 +568,7 @@ test("14.4/19.2: a worker native_failure keeps faulted history when host cancel 
 	const executor: TeamRuntimeExecutor = {
 		runActivation: async (activation) => {
 			assert.equal(runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
-			if (activation.scope.kind === "management") {
+			if (activation.scope.kind === "events") {
 				apply(runtime, activation, 1, "yield", { action: "yield" });
 				finish(runtime, activation, "yield");
 				return;
@@ -613,7 +604,7 @@ test("14.4/19.2: a worker native_failure keeps faulted history when host cancel 
 test("memberExitConfirmed accepts only an exact faulted unknown-exit lifetime", () => {
 	const runtime = new TeamRuntime();
 	const prepared = runtime.prepare({
-		manager: { alias: "lead", roleDescription: "Manage." }, workers: [{ alias: "w1", roleDescription: "Work." }],
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead",
 		brief: { goal: "Reject invalid exit reconciliation." }, initialRequests: [{ to: "w1", task: "lost" }], timeoutSeconds: null,
 	});
 	runtime.launch(prepared.teamId);

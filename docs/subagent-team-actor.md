@@ -194,7 +194,16 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 
 另有 `TeamRuntime.handoverLead(teamId, alias, reason?)`（`/rail-team <id> lead <alias> [reason]`，需确认）：把 lead 职责交给另一个 open 成员，原 lead 成为普通成员。目标必须是 open 且不是当前 lead 的成员；原 lead 正在处理 events activation 时拒绝（除非它已 faulted/closed）。未处理的 Team 事件（含原 lead 未完成批次里的事件）归新 lead；新 lead 收到一条 `USER_COMMAND` 事件 `Host made you the Team lead: <reason>`。原 lead 故障时：`LEAD_UNAVAILABLE` incident 全部 resolved，其余成员的安全暂停解除，而 `lead_unavailable` hold 住的 work 的 assignee 正是已故障的原 lead，无法继续，所以与其他故障成员的工作一样记为 failed（`MEMBER_UNAVAILABLE`），其请求者随之收到失败 outcome。移交写入 journal（`handover` 记录），history 显示当前 lead，旧 journal 不受影响。
 
-`/rail-team [list] | <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]`：grant、resume 和 lead 会先展示影响范围并要求确认；无 UI 的环境不能修改。`/rail-agent` 中对 Team 成员的 Stop/Delete 会经 Runtime 路由（见 README）。
+
+### 定期巡检（review）
+
+`prepare` 的 `review: {by, everyMinutes} | null`（默认 null）指定一名非 lead 成员（reviewer）每 `everyMinutes`（1..1440）分钟巡检一次进度；`by` 必须是 lead 以外的成员。巡检只给建议：reviewer 不能 `request` 或 `control`（`FORBIDDEN_ACTION`「A review only advises」），结果以 `REVIEW_READY` 事件（含完整结果与 resultRef）发给 lead，lead 自行决定（request、revise_work、cancel_work 或不处理），无需回复。
+
+- 每个 Team 一个（unref 的）定时器，随关闭/停止清除。每次触发只在以下条件全部满足时启动巡检：Team active、lead 与 reviewer 都 open、没有未结束的 review work、自上次巡检起非 review work 有创建或状态变化。`review now` 忽略「无变化」这一条。`TeamRuntime.runReviewTick(teamId)` 是定时器调用的入口，测试可直接驱动。
+- 巡检是 `kind: "review"` 的 work：requester 为 lead、assignee 为 reviewer，由 Runtime 创建，task 是宿主生成的有界快照（用时、目标、各状态 work、自上次起完成的 work、各成员状态与等待/hold、未决 incident、主要预算计数、自上次起的时间线、上一次巡检的结论）加固定指示（summary 必须以 `ON TRACK:`、`AT RISK:` 或 `OFF TRACK:` 开头）。review work 计入预算，但不是交付物：不计入 root 计数、close 阻塞项、Waiting for、processStats 与最终结果；`close_team`（或 Team 停止）时未结束的 review 自动取消，永不阻塞关闭。
+- 提交后存为 `TeamReviewRecord`（`listReviews(teamId)`，保留最新 200 条，结论由 summary 前缀解析）；review 失败也记录（`failed`），hold 的问题照常交给 lead。`reviewSchedule(teamId)` 返回 `{by, everyMinutes, nextAt}`。宿主用 `setReview`/`reviewNow`（即 `/rail-team <id> review ...`）调整；journal 记录 `review`、`review_schedule`，history 条目含 `reviews` 与 `review`，已关闭的 Team 也能看到。
+
+`/rail-team [list] | <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|review [now|every <N> [by <alias>]|off]`：grant、resume、lead 和 review（now/every/off）会先展示影响范围并要求确认；无 UI 的环境不能修改。`/rail-agent` 中对 Team 成员的 Stop/Delete 会经 Runtime 路由（见 README）。
 
 ## 10. 容量上限
 

@@ -3,16 +3,16 @@ import {
 	TEAM_COMMAND_CACHE, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_PROTOCOL_VERSION,
-	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, isTerminalWorkState, sameWorkRef,
+	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_BUDGET_UNLIMITED, TEAM_MAX_REVIEWS, isTerminalWorkState, reviewVerdict, sameWorkRef,
 	workRefKey, shortWorkRef, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type ActivationInput, type ActivationScope, type ChildIssue, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
 	type TeamEventView, type MemberRecord, type OutcomeView, type ResultRecord,
 	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle, type GateDecision,
-	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamTeamView,
+	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView,
 	type TeamWorkSummary, type TeamWorkView, type WorkError, type WorkRecord, type WorkRef, type WorkResult, type WorkVersion,
 } from "./team-protocol";
 import {
-	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeTeamAction, normalizeTeamPlan, normalizeTeamBudgetPreset, parseActivationScope, parseBinding, sameScope,
+	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeReviewPlan, normalizeTeamAction, normalizeTeamPlan, normalizeTeamBudgetPreset, parseActivationScope, parseBinding, sameScope,
 	okReply, jsonTextBytes, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
 import { WorkLedger } from "./team-work-ledger";
@@ -52,7 +52,12 @@ const CHILD_ISSUE_NOTICE = " A sub-task you requested is held (see childIssues):
 const EVENTS_NOTICE = "Events activation: you are the Team's lead and there is no current WorkRef. Handle these events, then end with yield (checkpoint only, no waitingFor). "
 	+ "New results, failures and incidents start the next events activation automatically; do not poll status to wait. "
 	+ "A WORK_HELD event is a member asking for input: answer with resume_work {workId, expectedRevision, incidentId, instruction} "
-	+ "(for example naming the resultRef or WorkRef it needs), or revise_work/cancel_work. close_team checks every root itself and names any blocker, so no status check is needed before it.";
+	+ "(for example naming the resultRef or WorkRef it needs), or revise_work/cancel_work. close_team checks every root itself and names any blocker, so no status check is needed before it. "
+	+ "A REVIEW_READY event is advice from the reviewer: decide whether to act on it (request, revise_work, cancel_work, or nothing); it needs no reply.";
+/** The periodic review work asks for advice only; its task is this plus a host-built snapshot. */
+const REVIEW_INSTRUCTIONS = "You are reviewing the Team's progress against the goal. You only advise: do not request or control work. Use status and read tools if needed. "
+	+ "Reply with reply {result}: summary must start with 'ON TRACK:', 'AT RISK:' or 'OFF TRACK:' followed by a one-paragraph assessment; "
+	+ "findings are risks and concrete recommendations that name members/WorkRefs; limitations what you could not verify.";
 
 export interface RuntimeActivation {
 	binding: BindingV2;
@@ -226,6 +231,21 @@ interface CloseDecision {
 	roots: TeamResult["roots"];
 }
 
+/** Periodic review: the (host-changeable) schedule and what the last review already saw. */
+interface ReviewState {
+	schedule: TeamReviewPlan | null;
+	nextAt: number | null;
+	startedAt: number;
+	/** Non-review works as of the last review's start: change detection. */
+	signature: string;
+	/** Non-review works already terminal then, and the wall clock then (timeline cut). */
+	finished: Set<string>;
+	wall: number;
+	/** The open review's snapshot, kept for its record. */
+	pending?: { workId: string; snapshot: TeamReviewRecord["snapshot"] };
+	records: TeamReviewRecord[];
+}
+
 interface TeamState {
 	id: string;
 	lifecycle: TeamLifecycle;
@@ -261,6 +281,7 @@ interface TeamState {
 	/** Display-only schedule of milestones for the host (bounded: the first TEAM_TIMELINE_HEAD and the newest); never an obligation or a recovery log. */
 	timeline: Array<{ at: number; text: string }>;
 	timelineOmitted: number;
+	review: ReviewState;
 	dependencyWaits: number;
 	questions: number;
 	toolErrors: number;
@@ -276,12 +297,12 @@ interface TeamState {
  * make a mistyped code almost never another valid ID.
  */
 const ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
-type ModelIdKind = "work" | "result" | "incident" | "event";
+type ModelIdKind = "work" | "result" | "incident" | "event" | "review";
 /**
  * An ID in that form quoted in text. Every code has a digit, so a word such as `result:pass` is not read as
  * an ID; longer (old UUID-format) IDs do not fit and are left alone.
  */
-const QUOTED_ID = new RegExp(`\\b(?:work|result|incident|event):(?=[a-z]{0,3}[2-9])[${ID_ALPHABET}]{4}\\b`, "gu");
+const QUOTED_ID = new RegExp(`\\b(?:work|result|incident|event|review):(?=[a-z]{0,3}[2-9])[${ID_ALPHABET}]{4}\\b`, "gu");
 
 /** One substitution or one adjacent transposition apart: the slips made when copying an ID. */
 function isTypo(left: string, right: string): boolean {
@@ -308,6 +329,21 @@ const copy = <T>(value: T): T => structuredClone(value);
 const currentVersion = (record: WorkRecord): WorkVersion => record.versions[record.currentRevision - 1]!;
 const TERMINAL_TEAM_LIFECYCLES: readonly TeamLifecycle[] = ["closed", "failed", "cancelled", "interrupted"];
 const plural = (count: number): string => count === 1 ? "" : "s";
+export const clock = (ms: number): string => {
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+};
+
+/** Bounded status timeline: head 30, newest entries, and one in-place omission marker (100 rows total). */
+export function formatTimeline(timeline: readonly { at: number; text: string }[], omitted: number, origin: number): string[] {
+	const needsMarker = omitted > 0 || timeline.length > 100;
+	const skipped = Math.max(0, timeline.length - (needsMarker ? 99 : 100));
+	const entries = skipped ? [...timeline.slice(0, TEAM_TIMELINE_HEAD), ...timeline.slice(TEAM_TIMELINE_HEAD + skipped)] : timeline;
+	const lines = entries.map((entry) => `- ${clock(entry.at - origin)} ${entry.text}`);
+	if (needsMarker) lines.splice(TEAM_TIMELINE_HEAD, 0, `- … ${omitted + skipped} milestones omitted …`);
+	return lines;
+}
+
 /** At most `cap` items, then "+N more". */
 export const capped = (items: readonly string[], cap: number, separator = ", "): string =>
 	items.slice(0, cap).join(separator) + (items.length > cap ? ` +${items.length - cap} more` : "");
@@ -343,6 +379,7 @@ export class TeamRuntime {
 	private readonly closingEffects = new Set<string>();
 	private readonly completionWaiters = new Map<string, Set<(result: TeamResult) => void>>();
 	private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly reviewTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly now: () => number;
 	private readonly createId: () => string;
 	/** Without an injected createId (tests), model-visible IDs are short random codes. */
@@ -428,6 +465,7 @@ export class TeamRuntime {
 			plan: copy(plan), lead: plan.lead, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
+			review: { schedule: copy(plan.review), nextAt: null, startedAt: createdAt, signature: "", finished: new Set(), wall: 0, records: [] },
 			dependencyWaits: 0, questions: 0, toolErrors: 0,
 		};
 		for (const initial of plan.initialRequests) {
@@ -452,13 +490,15 @@ export class TeamRuntime {
 		const launchAt = this.timestamp();
 		// History must record admission before any provider can run; a failed write fails startup closed.
 		if (!this.tryJournal(team, { version: 2, kind: "launched", teamId, at: launchAt,
-			roster: { lead: team.lead, members: team.plan.members.map((member) => member.alias) }, goal: previewText(team.plan.brief.goal, 512) })) {
+			roster: { lead: team.lead, members: team.plan.members.map((member) => member.alias) }, goal: previewText(team.plan.brief.goal, 512),
+			...(team.plan.review ? { review: team.plan.review } : {}) })) {
 			const reason = team.journalFailure;
 			this.applyJournalFailure(team);
 			fail("PROTOCOL_FAILURE", `Team launch could not be journaled: ${reason}`);
 		}
 		team.deadline = team.plan.timeoutSeconds === null ? null : launchAt + Math.ceil(team.plan.timeoutSeconds * 1000);
 		team.lifecycle = "active";
+		team.review.startedAt = launchAt;
 		for (const member of team.members.values()) {
 			member.lifecycle = "open";
 			member.resourceState = "owned";
@@ -475,6 +515,7 @@ export class TeamRuntime {
 			}, Math.ceil(team.plan.timeoutSeconds * 1000));
 			this.deadlineTimers.set(teamId, timer);
 		}
+		this.armReview(team);
 		this.requestDrain(teamId);
 		return this.view(team);
 	}
@@ -802,6 +843,189 @@ export class TeamRuntime {
 		return { actor: "@host", status: "applied", teamId, lead: target.id };
 	}
 
+	/** The current periodic-review schedule (nextAt: when the timer fires next, null while it is not running); undefined without one. */
+	reviewSchedule(teamId: string): { by: string; everyMinutes: number; nextAt: number | null } | undefined {
+		const { schedule, nextAt } = this.team(teamId).review;
+		return schedule ? { ...schedule, nextAt } : undefined;
+	}
+
+	/** The Team's reviews, oldest first (the newest TEAM_MAX_REVIEWS). */
+	listReviews(teamId: string): TeamReviewRecord[] {
+		return copy(this.team(teamId).review.records);
+	}
+
+	/** Host-only: set the periodic review (without `by` the current reviewer stays), or stop it with null. Restarts the interval. */
+	setReview(teamId: string, value: { by?: string; everyMinutes: number } | null): HostControlReceipt {
+		const team = this.team(teamId);
+		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
+		const by = value?.by ?? team.review.schedule?.by;
+		if (value && !by) fail("INVALID_ARGUMENT", "Name the reviewer: review every <N> by <alias>");
+		const schedule = value ? normalizeReviewPlan({ by, everyMinutes: value.everyMinutes }, "review", [...team.members.keys()], team.lead) : null;
+		if (canonicalJson(schedule) === canonicalJson(team.review.schedule)) return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle };
+		this.writeJournal(team, { version: 2, kind: "review_schedule", teamId, at: this.timestamp(), review: copy(schedule) });
+		team.review.schedule = schedule;
+		this.armReview(team);
+		this.note(team, schedule ? `host set the review: ${schedule.by} every ${schedule.everyMinutes} min` : "host stopped the periodic review");
+		this.changed(team);
+		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle };
+	}
+
+	/** Host-only: start a review now, even if nothing changed since the last one. */
+	reviewNow(teamId: string): Extract<HostControlReceipt, { work: WorkRef }> {
+		const team = this.team(teamId);
+		const blocked = this.reviewBlocker(team, true);
+		if (blocked) fail("INVALID_ARGUMENT", `No review started: ${blocked}`);
+		const work = this.startReview(team);
+		this.armReview(team);
+		return { actor: "@host", status: "applied", teamId, work };
+	}
+
+	/** What the review timer runs (public so a test can drive it): start a review if one is due. */
+	runReviewTick(teamId: string): WorkRef | undefined {
+		const team = this.team(teamId);
+		if (this.reviewBlocker(team, false)) return undefined;
+		try { return this.startReview(team); }
+		catch (error) {
+			if (!(error instanceof TeamProtocolError)) throw error;
+			this.note(team, `review skipped: ${error.message}`);
+			return undefined;
+		}
+	}
+
+	private armReview(team: TeamState): void {
+		this.clearReview(team);
+		if (!team.review.schedule || team.lifecycle !== "active") return;
+		const ms = team.review.schedule.everyMinutes * 60_000;
+		team.review.nextAt = this.timestamp() + ms;
+		const timer = setTimeout(() => {
+			this.reviewTimers.delete(team.id);
+			this.runReviewTick(team.id);
+			this.armReview(team);
+		}, ms);
+		// A review timer alone never keeps the process alive.
+		timer.unref();
+		this.reviewTimers.set(team.id, timer);
+	}
+
+	private clearReview(team: TeamState): void {
+		clearTimeout(this.reviewTimers.get(team.id));
+		this.reviewTimers.delete(team.id);
+		team.review.nextAt = null;
+	}
+
+	/** Why no review can start now, if so. Without `force`, an unchanged Team (nothing created or moved since the last review) is skipped too. */
+	private reviewBlocker(team: TeamState, force: boolean): string | undefined {
+		const reviewer = team.review.schedule && team.members.get(team.review.schedule.by);
+		if (team.lifecycle !== "active") return `Team is ${team.lifecycle}`;
+		if (!reviewer) return "no reviewer is set (review every <N> by <alias>)";
+		if (team.members.get(team.lead)!.lifecycle !== "open") return "the lead is not open";
+		if (reviewer.lifecycle !== "open" || reviewer.id === team.lead) return `${reviewer.id} is not an open reviewer`;
+		if (team.ledger.order.some((id) => this.isReview(team, { workId: id, revision: 1 }) && !isTerminalWorkState(team.ledger.current(id)!.state))) return "a review is still open";
+		if (team.ledger.order.length >= team.limits.teamWorks || team.reservedResultBytes + TEAM_MAX_RESULT_BYTES > team.limits.reservedResultBytes) return "the Team work ledger is full";
+		return !force && this.reviewSignature(team) === team.review.signature ? "nothing changed since the last review" : undefined;
+	}
+
+	/** Deliverable and sub-task works: every work that is not a review. */
+	private plainRecords(team: TeamState): WorkRecord[] {
+		return team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => record.kind !== "review");
+	}
+
+	/** The roots a Team delivers: parent-less works other than reviews. */
+	private rootRecords(team: TeamState): WorkRecord[] {
+		return this.plainRecords(team).filter((record) => !record.parent);
+	}
+
+	private isReview(team: TeamState, ref: WorkRef | undefined): boolean {
+		return !!ref && team.ledger.get(ref.workId)?.record.kind === "review";
+	}
+
+	private reviewSignature(team: TeamState): string {
+		return this.plainRecords(team).map((record) => `${record.id}@${record.currentRevision}:${currentVersion(record).state}:${currentVersion(record).hold?.incidentId ?? ""}`).join("|");
+	}
+
+	/** Create the review work (reviewer's task = snapshot + instructions) and remember what this review saw. */
+	private startReview(team: TeamState): WorkRef {
+		const reviewer = team.members.get(team.review.schedule!.by)!;
+		const records = this.plainRecords(team);
+		const done = records.filter((record) => isTerminalWorkState(currentVersion(record).state));
+		const fresh = done.filter((record) => !team.review.finished.has(record.id));
+		const state = (pick: (version: WorkVersion) => boolean) => records.filter((record) => pick(currentVersion(record))).length;
+		const used: Record<string, number> = { teamWorks: team.ledger.order.length, ...team.budget.used };
+		const snapshot: TeamReviewRecord["snapshot"] = {
+			elapsedMs: this.timestamp() - team.review.startedAt,
+			works: { total: records.length, resolved: state((v) => v.state === "resolved"), running: state((v) => v.state === "running"),
+				blocked: state((v) => v.state === "blocked"), held: state((v) => !!v.hold), failed: state((v) => v.state === "failed"),
+				cancelled: state((v) => v.state === "cancelled" || v.state === "superseded") },
+			finishedSinceLast: fresh.length,
+			budget: (["teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "teamWorks"] as const)
+				.map((counter) => ({ counter, used: used[counter]!, limit: team.limits[counter] })),
+		};
+		const at = this.timestamp();
+		const work = this.makeWork(team, team.lead, reviewer.id, this.reviewTask(team, snapshot, fresh, records), [], undefined, at);
+		work.kind = "review";
+		this.assertInputFits(team, reviewer, work);
+		team.ledger.add(work);
+		const ref = { workId: work.id, revision: 1 };
+		team.ready.push(ref);
+		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
+		team.review.signature = this.reviewSignature(team);
+		team.review.finished = new Set(done.map((record) => record.id));
+		team.review.wall = Date.now();
+		team.review.pending = { workId: work.id, snapshot };
+		this.note(team, `review ${shortWorkRef(ref)} → ${reviewer.id}`);
+		this.changed(team);
+		this.check(team);
+		this.requestDrain(team.id);
+		return copy(ref);
+	}
+
+	/** The host-built snapshot (bounded well under 16 KiB: every list is capped and previewed) plus the instructions. */
+	private reviewTask(team: TeamState, snapshot: TeamReviewRecord["snapshot"], fresh: readonly WorkRecord[], records: readonly WorkRecord[]): string {
+		const facts = this.panelFacts(team.id);
+		const now = this.timestamp();
+		const minutes = (ms: number) => `${Math.round(ms / 60_000)} min`;
+		const w = snapshot.works;
+		const outcome = (record: WorkRecord) => {
+			const version = currentVersion(record);
+			return `- ${workRefKey({ workId: record.id, revision: record.currentRevision })} ${record.assignee} ${version.state}: `
+				+ previewText(team.ledger.results.get(version.resultRef ?? "")?.result.summary ?? version.error?.message ?? version.task, 160);
+		};
+		const members = [...team.members.values()].map((member) => {
+			const last = Math.max(0, ...records.filter((record) => record.assignee === member.id).map((record) => currentVersion(record).updatedAt));
+			const doing = member.lifecycle !== "open" ? member.lifecycle : member.currentWork ? `running ${workRefKey(member.currentWork)}` : facts.stalled.get(member.id) ?? "idle";
+			return `- ${member.id}${member.id === team.lead ? " (lead)" : ""} · ${doing} · ${last ? `last activity ${minutes(now - last)} ago` : "no work yet"}`;
+		});
+		const incidents = team.incidents.filter((incident) => incident.state === "open");
+		const previous = team.review.records.at(-1);
+		const timeline = formatTimeline(facts.timeline.filter((entry) => entry.at > team.review.wall).slice(-25), 0, facts.timeline[0]?.at ?? 0);
+		return [
+			`Team progress review · elapsed ${minutes(snapshot.elapsedMs)}`,
+			`Goal: ${previewText(team.plan.brief.goal, 600)}`,
+			`Works (reviews excluded): ${w.total} total · resolved ${w.resolved} · running ${w.running} · blocked ${w.blocked} · held ${w.held} · failed ${w.failed} · cancelled ${w.cancelled}`,
+			...(facts.waitingFor ? [`Waiting for: ${facts.waitingFor}`] : []),
+			`Finished since the last review (${fresh.length}):`, ...fresh.slice(0, 12).map(outcome), ...(fresh.length > 12 ? [`+${fresh.length - 12} more`] : []),
+			"Members:", ...members,
+			`Open incidents: ${incidents.length ? "" : "none"}${incidents.slice(0, 5).map((incident) => `\n- ${incident.id} [${incident.code}]${incident.work ? ` ${workRefKey(incident.work)}` : ""}: ${previewText(incident.message, 160)}`).join("")}`,
+			`Budget: ${snapshot.budget.map(({ counter, used, limit }) => `${counter} ${used}/${limit >= TEAM_BUDGET_UNLIMITED ? "unlimited" : limit}`).join(" · ")}`,
+			`Previous review: ${previous ? `${previous.verdict?.replace("_", " ").toUpperCase() ?? "no verdict"} — ${previewText(previous.summary, 400)}` : "none"}`,
+			"Timeline since the last review (m:ss from launch):", ...timeline.map((line) => previewText(line, 200)),
+			"", REVIEW_INSTRUCTIONS,
+		].join("\n");
+	}
+
+	/** Store (and journal) a review's outcome; a missing result means the review work failed. */
+	private recordReview(team: TeamState, member: RuntimeMember, ref: WorkRef, resultRef: string | undefined,
+		result: Pick<WorkResult, "status" | "summary" | "findings" | "limitations">): void {
+		const verdict = reviewVerdict(result.summary);
+		const record: TeamReviewRecord = { id: this.modelId(team, "review"), at: this.timestamp(), by: member.id, work: copy(ref),
+			...(resultRef ? { resultRef } : {}), status: result.status, ...(verdict ? { verdict } : {}),
+			summary: previewText(result.summary, TEAM_MAX_TEXT_ITEM_BYTES), ...(result.findings ? { findings: copy(result.findings) } : {}),
+			...(result.limitations ? { limitations: copy(result.limitations) } : {}), snapshot: team.review.pending!.snapshot };
+		this.tryJournal(team, { version: 2, kind: "review", teamId: team.id, at: record.at, review: copy(record) });
+		team.review.records.push(record);
+		if (team.review.records.length > TEAM_MAX_REVIEWS) team.review.records.shift();
+	}
+
 	/**
 	 * Host-only budget grant. Limits grow cumulatively and usage never resets; only budget holds
 	 * whose scope is now within limits are released. Attention, pause and lead-fault holds stay.
@@ -893,7 +1117,7 @@ export class TeamRuntime {
 	/** Host inspection of every root budget (the Team view is a bounded summary). */
 	inspectBudget(teamId: string): { limits: TeamBudgetLimits; used: TeamBudgetView["used"]; roots: TeamRootBudgetView[]; grants: TeamBudgetGrantView[] } {
 		const team = this.team(teamId);
-		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
+		const roots = this.rootRecords(team);
 		return { limits: copy(team.limits), used: { teamWorks: team.ledger.order.length, ...copy(team.budget.used), reservedResultBytes: team.reservedResultBytes },
 			roots: roots.map((record) => team.budget.rootView(record.id, this.rootChildCount(team, record.id))), grants: copy(team.budget.grants) };
 	}
@@ -1405,10 +1629,12 @@ export class TeamRuntime {
 		delete active.stopTimer;
 	}
 
+	/** The deadline and the review timer both end with the Team. */
 	private clearDeadline(teamId: string): void {
 		const timer = this.deadlineTimers.get(teamId);
 		if (timer) clearTimeout(timer);
 		this.deadlineTimers.delete(teamId);
+		this.clearReview(this.team(teamId));
 	}
 
 	/** Validate identity, activation-local order, idempotency and public action before transition. */
@@ -1745,14 +1971,14 @@ export class TeamRuntime {
 	/** Host-only process totals; deliveries and all ledger versions survive activation settlement. */
 	processStats(teamId: string) {
 		const team = this.team(teamId);
-		const records = team.ledger.order.map((id) => team.ledger.get(id)!.record);
+		const records = this.plainRecords(team);
 		const memberActivations = new Map<string, number>();
 		for (const delivery of team.deliveries.values()) {
 			memberActivations.set(delivery.memberId, (memberActivations.get(delivery.memberId) ?? 0) + 1);
 		}
 		return {
 			works: records.length, roots: records.filter((record) => !record.parent).length,
-			results: team.ledger.results.size,
+			results: team.ledger.resultOrder.filter((id) => !this.isReview(team, team.ledger.results.get(id)!.work)).length,
 			activations: team.budget.used.teamActivations + team.budget.used.emergencyLeadActivations,
 			modelTurns: team.usage.turns, dependencyWaits: team.dependencyWaits, questions: team.questions,
 			revisions: records.reduce((sum, record) => sum + record.versions.length - 1, 0),
@@ -1862,7 +2088,7 @@ export class TeamRuntime {
 			const unreviewed = blockers.filter((blocker) => blocker.kind === "root_review").length;
 			return unreviewed ? `Lead review of ${unreviewed} result${plural(unreviewed)}` : "Lead to close the Team";
 		}
-		const running = [...team.members.values()].filter((member) => member.activity !== "idle").map((member) => member.id);
+		const running = [...team.members.values()].filter((member) => member.activity !== "idle" && !this.isReview(team, member.currentWork)).map((member) => member.id);
 		// Members that are not running: what each waits on, or (a hold outranks a wait) why its work is held.
 		const stalls = new Map<string, string>([...waits].map(([member, waited]) => [member, `waiting on ${capped([...new Set(waited.map((wait) => wait.assignee))], 3)}`]));
 		for (const [member, hold] of oldestHolds) if (hold.reason !== "attention") stalls.set(member, `held: ${HELD_REASON[hold.reason]}`);
@@ -1886,7 +2112,7 @@ export class TeamRuntime {
 	getTeamResult(teamId: string): TeamResult | undefined {
 		const team = this.team(teamId);
 		if (["prepared", "active", "closing"].includes(team.lifecycle)) return undefined;
-		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
+		const roots = this.rootRecords(team);
 		const unresolvedIncidents = team.incidents.filter((incident) => incident.state === "open");
 		return {
 			version: TEAM_PROTOCOL_VERSION,
@@ -1931,6 +2157,9 @@ export class TeamRuntime {
 		if (active.budget.emergency && action.action !== "status" && action.action !== "yield"
 			&& !(action.action === "control" && ["cancel_work", "accept_result", "close_member", "close_team"].includes(action.control.command))) {
 			fail("BUDGET_BLOCKED", "Emergency lead activations cannot create or revise work; only status, cancel_work, accept_result, close_member, close_team and yield are allowed");
+		}
+		if ((action.action === "request" || action.action === "control") && active.scope.kind === "work" && this.isReview(team, active.scope.work)) {
+			fail("FORBIDDEN_ACTION", "A review only advises");
 		}
 		this.requireKnownIds(team, forwardedText(action));
 		switch (action.action) {
@@ -2252,34 +2481,36 @@ export class TeamRuntime {
 		}
 		this.writeJournal(team, { version: 2, kind: "decision", teamId: team.id, at: this.timestamp(), decision: "cancel_work", work: ref, reason: control.reason });
 		this.note(team, `${actor.id} cancelled ${shortWorkRef(ref)}`);
-		const affected = [ref, ...team.ledger.openSubtree(ref)];
-		for (const work of affected) {
-			const version = team.ledger.version(work)!;
-			if (isTerminalWorkState(version.state)) continue;
-			version.state = "cancelled";
-			version.error = { code: "CANCELLED", message: control.reason };
-			version.waitingFor = [];
-			this.dropHold(team, version);
-			version.updatedAt = this.timestamp();
-			delete team.ledger.get(work.workId)!.stagedWait;
-			const assignee = team.members.get(team.ledger.get(work.workId)!.record.assignee)!;
-			if (assignee.active?.scope.kind === "work" && sameWorkRef(assignee.active.scope.work!, work)) {
-				assignee.active.stopReason = "cancelled";
-				team.ledger.cleanupPending.add(workRefKey(work));
-				this.requestActivationStop(team, assignee, "policy_cancelled");
-			}
-		}
-		team.ready = team.ready.filter((queued) => !affected.some((item) => sameWorkRef(item, queued)));
+		for (const work of [ref, ...team.ledger.openSubtree(ref)]) this.cancelVersion(team, work, control.reason);
 		this.wakeWaiters(team);
 		this.changed(team);
 		return okReply(actor.id, { receipt: { status: "applied", command: "cancel_work", work: ref } });
+	}
+
+	/** Cancel one open work version and stop its running activation. */
+	private cancelVersion(team: TeamState, work: WorkRef, reason: string): void {
+		const version = team.ledger.version(work)!;
+		if (isTerminalWorkState(version.state)) return;
+		version.state = "cancelled";
+		version.error = { code: "CANCELLED", message: reason };
+		version.waitingFor = [];
+		this.dropHold(team, version);
+		version.updatedAt = this.timestamp();
+		delete team.ledger.get(work.workId)!.stagedWait;
+		team.ready = team.ready.filter((queued) => !sameWorkRef(queued, work));
+		const assignee = team.members.get(team.ledger.get(work.workId)!.record.assignee)!;
+		if (assignee.active?.scope.kind === "work" && sameWorkRef(assignee.active.scope.work!, work)) {
+			assignee.active.stopReason = "cancelled";
+			team.ledger.cleanupPending.add(workRefKey(work));
+			this.requestActivationStop(team, assignee, "policy_cancelled");
+		}
 	}
 
 	private acceptResult(team: TeamState, actor: RuntimeMember, control: Extract<NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, { command: "accept_result" }>): TeamReply {
 		const entry = team.ledger.get(control.work.workId);
 		const version = team.ledger.version(control.work);
 		if (!entry || !version) fail("UNKNOWN_WORK", `Unknown work ${workRefKey(control.work)}`);
-		if (entry.record.parent || entry.record.currentRevision !== control.work.revision) fail("INVALID_ARGUMENT", "Only a current root work version can be reviewed");
+		if (entry.record.parent || entry.record.kind || entry.record.currentRevision !== control.work.revision) fail("INVALID_ARGUMENT", "Only a current root work version can be reviewed");
 		if (version.review) {
 			if (version.review.disposition === control.disposition && version.review.reason === control.reason) {
 				return okReply(actor.id, { receipt: { status: "unchanged", command: "accept_result", work: control.work } });
@@ -2331,7 +2562,7 @@ export class TeamRuntime {
 	/** The roots and what each still owes before close_team: to be terminal, then to be reviewed. */
 	private rootObligations(team: TeamState): { roots: WorkRecord[]; blockers: Array<{ kind: string; id?: string; reason: string }> } {
 		const blockers: Array<{ kind: string; id?: string; reason: string }> = [];
-		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
+		const roots = this.rootRecords(team);
 		for (const root of roots) {
 			const version = currentVersion(root);
 			if (!isTerminalWorkState(version.state)) blockers.push({ kind: "root_work", id: workRefKey({ workId: root.id, revision: root.currentRevision }), reason: `root is ${version.state}` });
@@ -2344,19 +2575,19 @@ export class TeamRuntime {
 	private closeTeam(team: TeamState, lead: RuntimeMember, active: ActiveActivation, resultRefs: string[], outcome: "succeeded" | "partial" | "failed", reason: string | undefined, toolCallId: string): TeamReply {
 		if (lead.id !== team.lead || active.scope.kind !== "events") fail("FORBIDDEN_ACTION", "close_team requires the lead's events activation");
 		const { roots, blockers } = this.rootObligations(team);
-		for (const id of team.ledger.order) {
-			const record = team.ledger.get(id)!.record;
+		for (const record of this.plainRecords(team)) {
+			const id = record.id;
 			const version = currentVersion(record);
 			if (!isTerminalWorkState(version.state)) blockers.push({ kind: "work", id: workRefKey({ workId: id, revision: record.currentRevision }), reason: `work is ${version.state}` });
 		}
 		for (const member of team.members.values()) if (member.id !== lead.id) {
-			if (member.active) blockers.push({ kind: "activation", id: member.id, reason: `${member.id} still has an active activation` });
+			if (member.active && !this.isReview(team, member.active.scope.work)) blockers.push({ kind: "activation", id: member.id, reason: `${member.id} still has an active activation` });
 			if (!((member.lifecycle === "open" && member.resourceState === "owned")
 				|| (member.resourceState === "released" && (member.lifecycle === "closed" || member.lifecycle === "faulted")))) {
 				blockers.push({ kind: "member_resource", id: member.id, reason: `${member.id} is ${member.lifecycle} with resources ${member.resourceState}` });
 			}
 		}
-		for (const delivery of team.deliveries.values()) if (delivery.state !== "delivered" && delivery.state !== "cancelled" && delivery.activationId !== active.scope.activationId) {
+		for (const delivery of team.deliveries.values()) if (delivery.state !== "delivered" && delivery.state !== "cancelled" && delivery.activationId !== active.scope.activationId && !this.isReview(team, delivery.work)) {
 			blockers.push({ kind: "delivery", id: delivery.memberId, reason: "required input is in flight" });
 		}
 		for (const event of team.events) if (!event.processed && event.kind !== "TEAM_QUIESCENT" && event.batchId !== active.scope.eventBatchId) {
@@ -2364,7 +2595,7 @@ export class TeamRuntime {
 		}
 		// An exhausted-budget notice that holds no work is not an unresolved obligation; held work blocks on its own.
 		const holdsWork = (incidentId: string) => team.ledger.order.some((id) => team.ledger.current(id)?.hold?.incidentId === incidentId);
-		if (outcome === "succeeded" && team.incidents.some((incident) => incident.state === "open"
+		if (outcome === "succeeded" && team.incidents.some((incident) => incident.state === "open" && !this.isReview(team, incident.work)
 			&& (incident.code !== "BUDGET_HIT" || holdsWork(incident.id)))) {
 			blockers.push({ kind: "incident", reason: "succeeded close cannot leave an unresolved incident" });
 		}
@@ -2388,6 +2619,10 @@ export class TeamRuntime {
 		if (blockers.length) fail("CLOSE_BLOCKED", "Team close is blocked by unresolved obligations", blockers);
 		if (active.intent) fail("ACTIVATION_ENDING", "Lead activation already staged another intent");
 		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
+		this.clearReview(team);
+		for (const id of team.ledger.order) {
+			if (this.isReview(team, { workId: id, revision: 1 })) this.cancelVersion(team, team.ledger.currentRef(id)!, "The Team is closing");
+		}
 		const closeId = this.id("close");
 		const rootSnapshot: TeamResult["roots"] = roots.map((root) => {
 			const version = currentVersion(root);
@@ -2640,6 +2875,7 @@ export class TeamRuntime {
 				version.state = "failed";
 				version.error = copy(error);
 				version.updatedAt = this.timestamp();
+				if (entry.record.kind === "review") this.recordReview(team, member, ref, undefined, { status: "failed", summary: error.message });
 			} else {
 				this.createIncident(team, error.code, error.message, ref, member.id);
 			}
@@ -2794,7 +3030,11 @@ export class TeamRuntime {
 		if (result.status === "failed") version.error = { code: "BUSINESS_FAILED", message: result.summary };
 		else delete version.error;
 		version.updatedAt = committed.committedAt;
-		if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY",
+		if (record.kind === "review") {
+			this.recordReview(team, member, ref, resultRef, result);
+			this.addEvent(team, { key: `review:${resultRef}`, kind: "REVIEW_READY", work: ref, resultRef,
+				message: `Periodic review ${workRefKey(ref)} from ${member.id}, result ${resultRef}, in full below. It is advice only:\n\n${formatWorkResult(result)}` });
+		} else if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY",
 			message: `Root work ${workRefKey(ref)} has a committed ${result.status} result ${resultRef} from ${member.id}, in full below; review it and accept_result or waive it without a status call:\n\n${formatWorkResult(result)}`, work: ref, resultRef });
 		this.wakeWaiters(team);
 	}
@@ -2891,10 +3131,10 @@ export class TeamRuntime {
 
 	private updateQuiescence(team: TeamState): void {
 		if (!team.bootProcessed || team.lifecycle !== "active" || [...team.members.values()].some((member) => member.active)) return;
-		if (team.ledger.order.some((id) => !isTerminalWorkState(team.ledger.current(id)!.state)
-			&& team.ledger.current(id)!.state !== "blocked")) return;
-		const signature = team.ledger.order.map((id) => {
-			const record = team.ledger.get(id)!.record;
+		const records = this.plainRecords(team);
+		if (records.some((record) => !isTerminalWorkState(currentVersion(record).state) && currentVersion(record).state !== "blocked")) return;
+		const signature = records.map((record) => {
+			const id = record.id;
 			const version = currentVersion(record);
 			return `${id}@${record.currentRevision}:${version.state}:${version.hold?.incidentId ?? ""}:${version.resultRef ?? ""}:${version.review?.disposition ?? ""}:${version.review?.reason ?? ""}`;
 		}).join("|");
@@ -3370,7 +3610,8 @@ export class TeamRuntime {
 			return { work: { workId: id, revision: record.currentRevision }, requester: record.requester, assignee: record.assignee,
 				...(record.parent ? { parent: copy(record.parent) } : {}),
 				state: version.state, taskPreview: previewText(version.task, 512), ...(version.hold ? { hold: version.hold.reason } : {}),
-				...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: version.review.disposition } : {}) };
+				...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: version.review.disposition } : {}),
+				...(record.kind ? { kind: record.kind } : {}) };
 		});
 	}
 
@@ -3440,7 +3681,7 @@ export class TeamRuntime {
 			policy: copy(member.policy),
 			usage: copy(member.usage),
 		}));
-		const roots = team.ledger.order.map((id) => team.ledger.get(id)!.record).filter((record) => !record.parent);
+		const roots = this.rootRecords(team);
 		const used: TeamBudgetView["used"] = { teamWorks: team.ledger.order.length, ...team.budget.used, reservedResultBytes: team.reservedResultBytes };
 		const rootChildren = (rootId: string) => this.rootChildCount(team, rootId);
 		// Bounded summaries (one private reply frame): exhausted, then granted, then used roots; untouched
@@ -3488,6 +3729,7 @@ export class TeamRuntime {
 			case "result": return team.ledger.resultOrder;
 			case "incident": return team.incidents.map((incident) => incident.id);
 			case "event": return team.events.map((event) => event.id);
+			case "review": return team.review.records.map((record) => record.id);
 		}
 	}
 
@@ -3694,7 +3936,7 @@ export class TeamRuntime {
 			}
 		}
 		if (team.lifecycle === "closing" && (!team.closeDecision || [...team.members.values()].some((member) => member.active
-			&& (member.id !== team.lead || member.active.intent?.kind !== "close_team")))) throw new Error("Invariant I27: close_team has an unrelated active operation");
+			&& (member.id !== team.lead ? !this.isReview(team, member.active.scope.work) : member.active.intent?.kind !== "close_team")))) throw new Error("Invariant I27: close_team has an unrelated active operation");
 	}
 
 	private parseWorkRefKey(key: string): WorkRef {

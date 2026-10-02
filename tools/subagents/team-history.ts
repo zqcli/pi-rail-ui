@@ -1,11 +1,11 @@
 import { TEAM_JOURNAL_ENTRY_TYPE } from "./team-journal";
 import {
-	TEAM_MAX_MEMBERS, TEAM_MAX_RESERVED_RESULT_BYTES, TEAM_MAX_RESULT_RECORDS, TEAM_MIN_MEMBERS,
-	type ResultRecord, type TeamLifecycle, type TeamOutcome, type TeamResult, type WorkRef,
+	TEAM_MAX_MEMBERS, TEAM_MAX_RESERVED_RESULT_BYTES, TEAM_MAX_RESULT_RECORDS, TEAM_MAX_REVIEWS, TEAM_MIN_MEMBERS,
+	type ResultRecord, type TeamLifecycle, type TeamOutcome, type TeamResult, type TeamReviewPlan, type TeamReviewRecord, type WorkRef,
 } from "./team-protocol";
 import {
 	canonicalJson, jsonBytes, jsonTextBytes, normalizeAlias, normalizeId, normalizeResultRecord, normalizeTeamBudgetGrantRecord,
-	normalizeTeamResult, normalizeTeamResultRoots, normalizeWorkRef,
+	normalizeReviewPlan, normalizeTeamResult, normalizeTeamResultRoots, normalizeTeamReviewRecord, normalizeWorkRef,
 } from "./team-codec";
 
 /** Custom-entry type of retired v1 Team snapshots; only read, never written. */
@@ -32,6 +32,9 @@ export interface TeamHistoryEntry {
 	goal?: string;
 	results: ResultRecord[];
 	finalResultRefs: string[];
+	/** The Team's periodic reviews (newest TEAM_MAX_REVIEWS) and its latest review schedule. */
+	reviews?: TeamReviewRecord[];
+	review?: TeamReviewPlan;
 	at: number;
 }
 
@@ -84,13 +87,14 @@ function applyJournalRecord(
 	const current = teams.get(teamId);
 	switch (kind) {
 		case "launched": {
-			onlyKeys(data, ["version", "kind", "teamId", "at", "roster", "goal"]);
+			onlyKeys(data, ["version", "kind", "teamId", "at", "roster", "goal", "review"]);
 			if (current) return false;
 			const roster = data["roster"];
 			if (!isRecord(roster)) return false;
 			const { lead, members } = parseRoster(roster);
 			const goal = boundedText(data["goal"], 512, "journal.goal");
-			teams.set(teamId, { teamId, version: 2, lifecycle: "interrupted", lead, members, goal, results: [], finalResultRefs: [], at });
+			const review = data["review"] === undefined ? undefined : normalizeReviewPlan(data["review"], "journal.review", members, lead);
+			teams.set(teamId, { teamId, version: 2, lifecycle: "interrupted", lead, members, goal, results: [], finalResultRefs: [], ...(review ? { review } : {}), at });
 			resultsByTeam.set(teamId, new Map());
 			resultBytesByTeam.set(teamId, 0);
 			return true;
@@ -127,6 +131,22 @@ function applyJournalRecord(
 			records.set(result.id, result);
 			resultBytesByTeam.set(teamId, resultBytesByTeam.get(teamId)! + bytes);
 			current.results.push(result);
+			return true;
+		}
+		case "review_schedule": {
+			onlyKeys(data, ["version", "kind", "teamId", "at", "review"]);
+			if (!current || current.version !== 2 || ended.has(teamId)) return false;
+			if (data["review"] === null) delete current.review;
+			else current.review = normalizeReviewPlan(data["review"], "journal.review", current.members, current.lead!);
+			return true;
+		}
+		case "review": {
+			onlyKeys(data, ["version", "kind", "teamId", "at", "review"]);
+			if (!current || current.version !== 2 || ended.has(teamId)) return false;
+			const review = normalizeTeamReviewRecord(data["review"], "journal.review");
+			if (!current.members.includes(review.by)) return false;
+			(current.reviews ??= []).push(review);
+			if (current.reviews.length > TEAM_MAX_REVIEWS) current.reviews.shift();
 			return true;
 		}
 		case "decision": {

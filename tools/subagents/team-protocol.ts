@@ -20,6 +20,8 @@ export const TEAM_MAX_TOOL_NAMES = 64;
 export const TEAM_RESERVED_TOOLS: readonly string[] = ["subagent", "subagent_team", "team"];
 export const TEAM_MAX_ID_LENGTH = 256;
 export const TEAM_MAX_TASK_BYTES = 8 * 1024;
+/** A task as delivered: the runtime-built review snapshot may exceed what a member can write. */
+export const TEAM_MAX_DELIVERED_TASK_BYTES = 16 * 1024;
 export const TEAM_MAX_ROLE_BYTES = 4 * 1024;
 export const TEAM_MAX_BRIEF_BYTES = 32 * 1024;
 export const TEAM_MAX_NOTE_BYTES = 4 * 1024; // checkpoint, attention, resume instruction, reasons
@@ -61,6 +63,9 @@ export const TEAM_MAX_RESERVED_RESULT_BYTES = 256 * 1024 * 1024;
 /** One result slot per accepted work revision, including superseded revisions. */
 export const TEAM_MAX_RESULT_RECORDS = Math.floor(TEAM_MAX_RESERVED_RESULT_BYTES / TEAM_MAX_RESULT_BYTES);
 export const TEAM_MAX_TIMEOUT_SECONDS = 86400;
+/** Periodic review interval bound, and the newest reviews kept per Team. */
+export const TEAM_MAX_REVIEW_MINUTES = 1440;
+export const TEAM_MAX_REVIEWS = 200;
 /** Completed idempotency entries kept per active member; pending entries are never evicted. */
 export const TEAM_COMMAND_CACHE = 128;
 export const TEAM_MAX_PENDING_OPERATIONS = 32;
@@ -135,6 +140,8 @@ export interface WorkVersion {
 }
 export interface WorkRecord {
 	id: string;
+	/** A periodic progress review created by the runtime; absent for every normal work. */
+	kind?: "review";
 	requester: string;
 	assignee: string;
 	rootId: string;
@@ -196,6 +203,39 @@ export interface TeamPlan {
 	initialRequests: TeamInitialRequest[];
 	/** null = no team-wide deadline. */
 	timeoutSeconds: number | null;
+	/** Periodic progress review by a non-lead member; null = none. */
+	review: TeamReviewPlan | null;
+}
+export interface TeamReviewPlan { by: string; everyMinutes: number }
+
+export const REVIEW_VERDICTS = { "ON TRACK": "on_track", "AT RISK": "at_risk", "OFF TRACK": "off_track" } as const;
+export type TeamReviewVerdict = typeof REVIEW_VERDICTS[keyof typeof REVIEW_VERDICTS];
+/** The verdict a review's summary starts with, if any. */
+export function reviewVerdict(summary: string): TeamReviewVerdict | undefined {
+	const match = /^\s*(ON TRACK|AT RISK|OFF TRACK):/iu.exec(summary);
+	return match ? REVIEW_VERDICTS[match[1]!.toUpperCase() as keyof typeof REVIEW_VERDICTS] : undefined;
+}
+
+export interface TeamReviewRecord {
+	/** Team-local short id "review:xxxx". */
+	id: string;
+	/** Commit time. */
+	at: number;
+	/** Reviewer alias. */
+	by: string;
+	work: WorkRef;
+	resultRef?: string;
+	status: WorkResult["status"];
+	verdict?: TeamReviewVerdict;
+	summary: string;
+	findings?: string[];
+	limitations?: string[];
+	snapshot: {
+		elapsedMs: number;
+		works: { total: number; resolved: number; running: number; blocked: number; held: number; failed: number; cancelled: number };
+		finishedSinceLast: number;
+		budget: Array<{ counter: string; used: number; limit: number }>;
+	};
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -382,7 +422,7 @@ export interface TeamEventView {
 	incidentId?: string;
 	resultRef?: string;
 }
-export const TEAM_EVENT_KINDS = ["BOOT", "USER_COMMAND", "ROOT_RESULT_READY", "WORK_HELD", "MEMBER_FAULTED",
+export const TEAM_EVENT_KINDS = ["BOOT", "USER_COMMAND", "ROOT_RESULT_READY", "REVIEW_READY", "WORK_HELD", "MEMBER_FAULTED",
 	"MEMBER_CLOSED", "DEPENDENCY_UNAVAILABLE", "BUDGET_HIT", "TEAM_QUIESCENT"] as const;
 export type TeamEventKind = typeof TEAM_EVENT_KINDS[number];
 
@@ -503,6 +543,8 @@ export interface TeamWorkSummary {
 	hold?: HoldReason;
 	resultRef?: string;
 	review?: "accepted" | "waived";
+	/** A periodic review work rather than a deliverable. */
+	kind?: "review";
 }
 export interface TeamMemberView extends MemberRecord {
 	queued: number;

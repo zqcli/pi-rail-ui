@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { installTeamCommand, runTeamCommand } from "../../tools/subagents/team-command";
 import type { SessionBroker } from "../../tools/subagents/session-broker";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
+import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
 import type { TeamOverlayComponent } from "../../tools/subagents/team-overlay";
 
 function setup(initialRequests: Array<{ to: string; task: string }> = [], budget?: "standard" | "long" | "unlimited") {
@@ -243,4 +244,71 @@ test("declining a preset confirmation leaves all limits and grants unchanged", a
 	assert.equal(confirmations.length, 1);
 	assert.match(confirmations[0]!.message, /Reason: Raise to long/u);
 	assert.deepEqual(host.runtime.inspectBudget(teamId), before);
+});
+
+test("review command: now, every (with or without by), off and the bare status, each confirmed; bad forms and the lead are refused", async () => {
+	const { host, teamId } = setup([{ to: "worker", task: "root" }]);
+	host.runtime.launch(teamId);
+	let command: any;
+	installTeamCommand({ registerCommand: (_name: string, value: any) => { command = value; } } as any, () => host);
+	const labels = (prefix: string) => command.getArgumentCompletions(prefix)?.map((item: any) => item.value);
+	assert.ok(labels(`${teamId} rev`).includes(`${teamId} review`));
+	assert.deepEqual(labels(`${teamId} review `), [`${teamId} review now`, `${teamId} review every`, `${teamId} review off`]);
+	assert.deepEqual(labels(`${teamId} review every 30 `), [`${teamId} review every 30 by`]);
+	assert.deepEqual(labels(`${teamId} review every 30 by `), [`${teamId} review every 30 by worker`], "the lead is not offered");
+
+	const bare = commandContext();
+	await runTeamCommand(host, `${teamId} review`, bare.ctx);
+	assert.equal(bare.notifications.at(-1)!.text, "Review: off");
+
+	const every = commandContext();
+	await runTeamCommand(host, `${teamId} review every 30 by worker`, every.ctx);
+	assert.match(every.confirmations[0]!.message, /worker reviews the Team's progress and advises the lead; it cannot request or control work/u);
+	assert.deepEqual(host.runtime.reviewSchedule(teamId), { by: "worker", everyMinutes: 30, nextAt: host.runtime.reviewSchedule(teamId)!.nextAt });
+	assert.match(every.notifications.at(-1)!.text, /Review set: every 30 min/u);
+	await runTeamCommand(host, `${teamId} review every 15`, commandContext().ctx);
+	assert.deepEqual(host.runtime.reviewSchedule(teamId), { by: "worker", everyMinutes: 15, nextAt: host.runtime.reviewSchedule(teamId)!.nextAt }, "without by the reviewer stays");
+	await runTeamCommand(host, `${teamId} review`, bare.ctx);
+	assert.equal(bare.notifications.at(-1)!.text, "Review: worker every 15 min");
+
+	const declined = commandContext({ confirmation: false });
+	await runTeamCommand(host, `${teamId} review now`, declined.ctx);
+	assert.equal(host.runtime.listWorks(teamId).some((work) => work.kind === "review"), false);
+	const now = commandContext();
+	await runTeamCommand(host, `${teamId} review now`, now.ctx);
+	assert.ok(host.runtime.listWorks(teamId).some((work) => work.kind === "review" && work.assignee === "worker"));
+	assert.match(now.notifications.at(-1)!.text, /Review work:\S+@1 started/u);
+	await assert.rejects(runTeamCommand(host, `${teamId} review now`, commandContext().ctx), /a review is still open/u);
+
+	for (const bad of ["review every", "review every 0", "review every 5m", "review every 5 worker", "review every 5 by", "review soon", "review now now"]) {
+		await assert.rejects(runTeamCommand(host, `${teamId} ${bad}`, commandContext().ctx), /Usage: \/rail-team .* review \[now\|every <N> \[by <alias>\]\|off\]/u, bad);
+	}
+	await assert.rejects(runTeamCommand(host, `${teamId} review every 5 by lead`, commandContext().ctx), /other than the lead/u);
+	await assert.rejects(runTeamCommand(host, `${teamId} review off`, commandContext({ hasUI: false }).ctx), /needs interactive confirmation/u);
+	assert.ok(host.runtime.reviewSchedule(teamId));
+	const off = commandContext();
+	await runTeamCommand(host, `${teamId} review off`, off.ctx);
+	assert.equal(host.runtime.reviewSchedule(teamId), undefined);
+	assert.match(off.notifications.at(-1)!.text, /Review stopped/u);
+	await assert.rejects(runTeamCommand(host, `${teamId} review now`, commandContext().ctx), /no reviewer is set/u);
+
+	host.runtime.cancelTeam(teamId, "done");
+	await assert.rejects(runTeamCommand(host, `${teamId} review every 5`, commandContext().ctx), /Team .* is cancelled; its review cannot be changed/u);
+	await runTeamCommand(host, `${teamId} review`, bare.ctx);
+	assert.equal(bare.notifications.at(-1)!.text, "Review: off");
+});
+
+test("review command on a Team from history shows its schedule and reviews, and changes nothing", async () => {
+	const at = 1_700_000_000_000;
+	const data = [
+		{ version: 2, kind: "launched", teamId: "hist-1", at, roster: { lead: "lead", members: ["lead", "worker"] }, goal: "Old goal", review: { by: "worker", everyMinutes: 20 } },
+		{ version: 2, kind: "review", teamId: "hist-1", at: at + 1, review: { id: "review:abcd", at: at + 1, by: "worker", work: { workId: "work:x", revision: 1 }, status: "succeeded",
+			verdict: "off_track", summary: "OFF TRACK: nothing merged.", snapshot: { elapsedMs: 125_000, works: { total: 1, resolved: 0, running: 1, blocked: 0, held: 0, failed: 0, cancelled: 0 }, finishedSinceLast: 0, budget: [] } } },
+	].map((record) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: record }));
+	const host = new TeamSessionHost({ assertAliasesAvailable: async () => undefined } as unknown as SessionBroker, () => undefined, data);
+	assert.equal(host.history.skipped, 0);
+	const { ctx, notifications } = commandContext();
+	await runTeamCommand(host, "hist-1 review", ctx);
+	assert.equal(notifications.at(-1)!.text, "Review: worker every 20 min\nreview:abcd · 2:05 · worker · off track: OFF TRACK: nothing merged.");
+	await assert.rejects(runTeamCommand(host, "hist-1 review now", ctx), /read-only history/u);
 });

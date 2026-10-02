@@ -3,12 +3,13 @@ import type { BudgetScope } from "./team-budget";
 import { previewText } from "./team-codec";
 import type { TeamSessionHost } from "./team-host";
 import { showTeamOverlay } from "./team-overlay";
-import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, workRefKey } from "./team-protocol";
-import type { GrantPreview } from "./team-runtime";
+import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, workRefKey, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView } from "./team-protocol";
+import { clock, type GrantPreview } from "./team-runtime";
 import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView } from "./team-tool";
 
-const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead"] as const;
-const USAGE = "Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]";
+const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "review"] as const;
+const REVIEW_USAGE = "review [now|every <N> [by <alias>]|off]";
+const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|${REVIEW_USAGE}`;
 
 /**
  * `/rail-team`: the user-facing HostControl entry. It is a host command, never a model action:
@@ -28,6 +29,13 @@ export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionH
 			if (parts.length === 2) {
 				const subs = SUBCOMMANDS.filter((sub) => sub.startsWith(parts[1] ?? ""));
 				return subs.length ? subs.map((sub) => ({ value: `${parts[0]} ${sub}`, label: sub })) : null;
+			}
+			if (parts[1] === "review") {
+				const team = host.runtime.listTeams().find((item) => item.teamId === parts[0]);
+				const options = parts.length === 3 ? ["now", "every", "off"] : parts.length === 5 ? ["by"]
+					: parts.length === 6 && parts[4] === "by" ? (team?.members ?? []).filter((member) => member.id !== team!.lead).map((member) => member.id) : [];
+				const matching = options.filter((option) => option.startsWith(parts.at(-1) ?? ""));
+				return matching.length ? matching.map((option) => ({ value: `${parts.slice(0, -1).join(" ")} ${option}`, label: option })) : null;
 			}
 			if (parts.length === 3 && parts[1] === "lead") {
 				const team = host.runtime.listTeams().find((item) => item.teamId === parts[0]);
@@ -82,6 +90,10 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			const historical = entry.results.find((result) => result.id === text);
 			if (!historical) throw new Error(`Unknown resultRef ${text} for Team ${teamId}`);
 			ctx.ui.notify(formatResult(historical), "info");
+			return;
+		}
+		if (subcommand === "review" && !rest.length) {
+			ctx.ui.notify(reviewLines(entry.review, entry.reviews ?? []).join("\n"), "info");
 			return;
 		}
 		throw new Error(`Team ${teamId} is read-only history; nothing can be resumed or changed.`);
@@ -156,6 +168,9 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			ctx.ui.notify(`${alias} is now the lead of ${teamId}`, "info");
 			return;
 		}
+		case "review":
+			await reviewCommand(host, liveTeam, rest, ctx);
+			return;
 		case "grant":
 			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; budget cannot be granted.`);
 			await grantBudget(host, teamId, rest, ctx);
@@ -163,6 +178,34 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		default:
 			throw new Error(USAGE);
 	}
+}
+
+function reviewLines(schedule: TeamReviewPlan | undefined, reviews: readonly TeamReviewRecord[]): string[] {
+	return [`Review: ${schedule ? `${schedule.by} every ${schedule.everyMinutes} min` : "off"}`,
+		...reviews.slice(-10).map((review) => `${review.id} · ${clock(review.snapshot.elapsedMs)} · ${review.by} · ${review.verdict?.replace("_", " ") ?? review.status}: ${previewText(review.summary, 200)}`)];
+}
+
+/** `review` alone shows the schedule and the latest reviews; now, every and off change the Team and need confirmation. */
+async function reviewCommand(host: TeamSessionHost, team: TeamTeamView, args: string[], ctx: ExtensionCommandContext): Promise<void> {
+	const { teamId } = team;
+	const [action, ...rest] = args;
+	if (!action) {
+		ctx.ui.notify(reviewLines(host.runtime.reviewSchedule(teamId), host.runtime.listReviews(teamId)).join("\n"), "info");
+		return;
+	}
+	if (team.lifecycle !== "active") throw new Error(`Team ${teamId} is ${team.lifecycle}; its review cannot be changed.`);
+	if (action === "now" && !rest.length) {
+		if (!await confirm(ctx, `Start a review of ${teamId} now?`, "The reviewer gets a progress snapshot as a new work and sends its advice to the lead; it cannot request or control work.")) return;
+		ctx.ui.notify(`Review ${workRefKey(host.runtime.reviewNow(teamId).work)} started`, "info");
+	} else if (action === "off" && !rest.length) {
+		if (!await confirm(ctx, `Stop the periodic review of ${teamId}?`, "No further review starts; one already open continues.")) return;
+		ctx.ui.notify(`Review ${host.runtime.setReview(teamId, null).status === "applied" ? "stopped" : "was already off"}`, "info");
+	} else if (action === "every" && /^[1-9][0-9]*$/u.test(rest[0] ?? "") && (rest.length === 1 || (rest.length === 3 && rest[1] === "by"))) {
+		const by = rest[2];
+		if (!await confirm(ctx, `Review ${teamId} every ${rest[0]} min?`, `${by ?? host.runtime.reviewSchedule(teamId)?.by ?? "The named member"} reviews the Team's progress and advises the lead; it cannot request or control work.`)) return;
+		const receipt = host.runtime.setReview(teamId, { everyMinutes: Number(rest[0]), ...(by ? { by } : {}) });
+		ctx.ui.notify(`Review ${receipt.status === "applied" ? "set" : "unchanged"}: every ${rest[0]} min`, "info");
+	} else throw new Error(`Usage: /rail-team <teamId> ${REVIEW_USAGE}`);
 }
 
 function formatResult(record: { id: string; author: string; work: { workId: string; revision: number }; result: { status: string; summary: string; findings?: string[]; evidence?: Array<{ basis: string; source: string; locator?: string }>; limitations?: string[]; artifacts?: string[] } }): string {

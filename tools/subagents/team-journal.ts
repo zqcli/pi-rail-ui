@@ -1,12 +1,14 @@
 import type { BudgetGrantRecord } from "./team-budget";
-import type { ResultRecord, TeamResult, WorkRef } from "./team-protocol";
+import type { ResultRecord, TeamResult, TeamReviewPlan, TeamReviewRecord, WorkRef } from "./team-protocol";
 
 /**
  * Bounded history facts written synchronously before Runtime publishes them. The journal is
  * history, not a recovery log: it never contains the whole ledger, gates, ACKs or private frames.
  */
 export type TeamJournalRecord =
-	| { version: 2; kind: "launched"; teamId: string; at: number; roster: { lead: string; members: string[] }; goal: string }
+	| { version: 2; kind: "launched"; teamId: string; at: number; roster: { lead: string; members: string[] }; goal: string; review?: TeamReviewPlan }
+	| { version: 2; kind: "review_schedule"; teamId: string; at: number; review: TeamReviewPlan | null }
+	| { version: 2; kind: "review"; teamId: string; at: number; review: TeamReviewRecord }
 	| { version: 2; kind: "handover"; teamId: string; at: number; lead: string }
 	| { version: 2; kind: "interrupted"; teamId: string; at: number; reason: string }
 	| { version: 2; kind: "result"; teamId: string; at: number; result: ResultRecord }

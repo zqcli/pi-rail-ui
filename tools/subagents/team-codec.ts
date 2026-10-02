@@ -10,12 +10,12 @@ import {
 	TEAM_MAX_ACTION_BYTES, TEAM_MAX_PUBLIC_CHILDREN, TEAM_MAX_OWNED_CHILD_PREVIEWS,
 	TEAM_MAX_CHILD_ISSUES, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES,
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_INPUT_REFS, TEAM_MAX_MEMBERS, TEAM_MAX_NOTE_BYTES,
-	TEAM_MAX_EVENT_MESSAGE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
+	TEAM_MAX_EVENT_MESSAGE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_DELIVERED_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_WAITING_FOR, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_MAX_DELIVERED_OUTCOMES, TEAM_MAX_EVENT_BATCH,
 	TEAM_PROTOCOL_VERSION, TEAM_STATUS_DEFAULT_LIMIT,
 	TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_MAX_RESULT_RECORDS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS, DEFAULT_TEAM_BUDGET, WORK_STATES, sameWorkRef, workRefKey, ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS,
-	TEAM_EVENT_KINDS,
+	TEAM_EVENT_KINDS, TEAM_MAX_REVIEW_MINUTES, REVIEW_VERDICTS,
 	type ActivationInput, type ActivationScope, type BindingV2, type ChildFrame, type ChildIssue, type GateDecision, type ParentCommand,
 	type Health, type HoldReason, type MemberActivity, type MemberLifecycle, type TeamEventView, type OutcomeView, type PauseState, type PrivateAction,
 	type PrivateReply, type ResourceState, type TeamAction, type TeamBrief, type TeamControl, type TeamError,
@@ -23,7 +23,7 @@ import {
 	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReceipt, type TeamReply, type TeamReplyData,
 	type TeamStatusPage, type TeamTeamView, type TeamWorkSummary, type TeamWorkView, type MemberRecord, type ResultRecord,
 	type WorkError, type WorkRef, type WorkResult, type WorkState, type WorkVersion, type TeamBudgetGrantView, type TeamRootBudgetView,
-	type TeamResult,
+	type TeamResult, type TeamReviewPlan, type TeamReviewRecord,
 } from "./team-protocol";
 import type { SubagentUsage } from "./session-broker";
 
@@ -349,11 +349,20 @@ export function normalizeTeamBudgetPreset(value: unknown): TeamBudgetPreset {
 	return value;
 }
 
+/** `by` must name a member other than the lead; the interval is whole minutes. */
+export function normalizeReviewPlan(value: unknown, field: string, roster: readonly string[], lead: string): TeamReviewPlan {
+	if (!isRecord(value)) return invalid(`${field} must be {by, everyMinutes} or null`);
+	onlyKeys(value, ["by", "everyMinutes"], field);
+	const by = normalizeAlias(value["by"], `${field}.by`);
+	if (!roster.includes(by) || by === lead) return invalid(`${field}.by must name a member other than the lead`);
+	return { by, everyMinutes: safeInteger(value["everyMinutes"], `${field}.everyMinutes`, 1, TEAM_MAX_REVIEW_MINUTES) };
+}
+
 export function normalizeTeamPlan(value: unknown): TeamPlan {
 	assertJsonValue(value, new Set());
 	if (!isRecord(value)) return invalid("prepare expects {members, lead, brief, initialRequests?, timeoutSeconds?}");
 	if (present(value["manager"]) || present(value["workers"]) || present(value["coordinator"])) return invalid(TEAM_PLAN_MIGRATION);
-	onlyKeys(value, ["members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget"], "prepare");
+	onlyKeys(value, ["members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review"], "prepare");
 	const rawMembers = array(value["members"], "members", TEAM_MAX_MEMBERS);
 	if (rawMembers.length < TEAM_MIN_MEMBERS) return invalid(`members must list ${TEAM_MIN_MEMBERS}-${TEAM_MAX_MEMBERS} members`);
 	const members = rawMembers.map((member, index) => normalizeMemberPlan(member, `members[${index}]`));
@@ -383,6 +392,7 @@ export function normalizeTeamPlan(value: unknown): TeamPlan {
 		timeoutSeconds = seconds;
 	}
 	return { members, lead, brief, initialRequests, timeoutSeconds,
+		review: value["review"] == null ? null : normalizeReviewPlan(value["review"], "review", roster, lead),
 		...(value["budget"] == null ? {} : { budget: normalizeTeamBudgetPreset(value["budget"]) }) };
 }
 
@@ -819,7 +829,7 @@ function parseWorkVersion(value: unknown, field: string): WorkVersion {
 	if (typeof createdAt !== "number" || !Number.isFinite(createdAt) || createdAt < 0
 		|| typeof updatedAt !== "number" || !Number.isFinite(updatedAt) || updatedAt < createdAt) return protocol(`${field} timestamps are invalid`);
 	return {
-		revision: safeInteger(value["revision"], `${field}.revision`, 1), task: text(value["task"], `${field}.task`, TEAM_MAX_TASK_BYTES),
+		revision: safeInteger(value["revision"], `${field}.revision`, 1), task: text(value["task"], `${field}.task`, TEAM_MAX_DELIVERED_TASK_BYTES),
 		inputRefs: idList(value["inputRefs"], `${field}.inputRefs`, TEAM_MAX_INPUT_REFS), state: state as WorkState,
 		waitingFor: parseRefs(value["waitingFor"], `${field}.waitingFor`, TEAM_MAX_WAITING_FOR),
 		observedOutcomes: parseRefs(value["observedOutcomes"], `${field}.observedOutcomes`, TEAM_MAX_RESULT_RECORDS),
@@ -866,6 +876,43 @@ export function normalizeResultRecord(value: unknown, field = "result record"): 
 	if (source !== "explicit_reply" && source !== "natural_final") return protocol(`${field}.source is invalid`);
 	return { id: frameId(value["id"], `${field}.id`), work: normalizeWorkRef(value["work"], `${field}.work`),
 		author: normalizeAlias(value["author"], `${field}.author`), result: normalizeWorkResult(value["result"], `${field}.result`), committedAt, source };
+}
+
+/** Strict decoder for a review record written to the v2 history journal. */
+export function normalizeTeamReviewRecord(value: unknown, field = "review record"): TeamReviewRecord {
+	if (!isRecord(value)) return protocol(`${field} must be an object`);
+	frameKeys(value, ["id", "at", "by", "work", "resultRef", "status", "verdict", "summary", "findings", "limitations", "snapshot"], field);
+	const status = value["status"];
+	if (status !== "succeeded" && status !== "partial" && status !== "failed") return protocol(`${field}.status is invalid`);
+	const verdict = value["verdict"];
+	if (verdict !== undefined && !(Object.values(REVIEW_VERDICTS) as readonly unknown[]).includes(verdict)) return protocol(`${field}.verdict is invalid`);
+	const snapshot = value["snapshot"];
+	if (!isRecord(snapshot)) return protocol(`${field}.snapshot must be an object`);
+	frameKeys(snapshot, ["elapsedMs", "works", "finishedSinceLast", "budget"], `${field}.snapshot`);
+	const works = snapshot["works"];
+	if (!isRecord(works)) return protocol(`${field}.snapshot.works must be an object`);
+	const counts = ["total", "resolved", "running", "blocked", "held", "failed", "cancelled"] as const;
+	frameKeys(works, counts, `${field}.snapshot.works`);
+	const findings = textList(value["findings"], `${field}.findings`);
+	const limitations = textList(value["limitations"], `${field}.limitations`);
+	return {
+		id: frameId(value["id"], `${field}.id`), at: safeInteger(value["at"], `${field}.at`, 0), by: normalizeAlias(value["by"], `${field}.by`),
+		work: normalizeWorkRef(value["work"], `${field}.work`), ...(value["resultRef"] !== undefined ? { resultRef: frameId(value["resultRef"], `${field}.resultRef`) } : {}),
+		status, ...(verdict !== undefined ? { verdict: verdict as NonNullable<TeamReviewRecord["verdict"]> } : {}),
+		summary: text(value["summary"], `${field}.summary`, TEAM_MAX_TEXT_ITEM_BYTES),
+		...(findings?.length ? { findings } : {}), ...(limitations?.length ? { limitations } : {}),
+		snapshot: {
+			elapsedMs: safeInteger(snapshot["elapsedMs"], `${field}.snapshot.elapsedMs`, 0),
+			works: Object.fromEntries(counts.map((key) => [key, safeInteger(works[key], `${field}.snapshot.works.${key}`, 0)])) as TeamReviewRecord["snapshot"]["works"],
+			finishedSinceLast: safeInteger(snapshot["finishedSinceLast"], `${field}.snapshot.finishedSinceLast`, 0),
+			budget: array(snapshot["budget"], `${field}.snapshot.budget`, 16).map((raw, index) => {
+				const name = `${field}.snapshot.budget[${index}]`;
+				if (!isRecord(raw)) return protocol(`${name} must be an object`);
+				frameKeys(raw, ["counter", "used", "limit"], name);
+				return { counter: text(raw["counter"], `${name}.counter`, 64), used: safeInteger(raw["used"], `${name}.used`, 0), limit: safeInteger(raw["limit"], `${name}.limit`, 0) };
+			}),
+		},
+	};
 }
 
 /** Strict shared decoder for the terminal result written to the v2 history journal. */
@@ -949,7 +996,8 @@ function parseTerminalMembers(value: unknown, field: string): TeamResult["member
 
 function parseWorkSummary(value: unknown): TeamWorkSummary {
 	if (!isRecord(value)) return protocol("work summary must be an object");
-	frameKeys(value, ["work", "parent", "requester", "assignee", "state", "taskPreview", "hold", "resultRef", "review"], "work summary");
+	frameKeys(value, ["work", "parent", "requester", "assignee", "state", "taskPreview", "hold", "resultRef", "review", "kind"], "work summary");
+	if (value["kind"] !== undefined && value["kind"] !== "review") return protocol("work summary kind is invalid");
 	const state = value["state"];
 	if (!(WORK_STATES as readonly unknown[]).includes(state)) return protocol("work summary state is invalid");
 	const hold = value["hold"];
@@ -963,7 +1011,7 @@ function parseWorkSummary(value: unknown): TeamWorkSummary {
 		taskPreview: text(value["taskPreview"], "work summary.taskPreview", TEAM_MAX_TASK_BYTES),
 		...(hold !== undefined ? { hold: hold as HoldReason } : {}),
 		...(value["resultRef"] !== undefined ? { resultRef: frameId(value["resultRef"], "work summary.resultRef") } : {}),
-		...(review !== undefined ? { review } : {}) };
+		...(review !== undefined ? { review } : {}), ...(value["kind"] ? { kind: "review" as const } : {}) };
 }
 
 function parseTeamWorkView(value: unknown): TeamWorkView {
@@ -1274,7 +1322,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 		const waitingFor = array(rawScope["waitingFor"], "activation input waitingFor", TEAM_MAX_WAITING_FOR).map((item, index) => normalizeWorkRef(item, `activation input waitingFor[${index}]`));
 		if (new Set(waitingFor.map((ref) => `${ref.workId}@${ref.revision}`)).size !== waitingFor.length) return protocol("activation input waitingFor contains duplicates");
 		scope = { kind: "work", work: normalizeWorkRef(rawScope["work"], "activation input work"),
-			task: text(rawScope["task"], "activation input task", TEAM_MAX_TASK_BYTES), requester: normalizeAlias(rawScope["requester"], "activation input requester"),
+			task: text(rawScope["task"], "activation input task", TEAM_MAX_DELIVERED_TASK_BYTES), requester: normalizeAlias(rawScope["requester"], "activation input requester"),
 			rootId: frameId(rawScope["rootId"], "activation input rootId"),
 			...(rawScope["parent"] !== undefined ? { parent: normalizeWorkRef(rawScope["parent"], "activation input parent") } : {}),
 			depth: safeInteger(rawScope["depth"], "activation input depth", 0),

@@ -368,6 +368,34 @@ test("launch final output carries deliverables, process, members and selected re
 		"the output body contains only the result, not its destination");
 });
 
+test("prepare takes review {by, everyMinutes}, prints it, and the final text shows the last review without counting it as a deliverable", async () => {
+	const first = setup();
+	const { tool } = first;
+	const none = await tool.execute("prepare", { ...prepareArgs, review: null }, undefined, undefined, context());
+	assert.match(none.content[0].text, /^Review: none$/mu);
+	assert.equal(first.host.runtime.reviewSchedule(none.details.view.teamId), undefined);
+	await assert.rejects(tool.execute("bad", { ...prepareArgs, review: { by: "lead", everyMinutes: 30 } }, undefined, undefined, context()), /review\.by must name a member other than the lead/u);
+	await assert.rejects(tool.execute("bad", { ...prepareArgs, review: { by: "worker", everyMinutes: 0 } }, undefined, undefined, context()), /review\.everyMinutes must be an integer from 1 to 1440/u);
+	assert.throws(() => tool.prepareArguments({ action: "launch", teamId: "any", review: { by: "worker", everyMinutes: 30 } }), /does not accept.*review/u);
+	assert.match(tool.promptGuidelines.join("\n"), /set review \{by, everyMinutes\} naming a member whose roleDescription covers progress review/u);
+
+	const { host, tool: second } = setup();
+	const prepared = await second.execute("prepare", { ...prepareArgs, review: { by: "worker", everyMinutes: 30 } }, undefined, undefined, context());
+	assert.match(prepared.content[0].text, /^Review: worker every 30 min$/mu);
+	const teamId = prepared.details.view.teamId;
+	host.driver.openAndLaunch = async () => {
+		host.runtime.launch(teamId);
+		completeRoots(host, teamId, () => ({ status: "succeeded", summary: "Root done." }));
+		host.runtime.reviewNow(teamId);
+		completeRoots(host, teamId, () => ({ status: "succeeded", summary: "AT RISK: nobody has accepted the root." }));
+		return { lifetime: Promise.resolve(terminal(teamId)) };
+	};
+	const text: string = (await second.execute("launch", { action: "launch", teamId }, undefined, undefined, context())).content[0].text;
+	assert.match(text, /^Deliverables \(1 roots · 0 accepted · 0 waived\):/mu);
+	assert.match(text, /^Process:\n- works 1 \(1 roots, 0 sub-tasks\) · results 1/mu);
+	assert.match(text, /^- Last review \d+:\d\d at risk: AT RISK: nobody has accepted the root\.$/mu);
+});
+
 /** Reserve the next activation and acknowledge its input, as a native member would. */
 function activate(host: TeamSessionHost, teamId: string): RuntimeActivation {
 	const activation = host.runtime.takeNextActivation(teamId)!;

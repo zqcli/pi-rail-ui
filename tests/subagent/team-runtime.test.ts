@@ -103,7 +103,7 @@ test("P: v2 codec rejects v1 live frames, legacy actions, unknown fields and non
 		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead", brief: { goal: "Test." }, timeoutSeconds: null,
 	}), {
 		members: [{ alias: "lead", roleDescription: "Manage.", policy: {} }, { alias: "w1", roleDescription: "Work.", policy: {} }], lead: "lead",
-		brief: { goal: "Test." }, initialRequests: [], timeoutSeconds: null,
+		brief: { goal: "Test." }, initialRequests: [], timeoutSeconds: null, review: null,
 	});
 });
 

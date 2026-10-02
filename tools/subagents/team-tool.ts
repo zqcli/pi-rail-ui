@@ -8,10 +8,12 @@ import type { TeamHistoryEntry } from "./team-history";
 import type { TeamSessionHost } from "./team-host";
 import { TeamLaunchError } from "./team-member-driver";
 import {
-	TEAM_BUDGET_UNLIMITED, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_MEMBERS, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_RESERVED_TOOLS,
+	TEAM_BUDGET_UNLIMITED, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_REVIEW_MINUTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_MEMBERS, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_RESERVED_TOOLS,
 	workRefKey, type TeamBudgetLimits, type TeamBudgetPreset, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, sameWorkRef, shortWorkRef,
 } from "./team-protocol";
-import { capped, TEAM_TIMELINE_HEAD, type TeamRuntime } from "./team-runtime";
+import { capped, clock, formatTimeline, type TeamRuntime } from "./team-runtime";
+
+export { formatTimeline };
 import {
 	formatContextWindowForDisplay, markdownThemeFromTheme, resolveTeamMemberPolicy, verifyPinnedTeamMemberPolicy,
 	type ResolvedTeamMemberPolicy,
@@ -68,6 +70,7 @@ type Params = {
 	initialRequests?: unknown;
 	timeoutSeconds?: number | null;
 	budget?: TeamBudgetPreset | null;
+	review?: unknown;
 	reason?: string | null;
 	cursor?: string | null;
 	resultRef?: string | null;
@@ -164,7 +167,7 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 
 /** What the lead has handed out that is still open: unfinished work, or a finished root awaiting its review. */
 function dispatchedText(lead: string, works: readonly TeamWorkSummary[]): string | undefined {
-	const open = works.flatMap((work) => work.requester !== lead ? []
+	const open = works.flatMap((work) => work.requester !== lead || work.kind ? []
 		: !isTerminalWorkState(work.state) ? [`${work.assignee} (${work.hold ? "held" : work.state === "blocked" ? "waiting" : work.state})`]
 			: !work.parent && !work.review ? [`${work.assignee} (awaiting review)`] : []);
 	return open.length ? `dispatched: ${capped(open, 3)}` : undefined;
@@ -279,21 +282,6 @@ function formatResultRecord(record: ResultRecord): string {
 	return [`${record.id} · ${record.author} · ${workRefKey(record.work)} · ${record.result.status}`, formatWorkResult(record.result)].join("\n");
 }
 
-function clock(ms: number): string {
-	const seconds = Math.max(0, Math.round(ms / 1000));
-	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-}
-
-/** Bounded status timeline: head 30, newest entries, and one in-place omission marker (100 rows total). */
-export function formatTimeline(timeline: readonly { at: number; text: string }[], omitted: number, origin: number): string[] {
-	const needsMarker = omitted > 0 || timeline.length > 100;
-	const skipped = Math.max(0, timeline.length - (needsMarker ? 99 : 100));
-	const entries = skipped ? [...timeline.slice(0, TEAM_TIMELINE_HEAD), ...timeline.slice(TEAM_TIMELINE_HEAD + skipped)] : timeline;
-	const lines = entries.map((entry) => `- ${clock(entry.at - origin)} ${entry.text}`);
-	if (needsMarker) lines.splice(TEAM_TIMELINE_HEAD, 0, `- … ${omitted + skipped} milestones omitted …`);
-	return lines;
-}
-
 function formatResultRefPage(page: TeamResultRefPage): string[] {
 	const lines = [`Result refs ${page.items.length ? `${page.items[0]!.id}…${page.items.at(-1)!.id}` : "(empty)"} · ${page.total} total`];
 	for (const item of page.items) lines.push(`  ${item.id} · ${item.author} · ${workRefKey(item.work)} · ${item.status}: ${previewText(item.summaryPreview, 240)}`);
@@ -309,11 +297,11 @@ function hasPayload(value: unknown): boolean {
 /** Enforce the action whitelist before projecting parameters into the shared plan codec. */
 function assertActionParams(params: Params, action: Params["action"]): void {
 	if (["manager", "workers", "coordinator"].some((key) => hasPayload((params as Record<string, unknown>)[key]))) throw new Error(TEAM_PLAN_MIGRATION);
-	const known = ["action", "teamId", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "reason", "cursor", "resultRef"];
+	const known = ["action", "teamId", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review", "reason", "cursor", "resultRef"];
 	const unknown = Object.keys(params).filter((key) => !known.includes(key));
 	if (unknown.length) throw new Error(`${action} contains unsupported field(s): ${unknown.join(", ")}`);
 	const allowed: Record<Params["action"], readonly string[]> = {
-		prepare: ["action", "teamId", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget"],
+		prepare: ["action", "teamId", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review"],
 		launch: ["action", "teamId"],
 		status: ["action", "teamId", "cursor", "resultRef"],
 		cancel: ["action", "teamId", "reason"],
@@ -330,7 +318,8 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 	const view = host.runtime.getTeam(result.teamId);
 	const facts = host.runtime.panelFacts(result.teamId);
 	const stats = host.runtime.processStats(result.teamId);
-	const roots = host.runtime.listWorks(result.teamId).filter((work) => !work.parent);
+	const roots = host.runtime.listWorks(result.teamId).filter((work) => !work.parent && !work.kind);
+	const lastReview = host.runtime.listReviews(result.teamId).at(-1);
 	const reviewOf = (work: TeamWorkSummary) => result.roots.find((root) => sameWorkRef(root.work, work.work))?.review;
 	const accepted = roots.filter((work) => (reviewOf(work)?.disposition ?? work.review) === "accepted").length;
 	const waived = roots.filter((work) => (reviewOf(work)?.disposition ?? work.review) === "waived").length;
@@ -347,10 +336,11 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		...(roots.length > 20 ? [`+${roots.length - 20} more roots`] : []),
 		"Process:",
 		`- works ${stats.works} (${stats.roots} roots, ${stats.works - stats.roots} sub-tasks) · results ${stats.results}`,
-		`- activations ${stats.activations} · model turns ${stats.modelTurns} · dependency waits ${stats.dependencyWaits} · questions to the lead ${stats.questions}`,
+		`- activations ${stats.activations} · model turns ${stats.modelTurns} · dependency waits ${stats.dependencyWaits} · questions ${stats.questions}`,
 		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · tool errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})`,
 		`- tokens input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
 		`- Budget: ${budgetLimitsText(view.budget.limits)}`,
+		...(lastReview ? [`- Last review ${clock(lastReview.snapshot.elapsedMs)} ${lastReview.verdict?.replace("_", " ") ?? "no verdict"}: ${previewText(lastReview.summary, 160)}`] : []),
 		"Members:",
 		...view.members.map((member) => {
 			const activity = host.driver.memberActivity(result.teamId, member.id);
@@ -406,7 +396,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		if (!host.active) throw new Error("The Team runtime for this session branch has ended; nothing was prepared");
 		if (params.teamId?.trim()) throw new Error("prepare creates a new Team and does not accept teamId");
 		const raw: Record<string, unknown> = {};
-		for (const key of ["members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget"] as const) {
+		for (const key of ["members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review"] as const) {
 			if (params[key] !== undefined) raw[key] = params[key];
 		}
 		const plan = normalizeTeamPlan(raw);
@@ -449,6 +439,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			`Initial work: ${works.map((work) => `${workRefKey(work.work)} → ${work.assignee}`).join(" · ") || "none (members start idle; the lead assigns work)"}`,
 			`Deadline: ${plan.timeoutSeconds === null ? "no Team deadline" : `${plan.timeoutSeconds}s from launch`}`,
 			`Budget (${plan.budget ?? "long"}): ${budgetLimitsText(view.budget.limits)}; the host can grant more with /rail-team.`,
+			`Review: ${plan.review ? `${plan.review.by} every ${plan.review.everyMinutes} min` : "none"}`,
 			`Next: in your next message call subagent_team {"action":"launch","teamId":"${view.teamId}"}. It returns when the whole Team has ended. Do not start members with the subagent tool.`,
 		];
 		return textResult(lines.join("\n"), { view, works });
@@ -617,6 +608,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			"Run a Team with two subagent_team calls in consecutive messages: prepare with members (alias + roleDescription each), lead (the alias of one member), brief.goal and optional initialRequests to members other than the lead; then launch with only the returned teamId. Never start Team members with the subagent tool. The launch result already contains the selected results in full; use status afterwards for the timeline or results it names as truncated or unselected.",
 			"Keep timeoutSeconds null (no Team deadline) unless the user asks for one; an explicit deadline covers the whole Team from launch.",
 			"Leave budget null (long, sized for multi-hour runs); set unlimited only when the user asks for an open-ended or loop run.",
+			"For a long or open-ended run set review {by, everyMinutes} naming a member whose roleDescription covers progress review; it only advises the lead.",
 			"Role-only members are valid: they stay idle until they are assigned work. Give a member tools only to restrict its base tools (null = all); the lead gets the same tools as everyone else. Put shared scope, acceptance criteria, constraints and per-member authorization in brief.",
 			"If prepare is rejected, fix the named field and prepare again; nothing was started. After a Team fails or is cancelled, prepare a new Team with new aliases for members that started.",
 		],
@@ -631,6 +623,10 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			brief: nullable(BriefSchema),
 			initialRequests: nullable(Type.Array(InitialRequestSchema, { maxItems: TEAM_MAX_INITIAL_REQUESTS })),
 			budget: nullable(StringEnum(["standard", "long", "unlimited"], { description: "prepare: null = long. unlimited removes activation, model-request and tool-call caps (works stay capped at 20000)." })),
+			review: nullable(Type.Object({
+				by: Type.String({ minLength: 1, maxLength: 64, description: "A member alias other than the lead" }),
+				everyMinutes: Type.Integer({ minimum: 1, maximum: TEAM_MAX_REVIEW_MINUTES }),
+			}, { additionalProperties: false, description: "prepare: periodic progress review by that member, reported to the lead; null = none" })),
 			timeoutSeconds: nullable(Type.Number({ exclusiveMinimum: 0, maximum: TEAM_MAX_TIMEOUT_SECONDS, description: "null = no Team deadline. Only for a user-requested deadline, counted from launch." })),
 			reason: nullable(Type.String({ description: "cancel: why the Team is cancelled" })),
 		}, { additionalProperties: false }),

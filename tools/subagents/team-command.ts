@@ -7,9 +7,20 @@ import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, 
 import { clock, type GrantPreview } from "./team-runtime";
 import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView } from "./team-tool";
 
-const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "review"] as const;
+const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "review"] as const;
 const REVIEW_USAGE = "review [now|every <N> [by <alias>]|off]";
-const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|${REVIEW_USAGE}`;
+const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|${REVIEW_USAGE}`;
+
+/** Live and history Team IDs that equal or start with what the user typed (the popup shows only the first 8 characters). */
+function matchTeamIds(host: TeamSessionHost, typed: string): string[] {
+	const ids = [...new Set([...host.runtime.listTeams().map((team) => team.teamId), ...host.history.teams.map((team) => team.teamId)])];
+	return ids.includes(typed) ? [typed] : ids.filter((id) => id.startsWith(typed));
+}
+
+function completionTeam(host: TeamSessionHost, typed: string) {
+	const matches = matchTeamIds(host, typed);
+	return matches.length === 1 ? host.runtime.listTeams().find((team) => team.teamId === matches[0]) : undefined;
+}
 
 /**
  * `/rail-team`: the user-facing HostControl entry. It is a host command, never a model action:
@@ -17,7 +28,7 @@ const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [pa
  */
 export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionHost | undefined): void {
 	pi.registerCommand("rail-team", {
-		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead)",
+		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead, revive)",
 		getArgumentCompletions: (prefix) => {
 			const host = getHost();
 			if (!host) return null;
@@ -31,16 +42,17 @@ export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionH
 				return subs.length ? subs.map((sub) => ({ value: `${parts[0]} ${sub}`, label: sub })) : null;
 			}
 			if (parts[1] === "review") {
-				const team = host.runtime.listTeams().find((item) => item.teamId === parts[0]);
+				const team = completionTeam(host, parts[0]!);
 				const options = parts.length === 3 ? ["now", "every", "off"] : parts.length === 5 ? ["by"]
 					: parts.length === 6 && parts[4] === "by" ? (team?.members ?? []).filter((member) => member.id !== team!.lead).map((member) => member.id) : [];
 				const matching = options.filter((option) => option.startsWith(parts.at(-1) ?? ""));
 				return matching.length ? matching.map((option) => ({ value: `${parts.slice(0, -1).join(" ")} ${option}`, label: option })) : null;
 			}
-			if (parts.length === 3 && parts[1] === "lead") {
-				const team = host.runtime.listTeams().find((item) => item.teamId === parts[0]);
-				const aliases = (team?.members ?? []).filter((member) => member.id !== team!.lead && member.id.startsWith(parts[2] ?? "")).map((member) => member.id);
-				return aliases.length ? aliases.map((alias) => ({ value: `${parts[0]} lead ${alias}`, label: alias })) : null;
+			if (parts.length === 3 && (parts[1] === "lead" || parts[1] === "revive")) {
+				const team = completionTeam(host, parts[0]!);
+				const aliases = (team?.members ?? []).filter((member) => member.id.startsWith(parts[2] ?? "")
+					&& (parts[1] === "lead" ? member.id !== team!.lead : member.lifecycle === "faulted" && member.resourceState === "owned")).map((member) => member.id);
+				return aliases.length ? aliases.map((alias) => ({ value: `${parts[0]} ${parts[1]} ${alias}`, label: alias })) : null;
 			}
 			return null;
 		},
@@ -61,12 +73,20 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		if (choice.action === "message") {
 			text = (await ctx.ui.input("Message the lead", "What should the lead know?"))?.trim() ?? "";
 			if (!text) return;
+		} else if (choice.action === "revive" || choice.action === "lead") {
+			const team = host.runtime.getTeam(choice.teamId);
+			const revive = choice.action === "revive";
+			const aliases = team.members.filter((member) => revive ? member.lifecycle === "faulted" && member.resourceState === "owned" : member.lifecycle === "open" && member.id !== team.lead).map((member) => member.id);
+			if (!aliases.length) { ctx.ui.notify(revive ? `${choice.teamId} has no faulted member that can be revived` : `${choice.teamId} has no open member to make the lead`, "info"); return; }
+			const alias = await ctx.ui.select(revive ? `Revive which member of ${choice.teamId}?` : `Make which member the lead of ${choice.teamId}?`, aliases);
+			if (!alias) return;
+			text = alias;
 		}
 		await runTeamCommand(host, `${choice.teamId} ${choice.action}${text ? ` ${text}` : ""}`, ctx);
 		return;
 	}
-	const [teamId, subcommand = "status", ...rest] = args.split(/\s+/u).filter(Boolean);
-	if (!teamId || teamId === "list") {
+	const [typedId, subcommand = "status", ...rest] = args.split(/\s+/u).filter(Boolean);
+	if (!typedId || typedId === "list") {
 		const teams = host.runtime.listTeams();
 		const liveIds = new Set(teams.map((team) => team.teamId));
 		const lines = [
@@ -77,6 +97,9 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		ctx.ui.notify(lines.join("\n") || "No teams", "info");
 		return;
 	}
+	const matches = matchTeamIds(host, typedId);
+	if (matches.length > 1) throw new Error(`Ambiguous teamId ${typedId}: matches ${matches.join(", ")}`);
+	const teamId = matches[0] ?? typedId;
 	const text = rest.join(" ").trim();
 	const liveTeam = host.runtime.listTeams().find((team) => team.teamId === teamId);
 	if (!liveTeam) {
@@ -166,6 +189,16 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			if (!await confirm(ctx, `Make ${alias} the lead of ${teamId}?`, `${liveTeam.lead} stays a member. Unprocessed Team events go to ${alias}; after a lead failure its incidents resolve and the other members resume.`)) return;
 			host.runtime.handoverLead(teamId, alias, reason || undefined);
 			ctx.ui.notify(`${alias} is now the lead of ${teamId}`, "info");
+			return;
+		}
+		case "revive": {
+			const [alias] = rest;
+			if (!alias) throw new Error("revive requires a member alias: /rail-team <teamId> revive <alias>");
+			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; no member can be revived.`);
+			const leadNote = alias === liveTeam.lead ? " Work held for the unavailable lead is queued again, its Team events are delivered again and the paused members resume." : "";
+			if (!await confirm(ctx, `Revive ${alias} of ${teamId}?`, `${alias} is reopened and can receive work again. Its failed work stays failed: the lead must request or revise it again.${leadNote}`)) return;
+			host.runtime.reviveMember(teamId, alias);
+			ctx.ui.notify(`${alias} revived in ${teamId}`, "info");
 			return;
 		}
 		case "review":

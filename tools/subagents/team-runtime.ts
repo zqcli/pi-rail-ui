@@ -126,7 +126,8 @@ export type HostControlReceipt =
 	| { actor: "@host"; status: "applied" | "unchanged"; teamId: string; work: WorkRef }
 	| { actor: "@host"; status: "applied" | "unchanged"; teamId: string; eventId: string }
 	| { actor: "@host"; status: "applied"; teamId: string; grantId: string; released: WorkRef[] }
-	| { actor: "@host"; status: "applied"; teamId: string; lead: string };
+	| { actor: "@host"; status: "applied"; teamId: string; lead: string }
+	| { actor: "@host"; status: "applied"; teamId: string; memberId: string };
 
 export interface TeamHostControl {
 	cancel_team(reason: string): HostControlReceipt;
@@ -837,6 +838,37 @@ export class TeamRuntime {
 		this.check(team);
 		this.requestDrain(teamId);
 		return { actor: "@host", status: "applied", teamId, lead: target.id };
+	}
+
+	/**
+	 * Host-only: reopen a faulted member whose process is still alive (the lead included). Reviving the lead undoes
+	 * its fault the way a handover does, minus the lead change: its events are delivered again, its held work is queued
+	 * instead of failed, and the safety pause of the other members ends.
+	 */
+	reviveMember(teamId: string, aliasValue: string): HostControlReceipt {
+		const team = this.team(teamId);
+		const member = team.members.get(aliasValue);
+		if (!member) fail("UNKNOWN_MEMBER", `Unknown member ${aliasValue}`);
+		this.revive(team, member, "host");
+		if (member.id === team.lead) {
+			for (const event of team.events) delete event.batchId;
+			team.eventBatches.clear();
+			for (const id of team.ledger.order) {
+				const ref = team.ledger.currentRef(id)!;
+				const version = team.ledger.version(ref)!;
+				if (version.hold?.reason !== "lead_unavailable") continue;
+				delete version.hold;
+				version.state = "queued";
+				version.updatedAt = this.timestamp();
+				team.ready.push(copy(ref));
+			}
+			for (const incident of team.incidents) if (incident.code === "LEAD_UNAVAILABLE" && incident.state === "open") this.resolveIncident(team, incident.id);
+			for (const other of team.members.values()) if (other.lifecycle === "open") this.liftPause(team, other);
+		}
+		this.addEvent(team, { key: `revive:${team.eventSeq}`, kind: "USER_COMMAND", actor: "@host", message: prompt("team", "event_member_revived", { member: member.id }) });
+		this.check(team);
+		this.requestDrain(teamId);
+		return { actor: "@host", status: "applied", teamId, memberId: member.id };
 	}
 
 	/** The current periodic-review schedule (nextAt: when the timer fires next, null while it is not running); undefined without one. */
@@ -2100,6 +2132,8 @@ export class TeamRuntime {
 	/** The single most relevant reason an active Team has not finished, by priority. */
 	private teamWaitingFor(team: TeamState, holds: readonly HostHoldView[], oldestHolds: ReadonlyMap<string, HostHoldView>,
 		waits: ReadonlyMap<string, WaitedWork[]>): string | undefined {
+		const lead = team.members.get(team.lead)!;
+		if (lead.lifecycle === "faulted") return "Lead failed: revive it (v) or hand the lead over (l) in /rail-team";
 		const questions = holds.filter((hold) => hold.reason === "attention" && team.events.some((event) => event.incidentId === hold.incidentId)).map((hold) => hold.assignee);
 		if (questions.length) {
 			const askers = [...new Set(questions)];
@@ -2319,12 +2353,13 @@ export class TeamRuntime {
 	private control(team: TeamState, member: RuntimeMember, active: ActiveActivation, control: NonNullable<Extract<TeamAction, { action: "control" }>["control"]>, toolCallId: string): TeamReply {
 		const workId = "workId" in control ? control.workId : control.command === "accept_result" ? control.work.workId : undefined;
 		if (workId !== undefined) this.requireWorkControl(team, member, active, workId);
-		else if (member.id !== team.lead) fail("FORBIDDEN_ACTION", "Only the Team lead may pause, resume or close members or close the Team");
+		else if (member.id !== team.lead) fail("FORBIDDEN_ACTION", "Only the Team lead may pause, resume, revive or close members or close the Team");
 		switch (control.command) {
 			case "revise_work": return this.reviseWork(team, member, control);
 			case "cancel_work": return this.cancelWork(team, member, control);
 			case "accept_result": return this.acceptResult(team, member, control);
 			case "close_member": return this.closeMember(team, member, control.memberId);
+			case "revive_member": return this.reviveMemberControl(team, member, control.memberId);
 			case "pause_member": return this.pauseMember(team, member, control.memberId);
 			case "resume_member": return this.resumeMember(team, member, control.memberId);
 			case "resume_work": return this.resumeWork(team, member, control.workId, control.expectedRevision, control.incidentId, control.instruction);
@@ -2555,12 +2590,48 @@ export class TeamRuntime {
 		return okReply(actor.id, { receipt: { status: "applied", command: "accept_result", work: control.work } });
 	}
 
+	private reviveMemberControl(team: TeamState, lead: RuntimeMember, memberId: string): TeamReply {
+		const target = team.members.get(memberId);
+		if (!target) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
+		if (target.id === lead.id) fail("FORBIDDEN_ACTION", "The lead cannot revive itself");
+		this.revive(team, target, lead.id);
+		return okReply(lead.id, { receipt: { status: "applied", command: "revive_member", memberId } });
+	}
+
+	/** Reopen a faulted member whose process is still alive. Its failed works stay failed; whoever revives it requests or revises them again. */
+	private revive(team: TeamState, member: RuntimeMember, by: string): void {
+		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
+		if (member.lifecycle !== "faulted") fail("MEMBER_UNAVAILABLE", `${member.id} is not faulted`);
+		if (member.resourceState !== "owned" || member.active) {
+			fail("MEMBER_UNAVAILABLE", `${member.id}'s process has exited or is closing; it cannot be revived — give its work to another member`);
+		}
+		member.lifecycle = "open";
+		member.pause = "none";
+		delete member.error;
+		delete member.retry;
+		this.note(team, `${by} revived ${member.id}`);
+		this.refreshHealth(team);
+		this.changed(team);
+	}
+
 	private closeMember(team: TeamState, lead: RuntimeMember, memberId: string): TeamReply {
 		if (memberId === lead.id) fail("FORBIDDEN_ACTION", "The lead cannot close itself; use close_team");
 		const target = team.members.get(memberId);
 		if (!target) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
 		if (target.lifecycle === "closing" && target.closeId) return okReply(lead.id, { receipt: { status: "closing", command: "close_member", memberId, closeId: target.closeId } });
-		if (target.lifecycle === "closed") return okReply(lead.id, { receipt: { status: "applied", command: "close_member", memberId } });
+		if (target.lifecycle === "closed" || (target.lifecycle === "faulted" && target.resourceState === "released")) {
+			return okReply(lead.id, { receipt: { status: "applied", command: "close_member", memberId } });
+		}
+		if (target.lifecycle === "faulted" && target.resourceState === "owned" && !target.active) {
+			// The fault stays on record; only its live process is stopped.
+			target.resourceState = "stopping";
+			target.closeId = this.id("close");
+			this.changed(team);
+			this.check(team);
+		}
+		if (target.lifecycle === "faulted" && target.resourceState === "stopping" && target.closeId) {
+			return okReply(lead.id, { receipt: { status: "closing", command: "close_member", memberId, closeId: target.closeId } });
+		}
 		if (target.lifecycle !== "open") fail("RECIPIENT_CLOSED", `Member ${memberId} is ${target.lifecycle}`);
 		const blockers: Array<{ kind: string; id?: string; reason: string }> = [];
 		if (target.active) blockers.push({ kind: "activation", id: target.id, reason: "native activation or cleanup is still in flight" });
@@ -2606,7 +2677,9 @@ export class TeamRuntime {
 		}
 		for (const member of team.members.values()) if (member.id !== lead.id) {
 			if (member.active && !this.isReview(team, member.active.scope.work)) blockers.push({ kind: "activation", id: member.id, reason: `${member.id} still has an active activation` });
+			// A faulted member's live process is stopped by the close; only an unconfirmed exit (cleanup_failed) blocks.
 			if (!((member.lifecycle === "open" && member.resourceState === "owned")
+				|| (member.lifecycle === "faulted" && (member.resourceState === "owned" || member.resourceState === "stopping"))
 				|| (member.resourceState === "released" && (member.lifecycle === "closed" || member.lifecycle === "faulted")))) {
 				blockers.push({ kind: "member_resource", id: member.id, reason: `${member.id} is ${member.lifecycle} with resources ${member.resourceState}` });
 			}
@@ -2667,6 +2740,9 @@ export class TeamRuntime {
 				target.closeId = closeId;
 			} else if (target.lifecycle === "open") {
 				target.lifecycle = "closing";
+				target.resourceState = "stopping";
+				target.closeId = closeId;
+			} else if (target.lifecycle === "faulted" && target.resourceState === "owned") {
 				target.resourceState = "stopping";
 				target.closeId = closeId;
 			}

@@ -418,6 +418,7 @@ const CONTROL_FIELDS: Record<TeamControl["command"], readonly string[]> = {
 	resume_work: ["workId", "expectedRevision", "incidentId", "instruction"],
 	accept_result: ["work", "disposition", "reason"],
 	close_member: ["memberId"],
+	revive_member: ["memberId"],
 	close_team: ["resultRefs", "outcome", "reason"],
 };
 export const TEAM_ACTION_FIELDS: readonly string[] = [...new Set(Object.values(ACTION_FIELDS).flat())];
@@ -491,7 +492,8 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 		disposition: Type.Union([Type.Literal("accepted"), Type.Literal("waived")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
 	}, "Root's requester or the lead: explicitly accept a successful root or waive a terminal outcome with a reason."),
-	controlAction("close_member", { memberId: aliasSchema }, "Lead only: close an idle member with no unresolved obligations."),
+	controlAction("close_member", { memberId: aliasSchema }, "Lead only: close an idle member with no unresolved obligations, or stop a faulted member's process."),
+	controlAction("revive_member", { memberId: aliasSchema }, "Lead only: reopen a faulted member whose process is alive; its failed work stays failed, so revise or re-request it."),
 	controlAction("close_team", { resultRefs: Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
 		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
@@ -580,6 +582,8 @@ function normalizeControl(value: Record<string, unknown>): TeamControl {
 			return { command: "resume_member", memberId: normalizeAlias(value["memberId"], "memberId") };
 		case "close_member":
 			return { command: "close_member", memberId: normalizeAlias(value["memberId"], "memberId") };
+		case "revive_member":
+			return { command: "revive_member", memberId: normalizeAlias(value["memberId"], "memberId") };
 		case "revise_work":
 			return { command: "revise_work", workId: normalizeId(value["workId"], "workId"),
 				expectedRevision: safeInteger(value["expectedRevision"], "expectedRevision", 1),

@@ -16,7 +16,7 @@ Run a Team: 2-9 members, all new persistent aliases with the same capabilities (
 
 ## tool_description
 
-Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control: revise_work, cancel_work, resume_work and accept_result are for the work's requester or the lead (never for your own current work); pause_member, resume_member, close_member and close_team are lead only. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.
+Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control: revise_work, cancel_work, resume_work and accept_result are for the work's requester or the lead (never for your own current work); pause_member, resume_member, close_member and close_team are lead only; revive_member (lead only) reopens a faulted member whose process is alive, and its failed work stays failed. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.
 
 ## member_tool_description_suffix
 
@@ -137,6 +137,10 @@ Team is active. {{count}} initial request(s) are already assigned and run withou
 
 Host made you the Team lead: {{reason}}
 
+## event_member_revived
+
+The host revived {{member}}; its earlier failed work stays failed — request or revise it again if still needed.
+
 ## event_budget_granted
 
 Host granted budget for {{scope}}: {{reason}}
@@ -147,7 +151,7 @@ Host granted budget for {{scope}}: {{reason}}
 
 ## event_member_failed
 
-{{member}} failed during native activation
+{{member}} failed during native activation. If the cause looks temporary, revive_member it and revise or re-request its work; otherwise give that work to another member.
 
 ## event_lead_failed
 

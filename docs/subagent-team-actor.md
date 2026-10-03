@@ -82,7 +82,7 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 `control` 的权限按所有权划分，字段是扁平的：
 
 - `revise_work`、`cancel_work`、`resume_work`、`accept_result`：该 work 的**请求者**（owner）或 lead 可用，可以在 owner 的 work activation 里，也可以在 lead 的 events activation 里。成员不能控制自己当前的 WorkRef（`FORBIDDEN_ACTION`）；既不是请求者也不是 lead 的成员同样得到 `FORBIDDEN_ACTION`。
-- `pause_member`、`resume_member`、`close_member`、`close_team`：只限 lead（`close_team` 还必须在 events activation 里）。
+- `pause_member`、`resume_member`、`revive_member`、`close_member`、`close_team`：只限 lead（`close_team` 还必须在 events activation 里）。
 
 **子任务 issue。** 有 parent 的 work（子任务）被 held（attention 或协议 hold）时，不再向 lead 发 `WORK_HELD`：Runtime 把 issue 记在 parent 当前版本上，并让 parent 可运行，即使它的 `waitingFor` 尚未满足。parent 的下一次 work activation 输入带 `childIssues: [{work, assignee, incidentId, reason, message}]`（`work` 是被 held 的子 WorkRef，`reason` 为 `attention|protocol`，`message` 至多 512 字节；每次最多 8 项，其余数量在 `childIssuesOmitted`，仍未送达，下次再带），notice 末尾多一句：`A sub-task you requested is held (see childIssues): answer it with resume_work {workId, expectedRevision, incidentId, instruction} or revise_work/cancel_work, then yield waitingFor again, or yield attention to escalate it.` owner 回答后再 `yield {waitingFor}`；答不了就 `yield {attention}`，由它自己的请求者（root 则是 lead）接手，即自然升级。每个 issue 只送达一次（对应 incident 已 resolved 的 issue 不再送达）；parent 正在运行时，issue 在它下次 yield 时送达（立即重新入队，不会阻塞在被 held 的子任务上）。以下情况仍回退为发给 lead 的 `WORK_HELD`：root（无 parent）、parent 版本已终态或自身被 hold、Team 级 incident（`BUDGET_HIT`、`DEPENDENCY_UNAVAILABLE`、`LEAD_UNAVAILABLE`）。lead 在自己 work activation 里创建的子任务 held 时，issue 交给那项 work；root（来自 events activation 或 initialRequests）则交给 events。
 
@@ -101,7 +101,8 @@ launch 会等所有成员资源创建并绑定完成后才开放执行；它的 
 | `cancel_work` | `workId, expectedRevision, reason` | 只取消该版本及其从属子树；已终态时稳定 no-op |
 | `resume_work` | `workId, expectedRevision, incidentId, instruction` | 只解除 attention/protocol hold |
 | `accept_result` | `work, disposition: accepted\|waived, reason?` | 根工作验收或明确豁免 |
-| `close_member` | `memberId`（lead 以外的成员） | 条件式关闭 |
+| `close_member` | `memberId`（lead 以外的成员） | 条件式关闭；对 faulted 成员则停止其仍存活的进程 |
+| `revive_member` | `memberId`（lead 以外的成员） | 重新打开 faulted 且进程仍存活的成员 |
 | `close_team` | `resultRefs, outcome: succeeded\|partial\|failed, reason?` | 原子关闭整个 Team |
 
 `reply`、`yield`、`close_team` 必须是最终 assistant 批次中唯一的工具调用（依据原生最终批次核验）。暂存结束意图之后，同一 activation 的新业务返回 `ACTIVATION_ENDING` 或 `INTENT_CONFLICT`。
@@ -155,11 +156,12 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 - revise/cancel 先向原生运行发送 activation-only abort，等待收尾与清理；超过 `activationStopTimeoutMs`（默认 5000 ms）仍未收敛时终止成员进程，并以真实退出结果结清。清理确认前，下游拿不到 outcome。
 - 临时 provider/传输错误（原生 assistant `stopReason:"error"` 且 `isRetryableAssistantError` 为真，完成证据 `error.transient`；额度/鉴权/400、`length`、abort 和传输丢失不算）不立即故障：未暂存结束意图、成员 open 且 Team active 时，成员保持 open，`member.retry` 记录次数与下次时间，原 work 回到 `queued`（重试 activation 的 `notice` 附带说明：上次因临时错误中断、已有工具结果仍在会话里、勿重复已完成的副作用；`member.retry` 存在期间才附带，不改动 `resumeInstruction`），lead 的 events 批次不消费、整批重新投递；等待 10/30/60/120/300 秒后在同一原生会话上重新 activation，期间该成员不被调度，其余成员照常运行，lead 不置 faulted、不暂停其他成员。Worker 最多重试 5 次；lead 前 5 次后每 300 秒一次，自首次错误起 30 分钟后放弃。成功完成即清除 `retry`；用尽后走下面的故障路径。每次重试写入时间线（`transient error (...); retry n in Ns`），成员状态显示 `retrying n/5 · next Ns · error`，Team 计数 `transientRetries`，结果的 Process 行在大于 0 时显示 `transient retries N`。
 - 非 lead 成员的 provider/传输/协议故障只隔离该成员：它名下的工作显式 failed（未开始的记为 `MEMBER_UNAVAILABLE`，正在运行的记为 outcome unknown），无关工作继续。
+- faulted 成员的 Pi 子进程仍存活且空闲（`faulted` + `owned`）。`revive_member`（lead）或宿主 `reviveMember(teamId, alias)`（`/rail-team <id> revive <alias>`，需确认，lead 也可）把它改回 `open`、`pause none`、清除 `error`/`retry`；只允许 Team active、成员 faulted、`resourceState` 为 `owned` 且无 activation，否则 `MEMBER_UNAVAILABLE`（进程已退出或正在关闭的成员不能复活，请把工作交给其他成员）。已 failed 的工作保持 failed（账本不改写），由 lead 重新 request 或 revise。预算耗尽的紧急 activation 不允许 `revive_member`。宿主复活会给 lead 一条 `USER_COMMAND` 事件（`The host revived <member>; …`）；复活 lead 时还会撤销 lead 故障的影响：未处理事件重新投递、`lead_unavailable` hold 住的 work 回到 queued（不是 failed）、`LEAD_UNAVAILABLE` incident resolved、因 lead 故障而暂停的成员解除暂停。复活不写 journal（lead 未变）。
 
 ## 8. 关闭
 
-- `close_member`：目标必须 open、没有 activation（包括停驻中的）、没有名下的未终态工作、没有待其接收的 outgoing 请求、资源状态确定。条件不满足返回 `CLOSE_BLOCKED` 和 blockers，状态不变。满足时进入 closing，新请求得到 `RECIPIENT_CLOSING`。只剩已提交历史结果的作者可以关闭。
-- `close_team`：只能在 lead 的 events activation 中调用。要求所有 root 和 child（包括 lead 自己的 work）都有明确 outcome，root 已被 accepted 或 waived，其他成员都没有运行中的 activation 或清理，resultRefs 属于本 Team。它自己会关闭仍 open 的 idle 成员，无需先逐个 `close_member`。
+- `close_member`：对 faulted 成员：已 released 返回 applied；`stopping` 返回其 closeId 的 closing 回执；仍 `owned` 且无 activation 时改为 `stopping` 并发出 closing 回执（lifecycle 保持 faulted，进程退出后为 `faulted` + `released`）；`cleanup_failed` 仍返回 `RECIPIENT_CLOSED`。对其他成员：目标必须 open、没有 activation（包括停驻中的）、没有名下的未终态工作、没有待其接收的 outgoing 请求、资源状态确定。条件不满足返回 `CLOSE_BLOCKED` 和 blockers，状态不变。满足时进入 closing，新请求得到 `RECIPIENT_CLOSING`。只剩已提交历史结果的作者可以关闭。
+- `close_team`：只能在 lead 的 events activation 中调用。要求所有 root 和 child（包括 lead 自己的 work）都有明确 outcome，root 已被 accepted 或 waived，其他成员都没有运行中的 activation 或清理，resultRefs 属于本 Team。它自己会关闭仍 open 的 idle 成员，无需先逐个 `close_member`。已 faulted 的非 lead 成员（`owned` 或已在 `stopping`）不阻止关闭：`owned` 的会改为 `stopping` 并使用这次的 closeId，进程退出后 Team 才 closed，成员保持 faulted；`cleanup_failed`（退出未确认）仍阻止，由宿主处理。lead 交接后，原（faulted）lead 同样如此处理。
   - `succeeded`：所有 root 都是 accepted 且结果为 succeeded，没有未决 incident，至少一个 resultRef。被拒时 `INVALID_TEAM_OUTCOME` 的 blockers（`root_outcome`）列出每个阻止成功的 root；被取消、失败或 waived 的 root（例如重复派发的工作）只能以 `partial` 关闭。
   - `partial`：需要 reason 和至少一个 resultRef。
   - `failed`：需要 reason。
@@ -205,7 +207,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 - 巡检是 `kind: "review"` 的 work：requester 为 lead、assignee 为 reviewer，由 Runtime 创建，task 是宿主生成的有界快照（用时、目标、各状态 work、自上次起完成的 work、各成员状态与等待/hold、未决 incident、主要预算计数、自上次起的时间线、上一次巡检的结论）以及宿主计算的信号（每个 held work 已 hold 多久；lead 是否在运行及排队给它的 Team 事件数；距上一个已结束的非 review work 的分钟数与连续无进展的巡检数（含本次）；预算用量百分比；快照时间及「快照可能早于你的 activation，以 status 为准」的提示），再加固定判定标准（`ON TRACK`/`AT RISK`/`OFF TRACK` 的定义、「不算风险」的情形、AT RISK/OFF TRACK 必须引用具体证据与建议、没有证据就报 ON TRACK；summary 必须以 `ON TRACK:`、`AT RISK:` 或 `OFF TRACK:` 开头）和可选的 `focus`。review work 计入预算，但不是交付物：不计入 root 计数、close 阻塞项、Waiting for、processStats 与最终结果；`close_team`（或 Team 停止）时未结束的 review 自动取消，永不阻塞关闭。
 - 提交后存为 `TeamReviewRecord`（`listReviews(teamId)`，保留最新 200 条，结论由 summary 前缀解析）；review 失败也记录（`failed`），hold 的问题照常交给 lead。`reviewSchedule(teamId)` 返回 `{by, everyMinutes, focus?, nextAt}`。宿主用 `setReview`/`reviewNow`（即 `/rail-team <id> review ...`）调整；journal 记录 `review`、`review_schedule`，history 条目含 `reviews` 与 `review`，已关闭的 Team 也能看到。
 
-`/rail-team [list] | <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|review [now|every <N> [by <alias>]|off]`：grant、resume、lead 和 review（now/every/off）会先展示影响范围并要求确认；无 UI 的环境不能修改。`/rail-agent` 中对 Team 成员的 Stop/Delete 会经 Runtime 路由（见 README）。
+`/rail-team [list] | <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|review [now|every <N> [by <alias>]|off]`：`<teamId>` 可写成 live 或历史 Team ID 的唯一前缀（弹窗只显示前 8 个字符；有歧义或未知时报错）。弹窗另有 `v`（选择要复活的 faulted 成员）和 `l`（选择新 lead）两个操作键，Overview 里的 `Team:` 行显示完整 ID。grant、resume、lead、revive 和 review（now/every/off）会先展示影响范围并要求确认；无 UI 的环境不能修改。`/rail-agent` 中对 Team 成员的 Stop/Delete 会经 Runtime 路由（见 README）。
 
 ## 10. 容量上限
 

@@ -655,7 +655,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 				const panel = new Container();
 				panel.addChild(new TruncatedText(theme.fg(titleColor, theme.bold(title!)), 0, 0));
 				for (const line of rest) {
-					const color = /^Budget EXHAUSTED/u.test(line) ? "error" : /^(Holds|Incident|\+\d+ more open incidents|Waiting for: Lead decisions? on )/u.test(line) ? "warning" : "dim";
+					const color = /^Budget EXHAUSTED/u.test(line) ? "error" : /^(Holds|Incident|\+\d+ more open incidents|Waiting for: Lead (decisions? on |failed))/u.test(line) ? "warning" : "dim";
 					const styled = theme.fg(color, line);
 					panel.addChild(!expanded && /^(Goal|Reason):/u.test(line) ? new TruncatedText(styled, 0, 0) : new Text(styled, 0, 0));
 				}

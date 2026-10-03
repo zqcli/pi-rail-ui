@@ -389,7 +389,7 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 	facts.timeline = Array.from({ length: 20 }, (_, index) => ({ at: index * 60_000, text: `milestone ${index}` }));
 	facts.timelineOmitted = 3;
 	host.runtime.panelFacts = () => facts;
-	const ui = overlay(host, { rows: 20 });
+	const ui = overlay(host, { rows: 21 }); // two help rows: 21 terminal rows keep an 8-row Timeline page
 	t.after(() => ui.component.dispose());
 	ui.key("left");
 	const cursor = () => ui.component.render(100).find((line) => line.startsWith("│ →"))!;
@@ -634,16 +634,25 @@ test("review works do not count in the Overview progress", (t) => {
 	assert.match(ui.text(), /roots 0\/3 accepted · works 0\/4/u);
 });
 
-test("Overview shows the full Team ID, and v/l (with c/r/g/m) are popup actions whose hint fits 80 columns", (t) => {
+test("Overview shows the full Team ID, and every popup action key is named on its own help row that fits 80 columns", (t) => {
 	const { host, teamId } = fixture();
 	host.runtime.prepare({ members: [{ alias: "a", roleDescription: "A." }, { alias: "b", roleDescription: "B." }], lead: "a", brief: { goal: "Second Team." }, timeoutSeconds: null });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	const lines = ui.component.render(80);
 	assert.match(stripTerminalSequences(lines.join("\n")), new RegExp(`Team:\\s+${teamId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u"));
-	const help = lines.find((line) => line.includes("actions"))!;
-	assert.match(help, /\[ \] teams · c\/r\/g\/m\/v\/l actions · esc close/u, "the whole hint is visible at 80 columns");
-	assert.equal(visibleWidth(help), 80);
+	const navigation = lines.find((line) => line.includes("esc close"))!;
+	assert.match(navigation, /←→\/tab views · \[ \] teams · esc close/u, "the whole navigation hint is visible at 80 columns");
+	const actions = lines.find((line) => line.includes("c cancel"))!;
+	assert.match(actions, /c cancel · r resume hold · g grant · m message · v revive · l switch lead/u, "each action key is named in full");
+	assert.equal(visibleWidth(actions), 80);
+	for (const [tab, label] of [[2, "Members"], [4, "Timeline"]] as const) {
+		const popup = overlay(host);
+		for (let index = 0; index < tab; index++) popup.component.handleInput("\t");
+		const rendered = popup.component.render(80).map(stripTerminalSequences);
+		assert.ok(rendered.some((line) => line.includes("esc close")) && rendered.some((line) => line.includes("l switch lead")), `${label}: both help rows are whole`);
+		popup.component.dispose();
+	}
 	for (const [key, action] of [["v", "revive"], ["l", "lead"]] as const) {
 		const popup = overlay(host);
 		popup.component.handleInput(key);

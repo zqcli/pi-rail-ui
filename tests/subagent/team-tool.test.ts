@@ -402,6 +402,19 @@ test("prepare takes review {by, everyMinutes}, prints it, and the final text sho
 	assert.match(text, /^- Last review \d+:\d\d at risk: nobody has accepted the root\.$/mu);
 });
 
+test("the final text's Process block carries one flow line", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	host.driver.openAndLaunch = async () => {
+		host.runtime.launch(teamId);
+		completeRoots(host, teamId, () => ({ status: "succeeded", summary: "Root done." }));
+		return { lifetime: Promise.resolve(terminal(teamId)) };
+	};
+	const text: string = (await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context())).content[0].text;
+	assert.match(text, /^Process:\n(?:- .*\n)*?- flow: workers avg \S+ · only lead \S+ · start delay p90 \S+ · waits p90 \S+ · most waited: \S.*\n(?:- .*\n)*Members:/mu);
+});
+
 /** Reserve the next activation and acknowledge its input, as a native member would. */
 function activate(host: TeamSessionHost, teamId: string): RuntimeActivation {
 	const activation = host.runtime.takeNextActivation(teamId)!;

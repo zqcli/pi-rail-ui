@@ -35,6 +35,8 @@ export interface TeamHistoryEntry {
 	/** The Team's periodic reviews (newest TEAM_MAX_REVIEWS) and its latest review schedule. */
 	reviews?: TeamReviewRecord[];
 	review?: TeamReviewPlan;
+	/** The compact flow summary of the Team's terminal record. */
+	flow?: string;
 	at: number;
 }
 
@@ -179,7 +181,7 @@ function applyJournalRecord(
 			return true;
 		}
 		case "terminal": {
-			onlyKeys(data, ["version", "kind", "teamId", "at", "closeId", "result"]);
+			onlyKeys(data, ["version", "kind", "teamId", "at", "closeId", "result", "flow"]);
 			if (!current || current.version !== 2 || ended.has(teamId)) return false;
 			const close = closeByTeam.get(teamId);
 			const closeId = data["closeId"] === undefined ? undefined : normalizeId(data["closeId"], "journal.terminal.closeId");
@@ -190,6 +192,7 @@ function applyJournalRecord(
 			if (result.outcome) current.outcome = result.outcome;
 			if (result.reason) current.reason = result.reason;
 			current.finalResultRefs = result.finalResultRefs;
+			if (data["flow"] !== undefined) current.flow = boundedText(data["flow"], 512, "journal.terminal.flow");
 			current.at = at;
 			ended.add(teamId);
 			return true;

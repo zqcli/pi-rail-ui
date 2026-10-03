@@ -15,7 +15,7 @@ export type TeamJournalRecord =
 	| { version: 2; kind: "decision"; teamId: string; at: number; decision: "revise_work" | "cancel_work"; work: WorkRef; reason?: string }
 	| { version: 2; kind: "close_decision"; teamId: string; at: number; closeId: string; outcome: "succeeded" | "partial" | "failed"; resultRefs: string[]; roots: TeamResult["roots"]; reason?: string }
 	| { version: 2; kind: "grant"; teamId: string; at: number; grant: BudgetGrantRecord }
-	| { version: 2; kind: "terminal"; teamId: string; at: number; closeId?: string; result: TeamResult };
+	| { version: 2; kind: "terminal"; teamId: string; at: number; closeId?: string; result: TeamResult; flow?: string };
 
 /** Session custom-entry type of v2 Team journal records (display-only history, never replayed). */
 export const TEAM_JOURNAL_ENTRY_TYPE = "rail-subagent-team-v2";

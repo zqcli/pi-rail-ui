@@ -109,6 +109,10 @@ Last finished non-review work: {{last_finished}} · consecutive reviews without 
 Held works:
 {{held}}
 
+## review_flow_note
+
+The Flow, Lead and Waits numbers locate bottlenecks (the lead, a hot member, work permits); they are not a risk by themselves.
+
 ## review_retry_note
 
 A member shown as retrying is waiting out a temporary provider error; that is not a risk by itself.

@@ -1,6 +1,7 @@
 import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import type { TeamSessionHost } from "./team-host";
+import { flowLegend, flowRows } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, shortWorkRef, workRefKey, type TeamMemberView, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { memberDetail } from "./team-tool";
@@ -19,6 +20,7 @@ const clock = (ms: number) => `${Math.floor(Math.max(0, ms) / 60000)}:${String(M
 const writable = (team: TeamTeamView) => team.lifecycle === "prepared" || team.lifecycle === "active" || team.lifecycle === "closing";
 const VERDICTS = { on_track: ["on track", "success"], at_risk: ["at risk", "warning"], off_track: ["off track", "error"] } as const;
 const verdictOf = (review: TeamReviewRecord) => review.verdict ? VERDICTS[review.verdict] : ["no verdict", "muted"] as const;
+const BUDGET_COUNTERS = [["activations", "teamActivations"], ["lead", "leadActivations"], ["model requests", "teamModelRequests"], ["tool calls", "teamToolCalls"], ["works", "teamWorks"]] as const;
 const workState = (work: TeamWorkSummary) => `${work.hold ? "held" : work.state}${work.review ? `/${work.review}` : ""}`;
 
 function progress(works: readonly TeamWorkSummary[], done = true): string {
@@ -226,10 +228,10 @@ export class TeamOverlayComponent implements Focusable {
 		const omitted = this.tab === 4 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
 		const live = !!team && writable(team) && this.host.active;
-		const help = this.helpLines(live, ids.length > 1);
+		const help = this.helpLines(live, ids.length > 1).flatMap((text) => wrapTextWithAnsi(text, inner - 1));
 		const room = height - 6 - help.length - (notice ? 1 : 0) - (omitted ? 1 : 0);
 		// The snapshot block yields to the list on short terminals, keeping at least three list rows.
-		const head = (this.tab === 1 && !this.detail && (team || history) ? this.progressHead(team, works, facts, reviews, team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review, inner - 1) : []).slice(0, Math.max(0, room - 3));
+		const head = (this.tab === 1 && !this.detail && (team || history) ? this.progressHead(team, works, facts, reviews, team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review, history?.flow, inner - 1) : []).slice(0, Math.max(0, room - 3));
 		const available = Math.max(1, room - head.length);
 		const selectable = !this.detail && this.tab !== 0 && (this.tab === 1 ? reviews.length > 0 : !!team);
 		// The cap keeps the selection details under Progress/Members/Tasks; the Timeline has none.
@@ -278,19 +280,18 @@ export class TeamOverlayComponent implements Focusable {
 		return (writable(team) ? this.now() : facts.timeline.at(-1)?.at ?? start) - start;
 	}
 
-	/** Navigation for the current view, then (live Teams only) every action key with its name; each row fits 80 columns. */
+	/** Navigation for the current view, then (live Teams only) every action key with its name; the caller wraps rows wider than the popup. */
 	private helpLines(live: boolean, multiple: boolean): string[] {
 		const view = this.detail ? "↑↓/pgup/dn scroll · esc back" : this.tab === 0 ? "↑↓ scroll" : this.tab === 1 || this.tab === 2 ? "↑↓ select · enter details"
 			: this.tab === 3 ? "↑↓ select · enter fold" : "↑↓ cursor · pgup/dn page · home/end";
 		const navigation = [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? [] : ["read-only"]), ...(!this.detail ? ["esc close"] : [])].join(" · ");
-		return live ? [navigation, "c cancel · r resume hold · g grant · m message · v revive · l switch lead"] : [navigation];
+		return live ? [navigation, "c cancel · r resume hold · g grant · m message · v revive · l new lead"] : [navigation];
 	}
 
 	/** Budget meters: a bar with eighth-cell resolution, so even a small share of a large limit is visible. */
 	private budget(teamId: string, cells: number): Array<{ label: string; meter: string }> {
 		const { used, limits } = this.host.runtime.inspectBudget(teamId);
-		const counters = [["activations", "teamActivations"], ["lead", "leadActivations"], ["model requests", "teamModelRequests"], ["tool calls", "teamToolCalls"], ["works", "teamWorks"]] as const;
-		return counters.map(([label, key]) => {
+		return BUDGET_COUNTERS.map(([label, key]) => {
 			const value = used[key], limit = limits[key];
 			if (limit >= TEAM_BUDGET_UNLIMITED) return { label, meter: `${value} · unlimited` };
 			const share = limit ? Math.min(1, value / limit) : 1;
@@ -367,7 +368,7 @@ export class TeamOverlayComponent implements Focusable {
 	}
 
 	private progressHead(team: TeamTeamView | undefined, works: TeamWorkSummary[], facts: Facts | undefined, reviews: readonly TeamReviewRecord[],
-		schedule: (TeamReviewPlan & { nextAt?: number | null }) | undefined, width: number): string[] {
+		schedule: (TeamReviewPlan & { nextAt?: number | null }) | undefined, historyFlow: string | undefined, width: number): string[] {
 		const lines: string[] = [];
 		if (team && facts) {
 			const plain = works.filter((work) => !work.kind);
@@ -380,15 +381,22 @@ export class TeamOverlayComponent implements Focusable {
 		}
 		const next = schedule?.nextAt ? ` · next in ${Math.max(0, Math.ceil((schedule.nextAt - this.now()) / 60_000))}m` : "";
 		lines.push(schedule ? `Review: ${schedule.by} every ${schedule.everyMinutes} min${next}` : "Review: off");
+		// Labels take 8 columns; wrapped rows continue under the text.
+		const row = (label: string, text: string, color?: "warning" | "dim") => wrapTextWithAnsi(text, width - 8).map((line, index) => {
+			const full = `${index ? "        " : label && label.padEnd(8)}${line}`;
+			return color ? this.theme.fg(color, full) : full;
+		});
 		if (team) {
-			const budget: string[] = [];
-			for (const { label, meter } of this.budget(team.teamId, 10)) {
-				const cell = `${label} ${meter}`, last = budget.at(-1);
-				if (last && visibleWidth(last) + 2 + visibleWidth(cell) <= width - 8) budget[budget.length - 1] = `${last}  ${cell}`;
-				else budget.push(cell);
-			}
-			lines.push(...budget.map((text, index) => `${index ? "        " : "Budget  "}${text}`));
-		}
+			const { used, limits } = this.host.runtime.inspectBudget(team.teamId);
+			const [label, share] = BUDGET_COUNTERS.map(([label, key]) => [label, limits[key] >= TEAM_BUDGET_UNLIMITED ? 0 : used[key] / limits[key]] as const)
+				.reduce((top, item) => item[1] > top[1] ? item : top);
+			if (share >= 0.8) lines.push(this.theme.fg("warning", `Budget ${Math.floor(share * 100)}% (${label})`));
+			const stats = this.host.runtime.flowStats(team.teamId);
+			const rows = flowRows(stats);
+			lines.push(...row("Flow", rows.flow), ...row("Lead", rows.lead, stats.warn.lead ? "warning" : undefined), ...row("Queue", rows.queue, stats.warn.queue ? "warning" : undefined),
+				...row("Waits", rows.waits, stats.warn.waits ? "warning" : undefined), ...row("Cost", rows.cost, stats.warn.cost ? "warning" : undefined),
+				...wrapTextWithAnsi(flowLegend(), width).map((line) => this.theme.fg("dim", line)));
+		} else if (historyFlow) lines.push(...row("Flow", historyFlow));
 		return [...lines, ""];
 	}
 

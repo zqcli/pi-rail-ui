@@ -132,7 +132,7 @@ test("a journal written before the lead model (manager/workers roster, member ro
 		{ id: "worker", role: "worker", lifecycle: "closed", resourceState: "released" },
 	] };
 	const oldGrant = { id: "g1", actor: "@host", scope: { kind: "team" }, increments: { managerActivations: 64, emergencyManagerActivations: 1 }, reason: "raise", at: 2 };
-	const oldPresetGrant = { id: "g2", actor: "@host", scope: { kind: "team" }, preset: "long", increments: { workerPermits: 4, teamToolCalls: 100 }, reason: "Raise to long", at: 2 };
+	const oldPresetGrant = { id: "g2", actor: "@host", scope: { kind: "team" }, preset: "long", increments: { workerPermits: 4, teamToolCalls: 100, activationModelRequests: 63, activationToolCalls: 255 }, reason: "Raise to long", at: 2 };
 	const records = entries([{ version: 2, kind: "grant", teamId, at: 2, grant: oldGrant }, { version: 2, kind: "grant", teamId, at: 2, grant: oldPresetGrant }]) as any[];
 	records[0].data.roster = { manager: "lead", workers: ["worker"] };
 	records[records.length - 1].data.result = oldTerminal;

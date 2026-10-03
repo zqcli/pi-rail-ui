@@ -571,18 +571,6 @@ test("panel facts: budget, protocol and Manager-unavailable holds say why they a
 		assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "held · budget teamActivations exhausted");
 	}
 	{
-		const { runtime, teamId } = makeRuntime(undefined, { limits: { activationModelRequests: 1 } });
-		finishManagerBoot(runtime, teamId);
-		const worker = runtime.takeNextActivation(teamId)!;
-		inputReady(runtime, worker);
-		assert.deepEqual(runtime.gate(worker.binding, worker.scope, "provider_gate"), { allow: true });
-		assert.equal(runtime.gate(worker.binding, worker.scope, "provider_gate").allow, false);
-		runtime.nativeSettled(worker.binding, worker.scope.activationId, { status: "aborted" });
-		runtime.cleanupFinished(worker.binding, worker.scope.activationId, { ok: true });
-		assert.equal(runtime.getWork(teamId, workRef(worker))?.current.hold?.reason, "budget");
-		assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), "held · budget exhausted", "a per-activation limit has no Team or root counter to name");
-	}
-	{
 		const { runtime, teamId } = makeRuntime();
 		finishManagerBoot(runtime, teamId);
 		const worker = runtime.takeNextActivation(teamId)!;

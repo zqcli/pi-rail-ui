@@ -43,8 +43,8 @@ test("presets preserve standard safeguards, default to long, and apply runtime o
 	assert.equal(protocol.TEAM_BUDGET_UNLIMITED, 1_000_000_000);
 	assert.deepEqual(standard, {
 		workPermits: 4, memberUnresolvedWork: 64, teamWorks: 512, rootChildren: 64, depth: 8, workRevisions: 32,
-		rootActivations: 128, teamActivations: 512, leadActivations: 128, activationModelRequests: 64,
-		rootModelRequests: 256, teamModelRequests: 1024, activationToolCalls: 256, rootToolCalls: 1024,
+		rootActivations: 128, teamActivations: 512, leadActivations: 128,
+		rootModelRequests: 256, teamModelRequests: 1024, rootToolCalls: 1024,
 		teamToolCalls: 4096, emergencyLeadActivations: 3, reservedResultBytes: 16 * 1024 * 1024,
 	});
 	assert.deepEqual(long, { ...standard, teamActivations: 4096, leadActivations: 1024, teamModelRequests: 8192,
@@ -60,6 +60,7 @@ test("presets preserve standard safeguards, default to long, and apply runtime o
 	for (const preset of [undefined, "standard", "unlimited"] as const) {
 		const view = runtime.prepare({ ...oldPlan, ...(preset ? { budget: preset } : {}) });
 		assert.deepEqual(view.budget.limits, { ...protocol.TEAM_BUDGET_PRESETS[preset ?? "long"], workPermits: 2, teamActivations: 42 });
+		assert.equal(Object.keys(view.budget.limits).some((key) => key.startsWith("activation")), false, "no per-activation caps");
 		assert.deepEqual(parseTeamReply({ ok: true, from: "@hub", to: "lead", data: view }), { ok: true, from: "@hub", to: "lead", data: view });
 	}
 });
@@ -329,7 +330,7 @@ test("G07/G09: new roots cannot evade the Team budget; the Manager gets bounded 
 });
 
 test("gates: every observable provider request counts, including a retry, and exhaustion is a budget hold", () => {
-	const { runtime, teamId } = makeRuntime({ limits: { activationModelRequests: 2 }, initialRequests: [{ to: "w1", task: "bounded" }] });
+	const { runtime, teamId } = makeRuntime({ limits: { rootModelRequests: 2 }, initialRequests: [{ to: "w1", task: "bounded" }] });
 	const held = nextWork(runtime, teamId)!;
 	const gate = () => runtime.gate(held.binding, held.scope, "provider_gate");
 	assert.deepEqual(gate(), { allow: true });
@@ -342,8 +343,39 @@ test("gates: every observable provider request counts, including a retry, and ex
 	runtime.assertInvariants(teamId);
 });
 
+test("gates: no per-activation cap on a normal activation; root and Team exhaustion still stop it; an emergency activation keeps fixed caps", () => {
+	{
+		const { runtime, teamId } = makeRuntime({ limits: { rootModelRequests: 300, rootToolCalls: 1000 }, initialRequests: [{ to: "w1", task: "long" }] });
+		const work = nextWork(runtime, teamId)!;
+		assert.ok(work.input.budget.modelRequests === 300 && work.input.budget.toolCalls === 1000, "the summary is the remaining root amount");
+		for (let index = 0; index < 300; index++) assert.deepEqual(runtime.gate(work.binding, work.scope, "provider_gate"), { allow: true }, `request ${index + 1}`);
+		for (let index = 0; index < 300; index++) assert.deepEqual(runtime.gate(work.binding, work.scope, "tool_gate", undefined, "read"), { allow: true }, `tool call ${index + 1}`);
+		assert.equal(denial(runtime.gate(work.binding, work.scope, "provider_gate")), "budget", "root exhaustion stops the activation");
+		settle(runtime, work, { status: "aborted" });
+		assert.equal(runtime.getWork(teamId, work.scope.work!)!.current.hold?.reason, "budget");
+		assert.equal(openBudgetIncidents(runtime.getTeam(teamId))[0]?.rootId, work.scope.work!.workId);
+	}
+	{
+		const { runtime, teamId } = makeRuntime({ limits: { teamToolCalls: 300 }, initialRequests: [{ to: "w1", task: "long" }] });
+		const work = nextWork(runtime, teamId)!;
+		for (let index = 0; index < 300; index++) assert.deepEqual(runtime.gate(work.binding, work.scope, "tool_gate", undefined, "read"), { allow: true }, `tool call ${index + 1}`);
+		assert.equal(denial(runtime.gate(work.binding, work.scope, "tool_gate", undefined, "read")), "budget", "Team exhaustion stops it");
+	}
+	{
+		const { runtime, teamId } = makeRuntime({ limits: { teamActivations: 1 } });
+		end(runtime, takeManager(runtime, teamId), yieldNow);
+		runtime.hostControl(teamId).message_lead("emergency");
+		const emergency = takeManager(runtime, teamId);
+		assert.deepEqual(emergency.input.budget, { emergency: true, modelRequests: 64, toolCalls: 256, activations: 2 });
+		for (let index = 0; index < 64; index++) assert.deepEqual(runtime.gate(emergency.binding, emergency.scope, "provider_gate"), { allow: true });
+		assert.equal(denial(runtime.gate(emergency.binding, emergency.scope, "provider_gate")), "budget");
+		for (let index = 0; index < 256; index++) assert.deepEqual(runtime.gate(emergency.binding, emergency.scope, "tool_gate", undefined, "read"), { allow: true });
+		assert.equal(denial(runtime.gate(emergency.binding, emergency.scope, "tool_gate", undefined, "read")), "budget");
+	}
+});
+
 test("gates: invalid end intents consume tool budget; one charged final attempt lets a legal reply finish", () => {
-	const { runtime, teamId } = makeRuntime({ limits: { activationToolCalls: 2, activationModelRequests: 5 }, initialRequests: [{ to: "w2", task: "finishes" }] });
+	const { runtime, teamId } = makeRuntime({ limits: { rootToolCalls: 2 }, initialRequests: [{ to: "w2", task: "finishes" }] });
 	const work = nextWork(runtime, teamId)!;
 	const gate = (phase: "provider_gate" | "tool_gate", toolCallId?: string, toolName?: string, endIntent = false) =>
 		runtime.gate(work.binding, work.scope, phase, toolCallId, toolName, endIntent);
@@ -370,7 +402,7 @@ test("gates: invalid end intents consume tool budget; one charged final attempt 
 });
 
 test("gates: repeated invalid end intents cannot bypass exhaustion; the next attempt and request stop as a budget hold", () => {
-	const { runtime, teamId } = makeRuntime({ limits: { activationToolCalls: 1, activationModelRequests: 10 }, initialRequests: [{ to: "w1", task: "loops" }] });
+	const { runtime, teamId } = makeRuntime({ limits: { rootToolCalls: 1 }, initialRequests: [{ to: "w1", task: "loops" }] });
 	const work = nextWork(runtime, teamId)!;
 	const gate = (phase: "provider_gate" | "tool_gate", toolCallId?: string) =>
 		runtime.gate(work.binding, work.scope, phase, toolCallId, toolCallId ? "team" : undefined, toolCallId !== undefined);
@@ -411,7 +443,7 @@ test("gates: tool-budget denials that end naturally become a budget hold, not a 
 });
 
 test("C04: a parked pause resumed after exhaustion stops at budget, and grants never lift attention or pause holds", async () => {
-	const { runtime, teamId } = makeRuntime({ limits: { activationModelRequests: 1 }, initialRequests: [{ to: "w1", task: "paused" }, { to: "w2", task: "attention" }] });
+	const { runtime, teamId } = makeRuntime({ limits: { rootModelRequests: 1 }, initialRequests: [{ to: "w1", task: "paused" }, { to: "w2", task: "attention" }] });
 	const paused = nextWork(runtime, teamId)!;
 	const attention = nextWork(runtime, teamId)!;
 	end(runtime, attention, { action: "yield", attention: "needs a human check", checkpoint: "stopped" });
@@ -432,7 +464,7 @@ test("C04: a parked pause resumed after exhaustion stops at budget, and grants n
 	settle(runtime, paused, { status: "aborted" });
 	assert.equal(runtime.getWork(teamId, paused.scope.work!)!.current.hold?.reason, "budget");
 
-	const grant = runtime.hostControl(teamId).grant({ kind: "team" }, { teamModelRequests: 1 }, "lift budget only");
+	const grant = runtime.hostControl(teamId).grant({ kind: "root", rootId: paused.scope.work!.workId }, { rootModelRequests: 1 }, "lift budget only");
 	assert.ok(grant.status === "applied" && "released" in grant);
 	assert.deepEqual(grant.released, [paused.scope.work], "only the budget hold is released");
 	assert.equal(runtime.getWork(teamId, attention.scope.work!)!.current.hold?.reason, "attention");
@@ -678,26 +710,26 @@ test("usage: loss keeps observed cost once; settle/lost races and repeats never 
 });
 
 test("9.4: activation input carries the tightest current scope budget summary", () => {
-	const { runtime, teamId } = makeRuntime({ limits: { rootActivations: 2, rootModelRequests: 5, activationModelRequests: 3, leadActivations: 2 },
+	const { runtime, teamId } = makeRuntime({ limits: { rootActivations: 2, rootModelRequests: 5, leadActivations: 2 },
 		initialRequests: [{ to: "w1", task: "summarised" }] });
 	const boot = takeManager(runtime, teamId);
-	assert.deepEqual(boot.input.budget, { emergency: false, modelRequests: 3, toolCalls: 256, activations: 1 });
+	assert.deepEqual(boot.input.budget, { emergency: false, modelRequests: 8192, toolCalls: 32768, activations: 1 }, "the Team's remaining amounts");
 	end(runtime, boot, yieldNow);
 	const work = runtime.takeNextActivation(teamId)!;
-	assert.deepEqual(work.input.budget, { emergency: false, modelRequests: 3, toolCalls: 256, activations: 1 });
+	assert.deepEqual(work.input.budget, { emergency: false, modelRequests: 5, toolCalls: 8192, activations: 1 });
 	ready(runtime, work);
-	for (let index = 0; index < 3; index++) assert.deepEqual(runtime.gate(work.binding, work.scope, "provider_gate"), { allow: true });
+	for (let index = 0; index < 5; index++) assert.deepEqual(runtime.gate(work.binding, work.scope, "provider_gate"), { allow: true });
 	assert.equal(denial(runtime.gate(work.binding, work.scope, "provider_gate")), "budget");
 	settle(runtime, work, { status: "aborted" });
 	assert.equal(runtime.getWork(teamId, work.scope.work!)!.current.hold?.reason, "budget");
-	runtime.hostControl(teamId).grant({ kind: "root", rootId: work.scope.work!.workId }, { rootActivations: 1 }, "continue");
+	runtime.hostControl(teamId).grant({ kind: "root", rootId: work.scope.work!.workId }, { rootActivations: 1, rootModelRequests: 2 }, "continue");
 	const again = nextWork(runtime, teamId)!;
-	assert.deepEqual(again.input.budget, { emergency: false, modelRequests: 2, toolCalls: 256, activations: 1 }, "root model requests left: 5 - 3; root activations left: 3 - 2");
+	assert.deepEqual(again.input.budget, { emergency: false, modelRequests: 2, toolCalls: 8192, activations: 1 }, "root model requests left: 7 - 5; root activations left: 3 - 2");
 	const hold = { action: "yield", attention: "stop here", checkpoint: "held" };
 	end(runtime, again, hold);
 	runtime.hostControl(teamId).message_lead("status");
 	const emergency = takeManager(runtime, teamId);
-	assert.deepEqual(emergency.input.budget, { emergency: true, modelRequests: 3, toolCalls: 256, activations: 2 });
+	assert.deepEqual(emergency.input.budget, { emergency: true, modelRequests: 64, toolCalls: 256, activations: 2 }, "emergency activations keep fixed caps");
 });
 
 test("grant validation rejects a safe-integer overflow of any raised limit atomically, before the journal", () => {

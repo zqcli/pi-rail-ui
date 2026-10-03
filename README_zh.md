@@ -108,7 +108,7 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 子任务被 held（提问或协议 hold）时不再升级给 lead，而是唤醒它的请求者：其下一次 activation 带 `childIssues` 和 notice，用 `resume_work`、`revise_work` 或 `cancel_work` 回答后再次等待（答不了就 yield attention 向上升级）。root 与 Team 级 incident 仍以 `WORK_HELD` 等事件交给 lead。宿主可用 `/rail-team <teamId> lead <alias> [reason]` 更换 lead：未处理的 Team 事件归新 lead，lead 故障后其余成员恢复运行。
 
-`subagent_team prepare` 支持 `budget: "standard" | "long" | "unlimited"`（默认 `long`：Team 4096 次 activation、8192 次模型请求、32768 次工具调用）；仅用户要求开放式/循环任务时选 `unlimited`。预算累计不重置，只有宿主可经 `/rail-team <id> grant` 提额，各档均保留 4 个 work 许可（`workPermits`，任何成员的 work activation 都计入，lead 的也算）与 lead 处理 Team 事件的独立槽位。
+`subagent_team prepare` 支持 `budget: "standard" | "long" | "unlimited"`（默认 `long`：Team 4096 次 activation、8192 次模型请求、32768 次工具调用）；仅用户要求开放式/循环任务时选 `unlimited`。单个 activation 没有模型请求/工具调用上限（成本由 root 与 Team 计数器约束）；成员连续 8 次发出同一个失败的工具调用时会被停止，work 进入 `TOOL_LOOP` hold，由请求者或 lead `resume_work`、`revise_work` 或 `cancel_work`。预算累计不重置，只有宿主可经 `/rail-team <id> grant` 提额，各档均保留 4 个 work 许可（`workPermits`，任何成员的 work activation 都计入，lead 的也算）与 lead 处理 Team 事件的独立槽位。
 
 `/rail-team` 打开实时弹窗，包含 Overview、Progress（定期评审）、Members、Tasks 和 Timeline 五个视图（Tab 切换，方向键导航），支持经确认的 cancel/resume/grant/message/revive/lead 操作（按键 `c/r/g/m/v/l`，Overview 显示完整 Team ID）及只读历史。`/rail-team list`（或在非 TUI 模式如 RPC/headless 下不带参数）保留文本列表；`/rail-team <teamId> …` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、lead（把 lead 交给其他成员）、revive（重新打开进程仍存活的 faulted 成员；Team ID 可写唯一前缀）、resume（解除 attention/protocol hold）、grant 和 cancel。模型工具 `subagent_team status` 以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。历史只读：跨 session branch 或重启不恢复旧 Promise 或继续运行，未结束的 Team 显示为 interrupted；旧 v1 Team 记录只读映射为 legacy。
 

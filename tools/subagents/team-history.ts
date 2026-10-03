@@ -277,11 +277,13 @@ function parseRoster(roster: Record<string, unknown>): { lead: string; members: 
 	return { lead, members };
 }
 
-/** Old grants named the Manager/worker counters; they are the lead/work counters now. */
+/** Old grants named the Manager/worker counters; they are the lead/work counters now. The per-activation counters no longer exist. */
 const LEGACY_COUNTERS: Record<string, string> = { managerActivations: "leadActivations", emergencyManagerActivations: "emergencyLeadActivations", workerPermits: "workPermits" };
+const REMOVED_COUNTERS: readonly string[] = ["activationModelRequests", "activationToolCalls"];
 function legacyGrant(value: unknown): unknown {
 	if (!isRecord(value) || !isRecord(value["increments"])) return value;
-	return { ...value, increments: Object.fromEntries(Object.entries(value["increments"]).map(([key, amount]) => [LEGACY_COUNTERS[key] ?? key, amount])) };
+	return { ...value, increments: Object.fromEntries(Object.entries(value["increments"]).filter(([key]) => !REMOVED_COUNTERS.includes(key))
+		.map(([key, amount]) => [LEGACY_COUNTERS[key] ?? key, amount])) };
 }
 
 /** Old terminal results tagged every member with a role. */

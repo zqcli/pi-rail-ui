@@ -701,15 +701,19 @@ function parsePrivateAction(value: unknown): PrivateAction {
 			frameKeys(value, ["action"], "provider_gate");
 			return { action: "provider_gate" };
 		case "tool_gate":
-			frameKeys(value, ["action", "toolCallId", "toolName", "endIntent"], "tool_gate");
+			frameKeys(value, ["action", "toolCallId", "toolName", "endIntent", "inputHash"], "tool_gate");
 			if (typeof value["toolCallId"] !== "string") return protocol("tool_gate.toolCallId is invalid");
 			if (typeof value["toolName"] !== "string" || !value["toolName"] || value["toolName"].length > 128) return protocol("tool_gate.toolName is invalid");
 			if (typeof value["endIntent"] !== "boolean") return protocol("tool_gate.endIntent must be boolean");
-			return { action: "tool_gate", toolCallId: normalizeNativeToolCallId(value["toolCallId"], "tool_gate.toolCallId"), toolName: value["toolName"], endIntent: value["endIntent"] };
+			if (value["inputHash"] !== undefined && (typeof value["inputHash"] !== "string" || !/^[0-9a-f]{16}$/u.test(value["inputHash"]))) return protocol("tool_gate.inputHash is invalid");
+			return { action: "tool_gate", toolCallId: normalizeNativeToolCallId(value["toolCallId"], "tool_gate.toolCallId"), toolName: value["toolName"], endIntent: value["endIntent"],
+				...(value["inputHash"] !== undefined ? { inputHash: value["inputHash"] } : {}) };
 		case "tool_result":
-			frameKeys(value, ["action", "toolCallId", "toolName"], "tool_result");
+			frameKeys(value, ["action", "toolCallId", "toolName", "isError"], "tool_result");
 			if (typeof value["toolName"] !== "string" || !value["toolName"] || value["toolName"].length > 128) return protocol("tool_result.toolName is invalid");
-			return { action: "tool_result", toolCallId: normalizeNativeToolCallId(value["toolCallId"], "tool_result.toolCallId"), toolName: value["toolName"] };
+			if (value["isError"] !== undefined && typeof value["isError"] !== "boolean") return protocol("tool_result.isError must be boolean");
+			return { action: "tool_result", toolCallId: normalizeNativeToolCallId(value["toolCallId"], "tool_result.toolCallId"), toolName: value["toolName"],
+				...(value["isError"] !== undefined ? { isError: value["isError"] } : {}) };
 		case "boundary":
 			frameKeys(value, ["action", "kind"], "boundary");
 			if (value["kind"] !== "turn_end" && value["kind"] !== "agent_end") return protocol("boundary.kind is invalid");

@@ -595,9 +595,9 @@ export class TeamMemberDriver {
 				return { kind: "gate", decision: await this.runtime.waitAtProviderGate(member.binding, activation.scope) };
 			case "tool_gate":
 				return { kind: "gate", decision: this.runtime.gate(member.binding, activation.scope, frame.request.action,
-					frame.request.toolCallId, frame.request.toolName, frame.request.endIntent) };
+					frame.request.toolCallId, frame.request.toolName, frame.request.endIntent, frame.request.inputHash) };
 			case "tool_result": {
-				const reply = this.runtime.toolResult(member.binding, activation.scope, frame.request.toolCallId, frame.request.toolName);
+				const reply = this.runtime.toolResult(member.binding, activation.scope, frame.request.toolCallId, frame.request.toolName, frame.request.isError);
 				return reply.ok ? { kind: "ack" } : { kind: "gate", decision: {
 					allow: false, reason: "activation_ending", message: reply.error.message,
 				} };

@@ -261,16 +261,16 @@ export interface TeamBudgetLimits {
 	rootActivations: number;
 	teamActivations: number;
 	leadActivations: number;
-	activationModelRequests: number;
 	rootModelRequests: number;
 	teamModelRequests: number;
-	activationToolCalls: number;
 	rootToolCalls: number;
 	teamToolCalls: number;
 	emergencyLeadActivations: number;
 	reservedResultBytes: number;
 }
 export const TEAM_BUDGET_UNLIMITED = 1_000_000_000;
+/** Consecutive failed tool results of the same call (tool and input) that count as a tool loop. */
+export const TEAM_LOOP_REPEATS = 8;
 const STANDARD_TEAM_BUDGET: Readonly<TeamBudgetLimits> = Object.freeze({
 	workPermits: 4,
 	memberUnresolvedWork: 64,
@@ -281,10 +281,8 @@ const STANDARD_TEAM_BUDGET: Readonly<TeamBudgetLimits> = Object.freeze({
 	rootActivations: 128,
 	teamActivations: 512,
 	leadActivations: 128,
-	activationModelRequests: 64,
 	rootModelRequests: 256,
 	teamModelRequests: 1024,
-	activationToolCalls: 256,
 	rootToolCalls: 1024,
 	teamToolCalls: 4096,
 	emergencyLeadActivations: 3,
@@ -377,8 +375,9 @@ export type PrivateAction =
 	| { action: "business"; args: Record<string, unknown> }
 	| { action: "input_ready"; deliveryId: string }
 	| { action: "provider_gate" }
-	| { action: "tool_gate"; toolCallId: string; toolName: string; endIntent: boolean }
-	| { action: "tool_result"; toolCallId: string; toolName: string }
+	/** `inputHash` is a short fingerprint of the tool input, for tool-loop detection. */
+	| { action: "tool_gate"; toolCallId: string; toolName: string; endIntent: boolean; inputHash?: string }
+	| { action: "tool_result"; toolCallId: string; toolName: string; isError?: boolean }
 	| { action: "boundary"; kind: "turn_end" | "agent_end" };
 
 export interface ChildRequestFrame {

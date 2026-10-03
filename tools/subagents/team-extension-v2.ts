@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	TEAM_ACTIVATION_MESSAGE_TYPE, TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_CACHE, TEAM_COMMAND_DESCRIPTION,
@@ -166,8 +166,8 @@ export default function install(pi: ExtensionAPI): void {
 		});
 	};
 
-	const acknowledgeToolResult = async (toolCallId: string, toolName: string, ctx: ExtensionContext): Promise<void> => {
-		const reply = await request({ action: "tool_result", toolCallId, toolName }, ctx);
+	const acknowledgeToolResult = async (toolCallId: string, toolName: string, ctx: ExtensionContext, isError?: boolean): Promise<void> => {
+		const reply = await request({ action: "tool_result", toolCallId, toolName, ...(isError !== undefined ? { isError } : {}) }, ctx);
 		if (reply.kind !== "ack") throw new Error("Team runtime returned an invalid tool-result acknowledgment");
 	};
 
@@ -367,7 +367,8 @@ export default function install(pi: ExtensionAPI): void {
 		if (event.toolName === "subagent" || event.toolName === "subagent_team") return { block: true, reason: "Team members cannot spawn subagents" };
 		try {
 			const reply = await request({ action: "tool_gate", toolCallId: event.toolCallId, toolName: event.toolName,
-				endIntent: event.toolName === "team" && isRecord(event.input) && isEndIntent(event.input) }, ctx, ctx.signal);
+				endIntent: event.toolName === "team" && isRecord(event.input) && isEndIntent(event.input),
+				inputHash: createHash("sha1").update(canonicalJson(event.input)).digest("hex").slice(0, 16) }, ctx, ctx.signal);
 			if (reply.kind !== "gate") return { block: true, reason: "Team runtime returned an invalid tool gate" };
 			if (!reply.decision.allow) {
 				try { await acknowledgeToolResult(event.toolCallId, event.toolName, ctx); }
@@ -386,7 +387,7 @@ export default function install(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		if (!binding || !active) return;
 		try {
-			await acknowledgeToolResult(event.toolCallId, event.toolName, ctx);
+			await acknowledgeToolResult(event.toolCallId, event.toolName, ctx, event.isError);
 		} catch (error) {
 			fail(ctx, error);
 		}

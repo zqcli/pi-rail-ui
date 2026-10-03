@@ -1,6 +1,6 @@
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import {
-	TEAM_COMMAND_CACHE, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_EVENT_BATCH,
+	TEAM_COMMAND_CACHE, TEAM_LOOP_REPEATS, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_PROTOCOL_VERSION,
 	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_BUDGET_UNLIMITED, TEAM_MAX_REVIEWS, isTerminalWorkState, reviewVerdict, sameWorkRef,
@@ -50,6 +50,7 @@ const LEAD_RETRY_WINDOW_MS = 30 * 60_000;
 /** Names the exact work, because a member's session outlives its works and a model may answer an earlier one. */
 /** Events that only advise the lead: they never block close_team and are marked processed when the Team closes. */
 const ADVISORY_EVENTS: readonly string[] = ["REVIEW_READY", "TEAM_QUIESCENT"];
+const loopKey = (toolName: string, inputHash?: string): string | undefined => inputHash === undefined ? undefined : `${toolName}\0${inputHash}`;
 const workNotice = (work: WorkRef): string => `${prompt("team", "work_notice", { work: workRefKey(work) })} ${prompt("team", "brief_pointer")}`;
 
 export interface RuntimeActivation {
@@ -72,7 +73,7 @@ export interface NativeCompletion {
 }
 
 export type ActivationCompletionReason = "normal" | "policy_pause" | "policy_superseded" | "policy_cancelled"
-	| "budget_hold" | "native_failure" | "transport_failure";
+	| "budget_hold" | "loop_hold" | "native_failure" | "transport_failure";
 
 export interface ActivationCompletion {
 	native: NativeCompletion;
@@ -182,7 +183,7 @@ interface ActiveActivation {
 	parked: boolean;
 	resumeRequested: boolean;
 	providerGatePending: boolean;
-	toolCalls: Map<string, { toolName: string; allowed: boolean; denial?: GateDecision }>;
+	toolCalls: Map<string, { toolName: string; inputHash?: string; allowed: boolean; denial?: GateDecision }>;
 	completedToolCalls: Map<string, string>;
 	pauseBlockedToolCalls: number;
 	providerGatePromise?: Promise<GateDecision>;
@@ -194,6 +195,10 @@ interface ActiveActivation {
 	budgetStop?: BudgetExhaustion;
 	/** The one end-intent attempt allowed (and charged) after the tool budget was exhausted. */
 	budgetFinalAttempt?: boolean;
+	/** The current run of consecutive failed results of one identical call (tool name + input fingerprint). */
+	loop?: { key: string; count: number };
+	/** Set when a work activation hit the tool-loop limit: it stops at its next gate and the work is held. */
+	loopStop?: { tool: string };
 	postIntentContinuations: number;
 	cache: Map<string, CachedAction>;
 	lastSequence: number;
@@ -1153,8 +1158,6 @@ export class TeamRuntime {
 			depth: Math.max(0, ...records.map((record) => record.depth)),
 			workPermits: this.usedWorkPermits(team),
 			memberUnresolvedWork: Math.max(0, ...members.map((member) => records.filter((record) => record.assignee === member.id && !isTerminalWorkState(currentVersion(record).state)).length)),
-			activationModelRequests: Math.max(0, ...members.map((member) => member.active?.budget.modelRequests ?? 0)),
-			activationToolCalls: Math.max(0, ...members.map((member) => member.active?.budget.toolCalls ?? 0)),
 		};
 		for (const counter of ROOT_GRANTABLE_COUNTERS) used[counter] = Math.max(0, ...budget.roots.map((root) => root.used[counter]));
 		const changes = Object.keys(incrementsValue).map((counter) => scope.kind === "team"
@@ -1410,7 +1413,7 @@ export class TeamRuntime {
 
 	/** Synchronous permission check used by tool_call preflight and pure Runtime tests. */
 	gate(bindingValue: BindingV2, scopeValue: ActivationScope, phase: "provider_gate" | "tool_gate",
-		toolCallId?: string, toolName?: string, endIntent = false): GateDecision {
+		toolCallId?: string, toolName?: string, endIntent = false, inputHash?: string): GateDecision {
 		let binding: BindingV2;
 		let scope: ActivationScope;
 		let member: RuntimeMember;
@@ -1446,6 +1449,10 @@ export class TeamRuntime {
 		}
 		const endIntentTool = phase === "tool_gate" && toolName === "team" && endIntent;
 		let decision = this.gateDecision(team, member, active, scope, phase, endIntentTool);
+		// A call that already failed TEAM_LOOP_REPEATS times in a row is not run again (the lead's events activation has no hold to fall back on).
+		if (decision.allow && phase === "tool_gate" && active.loop?.count === TEAM_LOOP_REPEATS && active.loop.key === loopKey(toolName!, inputHash)) {
+			decision = this.loopDenial(toolName!);
+		}
 		if (decision.allow && phase === "provider_gate") decision = this.admitProvider(team, active);
 		else if (decision.allow) {
 			// Every real tool attempt is charged once, including end intents that later fail validation.
@@ -1463,7 +1470,7 @@ export class TeamRuntime {
 			}
 		}
 		if (nativeToolCallId) {
-			active.toolCalls.set(nativeToolCallId, { toolName: toolName ?? "", allowed: decision.allow, ...(!decision.allow ? { denial: decision } : {}) });
+			active.toolCalls.set(nativeToolCallId, { toolName: toolName ?? "", ...(inputHash ? { inputHash } : {}), allowed: decision.allow, ...(!decision.allow ? { denial: decision } : {}) });
 			if (!decision.allow && decision.reason === "paused") active.pauseBlockedToolCalls++;
 		}
 		return decision;
@@ -1477,6 +1484,10 @@ export class TeamRuntime {
 		active.budgetStop ??= exhausted;
 		active.completionReason ??= "budget_hold";
 		return { allow: false, reason: "budget", message: this.budgetMessage(exhausted) };
+	}
+
+	private loopDenial(tool: string): GateDecision {
+		return { allow: false, reason: "policy_stop", message: prompt("team", "tool_loop_denied", { tool, count: String(TEAM_LOOP_REPEATS) }) };
 	}
 
 	private budgetMessage(exhausted: BudgetExhaustion): string {
@@ -1518,7 +1529,7 @@ export class TeamRuntime {
 	}
 
 	/** A real native tool_result closes only the exact preflighted tool-call slot. */
-	toolResult(bindingValue: BindingV2, scopeValue: ActivationScope, toolCallId: string, toolName: string): TeamReply {
+	toolResult(bindingValue: BindingV2, scopeValue: ActivationScope, toolCallId: string, toolName: string, isError?: boolean): TeamReply {
 		const binding = this.validateBinding(bindingValue);
 		const scope = this.validateScope(scopeValue);
 		const team = this.team(binding.teamId);
@@ -1536,6 +1547,21 @@ export class TeamRuntime {
 		active.toolCalls.delete(id);
 		active.completedToolCalls.set(id, call.toolName);
 		if (active.completedToolCalls.size > TEAM_COMMAND_CACHE) active.completedToolCalls.delete(active.completedToolCalls.keys().next().value!);
+		// Tool loop: the same call (tool + input) failing again and again. A call denied at the gate is not a real result.
+		const key = loopKey(call.toolName, call.inputHash);
+		if (!call.denial) {
+			if (!isError || key === undefined) delete active.loop;
+			else {
+				active.loop = { key, count: active.loop?.key === key ? active.loop.count + 1 : 1 };
+				if (active.loop.count === TEAM_LOOP_REPEATS) {
+					this.note(team, `${member.id} tool loop: ${call.toolName} failed ${TEAM_LOOP_REPEATS}× with the same input`);
+					if (active.scope.kind === "work") {
+						active.loopStop = { tool: call.toolName };
+						active.completionReason ??= "loop_hold";
+					}
+				}
+			}
+		}
 		if (active.providerGatePending) this.tryParkAtProviderGate(team, member, active);
 		// Let the matching private ACK reach Pi before denying its next provider gate.
 		// The stop-expiry timer remains the fallback if the native turn never reaches that safe point.
@@ -1551,6 +1577,7 @@ export class TeamRuntime {
 			return { allow: false, reason: "stale_scope", message: "This member is not running the exact active scope" };
 		}
 		if (active.stopReason) return { allow: false, reason: "policy_stop", message: "This activation's exact work scope has ended" };
+		if (active.loopStop) return this.loopDenial(active.loopStop.tool);
 		if (member.pause !== "none" && !allowPausedEndIntent) return { allow: false, reason: "paused", message: "This member is paused by TeamRuntime" };
 		const delivery = team.deliveries.get(active.deliveryId);
 		if (!active.inputReady || delivery?.state !== "delivered") {
@@ -3113,7 +3140,7 @@ export class TeamRuntime {
 		const completion = active.completion;
 		const completionReason = completion?.reason ?? (active.native?.status === "success" ? "normal" : "native_failure");
 		const controlledAbort = active.native?.status === "aborted"
-			&& ["policy_pause", "policy_superseded", "policy_cancelled", "budget_hold"].includes(completionReason);
+			&& ["policy_pause", "policy_superseded", "policy_cancelled", "budget_hold", "loop_hold"].includes(completionReason);
 		if (active.native?.status !== "success" && !controlledAbort) {
 			delete team.ledger.get(ref.workId)!.stagedWait;
 			if (!active.stopReason && version.state === "running" && this.scheduleRetry(team, member, active)) {
@@ -3147,8 +3174,8 @@ export class TeamRuntime {
 			this.wakeWaiters(team);
 			return;
 		}
-		if ((controlledAbort || (active.native?.status === "success" && (completionReason === "policy_pause" || completionReason === "budget_hold")))
-			&& (completionReason === "policy_pause" || completionReason === "budget_hold") && !active.intent) {
+		if ((controlledAbort || active.native?.status === "success") && !active.intent
+			&& (completionReason === "policy_pause" || completionReason === "budget_hold" || completionReason === "loop_hold")) {
 			delete entry.stagedWait;
 			if (current && sameWorkRef(current, ref) && version.state === "running") {
 				const progress = active.native?.finalAssistantText?.trim();
@@ -3158,6 +3185,9 @@ export class TeamRuntime {
 					version.state = "queued";
 					member.pause = "confirmed";
 					if (!team.ready.some((queued) => sameWorkRef(queued, ref))) team.ready.push(copy(ref));
+				} else if (completionReason === "loop_hold") {
+					this.holdWork(team, member, ref, "TOOL_LOOP",
+						`${member.id} repeated the same failing ${active.loopStop!.tool} call ${TEAM_LOOP_REPEATS} times; the work is held`, "protocol");
 				} else {
 					const incident = this.budgetIncident(team, active.budgetStop ?? { scope: { kind: "team" }, counter: "teamModelRequests" });
 					version.state = "blocked";

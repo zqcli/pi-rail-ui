@@ -216,6 +216,34 @@ test("wrong native context aborts before private readiness or provider continuat
 	assert.equal(h.privateFrames().filter((frame) => frame.kind === "request").length, 0);
 });
 
+test("tool_call sends a stable fingerprint of the input and tool_result reports isError, both parsed by the frame codec", async () => {
+	const h = harness();
+	await h.command(bindCommand(h));
+	await h.command(activateCommand(h));
+	const gate = async (toolCallId: string, input: unknown, after: number) => {
+		const pending = h.handlers.get("tool_call")!({ toolName: "read", toolCallId, input }, h.ctx);
+		const frame = await waitForRequest(h, "tool_gate", after);
+		await replyToRequest(h, frame, { kind: "gate", decision: { allow: true } }, `reply-${toolCallId}`);
+		assert.equal(await pending, undefined);
+		return parseChildFrame(frame);
+	};
+	const first: any = await gate("call-1", { path: "a.ts", range: { to: 2, from: 1 } }, 0);
+	const second: any = await gate("call-2", { range: { from: 1, to: 2 }, path: "a.ts" }, 1);
+	const other: any = await gate("call-3", { path: "b.ts" }, 2);
+	assert.match(first.request.inputHash, /^[0-9a-f]{16}$/u);
+	assert.equal(second.request.inputHash, first.request.inputHash, "key order does not change the fingerprint");
+	assert.notEqual(other.request.inputHash, first.request.inputHash);
+
+	for (const [toolCallId, isError] of [["call-1", true], ["call-2", false]] as const) {
+		const pending = h.handlers.get("tool_result")!({ toolName: "read", toolCallId, isError }, h.ctx);
+		const frame = (await waitForRequest(h, "tool_result", toolCallId === "call-1" ? 3 : 4));
+		assert.equal(frame.request.isError, isError);
+		assert.deepEqual(parseChildFrame(frame), frame);
+		await replyToRequest(h, frame, { kind: "ack" }, `ack-${toolCallId}`);
+		await pending;
+	}
+});
+
 test("business tool errors retain the structured TeamError JSON including its code", async () => {
 	const h = harness();
 	await h.command(bindCommand(h));

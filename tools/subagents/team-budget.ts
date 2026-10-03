@@ -33,6 +33,9 @@ export interface TeamBudgetUsed {
 interface RootCounters { rootActivations: number; rootModelRequests: number; rootToolCalls: number }
 
 export const TEAM_MAX_BUDGET_GRANTS = 128;
+/** Emergency lead activations (Team budget exhausted) stay bounded by these fixed per-activation caps. */
+const EMERGENCY_MODEL_REQUESTS = 64;
+const EMERGENCY_TOOL_CALLS = 256;
 
 export class TeamBudget {
 	readonly used: TeamBudgetUsed = { teamActivations: 0, leadActivations: 0, teamModelRequests: 0, teamToolCalls: 0, emergencyLeadActivations: 0 };
@@ -89,13 +92,12 @@ export class TeamBudget {
 
 	/** Why one more observable provider request or tool attempt cannot run; undefined when it may. */
 	stepExhaustion(kind: "model" | "tool", activation: ActivationBudget, rootId: string | undefined): BudgetExhaustion | undefined {
-		const activationCounter = kind === "model" ? "activationModelRequests" : "activationToolCalls";
-		const activationUsed = kind === "model" ? activation.modelRequests : activation.toolCalls;
-		if (activationUsed >= this.limits[activationCounter]) {
-			return { scope: rootId !== undefined ? { kind: "root", rootId } : { kind: "team" }, counter: activationCounter };
+		// Emergency activations are bounded only by their fixed per-activation caps and the emergency count.
+		if (activation.emergency) {
+			const used = kind === "model" ? activation.modelRequests : activation.toolCalls;
+			return used >= (kind === "model" ? EMERGENCY_MODEL_REQUESTS : EMERGENCY_TOOL_CALLS)
+				? { scope: { kind: "team" }, counter: "emergencyLeadActivations" } : undefined;
 		}
-		// Emergency activations are bounded only by their per-activation limit and the emergency count.
-		if (activation.emergency) return undefined;
 		const teamCounter = kind === "model" ? "teamModelRequests" : "teamToolCalls";
 		if (this.used[teamCounter] >= this.limits[teamCounter]) return { scope: { kind: "team" }, counter: teamCounter };
 		const rootCounter = kind === "model" ? "rootModelRequests" : "rootToolCalls";
@@ -123,13 +125,13 @@ export class TeamBudget {
 	/** Model-facing summary for a new activation, computed before it is recorded (spec 9.4). */
 	inputSummary(rootId: string | undefined, lead: boolean, emergency: boolean): ActivationBudgetSummary {
 		const left = (limit: number, used: number) => Math.max(0, limit - used);
-		let modelRequests = this.limits.activationModelRequests;
-		let toolCalls = this.limits.activationToolCalls;
+		let modelRequests = EMERGENCY_MODEL_REQUESTS;
+		let toolCalls = EMERGENCY_TOOL_CALLS;
 		let activations: number;
 		if (emergency) activations = left(this.limits.emergencyLeadActivations, this.used.emergencyLeadActivations + 1);
 		else {
-			modelRequests = Math.min(modelRequests, left(this.limits.teamModelRequests, this.used.teamModelRequests));
-			toolCalls = Math.min(toolCalls, left(this.limits.teamToolCalls, this.used.teamToolCalls));
+			modelRequests = left(this.limits.teamModelRequests, this.used.teamModelRequests);
+			toolCalls = left(this.limits.teamToolCalls, this.used.teamToolCalls);
 			activations = left(this.limits.teamActivations, this.used.teamActivations + 1);
 			if (lead) activations = Math.min(activations, left(this.limits.leadActivations, this.used.leadActivations + 1));
 			if (rootId !== undefined) {

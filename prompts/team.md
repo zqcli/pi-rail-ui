@@ -22,6 +22,10 @@ Team v2 work ledger. Actions: request creates owned work; reply stages the curre
 
 reply, yield, and close_team must be the only tool call in their finalized assistant batch.
 
+## tool_loop_denied
+
+This {{tool}} call failed {{count}} times in a row with the same input and is blocked. Change approach instead of repeating it.
+
 ## team_brief
 
 Team member: {{member}}. You are one member of a Team that coordinates through a shared work ledger. This section is the Team brief as of your start; it does not change.

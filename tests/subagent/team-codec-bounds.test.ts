@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Check } from "typebox/value";
 import {
-	errorReply, jsonBytes, jsonTextBytes, normalizeTeamAction, parseParentCommand, parseTeamReply,
+	errorReply, jsonBytes, jsonTextBytes, normalizeTeamAction, parseChildFrame, parseParentCommand, parseTeamReply,
 	projectActivationInput, projectErrorText, projectOwnedChildren, projectWorkChildren, projectWorkError,
 	TEAM_TOOL_SCHEMA, TeamProtocolError,
 } from "../../tools/subagents/team-codec";
@@ -189,5 +189,18 @@ test("omission metadata is strict, and projection retains detached copies of chi
 	for (const omitted of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
 		assert.throws(() => parseParentCommand(activate({ ...input(), ownedChildrenOmitted: omitted })), protocolFailure);
 		assert.throws(() => parseTeamReply({ ok: true, from: "@hub", to: "owner", data: { ...workView(), childrenOmitted: omitted } }), protocolFailure);
+	}
+});
+
+test("private tool_gate may carry an input fingerprint and tool_result an isError flag; frames without them still parse", () => {
+	const frame = (request: unknown) => ({ version: 2, kind: "request", binding, activation: { activationId: "activation", kind: "work", work },
+		sequence: 1, rpcRequestId: "rpc-1", request });
+	const gate = { action: "tool_gate", toolCallId: "call-1", toolName: "bash", endIntent: false };
+	const result = { action: "tool_result", toolCallId: "call-1", toolName: "bash" };
+	for (const request of [gate, { ...gate, inputHash: "0123456789abcdef" }, result, { ...result, isError: true }, { ...result, isError: false }]) {
+		assert.deepEqual(parseChildFrame(frame(request)), frame(request));
+	}
+	for (const request of [{ ...gate, inputHash: "xyz" }, { ...gate, inputHash: 7 }, { ...result, isError: "yes" }]) {
+		assert.throws(() => parseChildFrame(frame(request)), protocolFailure);
 	}
 });

@@ -1250,7 +1250,7 @@ test("real Pi budget safe stop: the root model budget stops after the running st
 });
 
 test("real Pi A09: a third-party continuation after a staged reply stays settling, is refused new side effects, is budget-bounded, and commits the intent once", { timeout: 90000 }, async (t) => {
-	const { runtime, teamId, driver, handles } = await createHarness(t, "a09-live", ["lead", "w1", "w2"], { limits: { activationModelRequests: 3 } });
+	const { runtime, teamId, driver, handles } = await createHarness(t, "a09-live", ["lead", "w1", "w2"], { limits: { rootModelRequests: 3 } });
 	const snapshots: Array<{ state: string | undefined; activity: string | undefined }> = [];
 	const gate = runtime.gate.bind(runtime);
 	runtime.gate = (binding, scope, phase, ...rest) => {
@@ -1293,7 +1293,7 @@ test("real Pi A09: a third-party continuation after a staged reply stays settlin
 });
 
 test("real Pi tool budget: invalid end intents are counted native steps and one final legal reply still settles", { timeout: 90000 }, async (t) => {
-	const { runtime, teamId, driver, handles } = await createHarness(t, "tool-budget", ["lead", "w1", "w2"], { limits: { activationToolCalls: 2 } });
+	const { runtime, teamId, driver, handles } = await createHarness(t, "tool-budget", ["lead", "w1", "w2"], { limits: { rootToolCalls: 2 } });
 	runtime.launch(teamId);
 	await drain(driver, teamId);
 	const team = runtime.getTeam(teamId);

@@ -261,3 +261,47 @@ test("host revive of a faulted lead requeues its held work, redelivers its event
 	assert.equal(runtime.getTeam(teamId).lifecycle, "closed");
 	runtime.assertInvariants(teamId);
 });
+
+test("revive and handover while the host has paused the Team keep every member paused until continue", () => {
+	const { runtime, teamId } = world([{ to: "w1", task: "root" }, { to: "w2", task: "bystander" }]);
+	bootIdle(runtime, teamId);
+	fault(runtime, take(runtime, teamId));
+	assert.deepEqual(state(runtime, teamId, "w1"), ["faulted", "owned"]);
+	const pauses = () => ["lead", "w1", "w2", "w3"].map((id) => memberOf(runtime, teamId, id).pause);
+	runtime.pauseTeam(teamId);
+	assert.deepEqual(pauses(), ["confirmed", "none", "confirmed", "confirmed"], "a faulted member is not paused by the host");
+
+	runtime.reviveMember(teamId, "w1");
+	assert.deepEqual(state(runtime, teamId, "w1"), ["open", "owned"]);
+	assert.deepEqual(pauses(), ["confirmed", "confirmed", "confirmed", "confirmed"], "a member reopened during the pause stays paused");
+	runtime.handoverLead(teamId, "w3", "swap during the pause");
+	assert.equal(runtime.getTeam(teamId).lead, "w3");
+	assert.deepEqual(pauses(), ["confirmed", "confirmed", "confirmed", "confirmed"], "the new lead stays paused too");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "nothing starts, not even for the new lead's events");
+
+	runtime.continueTeam(teamId);
+	assert.deepEqual(pauses(), ["none", "none", "none", "none"]);
+	const lead = take(runtime, teamId);
+	assert.equal(lead.binding.memberId, "w3");
+	assert.ok(events(lead).some((event) => /continued the Team/u.test(event.message)));
+	assert.ok(events(lead).some((event) => /The host revived w1/u.test(event.message)));
+	runtime.assertInvariants(teamId);
+});
+
+test("a lead that fails during the host pause is revived still paused; its fault recovery does not lift the host's pause", () => {
+	const { runtime, teamId } = world([{ to: "w1", task: "root" }]);
+	bootIdle(runtime, teamId);
+	runtime.messageLead(teamId, "ping");
+	const lead = take(runtime, teamId);
+	runtime.pauseTeam(teamId);
+	fault(runtime, lead);
+	assert.deepEqual(state(runtime, teamId, "lead"), ["faulted", "owned"]);
+	runtime.reviveMember(teamId, "lead");
+	assert.deepEqual(["lead", "w1", "w2", "w3"].map((id) => memberOf(runtime, teamId, id).pause), ["confirmed", "confirmed", "confirmed", "confirmed"]);
+	assert.equal(runtime.takeNextActivation(teamId), undefined);
+	runtime.continueTeam(teamId);
+	const again = take(runtime, teamId);
+	assert.equal(again.binding.memberId, "lead");
+	assert.ok(events(again).some((event) => event.message === "ping"), "the batch the lead never finished is delivered again");
+	runtime.assertInvariants(teamId);
+});

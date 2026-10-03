@@ -1073,7 +1073,7 @@ function parsePolicy(value: unknown, field: string): TeamMemberPolicy {
 
 function parseTeamTeamView(value: unknown): TeamTeamView {
 	if (!isRecord(value)) return protocol("team view must be an object");
-	frameKeys(value, ["version", "teamId", "lifecycle", "health", "stateVersion", "eventSeq", "lead", "timeoutSeconds", "deadline", "brief", "members", "works", "incidents", "incidentsOmitted", "budget", "usage", "outcome", "reason"], "team view");
+	frameKeys(value, ["version", "teamId", "lifecycle", "health", "stateVersion", "eventSeq", "lead", "timeoutSeconds", "deadline", "paused", "brief", "members", "works", "incidents", "incidentsOmitted", "budget", "usage", "outcome", "reason"], "team view");
 	if (value["version"] !== TEAM_PROTOCOL_VERSION) return protocol("team view version is invalid");
 	const lifecycle = value["lifecycle"];
 	if (!["prepared", "active", "closing", "closed", "failed", "cancelled", "interrupted"].includes(String(lifecycle))) return protocol("team view lifecycle is invalid");
@@ -1137,9 +1137,15 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 	if (timeoutSeconds !== null && (typeof timeoutSeconds !== "number" || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > TEAM_MAX_TIMEOUT_SECONDS)) return protocol("team view timeoutSeconds is invalid");
 	const deadline = value["deadline"];
 	if (deadline !== null && (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline < 0)) return protocol("team view deadline is invalid");
+	const paused = value["paused"];
+	if (paused !== undefined) {
+		if (!isRecord(paused)) return protocol("team view paused must be an object");
+		frameKeys(paused, ["since", "finishing"], "team view paused");
+	}
 	return { version: TEAM_PROTOCOL_VERSION, teamId: frameId(value["teamId"], "team view.teamId"), lifecycle: lifecycle as TeamTeamView["lifecycle"], health: health as Health,
 		stateVersion: safeInteger(value["stateVersion"], "team view.stateVersion", 0), eventSeq: safeInteger(value["eventSeq"], "team view.eventSeq", 0),
 		lead, timeoutSeconds, deadline, brief, members, works: counts,
+		...(isRecord(paused) ? { paused: { since: safeInteger(paused["since"], "team view paused.since", 0), finishing: safeInteger(paused["finishing"], "team view paused.finishing", 0) } } : {}),
 		incidents: array(value["incidents"], "team view.incidents", TEAM_VIEW_MAX_INCIDENTS).map((incident, index) => parseIncident(incident, `team view.incidents[${index}]`)),
 		incidentsOmitted: safeInteger(value["incidentsOmitted"], "team view.incidentsOmitted", 0),
 		budget: { limits, used, exhausted: rawBudget["exhausted"],

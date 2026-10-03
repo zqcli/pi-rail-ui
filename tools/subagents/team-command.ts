@@ -5,11 +5,11 @@ import type { TeamSessionHost } from "./team-host";
 import { showTeamOverlay } from "./team-overlay";
 import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, workRefKey, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView } from "./team-protocol";
 import { clock, type GrantPreview } from "./team-runtime";
-import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView } from "./team-tool";
+import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView, lifecycleText } from "./team-tool";
 
-const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "review"] as const;
+const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "pause", "continue", "review"] as const;
 const REVIEW_USAGE = "review [now|every <N> [by <alias>]|off]";
-const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|${REVIEW_USAGE}`;
+const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|pause [reason]|continue|${REVIEW_USAGE}`;
 
 /** Live and history Team IDs that equal or start with what the user typed (the popup shows only the first 8 characters). */
 function matchTeamIds(host: TeamSessionHost, typed: string): string[] {
@@ -28,7 +28,7 @@ function completionTeam(host: TeamSessionHost, typed: string) {
  */
 export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionHost | undefined): void {
 	pi.registerCommand("rail-team", {
-		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead, revive)",
+		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead, revive, pause, continue)",
 		getArgumentCompletions: (prefix) => {
 			const host = getHost();
 			if (!host) return null;
@@ -90,7 +90,7 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		const teams = host.runtime.listTeams();
 		const liveIds = new Set(teams.map((team) => team.teamId));
 		const lines = [
-			...teams.map((team) => `${team.teamId} · ${team.lifecycle.toUpperCase()} · ${team.health === "ok" ? "ok" : "needs attention"} · lead ${team.lead} · works ${team.works.total}`),
+			...teams.map((team) => `${team.teamId} · ${lifecycleText(team)} · ${team.health === "ok" ? "ok" : "needs attention"} · lead ${team.lead} · works ${team.works.total}`),
 			...host.history.teams.filter((entry) => !liveIds.has(entry.teamId)).map(formatHistorySummary),
 			...(host.history.skipped ? [`${host.history.skipped} malformed Team history entries skipped`] : []),
 		];
@@ -201,6 +201,16 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			ctx.ui.notify(`${alias} revived in ${teamId}`, "info");
 			return;
 		}
+		case "pause":
+			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; it cannot be paused.`);
+			if (!await confirm(ctx, `Pause Team ${teamId}?`, "Running activations finish their current model request and the tool calls already issued, then stop. Nothing new starts until you continue; the Team deadline does not run meanwhile.")) return;
+			ctx.ui.notify(`Team ${teamId} ${host.runtime.pauseTeam(teamId, text || undefined).status === "applied" ? "paused" : "was already paused"}`, "info");
+			return;
+		case "continue":
+			if (liveTeam.lifecycle !== "active") throw new Error(`Team ${teamId} is ${liveTeam.lifecycle}; it cannot be continued.`);
+			if (!await confirm(ctx, `Continue Team ${teamId}?`, "Parked work resumes where it stopped and scheduling restarts. The lead gets a message that the host continued the Team.")) return;
+			ctx.ui.notify(`Team ${teamId} ${host.runtime.continueTeam(teamId).status === "applied" ? "continued" : "was not paused"}`, "info");
+			return;
 		case "review":
 			await reviewCommand(host, liveTeam, rest, ctx);
 			return;

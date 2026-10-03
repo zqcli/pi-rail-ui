@@ -2090,3 +2090,249 @@ test("workPermits bounds work activations of every member, the lead's included; 
 	const w2Work = runtime.takeNextActivation(teamId)!;
 	assert.equal(w2Work.binding.memberId, "w2", "the permit freed by the lead's work goes to the next member");
 });
+
+const pausesOf = (runtime: TeamRuntime, teamId: string) => runtime.getTeam(teamId).members.map((member) => `${member.id}:${member.pause}`);
+const leadEvents = (activation: RuntimeActivation) => activation.input.scope.kind === "events" ? activation.input.scope.events : [];
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("host pause: a running worker finishes its tool call and parks at the next provider gate, nothing new starts, and continue resumes the same run and the pending work", async () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "running root" }, { to: "w2", task: "queued root" }]);
+	finishManagerBoot(runtime, teamId);
+	const first = runtime.takeNextActivation(teamId)!;
+	assert.equal(first.binding.memberId, "w1");
+	inputReady(runtime, first);
+	assert.equal(runtime.gate(first.binding, first.scope, "tool_gate", "approved-read", "read").allow, true);
+
+	assert.equal(runtime.continueTeam(teamId).status, "unchanged", "nothing to continue");
+	assert.deepEqual(runtime.pauseTeam(teamId, "lunch"), { actor: "@host", status: "applied", teamId, lifecycle: "active" });
+	assert.equal(runtime.pauseTeam(teamId).status, "unchanged");
+	assert.deepEqual(pausesOf(runtime, teamId), ["lead:confirmed", "w1:requested", "w2:confirmed"]);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "active", "pausing adds no lifecycle");
+	assert.equal(runtime.getTeam(teamId).paused?.finishing, 1);
+	assert.equal(runtime.panelFacts(teamId).waitingFor, "Paused by the host (1 activation finishing)");
+	assert.equal(runtime.gate(first.binding, first.scope, "tool_gate", "blocked-write", "write").allow, false, "no new tool call starts");
+	assert.equal(runtime.toolResult(first.binding, first.scope, "blocked-write", "write").ok, true);
+	let decision: boolean | undefined;
+	const gate = runtime.waitAtProviderGate(first.binding, first.scope).then((value) => { decision = value.allow; return value; });
+	runtime.hostControl(teamId).message_lead("while paused");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "neither the queued work nor the lead's event starts while paused");
+	assert.equal(pausesOf(runtime, teamId)[1], "w1:requested", "the issued tool call has not returned yet");
+
+	assert.equal(runtime.toolResult(first.binding, first.scope, "approved-read", "read").ok, true);
+	await tick();
+	assert.equal(decision, undefined, "the next provider gate parks");
+	assert.equal(pausesOf(runtime, teamId)[1], "w1:confirmed");
+	assert.equal(runtime.getTeam(teamId).paused?.finishing, 0);
+	assert.match(runtime.panelFacts(teamId).waitingFor ?? "", /^Paused by the host for \d+:\d\d$/u);
+	assert.equal(runtime.takeNextActivation(teamId), undefined);
+	runtime.assertInvariants(teamId);
+
+	assert.deepEqual(runtime.continueTeam(teamId), { actor: "@host", status: "applied", teamId, lifecycle: "active" });
+	assert.equal((await gate).allow, true, "the parked run continues");
+	assert.deepEqual(pausesOf(runtime, teamId), ["lead:none", "w1:none", "w2:none"]);
+	assert.equal(runtime.getTeam(teamId).paused, undefined);
+	const lead = runtime.takeNextActivation(teamId)!;
+	assert.equal(lead.scope.kind, "events");
+	const messages = leadEvents(lead).filter((event) => event.kind === "USER_COMMAND").map((event) => event.message);
+	assert.equal(messages.length, 2);
+	assert.equal(messages[0], "while paused");
+	assert.match(messages[1]!, /The host continued the Team after pausing it for about 1 min/u);
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "lead-yield", { action: "yield" }).ok, true);
+	settle(runtime, lead, "lead-yield");
+	const queued = runtime.takeNextActivation(teamId)!;
+	assert.equal(queued.binding.memberId, "w2", "pending work starts after continue");
+	const endCall = "w1-final";
+	assert.equal(runtime.gate(first.binding, first.scope, "tool_gate", endCall, "team", true).allow, true);
+	assert.equal(runtime.toolResult(first.binding, first.scope, endCall, "team").ok, true);
+	assert.equal(action(runtime, first, 1, endCall, { action: "reply", result: { status: "succeeded", summary: "done after pause" } }, endCall).ok, true);
+	settle(runtime, first, endCall);
+	assert.equal(runtime.getWork(teamId, workRef(first))?.current.state, "resolved", "the same native run finished its work");
+	runtime.assertInvariants(teamId);
+});
+
+test("host pause parks the lead's events activation at its provider gate; continue resumes the same run", async () => {
+	const { runtime, teamId } = makeRuntime([]);
+	finishManagerBoot(runtime, teamId);
+	runtime.hostControl(teamId).message_lead("first");
+	const lead = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, lead);
+	runtime.pauseTeam(teamId);
+	assert.deepEqual(pausesOf(runtime, teamId), ["lead:requested", "w1:confirmed", "w2:confirmed"]);
+	let decision: boolean | undefined;
+	const gate = runtime.waitAtProviderGate(lead.binding, lead.scope).then((value) => { decision = value.allow; return value; });
+	await tick();
+	assert.equal(decision, undefined, "the lead's events activation parks too");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "lead")?.pause, "confirmed");
+	assert.equal(runtime.getTeam(teamId).paused?.finishing, 0);
+	runtime.assertInvariants(teamId);
+	assert.equal(runtime.takeNextActivation(teamId), undefined);
+
+	runtime.continueTeam(teamId);
+	assert.equal((await gate).allow, true);
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "lead")?.pause, "none");
+	assert.equal(action(runtime, lead, 1, "lead-yield", { action: "yield" }).ok, true);
+	settle(runtime, lead, "lead-yield");
+	const next = runtime.takeNextActivation(teamId)!;
+	assert.equal(leadEvents(next).filter((event) => /continued the Team/u.test(event.message)).length, 1, "the lead is told once");
+	runtime.assertInvariants(teamId);
+});
+
+test("host pause: a lead events activation that ends during the pause is not followed by a new one until continue", () => {
+	const { runtime, teamId } = makeRuntime([]);
+	finishManagerBoot(runtime, teamId);
+	runtime.hostControl(teamId).message_lead("first");
+	const lead = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, lead);
+	runtime.pauseTeam(teamId);
+	assert.equal(action(runtime, lead, 1, "lead-yield", { action: "yield" }).ok, true, "a staged yield still commits");
+	settle(runtime, lead, "lead-yield");
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "lead")?.pause, "confirmed");
+	runtime.hostControl(teamId).message_lead("later");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "no new events activation while paused");
+	runtime.continueTeam(teamId);
+	const next = runtime.takeNextActivation(teamId)!;
+	assert.deepEqual(leadEvents(next).map((event) => event.kind), ["USER_COMMAND", "USER_COMMAND"]);
+	assert.equal(leadEvents(next)[0]!.message, "later");
+	runtime.assertInvariants(teamId);
+});
+
+test("a member the lead paused itself stays paused after continue; the lead cannot lift the host's pause or close the Team meanwhile", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "paused by the lead" }, { to: "w2", task: "independent" }]);
+	finishManagerBoot(runtime, teamId);
+	runtime.hostControl(teamId).message_lead("pause w1");
+	const lead = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "pause-w1", { action: "control", command: "pause_member", memberId: "w1" }).ok, true);
+	runtime.pauseTeam(teamId);
+	assert.deepEqual(pausesOf(runtime, teamId), ["lead:requested", "w1:confirmed", "w2:confirmed"]);
+	const resume = action(runtime, lead, 2, "resume-w2", { action: "control", command: "resume_member", memberId: "w2" });
+	assert.ok(resume.ok && resume.receipt?.status === "unchanged", "the host's pause is not the lead's to lift");
+	assert.equal(pausesOf(runtime, teamId)[2], "w2:confirmed");
+	const close = action(runtime, lead, 3, "close", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "stop" });
+	assert.equal(code(close), "FORBIDDEN_ACTION");
+	assert.match(close.ok ? "" : close.error.message, /paused the Team/u);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "active");
+
+	runtime.continueTeam(teamId);
+	assert.deepEqual(pausesOf(runtime, teamId), ["lead:none", "w1:confirmed", "w2:none"], "only what the host paused is continued");
+	assert.equal(action(runtime, lead, 4, "yield", { action: "yield" }).ok, true);
+	settle(runtime, lead, "yield");
+	const notice = runtime.takeNextActivation(teamId)!;
+	assert.ok(leadEvents(notice).some((event) => /continued the Team/u.test(event.message)));
+	inputReady(runtime, notice);
+	assert.equal(action(runtime, notice, 1, "notice-yield", { action: "yield" }).ok, true);
+	settle(runtime, notice, "notice-yield");
+	assert.equal(runtime.takeNextActivation(teamId)!.binding.memberId, "w2");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "w1 is still paused by the lead");
+	runtime.assertInvariants(teamId);
+});
+
+test("no TEAM_QUIESCENT comes from the pause: work that commits meanwhile is reported after continue", () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "only root" }]);
+	finishManagerBoot(runtime, teamId);
+	const worker = runtime.takeNextActivation(teamId)!;
+	runtime.pauseTeam(teamId);
+	reply(runtime, worker, "w1-reply", "committed while paused");
+	assert.equal(pausesOf(runtime, teamId)[1], "w1:confirmed", "a requested pause is confirmed when the activation ends");
+	assert.equal(runtime.takeNextActivation(teamId), undefined);
+	runtime.continueTeam(teamId);
+	const lead = runtime.takeNextActivation(teamId)!;
+	assert.deepEqual(leadEvents(lead).map((event) => event.kind), ["USER_COMMAND", "ROOT_RESULT_READY"], "no TEAM_QUIESCENT in the first batch");
+	assert.ok(leadEvents(lead).some((event) => /committed while paused/u.test(event.message)));
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "yield", { action: "yield" }).ok, true);
+	settle(runtime, lead, "yield");
+	assert.ok(runtime.takeNextActivation(teamId)!.input.scope.kind === "events", "once running again, the quiescence is reported as usual");
+});
+
+test("host cancel works while the Team is paused: the parked activation is stopped and the Team ends", async () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "root" }]);
+	finishManagerBoot(runtime, teamId);
+	const parked = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, parked);
+	runtime.pauseTeam(teamId);
+	const gate = runtime.waitAtProviderGate(parked.binding, parked.scope);
+	await tick();
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.pause, "confirmed");
+	assert.equal(runtime.cancelTeam(teamId, "Stopped while paused").status, "applied");
+	assert.deepEqual(await gate, { allow: false, reason: "activation_ending", message: "This activation was stopped by a Team control" });
+	assert.equal(runtime.getTeam(teamId).lifecycle, "cancelled");
+	assert.equal(runtime.getTeam(teamId).paused, undefined);
+	assert.throws(() => runtime.continueTeam(teamId), (error) => error instanceof TeamProtocolError && error.code === "RECIPIENT_CLOSING");
+	assert.throws(() => runtime.pauseTeam(teamId), (error) => error instanceof TeamProtocolError && error.code === "RECIPIENT_CLOSING");
+});
+
+test("host pause shifts the deadline by the paused time, holds the review timer until continue and does not count as active time", (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const origin = 1_700_000_000_000;
+	let time = origin;
+	let ids = 0;
+	const advance = (ms: number) => { time += ms; t.mock.timers.tick(ms); };
+	const runtime = new TeamRuntime({ now: () => time, createId: () => `id${++ids}` });
+	const { teamId } = runtime.prepare({
+		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }, { alias: "w2", roleDescription: "Review." }], lead: "lead",
+		brief: { goal: "Pause the clock." }, initialRequests: [{ to: "w1", task: "root" }], timeoutSeconds: 600, review: { by: "w2", everyMinutes: 5 },
+	});
+	runtime.launch(teamId);
+	const reviews = () => runtime.listWorks(teamId).filter((work) => work.kind === "review").length;
+	const MINUTE = 60_000;
+	advance(MINUTE);
+	runtime.pauseTeam(teamId);
+	assert.equal(runtime.reviewSchedule(teamId)?.nextAt, null, "the review timer stops");
+	runtime.setReview(teamId, { everyMinutes: 3 });
+	assert.equal(runtime.reviewSchedule(teamId)?.nextAt, null, "changing the interval does not start the timer while paused");
+	assert.equal(runtime.liveEffects(teamId).deadlineTimer, false, "and the deadline timer");
+	advance(20 * MINUTE);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "active", "the original deadline passes unnoticed");
+	assert.equal(reviews(), 0, "no review started meanwhile");
+	assert.equal(runtime.runReviewTick(teamId), undefined, "a review cannot be forced while paused");
+	assert.equal(runtime.flowStats(teamId).activeMs, MINUTE, "paused time is not active time");
+
+	runtime.continueTeam(teamId);
+	assert.equal(runtime.getTeam(teamId).deadline, origin + 600_000 + 20 * MINUTE, "the deadline moved by the paused duration");
+	assert.equal(runtime.reviewSchedule(teamId)?.nextAt, time + 3 * MINUTE, "the review interval starts again from now");
+	advance(3 * MINUTE);
+	assert.equal(reviews(), 1, "the re-armed review timer fires");
+	assert.equal(runtime.flowStats(teamId).activeMs, 4 * MINUTE);
+	advance(6 * MINUTE - 1);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "active", "the remaining 9 minutes are intact");
+	advance(1);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "cancelled");
+	assert.match(runtime.getTeam(teamId).reason ?? "", /DEADLINE/u);
+});
+
+test("the lead's Team status view carries the pause through the typed reply codec", () => {
+	const { runtime, teamId } = makeRuntime([]);
+	finishManagerBoot(runtime, teamId);
+	runtime.hostControl(teamId).message_lead("status please");
+	const lead = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, lead);
+	runtime.pauseTeam(teamId);
+	const status = action(runtime, lead, 1, "paused-status", { action: "status", view: "team" });
+	assert.ok(status.ok);
+	assert.deepEqual(parseTeamReply(status), status);
+	assert.deepEqual(status.data && "paused" in status.data ? status.data.paused : undefined, { since: runtime.getTeam(teamId).paused!.since, finishing: 1 });
+});
+
+test("continue resumes the parked lead events activation without a work permit, next to a worker that needs the only one", async () => {
+	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "root" }], { limits: { workPermits: 1 } });
+	finishManagerBoot(runtime, teamId);
+	const worker = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, worker);
+	runtime.hostControl(teamId).message_lead("events beside the worker");
+	const lead = runtime.takeNextActivation(teamId)!;
+	inputReady(runtime, lead);
+	runtime.pauseTeam(teamId);
+	const decisions: Record<string, boolean | undefined> = {};
+	const gates = [["lead", lead], ["w1", worker]].map(([name, activation]) => runtime.waitAtProviderGate((activation as RuntimeActivation).binding, (activation as RuntimeActivation).scope)
+		.then((value) => { decisions[name as string] = value.allow; return value; }));
+	await tick();
+	assert.deepEqual(pausesOf(runtime, teamId).slice(0, 2), ["lead:confirmed", "w1:confirmed"]);
+	runtime.assertInvariants(teamId);
+	runtime.continueTeam(teamId);
+	await tick();
+	assert.deepEqual(decisions, { lead: true, w1: true });
+	await Promise.all(gates);
+	runtime.assertInvariants(teamId);
+});

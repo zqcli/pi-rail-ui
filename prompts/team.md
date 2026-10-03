@@ -149,6 +149,10 @@ Host made you the Team lead: {{reason}}
 
 The host revived {{member}}; its earlier failed work stays failed — request or revise it again if still needed.
 
+## event_team_continued
+
+The host continued the Team after pausing it for about {{minutes}} min. Work that was running resumed where it stopped; check the Team status before deciding the next step.
+
 ## event_budget_granted
 
 Host granted budget for {{scope}}: {{reason}}

@@ -482,6 +482,34 @@ test("launch panel says who a waiting member waits on, what a held one asks, and
 	await pending;
 });
 
+test("a paused Team says PAUSED in the launch panel, the status text and the Team list", async () => {
+	const { host, tool } = setup();
+	const prepared = await tool.execute("prepare", sourceWriterArgs, undefined, undefined, context());
+	const teamId = prepared.details.view.teamId;
+	let resolveLifetime!: (result: TeamResult) => void;
+	const lifetime = new Promise<TeamResult>((resolve) => { resolveLifetime = resolve; });
+	host.driver.openAndLaunch = async () => { host.runtime.launch(teamId); return { lifetime }; };
+	const updates: any[] = [];
+	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context());
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	host.runtime.pauseTeam(teamId);
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	const update = updates.at(-1);
+	assert.match(update.content[0].text, /^Team \S+ · ACTIVE · PAUSED · ok/u);
+	assert.match(update.content[0].text, /^Waiting for: Paused by the host/mu);
+	assert.match(tool.renderResult(update, { expanded: false, isPartial: true }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }).render(200).join("\n"), /Team \S+ · ACTIVE · PAUSED/u);
+	const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
+	assert.match(status.content[0].text, /^Team \S+ · ACTIVE · PAUSED · ok/u);
+	const list = await tool.execute("list", { action: "status" }, undefined, undefined, context());
+	assert.match(list.content[0].text, /· ACTIVE · PAUSED · ok · lead /u);
+	host.runtime.continueTeam(teamId);
+	const resumed = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
+	assert.doesNotMatch(resumed.content[0].text, /PAUSED/u);
+
+	resolveLifetime(terminal(teamId));
+	await pending;
+});
+
 test("launch panel titles each task with who asked and which work, says where a result went, and shows what the Manager handles or has dispatched", async () => {
 	const { host, tool } = setup();
 	const prepared = await tool.execute("prepare", { ...sourceWriterArgs, initialRequests: [{ to: "writer", task: "Write the change.", inputRefs: null }] },

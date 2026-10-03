@@ -403,3 +403,55 @@ test("popup v asks which faulted member to revive; l asks which open member beco
 	assert.match(lead.confirmations[0]!.title, /Make worker the lead/u);
 	assert.equal(third.host.runtime.getTeam(third.teamId).lead, "worker");
 });
+
+test("/rail-team pause and continue confirm their effect; popup p toggles them; list, status and the popup summary show PAUSED", async () => {
+	const { host, teamId } = setup([{ to: "worker", task: "root" }]);
+	host.runtime.launch(teamId);
+	let command: any;
+	installTeamCommand({ registerCommand: (_name: string, value: any) => { command = value; } } as any, () => host);
+	assert.ok(command.getArgumentCompletions(`${teamId} pa`).some((item: any) => item.label === "pause"));
+	assert.ok(command.getArgumentCompletions(`${teamId} con`).some((item: any) => item.label === "continue"));
+	const paused = () => !!host.runtime.getTeam(teamId).paused;
+
+	const declined = commandContext({ confirmation: false });
+	await runTeamCommand(host, `${teamId} pause`, declined.ctx);
+	assert.equal(paused(), false, "declined");
+	await assert.rejects(runTeamCommand(host, `${teamId} pause`, commandContext({ hasUI: false }).ctx), /needs interactive confirmation/u);
+	const pause = commandContext();
+	await runTeamCommand(host, `${teamId} pause lunch break`, pause.ctx);
+	assert.match(pause.confirmations[0]!.title, /Pause Team /u);
+	assert.match(pause.confirmations[0]!.message, /finish their current model request.*then stop.*Nothing new starts until you continue/u);
+	assert.equal(paused(), true);
+	assert.match(pause.notifications.at(-1)!.text, /paused/u);
+	assert.ok(host.runtime.panelFacts(teamId).timeline.some((entry) => entry.text === "host paused the Team: lunch break"));
+	await runTeamCommand(host, `${teamId} pause`, pause.ctx);
+	assert.match(pause.notifications.at(-1)!.text, /was already paused/u);
+
+	const list = commandContext();
+	await runTeamCommand(host, "list", list.ctx);
+	assert.match(list.notifications.at(-1)!.text, new RegExp(`${teamId} · ACTIVE · PAUSED · ok`, "u"));
+	await runTeamCommand(host, `${teamId} status`, list.ctx);
+	assert.match(list.notifications.at(-1)!.text, /Team \S+ · ACTIVE · PAUSED · ok/u);
+	assert.match(list.notifications.at(-1)!.text, /Waiting for: Paused by the host/u);
+
+	const popupContinue = commandContext({ overlayKey: "p" });
+	await runTeamCommand(host, "", popupContinue.ctx);
+	assert.match(popupContinue.overlays[0]!.output, /ACTIVE · PAUSED · ok/u, "the popup summary");
+	assert.match(popupContinue.overlays[0]!.output, /p continue/u);
+	assert.match(popupContinue.confirmations[0]!.title, /Continue Team /u);
+	assert.match(popupContinue.confirmations[0]!.message, /Parked work resumes where it stopped.*The lead gets a message/u);
+	assert.equal(paused(), false);
+	assert.match(popupContinue.notifications.at(-1)!.text, /continued/u);
+	await runTeamCommand(host, `${teamId} continue`, popupContinue.ctx);
+	assert.match(popupContinue.notifications.at(-1)!.text, /was not paused/u);
+
+	const popupPause = commandContext({ overlayKey: "p" });
+	await runTeamCommand(host, "", popupPause.ctx);
+	assert.match(popupPause.overlays[0]!.output, /p pause/u);
+	assert.match(popupPause.confirmations[0]!.title, /Pause Team /u);
+	assert.equal(paused(), true);
+
+	host.runtime.cancelTeam(teamId, "done");
+	await assert.rejects(runTeamCommand(host, `${teamId} continue`, commandContext().ctx), /is cancelled; it cannot be continued/u);
+	await assert.rejects(runTeamCommand(host, `${teamId} pause`, commandContext().ctx), /is cancelled; it cannot be paused/u);
+});

@@ -1615,7 +1615,7 @@ test("L: close blockers never expose private activation or delivery IDs", () => 
 	runtime.assertInvariants(teamId);
 });
 
-test("L: close_team refuses faulted worker resources that were never released", () => {
+test("L: close_team stops a faulted worker's live process and closes the Team with the worker still faulted", () => {
 	const { runtime, teamId } = makeRuntime();
 	finishManagerBoot(runtime, teamId);
 	const worker = runtime.takeNextActivation(teamId)!;
@@ -1628,13 +1628,20 @@ test("L: close_team refuses faulted worker resources that were never released", 
 	assert.equal(action(runtime, manager, 1, "waive-failed-root", {
 		action: "control", command: "accept_result", work: ref, disposition: "waived", reason: "Worker failed.",
 	}).ok, true);
-	const beforeClose = businessSnapshot(runtime, teamId, [ref]);
 	const close = action(runtime, manager, 2, "close-with-unreleased-fault", {
 		action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "Worker resources remain owned.",
 	});
-	assert.equal(code(close), "CLOSE_BLOCKED");
-	assert.deepEqual(businessSnapshot(runtime, teamId, [ref]), beforeClose, "rejected close does not commit a decision or mutate lifecycle");
-	assert.equal(runtime.getTeam(teamId).lifecycle, "active");
+	assert.equal(close.ok && close.receipt?.status, "closing");
+	const closeId = close.ok && close.receipt?.status === "closing" ? close.receipt.closeId : undefined;
+	assert.ok(closeId);
+	const member = (id: string) => runtime.getTeam(teamId).members.find((item) => item.id === id)!;
+	assert.deepEqual([member("w1").lifecycle, member("w1").resourceState], ["faulted", "stopping"], "the live process is being stopped; the fault stays on record");
+	settle(runtime, manager, "close-with-unreleased-fault");
+	assert.equal(runtime.memberReleased(runtime.bindingForDriver(teamId, "w1"), closeId, { ok: true }).ok, true);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "closing", "the other exits are still pending");
+	for (const id of ["w2", "lead"]) assert.equal(runtime.memberReleased(runtime.bindingForDriver(teamId, id), closeId, { ok: true }).ok, true);
+	assert.equal(runtime.getTeam(teamId).lifecycle, "closed");
+	assert.deepEqual([member("w1").lifecycle, member("w1").resourceState], ["faulted", "released"]);
 	runtime.assertInvariants(teamId);
 });
 

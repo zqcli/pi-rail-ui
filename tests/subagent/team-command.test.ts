@@ -312,3 +312,94 @@ test("review command on a Team from history shows its schedule and reviews, and 
 	assert.equal(notifications.at(-1)!.text, "Review: worker every 20 min\nreview:abcd · 2:05 · worker · off track: OFF TRACK: nothing merged.");
 	await assert.rejects(runTeamCommand(host, "hist-1 review now", ctx), /read-only history/u);
 });
+
+/** Launch the Team and let the worker's native activation fail: the worker is faulted with its process still owned. */
+function faultWorker(host: TeamSessionHost, teamId: string): void {
+	const runtime = host.runtime;
+	runtime.launch(teamId);
+	const take = () => {
+		const activation = runtime.takeNextActivation(teamId)!;
+		assert.equal(runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
+		return activation;
+	};
+	const boot = take();
+	assert.equal(runtime.handleAction(boot.binding, boot.scope, 1, "boot", { action: "yield" }, "boot").ok, true);
+	runtime.nativeSettled(boot.binding, boot.scope.activationId, { status: "success", appliedToolCallId: "boot" });
+	runtime.cleanupFinished(boot.binding, boot.scope.activationId, { ok: true });
+	const work = take();
+	runtime.nativeSettled(work.binding, work.scope.activationId, { status: "error", error: { code: "NATIVE_FAILURE", message: "boom" } });
+	runtime.cleanupFinished(work.binding, work.scope.activationId, { ok: true });
+}
+
+test("/rail-team revive completes faulted aliases, confirms what happens, and reopens the member", async () => {
+	const { host, teamId } = setup([{ to: "worker", task: "root" }]);
+	faultWorker(host, teamId);
+	let command: any;
+	installTeamCommand({ registerCommand: (_name: string, value: any) => { command = value; } } as any, () => host);
+	assert.ok(command.getArgumentCompletions(`${teamId} rev`).some((item: any) => item.label === "revive"));
+	assert.deepEqual(command.getArgumentCompletions(`${teamId} revive `).map((item: any) => item.label), ["worker"], "only faulted members with a live process");
+
+	const declined = commandContext({ confirmation: false });
+	await runTeamCommand(host, `${teamId} revive worker`, declined.ctx);
+	assert.equal(host.runtime.getTeam(teamId).members.find((member) => member.id === "worker")!.lifecycle, "faulted");
+	await assert.rejects(runTeamCommand(host, `${teamId} revive`, declined.ctx), /requires a member alias/u);
+
+	const { ctx, confirmations, notifications } = commandContext();
+	await runTeamCommand(host, `${teamId} revive worker`, ctx);
+	assert.match(confirmations[0]!.title, /Revive worker of /u);
+	assert.match(confirmations[0]!.message, /reopened.*failed work stays failed/u);
+	assert.doesNotMatch(confirmations[0]!.message, /held for the unavailable lead/u);
+	assert.equal(host.runtime.getTeam(teamId).members.find((member) => member.id === "worker")!.lifecycle, "open");
+	assert.match(notifications.at(-1)?.text ?? "", /worker revived/u);
+	assert.equal(command.getArgumentCompletions(`${teamId} revive `), null);
+});
+
+test("a unique Team ID prefix is accepted wherever a teamId is parsed; an ambiguous or unknown one is refused", async () => {
+	// Deterministic IDs that share a long prefix, as the popup's 8-character Team IDs can.
+	let counter = 0;
+	const host = new TeamSessionHost({ assertAliasesAvailable: async () => undefined } as unknown as SessionBroker, () => undefined, [], { createId: () => `shared-${String(++counter * 7919).padStart(8, "0")}` });
+	const prepare = () => host.runtime.prepare({ members: [{ alias: "lead", roleDescription: "Lead." }, { alias: "worker", roleDescription: "Work." }], lead: "lead", brief: { goal: "Other." }, timeoutSeconds: null }).teamId;
+	const teamId = prepare();
+	const second = prepare();
+	let common = 0;
+	while (teamId[common] === second[common]) common++;
+	assert.ok(common >= 7 && common < teamId.length - 1, `${teamId} ${second}`);
+	const { ctx, notifications } = commandContext();
+	await runTeamCommand(host, `${teamId.slice(0, common + 1)} status`, ctx);
+	assert.ok(notifications.at(-1)!.text.includes(teamId));
+	await assert.rejects(runTeamCommand(host, `${teamId.slice(0, common)} status`, ctx), (error: Error) => error.message.includes("Ambiguous") && error.message.includes(teamId) && error.message.includes(second));
+	await assert.rejects(runTeamCommand(host, "nope status", ctx), /Unknown teamId nope/u);
+	let command: any;
+	installTeamCommand({ registerCommand: (_name: string, value: any) => { command = value; } } as any, () => host);
+	assert.deepEqual(command.getArgumentCompletions(`${teamId.slice(0, common + 1)} lead `).map((item: any) => item.label), ["worker"], "completion also resolves a prefix");
+});
+
+test("popup v asks which faulted member to revive; l asks which open member becomes the lead", async () => {
+	const { host, teamId } = setup([{ to: "worker", task: "root" }]);
+	host.runtime.launch(teamId);
+	const none = commandContext({ overlayKey: "v" });
+	await runTeamCommand(host, "", none.ctx);
+	assert.match(none.notifications[0]!.text, /no faulted member that can be revived/u);
+	assert.equal(none.confirmations.length, 0);
+	host.runtime.cancelTeam(teamId, "reset");
+
+	const second = setup([{ to: "worker", task: "root" }]);
+	faultWorker(second.host, second.teamId);
+	const revive = commandContext({ overlayKey: "v" });
+	const asked: string[][] = [];
+	revive.ctx.ui.select = async (_title: string, choices: string[]) => { asked.push(choices); return choices[0]; };
+	await runTeamCommand(second.host, "", revive.ctx);
+	assert.deepEqual(asked, [["worker"]]);
+	assert.match(revive.confirmations[0]!.title, /Revive worker of /u);
+	assert.equal(second.host.runtime.getTeam(second.teamId).members.find((member) => member.id === "worker")!.lifecycle, "open");
+
+	const third = setup();
+	third.host.runtime.launch(third.teamId);
+	const lead = commandContext({ overlayKey: "l" });
+	const options: string[][] = [];
+	lead.ctx.ui.select = async (_title: string, choices: string[]) => { options.push(choices); return choices[0]; };
+	await runTeamCommand(third.host, "", lead.ctx);
+	assert.deepEqual(options, [["worker"]], "only open members other than the lead");
+	assert.match(lead.confirmations[0]!.title, /Make worker the lead/u);
+	assert.equal(third.host.runtime.getTeam(third.teamId).lead, "worker");
+});

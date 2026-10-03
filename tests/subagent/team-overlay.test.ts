@@ -633,3 +633,20 @@ test("review works do not count in the Overview progress", (t) => {
 	t.after(() => ui.component.dispose());
 	assert.match(ui.text(), /roots 0\/3 accepted · works 0\/4/u);
 });
+
+test("Overview shows the full Team ID, and v/l (with c/r/g/m) are popup actions whose hint fits 80 columns", (t) => {
+	const { host, teamId } = fixture();
+	host.runtime.prepare({ members: [{ alias: "a", roleDescription: "A." }, { alias: "b", roleDescription: "B." }], lead: "a", brief: { goal: "Second Team." }, timeoutSeconds: null });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	const lines = ui.component.render(80);
+	assert.match(stripTerminalSequences(lines.join("\n")), new RegExp(`Team:\\s+${teamId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u"));
+	const help = lines.find((line) => line.includes("actions"))!;
+	assert.match(help, /\[ \] teams · c\/r\/g\/m\/v\/l actions · esc close/u, "the whole hint is visible at 80 columns");
+	assert.equal(visibleWidth(help), 80);
+	for (const [key, action] of [["v", "revive"], ["l", "lead"]] as const) {
+		const popup = overlay(host);
+		popup.component.handleInput(key);
+		assert.deepEqual(popup.closed, [{ teamId, action }]);
+	}
+});

@@ -331,6 +331,7 @@ export type TeamControl =
 	| { command: "resume_work"; workId: string; expectedRevision: number; incidentId: string; instruction: string }
 	| { command: "accept_result"; work: WorkRef; disposition: "accepted" | "waived"; reason?: string }
 	| { command: "close_member"; memberId: string }
+	| { command: "revive_member"; memberId: string }
 	| { command: "close_team"; resultRefs: string[]; outcome: TeamOutcome; reason?: string };
 export type TeamControlCommand = TeamControl["command"];
 

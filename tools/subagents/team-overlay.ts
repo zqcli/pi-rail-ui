@@ -8,7 +8,7 @@ import { statusColor } from "./transcript";
 
 const TABS = ["Overview", "Progress", "Members", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
-export interface TeamOverlayAction { teamId: string; action: "cancel" | "resume" | "grant" | "message" }
+export interface TeamOverlayAction { teamId: string; action: "cancel" | "resume" | "grant" | "message" | "revive" | "lead" }
 type Facts = ReturnType<TeamSessionHost["runtime"]["panelFacts"]>;
 type Row = { text: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string };
 const oneLine = (text: string) => stripTerminalSequences(text).replace(/\s+/gu, " ").trim();
@@ -179,7 +179,7 @@ export class TeamOverlayComponent implements Focusable {
 				if (!this.expanded.delete(row.fold)) this.expanded.add(row.fold);
 			}
 		} else {
-			const action = ({ c: "cancel", r: "resume", g: "grant", m: "message" } as const)[data as "c" | "r" | "g" | "m"];
+			const action = ({ c: "cancel", r: "resume", g: "grant", m: "message", v: "revive", l: "lead" } as const)[data as "c" | "r" | "g" | "m" | "v" | "l"];
 			const team = this.host.runtime.listTeams().find((team) => team.teamId === this.teamId);
 			if (action && team && writable(team) && this.host.active) {
 				this.dispose();
@@ -222,7 +222,7 @@ export class TeamOverlayComponent implements Focusable {
 		this.timelineCursor = rows[this.selected]?.milestone;
 		const live = !!team && writable(team) && this.host.active;
 		// Overview already shows Waiting for in its body.
-		const notice = this.tab !== 0 && facts?.waitingFor?.startsWith("Lead decision") ? `Waiting for: ${facts.waitingFor}`
+		const notice = this.tab !== 0 && /^Lead (decision|failed)/u.test(facts?.waitingFor ?? "") ? `Waiting for: ${facts!.waitingFor}`
 			: this.notice;
 		const omitted = this.tab === 4 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
@@ -280,7 +280,7 @@ export class TeamOverlayComponent implements Focusable {
 	private helpText(live: boolean, multiple: boolean): string {
 		const view = this.detail ? "↑↓/pgup/dn scroll · esc back" : this.tab === 0 ? "↑↓ scroll" : this.tab === 1 || this.tab === 2 ? "↑↓ select · enter details"
 			: this.tab === 3 ? "↑↓ select · enter fold" : "↑↓ cursor · pgup/dn page · home/end";
-		return [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? ["c/r/g/m actions"] : ["read-only"]), ...(!this.detail ? ["esc close"] : [])].join(" · ");
+		return [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? ["c/r/g/m/v/l actions"] : ["read-only"]), ...(!this.detail ? ["esc close"] : [])].join(" · ");
 	}
 
 	/** Budget meters: a bar with eighth-cell resolution, so even a small share of a large limit is visible. */
@@ -306,9 +306,10 @@ export class TeamOverlayComponent implements Focusable {
 			const text = `${(label ? `${label}:` : "").padEnd(labelWidth)}${value}`;
 			lines.push(color ? this.theme.fg(color, text) : text);
 		};
+		add("Team", team.teamId);
 		wrapTextWithAnsi(oneLine(team.brief.goal), Math.max(1, width - labelWidth)).slice(0, 3).forEach((line, index) => add(index ? "" : "Goal", line));
 		add("Progress", `${progress(works)} · ${team.works.cancelled} cancelled/superseded`);
-		add("Waiting for", facts.waitingFor ?? "—", facts.waitingFor?.startsWith("Lead decision") ? "warning" : undefined);
+		add("Waiting for", facts.waitingFor ?? "—", /^Lead (decision|failed)/u.test(facts.waitingFor ?? "") ? "warning" : undefined);
 		const holds = this.host.runtime.listHolds(team.teamId);
 		const incidents = team.incidents.filter((incident) => incident.state === "open");
 		add("Attention", holds.length || incidents.length ? `${holds.length} open holds · ${incidents.length} open incidents` : "none", holds.length || incidents.length ? "warning" : undefined);

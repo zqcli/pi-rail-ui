@@ -9,7 +9,7 @@ import { statusColor } from "./transcript";
 
 const TABS = ["Overview", "Progress", "Members", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
-export interface TeamOverlayAction { teamId: string; action: "cancel" | "resume" | "grant" | "message" | "revive" | "lead" }
+export interface TeamOverlayAction { teamId: string; action: "cancel" | "resume" | "grant" | "message" | "revive" | "lead" | "pause" | "continue" }
 type Facts = ReturnType<TeamSessionHost["runtime"]["panelFacts"]>;
 type Row = { text: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string };
 const oneLine = (text: string) => stripTerminalSequences(text).replace(/\s+/gu, " ").trim();
@@ -181,8 +181,8 @@ export class TeamOverlayComponent implements Focusable {
 				if (!this.expanded.delete(row.fold)) this.expanded.add(row.fold);
 			}
 		} else {
-			const action = ({ c: "cancel", r: "resume", g: "grant", m: "message", v: "revive", l: "lead" } as const)[data as "c" | "r" | "g" | "m" | "v" | "l"];
 			const team = this.host.runtime.listTeams().find((team) => team.teamId === this.teamId);
+			const action = ({ c: "cancel", r: "resume", g: "grant", m: "message", v: "revive", l: "lead", p: team?.paused ? "continue" : "pause" } as const)[data as "c" | "r" | "g" | "m" | "v" | "l" | "p"];
 			if (action && team && writable(team) && this.host.active) {
 				this.dispose();
 				this.done({ teamId: team.teamId, action });
@@ -228,7 +228,7 @@ export class TeamOverlayComponent implements Focusable {
 		const omitted = this.tab === 4 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
 		const live = !!team && writable(team) && this.host.active;
-		const help = this.helpLines(live, ids.length > 1).flatMap((text) => wrapTextWithAnsi(text, inner - 1));
+		const help = this.helpLines(live, ids.length > 1, !!team?.paused, inner - 1).flatMap((text) => wrapTextWithAnsi(text, inner - 1));
 		const room = height - 6 - help.length - (notice ? 1 : 0) - (omitted ? 1 : 0);
 		// The snapshot block yields to the list on short terminals, keeping at least three list rows.
 		const head = (this.tab === 1 && !this.detail && (team || history) ? this.progressHead(team, works, facts, reviews, team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review, history?.flow, inner - 1) : []).slice(0, Math.max(0, room - 3));
@@ -271,7 +271,7 @@ export class TeamOverlayComponent implements Focusable {
 			const count = team.members.filter((member) => memberStatus(member) === status).length;
 			return count ? [`${count} ${status}`] : [];
 		});
-		return [team.lifecycle.toUpperCase(), team.health === "ok" ? "ok" : "needs attention", clock(this.elapsed(team, facts)), progress(works, false), ...counts,
+		return [team.lifecycle.toUpperCase(), ...(team.paused ? ["PAUSED"] : []), team.health === "ok" ? "ok" : "needs attention", clock(this.elapsed(team, facts)), progress(works, false), ...counts,
 			...(!writable(team) || !this.host.active ? ["read-only"] : [])].join(" · ");
 	}
 
@@ -281,11 +281,14 @@ export class TeamOverlayComponent implements Focusable {
 	}
 
 	/** Navigation for the current view, then (live Teams only) every action key with its name; the caller wraps rows wider than the popup. */
-	private helpLines(live: boolean, multiple: boolean): string[] {
+	private helpLines(live: boolean, multiple: boolean, paused: boolean, width: number): string[] {
 		const view = this.detail ? "↑↓/pgup/dn scroll · esc back" : this.tab === 0 ? "↑↓ scroll" : this.tab === 1 || this.tab === 2 ? "↑↓ select · enter details"
 			: this.tab === 3 ? "↑↓ select · enter fold" : "↑↓ cursor · pgup/dn page · home/end";
 		const navigation = [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? [] : ["read-only"]), ...(!this.detail ? ["esc close"] : [])].join(" · ");
-		return live ? [navigation, "c cancel · r resume hold · g grant · m message · v revive · l new lead"] : [navigation];
+		// Whole keys per row: a key is never split or left with a dangling separator.
+		const keys = [paused ? "p continue" : "p pause", "c cancel", "r resume hold", "g grant", "m message", "v revive", "l new lead"];
+		const rows = keys.reduce<string[]>((packed, key) => packed.length && packed.at(-1)!.length + 3 + key.length <= width ? [...packed.slice(0, -1), `${packed.at(-1)} · ${key}`] : [...packed, key], []);
+		return live ? [navigation, ...rows] : [navigation];
 	}
 
 	/** Budget meters: a bar with eighth-cell resolution, so even a small share of a large limit is visible. */

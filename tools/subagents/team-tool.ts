@@ -106,6 +106,8 @@ export class TeamLaunchWaitAbortedError extends Error {
 // Bounded text views shared by the tool panel, tool results and /rail-team.
 
 const upper = (value: string) => value.replaceAll("_", " ").toUpperCase();
+/** A Team's lifecycle in capitals, with PAUSED while the host has frozen it. */
+export const lifecycleText = (view: Pick<TeamTeamView, "lifecycle" | "paused">): string => `${upper(view.lifecycle)}${view.paused ? " · PAUSED" : ""}`;
 export const formatBudgetLimit = (value: number): string => value >= TEAM_BUDGET_UNLIMITED ? "unlimited" : String(value);
 const limit = (used: number, max: number) => `${used}/${formatBudgetLimit(max)}`;
 const budgetLimitsText = (limits: TeamBudgetLimits) => `activations ${formatBudgetLimit(limits.teamActivations)} · lead ${formatBudgetLimit(limits.leadActivations)} · model requests ${formatBudgetLimit(limits.teamModelRequests)} · tool calls ${formatBudgetLimit(limits.teamToolCalls)} · works ${formatBudgetLimit(limits.teamWorks)}`;
@@ -146,7 +148,7 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 	const openIncidents = view.incidents.filter((incident) => incident.state === "open");
 	const health = view.health === "needs_attention" ? `needs attention ${openIncidents.length}` : "ok";
 	const lines = [
-		`Team ${view.teamId} · ${upper(view.lifecycle)} · ${health}${view.outcome ? ` · outcome ${view.outcome}` : ""}`,
+		`Team ${view.teamId} · ${lifecycleText(view)} · ${health}${view.outcome ? ` · outcome ${view.outcome}` : ""}`,
 		`Goal: ${previewText(view.brief.goal, 240)}`,
 	];
 	// Whole: the close reason is already bounded by the note limit (one line; the collapsed panel cuts it to a row).
@@ -569,7 +571,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		const liveIds = new Set(teams.map((team) => team.teamId));
 		const history = host.history.teams.filter((entry) => !liveIds.has(entry.teamId));
 		const lines = [
-			...teams.map((team) => `${team.teamId} · ${upper(team.lifecycle)} · ${team.health === "ok" ? "ok" : "needs attention"} · lead ${team.lead} · ${team.members.length} members · works ${team.works.total}`),
+			...teams.map((team) => `${team.teamId} · ${lifecycleText(team)} · ${team.health === "ok" ? "ok" : "needs attention"} · lead ${team.lead} · ${team.members.length} members · works ${team.works.total}`),
 			...history.map(formatHistorySummary),
 			...(host.history.skipped ? [`${host.history.skipped} malformed history entries skipped`] : []),
 		];

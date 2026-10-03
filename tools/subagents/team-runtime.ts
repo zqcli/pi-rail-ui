@@ -285,6 +285,8 @@ interface TeamState {
 	timeline: Array<{ at: number; text: string }>;
 	timelineOmitted: number;
 	review: ReviewState;
+	/** While the host has frozen the Team: since when, and the members this pause paused (a member the lead paused itself is not listed). */
+	hostPause?: { at: number; members: Set<string> };
 	flow: FlowState;
 	dependencyWaits: number;
 	questions: number;
@@ -515,13 +517,7 @@ export class TeamRuntime {
 		this.note(team, `launch${initial.length ? ` · initial ${initial.map((record) => `${shortWorkRef({ workId: record.id, revision: 1 })} → ${record.assignee}`).join(", ")}` : ""}`);
 		this.changed(team);
 		this.check(team);
-		if (team.plan.timeoutSeconds !== null) {
-			const timer = setTimeout(() => {
-				this.deadlineTimers.delete(teamId);
-				this.cancelTeam(teamId, "DEADLINE: Team runtime deadline expired");
-			}, Math.ceil(team.plan.timeoutSeconds * 1000));
-			this.deadlineTimers.set(teamId, timer);
-		}
+		if (team.plan.timeoutSeconds !== null) this.armDeadline(team, Math.ceil(team.plan.timeoutSeconds * 1000));
 		this.armReview(team);
 		this.requestDrain(teamId);
 		return this.view(team);
@@ -813,6 +809,61 @@ export class TeamRuntime {
 		return { actor: "@host", status: "applied", teamId, eventId: event.id };
 	}
 
+	private armDeadline(team: TeamState, ms: number): void {
+		this.deadlineTimers.set(team.id, setTimeout(() => {
+			this.deadlineTimers.delete(team.id);
+			this.cancelTeam(team.id, "DEADLINE: Team runtime deadline expired");
+		}, ms));
+	}
+
+	/**
+	 * Host-only: freeze the Team in this process. Every running activation (the lead's too) finishes its current request and the
+	 * tool calls already issued, then parks at its next provider gate; nothing new starts. The paused time does not count against the deadline.
+	 */
+	pauseTeam(teamId: string, reasonValue?: string): HostControlReceipt {
+		const team = this.team(teamId);
+		const reason = reasonValue === undefined ? undefined : this.hostText(reasonValue, "pause reason");
+		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
+		if (team.hostPause) return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle };
+		this.tickFlow(team);
+		const members = new Set<string>();
+		for (const member of team.members.values()) {
+			if (member.lifecycle !== "open" || member.pause !== "none") continue;
+			member.pause = member.active ? "requested" : "confirmed";
+			members.add(member.id);
+		}
+		team.hostPause = { at: this.timestamp(), members };
+		clearTimeout(this.deadlineTimers.get(teamId));
+		this.deadlineTimers.delete(teamId);
+		this.clearReview(team);
+		this.note(team, `host paused the Team${reason ? `: ${reason}` : ""}`);
+		this.changed(team);
+		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle };
+	}
+
+	/** Host-only: resume what pauseTeam froze (parked activations continue their native run) and tell the lead. */
+	continueTeam(teamId: string): HostControlReceipt {
+		const team = this.team(teamId);
+		if (team.lifecycle !== "active") fail("RECIPIENT_CLOSING", `Team is ${team.lifecycle}`);
+		const paused = team.hostPause;
+		if (!paused) return { actor: "@host", status: "unchanged", teamId, lifecycle: team.lifecycle };
+		this.tickFlow(team);
+		delete team.hostPause;
+		const now = this.timestamp();
+		for (const id of paused.members) this.liftPause(team, team.members.get(id)!);
+		if (team.deadline !== null) {
+			team.deadline += now - paused.at;
+			this.armDeadline(team, team.deadline - now);
+		}
+		this.armReview(team);
+		this.addEvent(team, { key: `host-continue:${team.eventSeq}`, kind: "USER_COMMAND", actor: "@host",
+			message: prompt("team", "event_team_continued", { minutes: String(Math.max(1, Math.round((now - paused.at) / 60_000))) }) });
+		this.note(team, "host continued the Team");
+		this.changed(team);
+		this.requestDrain(teamId);
+		return { actor: "@host", status: "applied", teamId, lifecycle: team.lifecycle };
+	}
+
 	/**
 	 * Host-only: make another open member the Team's lead. The previous lead stays a member. Unprocessed Team events
 	 * go to the new lead; after a lead fault the lead-unavailable incidents resolve, the previous lead's stranded work
@@ -932,7 +983,7 @@ export class TeamRuntime {
 
 	private armReview(team: TeamState): void {
 		this.clearReview(team);
-		if (!team.review.schedule || team.lifecycle !== "active") return;
+		if (!team.review.schedule || team.lifecycle !== "active" || team.hostPause) return;
 		const ms = team.review.schedule.everyMinutes * 60_000;
 		team.review.nextAt = this.timestamp() + ms;
 		const timer = setTimeout(() => {
@@ -955,6 +1006,7 @@ export class TeamRuntime {
 	private reviewBlocker(team: TeamState, force: boolean): string | undefined {
 		const reviewer = team.review.schedule && team.members.get(team.review.schedule.by);
 		if (team.lifecycle !== "active") return `Team is ${team.lifecycle}`;
+		if (team.hostPause) return "the Team is paused by the host";
 		if (!reviewer) return "no reviewer is set (review every <N> by <alias>)";
 		if (team.members.get(team.lead)!.lifecycle !== "open") return "the lead is not open";
 		if (reviewer.lifecycle !== "open" || reviewer.id === team.lead) return `${reviewer.id} is not an open reviewer`;
@@ -1520,7 +1572,7 @@ export class TeamRuntime {
 		const team = this.team(binding.teamId);
 		const member = this.authenticatedMember(binding);
 		const active = member.active;
-		if (!active || !sameScope(active.scope, scope) || active.scope.kind !== "work") return Promise.resolve(decision);
+		if (!active || !sameScope(active.scope, scope)) return Promise.resolve(decision);
 		if (active.providerGatePromise) return active.providerGatePromise;
 		active.providerGatePending = true;
 		active.providerGatePromise = new Promise<GateDecision>((resolve) => { active.providerGateResolve = resolve; });
@@ -1626,8 +1678,11 @@ export class TeamRuntime {
 		active.providerGatePending = false;
 		active.parked = true;
 		this.tickFlow(team);
-		active.workPermitHeld = false;
-		team.flow.slots--;
+		// The lead's events activation holds no work permit.
+		if (active.workPermitHeld) {
+			active.workPermitHeld = false;
+			team.flow.slots--;
+		}
 		member.pause = "confirmed";
 		this.changed(team);
 		this.requestDrain(team.id);
@@ -1639,7 +1694,7 @@ export class TeamRuntime {
 
 	/** Account flow time up to now; every change of running activations or held work permits calls this first. */
 	private tickFlow(team: TeamState): void {
-		tickFlow(team.flow, this.timestamp(), team.lifecycle === "active" || team.lifecycle === "closing", team.limits.workPermits);
+		tickFlow(team.flow, this.timestamp(), (team.lifecycle === "active" || team.lifecycle === "closing") && !team.hostPause, team.limits.workPermits);
 	}
 
 	private startFlow(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
@@ -1718,11 +1773,13 @@ export class TeamRuntime {
 			const active = member.active;
 			if (!active?.parked || !active.resumeRequested) continue;
 			if (member.lifecycle !== "open" || active.stopReason) continue;
-			if (permits >= team.limits.workPermits) break;
-			permits++;
-			this.tickFlow(team);
-			active.workPermitHeld = true;
-			team.flow.slots++;
+			if (active.scope.kind === "work") {
+				if (permits >= team.limits.workPermits) break;
+				permits++;
+				this.tickFlow(team);
+				active.workPermitHeld = true;
+				team.flow.slots++;
+			}
 			active.parked = false;
 			active.resumeRequested = false;
 			member.pause = "none";
@@ -2242,9 +2299,18 @@ export class TeamRuntime {
 		}
 	}
 
+	/** Activations of a paused Team that have not reached their provider gate yet. */
+	private finishingActivations(team: TeamState): number {
+		return [...team.members.values()].filter((member) => member.active && !member.active.parked).length;
+	}
+
 	/** The single most relevant reason an active Team has not finished, by priority. */
 	private teamWaitingFor(team: TeamState, holds: readonly HostHoldView[], oldestHolds: ReadonlyMap<string, HostHoldView>,
 		waits: ReadonlyMap<string, WaitedWork[]>): string | undefined {
+		if (team.hostPause) {
+			const finishing = this.finishingActivations(team);
+			return finishing ? `Paused by the host (${finishing} activation${plural(finishing)} finishing)` : `Paused by the host for ${clock(this.timestamp() - team.hostPause.at)}`;
+		}
 		const lead = team.members.get(team.lead)!;
 		if (lead.lifecycle === "faulted") return "Lead failed: revive it (v) or hand the lead over (l) in /rail-team";
 		const questions = holds.filter((hold) => hold.reason === "attention" && team.events.some((event) => event.incidentId === hold.incidentId)).map((hold) => hold.assignee);
@@ -2524,7 +2590,8 @@ export class TeamRuntime {
 	/** False when the member was not paused (or already resuming). */
 	private liftPause(team: TeamState, target: RuntimeMember): boolean {
 		const active = target.active;
-		if (target.pause === "none" || active?.resumeRequested) return false;
+		// The host's pause is lifted only by continueTeam.
+		if (target.pause === "none" || active?.resumeRequested || team.hostPause) return false;
 		if (active?.parked) {
 			active.resumeRequested = true;
 			target.pause = "requested";
@@ -2724,7 +2791,9 @@ export class TeamRuntime {
 			fail("MEMBER_UNAVAILABLE", `${member.id}'s process has exited or is closing; it cannot be revived — give its work to another member`);
 		}
 		member.lifecycle = "open";
-		member.pause = "none";
+		// A member that reopens while the host has paused the Team stays paused until the host continues.
+		member.pause = team.hostPause ? "confirmed" : "none";
+		team.hostPause?.members.add(member.id);
 		delete member.error;
 		delete member.retry;
 		this.note(team, `${by} revived ${member.id}`);
@@ -2787,6 +2856,7 @@ export class TeamRuntime {
 
 	private closeTeam(team: TeamState, lead: RuntimeMember, active: ActiveActivation, resultRefs: string[], outcome: "succeeded" | "partial" | "failed", reason: string | undefined, toolCallId: string): TeamReply {
 		if (lead.id !== team.lead || active.scope.kind !== "events") fail("FORBIDDEN_ACTION", "close_team requires the lead's events activation");
+		if (team.hostPause) fail("FORBIDDEN_ACTION", "The host has paused the Team; it can be closed after the host continues it");
 		const { roots, blockers } = this.rootObligations(team);
 		for (const record of this.plainRecords(team)) {
 			const id = record.id;
@@ -3073,7 +3143,7 @@ export class TeamRuntime {
 		delete member.currentWork;
 		member.activity = "idle";
 		this.resumeParkedActivations(team);
-		if (member.id !== team.lead && member.lifecycle === "open" && member.pause === "requested") member.pause = "confirmed";
+		if (member.lifecycle === "open" && member.pause === "requested") member.pause = "confirmed";
 		if (member.lifecycle === "closing" && member.id === team.lead) member.resourceState = "stopping";
 		this.changed(team);
 		this.updateQuiescence(team);
@@ -3419,7 +3489,7 @@ export class TeamRuntime {
 	}
 
 	private updateQuiescence(team: TeamState): void {
-		if (!team.bootProcessed || team.lifecycle !== "active" || [...team.members.values()].some((member) => member.active)) return;
+		if (!team.bootProcessed || team.lifecycle !== "active" || team.hostPause || [...team.members.values()].some((member) => member.active)) return;
 		const records = this.plainRecords(team);
 		if (records.some((record) => !isTerminalWorkState(currentVersion(record).state) && currentVersion(record).state !== "blocked")) return;
 		const signature = records.map((record) => {
@@ -4005,6 +4075,7 @@ export class TeamRuntime {
 				roots: shownRoots, rootsOmitted: budgetRoots.length - shownRoots.length,
 				grants: copy(team.budget.grants.slice(-TEAM_VIEW_MAX_GRANTS)), grantsOmitted: Math.max(0, team.budget.grants.length - TEAM_VIEW_MAX_GRANTS) },
 			usage: copy(team.usage),
+			...(team.hostPause && team.lifecycle === "active" ? { paused: { since: team.hostPause.at, finishing: this.finishingActivations(team) } } : {}),
 			...(team.outcome ? { outcome: team.outcome } : {}), ...(team.reason ? { reason: projectErrorText(team.reason) } : {}),
 		};
 	}

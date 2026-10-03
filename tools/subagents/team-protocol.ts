@@ -617,6 +617,8 @@ export interface TeamTeamView {
 	lead: string;
 	timeoutSeconds: number | null;
 	deadline: number | null;
+	/** While the host has paused the Team: since when, and how many activations are still finishing their current request. */
+	paused?: { since: number; finishing: number };
 	brief: TeamBrief;
 	members: TeamMemberView[];
 	works: { total: number; queued: number; running: number; blocked: number; held: number; resolved: number; failed: number; cancelled: number; roots: number; rootsReviewed: number };

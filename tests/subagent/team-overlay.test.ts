@@ -615,8 +615,8 @@ test("Progress fits widths 60/80/120 and short terminals", () => {
 				const lines = ui.component.render(width);
 				assert.ok(lines.every((line) => visibleWidth(line) === width), `${rows}x${width}`);
 				assert.ok(lines.length <= Math.floor(rows * 0.88), `${rows}x${width}: ${lines.length}`);
-				// At 60 columns the wrapped help rows take the room the snapshot block yields to the list.
-				if (rows >= 18 && width >= 80) assert.match(lines.join("\n"), /Review: waiter every 5 min/u);
+				// Below 100 columns the wrapped help rows take the room the snapshot block yields to the list.
+				if (rows >= 18 && width >= 100) assert.match(lines.join("\n"), /Review: waiter every 5 min/u);
 				ui.key("down");
 			}
 			ui.key("home");
@@ -638,6 +638,8 @@ test("review works do not count in the Overview progress", (t) => {
 
 /** The popup is 92% of the terminal: 73 columns at 80. */
 const POPUP_WIDTH = 73;
+/** The action keys wrapped by whole keys at the popup width. */
+const ACTION_HELP = ["p pause · c cancel · r resume hold · g grant · m message · v revive", "l new lead"];
 /** The text of each popup row, without the frame and its leading space. */
 const rowsOf = (lines: string[]) => lines.map((line) => stripTerminalSequences(line).slice(2, -1).trimEnd());
 /** The row starting with `label` and the rows that continue it: indented under a label, or up to the next blank row for an unlabeled wrap. */
@@ -663,9 +665,9 @@ test("Overview shows the full Team ID, and every popup action key is named on it
 	const lines = ui.component.render(POPUP_WIDTH);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
 	assert.match(stripTerminalSequences(lines.join("\n")), new RegExp(`Team:\\s+${teamId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u"));
-	assert.deepEqual(helpOf(lines), ["↑↓ scroll · ←→/tab views · [ ] teams · esc close", "c cancel · r resume hold · g grant · m message · v revive · l new lead"],
-		"navigation and the actions each on one line, none cut");
-	assert.equal("c cancel · r resume hold · g grant · m message · v revive · l new lead".length, 70);
+	assert.deepEqual(helpOf(lines), ["↑↓ scroll · ←→/tab views · [ ] teams · esc close", ...ACTION_HELP],
+		"navigation and the actions on whole rows, no key cut");
+	for (const row of ACTION_HELP) assert.ok(row.length <= POPUP_WIDTH - 3, row);
 	// Wider hints wrap instead of being cut, and stay dim.
 	const tagged = taggingTheme();
 	for (const [tab, navigation] of [[2, "↑↓ select · enter details · ←→/tab views · [ ] teams · esc close"], [4, "↑↓ cursor · pgup/dn page · home/end · ←→/tab views · [ ] teams · esc close"]] as const) {
@@ -674,8 +676,8 @@ test("Overview shows the full Team ID, and every popup action key is named on it
 		tagged.calls.length = 0;
 		const rendered = popup.component.render(POPUP_WIDTH);
 		const help = helpOf(rendered);
-		assert.equal(help.slice(0, -1).join(" "), navigation, `tab ${tab}: the navigation hint is whole`);
-		assert.equal(help.at(-1), "c cancel · r resume hold · g grant · m message · v revive · l new lead");
+		assert.equal(help.slice(0, -2).join(" "), navigation, `tab ${tab}: the navigation hint is whole`);
+		assert.deepEqual(help.slice(-2), ACTION_HELP);
 		for (const row of help) assert.ok(tagged.calls.some((call) => call.color === "dim" && call.text === row), `dim: ${row}`);
 		for (const line of rendered) assert.equal(visibleWidth(line), POPUP_WIDTH);
 		popup.component.dispose();
@@ -685,6 +687,32 @@ test("Overview shows the full Team ID, and every popup action key is named on it
 		popup.component.handleInput(key);
 		assert.deepEqual(popup.closed, [{ teamId, action }]);
 	}
+});
+
+test("a paused Team shows PAUSED in the summary and Overview; p pauses a running Team and continues a paused one; the help row stays whole at 73 columns", (t) => {
+	const { host, teamId } = fixture();
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	assert.doesNotMatch(ui.text(), /PAUSED/u);
+	assert.deepEqual(helpOf(ui.component.render(POPUP_WIDTH)).slice(-2), ACTION_HELP);
+	ui.component.handleInput("p");
+	assert.deepEqual(ui.closed, [{ teamId, action: "pause" }]);
+
+	host.runtime.pauseTeam(teamId);
+	const paused = overlay(host);
+	t.after(() => paused.component.dispose());
+	assert.match(paused.text(), /ACTIVE · PAUSED · needs attention · \d+:\d\d/u);
+	assert.match(paused.text(), /Waiting for:\s+Paused by the host/u);
+	const lines = paused.component.render(POPUP_WIDTH);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+	assert.deepEqual(helpOf(lines).slice(-2), ["p continue · c cancel · r resume hold · g grant · m message · v revive", "l new lead"]);
+	paused.component.handleInput("p");
+	assert.deepEqual(paused.closed, [{ teamId, action: "continue" }]);
+	host.runtime.cancelTeam(teamId, "done");
+	const ended = overlay(host);
+	t.after(() => ended.component.dispose());
+	ended.component.handleInput("p");
+	assert.equal(ended.closed.length, 0, "an ended Team is read-only");
 });
 
 const FLOW_STATS: TeamFlowStats = {

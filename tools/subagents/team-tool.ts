@@ -4,6 +4,7 @@ import { Container, Text, TruncatedText } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { SessionBroker } from "./session-broker";
 import { formatWorkResult, jsonTextBytes, normalizeTeamPlan, previewText, TEAM_PLAN_MIGRATION, truncateText } from "./team-codec";
+import { flowSummary } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
 import { prompt, promptList } from "../../core/prompts";
 import type { TeamSessionHost } from "./team-host";
@@ -342,6 +343,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 		`- activations ${stats.activations} · model turns ${stats.modelTurns} · dependency waits ${stats.dependencyWaits} · questions ${stats.questions}`,
 		`- revisions ${stats.revisions} · cancelled/superseded ${stats.cancelled} · team action errors ${stats.toolErrors} (${unresolved ? `${unresolved} unresolved incidents` : "all recovered"})${stats.transientRetries ? ` · transient retries ${stats.transientRetries}` : ""}`,
 		`- tokens input ${result.usage.input} · output ${result.usage.output} · cache ${result.usage.cacheRead}/${result.usage.cacheWrite} · cost ${result.usage.cost.toFixed(4)}`,
+		`- flow: ${flowSummary(host.runtime.flowStats(result.teamId))}`,
 		`- Budget: ${budgetLimitsText(view.budget.limits)}`,
 		...(lastReview ? [`- Last review ${clock(lastReview.snapshot.elapsedMs)} ${lastReview.verdict?.replace("_", " ") ?? "no verdict"}: ${previewText(reviewAssessment(lastReview.summary), 160)}`] : []),
 		"Members:",

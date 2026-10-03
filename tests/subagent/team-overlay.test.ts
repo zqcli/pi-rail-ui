@@ -5,6 +5,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SessionBroker } from "../../tools/subagents/session-broker";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import { TeamOverlayComponent, buildTeamTaskRows, type TeamOverlayAction } from "../../tools/subagents/team-overlay";
+import type { TeamFlowStats } from "../../tools/subagents/team-flow";
 import type { RuntimeActivation } from "../../tools/subagents/team-runtime";
 import type { TeamReviewRecord, TeamWorkSummary } from "../../tools/subagents/team-protocol";
 
@@ -525,7 +526,7 @@ test("Progress shows the live snapshot, the schedule and reviews newest first wi
 	assert.match(text, /\[Progress\]/u);
 	assert.match(text, /Elapsed \d+:\d\d · works 0\/4 finished · 1 running · 2 waiting · 1 held · 0 finished since last review/u);
 	assert.match(text, /Review: waiter every 5 min · next in 3m/u);
-	assert.match(text, /Budget\s+activations .*lead .*model requests/u);
+	assert.doesNotMatch(text, /Budget\s+activations|█/u, "the Overview's budget bars are not repeated here");
 	const rows = text.split("\n").filter((line) => /\d+:\d\d  waiter  /u.test(line)).map((line) => line.replace(/^│\s+(→\s)?/u, "").replace(/\s*│$/u, ""));
 	assert.deepEqual(rows.map((row) => row.replace(/\s+/gu, " ")), ["20:00 waiter no verdict Plain note.", "15:00 waiter off track Review c3 summary.", "10:00 waiter at risk Review b2 summary.", "5:00 waiter on track Review a1 summary."]);
 	for (const [color, label] of [["success", "on track"], ["warning", "at risk"], ["error", "off track"], ["muted", "no verdict"]]) {
@@ -614,7 +615,8 @@ test("Progress fits widths 60/80/120 and short terminals", () => {
 				const lines = ui.component.render(width);
 				assert.ok(lines.every((line) => visibleWidth(line) === width), `${rows}x${width}`);
 				assert.ok(lines.length <= Math.floor(rows * 0.88), `${rows}x${width}: ${lines.length}`);
-				if (rows >= 18) assert.match(lines.join("\n"), /Review: waiter every 5 min/u);
+				// At 60 columns the wrapped help rows take the room the snapshot block yields to the list.
+				if (rows >= 18 && width >= 80) assert.match(lines.join("\n"), /Review: waiter every 5 min/u);
 				ui.key("down");
 			}
 			ui.key("home");
@@ -634,23 +636,48 @@ test("review works do not count in the Overview progress", (t) => {
 	assert.match(ui.text(), /roots 0\/3 accepted · works 0\/4/u);
 });
 
-test("Overview shows the full Team ID, and every popup action key is named on its own help row that fits 80 columns", (t) => {
+/** The popup is 92% of the terminal: 73 columns at 80. */
+const POPUP_WIDTH = 73;
+/** The text of each popup row, without the frame and its leading space. */
+const rowsOf = (lines: string[]) => lines.map((line) => stripTerminalSequences(line).slice(2, -1).trimEnd());
+/** The row starting with `label` and the rows that continue it: indented under a label, or up to the next blank row for an unlabeled wrap. */
+const rowBlock = (lines: string[], label: string, indented = true) => {
+	const rows = rowsOf(lines);
+	const start = rows.findIndex((row) => row.startsWith(label));
+	assert.ok(start >= 0, label);
+	const rest = rows.slice(start + 1);
+	const end = rest.findIndex((row) => indented ? !/^ {8}\S/u.test(row) : row === "");
+	return rows.slice(start, start + 1 + (end < 0 ? rest.length : end)).map((row) => row.trim()).join(" ");
+};
+/** The help rows: everything between the last blank row and the bottom border, without the lead-decision notice above them. */
+const helpOf = (lines: string[]) => {
+	const rows = rowsOf(lines).slice(0, -1);
+	return rows.slice(rows.lastIndexOf("") + 1).filter((row) => !row.startsWith("Waiting for:"));
+};
+
+test("Overview shows the full Team ID, and every popup action key is named on its own help row that fits the 73-column popup", (t) => {
 	const { host, teamId } = fixture();
 	host.runtime.prepare({ members: [{ alias: "a", roleDescription: "A." }, { alias: "b", roleDescription: "B." }], lead: "a", brief: { goal: "Second Team." }, timeoutSeconds: null });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	const lines = ui.component.render(80);
+	const lines = ui.component.render(POPUP_WIDTH);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
 	assert.match(stripTerminalSequences(lines.join("\n")), new RegExp(`Team:\\s+${teamId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u"));
-	const navigation = lines.find((line) => line.includes("esc close"))!;
-	assert.match(navigation, /←→\/tab views · \[ \] teams · esc close/u, "the whole navigation hint is visible at 80 columns");
-	const actions = lines.find((line) => line.includes("c cancel"))!;
-	assert.match(actions, /c cancel · r resume hold · g grant · m message · v revive · l switch lead/u, "each action key is named in full");
-	assert.equal(visibleWidth(actions), 80);
-	for (const [tab, label] of [[2, "Members"], [4, "Timeline"]] as const) {
-		const popup = overlay(host);
+	assert.deepEqual(helpOf(lines), ["↑↓ scroll · ←→/tab views · [ ] teams · esc close", "c cancel · r resume hold · g grant · m message · v revive · l new lead"],
+		"navigation and the actions each on one line, none cut");
+	assert.equal("c cancel · r resume hold · g grant · m message · v revive · l new lead".length, 70);
+	// Wider hints wrap instead of being cut, and stay dim.
+	const tagged = taggingTheme();
+	for (const [tab, navigation] of [[2, "↑↓ select · enter details · ←→/tab views · [ ] teams · esc close"], [4, "↑↓ cursor · pgup/dn page · home/end · ←→/tab views · [ ] teams · esc close"]] as const) {
+		const popup = overlay(host, { theme: tagged.theme });
 		for (let index = 0; index < tab; index++) popup.component.handleInput("\t");
-		const rendered = popup.component.render(80).map(stripTerminalSequences);
-		assert.ok(rendered.some((line) => line.includes("esc close")) && rendered.some((line) => line.includes("l switch lead")), `${label}: both help rows are whole`);
+		tagged.calls.length = 0;
+		const rendered = popup.component.render(POPUP_WIDTH);
+		const help = helpOf(rendered);
+		assert.equal(help.slice(0, -1).join(" "), navigation, `tab ${tab}: the navigation hint is whole`);
+		assert.equal(help.at(-1), "c cancel · r resume hold · g grant · m message · v revive · l new lead");
+		for (const row of help) assert.ok(tagged.calls.some((call) => call.color === "dim" && call.text === row), `dim: ${row}`);
+		for (const line of rendered) assert.equal(visibleWidth(line), POPUP_WIDTH);
 		popup.component.dispose();
 	}
 	for (const [key, action] of [["v", "revive"], ["l", "lead"]] as const) {
@@ -658,4 +685,154 @@ test("Overview shows the full Team ID, and every popup action key is named on it
 		popup.component.handleInput(key);
 		assert.deepEqual(popup.closed, [{ teamId, action }]);
 	}
+});
+
+const FLOW_STATS: TeamFlowStats = {
+	slotLimit: 4, activeMs: 42 * 60_000, workersAvg: 1.6, workersRecent: 2.3, allSlotsShare: 0.06, leadBusyShare: 0.41, onlyLeadShare: 0.18,
+	startP50: 0, startP90: 72_000, queued: { count: 2, oldestMs: 180_000, reason: "slots full" }, waitP50: 40_000, waitP90: 360_000,
+	waited: [{ member: "fix-test", count: 9, ms: 42 * 60_000 }, { member: "fix-scroll", count: 4, ms: 10 * 60_000 }], acceptP50: 50_000, acceptP90: 180_000,
+	pendingEvents: 2, tokensPerWork: 1_100_000, context: { member: "reviewer", tokens: 151_000 }, warn: { lead: false, queue: false, waits: false, cost: false },
+};
+
+test("Progress shows the Budget line only from 80%, the five flow rows and the legend, wrapped without truncation in the 73-column popup", (t) => {
+	const { host, teamId } = fixture();
+	host.runtime.flowStats = () => FLOW_STATS;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	let lines = ui.component.render(POPUP_WIDTH);
+	assert.doesNotMatch(lines.join("\n"), /Budget/u, "nothing below 80%");
+	const rows = rowsOf(lines);
+	const single = (label: string) => assert.ok(!/^ {8}\S/u.test(rows[rows.findIndex((row) => row.startsWith(label)) + 1]!), `${label} fits one line`);
+	assert.equal(rowBlock(lines, "Flow "), "Flow    workers avg 1.6 (last 10m 2.3) · all 4 slots busy 6%");
+	assert.equal(rowBlock(lines, "Lead "), "Lead    busy 41% · only lead 18% · accept p50 50s · p90 3.0m · 2 pending");
+	assert.equal(rowBlock(lines, "Queue "), "Queue   start p50 0s · p90 1.2m · 2 queued, oldest 3.0m (slots full)");
+	assert.equal(rowBlock(lines, "Waits "), "Waits   p50 40s · p90 6.0m · most: fix-test 9× 42m · fix-scroll 4× 10m");
+	assert.equal(rowBlock(lines, "Cost "), "Cost    1.1M tokens/finished work · largest context reviewer 151k");
+	assert.equal(rowBlock(lines, "Warn:", false), "Warn: only lead >25% · start p90 >2m, oldest >5m · top waited >50% · context >200k", "the legend wraps whole");
+	for (const label of ["Flow ", "Queue ", "Waits ", "Cost "]) single(label);
+	const order = ["Flow ", "Lead ", "Queue ", "Waits ", "Cost ", "Warn:"].map((label) => rows.findIndex((row) => row.startsWith(label)));
+	assert.deepEqual([...order].sort((x, y) => x - y), order, "in the requested order");
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+	// Worst-case values wrap cleanly: every value is still there and nothing is cut.
+	host.runtime.flowStats = () => ({ ...FLOW_STATS, workersAvg: 3.9, workersRecent: 3.9, allSlotsShare: 1, leadBusyShare: 1, onlyLeadShare: 1, acceptP50: 125 * 60_000, acceptP90: 125 * 60_000, pendingEvents: 100,
+		queued: { count: 100, oldestMs: 125 * 60_000, reason: "member busy" }, startP50: 59_000, startP90: 9.9 * 60_000, waitP50: 59_000, waitP90: 125 * 60_000,
+		waited: [{ member: "fix-test", count: 99, ms: 125 * 60_000 }, { member: "fix-scroll", count: 99, ms: 125 * 60_000 }, { member: "third", count: 1, ms: 1 }], tokensPerWork: 999_999_999 });
+	lines = ui.component.render(POPUP_WIDTH);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+	assert.doesNotMatch(lines.join("\n"), /…/u);
+	assert.equal(rowBlock(lines, "Flow "), "Flow    workers avg 3.9 (last 10m 3.9) · all 4 slots busy 100%");
+	assert.equal(rowBlock(lines, "Lead "), "Lead    busy 100% · only lead 100% · accept p50 125m · p90 125m · 100 pending");
+	assert.equal(rowBlock(lines, "Queue "), "Queue   start p50 59s · p90 9.9m · 100 queued, oldest 125m (member busy)");
+	assert.equal(rowBlock(lines, "Waits "), "Waits   p50 59s · p90 125m · most: fix-test 99× 125m · fix-scroll 99× 125m");
+	assert.equal(rowBlock(lines, "Cost "), "Cost    1000M tokens/finished work · largest context reviewer 151k");
+	assert.ok(rowsOf(lines).some((row) => /^ {8}\S/u.test(row)), "a row too wide for the popup continues under its text");
+	const budget = host.runtime.inspectBudget(teamId);
+	Object.assign(budget.used, { teamModelRequests: 85, teamActivations: 70 });
+	Object.assign(budget.limits, { teamModelRequests: 100, teamActivations: 100, teamToolCalls: 1_000_000_000 });
+	host.runtime.inspectBudget = () => budget;
+	const text = stripTerminalSequences(ui.text(POPUP_WIDTH));
+	assert.match(text, /^│ Budget 85% \(model requests\)/mu, "the highest counter only");
+	assert.doesNotMatch(text, /Budget {2}|░/u);
+});
+
+test("a crossed flow threshold colors only its row warning", (t) => {
+	const { host } = fixture();
+	const tagged = taggingTheme();
+	const ui = overlay(host, { theme: tagged.theme });
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	const colored = (stats: TeamFlowStats) => {
+		host.runtime.flowStats = () => stats;
+		tagged.calls.length = 0;
+		ui.text(120);
+		return tagged.calls.filter((call) => call.color === "warning" && /^(Flow|Queue|Waits|Lead|Cost) /u.test(call.text)).map((call) => call.text.slice(0, 5).trim());
+	};
+	assert.deepEqual(colored(FLOW_STATS), []);
+	assert.deepEqual(colored({ ...FLOW_STATS, warn: { lead: true, queue: true, waits: true, cost: true } }), ["Lead", "Queue", "Waits", "Cost"], "the Flow row has no threshold");
+	assert.deepEqual(colored({ ...FLOW_STATS, warn: { ...FLOW_STATS.warn, lead: true } }), ["Lead"], "the Lead row carries the only-lead warning");
+	assert.deepEqual(colored({ ...FLOW_STATS, warn: { ...FLOW_STATS.warn, waits: true } }), ["Waits"]);
+	assert.ok(tagged.calls.some((call) => call.color === "dim" && call.text.startsWith("Warn:")), "the legend is dim");
+});
+
+test("without data (a Team not launched yet) the flow rows show —", (t) => {
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => "x" });
+	host.runtime.prepare({ members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w", roleDescription: "Work." }], lead: "lead", brief: { goal: "Idle." }, timeoutSeconds: null });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	const text = stripTerminalSequences(ui.text(120));
+	assert.match(text, /Flow {4}workers avg — \(last 10m —\) · all 4 slots busy —/u);
+	assert.match(text, /Lead {4}busy — · only lead — · accept p50 — · p90 — · 0 pending/u);
+	assert.match(text, /Queue {3}start p50 — · p90 — · none queued/u);
+	assert.match(text, /Waits {3}p50 — · p90 — · most: —/u);
+	assert.match(text, /Cost {4}— tokens\/finished work · largest context —/u);
+});
+
+test("a history Team shows its stored flow summary, and omits the flow rows without one", (t) => {
+	const { host } = fixture();
+	const base = { version: 2 as const, lifecycle: "closed" as const, lead: "lead", members: ["lead", "waiter"], results: [], finalResultRefs: [] };
+	host.history.teams.push({ ...base, teamId: "with-flow", at: 2, flow: "workers avg 1.2 · only lead 25% · start delay p90 19s · waits p90 4.5m · most waited: rpc 26×" },
+		{ ...base, teamId: "no-flow", at: 1 });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	ui.component.handleInput("]");
+	let text = stripTerminalSequences(ui.text(120));
+	assert.match(text, /with-flo/u);
+	assert.match(text, /Flow {4}workers avg 1\.2 · only lead 25% · start delay p90 19s · waits p90 4\.5m · most waited: rpc 26×/u);
+	assert.doesNotMatch(text, /Queue {3}|Warn:/u);
+	ui.component.handleInput("]");
+	text = stripTerminalSequences(ui.text(120));
+	assert.match(text, /no-flow/u);
+	assert.doesNotMatch(text, /Flow {4}/u);
+});
+
+test("perf: flowStats and the Progress render stay fast for a Team with ~5000 works", (t) => {
+	let id = 0;
+	let time = 1_700_000_000_000;
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `p${++id}`, now: () => time += 10, limits: { teamWorks: 20000, memberUnresolvedWork: 6000, rootChildren: 6000, rootActivations: 6000 } });
+	const { teamId } = host.runtime.prepare({ members: ["lead", "w1", "w2", "w3", "w4"].map((alias) => ({ alias, roleDescription: "Work." })), lead: "lead", brief: { goal: "Many works." }, timeoutSeconds: null, review: null,
+		initialRequests: [{ to: "w1", task: "Root one" }, { to: "w2", task: "Root two" }] });
+	const runtime = host.runtime;
+	runtime.launch(teamId);
+	const take = () => {
+		const activation = runtime.takeNextActivation(teamId)!;
+		runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId);
+		return activation;
+	};
+	const act = (activation: RuntimeActivation, sequence: number, args: unknown) => {
+		const reply = runtime.handleAction(activation.binding, activation.scope, sequence, `${activation.scope.activationId}:${sequence}`, args, `${activation.scope.activationId}:${sequence}`);
+		assert.equal(reply.ok, true, JSON.stringify(reply));
+	};
+	const settle = (activation: RuntimeActivation, sequence: number) => {
+		runtime.nativeSettled(activation.binding, activation.scope.activationId, { status: "success", appliedToolCallId: `${activation.scope.activationId}:${sequence}` });
+		runtime.cleanupFinished(activation.binding, activation.scope.activationId, { ok: true });
+	};
+	const boot = take();
+	act(boot, 1, { action: "yield" });
+	settle(boot, 1);
+	// Two running roots own 2500 queued sub-tasks each; w3 and w4 then finish 1500 of them.
+	for (const [root, worker] of [["w1", "w3"], ["w2", "w4"]] as const) {
+		const activation = take();
+		assert.equal(activation.binding.memberId, root);
+		for (let index = 0; index < 2500; index++) act(activation, index + 1, { action: "request", to: worker, task: `Sub-task ${index}` });
+	}
+	for (let index = 0; index < 1500; index++) {
+		const activation = take();
+		act(activation, 1, activation.scope.kind === "events" ? { action: "yield" } : { action: "reply", result: { status: "succeeded", summary: "ok" } });
+		settle(activation, 1);
+	}
+	assert.equal(runtime.listWorks(teamId).length, 5002);
+	const stats = runtime.flowStats(teamId);
+	assert.ok(stats.queued && stats.queued.count > 3400 && stats.startP90 !== undefined);
+	const ui = overlay(host, { now: () => time });
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	const measure = (run: () => void) => { const start = performance.now(); for (let index = 0; index < 5; index++) run(); return (performance.now() - start) / 5; };
+	const statsMs = measure(() => runtime.flowStats(teamId));
+	const renderMs = measure(() => ui.component.render(80));
+	console.log(`perf (5002 works): flowStats ${statsMs.toFixed(2)} ms, Progress render ${renderMs.toFixed(2)} ms`);
+	assert.ok(statsMs < 50, `flowStats ${statsMs} ms`);
+	assert.ok(renderMs < 50, `Progress render ${renderMs} ms`);
 });

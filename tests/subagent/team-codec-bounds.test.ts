@@ -160,7 +160,7 @@ test("65 and 512 owned children project to bounded previews, with complete refs 
 		const allRefs: WorkRef[] = [];
 		for (let offset = 0; offset < count; offset += TEAM_STATUS_MAX_LIMIT) {
 			const items: TeamWorkSummary[] = children.slice(offset, offset + TEAM_STATUS_MAX_LIMIT).map((child) => ({
-				work: child, parent: work, requester: "owner", assignee: "lead", state: "resolved", taskPreview: "Child task",
+				work: child, title: "Child task", parent: work, requester: "owner", assignee: "lead", state: "resolved", taskPreview: "Child task",
 			}));
 			const hasMore = offset + items.length < count;
 			const page = { view: "work" as const, items, hasMore, ...(hasMore ? { cursor: `page:${offset + items.length}` } : {}) };

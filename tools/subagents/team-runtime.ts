@@ -12,7 +12,7 @@ import {
 	type TeamWorkSummary, type TeamWorkView, type WorkError, type WorkRecord, type WorkRef, type WorkResult, type WorkVersion,
 } from "./team-protocol";
 import {
-	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeReviewPlan, normalizeTeamAction, normalizeTeamPlan, normalizeTeamBudgetPreset, parseActivationScope, parseBinding, sameScope,
+	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeReviewPlan, normalizeTeamAction, normalizeTeamPlan, normalizeTitle, normalizeTeamBudgetPreset, parseActivationScope, parseBinding, sameScope,
 	okReply, jsonTextBytes, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
 import { readCompactThreshold } from "./team-compaction-settings";
@@ -109,6 +109,7 @@ export interface HostHoldView {
 export interface TeamRuntimeOptions {
 	now?: () => number;
 	createId?: () => string;
+	existingTeamIds?: () => readonly string[];
 	limits?: Partial<TeamBudgetLimits>;
 	activationStopTimeoutMs?: number;
 	/** Synchronous history writer for this runtime generation; critical writes fail closed. */
@@ -175,6 +176,9 @@ interface WaitedWork {
 }
 
 interface ActiveActivation {
+	/** Team-active clock when this native activation was reserved. */
+	startedActiveMs: number;
+	activeTimeFolded?: boolean;
 	scope: ActivationScope;
 	deliveryId: string;
 	inputReady: boolean;
@@ -237,6 +241,7 @@ interface RuntimeMember extends MemberRecord {
 	/** A driver was issued this prepared member's binding and may hold a native lifetime. */
 	nativeClaimed?: boolean;
 	usage: SubagentUsage;
+	activeMs: number;
 }
 
 interface CloseDecision {
@@ -269,6 +274,10 @@ interface TeamState {
 	stateVersion: number;
 	eventSeq: number;
 	createdAt: number;
+	startedAt?: number;
+	endedAt?: number;
+	workStats: Map<string, { activeMs: number; usage: SubagentUsage }>;
+	pausedMs: number;
 	deadline: number | null;
 	plan: TeamPlan;
 	lead: string;
@@ -403,6 +412,8 @@ export class TeamRuntime {
 	private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly now: () => number;
 	private readonly createId: () => string;
+	private readonly existingTeamIds: () => readonly string[];
+	private liveUsage?: (teamId: string, memberId: string) => SubagentUsage | undefined;
 	/** Without an injected createId (tests), model-visible IDs are short random codes. */
 	private readonly shortIds: boolean;
 	private readonly limitOverrides: Partial<TeamBudgetLimits>;
@@ -416,6 +427,7 @@ export class TeamRuntime {
 		this.journalGeneration = options.journal;
 		this.now = options.now ?? Date.now;
 		this.createId = options.createId ?? randomUUID;
+		this.existingTeamIds = options.existingTeamIds ?? (() => []);
 		this.shortIds = !options.createId;
 		this.limitOverrides = { ...options.limits };
 		this.activationStopTimeoutMs = options.activationStopTimeoutMs ?? 5000;
@@ -458,8 +470,10 @@ export class TeamRuntime {
 			unresolvedInitial.set(initial.to, count);
 		}
 		const createdAt = this.timestamp();
-		const id = this.newId();
-		if (this.teams.has(id)) fail("TEAM_CAPACITY", "Team ID collision");
+		const existing = new Set([...this.teams.keys(), ...this.existingTeamIds()]);
+		let id: string;
+		do { id = this.shortIds ? Array.from({ length: 8 }, () => "abcdefghijklmnopqrstuvwxyz234567".charAt(randomInt(32))).join("") : this.newId(); } while (existing.has(id));
+		this.hostId(id, "teamId");
 		const initialCount = plan.initialRequests.length;
 		const reserved = initialCount * TEAM_MAX_RESULT_BYTES;
 		if (initialCount > limits.teamWorks || reserved > limits.reservedResultBytes) {
@@ -476,12 +490,12 @@ export class TeamRuntime {
 				resourceState: "starting",
 				policy: copy(memberPlan.policy),
 				epoch: this.newId(),
-				usage: emptySubagentUsage(),
+				usage: emptySubagentUsage(), activeMs: 0,
 			});
 		}
 		const budget = new TeamBudget(limits);
 		const team: TeamState = {
-			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt,
+			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt, workStats: new Map(), pausedMs: 0,
 			deadline: null,
 			plan: copy(plan), lead: plan.lead, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
@@ -490,7 +504,7 @@ export class TeamRuntime {
 			flow: newFlow(createdAt), dependencyWaits: 0, questions: 0, toolErrors: 0, transientRetries: 0,
 		};
 		for (const initial of plan.initialRequests) {
-			const record = this.makeWork(team, team.lead, initial.to, initial.task, initial.inputRefs, undefined, createdAt);
+			const record = this.makeWork(team, team.lead, initial.to, initial.task, initial.inputRefs, undefined, createdAt, undefined, 0, initial.title);
 			this.assertInputFits(team, team.members.get(initial.to)!, record);
 			team.ledger.add(record);
 			team.ready.push({ workId: record.id, revision: 1 });
@@ -511,7 +525,7 @@ export class TeamRuntime {
 		const launchAt = this.timestamp();
 		// History must record admission before any provider can run; a failed write fails startup closed.
 		if (!this.tryJournal(team, { version: 2, kind: "launched", teamId, at: launchAt,
-			roster: { lead: team.lead, members: team.plan.members.map((member) => member.alias) }, goal: previewText(team.plan.brief.goal, 512),
+			roster: { lead: team.lead, members: team.plan.members.map((member) => member.alias) }, goal: previewText(team.plan.brief.goal, 512), title: team.plan.title!,
 			...(team.plan.review ? { review: team.plan.review } : {}) })) {
 			const reason = team.journalFailure;
 			this.applyJournalFailure(team);
@@ -521,6 +535,7 @@ export class TeamRuntime {
 		team.lifecycle = "active";
 		team.flow.lastAt = launchAt;
 		team.review.startedAt = launchAt;
+		team.startedAt = launchAt;
 		for (const member of team.members.values()) {
 			member.lifecycle = "open";
 			member.resourceState = "owned";
@@ -709,6 +724,8 @@ export class TeamRuntime {
 
 	/** Shared terminal stop for host cancellation and fail-closed journal loss; the first terminal lifecycle wins. */
 	private stopTeamExecution(team: TeamState, lifecycle: "cancelled" | "failed" | "interrupted", reason: string, workError: WorkError): void {
+		this.tickFlow(team);
+		team.endedAt ??= this.timestamp();
 		if (team.lifecycle === "failed") {
 			team.reason = `${team.reason ?? "Team failed"}; ${lifecycle === "cancelled" ? "host cancellation requested" : "additional failure"}: ${reason}`;
 		} else {
@@ -863,6 +880,7 @@ export class TeamRuntime {
 		this.tickFlow(team);
 		delete team.hostPause;
 		const now = this.timestamp();
+		team.pausedMs += now - paused.at;
 		for (const id of paused.members) this.liftPause(team, team.members.get(id)!);
 		if (team.deadline !== null) {
 			team.deadline += now - paused.at;
@@ -1849,7 +1867,8 @@ export class TeamRuntime {
 		this.tickFlow(team);
 		const records = this.plainRecords(team);
 		const finished = records.filter((record) => isTerminalWorkState(currentVersion(record).state)).length;
-		const tokens = team.usage.input + team.usage.output + team.usage.cacheRead;
+		const usage = this.teamUsage(team);
+		const tokens = usage.input + usage.output + usage.cacheRead;
 		let queuedCount = 0;
 		let oldest: { at: number; assignee: string } | undefined;
 		if (team.lifecycle === "active") for (const ref of team.ready) {
@@ -2044,7 +2063,8 @@ export class TeamRuntime {
 		active.native = copy(completion);
 		if (completion.status === "success") delete member.retry;
 		// Usage is folded exactly once, at the first accepted settlement of this activation.
-		if (completion.usage) this.foldUsage(team, member, completion.usage);
+		this.foldActiveTime(team, member, active);
+		if (completion.usage) this.foldUsage(team, member, completion.usage, active.scope.work);
 		// A still-parked provider gate belongs to a native run that has now ended; release its private request.
 		this.resolveProviderGate(active, { allow: false, reason: "activation_ending", message: "The native activation already settled" });
 		// Gate-blocked tool batches without an end intent are controlled stops, not protocol failures.
@@ -2128,7 +2148,8 @@ export class TeamRuntime {
 		}
 		if (active.native) fail("PROTOCOL_FAILURE", "A settled activation must use nativeSettled and cleanupFinished");
 		// Malformed evidence cannot block isolation; it is simply not billed.
-		if (usage && this.isValidUsage(usage)) this.foldUsage(team, member, usage);
+		this.foldActiveTime(team, member, active);
+		if (usage && this.isValidUsage(usage)) this.foldUsage(team, member, usage, active.scope.work);
 		this.clearActivationStopExpiry(active);
 		this.resolveProviderGate(active, { allow: false, reason: "stale_scope", message: "The native activation was isolated by Runtime" });
 		const delivery = team.deliveries.get(active.deliveryId);
@@ -2255,6 +2276,59 @@ export class TeamRuntime {
 	}
 
 	getTeam(teamId: string): TeamTeamView { return this.view(this.team(teamId)); }
+
+	/** Host-only title change; history records may be renamed after their Team ends. */
+	renameTeam(teamId: string, title: string): TeamTeamView {
+		const team = this.team(teamId);
+		const normalized = normalizeTitle(title, "");
+		if (team.lifecycle !== "prepared") this.writeJournal(team, { version: 2, kind: "title", teamId, at: this.timestamp(), title: normalized });
+		team.plan.title = normalized;
+		this.changed(team);
+		return this.view(team);
+	}
+
+	/** The driver supplies only the not-yet-settled native usage; no ledger mutation is involved. */
+	setLiveUsageSource(source: (teamId: string, memberId: string) => SubagentUsage | undefined): void {
+		this.liveUsage = source;
+	}
+
+	teamTime(teamId: string): { activeMs: number; wallMs: number; pausedMs: number; startedAt: number; endedAt?: number } {
+		const team = this.team(teamId);
+		this.tickFlow(team);
+		const at = team.endedAt ?? this.timestamp();
+		const startedAt = team.startedAt ?? team.createdAt;
+		return { activeMs: team.flow.activeMs, wallMs: team.startedAt === undefined ? 0 : Math.max(0, at - startedAt),
+			pausedMs: team.pausedMs + (team.hostPause ? Math.max(0, at - team.hostPause.at) : 0), startedAt,
+			...(team.endedAt !== undefined ? { endedAt: team.endedAt } : {}) };
+	}
+
+	memberStats(teamId: string, memberId: string): { activeMs: number; usage: SubagentUsage } {
+		const team = this.team(teamId);
+		const member = team.members.get(memberId);
+		if (!member) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
+		this.tickFlow(team);
+		const active = member.active;
+		const usage = copy(member.usage);
+		const live = active && !active.native && !active.activeTimeFolded ? this.liveUsage?.(teamId, memberId) : undefined;
+		if (live) addActivationUsage(usage, live);
+		return { activeMs: member.activeMs + (active && !active.activeTimeFolded ? Math.max(0, team.flow.activeMs - active.startedActiveMs) : 0), usage };
+	}
+
+	/** Work IDs survive revisions; totals include every native activation of all their versions. */
+	workStats(teamId: string, work: WorkRef): { activeMs: number; usage: SubagentUsage } {
+		const team = this.team(teamId);
+		if (!team.ledger.version(work)) fail("UNKNOWN_WORK", `Unknown work ${workRefKey(work)}`);
+		this.tickFlow(team);
+		const stats = copy(this.settledWorkStats(team, work.workId));
+		for (const member of team.members.values()) {
+			const active = member.active;
+			if (!active || active.scope.work?.workId !== work.workId || active.activeTimeFolded) continue;
+			stats.activeMs += Math.max(0, team.flow.activeMs - active.startedActiveMs);
+			const live = this.liveUsage?.(teamId, member.id);
+			if (live) addActivationUsage(stats.usage, live);
+		}
+		return stats;
+	}
 
 	/** Host/driver-only lifetime capability; never include this in a Team view or model input. */
 	bindingForDriver(teamId: string, memberId: string): BindingV2 {
@@ -2472,7 +2546,8 @@ export class TeamRuntime {
 					...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: copy(version.review) } : {}) };
 			}),
 			members: [...team.members.values()].map(({ id, lifecycle, resourceState }) => ({ id, lifecycle, resourceState })),
-			usage: copy(team.usage),
+			usage: this.teamUsage(team), activeMs: this.teamTime(teamId).activeMs,
+			memberStats: [...team.members.values()].map(({ id }) => ({ id, ...this.memberStats(teamId, id) })),
 			unresolvedIncidents: unresolvedIncidents.slice(-TEAM_MAX_TERMINAL_INCIDENTS).map(({ id, code, message }) => ({ id, ...projectWorkError({ code, message }) })),
 			...(unresolvedIncidents.length > TEAM_MAX_TERMINAL_INCIDENTS
 				? { unresolvedIncidentsOmitted: unresolvedIncidents.length - TEAM_MAX_TERMINAL_INCIDENTS }
@@ -2549,12 +2624,12 @@ export class TeamRuntime {
 		}
 		for (const resultRef of action.inputRefs) this.requireResult(team, resultRef);
 		const at = this.timestamp();
-		const work = this.makeWork(team, requester.id, recipient.id, action.task, action.inputRefs, parent, at, rootId, depth);
+		const work = this.makeWork(team, requester.id, recipient.id, action.task, action.inputRefs, parent, at, rootId, depth, action.title);
 		this.assertInputFits(team, recipient, work, parent);
 		team.ledger.add(work);
 		team.ready.push({ workId: work.id, revision: 1 });
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
-		this.note(team, `${requester.id} requested ${shortWorkRef({ workId: work.id, revision: 1 })} → ${recipient.id}`);
+		this.note(team, `${requester.id} requested ${shortWorkRef({ workId: work.id, revision: 1 })} «${work.title}» → ${recipient.id}`);
 		this.changed(team);
 		return okReply(requester.id, { receipt: { status: "accepted", work: { workId: work.id, revision: 1 }, recipient: recipient.id, ...(recipient.pause !== "none" ? { paused: true } : {}) } });
 	}
@@ -2796,7 +2871,8 @@ export class TeamRuntime {
 		this.assertInputFits(team, assignee, { ...entry.record, currentRevision: nextRevision, versions: [...entry.record.versions, candidate] }, entry.record.parent);
 		const currentRef = { workId: entry.record.id, revision: entry.record.currentRevision };
 		this.writeJournal(team, { version: 2, kind: "decision", teamId: team.id, at: candidate.createdAt, decision: "revise_work", work: currentRef });
-		this.note(team, `${actor.id} revised ${shortWorkRef(currentRef)}`);
+		if (control.title !== undefined) entry.record.title = control.title;
+		this.note(team, `${actor.id} revised ${shortWorkRef(currentRef)}: "${previewText(control.task, 120)}"`);
 		if (!isTerminalWorkState(current.state)) {
 			this.cancelDescendants(team, currentRef, "superseded");
 			current.state = "superseded";
@@ -3110,7 +3186,8 @@ export class TeamRuntime {
 		const eventBatch: EventBatch = { id: batchId, eventIds: selected.map((event) => event.id) };
 		for (const event of selected) event.batchId = batchId;
 		team.eventBatches.set(batchId, eventBatch);
-		const activation: ActiveActivation = { scope, deliveryId, inputReady: false, workPermitHeld: false, parked: false, resumeRequested: false,
+		this.tickFlow(team);
+		const activation: ActiveActivation = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: false, parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(undefined, true, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
@@ -3137,15 +3214,17 @@ export class TeamRuntime {
 		}, team.budget.inputSummary(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false));
 		version.state = "running";
 		version.updatedAt = at;
-		member.active = { scope, deliveryId, inputReady: false, workPermitHeld: true, parked: false, resumeRequested: false,
+		this.tickFlow(team);
+		member.active = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: true, parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false),
 			budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		this.startFlow(team, member, member.active);
+		const firstStart = !team.flow.started.has(workRefKey(ref));
 		this.flowWorkStarted(team, ref, version, at);
 		member.currentWork = copy(ref);
 		member.activity = "running";
-		this.note(team, `${member.id} started ${shortWorkRef(ref)}`);
+		this.note(team, firstStart ? `${member.id} started ${shortWorkRef(ref)} (queued ${clock(at - Math.max(version.createdAt, team.startedAt ?? version.createdAt))})` : `${member.id} resumed ${shortWorkRef(ref)}`);
 		this.addDelivery(team, member, scope, input);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
@@ -3247,7 +3326,10 @@ export class TeamRuntime {
 		if (!(active.intent?.kind === "reply" && team.ledger.version(scope.work!)?.resultRef)) {
 			const intent = active.intent;
 			const ending = intent?.kind === "yield_dependencies"
-				? `waiting on ${capped([...new Set(this.byCreation(team, intent.waitingFor, (ref) => ref).map((ref) => team.ledger.get(ref.workId)!.record.assignee))], 3)}`
+				? `waiting on ${this.byCreation(team, intent.waitingFor, (ref) => ref).map((ref) => {
+					const record = team.ledger.get(ref.workId)!.record;
+					return `${record.assignee} · ${shortWorkRef(ref)} «${record.title}»`;
+				}).join(", ")}`
 				: intent?.kind.replaceAll("_", " ");
 			this.note(team, `${member.id} ended ${scope.kind === "work" ? shortWorkRef(scope.work!) : "events activation"}${ending ? ` (${ending})` : ""}`);
 		}
@@ -3813,6 +3895,8 @@ export class TeamRuntime {
 		if ([...team.members.values()].some((member) => member.id === team.lead
 			? member.lifecycle !== "closed" || member.resourceState !== "released"
 			: !((member.lifecycle === "closed" || member.lifecycle === "faulted") && member.resourceState === "released"))) return;
+		this.tickFlow(team);
+		team.endedAt ??= this.timestamp();
 		team.lifecycle = "closed";
 		this.clearDeadline(team.id);
 		team.outcome = team.closeDecision.outcome;
@@ -3973,13 +4057,17 @@ export class TeamRuntime {
 	private settleCompletion(team: TeamState): void {
 		if (!this.completionReady(team)) return;
 		if (!team.terminalJournaled) {
+			team.endedAt ??= this.timestamp();
 			team.terminalJournaled = true;
 			this.note(team, `Team ${team.lifecycle}${team.outcome ? ` · outcome ${team.outcome}` : ""}`);
 			const terminal = this.getTeamResult(team.id);
 			// A closed success is only reported once its terminal history is written.
-			if (terminal && !this.tryJournal(team, { version: 2, kind: "terminal", teamId: team.id, at: this.timestamp(),
-				...(team.closeDecision ? { closeId: team.closeDecision.id } : {}), result: terminal, flow: flowSummary(this.flowStats(team.id)) })) {
-				this.applyJournalFailure(team);
+			if (terminal) {
+				const { activeMs, memberStats, ...result } = terminal;
+				if (!this.tryJournal(team, { version: 2, kind: "terminal", teamId: team.id, at: this.timestamp(), endedAt: team.endedAt,
+					...(team.closeDecision ? { closeId: team.closeDecision.id } : {}), result, activeMs: activeMs!, memberStats: memberStats!, flow: flowSummary(this.flowStats(team.id)) })) {
+					this.applyJournalFailure(team);
+				}
 			}
 		}
 		const result = this.getTeamResult(team.id);
@@ -4037,10 +4125,10 @@ export class TeamRuntime {
 		return { version: TEAM_PROTOCOL_VERSION, teamId: team.id, memberId: member.id, epoch: member.epoch };
 	}
 
-	private makeWork(team: TeamState, requester: string, assignee: string, task: string, inputRefs: string[], parent: WorkRef | undefined, at: number, rootId?: string, depth = 0): WorkRecord {
+	private makeWork(team: TeamState, requester: string, assignee: string, task: string, inputRefs: string[], parent: WorkRef | undefined, at: number, rootId?: string, depth = 0, title?: string): WorkRecord {
 		const id = this.modelId(team, "work");
 		const version = this.makeVersion(1, task, inputRefs, at);
-		return { id, requester, assignee, rootId: rootId ?? id, ...(parent ? { parent: copy(parent) } : {}), depth, currentRevision: 1, versions: [version] };
+		return { id, title: normalizeTitle(title, task), requester, assignee, rootId: rootId ?? id, ...(parent ? { parent: copy(parent) } : {}), depth, currentRevision: 1, versions: [version] };
 	}
 
 	private makeVersion(revision: number, task: string, inputRefs: string[], at: number): WorkVersion {
@@ -4088,7 +4176,7 @@ export class TeamRuntime {
 		return team.ledger.order.map((id) => {
 			const record = team.ledger.get(id)!.record;
 			const version = currentVersion(record);
-			return { work: { workId: id, revision: record.currentRevision }, requester: record.requester, assignee: record.assignee,
+			return { work: { workId: id, revision: record.currentRevision }, title: record.title!, requester: record.requester, assignee: record.assignee,
 				...(record.parent ? { parent: copy(record.parent) } : {}),
 				state: version.state, taskPreview: previewText(version.task, 512), ...(version.hold ? { hold: version.hold.reason } : {}),
 				...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: version.review.disposition } : {}),
@@ -4163,7 +4251,7 @@ export class TeamRuntime {
 			...(this.memberContext(member) ? { context: this.memberContext(member)! } : {}),
 			...(member.compaction?.state === "running" ? { compacting: true } : {}),
 			...(member.lastCompaction ? { lastCompaction: copy(member.lastCompaction) } : {}),
-			usage: copy(member.usage),
+			usage: this.memberStats(team.id, member.id).usage,
 		}));
 		const roots = this.rootRecords(team);
 		const used: TeamBudgetView["used"] = { teamWorks: team.ledger.order.length, ...team.budget.used, reservedResultBytes: team.reservedResultBytes };
@@ -4183,7 +4271,7 @@ export class TeamRuntime {
 			...team.incidents.filter((incident) => incident.state !== "open").slice(-Math.max(0, TEAM_VIEW_MAX_INCIDENTS - open.length))]);
 		const incidents = team.incidents.filter((incident) => selected.has(incident));
 		return {
-			version: TEAM_PROTOCOL_VERSION, teamId: team.id, lifecycle: team.lifecycle, health: team.health, stateVersion: team.stateVersion,
+			version: TEAM_PROTOCOL_VERSION, teamId: team.id, title: team.plan.title!, shortId: team.id.slice(0, 8), lifecycle: team.lifecycle, health: team.health, stateVersion: team.stateVersion,
 			eventSeq: team.eventSeq, lead: team.lead, timeoutSeconds: team.plan.timeoutSeconds, deadline: team.deadline, brief: copy(team.plan.brief), members,
 			works: { total: current.length, queued: current.filter((version) => version.state === "queued").length,
 				running: current.filter((version) => version.state === "running").length,
@@ -4199,7 +4287,7 @@ export class TeamRuntime {
 					|| team.reservedResultBytes >= team.limits.reservedResultBytes,
 				roots: shownRoots, rootsOmitted: budgetRoots.length - shownRoots.length,
 				grants: copy(team.budget.grants.slice(-TEAM_VIEW_MAX_GRANTS)), grantsOmitted: Math.max(0, team.budget.grants.length - TEAM_VIEW_MAX_GRANTS) },
-			usage: copy(team.usage),
+			usage: this.teamUsage(team),
 			...(team.hostPause && team.lifecycle === "active" ? { paused: { since: team.hostPause.at, finishing: this.finishingActivations(team) } } : {}),
 			...(team.outcome ? { outcome: team.outcome } : {}), ...(team.reason ? { reason: projectErrorText(team.reason) } : {}),
 		};
@@ -4262,9 +4350,36 @@ export class TeamRuntime {
 			.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0);
 	}
 
-	private foldUsage(team: TeamState, member: RuntimeMember, usage: SubagentUsage): void {
+	private foldUsage(team: TeamState, member: RuntimeMember, usage: SubagentUsage, work?: WorkRef): void {
 		addActivationUsage(team.usage, usage);
 		addActivationUsage(member.usage, usage);
+		if (work) addActivationUsage(this.settledWorkStats(team, work.workId).usage, usage);
+	}
+
+	private settledWorkStats(team: TeamState, workId: string): { activeMs: number; usage: SubagentUsage } {
+		let stats = team.workStats.get(workId);
+		if (!stats) team.workStats.set(workId, stats = { activeMs: 0, usage: emptySubagentUsage() });
+		return stats;
+	}
+
+	private foldActiveTime(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
+		if (active.activeTimeFolded) return;
+		this.tickFlow(team);
+		const ms = Math.max(0, team.flow.activeMs - active.startedActiveMs);
+		member.activeMs += ms;
+		if (active.scope.work) this.settledWorkStats(team, active.scope.work.workId).activeMs += ms;
+		active.activeTimeFolded = true;
+	}
+
+	private teamUsage(team: TeamState): SubagentUsage {
+		const usage = copy(team.usage);
+		for (const member of team.members.values()) {
+			if (member.active && !member.active.native && !member.active.activeTimeFolded) {
+				const live = this.liveUsage?.(team.id, member.id);
+				if (live) addActivationUsage(usage, live);
+			}
+		}
+		return usage;
 	}
 	private hostWorkRef(value: WorkRef): WorkRef {
 		if (!value || typeof value !== "object" || typeof value.workId !== "string" || !Number.isSafeInteger(value.revision) || value.revision < 1) {

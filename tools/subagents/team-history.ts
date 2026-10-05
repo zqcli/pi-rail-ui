@@ -6,7 +6,7 @@ import {
 } from "./team-protocol";
 import {
 	canonicalJson, jsonBytes, jsonTextBytes, normalizeAlias, normalizeId, normalizeResultRecord, normalizeTeamBudgetGrantRecord,
-	normalizeReviewPlan, normalizeTeamResult, normalizeTeamResultRoots, normalizeTeamReviewRecord, normalizeWorkRef,
+	normalizeTitle, normalizeReviewPlan, normalizeTeamResult, normalizeTeamResultRoots, normalizeTeamReviewRecord, normalizeWorkRef,
 } from "./team-codec";
 
 /** Custom-entry type of retired v1 Team snapshots; only read, never written. */
@@ -23,6 +23,10 @@ const MAX_HISTORY_RESULTS = TEAM_MAX_RESULT_RECORDS;
  */
 export interface TeamHistoryEntry {
 	teamId: string;
+	title?: string;
+	shortId?: string;
+	activeMs?: number;
+	memberStats?: TeamResult["memberStats"];
 	version: 1 | 2;
 	lifecycle: TeamLifecycle | "completed";
 	outcome?: TeamOutcome;
@@ -94,16 +98,22 @@ function applyJournalRecord(
 	const current = teams.get(teamId);
 	switch (kind) {
 		case "launched": {
-			onlyKeys(data, ["version", "kind", "teamId", "at", "roster", "goal", "review"]);
+			onlyKeys(data, ["version", "kind", "teamId", "at", "roster", "goal", "title", "review"]);
 			if (current) return false;
 			const roster = data["roster"];
 			if (!isRecord(roster)) return false;
 			const { lead, members } = parseRoster(roster);
 			const goal = boundedText(data["goal"], 512, "journal.goal");
 			const review = data["review"] === undefined ? undefined : normalizeReviewPlan(data["review"], "journal.review", members, lead);
-			teams.set(teamId, { teamId, version: 2, lifecycle: "interrupted", lead, members, goal, results: [], finalResultRefs: [], ...(review ? { review } : {}), startedAt: at, at });
+			teams.set(teamId, { teamId, title: normalizeTitle(data["title"], goal, "journal.title"), shortId: teamId.slice(0, 8), version: 2, lifecycle: "interrupted", lead, members, goal, results: [], finalResultRefs: [], ...(review ? { review } : {}), startedAt: at, at });
 			resultsByTeam.set(teamId, new Map());
 			resultBytesByTeam.set(teamId, 0);
+			return true;
+		}
+		case "title": {
+			onlyKeys(data, ["version", "kind", "teamId", "at", "title"]);
+			if (!current) return false;
+			current.title = normalizeTitle(data["title"] ?? "", "", "journal.title");
 			return true;
 		}
 		case "deleted": {
@@ -195,12 +205,17 @@ function applyJournalRecord(
 			return true;
 		}
 		case "terminal": {
-			onlyKeys(data, ["version", "kind", "teamId", "at", "closeId", "result", "flow"]);
+			onlyKeys(data, ["version", "kind", "teamId", "at", "endedAt", "closeId", "result", "flow", "activeMs", "memberStats"]);
 			if (!current || current.version !== 2 || ended.has(teamId)) return false;
+			const endedAt = data["endedAt"] === undefined ? at : data["endedAt"];
+			if (!validTime(endedAt) || (endedAt as number) < current.startedAt! || (endedAt as number) > at) return false;
 			const close = closeByTeam.get(teamId);
 			const closeId = data["closeId"] === undefined ? undefined : normalizeId(data["closeId"], "journal.terminal.closeId");
 			if ((close && closeId !== close.closeId) || (!close && closeId !== undefined)) return false;
-			const result = parseTeamResult(legacyTerminalResult(data["result"]));
+			const terminal = legacyTerminalResult(data["result"]);
+			const result = parseTeamResult(isRecord(terminal) ? { ...terminal,
+				...(data["activeMs"] !== undefined ? { activeMs: data["activeMs"] } : {}),
+				...(data["memberStats"] !== undefined ? { memberStats: data["memberStats"] } : {}) } : terminal);
 			if (result.teamId !== teamId || !terminalMatchesHistory(result, current, resultsByTeam.get(teamId)!, close)) return false;
 			current.lifecycle = result.lifecycle;
 			if (result.outcome) current.outcome = result.outcome;
@@ -208,13 +223,15 @@ function applyJournalRecord(
 			current.finalResultRefs = result.finalResultRefs;
 			current.usage = result.usage;
 			current.memberStates = result.members;
+			if (result.activeMs !== undefined) current.activeMs = result.activeMs;
+			if (result.memberStats !== undefined) current.memberStats = result.memberStats;
 			current.rootCounts = {
 				accepted: result.roots.filter((root) => root.review?.disposition === "accepted").length,
 				waived: result.roots.filter((root) => root.review?.disposition === "waived").length,
 				total: result.roots.length,
 			};
 			if (data["flow"] !== undefined) current.flow = boundedText(data["flow"], 512, "journal.terminal.flow");
-			current.at = at;
+			current.at = endedAt as number;
 			ended.add(teamId);
 			return true;
 		}
@@ -351,7 +368,7 @@ function applyLegacySnapshot(teams: Map<string, TeamHistoryEntry>, data: unknown
 	const members = [coordinator, ...rawWorkers.map((item, index) => normalizeAlias(item, `legacy.workers[${index}]`))];
 	if (members.length < TEAM_MIN_MEMBERS || members.length > TEAM_MAX_MEMBERS || new Set(members).size !== members.length) return false;
 	teams.set(teamId, {
-		teamId, version: 1, lead: coordinator, members,
+		teamId, shortId: teamId.slice(0, 8), title: existing?.title ?? normalizeTitle(undefined, typeof data["goal"] === "string" ? data["goal"] : teamId), version: 1, lead: coordinator, members,
 		lifecycle: (LEGACY_TERMINAL as readonly string[]).includes(phase) ? phase as TeamHistoryEntry["lifecycle"] : "interrupted",
 		results: [], finalResultRefs: [], at: validTime(data["createdAt"]) ? data["createdAt"] as number : 0,
 	});

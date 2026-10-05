@@ -142,6 +142,7 @@ export interface WorkVersion {
 }
 export interface WorkRecord {
 	id: string;
+	title?: string;
 	/** A periodic progress review created by the runtime; absent for every normal work. */
 	kind?: "review";
 	requester: string;
@@ -195,8 +196,9 @@ export interface TeamMemberPlan {
 	roleDescription: string;
 	policy: TeamMemberPolicy;
 }
-export interface TeamInitialRequest { to: string; task: string; inputRefs: string[] }
+export interface TeamInitialRequest { to: string; task: string; title?: string; inputRefs: string[] }
 export interface TeamPlan {
+	title?: string;
 	budget?: TeamBudgetPreset;
 	members: TeamMemberPlan[];
 	/** Alias of the member that handles Team events and requests the initial work. */
@@ -315,7 +317,7 @@ export type RootGrantCounter = typeof ROOT_GRANTABLE_COUNTERS[number];
 // Public member tool actions (`team` tool). Normalized by team-codec.
 
 export type TeamAction =
-	| { action: "request"; to: string; task: string; inputRefs: string[] }
+	| { action: "request"; to: string; task: string; title?: string; inputRefs: string[] }
 	| { action: "reply"; result: WorkResult }
 	| { action: "yield"; waitingFor: WorkRef[]; checkpoint?: string; attention?: string }
 	| { action: "status"; view: "team" | "work" | "result" | "incident"; id?: string; cursor?: string; limit: number }
@@ -324,7 +326,7 @@ export type TeamAction =
 export type TeamControl =
 	| { command: "pause_member"; memberId: string }
 	| { command: "resume_member"; memberId: string }
-	| { command: "revise_work"; workId: string; expectedRevision: number; task: string; inputRefs: string[] }
+	| { command: "revise_work"; workId: string; expectedRevision: number; task: string; title?: string; inputRefs: string[] }
 	| { command: "cancel_work"; workId: string; expectedRevision: number; reason: string }
 	| { command: "resume_work"; workId: string; expectedRevision: number; incidentId: string; instruction: string }
 	| { command: "accept_result"; work: WorkRef; disposition: "accepted" | "waived"; reason?: string }
@@ -555,6 +557,7 @@ export interface TeamWorkView {
 }
 export interface TeamWorkSummary {
 	work: WorkRef;
+	title?: string;
 	/** Exact owning version; lets paginated work summaries enumerate all children after host grants. */
 	parent?: WorkRef;
 	requester: string;
@@ -572,7 +575,7 @@ export interface TeamMemberView extends MemberRecord {
 	blocked: number;
 	held: number;
 	policy: TeamMemberPolicy;
-	/** Native usage of this member's settled activations, each counted once. */
+	/** Native usage including the in-flight activation, each counted once. */
 	usage: SubagentUsage;
 	context?: { used: number; window: number; percent: number };
 	compacting?: boolean;
@@ -615,6 +618,8 @@ export interface TeamBudgetView {
 export interface TeamTeamView {
 	version: 2;
 	teamId: string;
+	title?: string;
+	shortId?: string;
 	lifecycle: TeamLifecycle;
 	health: Health;
 	stateVersion: number;
@@ -631,7 +636,7 @@ export interface TeamTeamView {
 	incidents: TeamIncidentView[];
 	incidentsOmitted: number;
 	budget: TeamBudgetView;
-	/** Team total of settled native usage (all members). */
+	/** Team total of native usage (all members), including in-flight activations. */
 	usage: SubagentUsage;
 	outcome?: TeamOutcome;
 	reason?: string;
@@ -658,6 +663,8 @@ export interface TeamResult {
 	}>;
 	members: Array<{ id: string; lifecycle: MemberLifecycle; resourceState: ResourceState }>;
 	usage: SubagentUsage;
+	activeMs?: number;
+	memberStats?: Array<{ id: string; activeMs: number; usage: SubagentUsage }>;
 	unresolvedIncidents: Array<{ id: string; code: string; message: string }>;
 	unresolvedIncidentsOmitted?: number;
 }

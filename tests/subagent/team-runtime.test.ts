@@ -436,7 +436,7 @@ test("P: v2 codec rejects v1 live frames, legacy actions, unknown fields and non
 		members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w1", roleDescription: "Work." }], lead: "lead", brief: { goal: "Test." }, timeoutSeconds: null,
 	}), {
 		members: [{ alias: "lead", roleDescription: "Manage.", policy: {} }, { alias: "w1", roleDescription: "Work.", policy: {} }], lead: "lead",
-		brief: { goal: "Test." }, initialRequests: [], timeoutSeconds: null, review: null,
+		title: "Test.", brief: { goal: "Test." }, initialRequests: [], timeoutSeconds: null, review: null,
 	});
 });
 
@@ -751,8 +751,8 @@ test("timeline: a full timeline keeps its first entries and the newest, and coun
 	assert.equal(facts.timeline.length, 122, "more than 100 milestones remain available to the popup");
 	assert.equal(facts.timelineOmitted, 0);
 	assert.deepEqual(facts.timeline.slice(0, TEAM_TIMELINE_HEAD), head, "the start of the run is kept, launch included");
-	assert.equal(facts.timeline.at(-1)!.text, `lead requested ${shortWorkRef(last)} \u2192 w1`, "and so is the newest milestone (request 119 went to w1)");
-	assert.match(facts.timeline[TEAM_TIMELINE_HEAD]!.text, /^lead requested work \S+ \u2192 w[12]$/u);
+	assert.equal(facts.timeline.at(-1)!.text, `lead requested ${shortWorkRef(last)} «task 119» \u2192 w1`, "and so is the newest milestone (request 119 went to w1)");
+	assert.match(facts.timeline[TEAM_TIMELINE_HEAD]!.text, /^lead requested work \S+ «task \d+» \u2192 w[12]$/u);
 	const cancel = (ref: WorkRef) => assert.equal(action(runtime, boot, ++sequence, `cancel-${ref.workId}`, {
 		action: "control", command: "cancel_work", workId: ref.workId, expectedRevision: 1, reason: "Not needed.",
 	}).ok, true);
@@ -836,7 +836,7 @@ test("panel facts name who a blocked member waits on: a peer with its state, at 
 		assert.equal(facts.stalled.get("w1"), `waiting on w2 (running ${shortWorkRef(workRef(producer))})`, "one peer: its alias, state and short ref");
 		assert.equal(facts.stalled.has("w2"), false, "a running member is not stalled");
 		assert.equal(facts.waitingFor, "w2 (running) · w1 (waiting on w2)");
-		assert.ok(facts.timeline.some((entry) => entry.text === `w1 ended ${shortWorkRef(workRef(waiter))} (waiting on w2)`),
+		assert.ok(facts.timeline.some((entry) => entry.text === `w1 ended ${shortWorkRef(workRef(waiter))} (waiting on w2 · ${shortWorkRef(workRef(producer))} «conclude»)`),
 			"the timeline names the assignee a yielded work waits on");
 		reply(runtime, producer, "w2-reply", "w2 conclusion");
 		assert.equal(runtime.panelFacts(teamId).stalled.has("w1"), false, "once w2 has answered, w1 is queued and no longer waits");
@@ -851,7 +851,7 @@ test("panel facts name who a blocked member waits on: a peer with its state, at 
 		assert.equal(facts.stalled.get("w1"), "waiting on w2 (queued), w3 (queued), w4 (queued) +1 more", "peers in creation order, three named");
 		assert.equal(facts.waitingFor, "w1 (waiting on w2, w3, w4 +1 more)");
 		// The codec sorts waitingFor by WorkRef (here w3, w4, w5, w2); the timeline names them in creation order, like the panel.
-		assert.ok(facts.timeline.some((entry) => /^w1 ended \S+ \S+ \(waiting on w2, w3, w4 \+1 more\)$/u.test(entry.text)));
+		assert.ok(facts.timeline.some((entry) => entry.text === `w1 ended ${shortWorkRef(workRef(hub))} (waiting on ${peers.map((ref, index) => `w${index + 2} · ${shortWorkRef(ref)} «root of w${index + 2}»`).join(", ")})`));
 	}
 });
 

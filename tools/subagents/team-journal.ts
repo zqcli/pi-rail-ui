@@ -6,7 +6,8 @@ import type { ResultRecord, TeamResult, TeamReviewPlan, TeamReviewRecord, WorkRe
  * history, not a recovery log: it never contains the whole ledger, gates, ACKs or private frames.
  */
 export type TeamJournalRecord =
-	| { version: 2; kind: "launched"; teamId: string; at: number; roster: { lead: string; members: string[] }; goal: string; review?: TeamReviewPlan }
+	| { version: 2; kind: "launched"; teamId: string; at: number; roster: { lead: string; members: string[] }; goal: string; title?: string; review?: TeamReviewPlan }
+	| { version: 2; kind: "title"; teamId: string; at: number; title: string }
 	| { version: 2; kind: "review_schedule"; teamId: string; at: number; review: TeamReviewPlan | null }
 	| { version: 2; kind: "review"; teamId: string; at: number; review: TeamReviewRecord }
 	| { version: 2; kind: "handover"; teamId: string; at: number; lead: string }
@@ -16,7 +17,7 @@ export type TeamJournalRecord =
 	| { version: 2; kind: "decision"; teamId: string; at: number; decision: "revise_work" | "cancel_work"; work: WorkRef; reason?: string }
 	| { version: 2; kind: "close_decision"; teamId: string; at: number; closeId: string; outcome: "succeeded" | "partial" | "failed"; resultRefs: string[]; roots: TeamResult["roots"]; reason?: string }
 	| { version: 2; kind: "grant"; teamId: string; at: number; grant: BudgetGrantRecord }
-	| { version: 2; kind: "terminal"; teamId: string; at: number; closeId?: string; result: TeamResult; flow?: string };
+	| { version: 2; kind: "terminal"; teamId: string; at: number; endedAt?: number; closeId?: string; result: TeamResult; activeMs?: number; memberStats?: TeamResult["memberStats"]; flow?: string };
 
 /** Session custom-entry type of v2 Team journal records (display-only history, never replayed). */
 export const TEAM_JOURNAL_ENTRY_TYPE = "rail-subagent-team-v2";

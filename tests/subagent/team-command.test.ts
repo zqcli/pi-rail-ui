@@ -682,9 +682,9 @@ test("/rail-team pause and continue confirm their effect; popup p toggles them; 
 
 	const list = commandContext();
 	await runTeamCommand(host, "list", list.ctx);
-	assert.match(list.notifications.at(-1)!.text, new RegExp(`${teamId} · ACTIVE · PAUSED · ok`, "u"));
+	assert.match(list.notifications.at(-1)!.text, new RegExp(`${teamId} «Run host-control tests\\.» · ACTIVE · PAUSED · ok`, "u"));
 	await runTeamCommand(host, `${teamId} status`, list.ctx);
-	assert.match(list.notifications.at(-1)!.text, /Team \S+ · ACTIVE · PAUSED · ok/u);
+	assert.match(list.notifications.at(-1)!.text, /Team \S+ «Run host-control tests\.» · ACTIVE · PAUSED · ok/u);
 	assert.match(list.notifications.at(-1)!.text, /Waiting for: Paused by the host/u);
 
 	const popupContinue = commandContext({ overlayKey: "p" });

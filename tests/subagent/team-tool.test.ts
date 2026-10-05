@@ -311,7 +311,7 @@ test("launch waits for the full Team lifetime and passes only the prepared membe
 	const result = await pending;
 	assert.equal(settled, true);
 	assert.ok(updates.length > 0);
-	assert.match(result.content[0].text, new RegExp(`Team ${teamId} CLOSED · outcome succeeded`, "u"));
+	assert.match(result.content[0].text, new RegExp(`Team ${teamId} «Review the requested change\\.» CLOSED · outcome succeeded`, "u"));
 	assert.match(result.content[0].text, /Deliverables \(1 roots · 0 accepted · 0 waived\):/u);
 	assert.doesNotMatch(result.content[0].text, /fresh final summary|coordinator summary/u);
 });
@@ -495,11 +495,11 @@ test("a paused Team says PAUSED in the launch panel, the status text and the Tea
 	host.runtime.pauseTeam(teamId);
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	const update = updates.at(-1);
-	assert.match(update.content[0].text, /^Team \S+ · ACTIVE · PAUSED · ok/u);
+	assert.match(update.content[0].text, /^Team \S+ «Review the requested change\.» · ACTIVE · PAUSED · ok/u);
 	assert.match(update.content[0].text, /^Waiting for: Paused by the host/mu);
-	assert.match(tool.renderResult(update, { expanded: false, isPartial: true }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }).render(200).join("\n"), /Team \S+ · ACTIVE · PAUSED/u);
+	assert.match(tool.renderResult(update, { expanded: false, isPartial: true }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }).render(200).join("\n"), /Team \S+ «Review the requested change\.» · ACTIVE · PAUSED/u);
 	const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
-	assert.match(status.content[0].text, /^Team \S+ · ACTIVE · PAUSED · ok/u);
+	assert.match(status.content[0].text, /^Team \S+ «Review the requested change\.» · ACTIVE · PAUSED · ok/u);
 	const list = await tool.execute("list", { action: "status" }, undefined, undefined, context());
 	assert.match(list.content[0].text, /· ACTIVE · PAUSED · ok · lead /u);
 	host.runtime.continueTeam(teamId);
@@ -678,7 +678,7 @@ test("launch final text keeps the Manager's verdict: the waive reason, the whole
 	const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
 	const text: string = result.content[0].text;
 	const key = workRefKey(root!);
-	assert.match(text, new RegExp(`^Team ${teamId} CLOSED · outcome partial · \\d+:\\d\\d · ${reason}$`, "mu"), "the close reason is printed whole");
+	assert.match(text, new RegExp(`^Team ${teamId} «Review the requested change\\.» CLOSED · outcome partial · \\d+:\\d\\d · ${reason}$`, "mu"), "the close reason is printed whole");
 	assert.match(text, new RegExp(`^- ${key} worker ← lead · waived: ${waiveReason} · result:`, "mu"), "a waived root says why");
 	assert.match(text, new RegExp(`^### worker · ${key} · succeeded · waived · result:`, "mu"), "the worker's own status is not the final verdict on the root");
 
@@ -740,6 +740,13 @@ test("launch panel reuses grouped subagent panels per member, live and after the
 		transcript: { entries: [{ id: "tool:1", kind: "tool", label: "bash", groupId: "tool:1", text: "git status", status: "running", order: 5 }], omittedEntries: 0 },
 		output: "", liveUsage: live, durationMs: 61_000,
 	} as any;
+	const getTeam = host.runtime.getTeam.bind(host.runtime);
+	host.runtime.getTeam = (id) => {
+		const view = getTeam(id);
+		view.members.find((member) => member.id === "worker")!.usage = { ...live };
+		view.usage = { ...live };
+		return view;
+	};
 	const updates: any[] = [];
 	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context());
 	await new Promise((resolve) => setTimeout(resolve, 300));
@@ -755,7 +762,7 @@ test("launch panel reuses grouped subagent panels per member, live and after the
 	assert.match(worker.detail, /^queued for a work slot$/u);
 	assert.match(update.content[0].text, /lead \(lead\) +· .*pending events/u);
 	const livePanel = tool.renderResult(update, { expanded: false, isPartial: true }, theme).render(160).join("\n");
-	assert.match(livePanel, new RegExp(`Team ${teamId} · ACTIVE`, "u"));
+	assert.match(livePanel, new RegExp(`Team ${teamId} «Review the requested change\\.» · ACTIVE`, "u"));
 	assert.match(livePanel, /2 members · 0 complete · 0 running · 1 waiting · 1 idle · 0 failed/u);
 	assert.match(livePanel, /lead \(lead\) · /u);
 	assert.match(livePanel, /worker · [^\n]*\n[^\n]*FAST off/u);
@@ -772,7 +779,7 @@ test("launch panel reuses grouped subagent panels per member, live and after the
 
 	resolveLifetime(terminal(teamId));
 	const result = await pending;
-	assert.match(result.content[0].text, new RegExp(`Team ${teamId} CLOSED`, "u"), "the model still receives the bounded TeamResult text");
+	assert.match(result.content[0].text, new RegExp(`Team ${teamId} «Review the requested change\\.» CLOSED`, "u"), "the model still receives the bounded TeamResult text");
 	assert.equal(result.details.members.length, 2, "the finished panel keeps every member panel");
 	const finalPanel = tool.renderResult(result, { expanded: false, isPartial: false }, theme).render(160).join("\n");
 	assert.match(finalPanel, /lead \(lead\)/u);
@@ -814,4 +821,23 @@ test("runtime launch abort is a structured tool error, preserves host control, a
 	rejectLifetime(new Error("late lifetime failure"));
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	assert.deepEqual(notifications, [], "a detached lifetime cannot notify through its retired generation");
+});
+
+test("prepare exposes explicit Team and initial work titles and prints the short Team title in its first line", async () => {
+	const { host, tool } = setup();
+	const result = await tool.execute("prepare", { ...prepareArgs, title: "Agent release", initialRequests: [{ to: "worker", title: "Standalone QA", task: "Inspect the release. Report bugs." }] }, undefined, undefined, context());
+	assert.match(result.content[0].text, /^Prepared Team [a-z2-7]{8} «Agent release» \(nothing has started/u);
+	assert.equal(result.details.view.title, "Agent release");
+	assert.equal(result.details.works[0].title, "Standalone QA");
+	assert.equal(host.runtime.listWorks(result.details.view.teamId)[0]!.title, "Standalone QA");
+	await assert.rejects(tool.execute("prepare", { ...prepareArgs, title: "x".repeat(61) }, undefined, undefined, context()), /title/u);
+	await assert.rejects(tool.execute("status", { action: "status", title: "Only prepare accepts a title" }, undefined, undefined, context()), /does not accept/u);
+});
+
+test("prepare without a title derives Team and work titles from their first sentences", async () => {
+	const { tool } = setup();
+	const result = await tool.execute("prepare", { ...prepareArgs, brief: { goal: "Review release 0.6.0. Then approve it." }, initialRequests: [{ to: "worker", task: "Inspect the release. Report bugs." }] }, undefined, undefined, context());
+	assert.equal(result.details.view.title, "Review release 0.6.0.");
+	assert.equal(result.details.works[0].title, "Inspect the release.");
+	assert.match(result.content[0].text, /«Review release 0\.6\.0\.» \(/u);
 });

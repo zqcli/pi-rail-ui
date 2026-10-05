@@ -366,6 +366,7 @@ function actionFor(scenario, input, replies, turn, messages = [], activationInde
 		if (replies.length === 0) return [call(`request-${task.replaceAll(" ", "-")}`, {
 			action: "request", to: task === "W1 root" ? "w2" : "w1",
 			task: task === "W1 root" ? "W2 assigned" : "W1 question", inputRefs: [],
+			...(scenario === "panel-v3" ? { title: task === "W1 root" ? "Run the local dependency" : "Answer the local question" } : {}),
 		})];
 		const accepted = replies.map((reply) => reply.receipt).find((receipt) => receipt?.status === "accepted");
 		if (!accepted) throw new Error(`${task} did not receive an accepted child work reference: ${JSON.stringify(replies)}`);

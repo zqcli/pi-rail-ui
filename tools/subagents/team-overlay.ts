@@ -1,30 +1,41 @@
 import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import type { TeamMemberSession, TeamSessionHost } from "./team-host";
+import type { SubagentUsage } from "./session-broker";
+import { normalizeTitle } from "./team-codec";
 import { railModelReference } from "./models";
 import { COMPACT_THRESHOLD_CHOICES, readCompactThreshold, writeCompactThreshold } from "./team-compaction-settings";
-import { flowLegend, flowRows } from "./team-flow";
+import { flowRows } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, shortWorkRef, workRefKey, type TeamMemberView, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
 
-const TABS = ["Teams", "Overview", "Progress", "Members", "Tasks", "Timeline"] as const;
+const TABS = ["Teams", "Overview", "Progress", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
 export type TeamOverlayAction = { action: "delete"; teamIds: string[] }
+	| { teamId: string; action: "title" }
 	| { teamId: string; action: "cancel" | "resume" | "grant" | "message" | "revive" | "compact" | "lead" | "pause" | "continue"; memberId?: string };
 type Facts = ReturnType<TeamSessionHost["runtime"]["panelFacts"]>;
-type Row = { text: string; teamId?: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string };
+type Row = { text: string; lines?: string[]; teamId?: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string };
 const oneLine = (text: string) => stripTerminalSequences(text).replace(/\s+/gu, " ").trim();
 const compact = (text: string, width: number) => truncateToWidth(oneLine(text), Math.max(1, width));
 const fit = (text: string, width: number) => truncateToWidth(text, Math.max(1, width), "", true);
 const column = (text: string, width: number) => fit(truncateToWidth(text, Math.max(1, width)), width);
-const clock = (ms: number) => `${Math.floor(Math.max(0, ms) / 60000)}:${String(Math.floor(Math.max(0, ms) / 1000) % 60).padStart(2, "0")}`;
-const startTime = (at: number | undefined) => {
+const clock = (ms: number) => {
+	const seconds = Math.floor(Math.max(0, ms) / 1000);
+	const minutes = Math.floor(seconds / 60);
+	return `${minutes >= 60 ? `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}` : minutes}:${String(seconds % 60).padStart(2, "0")}`;
+};
+const tokens = (value: number) => value < 1000 ? String(value) : value < 1_000_000 ? `${Math.round(value / 1000)}k` : `${(value / 1_000_000).toFixed(value >= 100_000_000 ? 1 : 2).replace(/\.?0+$/u, "")}M`;
+const usageText = (usage: SubagentUsage) => `in ${tokens(usage.input)} · out ${tokens(usage.output)} · cache ${tokens(usage.cacheRead)}${usage.cacheWrite ? `/${tokens(usage.cacheWrite)}` : ""}`;
+const teamTitle = (entry: { title?: string }, goal?: string) => entry.title ?? normalizeTitle(undefined, goal ?? "not retained");
+const workTitle = (work: TeamWorkSummary) => work.title ?? normalizeTitle(undefined, work.taskPreview);
+const startTime = (at: number | undefined, now: number) => {
 	if (at === undefined) return "—";
 	const date = new Date(at);
 	const pad = (value: number) => String(value).padStart(2, "0");
-	return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+	return date.toDateString() === new Date(now).toDateString() ? `${pad(date.getHours())}:${pad(date.getMinutes())}` : `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 };
 const writable = (team: TeamTeamView) => team.lifecycle === "prepared" || team.lifecycle === "active" || team.lifecycle === "closing";
 const VERDICTS = { on_track: ["on track", "success"], at_risk: ["at risk", "warning"], off_track: ["off track", "error"] } as const;
@@ -46,47 +57,48 @@ function memberStatus(member: TeamMemberView): keyof typeof ICONS {
 
 function workIcon(work: TeamWorkSummary, theme: Theme): string {
 	if (work.hold) return theme.fg(statusColor("held"), ICONS.held);
-	if (work.state === "resolved") return theme.fg(work.review === "accepted" ? "success" : "dim", "✓");
+	if (work.state === "resolved") return theme.fg(work.review === "accepted" ? "success" : "dim", !work.parent && !work.review ? "◐" : "✓");
 	if (work.state === "cancelled" || work.state === "superseded") return theme.fg("muted", "–");
 	const status = work.state === "blocked" ? "waiting" : work.state === "queued" ? "idle" : work.state;
 	return theme.fg(statusColor(status), ICONS[status]);
 }
 
 /** Parent ownership survives revisions: keep older children under their owning work. */
-export function buildTeamTaskRows(works: readonly TeamWorkSummary[], expanded: ReadonlySet<string>, theme: Theme, width = 120): Row[] {
+export function buildTeamTaskRows(works: readonly TeamWorkSummary[], expanded: ReadonlySet<string>, theme: Theme, width = 120,
+	describe: (work: TeamWorkSummary) => string = workState): Row[] {
+	const latest = new Map<string, TeamWorkSummary>();
+	for (const work of works) if (!work.kind && (latest.get(work.work.workId)?.work.revision ?? 0) < work.work.revision) latest.set(work.work.workId, work);
 	const children = new Map<string, TeamWorkSummary[]>();
-	for (const work of works) if (work.parent) {
+	for (const work of latest.values()) if (work.parent) {
 		const siblings = children.get(work.parent.workId) ?? [];
 		siblings.push(work);
 		children.set(work.parent.workId, siblings);
 	}
-	const tree: Array<{ work: TeamWorkSummary; depth: number; fold?: string }> = [];
+	const rows: Row[] = [];
+	const titleWidth = Math.max(10, Math.floor(width * 0.42));
+	const assigneeWidth = Math.min(Math.floor(width * 0.2), Math.max(1, ...[...latest.values()].map((work) => visibleWidth(work.assignee))));
 	const visit = (work: TeamWorkSummary, depth: number) => {
-		tree.push({ work, depth });
+		const label = `${"  ".repeat(depth)}${workIcon(work, theme)} ${workTitle(work)}`;
+		const revision = work.work.revision > 1 ? ` @${work.work.revision} (rev ${work.work.revision - 1}×)` : "";
+		const state = describe(work);
+		const stateWidth = work.state === "resolved" && !work.parent && !work.review ? visibleWidth(state) : 15;
+		const prefix = `${column(label, Math.min(titleWidth, width - assigneeWidth - revision.length - stateWidth - 4))}  ${column(work.assignee, assigneeWidth)}  `;
+		rows.push({ work, text: `${prefix}${compact(state, width - visibleWidth(prefix + revision))}${revision}` });
 		const nested = children.get(work.work.workId) ?? [];
-		if (nested.length > 5) {
-			tree.push({ work, depth: depth + 1, fold: work.work.workId });
-			if (!expanded.has(work.work.workId)) return;
-		}
-		for (const child of nested) visit(child, depth + 1);
+		const cancelled = nested.filter((child) => child.state === "cancelled" || child.state === "superseded");
+		const finished = nested.filter((child) => child.state === "resolved");
+		for (const child of nested) if (!cancelled.includes(child) && !(finished.length > 5 && finished.includes(child))) visit(child, depth + 1);
+		const fold = (items: TeamWorkSummary[], kind: string, label: string) => {
+			if (!items.length) return;
+			const key = `${work.work.workId}:${kind}`;
+			rows.push({ work, fold: key, text: `${"  ".repeat(depth + 1)}${label} [${expanded.has(key) ? "−" : "+"}]` });
+			if (expanded.has(key)) for (const child of items) visit(child, depth + 1);
+		};
+		fold(cancelled, "cancelled", `– ${cancelled.length} cancelled/superseded`);
+		if (finished.length > 5) fold(finished, "done", `✓ ${finished.length} sub-tasks done`);
 	};
-	for (const work of works) if (!work.parent) visit(work, 0);
-	const ref = (work: TeamWorkSummary, depth: number) => `${"  ".repeat(depth)}${workIcon(work, theme)} ${shortWorkRef(work.work).replace("work ", "work:")}`;
-	const route = (work: TeamWorkSummary) => `${work.assignee} ← ${work.requester}`;
-	const refWidth = Math.min(Math.floor(width * 0.28), Math.max(1, ...tree.map(({ work, depth }) => visibleWidth(ref(work, depth)))));
-	const routeWidth = Math.min(Math.floor(width * 0.28), Math.max(1, ...works.map((work) => visibleWidth(route(work)))));
-	const stateWidth = Math.max(1, ...works.map((work) => workState(work).length));
-	return tree.map(({ work, depth, fold }) => {
-		if (fold) {
-			const nested = children.get(fold)!;
-			const counts = new Map<string, number>();
-			for (const child of nested) counts.set(child.assignee, (counts.get(child.assignee) ?? 0) + 1);
-			return { work, fold, text: `${"  ".repeat(depth)}✓ ${nested.length} sub-tasks (${[...counts].map(([name, count]) => `${name} ${count}`).join(" · ")}) · ${nested.filter((child) => child.state === "resolved").length} done [${expanded.has(fold) ? "−" : "+"}]` };
-		}
-		const prefix = `${column(ref(work, depth), refWidth)}  ${column(route(work), routeWidth)}  ${column(workState(work), stateWidth)}  `;
-		const suffix = work.resultRef ? ` · ${work.resultRef}` : "";
-		return { work, text: truncateToWidth(`${prefix}${compact(work.taskPreview, width - visibleWidth(prefix + suffix))}${suffix}`, width) };
-	});
+	for (const work of latest.values()) if (!work.parent) visit(work, 0);
+	return rows;
 }
 
 function assignedWork(member: TeamMemberView, works: readonly TeamWorkSummary[]): TeamWorkSummary | undefined {
@@ -95,16 +107,12 @@ function assignedWork(member: TeamMemberView, works: readonly TeamWorkSummary[])
 		?? assigned.find((work) => !isTerminalWorkState(work.state)) ?? assigned.at(-1);
 }
 
-function memberRoute(member: TeamMemberView, work: TeamWorkSummary | undefined): string {
-	return !work ? "—" : `${work.requester} → ${member.id} → ${work.requester}`;
-}
-
 function latestResult(memberId: string, works: TeamWorkSummary[], facts: Facts): string {
 	const latest = facts.results.get(memberId)?.latest;
 	if (!latest) return "Latest result: none";
 	const work = works.find((work) => work.work.workId === latest.work.workId)!;
-	const fate = work.work.revision !== latest.work.revision ? `superseded by @${work.work.revision}` : work.parent ? "" : work.review ?? "awaiting review";
-	return `result → ${work.requester} · ${latest.result.status}${fate ? ` · ${fate}` : ""} · ${latest.id}`;
+	const fate = work.work.revision !== latest.work.revision ? `superseded by @${work.work.revision}` : work.parent ? "" : work.review ?? "awaiting acceptance";
+	return `Latest result: ${latest.result.status} · "${oneLine(latest.result.summary)}"${fate ? ` · ${fate}` : ""}`;
 }
 
 export class TeamOverlayComponent implements Focusable {
@@ -117,6 +125,7 @@ export class TeamOverlayComponent implements Focusable {
 	private maxSelected = 0;
 	private rows: Row[] = [];
 	private detail: string | undefined;
+	private reviewing = false;
 	private expanded = new Set<string>();
 	private marked = new Set<string>();
 	private readonly sessions = new Map<string, Map<string, TeamMemberSession>>();
@@ -171,11 +180,13 @@ export class TeamOverlayComponent implements Focusable {
 		if (this.disposed) return;
 		if (matchesKey(data, Key.escape) || this.keybindings.matches(data, "tui.select.cancel")) {
 			if (this.detail) this.resetPosition();
+			else if (this.reviewing) { this.reviewing = false; this.resetPosition(); }
 			else if (this.tab !== 0) { this.tab = 0; this.resetPosition(); }
 			else { this.dispose(); this.done(undefined); return; }
 		} else if (matchesKey(data, Key.tab) || matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left) || matchesKey(data, Key.right)) {
 			const back = matchesKey(data, Key.left) || matchesKey(data, Key.shift("tab"));
 			this.tab = (this.tab + (back ? TABS.length - 1 : 1)) % TABS.length;
+			this.reviewing = false;
 			this.resetPosition();
 		} else if (data === " " && this.tab === 0) {
 			const teamId = this.rows[this.selected]?.teamId;
@@ -184,6 +195,9 @@ export class TeamOverlayComponent implements Focusable {
 			const teamIds = this.tab === 0 ? this.marked.size ? this.teamIds().filter((id) => this.marked.has(id)) : [this.rows[this.selected]?.teamId].filter((id): id is string => !!id)
 				: this.teamId ? [this.teamId] : [];
 			if (teamIds.length) { this.dispose(); this.done({ action: "delete", teamIds }); return; }
+		} else if (data === "n" && (this.tab === 0 || this.tab === 1 && !this.reviewing && !this.detail)) {
+			const teamId = this.tab === 0 ? this.rows[this.selected]?.teamId : this.teamId;
+			if (teamId) { this.dispose(); this.done({ action: "title", teamId }); return; }
 		} else if (data === "t") {
 			const choices = COMPACT_THRESHOLD_CHOICES;
 			const threshold = readCompactThreshold();
@@ -193,6 +207,7 @@ export class TeamOverlayComponent implements Focusable {
 			const ids = this.teamIds();
 			this.teamId = ids[(ids.indexOf(this.teamId!) + (data === "[" ? -1 : 1) + ids.length) % ids.length];
 			this.expanded.clear();
+			this.reviewing = false;
 			this.resetPosition();
 			if (this.tab === 0) this.selected = ids.indexOf(this.teamId!);
 		} else if (this.keybindings.matches(data, "tui.select.up") || this.keybindings.matches(data, "tui.select.down") || matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown) || matchesKey(data, Key.home) || matchesKey(data, Key.end)) {
@@ -204,16 +219,18 @@ export class TeamOverlayComponent implements Focusable {
 		} else if (this.keybindings.matches(data, "tui.select.confirm")) {
 			const row = this.rows[this.selected];
 			if (row?.teamId) { this.teamId = row.teamId; this.tab = 1; this.resetPosition(); }
+			else if (this.tab === 1 && !this.reviewing) { this.reviewing = true; this.resetPosition(); }
 			else if (row?.member ?? row?.review) { this.resetPosition(); this.detail = row.member ?? row.review; }
 			else if (row?.fold) {
 				if (!this.expanded.delete(row.fold)) this.expanded.add(row.fold);
 			}
+			else if (row?.work) { this.resetPosition(); this.detail = workRefKey(row.work.work); }
 		} else {
 			const team = this.host.runtime.listTeams().find((team) => team.teamId === this.teamId);
 			const action = ({ c: "cancel", r: "resume", g: "grant", m: "message", v: "revive", z: "compact", l: "lead", p: team?.paused ? "continue" : "pause" } as const)[data as "c" | "r" | "g" | "m" | "v" | "z" | "l" | "p"];
 			if (action && team && writable(team) && this.host.active) {
 				this.dispose();
-				const memberId = action === "compact" && this.tab === 3 ? this.detail ?? this.rows[this.selected]?.member : undefined;
+				const memberId = action === "compact" && this.tab === 2 ? this.detail ?? this.rows[this.selected]?.member : undefined;
 				this.done({ teamId: team.teamId, action, ...(memberId ? { memberId } : {}) });
 				return;
 			}
@@ -233,17 +250,17 @@ export class TeamOverlayComponent implements Focusable {
 		const reviews = team ? this.host.runtime.listReviews(team.teamId) : history?.reviews ?? [];
 		let rows: Row[] = [];
 		if (this.tab === 0) rows = ids.length ? this.teams(inner - 3) : [{ text: "No teams" }];
-		else if (this.tab === 2 && (team || history)) rows = this.detail ? this.reviewDetail(reviews, inner - 1) : this.reviewRows(reviews, inner - 3);
+		else if (this.reviewing && (team || history)) rows = this.detail ? this.reviewDetail(reviews, inner - 1) : this.reviewRows(reviews, inner - 3);
 		else if (team && facts) {
-			if (this.detail) rows = this.memberDetail(team, works, facts, inner - 1);
+			if (this.detail) rows = this.tab === 3 ? this.taskDetail(team, works, facts, inner - 1) : this.memberDetail(team, works, facts, inner - 1);
 			else if (this.tab === 1) rows = this.overview(team, works, facts, inner - 1);
-			else if (this.tab === 3) rows = this.members(team, works, facts, inner - 3);
-			else if (this.tab === 4) rows = buildTeamTaskRows(works, this.expanded, this.theme, inner - 3);
-			else rows = this.timeline(facts);
-		} else if (history) rows = this.historyRows(history, inner - 1);
+			else if (this.tab === 2) rows = this.members(team, works, facts, inner - 3);
+			else if (this.tab === 3) rows = buildTeamTaskRows(works, this.expanded, this.theme, inner - 3, (work) => this.taskState(team.teamId, work, works));
+			else rows = this.timeline(facts, works);
+		} else if (history) rows = this.historyRows(history, inner - (this.tab === 2 && !this.detail ? 3 : 1));
 		else rows = [{ text: "No teams" }];
 		this.rows = rows;
-		if (this.tab === 5) {
+		if (this.tab === 4) {
 			if (this.followTimeline) this.selected = rows.length - 1;
 			else if (this.timelineCursor) {
 				const index = rows.findIndex((row) => row.milestone === this.timelineCursor);
@@ -255,45 +272,51 @@ export class TeamOverlayComponent implements Focusable {
 		// Overview already shows Waiting for in its body.
 		const notice = this.tab > 1 && /^Lead (decision|failed)/u.test(facts?.waitingFor ?? "") ? `Waiting for: ${facts!.waitingFor}`
 			: this.notice;
-		const omitted = this.tab === 5 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
+		const omitted = this.tab === 4 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
+		const summary = this.tab === 0 ? `${ids.length} Team${ids.length === 1 ? "" : "s"} · ${this.host.runtime.listTeams().filter((item) => writable(item) && item.lifecycle !== "prepared").length} active`
+			: this.tab === 3 && team ? this.tasksSummary(works) : team && facts ? this.summaryText(team, works) : history ? `${history.lifecycle.toUpperCase()} · history (read-only) · ${history.results.length} results` : "No teams";
+		const summaryLines = wrapTextWithAnsi(summary, inner - 1);
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
 		const live = !!team && writable(team) && this.host.active;
 		const help = this.helpLines(live, ids.length > 1, !!team?.paused, inner - 1).flatMap((text) => wrapTextWithAnsi(text, inner - 1));
-		const room = height - 6 - help.length - (notice ? 1 : 0) - (omitted ? 1 : 0);
-		// The snapshot block yields to the list on short terminals, keeping at least three list rows.
-		const head = (this.tab === 2 && !this.detail && (team || history) ? this.progressHead(team, works, facts, reviews, team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review, history?.flow, inner - 1) : []).slice(0, Math.max(0, room - 3));
+		const legend = this.tab === 3 && !this.detail ? wrapTextWithAnsi("▶ running ⧗ waiting ◐ awaiting acceptance ✓ done/accepted ✗ failed – cancelled", inner - 1) : [];
+		const room = height - 5 - summaryLines.length - help.length - legend.length - (notice ? 1 : 0) - (omitted ? 1 : 0);
+		const schedule = team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review;
+		const head = (!this.detail && this.reviewing ? [this.reviewHeading(reviews, schedule), ""]
+			: !this.detail && this.tab === 2 ? team ? this.progressHead(team, inner - 1) : history ? this.historyProgressHead(history, inner - 1) : [] : []).slice(0, Math.max(0, room - 3));
 		const available = Math.max(1, room - head.length);
-		const selectable = !this.detail && (this.tab === 0 ? ids.length > 0 : this.tab !== 1 && (this.tab === 2 ? reviews.length > 0 : !!team));
-		// The cap keeps the selection details under Progress/Members/Tasks; the Timeline has none.
-		const cap = this.tab === 0 || this.tab === 5 ? available : Math.min(8, this.tui.terminal.rows - 13);
-		this.pageSize = selectable ? Math.max(1, Math.min(cap, available)) : available;
-		const details = this.detail ? [] : this.tab === 2 ? this.reviewDetails(reviews, inner - 1) : team && facts ? this.selectionDetails(team, works, facts, inner - 1) : [];
-		const showDetails = details.length > 0 && available >= Math.min(rows.length, this.pageSize) + details.length + 1;
+		const selectable = !this.detail && (this.reviewing ? reviews.length > 0 : this.tab === 0 ? ids.length > 0 : this.tab !== 1 && !!team || this.tab === 2 && !!history?.members.length);
+		const rowHeight = Math.max(1, ...rows.map((row) => 1 + (row.lines?.length ?? 0)));
+		const cap = this.tab === 4 ? 12 : this.tab === 0 ? available : Math.min(8, this.tui.terminal.rows - 13);
+		this.pageSize = selectable ? Math.max(1, Math.min(cap, Math.floor(available / rowHeight))) : available;
+		const details = this.detail ? [] : this.reviewing ? this.reviewDetails(reviews, inner - 1) : this.tab === 0 ? this.teamDetails(inner - 1) : team && facts ? this.selectionDetails(team, works, facts, inner - 1) : this.tab === 2 && history ? this.historyMembers(history).filter((text) => text.startsWith(`${this.rows[this.selected]?.member} ·`)).map((text) => compact(text, inner - 1)) : [];
+		const showDetails = details.length > 0 && available >= Math.min(rows.length, this.pageSize) * rowHeight + details.length + 1;
 		this.offset = Math.max(0, Math.min(this.offset, rows.length - this.pageSize));
 		// Without a visible cursor the hidden cursor is the scroll offset, so every key scrolls at once.
 		this.maxSelected = selectable ? rows.length - 1 : Math.max(0, rows.length - this.pageSize);
 		if (!selectable) this.offset = this.selected = Math.min(this.selected, this.maxSelected);
 		if (this.selected < this.offset) this.offset = this.selected;
 		if (this.selected >= this.offset + this.pageSize) this.offset = this.selected - this.pageSize + 1;
-		const body = rows.slice(this.offset, this.offset + this.pageSize).map((row, index) => {
-			if (!selectable) return ` ${row.text}`;
-			return index + this.offset === this.selected ? `${this.theme.fg("accent", " → ")}${this.theme.fg("accent", row.text)}` : `   ${row.text}`;
+		const body = rows.slice(this.offset, this.offset + this.pageSize).flatMap((row, index) => {
+			const prefix = row.review === "all" ? this.theme.fg("accent", "→") : !selectable ? " " : index + this.offset === this.selected ? this.theme.fg("accent", " → ") : "   ";
+			return [`${prefix}${row.text}`, ...(row.lines ?? []).map((text) => `     ${text}`)];
 		});
-		const selector = ids.length > 1 ? `‹ ${ids.indexOf(this.teamId!) + 1}/${ids.length} › ${this.teamId!.slice(0, 8)}` : "";
+		if (this.tab === 4 && !this.detail) while (body.length < this.pageSize) body.push("");
+		const selector = ids.length > 1 ? `‹ ${ids.indexOf(this.teamId!) + 1}/${ids.length} ›` : "";
 		const title = `${this.theme.fg("accent", this.theme.bold("Rail Team"))}  ${this.renderTabs(inner - 12 - (selector ? visibleWidth(selector) + 2 : 0))}`;
 		const header = selector ? `${fit(title, inner - visibleWidth(selector) - 2)} ${this.theme.fg("dim", selector)}` : title;
-		const summary = this.tab === 0 ? `${ids.length} Team${ids.length === 1 ? "" : "s"}` : team && facts ? this.summaryText(team, works, facts) : history ? `${history.lifecycle.toUpperCase()} · history (read-only) · ${history.results.length} results` : "No teams";
 		const border = (text: string) => this.theme.fg("borderAccent", text);
 		const line = (text = "") => `${this.theme.fg("border", "│")}${fit(text, inner)}${this.theme.fg("border", "│")}`;
-		return [border(`╭${"─".repeat(inner)}╮`), line(` ${header}`), line(` ${this.theme.fg("dim", summary)}`), line(),
+		return [border(`╭${"─".repeat(inner)}╮`), line(` ${header}`), ...summaryLines.map((text) => line(` ${this.theme.fg("dim", text)}`)), line(),
 			...(omitted ? [line(` ${this.theme.fg("dim", omitted)}`)] : []), ...head.map((text) => line(` ${text}`)), ...body.map(line),
 			...(showDetails ? [line(), ...details.map((text) => line(` ${text}`))] : []), line(),
+			...legend.map((text) => line(` ${this.theme.fg("dim", text)}`)),
 			...(notice ? [line(` ${this.theme.fg("warning", compact(notice, inner - 1))}`)] : []),
 			...help.map((text) => line(` ${this.theme.fg("dim", text)}`)), border(`╰${"─".repeat(inner)}╯`)];
 	}
 
 	private renderTabs(width: number): string {
-		const tabs = TABS.map((tab, index) => index === this.tab ? this.theme.fg("accent", `[${tab}]`) : this.theme.fg("dim", ` ${tab} `));
+		const tabs = TABS.map((tab, index) => index === this.tab ? this.theme.fg("accent", `[${tab}]`) : this.theme.fg("dim", tab));
 		let start = 0, end = tabs.length;
 		while (end - start > 1 && visibleWidth(tabs.slice(start, end).join(" ")) > width) {
 			if (this.tab - start > end - this.tab - 1) start++;
@@ -302,12 +325,12 @@ export class TeamOverlayComponent implements Focusable {
 		return tabs.slice(start, end).join(" ");
 	}
 
-	private summaryText(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts): string {
+	private summaryText(team: TeamTeamView, works: TeamWorkSummary[]): string {
 		const counts = (["running", "held", "waiting"] as const).flatMap((status) => {
 			const count = team.members.filter((member) => memberStatus(member) === status).length;
 			return count ? [`${count} ${status}`] : [];
 		});
-		return [team.lifecycle.toUpperCase(), ...(team.paused ? ["PAUSED"] : []), team.health === "ok" ? "ok" : "needs attention", clock(this.elapsed(team, facts)), progress(works, false), ...counts,
+		return [team.lifecycle.toUpperCase(), ...(team.paused ? ["PAUSED"] : []), team.health === "ok" ? "ok" : "needs attention", clock(this.host.runtime.teamTime(team.teamId).activeMs), progress(works, false), ...counts,
 			...(!writable(team) || !this.host.active ? ["read-only"] : [])].join(" · ");
 	}
 
@@ -316,42 +339,46 @@ export class TeamOverlayComponent implements Focusable {
 		return this.teamIds().map((teamId) => {
 			const team = live.find((item) => item.teamId === teamId);
 			const history = this.host.history.teams.find((item) => item.teamId === teamId);
-			const facts = team ? this.host.runtime.panelFacts(teamId) : undefined;
 			const lifecycle = team?.lifecycle ?? history!.lifecycle;
 			const outcome = team?.outcome ?? history?.outcome;
 			const active = lifecycle === "active" || lifecycle === "closing";
 			const closed = lifecycle === "closed" || lifecycle === "completed";
 			const icon = active ? ICONS.running : closed ? ICONS.completed : lifecycle === "prepared" ? ICONS.idle : ICONS.failed;
 			const color = active ? "accent" : closed ? "success" : lifecycle === "prepared" ? "muted" : "error";
-			const started = facts?.timeline[0]?.at ?? history?.startedAt;
-			const duration = team && facts ? clock(this.elapsed(team, facts)) : history?.startedAt !== undefined ? clock(history.at - history.startedAt) : "—";
-			const members = team?.members.length ?? history!.members.length;
-			const roots = team ? `${this.host.runtime.listWorks(teamId).filter((work) => !work.parent && !work.kind && work.review === "accepted").length}/${team.works.roots}` : history?.rootCounts ? `${history.rootCounts.accepted}/${history.rootCounts.total}` : "—";
+			const started = team ? this.host.runtime.teamTime(teamId).startedAt : history?.startedAt;
+			const duration = team ? clock(this.host.runtime.teamTime(teamId).activeMs) : history?.activeMs !== undefined ? clock(history.activeMs) : history?.startedAt !== undefined ? clock(history.at - history.startedAt) : "—";
 			const label = outcome ? ` ${outcome === "succeeded" ? "ok" : outcome}` : "";
-			const status = `${this.marked.has(teamId) ? "*" : this.theme.fg(color, icon)} ${column(teamId.slice(0, 8), 8)} ${lifecycle.toUpperCase()}${label} ${duration} `;
-			const suffix = ` roots ${roots} ${startTime(started)} `;
-			const memberCount = visibleWidth(`${status}${members} members${suffix}`) + 8 <= width ? `${members} members` : `${members}m`;
-			const prefix = `${status}${memberCount}${suffix}`;
-			return { teamId, text: `${prefix}${compact(team?.brief.goal ?? history?.goal ?? "not retained", width - visibleWidth(prefix))}` };
+			const suffix = ` ${column(teamId.slice(0, 8), 8)} ${column(`${lifecycle.toUpperCase()}${label}`, Math.max(12, visibleWidth(`${lifecycle.toUpperCase()}${label}`)))} ${duration.padStart(7)} ${startTime(started, this.now())}`;
+			const title = team ? teamTitle(team, team.brief.goal) : teamTitle(history!, history?.goal);
+			return { teamId, text: `${this.marked.has(teamId) ? "*" : this.theme.fg(color, icon)} ${column(title, width - visibleWidth(suffix) - 2)}${suffix}` };
 		});
 	}
 
-	private elapsed(team: TeamTeamView, facts: Facts): number {
-		const start = facts.timeline[0]?.at ?? this.now();
-		return (writable(team) ? this.now() : facts.timeline.at(-1)?.at ?? start) - start;
+	private teamDetails(width: number): string[] {
+		const id = this.rows[this.selected]?.teamId;
+		if (!id) return [];
+		const team = this.host.runtime.listTeams().find((item) => item.teamId === id);
+		const history = this.host.history.teams.find((item) => item.teamId === id);
+		const goal = team?.brief.goal ?? history?.goal;
+		const members = team?.members.length ?? history!.members.length;
+		const roots = team ? `${this.host.runtime.listWorks(id).filter((work) => !work.parent && !work.kind && work.review === "accepted").length}/${team.works.roots}` : history?.rootCounts ? `${history.rootCounts.accepted}/${history.rootCounts.total}` : "—";
+		const suffix = ` · ${members} members · roots ${roots} accepted`;
+		return [`${team ? "▶" : "✓"} ${compact(teamTitle(team ?? history!, goal), width - suffix.length - 2)}${suffix}`, `  ${compact(goal ?? "Goal not retained", width - 2)}`];
 	}
 
 	/** Navigation for the current view, then (live Teams only) every action key with its name; the caller wraps rows wider than the popup. */
 	private helpLines(live: boolean, multiple: boolean, paused: boolean, width: number): string[] {
-		if (this.tab === 0) return ["↑↓ select · enter open · space mark · d delete · esc close", "←→/tab views" + (multiple ? " · [ ] teams" : "")];
-		const view = this.detail ? "↑↓/pgup/dn scroll · esc back" : this.tab === 1 ? "↑↓ scroll" : this.tab === 2 || this.tab === 3 ? "↑↓ select · enter details"
-			: this.tab === 4 ? "↑↓ select · enter fold" : "↑↓ cursor · pgup/dn page · home/end";
-		const navigation = [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? [] : ["read-only"]), ...(!this.detail ? ["d delete", "esc teams"] : [])].join(" · ");
+		if (this.tab === 0) return ["↑↓ select · enter open · n rename · space mark · d delete · esc close", "←→/tab views" + (multiple ? " · [ ] teams" : "")];
+		if (this.reviewing) return [this.detail ? "↑↓/pgup/dn scroll · esc reviews" : "↑↓ select · enter details · esc overview"];
+		if (this.detail) return [`↑↓/pgup/dn scroll · esc ${this.tab === 3 ? "tasks" : "progress"}`];
+		const view = this.tab === 1 ? "↑↓ scroll · enter reviews · n rename" : this.tab === 2 || this.tab === 3 ? "↑↓ select · enter details"
+			: "↑↓ cursor · pgup/dn page · home/end";
+		const navigation = [view, ...(live && this.tab === 2 ? ["z compact"] : []), "←→/tab views", "esc teams"].join(" · ");
 		// Whole keys per row: a key is never split or left with a dangling separator.
 		const threshold = readCompactThreshold();
-		const keys = [paused ? "p continue" : "p pause", "c cancel", "r resume hold", "g grant", "m message", "v revive", "l new lead", "z compact", `t compact at ${threshold === null ? "off" : `${threshold}%`}`];
+		const keys = [paused ? "p continue" : "p pause", "c cancel", "r resume hold", "g grant", "m message", "v revive", "l new lead", "z compact", `t compact at ${threshold === null ? "off" : `${threshold}%`}`, "d delete"];
 		const rows = keys.reduce<string[]>((packed, key) => packed.length && packed.at(-1)!.length + 3 + key.length <= width ? [...packed.slice(0, -1), `${packed.at(-1)} · ${key}`] : [...packed, key], []);
-		return live ? [navigation, ...rows] : [navigation];
+		return live && this.tab === 1 ? [navigation, ...rows] : [navigation];
 	}
 
 	/** Budget meters: a bar with eighth-cell resolution, so even a small share of a large limit is visible. */
@@ -373,40 +400,62 @@ export class TeamOverlayComponent implements Focusable {
 		const lines: string[] = [];
 		const labelWidth = 13;
 		const add = (label: string, value: string, color?: "warning") => {
-			const text = `${(label ? `${label}:` : "").padEnd(labelWidth)}${value}`;
-			lines.push(color ? this.theme.fg(color, text) : text);
+			wrapTextWithAnsi(value, width - labelWidth).forEach((line, index) => {
+				const text = `${(index === 0 && label ? `${label}:` : "").padEnd(labelWidth)}${line}`;
+				lines.push(color ? this.theme.fg(color, text) : text);
+			});
 		};
-		add("Team", team.teamId);
+		add("Team", `${teamTitle(team, team.brief.goal)} · ${team.shortId ?? team.teamId.slice(0, 8)}`);
 		wrapTextWithAnsi(oneLine(team.brief.goal), Math.max(1, width - labelWidth)).slice(0, 3).forEach((line, index) => add(index ? "" : "Goal", line));
-		add("Progress", `${progress(works)} · ${team.works.cancelled} cancelled/superseded`);
-		add("Waiting for", facts.waitingFor ?? "—", /^Lead (decision|failed)/u.test(facts.waitingFor ?? "") ? "warning" : undefined);
+		const time = this.host.runtime.teamTime(team.teamId);
+		add("Time", `${clock(time.activeMs)}${time.pausedMs ? ` active · ${clock(time.wallMs)} wall (paused ${clock(time.pausedMs)})` : ""}`);
+		add("Tokens", usageText(team.usage));
+		add("Waiting for", this.overviewWaitingFor(team, works, facts), /^Lead (decision|failed)/u.test(facts.waitingFor ?? "") ? "warning" : undefined);
 		const holds = this.host.runtime.listHolds(team.teamId);
 		const incidents = team.incidents.filter((incident) => incident.state === "open");
 		add("Attention", holds.length || incidents.length ? `${holds.length} open holds · ${incidents.length} open incidents` : "none", holds.length || incidents.length ? "warning" : undefined);
 		for (const hold of holds) add("", `${hold.assignee} · ${shortWorkRef(hold.work)} · ${oneLine(hold.message)}`, "warning");
 		for (const incident of incidents) if (!holds.some((hold) => hold.incidentId === incident.id)) add("", `${incident.code}: ${oneLine(incident.message)}`, "warning");
-		this.budget(team.teamId, Math.max(6, Math.min(20, width - labelWidth - 16 - 22))).forEach(({ label, meter }, index) => add(index ? "" : "Budget", `${label.padEnd(15)} ${meter}`));
-		this.timeline(facts).slice(-5).forEach((row, index) => add(index ? "" : "Recent", row.text));
-		return lines.map((text) => ({ text }));
+		const reviews = this.host.runtime.listReviews(team.teamId);
+		const schedule = this.host.runtime.reviewSchedule(team.teamId);
+		const review = reviews.at(-1);
+		const [verdict, color] = review ? verdictOf(review) : ["", "muted"] as const;
+		const reviewIndex = lines.length;
+		add("Review", schedule ? review ? `${clock(review.snapshot.elapsedMs)} ${review.by} ${this.theme.fg(review.verdict === "off_track" ? "warning" : color, verdict.toUpperCase())} · ${compact(reviewAssessment(review.summary), width - labelWidth - 26)}` : "No reviews yet" : "off");
+		if (schedule) add("", `${reviews.length} review${reviews.length === 1 ? "" : "s"} · ${reviews.filter((item) => item.verdict === "at_risk" || item.verdict === "off_track").length} at risk${schedule.nextAt ? ` · next in ${Math.max(0, Math.ceil((schedule.nextAt - this.now()) / 60_000))}m` : ""} · enter: all reviews`);
+		const { used, limits } = this.host.runtime.inspectBudget(team.teamId);
+		if (BUDGET_COUNTERS.slice(0, 4).every(([, key]) => limits[key] >= TEAM_BUDGET_UNLIMITED)) add("Budget", `all counters unlimited · works ${used.teamWorks}/${limits.teamWorks >= TEAM_BUDGET_UNLIMITED ? "unlimited" : limits.teamWorks}`);
+		else this.budget(team.teamId, Math.max(6, Math.min(20, width - labelWidth - 16 - 22))).forEach(({ label, meter }, index) => add(index ? "" : "Budget", `${label.padEnd(15)} ${meter}`));
+		return lines.map((text, index) => ({ text, ...(index === reviewIndex ? { review: "all" } : {}) }));
+	}
+
+	private overviewWaitingFor(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts): string {
+		const text = facts.waitingFor ?? "—";
+		if (/^(Lead|Paused)/u.test(text)) return text;
+		return this.workReferences(text.replace(/([^·]+) \(running\)/gu, (_match, names: string) => names.trim().split(", ").map((name) => {
+			const member = team.members.find((member) => member.id === name);
+			const work = member?.currentWork && works.find((work) => work.work.workId === member.currentWork!.workId);
+			return work ? `${name} on ${shortWorkRef(work.work)} «${workTitle(work)}» (running ${clock(this.host.runtime.workStats(team.teamId, work.work).activeMs)})` : `${name} (running)`;
+		}).join(", ")), works);
 	}
 
 	private members(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
-		const rows = team.members.map((member) => ({ member, route: memberRoute(member, assignedWork(member, works)), time: clock(this.host.driver.memberActivity(team.teamId, member.id)?.durationMs ?? 0) }));
 		const label = (member: TeamMemberView) => member.id === team.lead ? `${member.id} (lead)` : member.id;
-		const aliasWidth = Math.min(Math.floor(width * 0.2), Math.max(...rows.map(({ member }) => visibleWidth(label(member)))));
-		const routeWidth = Math.min(Math.floor(width * 0.4), Math.max(...rows.map(({ route }) => visibleWidth(route))));
-		const timeWidth = Math.max(...rows.map(({ time }) => time.length));
-		const stateWidth = Math.max(1, width - aliasWidth - routeWidth - timeWidth - 8);
-		return rows.map(({ member, route, time }) => {
+		const aliasWidth = Math.min(Math.floor(width * 0.27), Math.max(...team.members.map((member) => visibleWidth(label(member)))));
+		const activeMs = this.host.runtime.teamTime(team.teamId).activeMs;
+		return team.members.map((member) => {
 			const status = memberStatus(member);
 			const context = memberContextText(member);
-			if (context) {
-				const prefix = `${this.theme.fg(statusColor(status), ICONS[status])} ${column(label(member), aliasWidth)}  `;
-				const room = width - visibleWidth(prefix + context) - 2;
-				const state = room > 12 ? `${column(oneLine(memberDetail(member, facts, works, team.lead)), room)}  ` : "";
-				return { member: member.id, text: `${prefix}${state}${context}` };
-			}
-			return { member: member.id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${column(label(member), aliasWidth)}  ${column(oneLine(memberDetail(member, facts, works, team.lead)), stateWidth)}  ${column(route, routeWidth)}  ${time.padStart(timeWidth)}` };
+			const prefix = `${this.theme.fg(statusColor(status), ICONS[status])} ${column(label(member), aliasWidth)}  `;
+			const stats = this.host.runtime.memberStats(team.teamId, member.id);
+			const busy = activeMs ? Math.round(stats.activeMs / activeMs * 100) : 0;
+			const state = member.currentWork && member.lifecycle === "open" ? `running ${shortWorkRef(member.currentWork)}` : oneLine(memberDetail(member, facts, works, team.lead)).replace(/waiting on \d+ sub-tasks?: /u, "waiting for ");
+			const now = member.currentWork ? ` · now ${clock(this.host.runtime.workStats(team.teamId, member.currentWork).activeMs)}` : "";
+			const contextText = member.context && !member.compacting && !member.lastCompaction ? `ctx ${Math.round(member.context.percent)}%` : context;
+			const ctx = contextText ? `  ${member.context && member.context.percent >= 80 ? this.theme.fg("warning", contextText) : contextText}` : "";
+			const detail = `active ${clock(stats.activeMs)} · ${busy >= 90 ? this.theme.fg("warning", `busy ${busy}%`) : `busy ${busy}%`} · ${usageText(stats.usage)}`;
+			return { member: member.id, text: `${prefix}${column(state + now, width - visibleWidth(prefix + ctx))}${ctx}`,
+				lines: wrapTextWithAnsi(detail, width - 2) };
 		});
 	}
 
@@ -414,16 +463,17 @@ export class TeamOverlayComponent implements Focusable {
 		const row = this.rows[this.selected];
 		const title = (text: string) => this.theme.fg("toolTitle", this.theme.bold(text));
 		const dim = (text: string) => this.theme.fg("dim", compact(text, width));
-		if (this.tab === 3 && row?.member) {
+		if (this.tab === 2 && row?.member) {
 			const member = team.members.find((member) => member.id === row.member)!;
 			const work = assignedWork(member, works);
-			return [title(member.id), dim(`Task: ${work ? this.host.runtime.getWork(team.teamId, work.work)!.current.task : member.id === team.lead ? team.brief.goal : "No assigned work"}`),
-				...(memberContextText(member) ? [dim(memberContextText(member))] : []), dim(`Route: ${memberRoute(member, work)}`), dim(latestResult(member.id, works, facts))];
+			return [...wrapTextWithAnsi(`${member.id}${work ? ` · ${workTitle(work)} · from ${work.requester} · ${shortWorkRef(work.work)}` : ` · ${member.id === team.lead ? team.brief.goal : "No assigned work"}`}`, width).map(title),
+				dim(latestResult(member.id, works, facts))];
 		}
-		if (this.tab === 4 && row?.work) {
+		if (this.tab === 3 && row?.work) {
 			const work = row.work;
-			return [title(workRefKey(work.work)), dim(`From: ${work.requester} → ${work.assignee} → ${work.requester}`),
-				dim(`State: ${workState(work)} · resultRef: ${work.resultRef ?? "—"}`), dim(`Task: ${this.host.runtime.getWork(team.teamId, work.work)!.current.task}`)];
+			const stats = this.host.runtime.workStats(team.teamId, work.work);
+			return [...wrapTextWithAnsi(`${workTitle(work)} · ${work.requester} → ${work.assignee} · ${shortWorkRef(work.work)}`, width).map(title),
+				dim(`active ${clock(stats.activeMs)} · ${usageText(stats.usage)}`)];
 		}
 		return [];
 	}
@@ -440,37 +490,69 @@ export class TeamOverlayComponent implements Focusable {
 		return lines.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((text) => ({ text })));
 	}
 
-	private progressHead(team: TeamTeamView | undefined, works: TeamWorkSummary[], facts: Facts | undefined, reviews: readonly TeamReviewRecord[],
-		schedule: (TeamReviewPlan & { nextAt?: number | null }) | undefined, historyFlow: string | undefined, width: number): string[] {
-		const lines: string[] = [];
-		if (team && facts) {
-			const plain = works.filter((work) => !work.kind);
-			const count = (pick: (work: TeamWorkSummary) => boolean) => plain.filter(pick).length;
-			const finished = count((work) => isTerminalWorkState(work.state));
-			const last = reviews.at(-1)?.snapshot.works;
-			const since = finished - (last ? last.resolved + last.failed + last.cancelled : 0);
-			lines.push(...wrapTextWithAnsi([`Elapsed ${clock(this.elapsed(team, facts))}`, `works ${finished}/${plain.length} finished`, `${count((work) => work.state === "running" && !work.hold)} running`,
-				`${count((work) => (work.state === "blocked" || work.state === "queued") && !work.hold)} waiting`, `${count((work) => !!work.hold)} held`, `${since} finished since last review`].join(" · "), width));
+	private progressHead(team: TeamTeamView, width: number): string[] {
+		const stats = this.host.runtime.flowStats(team.teamId);
+		const count = (state: keyof typeof ICONS) => team.members.filter((member) => memberStatus(member) === state).length;
+		const lines = wrapTextWithAnsi(`Σ Team ${clock(stats.activeMs)} · ${count("running")} running · ${count("waiting")} waiting · ${count("idle")} idle · workers avg ${stats.workersAvg?.toFixed(1) ?? "—"}`, width);
+		lines.push(...wrapTextWithAnsi(`     ${usageText(team.usage)} · lead busy ${stats.leadBusyShare === undefined ? "—" : `${Math.round(stats.leadBusyShare * 100)}%`} · only lead ${stats.onlyLeadShare === undefined ? "—" : `${Math.round(stats.onlyLeadShare * 100)}%`}`, width));
+		const rows = flowRows(stats);
+		for (const key of ["lead", "queue", "waits", "cost"] as const) if (stats.warn[key]) {
+			lines.push(...wrapTextWithAnsi(`⚠ ${key[0]!.toUpperCase()}${key.slice(1)} ${rows[key]}`, width).map((line) => this.theme.fg("warning", line)));
 		}
-		const next = schedule?.nextAt ? ` · next in ${Math.max(0, Math.ceil((schedule.nextAt - this.now()) / 60_000))}m` : "";
-		lines.push(schedule ? `Review: ${schedule.by} every ${schedule.everyMinutes} min${next}` : "Review: off");
-		// Labels take 8 columns; wrapped rows continue under the text.
-		const row = (label: string, text: string, color?: "warning" | "dim") => wrapTextWithAnsi(text, width - 8).map((line, index) => {
-			const full = `${index ? "        " : label && label.padEnd(8)}${line}`;
-			return color ? this.theme.fg(color, full) : full;
-		});
-		if (team) {
-			const { used, limits } = this.host.runtime.inspectBudget(team.teamId);
-			const [label, share] = BUDGET_COUNTERS.map(([label, key]) => [label, limits[key] >= TEAM_BUDGET_UNLIMITED ? 0 : used[key] / limits[key]] as const)
-				.reduce((top, item) => item[1] > top[1] ? item : top);
-			if (share >= 0.8) lines.push(this.theme.fg("warning", `Budget ${Math.floor(share * 100)}% (${label})`));
-			const stats = this.host.runtime.flowStats(team.teamId);
-			const rows = flowRows(stats);
-			lines.push(...row("Flow", rows.flow), ...row("Lead", rows.lead, stats.warn.lead ? "warning" : undefined), ...row("Queue", rows.queue, stats.warn.queue ? "warning" : undefined),
-				...row("Waits", rows.waits, stats.warn.waits ? "warning" : undefined), ...row("Cost", rows.cost, stats.warn.cost ? "warning" : undefined),
-				...wrapTextWithAnsi(flowLegend(), width).map((line) => this.theme.fg("dim", line)));
-		} else if (historyFlow) lines.push(...row("Flow", historyFlow));
 		return [...lines, ""];
+	}
+
+	private reviewHeading(reviews: readonly TeamReviewRecord[], schedule: (TeamReviewPlan & { nextAt?: number | null }) | undefined): string {
+		const next = schedule?.nextAt ? ` · next in ${Math.max(0, Math.ceil((schedule.nextAt - this.now()) / 60_000))}m` : "";
+		return `Reviews · ${reviews.length} · ${schedule ? `${schedule.by} every ${schedule.everyMinutes} min${next}` : "off"}`;
+	}
+
+	private tasksSummary(works: readonly TeamWorkSummary[]): string {
+		const plain = works.filter((work) => !work.kind);
+		const roots = plain.filter((work) => !work.parent);
+		return `${roots.length} deliverables · ${roots.filter((work) => work.state === "running" && !work.hold).length} running · ${roots.filter((work) => work.state === "resolved" && !work.review).length} awaiting acceptance · ${roots.filter((work) => work.review === "accepted").length} accepted · ${plain.length - roots.length} sub-tasks`;
+	}
+
+	private taskState(teamId: string, work: TeamWorkSummary, works: readonly TeamWorkSummary[]): string {
+		const version = this.host.runtime.getWork(teamId, work.work)!.current;
+		if (work.hold) return `held: ${{ attention: "attention", budget: "budget", protocol: "loop", lead_unavailable: "lead fault" }[work.hold]}`;
+		if (work.review) {
+			const summary = work.resultRef ? this.host.runtime.getResult(teamId, work.resultRef)?.result.summary : undefined;
+			const reason = version.review?.reason;
+			return `${work.review}${reason ? ` · ${oneLine(reason)}` : summary ? ` · "${oneLine(summary).split(/(?<=[.!?])\s/u)[0]}"` : ""}`;
+		}
+		if (work.state === "failed") return `failed: ${version.error?.code ?? "unknown"}`;
+		if (work.state === "blocked") {
+			const waits = [...version.waitingFor, ...this.host.runtime.getWork(teamId, work.work)!.children];
+			const names = [...new Set(waits.map((ref) => works.find((item) => item.work.workId === ref.workId)).filter((item) => item && !isTerminalWorkState(item.state)).map((item) => item!.assignee))];
+			return `waiting for ${names.join(", ") || "sub-tasks"}`;
+		}
+		if (work.state === "queued") {
+			const ahead = works.slice(0, works.indexOf(work)).filter((item) => item.assignee === work.assignee && item.state === "queued").length;
+			return ahead ? `queued (${ahead} ahead)` : works.some((item) => item.assignee === work.assignee && item.state === "running") ? "queued · member busy" : "queued (0 ahead)";
+		}
+		if (work.state === "resolved") {
+			if (!work.parent) return "delivered · awaiting acceptance";
+			const result = work.resultRef ? this.host.runtime.getResult(teamId, work.resultRef)?.result : undefined;
+			return `done ${clock(this.host.runtime.workStats(teamId, work.work).activeMs)}${result ? ` · "${oneLine(result.summary).split(/(?<=[.!?])\s/u)[0]}"` : ""}`;
+		}
+		return work.state === "running" ? `running ${clock(this.host.runtime.workStats(teamId, work.work).activeMs)}` : work.state;
+	}
+
+	private taskDetail(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
+		const work = works.find((item) => item.work.workId === this.detail!.slice(0, this.detail!.lastIndexOf("@")))!;
+		const view = this.host.runtime.getWork(team.teamId, work.work)!;
+		const ref = shortWorkRef(work.work).replace(/@\d+$/u, "");
+		const milestones = this.timeline(facts, works).filter((row) => row.text.includes(`${ref}@`) || row.text.includes(work.work.workId));
+		const children = works.filter((item) => item.parent?.workId === work.work.workId && !item.kind);
+		const result = work.resultRef ? this.host.runtime.getResult(team.teamId, work.resultRef)?.result : undefined;
+		const stats = this.host.runtime.workStats(team.teamId, work.work);
+		const lines = [`${workTitle(work)} · ${shortWorkRef(work.work)}${work.work.revision > 1 ? ` (revised ${work.work.revision - 1}×)` : ""}`,
+			`${work.requester} → ${work.assignee} · ${this.taskState(team.teamId, work, works)} · ${usageText(stats.usage)}`, `Task: ${view.current.task}`, "Lifecycle:",
+			...(facts.timelineOmitted ? ["  … earlier steps omitted"] : []), ...milestones.map((row) => `  ${row.text}`),
+			`Sub-tasks: ${children.length} · ${children.filter((item) => item.state === "resolved").length} done · ${children.filter((item) => item.state === "blocked").length} waiting`,
+			`Result: ${result?.summary ?? "—"}`, ...(result?.findings ?? []).map((line) => `Finding: ${line}`), ...(result?.evidence ?? []).map((item) => `Evidence: ${item.source}${item.locator ? ` · ${item.locator}` : ""} · ${item.basis}`)];
+		return lines.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((text) => ({ text })));
 	}
 
 	private reviewRows(reviews: readonly TeamReviewRecord[], width: number): Row[] {
@@ -496,9 +578,10 @@ export class TeamOverlayComponent implements Focusable {
 		const review = reviews.find((review) => review.id === this.rows[this.selected]?.review);
 		if (!review) return [];
 		const [label] = verdictOf(review);
-		return [this.theme.fg("toolTitle", this.theme.bold(`${review.id} · ${review.by} · ${label}`)),
-			...[`Summary: ${review.summary}`, `Findings: ${review.findings?.join(" · ") ?? "none"}`, `Limitations: ${review.limitations?.join(" · ") ?? "none"}`, ...this.snapshotLines(review)]
-				.map((text) => this.theme.fg("dim", compact(text, width)))];
+		const works = review.snapshot.works;
+		return [this.theme.fg("toolTitle", this.theme.bold(`${clock(review.snapshot.elapsedMs)} · ${review.by} · ${label}`)),
+			this.theme.fg("dim", compact(`Summary: ${reviewAssessment(review.summary)}`, width)),
+			this.theme.fg("dim", compact(`Snapshot: works ${works.resolved}/${works.total} resolved · ${works.running} running · ${works.held} held · ${works.failed} failed`, width))];
 	}
 
 	private reviewDetail(reviews: readonly TeamReviewRecord[], width: number): Row[] {
@@ -510,9 +593,16 @@ export class TeamOverlayComponent implements Focusable {
 		return lines.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((text) => ({ text })));
 	}
 
-	private timeline(facts: Facts): Row[] {
+	private workReferences(text: string, works: readonly TeamWorkSummary[]): string {
+		return text.replace(/work ([\w-]+)@\d+(?!\d)(?! «)/gu, (ref, id: string) => {
+			const work = works.find((work) => shortWorkRef(work.work).split(" ")[1]!.split("@")[0] === id);
+			return work ? `${ref} «${workTitle(work)}»` : ref;
+		});
+	}
+
+	private timeline(facts: Facts, works: readonly TeamWorkSummary[]): Row[] {
 		const origin = facts.timeline[0]?.at ?? 0;
-		return facts.timeline.map((entry) => ({ text: `${clock(entry.at - origin).padStart(7)}  ${oneLine(entry.text)}`, milestone: `${entry.at}:${entry.text}` }));
+		return facts.timeline.map((entry) => ({ text: `${clock(entry.at - origin).padStart(7)}  ${this.workReferences(oneLine(entry.text), works)}`, milestone: `${entry.at}:${entry.text}` }));
 	}
 
 	private historyMembers(entry: TeamHistoryEntry): string[] {
@@ -532,17 +622,34 @@ export class TeamOverlayComponent implements Focusable {
 	}
 
 	private historyRows(entry: TeamHistoryEntry, width: number): Row[] {
-		const heading = `Team ${entry.teamId} · ${entry.lifecycle.toUpperCase()} · ${entry.version === 1 ? "legacy · " : ""}history (read-only)`;
-		const lines = this.tab === 1 ? [heading, `Goal: ${entry.goal ?? "not retained"}`, `Outcome: ${entry.outcome ?? entry.lifecycle}`, entry.reason ?? "",
-			`Started: ${entry.startedAt === undefined ? "not retained" : new Date(entry.startedAt).toLocaleString()}`,
-			`Ended: ${new Date(entry.at).toLocaleString()} · duration ${entry.startedAt === undefined ? "not retained" : clock(entry.at - entry.startedAt)}`,
-			...(entry.usage ? [`Tokens: input ${entry.usage.input} · output ${entry.usage.output} · cache ${entry.usage.cacheRead}/${entry.usage.cacheWrite}`] : []),
-			...(entry.flow ? [`Flow: ${entry.flow}`] : []),
-			...(entry.rootCounts ? [`Roots: ${entry.rootCounts.accepted}/${entry.rootCounts.total} accepted · ${entry.rootCounts.waived} waived`] : []), `${entry.results.length} retained results`]
-			: this.tab === 3 ? [heading, ...this.historyMembers(entry)]
-				: this.tab === 4 ? [heading, "Work ledger not retained; retained results:", ...entry.results.map((result) => `${shortWorkRef(result.work)} · ${result.author} · ${result.result.status} · ${result.id}: ${oneLine(result.result.summary)}`)]
-					: [heading, "Timeline not retained in history"];
-		return lines.flatMap((text) => wrapTextWithAnsi(oneLine(text), width).map((text) => ({ text })));
+		if (this.tab === 2) {
+			if (this.detail) return this.historyMembers(entry).filter((text) => text.startsWith(`${this.detail} ·`)).flatMap((text) => wrapTextWithAnsi(text, width).map((text) => ({ text })));
+			return entry.members.map((id) => {
+				const state = entry.memberStates?.find((member) => member.id === id)?.lifecycle ?? "activity not retained";
+				const stats = entry.memberStats?.find((member) => member.id === id);
+				const busy = entry.activeMs && stats ? Math.round(stats.activeMs / entry.activeMs * 100) : undefined;
+				const status = state === "faulted" ? "failed" : state === "closed" ? "completed" : "idle";
+				return { member: id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${id}${id === entry.lead ? " (lead)" : ""}  ${state}`,
+					lines: wrapTextWithAnsi(stats ? `active ${clock(stats.activeMs)} · ${busy !== undefined && busy >= 90 ? this.theme.fg("warning", `busy ${busy}%`) : `busy ${busy ?? "—"}%`} · ${usageText(stats.usage)}` : "active — · busy — · tokens not retained", width - 2) };
+			});
+		}
+		const heading = `Team:        ${teamTitle(entry, entry.goal)} · ${entry.shortId ?? entry.teamId.slice(0, 8)}`;
+		const wall = entry.startedAt === undefined ? undefined : entry.at - entry.startedAt;
+		const paused = wall === undefined || entry.activeMs === undefined ? 0 : Math.max(0, wall - entry.activeMs);
+		const lines = this.tab === 1 ? [heading, `Goal:        ${entry.goal ?? "not retained"}`,
+			`Time:        ${entry.activeMs !== undefined ? clock(entry.activeMs) : wall === undefined ? "not retained" : clock(wall)}${paused ? ` active · ${clock(wall!)} wall (paused ${clock(paused)})` : ""}`,
+			...(entry.usage ? [`Tokens:      ${usageText(entry.usage)}`] : []), `Outcome:     ${entry.outcome ?? entry.lifecycle}${entry.reason ? ` · ${entry.reason}` : ""}`,
+			...(entry.rootCounts ? [`Roots:       ${entry.rootCounts.accepted}/${entry.rootCounts.total} accepted · ${entry.rootCounts.waived} waived`] : []),
+			`Review:      ${entry.reviews?.length ? `${clock(entry.reviews.at(-1)!.snapshot.elapsedMs)} ${entry.reviews.at(-1)!.by} ${verdictOf(entry.reviews.at(-1)!)[0].toUpperCase()} · ${compact(reviewAssessment(entry.reviews.at(-1)!.summary), width - 39)}` : entry.review ? "No reviews" : "off"}`,
+			...(entry.reviews?.length ? [`             ${entry.reviews.length} review${entry.reviews.length === 1 ? "" : "s"} · enter: all reviews`] : [])]
+			: this.tab === 3 ? [heading, "Work ledger not retained; retained results:", ...entry.results.map((result) => `${shortWorkRef(result.work)} · ${result.author} · ${result.result.status} · ${result.id}: ${oneLine(result.result.summary)}`)]
+				: [heading, "Timeline not retained in history"];
+		return lines.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((text) => ({ text, ...(text.startsWith("Review:") ? { review: "all" } : {}) })));
+	}
+
+	private historyProgressHead(entry: TeamHistoryEntry, width: number): string[] {
+		return [`Σ Team ${entry.activeMs === undefined ? "—" : clock(entry.activeMs)} · history · ${entry.members.length} members`,
+			...(entry.usage ? wrapTextWithAnsi(`     ${usageText(entry.usage)}`, width) : []), ...(entry.flow ? wrapTextWithAnsi(entry.flow.split(" · ").slice(0, 2).join(" · "), width) : []), ""];
 	}
 }
 

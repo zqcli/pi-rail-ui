@@ -3,7 +3,7 @@ import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionC
 import { Container, Text, TruncatedText } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { SessionBroker } from "./session-broker";
-import { formatWorkResult, jsonTextBytes, normalizeTeamPlan, previewText, TEAM_PLAN_MIGRATION, truncateText } from "./team-codec";
+import { formatWorkResult, jsonTextBytes, normalizeTeamPlan, normalizeTitle, previewText, TEAM_PLAN_MIGRATION, truncateText } from "./team-codec";
 import { flowSummary } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
 import { prompt, promptList } from "../../core/prompts";
@@ -22,7 +22,6 @@ import {
 } from "./tool";
 import { boundSubagentRunTranscripts, renderSubagentTranscript, type SubagentTranscriptRun } from "./transcript";
 import { fairShares } from "./text-budget";
-import { addActivationUsage } from "./usage";
 
 const MAX_MEMBER_OUTPUT_BYTES = 16 * 1024;
 const MAX_FINAL_TEXT_BYTES = 48 * 1024;
@@ -60,12 +59,14 @@ const BriefSchema = Type.Object({
 const InitialRequestSchema = Type.Object({
 	to: Type.String({ minLength: 1, maxLength: 64, description: "A member alias other than the lead" }),
 	task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES, description: "Self-contained initial work for that member" }),
+	title: nullable(Type.String({ minLength: 1, maxLength: 60, description: "Short single-line title for this work" })),
 	inputRefs: nullable(Type.Array(Type.String(), { maxItems: 0 })),
 }, { additionalProperties: false });
 
 type Params = {
 	action: "prepare" | "launch" | "status" | "cancel";
 	teamId?: string | null;
+	title?: string | null;
 	members?: unknown;
 	lead?: string | null;
 	brief?: unknown;
@@ -162,7 +163,7 @@ function teamLines(view: TeamTeamView, works: readonly TeamWorkSummary[], totalH
 	const openIncidents = view.incidents.filter((incident) => incident.state === "open");
 	const health = view.health === "needs_attention" ? `needs attention ${openIncidents.length}` : "ok";
 	const lines = [
-		`Team ${view.teamId} · ${lifecycleText(view)} · ${health}${view.outcome ? ` · outcome ${view.outcome}` : ""}`,
+		`Team ${view.teamId} «${view.title ?? normalizeTitle(undefined, view.brief.goal)}» · ${lifecycleText(view)} · ${health}${view.outcome ? ` · outcome ${view.outcome}` : ""}`,
 		`Goal: ${previewText(view.brief.goal, 240)}`,
 	];
 	// Whole: the close reason is already bounded by the note limit (one line; the collapsed panel cuts it to a row).
@@ -239,8 +240,7 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 	const works = host.runtime.listWorks(teamId);
 	return boundSubagentRunTranscripts(view.members.map((member, slot): SubagentTranscriptRun => {
 		const activity = host.driver.memberActivity(teamId, member.id);
-		const usage = { ...member.usage };
-		if (activity?.liveUsage) addActivationUsage(usage, activity.liveUsage);
+		const usage = member.usage;
 		const latest = facts.results.get(member.id)?.latest;
 		const currentKey = member.currentWork ? workRefKey(member.currentWork) : undefined;
 		// The lead's Team-level job is the goal in the Team header; a task line is only for assigned work.
@@ -276,7 +276,7 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 
 export function formatHistorySummary(entry: TeamHistoryEntry): string {
 	const roster = entry.lead ? ` · lead ${entry.lead} · members ${entry.members.join(", ")}` : "";
-	return `${entry.teamId} · ${upper(entry.lifecycle)}${entry.outcome ? ` · outcome ${entry.outcome}` : ""}${entry.version === 1 ? " · legacy v1 (read-only)" : " · history (read-only)"}${roster} · ${entry.results.length} results`;
+	return `${entry.teamId} «${entry.title ?? normalizeTitle(undefined, entry.goal ?? entry.teamId)}» · ${upper(entry.lifecycle)}${entry.outcome ? ` · outcome ${entry.outcome}` : ""}${entry.version === 1 ? " · legacy v1 (read-only)" : " · history (read-only)"}${roster} · ${entry.results.length} results`;
 }
 
 export function formatHistoryEntry(entry: TeamHistoryEntry, cursor?: string): string {
@@ -317,11 +317,11 @@ function hasPayload(value: unknown): boolean {
 /** Enforce the action whitelist before projecting parameters into the shared plan codec. */
 function assertActionParams(params: Params, action: Params["action"]): void {
 	if (["manager", "workers", "coordinator"].some((key) => hasPayload((params as Record<string, unknown>)[key]))) throw new Error(TEAM_PLAN_MIGRATION);
-	const known = ["action", "teamId", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review", "reason", "cursor", "resultRef"];
+	const known = ["action", "teamId", "title", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review", "reason", "cursor", "resultRef"];
 	const unknown = Object.keys(params).filter((key) => !known.includes(key));
 	if (unknown.length) throw new Error(`${action} contains unsupported field(s): ${unknown.join(", ")}`);
 	const allowed: Record<Params["action"], readonly string[]> = {
-		prepare: ["action", "teamId", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review"],
+		prepare: ["action", "teamId", "title", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review"],
 		launch: ["action", "teamId"],
 		status: ["action", "teamId", "cursor", "resultRef"],
 		cancel: ["action", "teamId", "reason"],
@@ -345,7 +345,7 @@ function finalTeamText(host: TeamSessionHost, result: TeamResult, startedAt: num
 	const waived = roots.filter((work) => (reviewOf(work)?.disposition ?? work.review) === "waived").length;
 	const unresolved = result.unresolvedIncidents.length + (result.unresolvedIncidentsOmitted ?? 0);
 	const lines = [
-		`Team ${result.teamId} ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""} · ${clock(Date.now() - startedAt)}${result.reason ? ` · ${previewText(result.reason, TEAM_MAX_NOTE_BYTES)}` : ""}`,
+		`Team ${result.teamId} «${view.title}» ${upper(result.lifecycle)}${result.outcome ? ` · outcome ${result.outcome}` : ""} · ${clock(Date.now() - startedAt)}${result.reason ? ` · ${previewText(result.reason, TEAM_MAX_NOTE_BYTES)}` : ""}`,
 		`Deliverables (${roots.length} roots · ${accepted} accepted · ${waived} waived):`,
 		...roots.slice(0, 20).map((work) => {
 			const record = work.resultRef ? host.runtime.getResult(result.teamId, work.resultRef) : undefined;
@@ -417,7 +417,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		if (!host.active) throw new Error("The Team runtime for this session branch has ended; nothing was prepared");
 		if (params.teamId?.trim()) throw new Error("prepare creates a new Team and does not accept teamId");
 		const raw: Record<string, unknown> = {};
-		for (const key of ["members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review"] as const) {
+		for (const key of ["title", "members", "lead", "brief", "initialRequests", "timeoutSeconds", "budget", "review"] as const) {
 			if (params[key] !== undefined) raw[key] = params[key];
 		}
 		const plan = normalizeTeamPlan(raw);
@@ -450,7 +450,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		host.pin(view.teamId, resolved);
 		const works = host.runtime.listWorks(view.teamId);
 		const lines = [
-			`Prepared Team ${view.teamId} (nothing has started: no provider, no tool).`,
+			`Prepared Team ${view.teamId} «${view.title}» (nothing has started: no provider, no tool).`,
 			...members.map((member) => {
 				const policy = resolved.get(member.alias)!;
 				const contextWindow = policy.contextWindow === undefined ? `native default ${policy.nativeContextWindow}` : `${policy.contextWindow} (explicit)`;
@@ -624,6 +624,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		executionMode: "parallel",
 		parameters: Type.Object({
 			action: StringEnum(["prepare", "launch", "status", "cancel"]),
+			title: nullable(Type.String({ minLength: 1, maxLength: 60, description: "prepare: short single-line Team title; defaults to the first sentence of the goal" })),
 			teamId: nullable(Type.String({ description: "launch/status/cancel: the teamId returned by prepare (status without it lists Teams). For a resultRef lookup, provide the owning teamId." })),
 			cursor: nullable(Type.String({ description: "status: next result-ref page cursor returned by the prior status page; requires teamId" })),
 			resultRef: nullable(Type.String({ description: "status: fetch exactly one complete ResultRecord by its resultRef; requires teamId and cannot be combined with cursor" })),

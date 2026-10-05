@@ -65,11 +65,11 @@ function overlay(host: TeamSessionHost, options: { rows?: number; now?: () => nu
 	return { component, closed, tui, renders: () => renders, text: (width = 120) => component.render(width).join("\n"), key: (key: keyof typeof keys) => component.handleInput(keys[key]) };
 }
 
-test("z selects the Members row or detail and opens the chooser from other tabs", (t) => {
+test("z selects the Progress row or detail and opens the chooser from other tabs", (t) => {
 	const { host, teamId } = fixture();
 	for (const detail of [false, true]) {
 		const ui = overlay(host);
-		ui.key("tab"); ui.key("tab"); ui.text(); ui.key("down"); ui.text();
+		ui.key("tab"); ui.text(); ui.key("down"); ui.text();
 		if (detail) { ui.key("enter"); ui.text(); }
 		ui.component.handleInput("z");
 		assert.deepEqual(ui.closed, [{ teamId, action: "compact", memberId: "runner" }]);
@@ -111,7 +111,7 @@ test("Members show context, running compaction and the last reduction at popup w
 	host.runtime.listTeams = () => [team];
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("tab"); ui.key("tab");
+	ui.key("tab");
 	assert.match(ui.text(73), /ctx 286k\/328k 87% · compacting…/u);
 	team.members[1]!.compacting = false;
 	team.members[1]!.lastCompaction = { tokensBefore: 286000, tokensAfter: 41000 };
@@ -124,23 +124,22 @@ test("five views show real running, waiting and held work, routes and attention"
 	const { host, now } = fixture();
 	const ui = overlay(host, { now });
 	t.after(() => ui.component.dispose());
-	assert.match(ui.text(), /ACTIVE · needs attention · \d+:\d\d/u);
-	assert.match(ui.text(), /Progress:\s+roots 0\/3 accepted · works 0\/4 done · 0 cancelled/u);
-	assert.match(ui.text(), /Waiting for: Lead decision/u);
-	assert.match(ui.text(), /Attention:\s+1 open holds/u);
-	assert.match(ui.text(), /Budget:\s+activations/u);
+	assert.match(ui.text(POPUP_WIDTH), /ACTIVE · needs attention · \d+:\d\d/u);
+	assert.doesNotMatch(ui.text(POPUP_WIDTH), /Progress:|Recent:/u);
+	assert.match(ui.text(POPUP_WIDTH), /Waiting for:\s+Lead decision/u);
+	assert.match(ui.text(POPUP_WIDTH), /Attention:\s+1 open holds/u);
+	assert.match(ui.text(POPUP_WIDTH), /Budget:\s+activations/u);
 	ui.key("tab");
-	assert.match(ui.text(), /\[Progress\]/u);
+	assert.match(ui.text(POPUP_WIDTH), /\[Progress\]/u);
+	assert.match(ui.text(POPUP_WIDTH), /▶ runner\s+running work/u);
+	assert.match(ui.text(POPUP_WIDTH), /⧗ waiter\s+waiting for runner/u);
+	assert.match(ui.text(POPUP_WIDTH), /⏸ held\s+held · asks: "Which requirements\?"/u);
 	ui.key("tab");
-	assert.match(ui.text(), /▶ runner\s+running work .*lead → runner → lead/u);
-	assert.match(ui.text(), /⧗ waiter\s+waiting on 1 sub-task: runner/u);
-	assert.match(ui.text(), /⏸ held\s+held · asks: "Which requirements\?"/u);
-	ui.key("tab");
-	assert.match(ui.text(), /roots 0\/3 accepted · works 0\/4/u);
-	assert.match(ui.text(), /  ○ work:.*runner ← waiter.*Check child 1/u);
+	assert.match(ui.text(POPUP_WIDTH), /3 deliverables · 1 running/u);
+	assert.match(ui.text(POPUP_WIDTH), /○ Check child 1\s+runner\s+queued · member busy/u);
 	ui.key("tab"); ui.text(); ui.key("home");
 	assert.match(ui.text(), /0:00  launch/u);
-	assert.match(ui.text(), /waiter requested work/u);
+	assert.match(ui.text(), /waiter requested work.*«Check child 1»/u);
 	ui.key("backTab");
 	assert.match(ui.text(), /\[Tasks\]/u);
 });
@@ -149,7 +148,7 @@ test("Members Enter shows full task, outbound works, and latest result with dest
 	const { host, runner, action, settle } = fixture();
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("tab"); ui.key("tab"); ui.text(); ui.key("down"); ui.key("down"); ui.text(); ui.key("enter");
+	ui.key("tab"); ui.text(); ui.key("down"); ui.key("down"); ui.text(); ui.key("enter");
 	assert.match(ui.text(), /Member waiter · Esc back/u);
 	assert.match(ui.text(), /Keep every detail of this task\./u);
 	assert.match(ui.text(), /→ runner · queued/u);
@@ -157,7 +156,7 @@ test("Members Enter shows full task, outbound works, and latest result with dest
 	settle(runner, action(runner, 1, { action: "reply", result: { status: "succeeded", summary: "Popup implemented." } }));
 	ui.text(); ui.key("down"); ui.text(); ui.key("enter");
 	assert.match(ui.text(), /Latest result: succeeded · /u);
-	assert.match(ui.text(), /result → lead · succeeded · awaiting review/u);
+	assert.match(ui.text(), /Latest result: succeeded · "Popup implemented\." · awaiting acceptance/u);
 	assert.match(ui.text(), /Popup implemented\./u);
 });
 
@@ -165,8 +164,10 @@ test("Tasks fold more than five children, expand with Enter, and collapse again"
 	const { host } = fixture(6);
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("tab"); ui.key("tab"); ui.key("tab");
-	assert.match(ui.text(), /✓ 6 sub-tasks \(runner 6\) · 0 done \[\+\]/u);
+	const original = host.runtime.listWorks.bind(host.runtime);
+	host.runtime.listWorks = (id) => original(id).map((work) => work.parent ? { ...work, state: "resolved" } : work);
+	ui.key("tab"); ui.key("tab");
+	assert.match(ui.text(), /✓ 6 sub-tasks done \[\+\]/u);
 	assert.doesNotMatch(ui.text(), /Check child 6/u);
 	ui.key("down"); ui.key("down"); ui.text(); ui.key("enter");
 	assert.match(ui.text(), /\[−\]/u);
@@ -177,14 +178,14 @@ test("Tasks fold more than five children, expand with Enter, and collapse again"
 });
 
 test("task rows preserve nesting across parent revisions and use state/review icons", () => {
-	const root: TeamWorkSummary = { work: { workId: "work:root", revision: 2 }, requester: "lead", assignee: "gate", state: "resolved", review: "accepted", taskPreview: "Root", resultRef: "result:one" };
+	const root: TeamWorkSummary = { work: { workId: "work:root", revision: 2 }, title: "Root release", requester: "lead", assignee: "gate", state: "resolved", review: "accepted", taskPreview: "Full root instruction", resultRef: "result:one" };
 	const children = ["resolved", "running", "blocked", "failed", "cancelled", "superseded", "queued"] as const;
 	const works: TeamWorkSummary[] = [root, ...children.map((state, index) => ({ work: { workId: `work:c${index}`, revision: 1 }, parent: { ...root.work, revision: 1 }, requester: "gate", assignee: index % 2 ? "rpc" : "reviewer", state, taskPreview: `Child\n${index}` }))];
-	const rows = buildTeamTaskRows(works, new Set([root.work.workId]), theme);
-	assert.match(rows[0]!.text, /^✓ work:root@2.*resolved\/accepted\s+Root · result:one$/u);
-	assert.match(rows[1]!.text, /7 sub-tasks \(reviewer 4 · rpc 3\) · 1 done/u);
-	assert.deepEqual(rows.slice(2).map((row) => row.text.trim()[0]), ["✓", "▶", "⧗", "✗", "–", "–", "○"]);
-	assert.ok(rows.slice(2).every((row) => row.text.startsWith("  ") && !row.text.includes("\n")));
+	const rows = buildTeamTaskRows(works, new Set([`${root.work.workId}:cancelled`]), theme);
+	assert.match(rows[0]!.text, /^✓ Root release.*gate.*@2 \(rev 1×\)$/u);
+	assert.match(rows[6]!.text, /– 2 cancelled\/superseded \[−\]/u);
+	assert.deepEqual(rows.slice(1, 6).map((row) => row.text.trim()[0]), ["✓", "▶", "⧗", "✗", "○"]);
+	assert.ok(rows.slice(1).every((row) => row.text.startsWith("  ") && !row.text.includes("\n")));
 });
 
 test("runtime and driver subscriptions request renders and are released on dispose", async () => {
@@ -211,7 +212,7 @@ test("all views and details fit widths 60–200 and respect a short terminal", (
 	const { host } = fixture(6);
 	const ui = overlay(host, { rows: 18 });
 	t.after(() => ui.component.dispose());
-	for (let view = 0; view < 6; view++) {
+	for (let view = 0; view < 5; view++) {
 		for (const width of [60, 100, 120, 200]) {
 			const lines = ui.component.render(width);
 			assert.ok(lines.every((line) => visibleWidth(line) <= width));
@@ -224,18 +225,19 @@ test("all views and details fit widths 60–200 and respect a short terminal", (
 	assert.ok(ui.component.render(60).every((line) => visibleWidth(line) <= 60));
 });
 
-test("narrow member rows retain routes and time; long Unicode task previews retain result status", (t) => {
+test("narrow member rows retain state and active time; long Unicode task titles retain result status", (t) => {
 	const { host } = fixture();
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("tab"); ui.key("tab");
-	assert.match(ui.text(60), /lead → held → lead\s+0:00/u);
+	ui.key("tab");
+	assert.match(ui.text(60), /held · asks:/u);
+	assert.match(ui.text(60), /active \d+:\d\d · busy/u);
 	const root: TeamWorkSummary = { work: { workId: "work:root", revision: 1 }, requester: "lead", assignee: "w1", state: "resolved", review: "accepted", taskPreview: "检查🧪".repeat(100), resultRef: "r1" };
 	const colored = { ...theme, fg: (_color: string, text: string) => `\x1b[32m${text}\x1b[0m` } as Theme;
 	for (const width of [60, 120]) {
 		const row = buildTeamTaskRows([root], new Set(), colored, width)[0]!;
 		assert.ok(visibleWidth(row.text) <= width);
-		assert.match(row.text, /resolved\/accepted\s+.* · r1$/u);
+		assert.match(row.text, /resolved\/accepted\s*$/u);
 	}
 });
 
@@ -243,10 +245,9 @@ test("long Tasks lists keep selection visible; Timeline pages from newest to old
 	const { host } = fixture(6);
 	const ui = overlay(host, { rows: 14 });
 	t.after(() => ui.component.dispose());
-	ui.key("tab"); ui.key("tab"); ui.key("tab"); ui.text();
-	ui.key("down"); ui.key("down"); ui.text(); ui.key("enter"); ui.text();
+	ui.key("tab"); ui.key("tab"); ui.text();
 	for (let index = 0; index < 10; index++) { ui.key("down"); ui.text(); }
-	assert.match(ui.text(), /→ ⏸ work:.*held ← lead/u);
+	assert.match(ui.text(), /→ ⏸ Check requirements.*held: attention/u);
 	ui.key("tab");
 	assert.match(ui.text(), /held ended work/u);
 	assert.doesNotMatch(ui.text(), /0:00  launch/u);
@@ -262,7 +263,7 @@ test("Timeline shows retained omission notice and updates after runtime change",
 	host.runtime.panelFacts = (id) => ({ ...original(id), timelineOmitted: 12 });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("tab"); ui.key("tab"); ui.key("tab"); ui.key("tab");
+	ui.key("tab"); ui.key("tab"); ui.key("tab");
 	assert.match(ui.text(), /… 12 earlier milestones omitted …/u);
 	const hold = host.runtime.listHolds(teamId)[0]!;
 	host.runtime.releaseHold(teamId, hold.work, hold.incidentId, "Use the approved requirements");
@@ -270,21 +271,21 @@ test("Timeline shows retained omission notice and updates after runtime change",
 });
 
 test("Team selector defaults to active, orders recent history last, and prevents history actions", (t) => {
-	const { host, teamId } = fixture();
+	const { host } = fixture();
 	host.runtime.prepare({ members: [{ alias: "other", roleDescription: "Manage." }, { alias: "worker", roleDescription: "Work." }], lead: "other", brief: { goal: "Prepared" }, timeoutSeconds: null });
 	host.history.teams.push({ teamId: "old", version: 2, lifecycle: "interrupted", lead: "lead", members: ["lead", "worker"], results: [], finalResultRefs: [], at: 1 },
 		{ teamId: "recent", version: 2, lifecycle: "closed", lead: "lead", members: ["lead", "worker"], goal: "Historic goal", results: [], finalResultRefs: [], at: 2 });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	assert.match(ui.text(), new RegExp(`‹ 1/4 › ${teamId}`, "u"));
+	assert.match(ui.text(), /‹ 1\/4 ›/u);
 	ui.component.handleInput("]"); ui.component.handleInput("]");
-	assert.match(ui.text(), /Team recent · CLOSED · history \(read-only\)/u);
+	assert.match(ui.text(), /Team:\s+Historic goal · recent/u);
 	ui.component.handleInput("c");
 	assert.equal(ui.closed.length, 0);
 	ui.component.handleInput("]");
-	assert.match(ui.text(), /Team old · INTERRUPTED/u);
+	assert.match(ui.text(), /INTERRUPTED · history/u);
 	ui.component.handleInput("["); ui.component.handleInput("["); ui.component.handleInput("[");
-	assert.match(ui.text(), new RegExp(`‹ 1/4 › ${teamId}`, "u"));
+	assert.match(ui.text(), /‹ 1\/4 ›/u);
 	assert.match(ui.text(), /ACTIVE/u);
 });
 
@@ -335,21 +336,21 @@ test("Rail Team frame, title, tabs, summary, and selection use Rail Agent theme 
 	assert.equal(lines[0], tagged.tag("borderAccent", `╭${"─".repeat(198)}╮`));
 	assert.equal(lines.at(-1), tagged.tag("borderAccent", `╰${"─".repeat(198)}╯`));
 	assert.ok(lines.slice(1, -1).every((line) => line.startsWith(tagged.tag("border", "│")) && line.endsWith(tagged.tag("border", "│"))));
-	assert.ok(lines.slice(1, -1).every((line) => stripTerminalSequences(line).startsWith("│ ")));
+	assert.ok(lines.slice(1, -1).every((line) => /^│[ →]/u.test(stripTerminalSequences(line))));
 	assert.ok(tagged.calls.some(({ color, text }) => color === "accent" && text === "\x1b[1mRail Team\x1b[22m"));
 	assert.ok(tagged.calls.some(({ color, text }) => color === "accent" && text === "[Overview]"));
-	assert.ok(tagged.calls.some(({ color, text }) => color === "dim" && text === " Members "));
+	assert.ok(tagged.calls.some(({ color, text }) => color === "dim" && text === "Progress"));
 	assert.match(stripTerminalSequences(lines[2]!), /ACTIVE · needs attention · \d+:\d\d · roots 0\/3 accepted · works 0\/4 · 1 running · 1 held · 1 waiting/u);
 	assert.equal(stripTerminalSequences(lines[3]!).trim(), "│" + " ".repeat(198) + "│");
-	ui.key("right"); ui.key("right");
+	ui.key("right");
 	const members = ui.text(100);
 	assert.match(stripTerminalSequences(members), /│ → ○ lead/u);
 	assert.ok(tagged.calls.some(({ color, text }) => color === "accent" && text === " → "));
-	assert.ok(tagged.calls.some(({ color, text }) => color === "accent" && stripTerminalSequences(text).startsWith("○ lead")));
+	assert.ok(tagged.calls.some(({ color, text }) => color === "muted" && text === "○"));
 	for (const width of [60, 100, 200]) assert.ok(ui.component.render(width).every((line) => visibleWidth(line) === width));
 });
 
-test("summary omits zero activity counts and header selector shows only eight ID characters", (t) => {
+test("summary omits zero activity counts and Teams rows show only eight ID characters", (t) => {
 	let id = 0;
 	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `long-team-id-${++id}` });
 	for (let index = 0; index < 2; index++) host.runtime.prepare({ members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "worker", roleDescription: "Work." }], lead: "lead", brief: { goal: "Test" }, timeoutSeconds: null });
@@ -357,51 +358,47 @@ test("summary omits zero activity counts and header selector shows only eight ID
 	t.after(() => ui.component.dispose());
 	const lines = ui.component.render(100);
 	assert.match(lines[1]!, /Rail Team\s+\[Teams\]\s+Overview\s+Progress/u);
-	assert.match(lines[1]!, /‹ 1\/2 › long-tea│$/u);
+	assert.match(lines[1]!, /‹ 1\/2 ›│$/u);
+	assert.match(lines.join("\n"), /○ Test\s+long-tea/u);
+	assert.doesNotMatch(lines.join("\n"), /long-team-id/u);
 	assert.match(lines[2]!, /2 Teams/u);
 	assert.doesNotMatch(lines[2]!, /0 running|held|waiting/u);
 });
 
-test("Members align alias, state, route and right-aligned active time, with selected details", (t) => {
+test("Progress aligns alias/state, shows two-line active/usage rows and selected work/results", (t) => {
 	const { host, runner, action, settle } = fixture();
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right"); ui.key("right");
-	const lines = ui.component.render(100);
+	ui.key("right");
+	const lines = ui.component.render(POPUP_WIDTH);
 	const members = lines.filter((line) => /[○▶⧗⏸] (lead|runner|waiter|held)/u.test(line));
 	assert.equal(members.length, 4);
-	assert.deepEqual(members.map((line) => visibleWidth(line.slice(0, line.indexOf("0:00")))), [95, 95, 95, 95]);
+	assert.equal(lines.filter((line) => /active \d+:\d\d · busy/u.test(line)).length, 4);
 	const workerLines = members.slice(1);
-	assert.equal(new Set(workerLines.map((line) => line.indexOf("lead →"))).size, 1);
-	assert.equal(new Set(workerLines.map((line) => line.indexOf("running work") >= 0 ? line.indexOf("running work") : line.indexOf("waiting on") >= 0 ? line.indexOf("waiting on") : line.indexOf("held ·"))).size, 1);
+	assert.equal(new Set(workerLines.map((line) => line.indexOf("running work") >= 0 ? line.indexOf("running work") : line.indexOf("waiting for") >= 0 ? line.indexOf("waiting for") : line.indexOf("held ·"))).size, 1);
 	ui.key("down");
-	assert.match(ui.text(100), /│ runner\s+│/u);
-	assert.match(ui.text(100), /Task: Implement the popup/u);
-	assert.match(ui.text(100), /Route: lead → runner → lead/u);
+	assert.match(ui.text(POPUP_WIDTH), /runner · Implement the popup · from lead · work/u);
 	settle(runner, action(runner, 1, { action: "reply", result: { status: "succeeded", summary: "Done" } }));
-	const latest = host.runtime.panelFacts(host.runtime.listTeams()[0]!.teamId).results.get("runner")!.latest;
-	assert.ok(ui.text(100).includes(`result → lead · succeeded · awaiting review · ${latest.id}`));
+	assert.match(ui.text(POPUP_WIDTH), /Latest result: succeeded · "Done" · awaiting acceptance/u);
 });
 
-test("Tasks align WorkRef, route and state before preview, with full selected details", (t) => {
+test("Tasks align title, assignee and state, with selected route, work ref and accounting", (t) => {
 	const { host, teamId } = fixture();
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right"); ui.key("right"); ui.key("right");
-	const lines = ui.component.render(100);
-	const rows = lines.filter((line) => /[▶⧗○⏸] work:/u.test(line));
+	ui.key("right"); ui.key("right");
+	const lines = ui.component.render(POPUP_WIDTH);
+	const rows = lines.map(stripTerminalSequences).filter((line) => /[▶⧗○⏸] (Implement|Review|Check)/u.test(line));
 	assert.equal(rows.length, 4);
-	const routes = ["runner ← lead", "waiter ← lead", "runner ← waiter", "held ← lead"];
-	const states = ["running", "blocked", "queued", "held"];
-	assert.equal(new Set(rows.map((line, index) => line.indexOf(routes[index]!))).size, 1);
-	assert.equal(new Set(rows.map((line, index) => line.indexOf(`  ${states[index]} `, line.indexOf(routes[index]!) + routes[index]!.length))).size, 1);
-	assert.equal(new Set(rows.map((line) => line.indexOf("Implement") >= 0 ? line.indexOf("Implement") : line.indexOf("Review") >= 0 ? line.indexOf("Review") : line.indexOf("Check"))).size, 1);
+	assert.equal(new Set(rows.map((line) => line.search(/(?:runner|waiter|held)\s+(?:running|waiting|queued|held:)/u))).size, 1, rows.join("\n"));
 	ui.key("down"); ui.key("down");
 	const child = host.runtime.listWorks(teamId).find((work) => work.parent)!;
-	assert.ok(ui.text(100).includes(`${child.work.workId}@${child.work.revision}`));
-	assert.match(ui.text(100), /From: waiter → runner → waiter/u);
-	assert.match(ui.text(100), /State: queued · resultRef: —/u);
-	assert.match(ui.text(100), /Task: Check child 1/u);
+	assert.ok(ui.text(POPUP_WIDTH).includes(`work ${child.work.workId.split(":")[1]}@1`));
+	assert.match(ui.text(POPUP_WIDTH), /Check child 1 · waiter → runner/u);
+	assert.match(ui.text(POPUP_WIDTH), /active \d+:\d\d · in 0 · out 0 · cache 0/u);
+	ui.key("enter");
+	assert.match(ui.text(POPUP_WIDTH), /Task: Check child 1/u);
+	assert.match(ui.text(POPUP_WIDTH), /Lifecycle:/u);
 });
 
 test("Overview aligns labels and renders budget bars, small shares, warning/exhaustion, and unlimited", (t) => {
@@ -421,7 +418,7 @@ test("Overview aligns labels and renders budget bars, small shares, warning/exha
 	assert.match(text, /works\s+▏░{19}  30\/4096 · 0%/u);
 	assert.match(text, /tool calls\s+156 · unlimited/u);
 	assert.doesNotMatch(text.split("\n").find((line) => line.includes("156 · unlimited"))!, /[█░]/u);
-	for (const label of ["Goal", "Progress", "Waiting for", "Attention", "Budget", "Recent"]) {
+	for (const label of ["Goal", "Time", "Tokens", "Waiting for", "Attention", "Budget"]) {
 		const line = text.split("\n").find((line) => line.startsWith(`│ ${label}:`))!;
 		assert.ok(line, label);
 		assert.match(line.slice(2, 15), new RegExp(`^${label}: +$`, "u"));
@@ -432,16 +429,16 @@ test("short terminals drop selected details before list rows in Members and Task
 	const { host } = fixture();
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right"); ui.key("right");
-	assert.match(ui.text(100), /Task: Ship the local Team popup/u);
+	ui.key("right");
+	assert.match(ui.text(100), /lead · Ship the local Team popup/u);
 	ui.tui.terminal.rows = 18;
-	assert.doesNotMatch(ui.text(100), /Task:|Route:|Latest result:/u);
-	assert.equal(ui.component.render(100).filter((line) => /[○▶⧗⏸] (lead|runner|waiter|held)/u.test(line)).length, 4);
+	assert.doesNotMatch(ui.text(100), /Latest result:/u);
+	assert.ok(ui.component.render(100).filter((line) => /[○▶⧗⏸] (lead|runner|waiter|held)/u.test(line)).length >= 1);
 	ui.key("right");
 	assert.doesNotMatch(ui.text(100), /Task:|From:|resultRef:/u);
-	assert.equal(ui.component.render(100).filter((line) => /[▶⧗○⏸] work:/u.test(line)).length, 4);
+	assert.equal(ui.component.render(100).filter((line) => /[▶⧗○⏸] (Implement|Review|Check)/u.test(line)).length, 4);
 	ui.tui.terminal.rows = 40;
-	assert.match(ui.text(100), /Task: Implement the popup/u);
+	assert.match(ui.text(100), /Implement the popup · lead → runner/u);
 });
 
 test("Timeline cursor uses aligned time, pages, Home/End, and follows only at newest", (t) => {
@@ -450,7 +447,7 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 	facts.timeline = Array.from({ length: 20 }, (_, index) => ({ at: index * 60_000, text: `milestone ${index}` }));
 	facts.timelineOmitted = 3;
 	host.runtime.panelFacts = () => facts;
-	const ui = overlay(host, { rows: 22 }); // Three help rows leave an 8-row Timeline page.
+	const ui = overlay(host, { rows: 22 }); // A short terminal leaves ten Timeline rows.
 	t.after(() => ui.component.dispose());
 	ui.key("left"); ui.key("left");
 	const cursor = () => ui.component.render(100).find((line) => line.startsWith("│ →"))!;
@@ -462,7 +459,7 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 	facts.timeline.push({ at: 21 * 60_000, text: "milestone 21" });
 	assert.match(cursor(), /19:00  milestone 19/u);
 	ui.key("pageUp");
-	assert.match(cursor(), /11:00  milestone 11/u);
+	assert.match(cursor(), /9:00  milestone 9/u);
 	ui.key("home");
 	assert.match(cursor(), /0:00  milestone 0/u);
 	assert.match(ui.text(100), /… 3 earlier milestones omitted …/u);
@@ -470,13 +467,13 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 	ui.key("down");
 	assert.match(cursor(), /1:00  milestone 1/u);
 	ui.key("pageDown");
-	assert.match(cursor(), /9:00  milestone 9/u);
+	assert.match(cursor(), /11:00  milestone 11/u);
 	ui.key("down");
 	assert.equal(cursor().indexOf("milestone"), first);
 	// Dropping older retained entries must not move a cursor to a different milestone.
 	facts.timeline.splice(1, 2);
 	facts.timelineOmitted += 2;
-	assert.match(cursor(), /10:00  milestone 10/u);
+	assert.match(cursor(), /12:00  milestone 12/u);
 	ui.key("end");
 	assert.match(cursor(), /21:00  milestone 21/u);
 	facts.timeline.push({ at: 22 * 60_000, text: "milestone 22" });
@@ -488,8 +485,8 @@ test("arrows switch views, brackets switch Teams, and configurable select keys a
 	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: [], results: [], finalResultRefs: [], at: 1 });
 	const ui = overlay(host, { bindings: { "tui.select.up": "k", "tui.select.down": "j", "tui.select.confirm": "e", "tui.select.cancel": "q" } });
 	t.after(() => ui.component.dispose());
-	ui.key("right"); ui.key("right");
-	assert.match(ui.text(), /\[Members\]/u);
+	ui.key("right");
+	assert.match(ui.text(), /\[Progress\]/u);
 	assert.match(ui.text(), /‹ 1\/2 ›/u);
 	ui.component.handleInput("j");
 	assert.match(ui.text(), /→ ▶ runner/u);
@@ -499,7 +496,7 @@ test("arrows switch views, brackets switch Teams, and configurable select keys a
 	assert.doesNotMatch(ui.text(), /Member runner · Esc back/u);
 	ui.component.handleInput("j"); ui.text(); ui.component.handleInput("k");
 	assert.match(ui.text(), /→ ○ lead/u);
-	ui.key("left"); ui.key("left");
+	ui.key("left");
 	assert.match(ui.text(), /\[Overview\]/u);
 	ui.key("backTab");
 	assert.match(ui.text(), /\[Teams\]/u);
@@ -508,7 +505,7 @@ test("arrows switch views, brackets switch Teams, and configurable select keys a
 	ui.key("tab"); ui.key("tab");
 	assert.match(ui.text(), /\[Overview\]/u);
 	ui.component.handleInput("]");
-	assert.match(ui.text(), /‹ 2\/2 › history/u);
+	assert.match(ui.text(), /‹ 2\/2 ›/u);
 	assert.match(ui.text(), /\[Overview\]/u);
 	ui.component.handleInput("[");
 	assert.match(ui.text(), /‹ 1\/2 ›/u);
@@ -528,14 +525,14 @@ test("Members state shows lifecycle, error and pause instead of idle", (t) => {
 				: member) })) as ReturnType<typeof original>;
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right"); ui.key("right");
+	ui.key("right");
 	const text = ui.text();
 	assert.match(text, /✗ runner\s+faulted · .*model_error: Provider failed/u);
 	assert.match(text, /✓ waiter\s+closed/u);
 	assert.doesNotMatch(text, /(runner|waiter)\s+idle/u);
 });
 
-test("Timeline pages use the available height instead of eight rows", (t) => {
+test("Timeline is a fixed 12-row pane even on a tall terminal", (t) => {
 	const { host } = fixture();
 	const facts = host.runtime.panelFacts(host.runtime.listTeams()[0]!.teamId);
 	facts.timeline = Array.from({ length: 40 }, (_, index) => ({ at: index * 1000, text: `milestone ${index}` }));
@@ -545,7 +542,7 @@ test("Timeline pages use the available height instead of eight rows", (t) => {
 	ui.key("left"); ui.key("left");
 	const shown = () => ui.component.render(100).filter((line) => /milestone \d+/u.test(line)).length;
 	const page = shown();
-	assert.ok(page > 8, `shown ${page}`);
+	assert.equal(page, 12);
 	ui.key("pageUp");
 	assert.match(ui.component.render(100).find((line) => line.startsWith("│ →"))!, new RegExp(`milestone ${39 - page}\\b`, "u"));
 });
@@ -580,17 +577,17 @@ function withReviews(host: TeamSessionHost, teamId: string, reviews: TeamReviewR
 	return teamId;
 }
 
-test("Progress shows the live snapshot, the schedule and reviews newest first with verdict colours", (t) => {
+test("Overview opens reviews newest first with schedule and verdict colours", (t) => {
 	const { host, teamId, now } = fixture();
 	withReviews(host, teamId, [reviewRecord("a1", 5, "on_track"), reviewRecord("b2", 10, "at_risk"), reviewRecord("c3", 15, "off_track"), reviewRecord("d4", 20, undefined, { summary: "Plain note." })], now() + 150_000);
 	const tagged = taggingTheme();
 	const ui = overlay(host, { theme: tagged.theme, now });
 	t.after(() => ui.component.dispose());
-	ui.key("right");
-	const text = stripTerminalSequences(ui.text(120));
-	assert.match(text, /\[Progress\]/u);
-	assert.match(text, /Elapsed \d+:\d\d · works 0\/4 finished · 1 running · 2 waiting · 1 held · 0 finished since last review/u);
-	assert.match(text, /Review: waiter every 5 min · next in 3m/u);
+	assert.match(stripTerminalSequences(ui.text(POPUP_WIDTH)), /4 reviews · 2 at risk · next in 3m/u);
+	ui.key("enter");
+	const text = stripTerminalSequences(ui.text(POPUP_WIDTH));
+	assert.match(text, /\[Overview\]/u);
+	assert.match(text, /Reviews · 4 · waiter every 5 min · next in 3m/u);
 	assert.doesNotMatch(text, /Budget\s+activations|█/u, "the Overview's budget bars are not repeated here");
 	const rows = text.split("\n").filter((line) => /\d+:\d\d  waiter  /u.test(line)).map((line) => line.replace(/^│\s+(→\s)?/u, "").replace(/\s*│$/u, ""));
 	assert.deepEqual(rows.map((row) => row.replace(/\s+/gu, " ")), ["20:00 waiter no verdict Plain note.", "15:00 waiter off track Review c3 summary.", "10:00 waiter at risk Review b2 summary.", "5:00 waiter on track Review a1 summary."]);
@@ -599,22 +596,19 @@ test("Progress shows the live snapshot, the schedule and reviews newest first wi
 	}
 });
 
-test("Progress selection shows details and Enter opens the full review", (t) => {
+test("Overview review sub-page selection shows summary/snapshot and Enter opens the full review", (t) => {
 	const { host, teamId } = fixture();
 	withReviews(host, teamId, [reviewRecord("a1", 5, "on_track"), reviewRecord("b2", 10, "at_risk", {
 		summary: "AT RISK: Two works wait.\nSecond summary line.", findings: ["held work blocks the lead", "no result for runner"], limitations: ["no tool output inspected"] })]);
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right"); ui.text();
-	assert.match(ui.text(100), /→\s+10:00  waiter  at risk\s+Two works wait\./u);
-	assert.match(ui.text(100), /review:b2 · waiter · at risk/u);
-	assert.match(ui.text(100), /Findings: held work blocks the lead · no result for runner/u);
-	assert.match(ui.text(100), /Limitations: no tool output inspected/u);
-	assert.match(ui.text(100), /Snapshot: 10:00 · 1 finished since last review/u);
-	assert.match(ui.text(100), /Works: 0\/4 resolved · 1 running · 1 blocked · 1 held · 0 failed · 0 cancelled/u);
+	ui.key("enter"); ui.text();
+	assert.match(ui.text(POPUP_WIDTH), /→\s+10:00  waiter  at risk\s+Two works wait\./u);
+	assert.match(ui.text(POPUP_WIDTH), /10:00 · waiter · at risk/u);
+	assert.match(ui.text(POPUP_WIDTH), /Summary: Two works wait\./u);
+	assert.match(ui.text(POPUP_WIDTH), /Snapshot: works 0\/4 resolved · 1 running · 1 held · 0 failed/u);
 	ui.key("down");
-	assert.match(ui.text(100), /review:a1 · waiter · on track/u);
-	assert.match(ui.text(100), /Findings: none/u);
+	assert.match(ui.text(POPUP_WIDTH), /5:00 · waiter · on track/u);
 	ui.key("up"); ui.key("enter");
 	const detail = ui.text(100);
 	assert.match(detail, /Review review:b2 · Esc back/u);
@@ -624,22 +618,26 @@ test("Progress selection shows details and Enter opens the full review", (t) => 
 	assert.match(detail, /Budget: teamActivations 5\/100 · teamToolCalls 9\/unlimited/u);
 	assert.doesNotMatch(detail, /Review: waiter every/u);
 	ui.key("escape");
-	assert.match(ui.text(100), /Review: waiter every 5 min/u);
-	assert.match(ui.text(100), /→\s+10:00  waiter  at risk/u);
+	assert.match(ui.text(POPUP_WIDTH), /Reviews · 2 · waiter every 5 min/u);
+	assert.match(ui.text(POPUP_WIDTH), /→\s+10:00  waiter  at risk/u);
+	ui.key("escape");
+	assert.match(ui.text(POPUP_WIDTH), /→Review:/u);
+	assert.doesNotMatch(ui.text(POPUP_WIDTH), /Reviews · 2/u);
 });
 
-test("Progress without reviews says so, and Review: off when none is scheduled", (t) => {
+test("Overview Review off still opens an empty review sub-page", (t) => {
 	const { host, teamId } = fixture();
 	host.runtime.setReview(teamId, null);
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right");
-	const text = ui.text(100);
-	assert.match(text, /Review: off/u);
+	assert.match(ui.text(POPUP_WIDTH), /→Review:\s+off/u);
+	ui.key("enter");
+	const text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Reviews · 0 · off/u);
 	assert.match(text, /No reviews yet/u);
 	assert.doesNotMatch(text, /│ →/u);
 	ui.key("enter"); ui.key("down");
-	assert.doesNotMatch(ui.text(100), /Esc back/u);
+	assert.doesNotMatch(ui.text(POPUP_WIDTH), /Esc back/u);
 });
 
 test("closed Teams from history show their recorded reviews and schedule", (t) => {
@@ -649,39 +647,38 @@ test("closed Teams from history show their recorded reviews and schedule", (t) =
 		{ teamId: "bare", version: 2, lifecycle: "closed", lead: "lead", members: ["lead"], results: [], finalResultRefs: [], at: 0 });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right");
-	ui.component.handleInput("]");
-	let text = ui.text(100);
-	assert.match(text, /‹ 2\/3 › old/u);
-	assert.match(text, /Review: waiter every 10 min/u);
+	ui.component.handleInput("]"); ui.text(); ui.key("enter");
+	let text = ui.text(POPUP_WIDTH);
+	assert.match(text, /‹ 2\/3 ›/u);
+	assert.match(text, /Reviews · 2 · waiter every 10 min/u);
 	assert.doesNotMatch(text, /next in|Elapsed|Budget {2}/u);
 	assert.match(text, /→\s+20:00  waiter  off track\s+Review h2 summary\./u);
 	assert.match(text, /10:00  waiter  on track/u);
 	ui.key("enter");
 	assert.match(ui.text(100), /Review review:h2 · Esc back/u);
-	ui.key("escape");
-	ui.component.handleInput("]");
-	text = ui.text(100);
-	assert.match(text, /Review: off/u);
+	ui.key("escape"); ui.key("escape");
+	ui.component.handleInput("]"); ui.text(); ui.key("enter");
+	text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Reviews · 0 · off/u);
 	assert.match(text, /No reviews yet/u);
-	ui.key("tab");
-	assert.match(ui.text(100), /Team bare · CLOSED/u);
+	ui.key("escape");
+	assert.match(ui.text(POPUP_WIDTH), /Team:\s+not retained · bare/u);
 });
 
-test("Progress fits widths 60/80/120 and short terminals", () => {
+test("review sub-page fits widths 60/80/120 and short terminals", () => {
 	const { host, teamId } = fixture();
 	const long = "x".repeat(300);
 	withReviews(host, teamId, Array.from({ length: 12 }, (_, index) => reviewRecord(String(index), index * 7, (["on_track", "at_risk", "off_track", undefined] as const)[index % 4], { by: index % 2 ? "a-very-long-reviewer-alias" : "waiter", summary: `AT RISK: ${long}`, findings: [long], limitations: [long] })), Date.now() + 60_000);
 	for (const rows of [40, 18, 14]) {
 		const ui = overlay(host, { rows });
-		ui.key("right");
+		ui.key("enter");
 		for (const width of [60, 80, 120]) {
 			for (let step = 0; step < 3; step++) {
 				const lines = ui.component.render(width);
 				assert.ok(lines.every((line) => visibleWidth(line) === width), `${rows}x${width}`);
 				assert.ok(lines.length <= Math.floor(rows * 0.88), `${rows}x${width}: ${lines.length}`);
 				// Below 100 columns the wrapped help rows take the room the snapshot block yields to the list.
-				if (rows >= 18 && width >= 100) assert.match(lines.join("\n"), /Review: waiter every 5 min/u);
+				if (rows >= 18 && width >= 100) assert.match(lines.join("\n"), /Reviews · 12 · waiter every 5 min/u);
 				ui.key("down");
 			}
 			ui.key("home");
@@ -705,7 +702,7 @@ test("review works do not count in the Overview progress", (t) => {
 const POPUP_WIDTH = 73;
 
 test("Teams is the first view; Enter opens the selected Team and Escape returns before closing", (t) => {
-	const { host, teamId } = fixture();
+	const { host } = fixture();
 	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: ["lead", "worker"], goal: "Past work", results: [], finalResultRefs: [], at: 1 });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
@@ -714,11 +711,11 @@ test("Teams is the first view; Enter opens the selected Team and Escape returns 
 	let lines = ui.component.render(POPUP_WIDTH);
 	assert.match(lines.join("\n"), /\[Teams\]/u);
 	assert.deepEqual(ui.closed, []);
-	assert.match(lines.join("\n"), /↑↓ select · enter open · space mark · d delete · esc close/u);
-	assert.ok(lines.findIndex((line) => line.includes(`▶ ${teamId}`)) < lines.findIndex((line) => line.includes("✓ history")));
+	assert.match(lines.join("\n"), /↑↓ select · enter open · n rename · space mark · d delete · esc close/u);
+	assert.ok(lines.findIndex((line) => line.includes("▶ Ship the")) < lines.findIndex((line) => line.includes("✓ Past work")));
 	ui.key("down"); ui.text(); ui.key("enter");
-	assert.match(ui.text(POPUP_WIDTH), /Team history · CLOSED/u);
-	assert.match(ui.text(POPUP_WIDTH), /Goal: Past work/u);
+	assert.match(ui.text(POPUP_WIDTH), /Team:\s+Past work · history/u);
+	assert.match(ui.text(POPUP_WIDTH), /Goal:\s+Past work/u);
 	ui.key("escape");
 	lines = ui.component.render(POPUP_WIDTH);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
@@ -731,7 +728,7 @@ test("every selected tab stays visible beside the Team selector at popup width",
 	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: [], results: [], finalResultRefs: [], at: 1 });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	for (const tab of ["Overview", "Progress", "Members", "Tasks", "Timeline", "Teams"]) {
+	for (const tab of ["Overview", "Progress", "Tasks", "Timeline", "Teams"]) {
 		const lines = ui.component.render(POPUP_WIDTH);
 		assert.ok(stripTerminalSequences(lines[1]!).includes(`[${tab}]`));
 		assert.match(stripTerminalSequences(lines[1]!), /‹ 1\/2 ›/u);
@@ -749,7 +746,7 @@ test("without an active Team multiple Teams start in Teams, but one Team starts 
 		assert.match(ui.text(POPUP_WIDTH), count === 1 ? /\[Overview\]/u : /\[Teams\]/u);
 		if (count === 2) {
 			const rows = ui.component.render(POPUP_WIDTH);
-			assert.ok(rows.findIndex((line) => line.includes("✓ history1")) < rows.findIndex((line) => line.includes("✓ history0")));
+			assert.ok(rows.findIndex((line) => /✓ Historical work\s+history1/u.test(line)) < rows.findIndex((line) => /✓ Historical work\s+history0/u.test(line)));
 		}
 	}
 });
@@ -761,16 +758,16 @@ test("space marks only the selected Teams row and brackets move the Teams cursor
 	t.after(() => ui.component.dispose());
 	ui.key("escape"); ui.text();
 	ui.component.handleInput(" ");
-	assert.match(ui.text(POPUP_WIDTH), new RegExp(`→ \\* ${teamId} +ACTIVE`, "u"));
+	assert.match(ui.text(POPUP_WIDTH), new RegExp(`→ \\* Ship.*${teamId} +ACTIVE`, "u"));
 	ui.component.handleInput("]"); ui.text();
-	assert.match(ui.text(POPUP_WIDTH), /→ ✗ history/u);
+	assert.match(ui.text(POPUP_WIDTH), /→ ✗ not retained\s+history/u);
 	ui.component.handleInput(" ");
-	assert.match(ui.text(POPUP_WIDTH), /→ \* history/u);
+	assert.match(ui.text(POPUP_WIDTH), /→ \* not retained\s+history/u);
 	ui.component.handleInput(" ");
-	assert.match(ui.text(POPUP_WIDTH), /→ ✗ history/u);
+	assert.match(ui.text(POPUP_WIDTH), /→ ✗ not retained\s+history/u);
 });
 
-test("Teams rows retain lifecycle, outcome, duration, member/root counts, start time and a truncated goal at 73 columns", (t) => {
+test("Teams rows lead with title and short ID, retain lifecycle/outcome/time/date and move members/roots/goal to details at 73 columns", (t) => {
 	const { host, teamId } = fixture();
 	const team = host.runtime.getTeam(teamId);
 	team.brief.goal = "Ship this long goal " + "details ".repeat(30);
@@ -783,9 +780,11 @@ test("Teams rows retain lifecycle, outcome, duration, member/root counts, start 
 	t.after(() => ui.component.dispose());
 	const lines = ui.component.render(POPUP_WIDTH);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
-	const row = lines.map(stripTerminalSequences).find((line) => line.includes(`✓ ${teamId}`))!;
-	assert.match(row, /CLOSED partial \d+:\d\d 4m roots 0\/3 \d\d-\d\d \d\d:\d\d Ship/u);
-	assert.match(row, /\.\.\./u);
+	const row = lines.map(stripTerminalSequences).find((line) => line.includes(`${teamId}     `))!;
+	assert.match(row, /✓ Ship.*id1\s+CLOSED partial\s+\d+:\d\d\s+\d\d-\d\d/u);
+	assert.doesNotMatch(row, /members|roots/u);
+	assert.match(lines.join("\n"), /4 members · roots 0\/3 accepted/u);
+	assert.match(lines.join("\n"), /Ship this long goal.*\.\.\./u);
 	assert.ok(tagged.calls.some((call) => call.color === "success" && call.text === "✓"));
 	assert.ok(tagged.calls.some((call) => call.color === "error" && call.text === "✗"));
 });
@@ -822,19 +821,19 @@ test("history Overview and Teams rows show terminal tokens, flow, roots and star
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	let lines = ui.component.render(POPUP_WIDTH);
-	assert.match(lines.join("\n"), /Started:/u);
-	assert.match(lines.join("\n"), /Ended:.*duration 5:00/u);
-	assert.match(lines.join("\n"), /Tokens: input 123 · output 45 · cache 67\/89/u);
-	assert.match(lines.join("\n"), /Flow: workers avg 1\.2 · only lead 25%/u);
-	assert.match(lines.join("\n"), /Roots: 2\/3 accepted · 1 waived/u);
+	assert.match(lines.join("\n"), /Time:\s+5:00/u);
+	assert.match(lines.join("\n"), /Tokens:\s+in 123 · out 45 · cache 67\/89/u);
+	assert.match(lines.join("\n"), /Roots:\s+2\/3 accepted · 1 waived/u);
+	ui.key("right");
+	assert.match(ui.text(POPUP_WIDTH), /workers avg 1\.2 · only lead 25%/u);
 	ui.key("escape");
 	lines = ui.component.render(POPUP_WIDTH);
-	assert.match(lines.join("\n"), /CLOSED ok 5:00 2 members roots 2\/3 \d\d-\d\d \d\d:\d\d Hist/u);
+	assert.match(lines.join("\n"), /✓ Historic goal\s+historic CLOSED ok\s+5:00\s+\d\d-\d\d/u);
+	assert.match(lines.join("\n"), /2 members · roots 2\/3 accepted/u);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
 	host.history.teams.push({ teamId: "legacy", version: 1, lifecycle: "completed", members: [], results: [], finalResultRefs: [], at: 1 });
 	ui.component.handleInput("]"); ui.text(); ui.key("enter");
-	assert.match(ui.text(POPUP_WIDTH), /Started: not retained/u);
-	assert.match(ui.text(POPUP_WIDTH), /duration not retained/u);
+	assert.match(ui.text(POPUP_WIDTH), /Time:\s+not retained/u);
 	assert.doesNotMatch(ui.text(POPUP_WIDTH), /Tokens:|Roots:/u);
 });
 
@@ -855,13 +854,15 @@ test("history Members cache verified saved-session models/sizes, final lifecycle
 	host.memberSessions = (teamId, aliases) => loaded = original(teamId, aliases);
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
-	ui.key("right"); ui.key("right");
+	ui.key("right");
 	assert.match(ui.text(POPUP_WIDTH), /checking session/u);
 	const before = ui.renders();
 	await loaded; await Promise.resolve();
-	const text = ui.text(POPUP_WIDTH);
+	let text = ui.text(POPUP_WIDTH);
 	assert.match(text, /lead · closed · 1 results · local\/fake · 24 B/u);
+	ui.key("down"); text = ui.text(POPUP_WIDTH);
 	assert.match(text, /gone · faulted · 0 results · session deleted/u);
+	ui.key("down"); text = ui.text(POPUP_WIDTH);
 	assert.match(text, /reused · closed · 0 results · session deleted/u);
 	assert.ok(ui.renders() > before, "the lookup completion refreshes the popup");
 	assert.equal(lookups, 1, "subsequent renders reuse the resolved sessions");
@@ -870,45 +871,35 @@ test("history Members cache verified saved-session models/sizes, final lifecycle
 	for (const line of ui.component.render(POPUP_WIDTH)) assert.equal(visibleWidth(line), POPUP_WIDTH);
 });
 /** The action keys wrapped by whole keys at the popup width. */
-const ACTION_HELP = ["p pause · c cancel · r resume hold · g grant · m message · v revive", "l new lead · z compact · t compact at 80%"];
+const ACTION_HELP = ["p pause · c cancel · r resume hold · g grant · m message · v revive", "l new lead · z compact · t compact at 80% · d delete"];
 /** The text of each popup row, without the frame and its leading space. */
 const rowsOf = (lines: string[]) => lines.map((line) => stripTerminalSequences(line).slice(2, -1).trimEnd());
-/** The row starting with `label` and the rows that continue it: indented under a label, or up to the next blank row for an unlabeled wrap. */
-const rowBlock = (lines: string[], label: string, indented = true) => {
-	const rows = rowsOf(lines);
-	const start = rows.findIndex((row) => row.startsWith(label));
-	assert.ok(start >= 0, label);
-	const rest = rows.slice(start + 1);
-	const end = rest.findIndex((row) => indented ? !/^ {8}\S/u.test(row) : row === "");
-	return rows.slice(start, start + 1 + (end < 0 ? rest.length : end)).map((row) => row.trim()).join(" ");
-};
 /** The help rows: everything between the last blank row and the bottom border, without the lead-decision notice above them. */
 const helpOf = (lines: string[]) => {
 	const rows = rowsOf(lines).slice(0, -1);
 	return rows.slice(rows.lastIndexOf("") + 1).filter((row) => !row.startsWith("Waiting for:"));
 };
 
-test("Overview shows the full Team ID, and every popup action key is named on its own help row that fits the 73-column popup", (t) => {
+test("Overview shows title/short ID, and action keys fit whole help rows at 73 columns", (t) => {
 	const { host, teamId } = fixture();
 	host.runtime.prepare({ members: [{ alias: "a", roleDescription: "A." }, { alias: "b", roleDescription: "B." }], lead: "a", brief: { goal: "Second Team." }, timeoutSeconds: null });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	const lines = ui.component.render(POPUP_WIDTH);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
-	assert.match(stripTerminalSequences(lines.join("\n")), new RegExp(`Team:\\s+${teamId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u"));
-	assert.deepEqual(helpOf(lines), ["↑↓ scroll · ←→/tab views · [ ] teams · d delete · esc teams", ...ACTION_HELP],
+	assert.match(stripTerminalSequences(lines.join("\n")), new RegExp(`Team:\\s+Ship.* · ${teamId}`, "u"));
+	assert.deepEqual(helpOf(lines), ["↑↓ scroll · enter reviews · n rename · ←→/tab views · esc teams", ...ACTION_HELP],
 		"navigation and the actions on whole rows, no key cut");
 	for (const row of ACTION_HELP) assert.ok(row.length <= POPUP_WIDTH - 3, row);
 	// Wider hints wrap instead of being cut, and stay dim.
 	const tagged = taggingTheme();
-	for (const [tab, navigation] of [[2, "↑↓ select · enter details · ←→/tab views · [ ] teams · d delete · esc teams"], [4, "↑↓ cursor · pgup/dn page · home/end · ←→/tab views · [ ] teams · d delete · esc teams"]] as const) {
+	for (const [tab, navigation] of [[1, "↑↓ select · enter details · z compact · ←→/tab views · esc teams"], [3, "↑↓ cursor · pgup/dn page · home/end · ←→/tab views · esc teams"]] as const) {
 		const popup = overlay(host, { theme: tagged.theme });
 		for (let index = 0; index < tab; index++) popup.component.handleInput("\t");
 		tagged.calls.length = 0;
 		const rendered = popup.component.render(POPUP_WIDTH);
 		const help = helpOf(rendered);
-		assert.equal(help.slice(0, -2).join(" "), navigation, `tab ${tab}: the navigation hint is whole`);
-		assert.deepEqual(help.slice(-2), ACTION_HELP);
+		assert.equal(help.join(" "), navigation, `tab ${tab}: the navigation hint is whole`);
 		for (const row of help) assert.ok(tagged.calls.some((call) => call.color === "dim" && call.text === row), `dim: ${row}`);
 		for (const line of rendered) assert.equal(visibleWidth(line), POPUP_WIDTH);
 		popup.component.dispose();
@@ -936,7 +927,7 @@ test("a paused Team shows PAUSED in the summary and Overview; p pauses a running
 	assert.match(paused.text(), /Waiting for:\s+Paused by the host/u);
 	const lines = paused.component.render(POPUP_WIDTH);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
-	assert.deepEqual(helpOf(lines).slice(-2), ["p continue · c cancel · r resume hold · g grant · m message · v revive", "l new lead · z compact · t compact at 80%"]);
+	assert.deepEqual(helpOf(lines).slice(-2), ["p continue · c cancel · r resume hold · g grant · m message · v revive", "l new lead · z compact · t compact at 80% · d delete"]);
 	paused.component.handleInput("p");
 	assert.deepEqual(paused.closed, [{ teamId, action: "continue" }]);
 	host.runtime.cancelTeam(teamId, "done");
@@ -953,46 +944,22 @@ const FLOW_STATS: TeamFlowStats = {
 	pendingEvents: 2, tokensPerWork: 1_100_000, context: { member: "reviewer", tokens: 151_000 }, warn: { lead: false, queue: false, waits: false, cost: false },
 };
 
-test("Progress shows the Budget line only from 80%, the five flow rows and the legend, wrapped without truncation in the 73-column popup", (t) => {
+test("Progress shows Σ Team and lead shares without always-on flow rows, legend or budget", (t) => {
 	const { host, teamId } = fixture();
 	host.runtime.flowStats = () => FLOW_STATS;
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	ui.key("right");
-	let lines = ui.component.render(POPUP_WIDTH);
-	assert.doesNotMatch(lines.join("\n"), /Budget/u, "nothing below 80%");
-	const rows = rowsOf(lines);
-	const single = (label: string) => assert.ok(!/^ {8}\S/u.test(rows[rows.findIndex((row) => row.startsWith(label)) + 1]!), `${label} fits one line`);
-	assert.equal(rowBlock(lines, "Flow "), "Flow    workers avg 1.6 (last 10m 2.3) · all 4 slots busy 6%");
-	assert.equal(rowBlock(lines, "Lead "), "Lead    busy 41% · only lead 18% · accept p50 50s · p90 3.0m · 2 pending");
-	assert.equal(rowBlock(lines, "Queue "), "Queue   start p50 0s · p90 1.2m · 2 queued, oldest 3.0m (slots full)");
-	assert.equal(rowBlock(lines, "Waits "), "Waits   p50 40s · p90 6.0m · most: fix-test 9× 42m · fix-scroll 4× 10m");
-	assert.equal(rowBlock(lines, "Cost "), "Cost    1.1M tokens/finished work · largest context reviewer 151k");
-	assert.equal(rowBlock(lines, "Warn:", false), "Warn: only lead >25% · start p90 >2m, oldest >5m · top waited >50% · context >200k", "the legend wraps whole");
-	for (const label of ["Flow ", "Queue ", "Waits ", "Cost "]) single(label);
-	const order = ["Flow ", "Lead ", "Queue ", "Waits ", "Cost ", "Warn:"].map((label) => rows.findIndex((row) => row.startsWith(label)));
-	assert.deepEqual([...order].sort((x, y) => x - y), order, "in the requested order");
+	const lines = ui.component.render(POPUP_WIDTH);
+	assert.match(lines.join("\n"), /Σ Team 42:00 · 1 running · 1 waiting · 1 idle · workers avg 1.6/u);
+	assert.match(lines.join("\n"), /in 0 · out 0 · cache 0 · lead busy 41% · only lead 18%/u);
+	assert.doesNotMatch(lines.join("\n"), /Budget|Warn:|⚠|Flow|Queue|Waits|Cost/u);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
-	// Worst-case values wrap cleanly: every value is still there and nothing is cut.
-	host.runtime.flowStats = () => ({ ...FLOW_STATS, workersAvg: 3.9, workersRecent: 3.9, allSlotsShare: 1, leadBusyShare: 1, onlyLeadShare: 1, acceptP50: 125 * 60_000, acceptP90: 125 * 60_000, pendingEvents: 100,
-		queued: { count: 100, oldestMs: 125 * 60_000, reason: "member busy" }, startP50: 59_000, startP90: 9.9 * 60_000, waitP50: 59_000, waitP90: 125 * 60_000,
-		waited: [{ member: "fix-test", count: 99, ms: 125 * 60_000 }, { member: "fix-scroll", count: 99, ms: 125 * 60_000 }, { member: "third", count: 1, ms: 1 }], tokensPerWork: 999_999_999 });
-	lines = ui.component.render(POPUP_WIDTH);
-	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
-	assert.doesNotMatch(lines.join("\n"), /…/u);
-	assert.equal(rowBlock(lines, "Flow "), "Flow    workers avg 3.9 (last 10m 3.9) · all 4 slots busy 100%");
-	assert.equal(rowBlock(lines, "Lead "), "Lead    busy 100% · only lead 100% · accept p50 125m · p90 125m · 100 pending");
-	assert.equal(rowBlock(lines, "Queue "), "Queue   start p50 59s · p90 9.9m · 100 queued, oldest 125m (member busy)");
-	assert.equal(rowBlock(lines, "Waits "), "Waits   p50 59s · p90 125m · most: fix-test 99× 125m · fix-scroll 99× 125m");
-	assert.equal(rowBlock(lines, "Cost "), "Cost    1000M tokens/finished work · largest context reviewer 151k");
-	assert.ok(rowsOf(lines).some((row) => /^ {8}\S/u.test(row)), "a row too wide for the popup continues under its text");
 	const budget = host.runtime.inspectBudget(teamId);
-	Object.assign(budget.used, { teamModelRequests: 85, teamActivations: 70 });
-	Object.assign(budget.limits, { teamModelRequests: 100, teamActivations: 100, teamToolCalls: 1_000_000_000 });
+	Object.assign(budget.used, { teamModelRequests: 85 });
+	Object.assign(budget.limits, { teamModelRequests: 100 });
 	host.runtime.inspectBudget = () => budget;
-	const text = stripTerminalSequences(ui.text(POPUP_WIDTH));
-	assert.match(text, /^│ Budget 85% \(model requests\)/mu, "the highest counter only");
-	assert.doesNotMatch(text, /Budget {2}|░/u);
+	assert.doesNotMatch(ui.text(POPUP_WIDTH), /Budget|░/u);
 });
 
 test("a crossed flow threshold colors only its row warning", (t) => {
@@ -1005,27 +972,26 @@ test("a crossed flow threshold colors only its row warning", (t) => {
 		host.runtime.flowStats = () => stats;
 		tagged.calls.length = 0;
 		ui.text(120);
-		return tagged.calls.filter((call) => call.color === "warning" && /^(Flow|Queue|Waits|Lead|Cost) /u.test(call.text)).map((call) => call.text.slice(0, 5).trim());
+		return tagged.calls.filter((call) => call.color === "warning" && /^⚠ (Queue|Waits|Lead|Cost) /u.test(call.text)).map((call) => call.text.split(" ")[1]);
 	};
 	assert.deepEqual(colored(FLOW_STATS), []);
 	assert.deepEqual(colored({ ...FLOW_STATS, warn: { lead: true, queue: true, waits: true, cost: true } }), ["Lead", "Queue", "Waits", "Cost"], "the Flow row has no threshold");
 	assert.deepEqual(colored({ ...FLOW_STATS, warn: { ...FLOW_STATS.warn, lead: true } }), ["Lead"], "the Lead row carries the only-lead warning");
 	assert.deepEqual(colored({ ...FLOW_STATS, warn: { ...FLOW_STATS.warn, waits: true } }), ["Waits"]);
-	assert.ok(tagged.calls.some((call) => call.color === "dim" && call.text.startsWith("Warn:")), "the legend is dim");
+	assert.ok(!tagged.calls.some((call) => call.text.startsWith("Warn:")), "the legend is removed");
 });
 
-test("without data (a Team not launched yet) the flow rows show —", (t) => {
+test("before launch Progress shows zero time/usage and unknown worker/lead shares", (t) => {
 	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => "x" });
 	host.runtime.prepare({ members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "w", roleDescription: "Work." }], lead: "lead", brief: { goal: "Idle." }, timeoutSeconds: null });
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	ui.key("right");
 	const text = stripTerminalSequences(ui.text(120));
-	assert.match(text, /Flow {4}workers avg — \(last 10m —\) · all 4 slots busy —/u);
-	assert.match(text, /Lead {4}busy — · only lead — · accept p50 — · p90 — · 0 pending/u);
-	assert.match(text, /Queue {3}start p50 — · p90 — · none queued/u);
-	assert.match(text, /Waits {3}p50 — · p90 — · most: —/u);
-	assert.match(text, /Cost {4}— tokens\/finished work · largest context —/u);
+	assert.match(text, /Σ Team 0:00.*workers avg —/u);
+	assert.match(text, /in 0 · out 0 · cache 0 · lead busy — · only lead —/u);
+	assert.match(text, /active 0:00 · busy 0% · in 0 · out 0 · cache 0/u);
+	assert.doesNotMatch(text, /⚠|Warn:/u);
 });
 
 test("a history Team shows its stored flow summary, and omits the flow rows without one", (t) => {
@@ -1038,13 +1004,348 @@ test("a history Team shows its stored flow summary, and omits the flow rows with
 	ui.key("right");
 	ui.component.handleInput("]");
 	let text = stripTerminalSequences(ui.text(120));
-	assert.match(text, /with-flo/u);
-	assert.match(text, /Flow {4}workers avg 1\.2 · only lead 25% · start delay p90 19s · waits p90 4\.5m · most waited: rpc 26×/u);
+	assert.match(text, /workers avg 1\.2 · only lead 25%/u);
 	assert.doesNotMatch(text, /Queue {3}|Warn:/u);
 	ui.component.handleInput("]");
 	text = stripTerminalSequences(ui.text(120));
-	assert.match(text, /no-flow/u);
-	assert.doesNotMatch(text, /Flow {4}/u);
+	assert.doesNotMatch(text, /workers avg|Flow {4}/u);
+});
+
+test("Overview formats live title, active/wall/pause time and compact usage, with one budget row for unlimited counters", (t) => {
+	const { host, teamId } = fixture();
+	host.runtime.renameTeam(teamId, "MiniCore release");
+	host.runtime.teamTime = () => ({ activeMs: 6_595_000, wallMs: 6_775_000, pausedMs: 180_000, startedAt: 0 });
+	const team = host.runtime.getTeam(teamId);
+	team.usage = { ...team.usage, input: 4_190_000, output: 352_000, cacheRead: 155_800_000 };
+	host.runtime.listTeams = () => [team];
+	const budget = host.runtime.inspectBudget(teamId);
+	for (const key of ["teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls"] as const) budget.limits[key] = 1_000_000_000;
+	budget.limits.teamWorks = 20_000;
+	host.runtime.inspectBudget = () => budget;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	let text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Team:\s+MiniCore release · id1/u);
+	assert.match(text, /Time:\s+1:49:55 active · 1:52:55 wall \(paused 3:00\)/u);
+	assert.match(text, /Tokens:\s+in 4.19M · out 352k · cache 155.8M/u);
+	assert.match(text, /Budget:\s+all counters unlimited · works 4\/20000/u);
+	assert.doesNotMatch(text, /Progress:|Recent:|░/u);
+	team.usage.cacheWrite = 912;
+	text = ui.text(POPUP_WIDTH);
+	assert.match(text, /cache 155.8M\/912/u);
+	host.runtime.teamTime = () => ({ activeMs: 252_000, wallMs: 252_000, pausedMs: 0, startedAt: 0 });
+	assert.match(ui.text(POPUP_WIDTH), /Time:\s+4:12\s+│/u);
+});
+
+test("Progress shows accumulated member/current-work times and in-flight usage once, with busy/context threshold colors", (t) => {
+	const { host, teamId } = fixture();
+	const original = host.runtime.listTeams.bind(host.runtime);
+	host.runtime.listTeams = () => original().map((team) => ({ ...team, members: team.members.map((member) => member.id === "runner" ? { ...member, context: { used: 80, window: 100, percent: 80 } } : member) }));
+	host.runtime.teamTime = () => ({ activeMs: 100_000, wallMs: 120_000, pausedMs: 20_000, startedAt: 0 });
+	const usage = { ...host.runtime.getTeam(teamId).usage, input: 1_220_000, output: 88_000, cacheRead: 37_900_000 };
+	host.runtime.memberStats = (_id, member) => ({ activeMs: member === "runner" ? 94_000 : 20_000, usage });
+	host.runtime.workStats = () => ({ activeMs: 252_000, usage });
+	host.driver.memberActivity = () => ({ liveUsage: usage } as any);
+	const tagged = taggingTheme();
+	const ui = overlay(host, { theme: tagged.theme });
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	const text = stripTerminalSequences(ui.text(POPUP_WIDTH));
+	assert.match(text, /runner\s+running work .*now 4:12.*ctx 80%/u);
+	assert.match(text, /active 1:34 · busy 94% · in 1.22M · out 88k · cache 37.9M/u);
+	assert.doesNotMatch(text, /2.44M|176k/u, "driver live usage is already in the runtime totals");
+	assert.ok(tagged.calls.some((call) => call.color === "warning" && call.text === "busy 94%"));
+	assert.ok(tagged.calls.some((call) => call.color === "warning" && call.text === "ctx 80%"));
+});
+
+test("history Progress restores memberStats, final memberStates, usage and pause-excluding busy; old stats may be absent", (t) => {
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, []);
+	const usage = { input: 4_190_000, output: 352_000, cacheRead: 155_800_000, cacheWrite: 0, turns: 1, cost: 0, contextTokens: 0 };
+	host.history.teams.push({ teamId: "k7m2qx3a", title: "Historical release", version: 2, lifecycle: "closed", members: ["lead", "qa"], lead: "lead", results: [], finalResultRefs: [], at: 120_000, startedAt: 0, activeMs: 100_000, usage,
+		memberStates: [{ id: "lead", lifecycle: "closed", resourceState: "released" }, { id: "qa", lifecycle: "faulted", resourceState: "released" }], memberStats: [{ id: "lead", activeMs: 25_000, usage }, { id: "qa", activeMs: 94_000, usage }] });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right");
+	let text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Σ Team 1:40 · history · 2 members/u);
+	assert.match(text, /✓ lead \(lead\)\s+closed/u);
+	assert.match(text, /✗ qa\s+faulted/u);
+	assert.match(text, /active 1:34 · busy 94%/u);
+	assert.match(text, /in 4.19M · out 352k · cache 155.8M/u);
+	delete host.history.teams[0]!.memberStats;
+	text = ui.text(POPUP_WIDTH);
+	assert.match(text, /active — · busy — · tokens not retained/u);
+});
+
+test("Tasks collapse revisions, exclude review works, keep accepted roots expanded and fold only finished/cancelled children", () => {
+	const root: TeamWorkSummary = { work: { workId: "work:release", revision: 2 }, requester: "lead", assignee: "dev", title: "Release", taskPreview: "Full instruction", state: "resolved", review: "accepted" };
+	const child = (id: string, state: TeamWorkSummary["state"]): TeamWorkSummary => ({ work: { workId: `work:${id}`, revision: 1 }, parent: { ...root.work, revision: 1 }, requester: "dev", assignee: "qa", title: id, taskPreview: id, state });
+	const works = [{ ...root, work: { ...root.work, revision: 1 }, title: "Obsolete" }, root,
+		...Array.from({ length: 6 }, (_, i) => child(`done${i}`, "resolved")), child("live", "running"), child("cancelled", "cancelled"), child("superseded", "superseded"), { ...child("review", "queued"), kind: "review" as const }];
+	let rows = buildTeamTaskRows(works, new Set(), theme, POPUP_WIDTH - 5);
+	assert.equal(rows.length, 4);
+	assert.match(rows[0]!.text, /Release.*@2 \(rev 1×\)/u);
+	assert.match(rows[1]!.text, /^  ▶ live/u, "accepted roots remain expanded");
+	assert.match(rows[2]!.text, /– 2 cancelled\/superseded \[\+\]/u);
+	assert.match(rows[3]!.text, /✓ 6 sub-tasks done \[\+\]/u);
+	assert.doesNotMatch(rows.map((row) => row.text).join("\n"), /Obsolete|review/u);
+	rows = buildTeamTaskRows(works, new Set(["work:release:cancelled", "work:release:done"]), theme, POPUP_WIDTH - 5);
+	assert.equal(rows.length, 12);
+	assert.ok(rows.every((row) => visibleWidth(row.text) <= POPUP_WIDTH - 5));
+});
+
+test("Tasks use waiting/held/delivered/accepted/reason/error words and child result summaries, not instructions", (t) => {
+	const { host, teamId, runner, action, settle } = fixture();
+	settle(runner, action(runner, 1, { action: "reply", result: { status: "succeeded", summary: "Three fixes shipped. Long detail." } }));
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right");
+	let text = ui.text(POPUP_WIDTH);
+	assert.match(text, /◐ Implement.*delivered · awaiting acceptance/u);
+	assert.match(text, /Review.*waiting for runner/u);
+	assert.match(text, /held: attention/u);
+	const originalWorks = host.runtime.listWorks.bind(host.runtime);
+	const originalWork = host.runtime.getWork.bind(host.runtime);
+	const originalResult = host.runtime.getResult.bind(host.runtime);
+	const root = originalWorks(teamId)[0]!;
+	const child = originalWorks(teamId).find((work) => work.parent)!;
+	host.runtime.listWorks = (id) => originalWorks(id).map((work) => work.work.workId === root.work.workId ? { ...work, review: "accepted" } : work.parent ? { ...work, state: "resolved", resultRef: "result:synthetic" } : work);
+	host.runtime.getResult = (id, ref) => ref === "result:synthetic" ? { id: ref, author: child.assignee, work: child.work, committedAt: 1, source: "explicit_reply", result: { status: "succeeded", summary: "3 fixed. Second sentence." } } : originalResult(id, ref);
+	text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Implement.*accepted · "Three fixes/u);
+	assert.match(text, /Check child 1.*done.*"3 fixed\."/u);
+	assert.doesNotMatch(text, /Second sentence/u);
+	host.runtime.getWork = (id, ref) => {
+		const view = originalWork(id, ref);
+		return view && ref.workId === root.work.workId ? { ...view, current: { ...view.current, review: { disposition: "waived", reason: "No longer required" }, error: { code: "PROVIDER_DOWN", message: "Failed" } } } : view;
+	};
+	host.runtime.listWorks = (id) => originalWorks(id).map((work) => work.work.workId === root.work.workId ? { ...work, review: "waived" } : work);
+	assert.match(ui.text(POPUP_WIDTH), /waived · No longer required/u);
+	host.runtime.listWorks = (id) => originalWorks(id).map((work) => work.work.workId === root.work.workId ? { ...work, state: "failed" } : work);
+	assert.match(ui.text(POPUP_WIDTH), /failed: PROVIDER_DOWN/u);
+});
+
+test("accepted root rows show the first result sentence unless an explicit disposition reason is present at 73 columns", (t) => {
+	for (const reason of [undefined, "QA approved"] as const) {
+		const { host, teamId, runner, action, settle } = fixture();
+		settle(runner, action(runner, 1, { action: "reply", result: { status: "succeeded", summary: "1178/0 pass. Further detailed notes." } }));
+		const lead = host.runtime.takeNextActivation(teamId)!;
+		assert.equal(lead.binding.memberId, "lead");
+		assert.equal(host.runtime.inputReady(lead.binding, lead.scope.activationId, lead.deliveryId).ok, true);
+		const root = host.runtime.listWorks(teamId).find((work) => work.assignee === "runner" && !work.parent)!;
+		action(lead, 1, { action: "control", command: "accept_result", work: root.work, disposition: "accepted", ...(reason ? { reason } : {}) });
+		const ui = overlay(host);
+		t.after(() => ui.component.dispose());
+		ui.key("right"); ui.key("right");
+		const lines = ui.component.render(POPUP_WIDTH);
+		const row = stripTerminalSequences(lines.find((line) => line.includes("✓ Implement the popup"))!);
+		assert.ok(row.includes(reason ? "accepted · QA approved" : 'accepted · "1178/0 pass."'));
+		assert.doesNotMatch(row, /Further detailed notes/u);
+		for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+	}
+});
+
+test("real dependency-yield lifecycle identifies the awaited member, WorkRef/title and queued start duration", (t) => {
+	const { host, teamId } = fixture();
+	const child = host.runtime.listWorks(teamId).find((work) => work.parent)!;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right"); ui.text(POPUP_WIDTH); ui.key("down"); ui.text(POPUP_WIDTH); ui.key("enter");
+	const text = rowsOf(ui.component.render(POPUP_WIDTH)).map((row) => row.trim()).join(" ");
+	assert.match(text, /Lifecycle:/u);
+	assert.match(text, /started work.*\(queued \d+:\d\d\)/u);
+	assert.ok(text.includes(`waiting on runner · work ${child.work.workId.split(":")[1]}@1 «Check child 1»`));
+});
+
+test("task detail wraps full instruction, usage, lifecycle, revisions, child counts and result evidence", (t) => {
+	const { host, teamId, runner, action, settle } = fixture();
+	settle(runner, action(runner, 1, { action: "reply", result: { status: "succeeded", summary: "Release complete.", findings: ["Three fixes"], evidence: [{ source: "unit tests", locator: "suite", basis: "verified" }] } }));
+	const works = host.runtime.listWorks(teamId);
+	const root = works[0]!;
+	const facts = host.runtime.panelFacts(teamId);
+	facts.timeline = [{ at: 0, text: `lead requested work ${root.work.workId.split(":")[1]}@1 → runner` }, { at: 1000, text: `runner started work ${root.work.workId.split(":")[1]}@1 (queued 0:01)` }, { at: 2000, text: `lead revised work ${root.work.workId.split(":")[1]}@1: "Use the public field"` }];
+	facts.timelineOmitted = 2;
+	host.runtime.panelFacts = () => facts;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right"); ui.text(); ui.key("enter");
+	const text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Task: Implement the popup/u);
+	assert.match(text, /Lifecycle:/u);
+	assert.match(text, /earlier steps omitted/u);
+	assert.match(text, /requested work.*«Implement the popup»/u);
+	const unwrapped = rowsOf(ui.component.render(POPUP_WIDTH)).join(" ");
+	assert.match(unwrapped, /started work.*queued\s+0:01/u);
+	assert.match(unwrapped, /revised work.*Use the\s+public field/u);
+	assert.match(text, /Sub-tasks: 0 · 0 done · 0 waiting/u);
+	assert.match(text, /Result: Release complete\./u);
+	assert.match(text, /Finding: Three fixes/u);
+	assert.match(text, /Evidence: unit tests · suite · verified/u);
+	assert.match(unwrapped, /in 0 · out 0 · cache\s+0/u);
+	assert.match(text, /esc tasks/u);
+	ui.key("escape");
+	assert.match(ui.text(POPUP_WIDTH), /\[Tasks\]/u);
+	assert.doesNotMatch(ui.text(POPUP_WIDTH), /Lifecycle:/u);
+});
+
+test("Timeline arrow scroll reaches every retained milestone and resolves work titles", (t) => {
+	const { host, teamId } = fixture();
+	const work = host.runtime.listWorks(teamId)[0]!;
+	const facts = host.runtime.panelFacts(teamId);
+	facts.timeline = Array.from({ length: 40 }, (_, index) => ({ at: index * 1000, text: `step ${index} · runner started work ${work.work.workId.split(":")[1]}@1` }));
+	host.runtime.panelFacts = () => facts;
+	const ui = overlay(host, { rows: 80 });
+	t.after(() => ui.component.dispose());
+	ui.key("left"); ui.key("left");
+	const cursor = () => stripTerminalSequences(ui.component.render(POPUP_WIDTH).find((line) => line.startsWith("│ →"))!);
+	assert.match(cursor(), /step 39.*«Implement the popup»/u);
+	assert.equal(ui.component.render(POPUP_WIDTH).filter((line) => /step \d+/u.test(line)).length, 12);
+	for (let index = 38; index >= 0; index--) { ui.key("up"); assert.match(cursor(), new RegExp(`step ${index} ·`, "u")); }
+	for (let index = 1; index < 40; index++) { ui.key("down"); assert.match(cursor(), new RegExp(`step ${index} ·`, "u")); }
+});
+
+test("n delegates rename from Overview/live Teams/history Teams without mutating or confusing the selected Team", () => {
+	const { host, teamId } = fixture();
+	host.history.teams.push({ teamId: "old-uuid-title", title: "Historical title", version: 2, lifecycle: "closed", members: [], results: [], finalResultRefs: [], at: 1 });
+	const overview = overlay(host);
+	overview.component.handleInput("n");
+	assert.deepEqual(overview.closed, [{ teamId, action: "title" }]);
+	const teams = overlay(host);
+	teams.key("escape"); teams.text(); teams.key("down"); teams.text(); teams.component.handleInput("n");
+	assert.deepEqual(teams.closed, [{ teamId: "old-uuid-title", action: "title" }]);
+	assert.equal(host.history.teams[0]!.title, "Historical title");
+	const historyOverview = overlay(host);
+	historyOverview.component.handleInput("]"); historyOverview.text(); historyOverview.component.handleInput("n");
+	assert.deepEqual(historyOverview.closed, [{ teamId: "old-uuid-title", action: "title" }]);
+});
+
+test("Teams preserves eight-character UUID prefixes and shows HH:MM today, MM-DD otherwise", (t) => {
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, []);
+	const today = new Date(2026, 9, 5, 14, 6).getTime();
+	const yesterday = new Date(2026, 9, 4, 14, 6).getTime();
+	const base = { version: 2 as const, lifecycle: "closed" as const, members: ["lead", "qa"], results: [], finalResultRefs: [], rootCounts: { total: 3, accepted: 1, waived: 0 }, activeMs: 6_810_000 };
+	host.history.teams.push({ ...base, teamId: "3ce7a106-4412-4683-a99f-1885528225e5", title: "Today release", startedAt: today, at: today + 1000 },
+		{ ...base, teamId: "22ed3adb-4412-4683-a99f-1885528225e5", title: "Yesterday release", startedAt: yesterday, at: yesterday + 1000 });
+	const ui = overlay(host, { now: () => today + 2000 });
+	t.after(() => ui.component.dispose());
+	const text = stripTerminalSequences(ui.text(POPUP_WIDTH));
+	assert.match(text, /Today release\s+3ce7a106 CLOSED\s+1:53:30 14:06/u);
+	assert.match(text, /Yesterday release\s+22ed3adb CLOSED\s+1:53:30 10-04/u);
+	assert.doesNotMatch(text, /4412-4683/u);
+});
+
+test("73-column Tasks summary preserves the sub-task count and Teams details preserve members/root counts for long titles", (t) => {
+	const { host, teamId } = fixture(2);
+	host.runtime.renameTeam(teamId, "A long release title that fills the entire title column");
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right");
+	let lines = ui.component.render(POPUP_WIDTH);
+	const summary = rowsOf(lines).slice(2, rowsOf(lines).indexOf("", 2)).join(" ");
+	assert.equal(summary, "3 deliverables · 1 running · 0 awaiting acceptance · 0 accepted · 2 sub-tasks");
+	assert.doesNotMatch(summary, /\.\.\./u);
+	ui.key("escape");
+	lines = ui.component.render(POPUP_WIDTH);
+	assert.match(stripTerminalSequences(lines.join("\n")), /▶ A long release.* · 4 members · roots 0\/3 accepted/u);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+});
+
+test("task detail follows a revision while open and Tasks queue labels distinguish member busy from work ahead", (t) => {
+	const { host, teamId } = fixture(2);
+	const works = host.runtime.listWorks(teamId);
+	const root = works[0]!;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right");
+	let text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Check child 1.*queued · member busy/u);
+	assert.match(text, /Check child 2.*queued \(1 ahead\)/u);
+	ui.key("enter"); ui.text();
+	const originalWorks = host.runtime.listWorks.bind(host.runtime);
+	host.runtime.listWorks = (id) => originalWorks(id).map((work) => work.work.workId === root.work.workId ? { ...work, title: "Revised release", work: { ...work.work, revision: 2 } } : work);
+	const originalWork = host.runtime.getWork.bind(host.runtime);
+	host.runtime.getWork = (id, ref) => originalWork(id, ref.workId === root.work.workId ? root.work : ref);
+	const originalStats = host.runtime.workStats.bind(host.runtime);
+	host.runtime.workStats = (id, ref) => originalStats(id, ref.workId === root.work.workId ? root.work : ref);
+	text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Revised release · work .*@2 \(revised 1×\)/u);
+	assert.match(text, /Task: Implement the popup/u);
+});
+
+test("real lead revise_work while task detail is open renders the latest title/ref/instruction without throwing", (t) => {
+	let id = 0;
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `r${++id}` });
+	const { teamId } = host.runtime.prepare({ title: "Revision regression", members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "worker", roleDescription: "Work." }], lead: "lead", brief: { goal: "Revise queued work." }, timeoutSeconds: null, initialRequests: [{ to: "worker", title: "Original title", task: "Original instruction." }] });
+	host.runtime.launch(teamId);
+	const lead = host.runtime.takeNextActivation(teamId)!;
+	assert.equal(host.runtime.inputReady(lead.binding, lead.scope.activationId, lead.deliveryId).ok, true);
+	const root = host.runtime.listWorks(teamId)[0]!;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right"); ui.text(POPUP_WIDTH); ui.key("enter");
+	assert.match(ui.text(POPUP_WIDTH), /Original title · work .*@1/u);
+	const reply = host.runtime.handleAction(lead.binding, lead.scope, 1, "revise-open-detail", { action: "control", command: "revise_work", workId: root.work.workId, expectedRevision: 1, title: "Revised title", task: "Use the public structured error field." }, "revise-open-detail");
+	assert.equal(reply.ok, true, JSON.stringify(reply));
+	const text = ui.text(POPUP_WIDTH);
+	assert.match(text, /Revised title · work .*@2 \(revised 1×\)/u);
+	assert.match(text, /Task: Use the public structured error field\./u);
+	assert.match(rowsOf(ui.component.render(POPUP_WIDTH)).join(" "), /lead revised work.*Use the public structured error field/u);
+});
+
+test("Overview preserves the full activity summary and wraps long title, pause time, cache writes and Waiting for at 73 columns", (t) => {
+	const { host, teamId } = fixture(6);
+	const title = "Release of the standalone runtime and terminal interface";
+	host.runtime.renameTeam(teamId, title);
+	host.runtime.teamTime = () => ({ activeMs: 6_595_000, wallMs: 10_775_000, pausedMs: 4_180_000, startedAt: 0 });
+	const originalTeams = host.runtime.listTeams.bind(host.runtime);
+	host.runtime.listTeams = () => originalTeams().map((team) => ({ ...team, usage: { ...team.usage, input: 4_190_000, output: 352_000, cacheRead: 155_800_000, cacheWrite: 37_900_000 } }));
+	const facts = host.runtime.panelFacts(teamId);
+	facts.waitingFor = "Standalone quality assurance on the revised release candidate, waiting for developer confirmation";
+	host.runtime.panelFacts = () => facts;
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	const lines = ui.component.render(POPUP_WIDTH);
+	const rows = rowsOf(lines);
+	const summary = rows.slice(2, rows.indexOf("", 2)).join(" ");
+	assert.equal(summary, "ACTIVE · needs attention · 1:49:55 · roots 0/3 accepted · works 0/9 · 1 running · 1 held · 1 waiting");
+	const text = rows.map((row) => row.trim()).join(" ");
+	assert.ok(text.includes(`Team:        ${title} · id1`));
+	assert.match(text, /Time: +1:49:55 active · 2:59:35 wall \(paused 1:09:40\)/u);
+	assert.match(text, /Tokens: +in 4.19M · out 352k · cache 155.8M\/37.9M/u);
+	assert.ok(text.includes(`Waiting for: ${facts.waitingFor}`));
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+});
+
+test("Overview wraps a valid 60-character title with short ID and enriches running Waiting for with current work/title/time", (t) => {
+	let id = 0;
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `run${++id}` });
+	const title = `MiniCore release ${"x".repeat(43)}`;
+	assert.equal(title.length, 60);
+	const { teamId } = host.runtime.prepare({ title, members: [{ alias: "lead", roleDescription: "Manage." }, { alias: "v060-qa", roleDescription: "Check." }], lead: "lead", brief: { goal: "Validate the final release candidate." }, timeoutSeconds: null,
+		initialRequests: [{ to: "v060-qa", title: "Standalone QA r5", task: "Validate the full candidate." }] });
+	host.runtime.launch(teamId);
+	const lead = host.runtime.takeNextActivation(teamId)!;
+	host.runtime.inputReady(lead.binding, lead.scope.activationId, lead.deliveryId);
+	const ended = host.runtime.handleAction(lead.binding, lead.scope, 1, "idle", { action: "yield" }, "idle");
+	assert.equal(ended.ok, true);
+	host.runtime.nativeSettled(lead.binding, lead.scope.activationId, { status: "success", appliedToolCallId: "idle" });
+	host.runtime.cleanupFinished(lead.binding, lead.scope.activationId, { ok: true });
+	const runner = host.runtime.takeNextActivation(teamId)!;
+	host.runtime.inputReady(runner.binding, runner.scope.activationId, runner.deliveryId);
+	assert.equal(host.runtime.panelFacts(teamId).waitingFor, "v060-qa (running)");
+	const stats = host.runtime.workStats(teamId, runner.scope.work!);
+	host.runtime.workStats = () => ({ ...stats, activeMs: 252_000 });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	const lines = ui.component.render(POPUP_WIDTH);
+	const text = rowsOf(lines).map((row) => row.trim()).join(" ");
+	assert.ok(text.includes(`${title} · ${teamId}`));
+	assert.ok(text.includes(`Waiting for: v060-qa on work ${runner.scope.work!.workId.split(":")[1]}@1 «Standalone QA r5» (running 4:12)`));
+	const facts = host.runtime.panelFacts(teamId);
+	facts.waitingFor = "Lead failed: revive it or hand the lead over";
+	host.runtime.panelFacts = () => facts;
+	assert.match(ui.text(POPUP_WIDTH), /Lead failed: revive it or hand the lead over/u);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
 });
 
 test("perf: flowStats and the Progress render stay fast for a Team with ~5000 works", (t) => {

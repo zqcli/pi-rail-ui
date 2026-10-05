@@ -1,15 +1,16 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Input, Key, matchesKey } from "@earendil-works/pi-tui";
 import type { BudgetScope } from "./team-budget";
-import { previewText } from "./team-codec";
+import { normalizeTitle, previewText } from "./team-codec";
 import type { TeamMemberSession, TeamSessionHost } from "./team-host";
 import { showTeamOverlay } from "./team-overlay";
 import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, workRefKey, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView } from "./team-protocol";
 import { clock, type GrantPreview } from "./team-runtime";
 import { formatBudgetLimit, formatBytes, formatHistoryEntry, formatHistorySummary, formatTeamView, lifecycleText } from "./team-tool";
 
-const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "compact", "pause", "continue", "review"] as const;
+const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "compact", "pause", "continue", "review", "title"] as const;
 const REVIEW_USAGE = "review [now|every <N> [by <alias>]|off]";
-const USAGE = `Usage: /rail-team [list] | /rail-team delete <id> [<id>…]|ended | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|compact <alias> [instructions]|pause [reason]|continue|${REVIEW_USAGE}`;
+const USAGE = `Usage: /rail-team [list] | /rail-team delete <id> [<id>…]|ended | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|compact <alias> [instructions]|pause [reason]|continue|title <text>|${REVIEW_USAGE}`;
 
 /** Live and history Team IDs that equal or start with what the user typed (the popup shows only the first 8 characters). */
 function matchTeamIds(host: TeamSessionHost, typed: string): string[] {
@@ -78,7 +79,13 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			return;
 		}
 		let text = "";
-		if (choice.action === "message") {
+		if (choice.action === "title") {
+			const team = host.runtime.listTeams().find((team) => team.teamId === choice.teamId);
+			const history = host.history.teams.find((team) => team.teamId === choice.teamId);
+			const current = team?.title ?? history?.title ?? normalizeTitle(undefined, team?.brief.goal ?? history?.goal ?? choice.teamId);
+			text = (await renameInput(ctx, current))?.trim() ?? "";
+			if (!text) return;
+		} else if (choice.action === "message") {
 			text = (await ctx.ui.input("Message the lead", "What should the lead know?"))?.trim() ?? "";
 			if (!text) return;
 		} else if (choice.action === "compact") {
@@ -108,7 +115,7 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		const teams = host.runtime.listTeams();
 		const liveIds = new Set(teams.map((team) => team.teamId));
 		const lines = [
-			...teams.map((team) => `${team.teamId} · ${lifecycleText(team)} · ${team.health === "ok" ? "ok" : "needs attention"} · lead ${team.lead} · works ${team.works.total}`),
+			...teams.map((team) => `${team.teamId} «${team.title}» · ${lifecycleText(team)} · ${team.health === "ok" ? "ok" : "needs attention"} · lead ${team.lead} · works ${team.works.total}`),
 			...host.history.teams.filter((entry) => !liveIds.has(entry.teamId)).map(formatHistorySummary),
 			...(host.history.skipped ? [`${host.history.skipped} malformed Team history entries skipped`] : []),
 		];
@@ -120,6 +127,19 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 	const teamId = matches[0] ?? typedId;
 	const text = rest.join(" ").trim();
 	const liveTeam = host.runtime.listTeams().find((team) => team.teamId === teamId);
+	if (subcommand === "title") {
+		if (!host.active) throw new Error("The Team runtime for this session branch has ended");
+		const title = normalizeTitle(args.trim().replace(/^\S+\s+\S+(?:[ \t]+|$)/u, ""), "");
+		if (liveTeam) host.runtime.renameTeam(teamId, title);
+		else {
+			const entry = host.history.teams.find((team) => team.teamId === teamId);
+			if (!entry) throw new Error(`Unknown teamId ${teamId}`);
+			host.journal.write({ version: 2, kind: "title", teamId, at: Date.now(), title });
+			entry.title = title;
+		}
+		ctx.ui.notify(`Team ${teamId} renamed to «${title}»`, "info");
+		return;
+	}
 	if (!liveTeam) {
 		const entry = host.history.teams.find((team) => team.teamId === teamId);
 		if (!entry) throw new Error(`Unknown teamId ${teamId}. ${USAGE}`);
@@ -459,6 +479,24 @@ async function confirmBudgetGrant(host: TeamSessionHost, teamId: string, preview
 
 function requireUi(ctx: ExtensionCommandContext): void {
 	if (!ctx.hasUI) throw new Error("This Team control needs interactive confirmation; without a UI, held work stays paused and the Team can only be cancelled.");
+}
+
+/** Pi's input dialog has no initial-value option; use its Input for an editable prefill. */
+async function renameInput(ctx: ExtensionCommandContext, title: string): Promise<string | undefined> {
+	return ctx.ui.custom<string | undefined>((_tui, theme, _keys, done) => {
+		const input = new Input();
+		// Inserted like typed text, so the cursor starts at the end of the current title.
+		input.handleInput(title);
+		input.onSubmit = (value) => done(value);
+		return {
+			get focused() { return input.focused; },
+			set focused(value: boolean) { input.focused = value; },
+			render: (width) => [theme.fg("accent", "Rename Team"), ...input.render(width), theme.fg("dim", "enter save · esc cancel")],
+			handleInput: (data) => { if (matchesKey(data, Key.escape)) done(undefined); else input.handleInput(data); },
+			invalidate: () => input.invalidate(),
+			dispose: () => undefined,
+		};
+	});
 }
 
 async function confirm(ctx: ExtensionCommandContext, title: string, message: string): Promise<boolean> {

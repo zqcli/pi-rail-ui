@@ -47,8 +47,6 @@ export interface TeamMemberActivity {
 interface ActivityRecord {
 	transcript: SubagentTranscript;
 	run?: RunResultCollector;
-	startedAt?: number;
-	activeMs: number;
 	output: string;
 	/** WorkRefs this member has run, so a later activation of one is shown as resumed. */
 	works: Set<string>;
@@ -86,7 +84,9 @@ export class TeamMemberDriver {
 	private readonly activity = new Map<string, ActivityRecord>();
 	private readonly activityListeners = new Set<(teamId: string) => void>();
 
-	constructor(private readonly runtime: TeamRuntime, private readonly broker: SessionBroker) {}
+	constructor(private readonly runtime: TeamRuntime, private readonly broker: SessionBroker) {
+		runtime.setLiveUsageSource((teamId, memberId) => this.activity.get(key(teamId, memberId))?.run?.result("").usage);
+	}
 
 	/** Display observation of native member activity; listeners must only read. */
 	onActivity(listener: (teamId: string) => void): () => void {
@@ -104,7 +104,7 @@ export class TeamMemberDriver {
 			output: live?.output || activity.output,
 			...(live ? { liveUsage: live.usage } : {}),
 			...(live?.isCompacting ? { isCompacting: true } : {}),
-			durationMs: activity.activeMs + (activity.startedAt !== undefined ? Date.now() - activity.startedAt : 0),
+			durationMs: this.runtime.memberStats(teamId, memberId).activeMs,
 		};
 	}
 
@@ -123,9 +123,7 @@ export class TeamMemberDriver {
 		if (!activity?.run) return;
 		const output = activity.run.result("").output;
 		if (output) activity.output = output;
-		activity.activeMs += Date.now() - activity.startedAt!;
 		delete activity.run;
-		delete activity.startedAt;
 		this.notifyActivity(teamId);
 	}
 
@@ -171,7 +169,7 @@ export class TeamMemberDriver {
 		// The claim fails once the Team is no longer prepared, so a cancelled Team never gains a new lifetime.
 		const binding = this.runtime.claimNativeLifetime(request.teamId, request.memberId);
 		this.forgetEvictedTeams();
-		const activity: ActivityRecord = { transcript: new SubagentTranscript(""), activeMs: 0, output: "", works: new Set() };
+		const activity: ActivityRecord = { transcript: new SubagentTranscript(""), output: "", works: new Set() };
 		this.activity.set(id, activity);
 		const opened = this.broker.openTeamMember({
 			binding,
@@ -367,7 +365,6 @@ export class TeamMemberDriver {
 		const activity = this.activity.get(id);
 		if (activity) {
 			activity.run = new RunResultCollector("", assistantText);
-			activity.startedAt = Date.now();
 			// The transcript spans activations; this marks where the next piece of work begins.
 			const { scope } = activation.input;
 			if (scope.kind === "events") activity.transcript.mark(`── ${handlingText(scope.events)}`);

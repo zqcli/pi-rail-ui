@@ -41,10 +41,10 @@ export class TeamSessionHost {
 	constructor(readonly broker: SessionBroker, sink: TeamJournalSink, branch: readonly BranchEntry[], options: Omit<TeamRuntimeOptions, "journal"> = {}) {
 		this.journal = new TeamJournalGeneration((record) => {
 			sink(record);
-			if (record.kind === "terminal" || record.kind === "interrupted") this.endedAt.set(record.teamId, record.at);
+			if (record.kind === "terminal" || record.kind === "interrupted") this.endedAt.set(record.teamId, record.kind === "terminal" ? record.endedAt ?? record.at : record.at);
 		});
 		// The full-ledger invariant sweep is O(works) per call on the UI thread; tests opt in explicitly.
-		this.runtime = new TeamRuntime({ checkInvariants: false, ...options, journal: this.journal });
+		this.runtime = new TeamRuntime({ checkInvariants: false, existingTeamIds: () => this.history.teams.map((entry) => entry.teamId), ...options, journal: this.journal });
 		this.driver = new TeamMemberDriver(this.runtime, broker);
 		let history: TeamHistory;
 		// History is display-only and must never prevent new Teams from starting.

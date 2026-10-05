@@ -11,6 +11,7 @@ export type TeamJournalRecord =
 	| { version: 2; kind: "review"; teamId: string; at: number; review: TeamReviewRecord }
 	| { version: 2; kind: "handover"; teamId: string; at: number; lead: string }
 	| { version: 2; kind: "interrupted"; teamId: string; at: number; reason: string }
+	| { version: 2; kind: "deleted"; teamId: string; at: number }
 	| { version: 2; kind: "result"; teamId: string; at: number; result: ResultRecord }
 	| { version: 2; kind: "decision"; teamId: string; at: number; decision: "revise_work" | "cancel_work"; work: WorkRef; reason?: string }
 	| { version: 2; kind: "close_decision"; teamId: string; at: number; closeId: string; outcome: "succeeded" | "partial" | "failed"; resultRefs: string[]; roots: TeamResult["roots"]; reason?: string }

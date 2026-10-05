@@ -1,3 +1,4 @@
+import type { SubagentUsage } from "./session-broker";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "./team-journal";
 import {
 	TEAM_MAX_MEMBERS, TEAM_MAX_RESERVED_RESULT_BYTES, TEAM_MAX_RESULT_RECORDS, TEAM_MAX_REVIEWS, TEAM_MIN_MEMBERS,
@@ -37,6 +38,10 @@ export interface TeamHistoryEntry {
 	review?: TeamReviewPlan;
 	/** The compact flow summary of the Team's terminal record. */
 	flow?: string;
+	startedAt?: number;
+	usage?: SubagentUsage;
+	memberStates?: TeamResult["members"];
+	rootCounts?: { accepted: number; waived: number; total: number };
 	at: number;
 }
 
@@ -96,9 +101,18 @@ function applyJournalRecord(
 			const { lead, members } = parseRoster(roster);
 			const goal = boundedText(data["goal"], 512, "journal.goal");
 			const review = data["review"] === undefined ? undefined : normalizeReviewPlan(data["review"], "journal.review", members, lead);
-			teams.set(teamId, { teamId, version: 2, lifecycle: "interrupted", lead, members, goal, results: [], finalResultRefs: [], ...(review ? { review } : {}), at });
+			teams.set(teamId, { teamId, version: 2, lifecycle: "interrupted", lead, members, goal, results: [], finalResultRefs: [], ...(review ? { review } : {}), startedAt: at, at });
 			resultsByTeam.set(teamId, new Map());
 			resultBytesByTeam.set(teamId, 0);
+			return true;
+		}
+		case "deleted": {
+			onlyKeys(data, ["version", "kind", "teamId", "at"]);
+			teams.delete(teamId);
+			resultsByTeam.delete(teamId);
+			resultBytesByTeam.delete(teamId);
+			closeByTeam.delete(teamId);
+			ended.delete(teamId);
 			return true;
 		}
 		case "interrupted": {
@@ -192,6 +206,13 @@ function applyJournalRecord(
 			if (result.outcome) current.outcome = result.outcome;
 			if (result.reason) current.reason = result.reason;
 			current.finalResultRefs = result.finalResultRefs;
+			current.usage = result.usage;
+			current.memberStates = result.members;
+			current.rootCounts = {
+				accepted: result.roots.filter((root) => root.review?.disposition === "accepted").length,
+				waived: result.roots.filter((root) => root.review?.disposition === "waived").length,
+				total: result.roots.length,
+			};
 			if (data["flow"] !== undefined) current.flow = boundedText(data["flow"], 512, "journal.terminal.flow");
 			current.at = at;
 			ended.add(teamId);

@@ -34,6 +34,22 @@ function makeRuntime(initialRequests: Array<{ to: string; task: string }> = [{ t
 	return { runtime, teamId: prepared.teamId };
 }
 
+test("forgetTeam removes only ended Teams whose member exits are released", async () => {
+	const { runtime, teamId } = makeRuntime([]);
+	assert.throws(() => runtime.forgetTeam(teamId), /cancel it first/u);
+	runtime.cancelTeam(teamId, "Delete after cancellation");
+	assert.throws(() => runtime.forgetTeam(teamId), /cancel it first/u);
+	runtime.attachCleanupExecutor(teamId, { runActivation: async () => undefined, closeMember: async () => ({ ok: true }) });
+	await runtime.waitForCompletion(teamId);
+	assert.equal(runtime.listTeams().length, 1);
+	runtime.forgetTeam(teamId);
+	assert.deepEqual(runtime.listTeams(), []);
+	assert.throws(() => runtime.getTeam(teamId), /Unknown Team/u);
+	const prepared = runtime.prepare({ members: [{ alias: "lead", roleDescription: "Lead" }, { alias: "worker", roleDescription: "Worker" }],
+		lead: "lead", brief: { goal: "Prepared Teams cannot be deleted" }, initialRequests: [], timeoutSeconds: null });
+	assert.throws(() => runtime.forgetTeam(prepared.teamId), /cancel it first/u);
+});
+
 function action(runtime: TeamRuntime, activation: RuntimeActivation, sequence: number, rpcRequestId: string, args: unknown, toolCallId = rpcRequestId) {
 	return runtime.handleAction(activation.binding, activation.scope, sequence, rpcRequestId, args, toolCallId);
 }

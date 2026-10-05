@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCompactThreshold } from "../../tools/subagents/team-compaction-settings";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { SessionBroker } from "../../tools/subagents/session-broker";
+import type { AgentInstance, SessionBroker } from "../../tools/subagents/session-broker";
+import type { TeamHistoryEntry } from "../../tools/subagents/team-history";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
 import { TeamOverlayComponent, buildTeamTaskRows, type TeamOverlayAction } from "../../tools/subagents/team-overlay";
 import type { TeamFlowStats } from "../../tools/subagents/team-flow";
@@ -210,7 +211,7 @@ test("all views and details fit widths 60–200 and respect a short terminal", (
 	const { host } = fixture(6);
 	const ui = overlay(host, { rows: 18 });
 	t.after(() => ui.component.dispose());
-	for (let view = 0; view < 5; view++) {
+	for (let view = 0; view < 6; view++) {
 		for (const width of [60, 100, 120, 200]) {
 			const lines = ui.component.render(width);
 			assert.ok(lines.every((line) => visibleWidth(line) <= width));
@@ -355,9 +356,9 @@ test("summary omits zero activity counts and header selector shows only eight ID
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	const lines = ui.component.render(100);
-	assert.match(lines[1]!, /Rail Team\s+\[Overview\]\s+Progress\s+Members\s+Tasks\s+Timeline/u);
+	assert.match(lines[1]!, /Rail Team\s+\[Teams\]\s+Overview\s+Progress/u);
 	assert.match(lines[1]!, /‹ 1\/2 › long-tea│$/u);
-	assert.match(lines[2]!, /PREPARED · ok · 0:00 · roots 0\/0 accepted · works 0\/0/u);
+	assert.match(lines[2]!, /2 Teams/u);
 	assert.doesNotMatch(lines[2]!, /0 running|held|waiting/u);
 });
 
@@ -451,7 +452,7 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 	host.runtime.panelFacts = () => facts;
 	const ui = overlay(host, { rows: 22 }); // Three help rows leave an 8-row Timeline page.
 	t.after(() => ui.component.dispose());
-	ui.key("left");
+	ui.key("left"); ui.key("left");
 	const cursor = () => ui.component.render(100).find((line) => line.startsWith("│ →"))!;
 	assert.match(cursor(), /19:00  milestone 19/u);
 	facts.timeline.push({ at: 20 * 60_000, text: "milestone 20" });
@@ -501,14 +502,19 @@ test("arrows switch views, brackets switch Teams, and configurable select keys a
 	ui.key("left"); ui.key("left");
 	assert.match(ui.text(), /\[Overview\]/u);
 	ui.key("backTab");
+	assert.match(ui.text(), /\[Teams\]/u);
+	ui.key("backTab");
 	assert.match(ui.text(), /\[Timeline\]/u);
-	ui.key("tab");
+	ui.key("tab"); ui.key("tab");
 	assert.match(ui.text(), /\[Overview\]/u);
 	ui.component.handleInput("]");
 	assert.match(ui.text(), /‹ 2\/2 › history/u);
 	assert.match(ui.text(), /\[Overview\]/u);
 	ui.component.handleInput("[");
 	assert.match(ui.text(), /‹ 1\/2 ›/u);
+	ui.component.handleInput("q");
+	assert.match(ui.text(), /\[Teams\]/u);
+	assert.deepEqual(ui.closed, []);
 	ui.component.handleInput("q");
 	assert.deepEqual(ui.closed, [undefined]);
 });
@@ -536,7 +542,7 @@ test("Timeline pages use the available height instead of eight rows", (t) => {
 	host.runtime.panelFacts = () => facts;
 	const ui = overlay(host, { rows: 40 });
 	t.after(() => ui.component.dispose());
-	ui.key("left");
+	ui.key("left"); ui.key("left");
 	const shown = () => ui.component.render(100).filter((line) => /milestone \d+/u.test(line)).length;
 	const page = shown();
 	assert.ok(page > 8, `shown ${page}`);
@@ -697,6 +703,172 @@ test("review works do not count in the Overview progress", (t) => {
 
 /** The popup is 92% of the terminal: 73 columns at 80. */
 const POPUP_WIDTH = 73;
+
+test("Teams is the first view; Enter opens the selected Team and Escape returns before closing", (t) => {
+	const { host, teamId } = fixture();
+	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: ["lead", "worker"], goal: "Past work", results: [], finalResultRefs: [], at: 1 });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	assert.match(ui.text(POPUP_WIDTH), /\[Overview\]/u, "the active Team starts in Overview");
+	ui.key("escape");
+	let lines = ui.component.render(POPUP_WIDTH);
+	assert.match(lines.join("\n"), /\[Teams\]/u);
+	assert.deepEqual(ui.closed, []);
+	assert.match(lines.join("\n"), /↑↓ select · enter open · space mark · d delete · esc close/u);
+	assert.ok(lines.findIndex((line) => line.includes(`▶ ${teamId}`)) < lines.findIndex((line) => line.includes("✓ history")));
+	ui.key("down"); ui.text(); ui.key("enter");
+	assert.match(ui.text(POPUP_WIDTH), /Team history · CLOSED/u);
+	assert.match(ui.text(POPUP_WIDTH), /Goal: Past work/u);
+	ui.key("escape");
+	lines = ui.component.render(POPUP_WIDTH);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+	ui.key("escape");
+	assert.deepEqual(ui.closed, [undefined]);
+});
+
+test("every selected tab stays visible beside the Team selector at popup width", (t) => {
+	const { host } = fixture();
+	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: [], results: [], finalResultRefs: [], at: 1 });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	for (const tab of ["Overview", "Progress", "Members", "Tasks", "Timeline", "Teams"]) {
+		const lines = ui.component.render(POPUP_WIDTH);
+		assert.ok(stripTerminalSequences(lines[1]!).includes(`[${tab}]`));
+		assert.match(stripTerminalSequences(lines[1]!), /‹ 1\/2 ›/u);
+		for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+		ui.key("tab");
+	}
+});
+
+test("without an active Team multiple Teams start in Teams, but one Team starts in Overview", (t) => {
+	for (const count of [1, 2]) {
+		const host = new TeamSessionHost({} as SessionBroker, () => undefined, []);
+		for (let index = 0; index < count; index++) host.history.teams.push({ teamId: `history${index}`, version: 2, lifecycle: "closed", members: [], goal: "Historical work", results: [], finalResultRefs: [], at: index });
+		const ui = overlay(host);
+		t.after(() => ui.component.dispose());
+		assert.match(ui.text(POPUP_WIDTH), count === 1 ? /\[Overview\]/u : /\[Teams\]/u);
+		if (count === 2) {
+			const rows = ui.component.render(POPUP_WIDTH);
+			assert.ok(rows.findIndex((line) => line.includes("✓ history1")) < rows.findIndex((line) => line.includes("✓ history0")));
+		}
+	}
+});
+
+test("space marks only the selected Teams row and brackets move the Teams cursor", (t) => {
+	const { host, teamId } = fixture();
+	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "interrupted", members: [], results: [], finalResultRefs: [], at: 1 });
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("escape"); ui.text();
+	ui.component.handleInput(" ");
+	assert.match(ui.text(POPUP_WIDTH), new RegExp(`→ \\* ${teamId} +ACTIVE`, "u"));
+	ui.component.handleInput("]"); ui.text();
+	assert.match(ui.text(POPUP_WIDTH), /→ ✗ history/u);
+	ui.component.handleInput(" ");
+	assert.match(ui.text(POPUP_WIDTH), /→ \* history/u);
+	ui.component.handleInput(" ");
+	assert.match(ui.text(POPUP_WIDTH), /→ ✗ history/u);
+});
+
+test("Teams rows retain lifecycle, outcome, duration, member/root counts, start time and a truncated goal at 73 columns", (t) => {
+	const { host, teamId } = fixture();
+	const team = host.runtime.getTeam(teamId);
+	team.brief.goal = "Ship this long goal " + "details ".repeat(30);
+	team.lifecycle = "closed";
+	team.outcome = "partial";
+	host.runtime.listTeams = () => [team];
+	host.history.teams.push({ teamId: "historic", version: 2, lifecycle: "interrupted", members: ["one"], goal: "History goal", results: [], finalResultRefs: [], at: 1 });
+	const tagged = taggingTheme();
+	const ui = overlay(host, { theme: tagged.theme });
+	t.after(() => ui.component.dispose());
+	const lines = ui.component.render(POPUP_WIDTH);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+	const row = lines.map(stripTerminalSequences).find((line) => line.includes(`✓ ${teamId}`))!;
+	assert.match(row, /CLOSED partial \d+:\d\d 4m roots 0\/3 \d\d-\d\d \d\d:\d\d Ship/u);
+	assert.match(row, /\.\.\./u);
+	assert.ok(tagged.calls.some((call) => call.color === "success" && call.text === "✓"));
+	assert.ok(tagged.calls.some((call) => call.color === "error" && call.text === "✗"));
+});
+
+test("d deletes marked Teams in list order, the cursor without marks, or the viewed Team on another tab", () => {
+	const { host, teamId } = fixture();
+	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: [], results: [], finalResultRefs: [], at: 1 });
+	const marked = overlay(host);
+	marked.key("escape"); marked.text(); marked.component.handleInput(" ");
+	marked.key("down"); marked.text(); marked.component.handleInput(" ");
+	marked.component.handleInput("d");
+	assert.deepEqual(marked.closed, [{ action: "delete", teamIds: [teamId, "history"] }]);
+	assert.equal(host.runtime.getTeam(teamId).lifecycle, "active", "deletion is delegated to the command's confirmation and eligibility checks");
+	marked.component.handleInput("d");
+	assert.equal(marked.closed.length, 1);
+	const cursor = overlay(host);
+	cursor.key("escape"); cursor.text(); cursor.key("down"); cursor.text(); cursor.component.handleInput("d");
+	assert.deepEqual(cursor.closed, [{ action: "delete", teamIds: ["history"] }]);
+	const viewed = overlay(host);
+	viewed.component.handleInput("]"); viewed.text(); viewed.component.handleInput("d");
+	assert.deepEqual(viewed.closed, [{ action: "delete", teamIds: ["history"] }]);
+	const unmarked = overlay(host);
+	unmarked.key("escape"); unmarked.text(); unmarked.component.handleInput(" "); unmarked.component.handleInput(" ");
+	unmarked.key("down"); unmarked.text(); unmarked.component.handleInput("d");
+	assert.deepEqual(unmarked.closed, [{ action: "delete", teamIds: ["history"] }]);
+});
+
+test("history Overview and Teams rows show terminal tokens, flow, roots and start/end duration; old journals still render", (t) => {
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, []);
+	const entry: TeamHistoryEntry = { teamId: "historic", version: 2, lifecycle: "closed", outcome: "succeeded", members: ["lead", "worker"], goal: "Historic goal", results: [], finalResultRefs: [],
+		startedAt: 1_700_000_000_000, at: 1_700_000_300_000, usage: { input: 123, output: 45, cacheRead: 67, cacheWrite: 89, turns: 2, cost: 0, contextTokens: 0 },
+		flow: "workers avg 1.2 · only lead 25%", rootCounts: { accepted: 2, waived: 1, total: 3 } };
+	host.history.teams.push(entry);
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	let lines = ui.component.render(POPUP_WIDTH);
+	assert.match(lines.join("\n"), /Started:/u);
+	assert.match(lines.join("\n"), /Ended:.*duration 5:00/u);
+	assert.match(lines.join("\n"), /Tokens: input 123 · output 45 · cache 67\/89/u);
+	assert.match(lines.join("\n"), /Flow: workers avg 1\.2 · only lead 25%/u);
+	assert.match(lines.join("\n"), /Roots: 2\/3 accepted · 1 waived/u);
+	ui.key("escape");
+	lines = ui.component.render(POPUP_WIDTH);
+	assert.match(lines.join("\n"), /CLOSED ok 5:00 2 members roots 2\/3 \d\d-\d\d \d\d:\d\d Hist/u);
+	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+	host.history.teams.push({ teamId: "legacy", version: 1, lifecycle: "completed", members: [], results: [], finalResultRefs: [], at: 1 });
+	ui.component.handleInput("]"); ui.text(); ui.key("enter");
+	assert.match(ui.text(POPUP_WIDTH), /Started: not retained/u);
+	assert.match(ui.text(POPUP_WIDTH), /duration not retained/u);
+	assert.doesNotMatch(ui.text(POPUP_WIDTH), /Tokens:|Roots:/u);
+});
+
+test("history Members cache verified saved-session models/sizes, final lifecycles and result counts, while absent or reused aliases show session deleted", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "team-history-members-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const instance = (alias: string): AgentInstance => ({ version: 2, agentId: alias, alias, model: { provider: "local", modelId: "fake" }, sessionId: alias,
+		sessionFile: join(dir, `${alias}.jsonl`), cwd: dir, createdAt: "2023-11-14T00:00:00Z", updatedAt: "2023-11-14T00:00:00Z", lastTask: "Team work" });
+	const saved = [instance("lead"), instance("reused")];
+	writeFileSync(saved[0]!.sessionFile, "history session contents");
+	writeFileSync(saved[1]!.sessionFile, "an unrelated Team session");
+	let lookups = 0;
+	const host = new TeamSessionHost({ listSaved: async () => { lookups++; return saved; } } as SessionBroker, () => undefined, []);
+	host.history.teams.push({ teamId: "history", version: 2, lifecycle: "closed", members: ["lead", "gone", "reused"], results: [{ id: "result:a", author: "lead", work: { workId: "work:a", revision: 1 }, result: { status: "succeeded", summary: "Done" }, committedAt: 1, source: "explicit_reply" }],
+		finalResultRefs: [], memberStates: [{ id: "lead", lifecycle: "closed", resourceState: "released" }, { id: "gone", lifecycle: "faulted", resourceState: "released" }, { id: "reused", lifecycle: "closed", resourceState: "released" }], at: 1 });
+	const original = host.memberSessions.bind(host);
+	let loaded: ReturnType<TeamSessionHost["memberSessions"]> | undefined;
+	host.memberSessions = (teamId, aliases) => loaded = original(teamId, aliases);
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right");
+	assert.match(ui.text(POPUP_WIDTH), /checking session/u);
+	const before = ui.renders();
+	await loaded; await Promise.resolve();
+	const text = ui.text(POPUP_WIDTH);
+	assert.match(text, /lead · closed · 1 results · local\/fake · 24 B/u);
+	assert.match(text, /gone · faulted · 0 results · session deleted/u);
+	assert.match(text, /reused · closed · 0 results · session deleted/u);
+	assert.ok(ui.renders() > before, "the lookup completion refreshes the popup");
+	assert.equal(lookups, 1, "subsequent renders reuse the resolved sessions");
+	delete host.history.teams[0]!.memberStates;
+	assert.match(ui.text(POPUP_WIDTH), /activity not retained/u, "old member snapshots need no lifecycle field");
+	for (const line of ui.component.render(POPUP_WIDTH)) assert.equal(visibleWidth(line), POPUP_WIDTH);
+});
 /** The action keys wrapped by whole keys at the popup width. */
 const ACTION_HELP = ["p pause · c cancel · r resume hold · g grant · m message · v revive", "l new lead · z compact · t compact at 80%"];
 /** The text of each popup row, without the frame and its leading space. */
@@ -724,12 +896,12 @@ test("Overview shows the full Team ID, and every popup action key is named on it
 	const lines = ui.component.render(POPUP_WIDTH);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
 	assert.match(stripTerminalSequences(lines.join("\n")), new RegExp(`Team:\\s+${teamId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u"));
-	assert.deepEqual(helpOf(lines), ["↑↓ scroll · ←→/tab views · [ ] teams · esc close", ...ACTION_HELP],
+	assert.deepEqual(helpOf(lines), ["↑↓ scroll · ←→/tab views · [ ] teams · d delete · esc teams", ...ACTION_HELP],
 		"navigation and the actions on whole rows, no key cut");
 	for (const row of ACTION_HELP) assert.ok(row.length <= POPUP_WIDTH - 3, row);
 	// Wider hints wrap instead of being cut, and stay dim.
 	const tagged = taggingTheme();
-	for (const [tab, navigation] of [[2, "↑↓ select · enter details · ←→/tab views · [ ] teams · esc close"], [4, "↑↓ cursor · pgup/dn page · home/end · ←→/tab views · [ ] teams · esc close"]] as const) {
+	for (const [tab, navigation] of [[2, "↑↓ select · enter details · ←→/tab views · [ ] teams · d delete · esc teams"], [4, "↑↓ cursor · pgup/dn page · home/end · ←→/tab views · [ ] teams · d delete · esc teams"]] as const) {
 		const popup = overlay(host, { theme: tagged.theme });
 		for (let index = 0; index < tab; index++) popup.component.handleInput("\t");
 		tagged.calls.length = 0;

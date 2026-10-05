@@ -768,6 +768,10 @@ export class SessionBroker {
 		this.validateContextWindow(contextWindow, cwd, selected.model);
 	}
 
+	async listSaved(): Promise<AgentInstance[]> {
+		return this.store.list();
+	}
+
 	async listLinked(): Promise<AgentInstance[]> {
 		const values = await Promise.all(this.roster.list().map(async (link) => {
 			const snapshotEpoch = this.descriptorSnapshotEpoch(link.agentId);

@@ -1,4 +1,5 @@
-import type { SessionBroker } from "./session-broker";
+import { readFile, stat } from "node:fs/promises";
+import type { AgentInstance, SessionBroker } from "./session-broker";
 import { restoreTeamHistory, type TeamHistory } from "./team-history";
 import { TeamJournalGeneration, type TeamJournalSink } from "./team-journal";
 import { TeamMemberDriver } from "./team-member-driver";
@@ -6,6 +7,12 @@ import { TeamRuntime, type TeamRuntimeOptions } from "./team-runtime";
 import type { ResolvedTeamMemberPolicy } from "./tool";
 
 type BranchEntry = { type: string; customType?: string; data?: unknown };
+
+export interface TeamMemberSession {
+	instance?: AgentInstance;
+	size: number;
+	reason?: "already deleted" | "not this Team's session";
+}
 
 export interface TeamHostDiagnostic {
 	code: "INTERRUPTION_JOURNAL_FAILED";
@@ -25,12 +32,17 @@ export class TeamSessionHost {
 	readonly driver: TeamMemberDriver;
 	readonly history: TeamHistory;
 	private readonly pinned = new Map<string, Map<string, ResolvedTeamMemberPolicy>>();
+	private readonly endedAt = new Map<string, number>();
+	private readonly verifiedSessions = new Map<string, Set<string>>();
 	private readonly transitionDiagnostics: TeamHostDiagnostic[] = [];
 	private retiring = false;
 	private closing: Promise<void> | undefined;
 
-	constructor(broker: SessionBroker, sink: TeamJournalSink, branch: readonly BranchEntry[], options: Omit<TeamRuntimeOptions, "journal"> = {}) {
-		this.journal = new TeamJournalGeneration(sink);
+	constructor(readonly broker: SessionBroker, sink: TeamJournalSink, branch: readonly BranchEntry[], options: Omit<TeamRuntimeOptions, "journal"> = {}) {
+		this.journal = new TeamJournalGeneration((record) => {
+			sink(record);
+			if (record.kind === "terminal" || record.kind === "interrupted") this.endedAt.set(record.teamId, record.at);
+		});
 		// The full-ledger invariant sweep is O(works) per call on the UI thread; tests opt in explicitly.
 		this.runtime = new TeamRuntime({ checkInvariants: false, ...options, journal: this.journal });
 		this.driver = new TeamMemberDriver(this.runtime, broker);
@@ -47,6 +59,43 @@ export class TeamSessionHost {
 	hasTeam(teamId: string): boolean {
 		try { this.runtime.getTeam(teamId); return true; }
 		catch { return false; }
+	}
+
+	teamEndedAt(teamId: string): number | undefined {
+		return this.endedAt.get(teamId) ?? this.history.teams.find((team) => team.teamId === teamId)?.at;
+	}
+
+	/** A reused alias is not enough: the saved session must belong to this Team. */
+	async memberSessions(teamId: string, aliases: readonly string[]): Promise<Map<string, TeamMemberSession>> {
+		const saved = await this.broker.listSaved();
+		const sessions = new Map<string, TeamMemberSession>();
+		for (const alias of aliases) {
+			const instance = saved.find((item) => item.alias === alias);
+			if (!instance) { sessions.set(alias, { size: 0, reason: "already deleted" }); continue; }
+			try {
+				const text = await readFile(instance.sessionFile, "utf8");
+				if (!text.includes(teamId)) { sessions.set(alias, { size: 0, reason: "not this Team's session" }); continue; }
+				const { size } = await stat(instance.sessionFile);
+				let verified = this.verifiedSessions.get(teamId);
+				if (!verified) this.verifiedSessions.set(teamId, verified = new Set());
+				verified.add(instance.agentId);
+				sessions.set(alias, { instance, size });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				// A failed store deletion can leave a verified descriptor after the file was removed.
+				sessions.set(alias, this.verifiedSessions.get(teamId)?.has(instance.agentId)
+					? { instance, size: 0 } : { size: 0, reason: "already deleted" });
+			}
+		}
+		return sessions;
+	}
+
+	forgetTeam(teamId: string): void {
+		if (this.hasTeam(teamId)) this.runtime.forgetTeam(teamId);
+		this.history.teams = this.history.teams.filter((team) => team.teamId !== teamId);
+		this.endedAt.delete(teamId);
+		this.verifiedSessions.delete(teamId);
+		this.unpin(teamId);
 	}
 
 	hasUnreleasedResources(): boolean {

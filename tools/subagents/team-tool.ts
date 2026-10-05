@@ -114,6 +114,11 @@ const budgetLimitsText = (limits: TeamBudgetLimits) => `activations ${formatBudg
 
 type PanelFacts = ReturnType<TeamRuntime["panelFacts"]>;
 
+/** Session sizes in host views. */
+export function formatBytes(bytes: number): string {
+	return bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 /** Current context and the last successful compaction, shared by host views. */
 export function memberContextText(member: TeamTeamView["members"][number]): string {
 	const tokens = (value: number) => value >= 1000 ? `${Math.round(value / 1000)}k` : String(value);

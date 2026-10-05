@@ -1265,6 +1265,17 @@ export class TeamRuntime {
 		return [...this.teams.values()].map((team) => this.view(team));
 	}
 
+	/** Remove an ended Team after its member sessions have been deleted. */
+	forgetTeam(teamId: string): void {
+		const team = this.team(teamId);
+		if (!["closed", "failed", "cancelled", "interrupted"].includes(team.lifecycle)
+			|| [...team.members.values()].some((member) => member.resourceState !== "released")) {
+			fail("INVALID_ARGUMENT", `Team ${teamId} has not ended with all members released; cancel it first`);
+		}
+		this.teams.delete(teamId);
+		this.executors.delete(teamId);
+	}
+
 	/** Host observation, coalesced to one call per Team per microtask; listeners must only read. */
 	onChange(listener: (teamId: string) => void): () => void {
 		this.changeListeners.add(listener);

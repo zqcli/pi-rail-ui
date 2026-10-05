@@ -48,6 +48,40 @@ test("history retains bounded worker-authored ResultRecords and validates termin
 	assert.deepEqual(restored.teams[0]?.results, [result], "history keeps the actual result facts, not only a count or summary snapshot");
 });
 
+test("history restores launch time, terminal usage, member lifecycles, root counts and flow", () => {
+	const records = entries() as any[];
+	records.at(-1).data.flow = "wall 3s · work 2s";
+	records.at(-1).data.result.members[1].lifecycle = "faulted";
+	const allRoots = [...roots, { work: { workId: "work-waived", revision: 1 }, state: "cancelled", review: { disposition: "waived", reason: "Not required" } }];
+	records.at(-2).data.roots = allRoots;
+	records.at(-1).data.result.roots = allRoots;
+	const entry = restoreTeamHistory(records).teams[0]!;
+	assert.equal(entry.startedAt, 1);
+	assert.equal(entry.at, 4);
+	assert.deepEqual(entry.usage, terminal().usage);
+	assert.deepEqual(entry.memberStates, records.at(-1).data.result.members);
+	assert.deepEqual(entry.rootCounts, { accepted: 1, waived: 1, total: 2 });
+	assert.equal(entry.flow, "wall 3s · work 2s");
+	const interrupted = restoreTeamHistory([records[0]!, { type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE,
+		data: { version: 2, kind: "interrupted", teamId, at: 9, reason: "Session ended" } }]).teams[0]!;
+	assert.equal(interrupted.startedAt, 1);
+	assert.equal(interrupted.at, 9);
+	assert.equal(interrupted.usage, undefined);
+	assert.equal(interrupted.memberStates, undefined);
+});
+
+test("deleted journal markers hide history, ignore unknown Teams and reject extra keys", () => {
+	const marker = { version: 2, kind: "deleted", teamId, at: 5 };
+	const record = (data: unknown) => ({ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data });
+	const deleted = restoreTeamHistory([...entries(), record(marker), record({ ...marker, teamId: "unknown" })]);
+	assert.deepEqual(deleted.teams, []);
+	assert.equal(deleted.skipped, 0);
+	const invalid = restoreTeamHistory([...entries(), record({ ...marker, members: [] })]);
+	assert.equal(invalid.teams.length, 1);
+	assert.equal(invalid.skipped, 1);
+	assert.equal(restoreTeamHistory(entries()).teams.length, 1, "the branch before the deletion marker still shows the Team");
+});
+
 test("unlimited history accepts 20000 results and roots beyond the old count and byte caps, with old launch records", () => {
 	const results = Array.from({ length: 20000 }, (_, index): ResultRecord => ({ ...result,
 		id: `result-${index}`, work: { workId: `work-${index}`, revision: 1 }, result: { status: "succeeded", summary: "x".repeat(1000) },

@@ -1,15 +1,15 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { BudgetScope } from "./team-budget";
 import { previewText } from "./team-codec";
-import type { TeamSessionHost } from "./team-host";
+import type { TeamMemberSession, TeamSessionHost } from "./team-host";
 import { showTeamOverlay } from "./team-overlay";
 import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, workRefKey, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView } from "./team-protocol";
 import { clock, type GrantPreview } from "./team-runtime";
-import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView, lifecycleText } from "./team-tool";
+import { formatBudgetLimit, formatBytes, formatHistoryEntry, formatHistorySummary, formatTeamView, lifecycleText } from "./team-tool";
 
 const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "compact", "pause", "continue", "review"] as const;
 const REVIEW_USAGE = "review [now|every <N> [by <alias>]|off]";
-const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|compact <alias> [instructions]|pause [reason]|continue|${REVIEW_USAGE}`;
+const USAGE = `Usage: /rail-team [list] | /rail-team delete <id> [<id>…]|ended | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|compact <alias> [instructions]|pause [reason]|continue|${REVIEW_USAGE}`;
 
 /** Live and history Team IDs that equal or start with what the user typed (the popup shows only the first 8 characters). */
 function matchTeamIds(host: TeamSessionHost, typed: string): string[] {
@@ -28,14 +28,18 @@ function completionTeam(host: TeamSessionHost, typed: string) {
  */
 export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionHost | undefined): void {
 	pi.registerCommand("rail-team", {
-		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead, revive, compact, pause, continue)",
+		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead, revive, compact, pause, continue, delete)",
 		getArgumentCompletions: (prefix) => {
 			const host = getHost();
 			if (!host) return null;
 			const parts = prefix.split(/\s+/u);
 			if (parts.length <= 1) {
-				const ids = ["list", ...host.runtime.listTeams().map((team) => team.teamId)].filter((id) => id.startsWith(parts[0] ?? ""));
+				const ids = ["list", "delete", ...matchTeamIds(host, "")].filter((id) => id.startsWith(parts[0] ?? ""));
 				return ids.length ? ids.map((id) => ({ value: id, label: id })) : null;
+			}
+			if (parts[0] === "delete") {
+				const candidates = ["ended", ...matchTeamIds(host, "")].filter((id) => id.startsWith(parts.at(-1) ?? ""));
+				return candidates.length ? candidates.map((id) => ({ value: `${parts.slice(0, -1).join(" ")} ${id}`, label: id })) : null;
 			}
 			if (parts.length === 2) {
 				const subs = SUBCOMMANDS.filter((sub) => sub.startsWith(parts[1] ?? ""));
@@ -69,6 +73,10 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 	if (!args.trim() && ctx.mode === "tui") {
 		const choice = await showTeamOverlay(ctx, host);
 		if (!choice) return;
+		if (choice.action === "delete") {
+			await runTeamCommand(host, `delete ${choice.teamIds.join(" ")}`, ctx);
+			return;
+		}
 		let text = "";
 		if (choice.action === "message") {
 			text = (await ctx.ui.input("Message the lead", "What should the lead know?"))?.trim() ?? "";
@@ -92,6 +100,10 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		return;
 	}
 	const [typedId, subcommand = "status", ...rest] = args.split(/\s+/u).filter(Boolean);
+	if (typedId === "delete") {
+		await deleteTeams(host, args.split(/\s+/u).filter(Boolean).slice(1), ctx);
+		return;
+	}
 	if (!typedId || typedId === "list") {
 		const teams = host.runtime.listTeams();
 		const liveIds = new Set(teams.map((team) => team.teamId));
@@ -237,6 +249,70 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		default:
 			throw new Error(USAGE);
 	}
+}
+
+function deletableTeam(team: TeamTeamView): boolean {
+	return ["closed", "failed", "cancelled", "interrupted"].includes(team.lifecycle)
+		&& team.members.every((member) => member.resourceState === "released");
+}
+
+async function deleteTeams(host: TeamSessionHost, targets: string[], ctx: ExtensionCommandContext): Promise<void> {
+	if (!host.active) throw new Error("The Team runtime for this session branch has ended");
+	if (!targets.length) throw new Error("Usage: /rail-team delete <id> [<id>…]|ended");
+	const live = host.runtime.listTeams();
+	const ids = targets.length === 1 && targets[0] === "ended"
+		? matchTeamIds(host, "").filter((id) => { const team = live.find((item) => item.teamId === id); return !team || deletableTeam(team); })
+		: [...new Set(targets.map((target) => {
+			const matches = matchTeamIds(host, target);
+			if (!matches.length) throw new Error(`Unknown teamId ${target}`);
+			if (matches.length > 1) throw new Error(`Ambiguous teamId ${target}: matches ${matches.join(", ")}`);
+			return matches[0]!;
+		}))];
+	if (!ids.length) { ctx.ui.notify("No ended Teams to delete", "info"); return; }
+	const teams: Array<{ teamId: string; goal: string; sessions: Map<string, TeamMemberSession> }> = [];
+	for (const teamId of ids) {
+		const team = live.find((item) => item.teamId === teamId);
+		if (team && !deletableTeam(team)) throw new Error(`Team ${teamId} has not ended with all members released; cancel it first`);
+		const history = host.history.teams.find((item) => item.teamId === teamId);
+		teams.push({ teamId, goal: team?.brief.goal ?? history?.goal ?? "", sessions: await host.memberSessions(teamId, team?.members.map((member) => member.id) ?? history!.members) });
+	}
+	const total = teams.reduce((bytes, team) => bytes + [...team.sessions.values()].reduce((sum, session) => sum + session.size, 0), 0);
+	const detail = teams.flatMap((team) => {
+		const endedAt = host.teamEndedAt(team.teamId);
+		return [`Team ${team.teamId} · ${team.goal}`, ...[...team.sessions].map(([alias, session]) => {
+			const warning = session.instance && endedAt !== undefined && Date.parse(session.instance.updatedAt) > endedAt
+				? " · WARNING: used after the Team ended; this helper session will still be deleted" : "";
+			return `  ${alias} · ${session.instance ? formatBytes(session.size) : `skipped: ${session.reason}`}${warning}`;
+		})];
+	});
+	if (!await confirm(ctx, `Delete ${teams.length} Team(s)?`, [...detail, `Total size: ${formatBytes(total)}`, "Kept: the main conversation", "This cannot be undone."].join("\n"))) return;
+	if (!host.active) throw new Error("The Team runtime for this session branch has ended");
+	const deleted: string[] = [];
+	const skipped: string[] = [];
+	const failures: string[] = [];
+	let removed = 0;
+	let freed = 0;
+	for (const team of teams) {
+		let complete = true;
+		for (const [alias, session] of team.sessions) {
+			if (!session.instance) { skipped.push(`${alias}: ${session.reason}`); continue; }
+			try {
+				const instance = await host.broker.delete(session.instance.agentId);
+				if (instance) { removed++; freed += session.size; }
+				else skipped.push(`${alias}: already deleted`);
+			} catch (error) {
+				complete = false;
+				failures.push(`${team.teamId}/${alias}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (complete) {
+			host.journal.write({ version: 2, kind: "deleted", teamId: team.teamId, at: Date.now() });
+			host.forgetTeam(team.teamId);
+			deleted.push(team.teamId);
+		}
+	}
+	ctx.ui.notify([`Deleted Teams: ${deleted.join(", ") || "none"}`, `Member sessions removed: ${removed} · freed ${formatBytes(freed)}`,
+		...skipped.map((item) => `Skipped ${item}`), ...failures.map((item) => `Failed ${item}; retry deletion to finish`)].join("\n"), failures.length ? "error" : "info");
 }
 
 function reviewLines(schedule: TeamReviewPlan | undefined, reviews: readonly TeamReviewRecord[]): string[] {

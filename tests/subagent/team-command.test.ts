@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { installTeamCommand, runTeamCommand } from "../../tools/subagents/team-command";
-import type { SessionBroker } from "../../tools/subagents/session-broker";
+import { SessionBroker, type AgentInstance, type AgentInstanceStore, type AgentRoster } from "../../tools/subagents/session-broker";
 import { TeamSessionHost } from "../../tools/subagents/team-host";
+import { formatBytes } from "../../tools/subagents/team-tool";
 import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
+import type { TeamJournalRecord } from "../../tools/subagents/team-journal";
 import type { TeamOverlayComponent } from "../../tools/subagents/team-overlay";
 
 function setup(initialRequests: Array<{ to: string; task: string }> = [], budget?: "standard" | "long" | "unlimited") {
@@ -44,6 +49,214 @@ function commandContext(options: { hasUI?: boolean; mode?: "tui" | "rpc"; confir
 	};
 	return { ctx: ctx as any, notifications, confirmations, overlays };
 }
+
+async function deletionFixture(t: TestContext, options: { reused?: boolean; fail?: boolean } = {}) {
+	const dir = await mkdtemp(join(tmpdir(), "rail-team-delete-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const teamId = "history-delete-team";
+	const saved: AgentInstance[] = [];
+	for (const alias of ["lead", "worker"]) {
+		const sessionFile = join(dir, `${alias}.jsonl`);
+		await writeFile(sessionFile, JSON.stringify({ teamId: options.reused && alias === "worker" ? "unrelated-team" : teamId }));
+		saved.push({ version: 2, agentId: `agent-${alias}`, alias, model: { provider: "local", modelId: "test" }, sessionId: alias,
+			sessionFile, cwd: dir, createdAt: new Date(1).toISOString(), updatedAt: new Date(30).toISOString(), lastTask: "test" });
+	}
+	let fail = options.fail;
+	const removed: string[] = [];
+	const records: TeamJournalRecord[] = [];
+	const broker = {
+		listSaved: async () => saved,
+		delete: async (agentId: string) => {
+			if (fail && agentId === "agent-worker") throw new Error("test deletion failure");
+			const index = saved.findIndex((instance) => instance.agentId === agentId);
+			if (index < 0) return undefined;
+			const instance = saved[index]!;
+			await rm(instance.sessionFile);
+			saved.splice(index, 1);
+			removed.push(agentId);
+			return instance;
+		},
+	} as unknown as SessionBroker;
+	const branch = [
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "launched", teamId, at: 1,
+			roster: { lead: "lead", members: ["lead", "worker"] }, goal: "Delete only this Team's saved sessions" } },
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "interrupted", teamId, at: 20, reason: "Session ended" } },
+	];
+	const host = new TeamSessionHost(broker, (record) => records.push(record), branch);
+	return { host, teamId, saved, removed, records, retry: () => { fail = false; } };
+}
+
+test("delete rejects prepared, active and ended Teams with unreleased members before confirmation", async () => {
+	const { host, teamId } = setup();
+	const ui = commandContext();
+	await assert.rejects(runTeamCommand(host, `delete ${teamId}`, ui.ctx), /cancel it first/u);
+	host.runtime.launch(teamId);
+	await assert.rejects(runTeamCommand(host, `delete ${teamId}`, ui.ctx), /cancel it first/u);
+	host.runtime.cancelTeam(teamId, "Not released yet");
+	await assert.rejects(runTeamCommand(host, `delete ${teamId}`, ui.ctx), /cancel it first/u);
+	assert.equal(ui.confirmations.length, 0);
+});
+
+test("delete confirms goals, verified aliases, sizes, later-use warning and keeping the main conversation", async (t) => {
+	const fixture = await deletionFixture(t);
+	const sessions = await fixture.host.memberSessions(fixture.teamId, ["lead", "worker"]);
+	const total = [...sessions.values()].reduce((bytes, session) => bytes + session.size, 0);
+	assert.equal(sessions.get("worker")!.instance!.model.provider, "local");
+	const declined = commandContext({ confirmation: false });
+	await runTeamCommand(fixture.host, "delete history-delete", declined.ctx);
+	assert.match(declined.confirmations[0]!.message, /history-delete-team · Delete only/u);
+	assert.match(declined.confirmations[0]!.message, /lead · [\d.]+ (B|KB)/u);
+	assert.match(declined.confirmations[0]!.message, /worker · [\d.]+ (B|KB)/u);
+	assert.ok(declined.confirmations[0]!.message.includes(`Total size: ${formatBytes(total)}`));
+	assert.match(declined.confirmations[0]!.message, /WARNING: used after the Team ended/u);
+	assert.match(declined.confirmations[0]!.message, /Kept: the main conversation/u);
+	assert.deepEqual(fixture.removed, []);
+	await assert.rejects(runTeamCommand(fixture.host, `delete ${fixture.teamId}`, commandContext({ hasUI: false }).ctx), /interactive confirmation/u);
+	const ui = commandContext();
+	await runTeamCommand(fixture.host, `delete ${fixture.teamId}`, ui.ctx);
+	assert.deepEqual(fixture.removed, ["agent-lead", "agent-worker"]);
+	assert.equal(fixture.records.length, 1);
+	assert.equal(fixture.records[0]!.kind, "deleted");
+	assert.equal(fixture.host.history.teams.length, 0);
+	assert.match(ui.notifications[0]!.text, /Member sessions removed: 2/u);
+	assert.ok(ui.notifications[0]!.text.includes(`freed ${formatBytes(total)}`));
+	assert.equal((await fixture.host.memberSessions(fixture.teamId, ["worker"])).get("worker")!.reason, "already deleted");
+});
+
+test("delete skips a reused alias whose saved session belongs to another Team", async (t) => {
+	const fixture = await deletionFixture(t, { reused: true });
+	const unrelated = fixture.saved[1]!;
+	const text = await readFile(unrelated.sessionFile, "utf8");
+	const ui = commandContext();
+	await runTeamCommand(fixture.host, `delete ${fixture.teamId}`, ui.ctx);
+	assert.deepEqual(fixture.removed, ["agent-lead"]);
+	assert.deepEqual(fixture.saved, [unrelated]);
+	assert.equal(await readFile(unrelated.sessionFile, "utf8"), text);
+	assert.match(ui.notifications[0]!.text, /Skipped worker: not this Team's session/u);
+	assert.equal(fixture.host.history.teams.length, 0);
+});
+
+test("partial deletion writes no marker; retry skips the gone member and finishes", async (t) => {
+	const fixture = await deletionFixture(t, { fail: true });
+	const ui = commandContext();
+	await runTeamCommand(fixture.host, `delete ${fixture.teamId}`, ui.ctx);
+	assert.deepEqual(fixture.removed, ["agent-lead"]);
+	assert.deepEqual(fixture.records, []);
+	assert.equal(fixture.host.history.teams.length, 1);
+	assert.equal(ui.notifications[0]!.type, "error");
+	assert.match(ui.notifications[0]!.text, /test deletion failure; retry/u);
+	fixture.retry();
+	await runTeamCommand(fixture.host, `delete ${fixture.teamId}`, ui.ctx);
+	assert.deepEqual(fixture.removed, ["agent-lead", "agent-worker"]);
+	assert.equal(fixture.records.length, 1);
+	assert.equal(fixture.host.history.teams.length, 0);
+	assert.match(ui.notifications.at(-1)!.text, /Skipped lead: already deleted/u);
+});
+
+test("retry real broker deletion after rm succeeds but store.delete fails removes the descriptor and roster", async (t) => {
+	const fixture = await deletionFixture(t);
+	const instances = new Map(fixture.saved.map((instance) => [instance.agentId, instance]));
+	const links = new Map(fixture.saved.map((instance) => [instance.alias, instance.agentId]));
+	links.set("worker-link", "agent-worker");
+	let fail = true;
+	const store: AgentInstanceStore = {
+		get: async (id) => instances.get(id),
+		put: async (instance) => { instances.set(instance.agentId, instance); },
+		list: async () => [...instances.values()],
+		delete: async (id) => { if (fail && id === "agent-worker") throw new Error("store.delete failed after rm"); instances.delete(id); },
+	};
+	const roster: AgentRoster = {
+		resolve: (alias) => links.get(alias),
+		link: (alias, id) => { links.set(alias, id); },
+		unlink: (alias) => { links.delete(alias); },
+		list: () => [...links].map(([alias, agentId]) => ({ alias, agentId })),
+	};
+	const broker = new SessionBroker({ store, roster, workerFactory: async () => { throw new Error("Deletion must not start a worker"); } });
+	const history = fixture.host.history.teams[0]!;
+	const records: TeamJournalRecord[] = [];
+	const host = new TeamSessionHost(broker, (record) => records.push(record), [
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "launched", teamId: history.teamId,
+			at: history.startedAt, roster: { lead: history.lead, members: history.members }, goal: history.goal } },
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "interrupted", teamId: history.teamId,
+			at: history.at, reason: history.reason } },
+	]);
+	const workerFile = instances.get("agent-worker")!.sessionFile;
+	const ui = commandContext();
+	await runTeamCommand(host, `delete ${history.teamId}`, ui.ctx);
+	await assert.rejects(readFile(workerFile), { code: "ENOENT" });
+	assert.ok(instances.has("agent-worker"));
+	assert.equal(links.get("worker-link"), "agent-worker");
+	assert.equal(records.length, 0);
+	assert.equal(host.history.teams.length, 1);
+	fail = false;
+	await runTeamCommand(host, `delete ${history.teamId}`, ui.ctx);
+	assert.equal(instances.size, 0);
+	assert.equal(links.size, 0);
+	assert.equal(records.length, 1);
+	assert.equal(records[0]!.kind, "deleted");
+	assert.equal(host.history.teams.length, 0);
+});
+
+test("a missing session file never verified for this Team is skipped even when its alias is saved", async (t) => {
+	const fixture = await deletionFixture(t);
+	await rm(fixture.saved[1]!.sessionFile);
+	const sessions = await fixture.host.memberSessions(fixture.teamId, ["worker"]);
+	assert.equal(sessions.get("worker")!.instance, undefined);
+	assert.equal(sessions.get("worker")!.reason, "already deleted");
+});
+
+test("popup d closes the overlay before the shared delete confirmation and honors rejection", async (t) => {
+	const fixture = await deletionFixture(t);
+	const ui = commandContext({ overlayKey: "d", confirmation: false });
+	const confirm = ui.ctx.ui.confirm;
+	ui.ctx.ui.confirm = async (title: string, message: string) => {
+		assert.equal(ui.overlays[0]!.disposed, true);
+		return confirm(title, message);
+	};
+	await runTeamCommand(fixture.host, "", ui.ctx);
+	assert.equal(ui.confirmations.length, 1);
+	assert.match(ui.confirmations[0]!.message, /Kept: the main conversation/u);
+	assert.deepEqual(fixture.removed, []);
+	assert.equal(fixture.host.history.teams.length, 1);
+});
+
+test("delete IDs validate the complete selection before any deletion", async (t) => {
+	const fixture = await deletionFixture(t);
+	fixture.host.history.teams.push({ ...fixture.host.history.teams[0]!, teamId: "history-delete-other" });
+	const ui = commandContext();
+	await assert.rejects(runTeamCommand(fixture.host, "delete history-delete", ui.ctx), /Ambiguous teamId/u);
+	await assert.rejects(runTeamCommand(fixture.host, `delete ${fixture.teamId} unknown`, ui.ctx), /Unknown teamId/u);
+	assert.equal(ui.confirmations.length, 0);
+	assert.deepEqual(fixture.removed, []);
+	await runTeamCommand(fixture.host, "delete history-delete-team history-delete-other", ui.ctx);
+	assert.equal(ui.confirmations.length, 1);
+	assert.equal(fixture.host.history.teams.length, 0);
+	assert.equal(fixture.records.length, 2);
+});
+
+test("delete ended selects history and released ended runtime Teams, preserves prepared/active and completes IDs", async (t) => {
+	const fixture = await deletionFixture(t);
+	const prepare = (lead: string, worker: string) => fixture.host.runtime.prepare({ members: [{ alias: lead, roleDescription: "Lead" },
+		{ alias: worker, roleDescription: "Worker" }], lead, brief: { goal: "Local Team" }, initialRequests: [], timeoutSeconds: null }).teamId;
+	const ended = prepare("ended-lead", "ended-worker");
+	fixture.host.runtime.cancelTeam(ended, "Never launched");
+	const prepared = prepare("prepared-lead", "prepared-worker");
+	const active = prepare("active-lead", "active-worker");
+	fixture.host.runtime.launch(active);
+	let command: any;
+	installTeamCommand({ registerCommand: (_name: string, value: any) => { command = value; } } as any, () => fixture.host);
+	assert.ok(command.getArgumentCompletions("del").some((item: any) => item.label === "delete"));
+	assert.ok(command.getArgumentCompletions("delete ").some((item: any) => item.label === fixture.teamId));
+	assert.ok(command.getArgumentCompletions(`delete ${fixture.teamId} `).some((item: any) => item.label === ended));
+	const ui = commandContext();
+	await runTeamCommand(fixture.host, "delete ended", ui.ctx);
+	assert.deepEqual(fixture.host.runtime.listTeams().map((team) => team.teamId), [prepared, active]);
+	assert.equal(fixture.host.history.teams.length, 0);
+	assert.equal(fixture.records.filter((record) => record.kind === "deleted").length, 2);
+	assert.equal(ui.confirmations.length, 1);
+	assert.doesNotMatch(ui.confirmations[0]!.message, new RegExp(prepared, "u"));
+	assert.doesNotMatch(ui.confirmations[0]!.message, new RegExp(active, "u"));
+});
 
 test("compact completes open aliases, confirms instructions and reports the immediate receipt", async () => {
 	const { host, teamId } = setup();

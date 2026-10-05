@@ -1,23 +1,31 @@
 import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Focusable, type TUI } from "@earendil-works/pi-tui";
-import type { TeamSessionHost } from "./team-host";
+import type { TeamMemberSession, TeamSessionHost } from "./team-host";
+import { railModelReference } from "./models";
 import { COMPACT_THRESHOLD_CHOICES, readCompactThreshold, writeCompactThreshold } from "./team-compaction-settings";
 import { flowLegend, flowRows } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, shortWorkRef, workRefKey, type TeamMemberView, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
-import { memberContextText, memberDetail } from "./team-tool";
+import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
 
-const TABS = ["Overview", "Progress", "Members", "Tasks", "Timeline"] as const;
+const TABS = ["Teams", "Overview", "Progress", "Members", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
-export interface TeamOverlayAction { teamId: string; action: "cancel" | "resume" | "grant" | "message" | "revive" | "compact" | "lead" | "pause" | "continue"; memberId?: string }
+export type TeamOverlayAction = { action: "delete"; teamIds: string[] }
+	| { teamId: string; action: "cancel" | "resume" | "grant" | "message" | "revive" | "compact" | "lead" | "pause" | "continue"; memberId?: string };
 type Facts = ReturnType<TeamSessionHost["runtime"]["panelFacts"]>;
-type Row = { text: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string };
+type Row = { text: string; teamId?: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string };
 const oneLine = (text: string) => stripTerminalSequences(text).replace(/\s+/gu, " ").trim();
 const compact = (text: string, width: number) => truncateToWidth(oneLine(text), Math.max(1, width));
 const fit = (text: string, width: number) => truncateToWidth(text, Math.max(1, width), "", true);
 const column = (text: string, width: number) => fit(truncateToWidth(text, Math.max(1, width)), width);
 const clock = (ms: number) => `${Math.floor(Math.max(0, ms) / 60000)}:${String(Math.floor(Math.max(0, ms) / 1000) % 60).padStart(2, "0")}`;
+const startTime = (at: number | undefined) => {
+	if (at === undefined) return "—";
+	const date = new Date(at);
+	const pad = (value: number) => String(value).padStart(2, "0");
+	return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
 const writable = (team: TeamTeamView) => team.lifecycle === "prepared" || team.lifecycle === "active" || team.lifecycle === "closing";
 const VERDICTS = { on_track: ["on track", "success"], at_risk: ["at risk", "warning"], off_track: ["off track", "error"] } as const;
 const verdictOf = (review: TeamReviewRecord) => review.verdict ? VERDICTS[review.verdict] : ["no verdict", "muted"] as const;
@@ -110,6 +118,8 @@ export class TeamOverlayComponent implements Focusable {
 	private rows: Row[] = [];
 	private detail: string | undefined;
 	private expanded = new Set<string>();
+	private marked = new Set<string>();
+	private readonly sessions = new Map<string, Map<string, TeamMemberSession>>();
 	private followTimeline = true;
 	private timelineCursor: string | undefined;
 	private notice = "";
@@ -126,7 +136,9 @@ export class TeamOverlayComponent implements Focusable {
 		private readonly now: () => number = Date.now,
 	) {
 		const teams = host.runtime.listTeams();
-		this.teamId = teams.find((team) => team.lifecycle === "active")?.teamId ?? this.teamIds()[0];
+		const active = teams.find((team) => team.lifecycle === "active");
+		this.teamId = active?.teamId ?? this.teamIds()[0];
+		this.tab = active || this.teamIds().length === 1 ? 1 : 0;
 		const refresh = () => { if (!this.disposed) this.tui.requestRender(); };
 		this.unsubscribe = [host.runtime.onChange(refresh), host.driver.onActivity(refresh)];
 		this.timer = setInterval(refresh, 1000);
@@ -159,11 +171,19 @@ export class TeamOverlayComponent implements Focusable {
 		if (this.disposed) return;
 		if (matchesKey(data, Key.escape) || this.keybindings.matches(data, "tui.select.cancel")) {
 			if (this.detail) this.resetPosition();
+			else if (this.tab !== 0) { this.tab = 0; this.resetPosition(); }
 			else { this.dispose(); this.done(undefined); return; }
 		} else if (matchesKey(data, Key.tab) || matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left) || matchesKey(data, Key.right)) {
 			const back = matchesKey(data, Key.left) || matchesKey(data, Key.shift("tab"));
 			this.tab = (this.tab + (back ? TABS.length - 1 : 1)) % TABS.length;
 			this.resetPosition();
+		} else if (data === " " && this.tab === 0) {
+			const teamId = this.rows[this.selected]?.teamId;
+			if (teamId && !this.marked.delete(teamId)) this.marked.add(teamId);
+		} else if (data === "d") {
+			const teamIds = this.tab === 0 ? this.marked.size ? this.teamIds().filter((id) => this.marked.has(id)) : [this.rows[this.selected]?.teamId].filter((id): id is string => !!id)
+				: this.teamId ? [this.teamId] : [];
+			if (teamIds.length) { this.dispose(); this.done({ action: "delete", teamIds }); return; }
 		} else if (data === "t") {
 			const choices = COMPACT_THRESHOLD_CHOICES;
 			const threshold = readCompactThreshold();
@@ -174,6 +194,7 @@ export class TeamOverlayComponent implements Focusable {
 			this.teamId = ids[(ids.indexOf(this.teamId!) + (data === "[" ? -1 : 1) + ids.length) % ids.length];
 			this.expanded.clear();
 			this.resetPosition();
+			if (this.tab === 0) this.selected = ids.indexOf(this.teamId!);
 		} else if (this.keybindings.matches(data, "tui.select.up") || this.keybindings.matches(data, "tui.select.down") || matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown) || matchesKey(data, Key.home) || matchesKey(data, Key.end)) {
 			const step = this.keybindings.matches(data, "tui.select.up") ? -1 : this.keybindings.matches(data, "tui.select.down") ? 1 : matchesKey(data, Key.pageUp) ? -this.pageSize : this.pageSize;
 			this.selected = matchesKey(data, Key.home) ? 0 : matchesKey(data, Key.end) ? this.rows.length - 1 : this.selected + step;
@@ -182,7 +203,8 @@ export class TeamOverlayComponent implements Focusable {
 			this.timelineCursor = this.rows[this.selected]?.milestone;
 		} else if (this.keybindings.matches(data, "tui.select.confirm")) {
 			const row = this.rows[this.selected];
-			if (row?.member ?? row?.review) { this.resetPosition(); this.detail = row.member ?? row.review; }
+			if (row?.teamId) { this.teamId = row.teamId; this.tab = 1; this.resetPosition(); }
+			else if (row?.member ?? row?.review) { this.resetPosition(); this.detail = row.member ?? row.review; }
 			else if (row?.fold) {
 				if (!this.expanded.delete(row.fold)) this.expanded.add(row.fold);
 			}
@@ -191,7 +213,7 @@ export class TeamOverlayComponent implements Focusable {
 			const action = ({ c: "cancel", r: "resume", g: "grant", m: "message", v: "revive", z: "compact", l: "lead", p: team?.paused ? "continue" : "pause" } as const)[data as "c" | "r" | "g" | "m" | "v" | "z" | "l" | "p"];
 			if (action && team && writable(team) && this.host.active) {
 				this.dispose();
-				const memberId = action === "compact" && this.tab === 2 ? this.detail ?? this.rows[this.selected]?.member : undefined;
+				const memberId = action === "compact" && this.tab === 3 ? this.detail ?? this.rows[this.selected]?.member : undefined;
 				this.done({ teamId: team.teamId, action, ...(memberId ? { memberId } : {}) });
 				return;
 			}
@@ -210,17 +232,18 @@ export class TeamOverlayComponent implements Focusable {
 		const facts = team ? this.host.runtime.panelFacts(team.teamId) : undefined;
 		const reviews = team ? this.host.runtime.listReviews(team.teamId) : history?.reviews ?? [];
 		let rows: Row[] = [];
-		if (this.tab === 1 && (team || history)) rows = this.detail ? this.reviewDetail(reviews, inner - 1) : this.reviewRows(reviews, inner - 3);
+		if (this.tab === 0) rows = ids.length ? this.teams(inner - 3) : [{ text: "No teams" }];
+		else if (this.tab === 2 && (team || history)) rows = this.detail ? this.reviewDetail(reviews, inner - 1) : this.reviewRows(reviews, inner - 3);
 		else if (team && facts) {
 			if (this.detail) rows = this.memberDetail(team, works, facts, inner - 1);
-			else if (this.tab === 0) rows = this.overview(team, works, facts, inner - 1);
-			else if (this.tab === 2) rows = this.members(team, works, facts, inner - 3);
-			else if (this.tab === 3) rows = buildTeamTaskRows(works, this.expanded, this.theme, inner - 3);
+			else if (this.tab === 1) rows = this.overview(team, works, facts, inner - 1);
+			else if (this.tab === 3) rows = this.members(team, works, facts, inner - 3);
+			else if (this.tab === 4) rows = buildTeamTaskRows(works, this.expanded, this.theme, inner - 3);
 			else rows = this.timeline(facts);
 		} else if (history) rows = this.historyRows(history, inner - 1);
 		else rows = [{ text: "No teams" }];
 		this.rows = rows;
-		if (this.tab === 4) {
+		if (this.tab === 5) {
 			if (this.followTimeline) this.selected = rows.length - 1;
 			else if (this.timelineCursor) {
 				const index = rows.findIndex((row) => row.milestone === this.timelineCursor);
@@ -230,21 +253,21 @@ export class TeamOverlayComponent implements Focusable {
 		this.selected = Math.max(0, Math.min(this.selected, rows.length - 1));
 		this.timelineCursor = rows[this.selected]?.milestone;
 		// Overview already shows Waiting for in its body.
-		const notice = this.tab !== 0 && /^Lead (decision|failed)/u.test(facts?.waitingFor ?? "") ? `Waiting for: ${facts!.waitingFor}`
+		const notice = this.tab > 1 && /^Lead (decision|failed)/u.test(facts?.waitingFor ?? "") ? `Waiting for: ${facts!.waitingFor}`
 			: this.notice;
-		const omitted = this.tab === 4 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
+		const omitted = this.tab === 5 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
 		const live = !!team && writable(team) && this.host.active;
 		const help = this.helpLines(live, ids.length > 1, !!team?.paused, inner - 1).flatMap((text) => wrapTextWithAnsi(text, inner - 1));
 		const room = height - 6 - help.length - (notice ? 1 : 0) - (omitted ? 1 : 0);
 		// The snapshot block yields to the list on short terminals, keeping at least three list rows.
-		const head = (this.tab === 1 && !this.detail && (team || history) ? this.progressHead(team, works, facts, reviews, team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review, history?.flow, inner - 1) : []).slice(0, Math.max(0, room - 3));
+		const head = (this.tab === 2 && !this.detail && (team || history) ? this.progressHead(team, works, facts, reviews, team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review, history?.flow, inner - 1) : []).slice(0, Math.max(0, room - 3));
 		const available = Math.max(1, room - head.length);
-		const selectable = !this.detail && this.tab !== 0 && (this.tab === 1 ? reviews.length > 0 : !!team);
+		const selectable = !this.detail && (this.tab === 0 ? ids.length > 0 : this.tab !== 1 && (this.tab === 2 ? reviews.length > 0 : !!team));
 		// The cap keeps the selection details under Progress/Members/Tasks; the Timeline has none.
-		const cap = this.tab === 4 ? available : Math.min(8, this.tui.terminal.rows - 13);
+		const cap = this.tab === 0 || this.tab === 5 ? available : Math.min(8, this.tui.terminal.rows - 13);
 		this.pageSize = selectable ? Math.max(1, Math.min(cap, available)) : available;
-		const details = this.detail ? [] : this.tab === 1 ? this.reviewDetails(reviews, inner - 1) : team && facts ? this.selectionDetails(team, works, facts, inner - 1) : [];
+		const details = this.detail ? [] : this.tab === 2 ? this.reviewDetails(reviews, inner - 1) : team && facts ? this.selectionDetails(team, works, facts, inner - 1) : [];
 		const showDetails = details.length > 0 && available >= Math.min(rows.length, this.pageSize) + details.length + 1;
 		this.offset = Math.max(0, Math.min(this.offset, rows.length - this.pageSize));
 		// Without a visible cursor the hidden cursor is the scroll offset, so every key scrolls at once.
@@ -256,10 +279,10 @@ export class TeamOverlayComponent implements Focusable {
 			if (!selectable) return ` ${row.text}`;
 			return index + this.offset === this.selected ? `${this.theme.fg("accent", " → ")}${this.theme.fg("accent", row.text)}` : `   ${row.text}`;
 		});
-		const title = `${this.theme.fg("accent", this.theme.bold("Rail Team"))}  ${this.renderTabs()}`;
 		const selector = ids.length > 1 ? `‹ ${ids.indexOf(this.teamId!) + 1}/${ids.length} › ${this.teamId!.slice(0, 8)}` : "";
+		const title = `${this.theme.fg("accent", this.theme.bold("Rail Team"))}  ${this.renderTabs(inner - 12 - (selector ? visibleWidth(selector) + 2 : 0))}`;
 		const header = selector ? `${fit(title, inner - visibleWidth(selector) - 2)} ${this.theme.fg("dim", selector)}` : title;
-		const summary = team && facts ? this.summaryText(team, works, facts) : history ? `${history.lifecycle.toUpperCase()} · history (read-only) · ${history.results.length} results` : "No teams";
+		const summary = this.tab === 0 ? `${ids.length} Team${ids.length === 1 ? "" : "s"}` : team && facts ? this.summaryText(team, works, facts) : history ? `${history.lifecycle.toUpperCase()} · history (read-only) · ${history.results.length} results` : "No teams";
 		const border = (text: string) => this.theme.fg("borderAccent", text);
 		const line = (text = "") => `${this.theme.fg("border", "│")}${fit(text, inner)}${this.theme.fg("border", "│")}`;
 		return [border(`╭${"─".repeat(inner)}╮`), line(` ${header}`), line(` ${this.theme.fg("dim", summary)}`), line(),
@@ -269,8 +292,14 @@ export class TeamOverlayComponent implements Focusable {
 			...help.map((text) => line(` ${this.theme.fg("dim", text)}`)), border(`╰${"─".repeat(inner)}╯`)];
 	}
 
-	private renderTabs(): string {
-		return TABS.map((tab, index) => index === this.tab ? this.theme.fg("accent", `[${tab}]`) : this.theme.fg("dim", ` ${tab} `)).join(" ");
+	private renderTabs(width: number): string {
+		const tabs = TABS.map((tab, index) => index === this.tab ? this.theme.fg("accent", `[${tab}]`) : this.theme.fg("dim", ` ${tab} `));
+		let start = 0, end = tabs.length;
+		while (end - start > 1 && visibleWidth(tabs.slice(start, end).join(" ")) > width) {
+			if (this.tab - start > end - this.tab - 1) start++;
+			else end--;
+		}
+		return tabs.slice(start, end).join(" ");
 	}
 
 	private summaryText(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts): string {
@@ -282,6 +311,31 @@ export class TeamOverlayComponent implements Focusable {
 			...(!writable(team) || !this.host.active ? ["read-only"] : [])].join(" · ");
 	}
 
+	private teams(width: number): Row[] {
+		const live = this.host.runtime.listTeams();
+		return this.teamIds().map((teamId) => {
+			const team = live.find((item) => item.teamId === teamId);
+			const history = this.host.history.teams.find((item) => item.teamId === teamId);
+			const facts = team ? this.host.runtime.panelFacts(teamId) : undefined;
+			const lifecycle = team?.lifecycle ?? history!.lifecycle;
+			const outcome = team?.outcome ?? history?.outcome;
+			const active = lifecycle === "active" || lifecycle === "closing";
+			const closed = lifecycle === "closed" || lifecycle === "completed";
+			const icon = active ? ICONS.running : closed ? ICONS.completed : lifecycle === "prepared" ? ICONS.idle : ICONS.failed;
+			const color = active ? "accent" : closed ? "success" : lifecycle === "prepared" ? "muted" : "error";
+			const started = facts?.timeline[0]?.at ?? history?.startedAt;
+			const duration = team && facts ? clock(this.elapsed(team, facts)) : history?.startedAt !== undefined ? clock(history.at - history.startedAt) : "—";
+			const members = team?.members.length ?? history!.members.length;
+			const roots = team ? `${this.host.runtime.listWorks(teamId).filter((work) => !work.parent && !work.kind && work.review === "accepted").length}/${team.works.roots}` : history?.rootCounts ? `${history.rootCounts.accepted}/${history.rootCounts.total}` : "—";
+			const label = outcome ? ` ${outcome === "succeeded" ? "ok" : outcome}` : "";
+			const status = `${this.marked.has(teamId) ? "*" : this.theme.fg(color, icon)} ${column(teamId.slice(0, 8), 8)} ${lifecycle.toUpperCase()}${label} ${duration} `;
+			const suffix = ` roots ${roots} ${startTime(started)} `;
+			const memberCount = visibleWidth(`${status}${members} members${suffix}`) + 8 <= width ? `${members} members` : `${members}m`;
+			const prefix = `${status}${memberCount}${suffix}`;
+			return { teamId, text: `${prefix}${compact(team?.brief.goal ?? history?.goal ?? "not retained", width - visibleWidth(prefix))}` };
+		});
+	}
+
 	private elapsed(team: TeamTeamView, facts: Facts): number {
 		const start = facts.timeline[0]?.at ?? this.now();
 		return (writable(team) ? this.now() : facts.timeline.at(-1)?.at ?? start) - start;
@@ -289,9 +343,10 @@ export class TeamOverlayComponent implements Focusable {
 
 	/** Navigation for the current view, then (live Teams only) every action key with its name; the caller wraps rows wider than the popup. */
 	private helpLines(live: boolean, multiple: boolean, paused: boolean, width: number): string[] {
-		const view = this.detail ? "↑↓/pgup/dn scroll · esc back" : this.tab === 0 ? "↑↓ scroll" : this.tab === 1 || this.tab === 2 ? "↑↓ select · enter details"
-			: this.tab === 3 ? "↑↓ select · enter fold" : "↑↓ cursor · pgup/dn page · home/end";
-		const navigation = [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? [] : ["read-only"]), ...(!this.detail ? ["esc close"] : [])].join(" · ");
+		if (this.tab === 0) return ["↑↓ select · enter open · space mark · d delete · esc close", "←→/tab views" + (multiple ? " · [ ] teams" : "")];
+		const view = this.detail ? "↑↓/pgup/dn scroll · esc back" : this.tab === 1 ? "↑↓ scroll" : this.tab === 2 || this.tab === 3 ? "↑↓ select · enter details"
+			: this.tab === 4 ? "↑↓ select · enter fold" : "↑↓ cursor · pgup/dn page · home/end";
+		const navigation = [view, ...(!this.detail ? ["←→/tab views"] : []), ...(multiple ? ["[ ] teams"] : []), ...(live ? [] : ["read-only"]), ...(!this.detail ? ["d delete", "esc teams"] : [])].join(" · ");
 		// Whole keys per row: a key is never split or left with a dangling separator.
 		const threshold = readCompactThreshold();
 		const keys = [paused ? "p continue" : "p pause", "c cancel", "r resume hold", "g grant", "m message", "v revive", "l new lead", "z compact", `t compact at ${threshold === null ? "off" : `${threshold}%`}`];
@@ -359,13 +414,13 @@ export class TeamOverlayComponent implements Focusable {
 		const row = this.rows[this.selected];
 		const title = (text: string) => this.theme.fg("toolTitle", this.theme.bold(text));
 		const dim = (text: string) => this.theme.fg("dim", compact(text, width));
-		if (this.tab === 2 && row?.member) {
+		if (this.tab === 3 && row?.member) {
 			const member = team.members.find((member) => member.id === row.member)!;
 			const work = assignedWork(member, works);
 			return [title(member.id), dim(`Task: ${work ? this.host.runtime.getWork(team.teamId, work.work)!.current.task : member.id === team.lead ? team.brief.goal : "No assigned work"}`),
 				...(memberContextText(member) ? [dim(memberContextText(member))] : []), dim(`Route: ${memberRoute(member, work)}`), dim(latestResult(member.id, works, facts))];
 		}
-		if (this.tab === 3 && row?.work) {
+		if (this.tab === 4 && row?.work) {
 			const work = row.work;
 			return [title(workRefKey(work.work)), dim(`From: ${work.requester} → ${work.assignee} → ${work.requester}`),
 				dim(`State: ${workState(work)} · resultRef: ${work.resultRef ?? "—"}`), dim(`Task: ${this.host.runtime.getWork(team.teamId, work.work)!.current.task}`)];
@@ -460,11 +515,32 @@ export class TeamOverlayComponent implements Focusable {
 		return facts.timeline.map((entry) => ({ text: `${clock(entry.at - origin).padStart(7)}  ${oneLine(entry.text)}`, milestone: `${entry.at}:${entry.text}` }));
 	}
 
+	private historyMembers(entry: TeamHistoryEntry): string[] {
+		if (!this.sessions.has(entry.teamId)) {
+			this.sessions.set(entry.teamId, new Map());
+			void this.host.memberSessions(entry.teamId, entry.members).then((sessions) => {
+				this.sessions.set(entry.teamId, sessions);
+			}, (error: unknown) => { this.notice = error instanceof Error ? error.message : String(error); })
+				.then(() => { if (!this.disposed) this.tui.requestRender(); });
+		}
+		return entry.members.map((name) => {
+			const session = this.sessions.get(entry.teamId)!.get(name);
+			const lifecycle = entry.memberStates?.find((member) => member.id === name)?.lifecycle ?? "activity not retained";
+			const saved = !session ? "checking session…" : session.instance ? `${railModelReference(session.instance.model)} · ${formatBytes(session.size)}` : "session deleted";
+			return `${name} · ${lifecycle} · ${entry.results.filter((result) => result.author === name).length} results · ${saved}`;
+		});
+	}
+
 	private historyRows(entry: TeamHistoryEntry, width: number): Row[] {
 		const heading = `Team ${entry.teamId} · ${entry.lifecycle.toUpperCase()} · ${entry.version === 1 ? "legacy · " : ""}history (read-only)`;
-		const lines = this.tab === 0 ? [heading, `Goal: ${entry.goal ?? "not retained"}`, `Outcome: ${entry.outcome ?? entry.lifecycle}`, entry.reason ?? "", `${entry.results.length} retained results`]
-			: this.tab === 2 ? [heading, ...entry.members.map((name) => `${name} · ${entry.results.filter((result) => result.author === name).length} results · activity not retained`)]
-				: this.tab === 3 ? [heading, "Work ledger not retained; retained results:", ...entry.results.map((result) => `${shortWorkRef(result.work)} · ${result.author} · ${result.result.status} · ${result.id}: ${oneLine(result.result.summary)}`)]
+		const lines = this.tab === 1 ? [heading, `Goal: ${entry.goal ?? "not retained"}`, `Outcome: ${entry.outcome ?? entry.lifecycle}`, entry.reason ?? "",
+			`Started: ${entry.startedAt === undefined ? "not retained" : new Date(entry.startedAt).toLocaleString()}`,
+			`Ended: ${new Date(entry.at).toLocaleString()} · duration ${entry.startedAt === undefined ? "not retained" : clock(entry.at - entry.startedAt)}`,
+			...(entry.usage ? [`Tokens: input ${entry.usage.input} · output ${entry.usage.output} · cache ${entry.usage.cacheRead}/${entry.usage.cacheWrite}`] : []),
+			...(entry.flow ? [`Flow: ${entry.flow}`] : []),
+			...(entry.rootCounts ? [`Roots: ${entry.rootCounts.accepted}/${entry.rootCounts.total} accepted · ${entry.rootCounts.waived} waived`] : []), `${entry.results.length} retained results`]
+			: this.tab === 3 ? [heading, ...this.historyMembers(entry)]
+				: this.tab === 4 ? [heading, "Work ledger not retained; retained results:", ...entry.results.map((result) => `${shortWorkRef(result.work)} · ${result.author} · ${result.result.status} · ${result.id}: ${oneLine(result.result.summary)}`)]
 					: [heading, "Timeline not retained in history"];
 		return lines.flatMap((text) => wrapTextWithAnsi(oneLine(text), width).map((text) => ({ text })));
 	}

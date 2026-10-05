@@ -114,6 +114,15 @@ const budgetLimitsText = (limits: TeamBudgetLimits) => `activations ${formatBudg
 
 type PanelFacts = ReturnType<TeamRuntime["panelFacts"]>;
 
+/** Current context and the last successful compaction, shared by host views. */
+export function memberContextText(member: TeamTeamView["members"][number]): string {
+	const tokens = (value: number) => value >= 1000 ? `${Math.round(value / 1000)}k` : String(value);
+	const context = member.context;
+	const last = member.lastCompaction;
+	return [context ? `ctx ${tokens(context.used)}/${tokens(context.window)} ${Math.round(context.percent)}%` : "",
+		member.compacting ? "compacting…" : last ? `compacted ${last.tokensBefore === undefined ? "?" : tokens(last.tokensBefore)}→${last.tokensAfter === undefined ? "?" : tokens(last.tokensAfter)}` : ""].filter(Boolean).join(" · ");
+}
+
 /** Team state of one member: lifecycle, activity and current work, queues, pause, Team events, results, error. */
 function memberStateText(member: TeamTeamView["members"][number], works: readonly TeamWorkSummary[], lead: string, facts?: PanelFacts,
 	refText: (ref: WorkRef) => string = workRefKey): string {
@@ -127,7 +136,7 @@ function memberStateText(member: TeamTeamView["members"][number], works: readonl
 	const events = facts && member.id === lead ? ` · pending events ${facts.pendingEvents}` : "";
 	const results = facts?.results.get(member.id)?.count;
 	const error = member.error ? ` · ${member.error.code}: ${previewText(member.error.message, 160)}` : "";
-	return `${upper(member.lifecycle)} · ${activity}${pause}${retrying ? ` · ${retrying}` : ""}${events}${results ? ` · results ${results}` : ""}${error}`;
+	return `${upper(member.lifecycle)} · ${activity}${pause}${retrying ? ` · ${retrying}` : ""}${events}${results ? ` · results ${results}` : ""}${error}${memberContextText(member) ? ` · ${memberContextText(member)}` : ""}`;
 }
 
 export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSummary[] = [], totalHolds = works.filter((work) => work.hold).length,

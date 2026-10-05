@@ -408,7 +408,7 @@ const ACTION_FIELDS = {
 	reply: ["result"],
 	yield: ["waitingFor", "checkpoint", "attention"],
 	status: ["view", "id", "cursor", "limit"],
-	control: ["command", "memberId", "workId", "expectedRevision", "task", "inputRefs", "reason", "incidentId", "instruction", "work", "disposition", "resultRefs", "outcome"],
+	control: ["command", "memberId", "workId", "expectedRevision", "task", "inputRefs", "reason", "incidentId", "instruction", "instructions", "work", "disposition", "resultRefs", "outcome"],
 } as const;
 const CONTROL_FIELDS: Record<TeamControl["command"], readonly string[]> = {
 	pause_member: ["memberId"],
@@ -419,6 +419,7 @@ const CONTROL_FIELDS: Record<TeamControl["command"], readonly string[]> = {
 	accept_result: ["work", "disposition", "reason"],
 	close_member: ["memberId"],
 	revive_member: ["memberId"],
+	compact_member: ["memberId", "instructions"],
 	close_team: ["resultRefs", "outcome", "reason"],
 };
 export const TEAM_ACTION_FIELDS: readonly string[] = [...new Set(Object.values(ACTION_FIELDS).flat())];
@@ -494,6 +495,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Root's requester or the lead: explicitly accept a successful root or waive a terminal outcome with a reason."),
 	controlAction("close_member", { memberId: aliasSchema }, "Lead only: close an idle member with no unresolved obligations, or stop a faulted member's process."),
 	controlAction("revive_member", { memberId: aliasSchema }, "Lead only: reopen a faulted member whose process is alive; its failed work stays failed, so revise or re-request it."),
+	controlAction("compact_member", { memberId: aliasSchema, instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })) }, "Lead only: compact any open member, including yourself, between activations. Optional instructions (max 2 KiB) say what to keep; omitted uses Pi's default prompt. Returns immediately."),
 	controlAction("close_team", { resultRefs: Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
 		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
@@ -584,6 +586,10 @@ function normalizeControl(value: Record<string, unknown>): TeamControl {
 			return { command: "close_member", memberId: normalizeAlias(value["memberId"], "memberId") };
 		case "revive_member":
 			return { command: "revive_member", memberId: normalizeAlias(value["memberId"], "memberId") };
+		case "compact_member": {
+			const instructions = optionalText(value["instructions"], "instructions", 2048);
+			return { command: "compact_member", memberId: normalizeAlias(value["memberId"], "memberId"), ...(instructions !== undefined ? { instructions } : {}) };
+		}
 		case "revise_work":
 			return { command: "revise_work", workId: normalizeId(value["workId"], "workId"),
 				expectedRevision: safeInteger(value["expectedRevision"], "expectedRevision", 1),
@@ -1085,7 +1091,7 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 	const members: TeamMemberView[] = rawMembers.map((item, index) => {
 		const field = `team view.members[${index}]`;
 		if (!isRecord(item)) return protocol(`${field} must be an object`);
-		frameKeys(item, ["id", "roleDescription", "lifecycle", "activity", "pause", "currentWork", "resourceState", "error", "queued", "blocked", "held", "policy", "usage"], field);
+		frameKeys(item, ["id", "roleDescription", "lifecycle", "activity", "pause", "currentWork", "resourceState", "error", "queued", "blocked", "held", "policy", "usage", "context", "compacting", "lastCompaction"], field);
 		const memberLifecycle = item["lifecycle"];
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(memberLifecycle))) return protocol(`${field}.lifecycle is invalid`);
 		const activity = item["activity"];
@@ -1099,12 +1105,30 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 			const parsed = parseWorkError(item["error"], `${field}.error`);
 			error = { code: parsed.code, message: parsed.message };
 		}
+		let context: TeamMemberView["context"];
+		if (item["context"] !== undefined) {
+			const value = item["context"];
+			if (!isRecord(value)) return protocol(`${field}.context must be an object`);
+			frameKeys(value, ["used", "window", "percent"], `${field}.context`);
+			context = { used: finiteNumber(value["used"], `${field}.context.used`, 0), window: finiteNumber(value["window"], `${field}.context.window`, 1), percent: finiteNumber(value["percent"], `${field}.context.percent`, 0) };
+		}
+		let lastCompaction: TeamMemberView["lastCompaction"];
+		if (item["lastCompaction"] !== undefined) {
+			const value = item["lastCompaction"];
+			if (!isRecord(value)) return protocol(`${field}.lastCompaction must be an object`);
+			frameKeys(value, ["tokensBefore", "tokensAfter"], `${field}.lastCompaction`);
+			lastCompaction = { ...(value["tokensBefore"] !== undefined ? { tokensBefore: finiteNumber(value["tokensBefore"], `${field}.lastCompaction.tokensBefore`, 0) } : {}),
+				...(value["tokensAfter"] !== undefined ? { tokensAfter: finiteNumber(value["tokensAfter"], `${field}.lastCompaction.tokensAfter`, 0) } : {}) };
+		}
+		if (item["compacting"] !== undefined && typeof item["compacting"] !== "boolean") return protocol(`${field}.compacting must be boolean`);
 		return { id: normalizeAlias(item["id"], `${field}.id`), roleDescription: text(item["roleDescription"], `${field}.roleDescription`, TEAM_MAX_ROLE_BYTES),
 			lifecycle: memberLifecycle as MemberLifecycle, activity: activity as MemberActivity, pause: pause as PauseState,
 			...(item["currentWork"] !== undefined ? { currentWork: normalizeWorkRef(item["currentWork"], `${field}.currentWork`) } : {}),
 			resourceState: resourceState as ResourceState, ...(error ? { error } : {}),
 			queued: safeInteger(item["queued"], `${field}.queued`, 0), blocked: safeInteger(item["blocked"], `${field}.blocked`, 0), held: safeInteger(item["held"], `${field}.held`, 0),
-			policy: parsePolicy(item["policy"], `${field}.policy`), usage: parseUsage(item["usage"], `${field}.usage`) };
+			policy: parsePolicy(item["policy"], `${field}.policy`), usage: parseUsage(item["usage"], `${field}.usage`),
+			...(context ? { context } : {}), ...(lastCompaction ? { lastCompaction } : {}),
+			...(item["compacting"] !== undefined ? { compacting: item["compacting"] as boolean } : {}) };
 	});
 	const roster = members.map((member) => member.id);
 	if (new Set(roster).size !== roster.length || !roster.includes(lead)) return protocol("team view roster/lead identity is inconsistent");
@@ -1155,6 +1179,11 @@ function parseTeamTeamView(value: unknown): TeamTeamView {
 			grantsOmitted: safeInteger(rawBudget["grantsOmitted"], "team view budget.grantsOmitted", 0) },
 		usage: parseUsage(value["usage"], "team view.usage"),
 		...(outcome !== undefined ? { outcome } : {}), ...(reason !== undefined ? { reason } : {}) };
+}
+
+function finiteNumber(value: unknown, field: string, min: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < min) return protocol(`${field} must be a finite number >= ${min}`);
+	return value;
 }
 
 function parseUsage(value: unknown, field: string): SubagentUsage {
@@ -1247,9 +1276,14 @@ function parseReceipt(value: unknown): TeamReceipt {
 			return { status: "staged", intent: intent as Extract<TeamReceipt, { status: "staged" }>["intent"], ...(value["work"] !== undefined ? { work: normalizeWorkRef(value["work"], "receipt.work") } : {}) };
 		}
 		case "applied": case "unchanged": {
+			if (value["command"] === "compact_member") {
+				frameKeys(value, ["status", "command", "memberId", "compaction"], "compaction receipt");
+				if (value["status"] !== "applied" || (value["compaction"] !== "started" && value["compaction"] !== "scheduled")) return protocol("compaction receipt status is invalid");
+				return { status: "applied", command: "compact_member", memberId: normalizeAlias(value["memberId"], "receipt.memberId"), compaction: value["compaction"] };
+			}
 			frameKeys(value, ["status", "command", "work", "memberId"], "control receipt");
 			if (typeof value["command"] !== "string" || !Object.hasOwn(CONTROL_FIELDS, value["command"])) return protocol("control receipt command is invalid");
-			return { status: value["status"], command: value["command"] as TeamControl["command"],
+			return { status: value["status"], command: value["command"] as Exclude<TeamControl["command"], "compact_member">,
 				...(value["work"] !== undefined ? { work: normalizeWorkRef(value["work"], "receipt.work") } : {}),
 				...(value["memberId"] !== undefined ? { memberId: normalizeAlias(value["memberId"], "receipt.memberId") } : {}) };
 		}
@@ -1306,10 +1340,11 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	const roster = array(value["roster"], "activation input.roster", TEAM_MAX_MEMBERS).map((raw, index) => {
 		const field = `activation input.roster[${index}]`;
 		if (!isRecord(raw)) return protocol(`${field} must be an object`);
-		frameKeys(raw, ["id", "lead", "lifecycle"], field);
+		frameKeys(raw, ["id", "lead", "lifecycle", "contextPercent"], field);
 		if (raw["lead"] !== undefined && raw["lead"] !== true) return protocol(`${field}.lead must be true when present`);
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(raw["lifecycle"]))) return protocol(`${field}.lifecycle is invalid`);
-		return { id: normalizeAlias(raw["id"], `${field}.id`), ...(raw["lead"] === true ? { lead: true as const } : {}), lifecycle: raw["lifecycle"] as MemberLifecycle };
+		return { id: normalizeAlias(raw["id"], `${field}.id`), ...(raw["lead"] === true ? { lead: true as const } : {}), lifecycle: raw["lifecycle"] as MemberLifecycle,
+			...(raw["contextPercent"] !== undefined ? { contextPercent: finiteNumber(raw["contextPercent"], `${field}.contextPercent`, 0) } : {}) };
 	});
 	const rosterIds = roster.map((item) => item.id);
 	if (!rosterIds.includes(binding.memberId) || new Set(rosterIds).size !== rosterIds.length || roster.filter((item) => item.lead).length !== 1

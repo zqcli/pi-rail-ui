@@ -73,6 +73,18 @@ function call(id, args) {
 const A09_CONTINUATION = "third-party boundary continuation";
 
 function actionFor(scenario, input, replies, turn, messages = [], activationIndex = 0) {
+	if (scenario.startsWith("rail-compaction-")) {
+		if (input.scope.kind === "events") {
+			const command = input.scope.events.find((event) => event.kind === "USER_COMMAND");
+			if (command?.message.includes("RAIL_KEEP_7C91") && replies.length === 0) return [call("rail-compact-member", {
+				action: "control", command: "compact_member", memberId: "w1", instructions: command.message,
+			})];
+			return [call(`rail-compaction-yield-${turn}`, { action: "yield" })];
+		}
+		return [call(`rail-compaction-reply-${turn}`, { action: "reply", result: {
+			status: "succeeded", summary: `Completed ${input.scope.task} after ${input.notice}`,
+		} })];
+	}
 	if (scenario === "n08-cache-warming") {
 		if (input.scope.kind === "events") return [call(`n08-manager-yield-${turn}`, { action: "yield" })];
 		// Keep the native run active past the 1s warming delay so Pi reaches its refresh decision while bound.
@@ -431,7 +443,12 @@ export default function install(pi) {
 			let activation;
 			let content;
 			let replies = [];
-			if (messageText(lastUser) === "verify restored context window") {
+			const summaryRequest = scenario.startsWith("rail-compaction-")
+				&& (messageText(lastUser).startsWith("<conversation>") || messageText(lastUser).startsWith("# Conversation\n"));
+			if (summaryRequest) {
+				pi.appendEntry("team-v2-summary-request", { text: messageText(lastUser), modelContextWindow: model.contextWindow });
+				content = [{ type: "text", text: "Completed work is recorded in the Team ledger. Continue the next canonical Team activation." }];
+			} else if (messageText(lastUser) === "verify restored context window") {
 				content = [{ type: "text", text: `window=${model.contextWindow}` }];
 			} else if (messageText(lastUser) === "ordinary reopen marker") {
 				const waited = context.messages.some((message) => message?.role === "toolResult" && message.toolCallId === "n08-ordinary-wait");
@@ -444,10 +461,13 @@ export default function install(pi) {
 				content = actionFor(scenario, activation.input, replies, turns, context.messages, activation.index);
 			}
 			const retry = scenario === "retry" && activation?.input.member.id === "w1" && turns === 1;
-			const inputTokens = cacheWarming ? 50000 : (scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1)
+			const overflow = ["rail-compaction-overflow", "rail-compaction-length"].includes(scenario)
+				&& activation?.input.member.id === "w1" && turns === 1;
+			const inputTokens = cacheWarming ? 50000 : (scenario === "rail-compaction-threshold" && activation?.input.member.id === "w1" && turns === 1)
+				|| (scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1)
 				|| (scenario === "n06-context-edit" && activation?.input.member.id === "w1" && activation.input.scope.kind === "work"
 					&& activation.input.scope.task === "N06 root" && activation.input.outcomes.length > 0 && replies.length === 0) ? 60000 : 1;
-			if (retry) content = [];
+			if (retry || overflow) content = [];
 			pi.appendEntry("team-v2-provider", {
 				turn: turns,
 				maxTokens: options?.maxTokens,
@@ -466,12 +486,14 @@ export default function install(pi) {
 				role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
 				usage: { input: inputTokens, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: inputTokens + 1,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-				...(retry ? { errorMessage: "429 rate limit exceeded" } : {}),
-				stopReason: options?.signal?.aborted ? "aborted" : retry ? "error" : toolUse ? "toolUse" : "stop", timestamp: Date.now(),
+				...(retry ? { errorMessage: "429 rate limit exceeded" } : overflow && scenario === "rail-compaction-overflow"
+					? { errorMessage: "maximum context length exceeded" } : {}),
+				stopReason: options?.signal?.aborted ? "aborted" : retry ? "error" : overflow
+					? scenario === "rail-compaction-length" ? "length" : "error" : toolUse ? "toolUse" : "stop", timestamp: Date.now(),
 			};
 			const stream = createAssistantMessageEventStream();
 			stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
-			stream.push(retry ? { type: "error", reason: "error", error: message } : { type: "done", reason: message.stopReason, message });
+			stream.push(message.stopReason === "error" ? { type: "error", reason: "error", error: message } : { type: "done", reason: message.stopReason, message });
 			stream.end(message);
 			return stream;
 		},

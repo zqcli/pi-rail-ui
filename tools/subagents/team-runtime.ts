@@ -15,6 +15,7 @@ import {
 	TeamProtocolError, canonicalJson, encodeActivationInput, errorReply, formatWorkResult, normalizeNativeToolCallId, normalizeReviewPlan, normalizeTeamAction, normalizeTeamPlan, normalizeTeamBudgetPreset, parseActivationScope, parseBinding, sameScope,
 	okReply, jsonTextBytes, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
+import { readCompactThreshold } from "./team-compaction-settings";
 import { WorkLedger } from "./team-work-ledger";
 import { prompt } from "../../core/prompts";
 import { addActivationUsage, emptySubagentUsage } from "./usage";
@@ -63,6 +64,7 @@ export interface RuntimeActivation {
 /** Evidence supplied only after the native send has reached its real settled boundary. */
 export interface NativeCompletion {
 	status: "success" | "error" | "aborted" | "length";
+	overflow?: boolean;
 	finalAssistantText?: string;
 	pendingToolCalls?: boolean;
 	/** The exact staged end-intent tool result observed in the settled native transcript. */
@@ -115,7 +117,12 @@ export interface TeamRuntimeOptions {
 	checkInvariants?: boolean;
 }
 
+export type CompactionResult = { ok: true; tokensBefore?: number; tokensAfter?: number; usage?: SubagentUsage } | { ok: false; error: string };
+type CompactionRequest = { trigger: "threshold" | "host" | "lead" | "overflow"; instructions?: string; requestedBy?: string };
+
 export interface TeamRuntimeExecutor {
+	compactMember?(binding: BindingV2, instructions?: string): Promise<CompactionResult>;
+	abortCompaction?(binding: BindingV2): void;
 	runActivation(activation: RuntimeActivation): Promise<unknown>;
 	closeMember(binding: BindingV2, closeId: string): Promise<CleanupCompletion>;
 	stopActivation?(binding: BindingV2, activationId: string, reason: ActivationCompletionReason): void;
@@ -129,7 +136,7 @@ export type HostControlReceipt =
 	| { actor: "@host"; status: "applied" | "unchanged"; teamId: string; eventId: string }
 	| { actor: "@host"; status: "applied"; teamId: string; grantId: string; released: WorkRef[] }
 	| { actor: "@host"; status: "applied"; teamId: string; lead: string }
-	| { actor: "@host"; status: "applied"; teamId: string; memberId: string };
+	| { actor: "@host"; status: "applied"; teamId: string; memberId: string; compaction?: "started" | "scheduled" };
 
 export interface TeamHostControl {
 	cancel_team(reason: string): HostControlReceipt;
@@ -213,6 +220,12 @@ interface CompletedActivationTombstone {
 }
 
 interface RuntimeMember extends MemberRecord {
+	compaction?: CompactionRequest & { state: "pending" | "running" };
+	pendingCompaction?: CompactionRequest;
+	lastCompaction?: { tokensBefore?: number; tokensAfter?: number };
+	compactedAtBoundary?: boolean;
+	nativeContextWindow?: number;
+	overflowRecoveries?: Set<string>;
 	policy: TeamMemberPolicy;
 	epoch: string;
 	active?: ActiveActivation;
@@ -1369,12 +1382,91 @@ export class TeamRuntime {
 		return this.reserveNextActivation(teamId);
 	}
 
+	setMemberContextWindow(teamId: string, memberId: string, window: number): void {
+		const member = this.team(teamId).members.get(memberId);
+		if (member) member.nativeContextWindow = window;
+	}
+
+	compactMember(teamId: string, memberId: string, instructions?: string): Extract<HostControlReceipt, { memberId: string }> {
+		const team = this.team(teamId);
+		if (instructions !== undefined && (typeof instructions !== "string" || Buffer.byteLength(instructions, "utf8") > 2048)) fail("INVALID_ARGUMENT", "Compaction instructions must be at most 2 KiB");
+		const compaction = this.requestCompaction(team, memberId, { trigger: "host", ...(instructions !== undefined ? { instructions } : {}) });
+		return { actor: "@host", status: "applied", teamId, memberId, compaction };
+	}
+
+	private memberContext(member: RuntimeMember): TeamMemberView["context"] {
+		const window = member.policy.contextWindow ?? member.nativeContextWindow;
+		return window ? { used: member.usage.contextTokens, window, percent: Math.round(member.usage.contextTokens / window * 100) } : undefined;
+	}
+
+	private requestCompaction(team: TeamState, memberId: string, request: CompactionRequest): "started" | "scheduled" {
+		const member = team.members.get(memberId);
+		if (!member) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
+		if (member.lifecycle !== "open") fail("MEMBER_UNAVAILABLE", `Member ${memberId} is ${member.lifecycle}`);
+		if (member.compaction?.state === "running") member.pendingCompaction = request;
+		else member.compaction = { ...request, state: "pending" };
+		const started = this.startCompaction(team, member);
+		this.changed(team);
+		this.requestDrain(team.id);
+		return started ? "started" : "scheduled";
+	}
+
+	private thresholdCompaction(team: TeamState, member: RuntimeMember): boolean {
+		const threshold = readCompactThreshold();
+		const context = this.memberContext(member);
+		if (member.compactedAtBoundary || threshold === null || !context || context.used / context.window * 100 < threshold) return false;
+		this.requestCompaction(team, member.id, { trigger: "threshold" });
+		return true;
+	}
+
+	private startCompaction(team: TeamState, member: RuntimeMember): boolean {
+		const request = member.compaction;
+		const executor = this.executors.get(team.id);
+		if (!request || request.state !== "pending" || member.active || member.lifecycle !== "open"
+			|| !["active", "closing"].includes(team.lifecycle) || (team.hostPause && request.trigger !== "host") || !executor?.compactMember) return false;
+		request.state = "running";
+		member.compactedAtBoundary = true;
+		const before = member.usage.contextTokens;
+		void Promise.resolve().then(() => member.compaction === request
+			? executor.compactMember!(this.binding(team, member), request.instructions) : { ok: false as const, error: "Compaction cancelled" })
+			.catch((error: unknown): CompactionResult => ({ ok: false, error: error instanceof Error ? error.message : String(error) }))
+			.then((result) => {
+				if (member.compaction !== request) return;
+				if (result.ok) {
+					if (result.usage) this.foldUsage(team, member, result.usage);
+					if (result.tokensAfter !== undefined) member.usage.contextTokens = result.tokensAfter;
+					member.lastCompaction = { tokensBefore: result.tokensBefore ?? before, ...(result.tokensAfter !== undefined ? { tokensAfter: result.tokensAfter } : {}) };
+					this.note(team, `${member.id} compacted (${request.trigger}) ${member.lastCompaction.tokensBefore}→${result.tokensAfter ?? "?"}`);
+				} else {
+					this.note(team, `${member.id} compaction failed (${request.trigger}): ${result.error}`);
+					if (request.trigger === "lead") this.addEvent(team, { key: `compaction:${this.newId()}`, kind: "USER_COMMAND", memberId: member.id,
+						message: prompt("team", "compaction_failed", { member: member.id, reason: result.error }) });
+				}
+				if (member.pendingCompaction) member.compaction = { ...member.pendingCompaction, state: "pending" };
+				else delete member.compaction;
+				delete member.pendingCompaction;
+				this.changed(team);
+				this.requestDrain(team.id);
+			});
+		return true;
+	}
+
+	private scheduleOverflow(team: TeamState, member: RuntimeMember, active: ActiveActivation): boolean {
+		if (!active.native?.overflow || active.intent || member.lifecycle !== "open" || team.lifecycle !== "active") return false;
+		const key = active.scope.work ? workRefKey(active.scope.work) : "events";
+		if (member.overflowRecoveries?.has(key)) return false;
+		(member.overflowRecoveries ??= new Set()).add(key);
+		member.compaction = { trigger: "overflow", state: "pending" };
+		this.note(team, `${member.id} context overflow; compacting before redelivery`);
+		return true;
+	}
+
 	private reserveNextActivation(teamId: string): RuntimeActivation | undefined {
 		const team = this.team(teamId);
 		if (team.lifecycle !== "active") return undefined;
 		const lead = team.members.get(team.lead)!;
 		if (lead.lifecycle !== "open") return undefined;
-		if (!lead.active && lead.pause === "none" && !this.retryWaitMs(lead)) {
+		if (!lead.active && !lead.compaction && lead.pause === "none" && !this.retryWaitMs(lead)) {
 			const pendingEvents = () => team.events.map((event, index) => ({ event, index }))
 				.filter(({ event }) => !event.processed && event.batchId === undefined)
 				.sort((left, right) => this.eventPriority(left.event.kind) - this.eventPriority(right.event.kind)
@@ -1387,6 +1479,9 @@ export class TeamRuntime {
 				// that only the host can grant or cancel. Members with remaining budget keep running.
 				if (exhausted) this.budgetIncident(team, exhausted);
 				if (!exhausted || team.budget.emergencyAvailable()) {
+					// requestCompaction schedules another drain pass, so workers still start right after.
+					if (this.thresholdCompaction(team, lead)) return undefined;
+					lead.compactedAtBoundary = false;
 					const activation = this.reserveEvents(team, lead, pendingEvents(), exhausted !== undefined);
 					this.check(team);
 					return activation;
@@ -1404,7 +1499,7 @@ export class TeamRuntime {
 				continue;
 			}
 			const member = team.members.get(entry.record.assignee)!;
-			if (member.lifecycle !== "open" || member.pause !== "none" || member.active || this.retryWaitMs(member)) continue;
+			if (member.lifecycle !== "open" || member.pause !== "none" || member.active || member.compaction || this.retryWaitMs(member)) continue;
 			if (workPermits >= team.limits.workPermits) continue;
 			const exhausted = team.budget.exhausted(entry.record.rootId, member.id === team.lead);
 			if (exhausted) {
@@ -1412,6 +1507,8 @@ export class TeamRuntime {
 				index--;
 				continue;
 			}
+			if (this.thresholdCompaction(team, member)) continue;
+			member.compactedAtBoundary = false;
 			const activation = this.reserveWork(team, member, ref);
 			team.ready.splice(index, 1);
 			this.check(team);
@@ -2539,6 +2636,8 @@ export class TeamRuntime {
 			case "accept_result": return this.acceptResult(team, member, control);
 			case "close_member": return this.closeMember(team, member, control.memberId);
 			case "revive_member": return this.reviveMemberControl(team, member, control.memberId);
+			case "compact_member": return okReply(member.id, { receipt: { status: "applied", command: "compact_member", memberId: control.memberId,
+				compaction: this.requestCompaction(team, control.memberId, { trigger: "lead", requestedBy: member.id, ...(control.instructions !== undefined ? { instructions: control.instructions } : {}) }) } });
 			case "pause_member": return this.pauseMember(team, member, control.memberId);
 			case "resume_member": return this.resumeMember(team, member, control.memberId);
 			case "resume_work": return this.resumeWork(team, member, control.workId, control.expectedRevision, control.incidentId, control.instruction);
@@ -2794,6 +2893,7 @@ export class TeamRuntime {
 		// A member that reopens while the host has paused the Team stays paused until the host continues.
 		member.pause = team.hostPause ? "confirmed" : "none";
 		team.hostPause?.members.add(member.id);
+		if (member.error?.code === "NATIVE_LENGTH") member.compaction = { trigger: by === "host" ? "host" : "lead", state: "pending", requestedBy: by };
 		delete member.error;
 		delete member.retry;
 		this.note(team, `${by} revived ${member.id}`);
@@ -3073,7 +3173,8 @@ export class TeamRuntime {
 			goal: team.plan.brief.goal,
 			roster: this.roster(team),
 			scope: copy(scope), outcomes, omittedOutcomes: 0, ...(childIssues.length ? { childIssues: copy(childIssues) } : {}),
-			ownedChildren, budget, notice: scope.kind === "work" ? workNotice(scope.work) : `${prompt("team", "events_notice")} ${prompt("team", "brief_pointer")}`,
+			ownedChildren, budget, notice: (scope.kind === "work" ? workNotice(scope.work) : `${prompt("team", "events_notice")} ${prompt("team", "brief_pointer")}`)
+				+ (member.overflowRecoveries?.has(scope.kind === "work" ? workRefKey(scope.work) : "events") ? `\n${prompt("team", "overflow_notice")}` : ""),
 		};
 		const projected = projectActivationInput(result);
 		if (projected.childIssues) projected.notice += ` ${prompt("team", "child_issue_notice")}`;
@@ -3156,7 +3257,7 @@ export class TeamRuntime {
 	 */
 	private scheduleRetry(team: TeamState, member: RuntimeMember, active: ActiveActivation): boolean {
 		const error = active.native?.status === "error" ? active.native.error : undefined;
-		if (!error?.transient || active.intent || member.lifecycle !== "open" || team.lifecycle !== "active") return false;
+		if (!error?.transient || active.native?.overflow || active.intent || member.lifecycle !== "open" || team.lifecycle !== "active") return false;
 		const now = this.timestamp();
 		const previous = member.retry;
 		const attempts = previous?.attempts ?? 0;
@@ -3213,7 +3314,7 @@ export class TeamRuntime {
 			&& ["policy_pause", "policy_superseded", "policy_cancelled", "budget_hold", "loop_hold"].includes(completionReason);
 		if (active.native?.status !== "success" && !controlledAbort) {
 			delete team.ledger.get(ref.workId)!.stagedWait;
-			if (!active.stopReason && version.state === "running" && this.scheduleRetry(team, member, active)) {
+			if (!active.stopReason && version.state === "running" && (this.scheduleOverflow(team, member, active) || this.scheduleRetry(team, member, active))) {
 				version.state = "queued";
 				version.updatedAt = this.timestamp();
 				if (!team.ready.some((queued) => sameWorkRef(queued, ref))) team.ready.push(copy(ref));
@@ -3280,6 +3381,7 @@ export class TeamRuntime {
 			this.wakeWaiters(team);
 			return;
 		}
+		member.overflowRecoveries?.delete(workRefKey(ref));
 		const intent = active.intent;
 		if (intent && active.native?.appliedToolCallId !== intent.toolCallId) {
 			delete team.ledger.get(ref.workId)!.stagedWait;
@@ -3330,7 +3432,7 @@ export class TeamRuntime {
 			this.budgetIncident(team, active.budgetStop ?? { scope: { kind: "team" }, counter: "teamModelRequests" });
 			return;
 		}
-		if (this.scheduleRetry(team, member, active)) {
+		if (this.scheduleOverflow(team, member, active) || this.scheduleRetry(team, member, active)) {
 			// The batch is not consumed: its events are delivered again after the wait.
 			for (const event of team.events) if (event.batchId === active.scope.eventBatchId) delete event.batchId;
 			team.eventBatches.delete(active.scope.eventBatchId!);
@@ -3344,7 +3446,7 @@ export class TeamRuntime {
 				team.reason = `Lead close activation lacked confirmed native evidence (status=${active.native?.status ?? "missing"}, hasIntent=${!!intent}, hasAppliedId=${!!active.native?.appliedToolCallId}, intentApplied=${intentApplied})`;
 			}
 			if (!closing) member.lifecycle = "faulted";
-			member.error = { code: active.native?.error?.code ?? (intentApplied ? "LEAD_FAILURE" : "PROTOCOL_FAILURE"),
+			member.error = { code: active.native?.error?.code ?? (intentApplied ? (active.native?.status === "length" ? "NATIVE_LENGTH" : "LEAD_FAILURE") : "PROTOCOL_FAILURE"),
 				message: active.native?.error?.message ?? (intentApplied ? "Lead activation failed" : "Staged intent was not confirmed in the native transcript") };
 			if (!closing) member.resourceState = "owned";
 			team.health = "needs_attention";
@@ -3353,6 +3455,7 @@ export class TeamRuntime {
 			this.pauseMembersForLeadFault(team);
 			return;
 		}
+		member.overflowRecoveries?.delete("events");
 		this.consumeBatch(team, active.scope.eventBatchId);
 		if (active.intent?.kind === "close_team") {
 			member.lifecycle = "closing";
@@ -3741,6 +3844,14 @@ export class TeamRuntime {
 			}
 		}
 
+		for (const member of team.members.values()) {
+			if (member.lifecycle !== "open" || !["active", "closing"].includes(team.lifecycle)) {
+				if (member.compaction?.state === "running") executor.abortCompaction?.(this.binding(team, member));
+				delete member.compaction;
+				delete member.pendingCompaction;
+			} else this.startCompaction(team, member);
+		}
+
 		// close_team must not stop even an idle member until the lead's own final activation
 		// has crossed native settlement and cleanup. Individual close_member remains independent.
 		const lead = team.members.get(team.lead)!;
@@ -3936,7 +4047,7 @@ export class TeamRuntime {
 
 	private roster(team: TeamState): ActivationInput["roster"] {
 		return [...team.members.values()].map((item) => ({ id: item.id, ...(item.id === team.lead ? { lead: true as const } : {}),
-			lifecycle: item.lifecycle }));
+			lifecycle: item.lifecycle, ...(this.memberContext(item) ? { contextPercent: this.memberContext(item)!.percent } : {}) }));
 	}
 
 	private previewInput(team: TeamState, member: RuntimeMember, deliveryId: string, scope: WorkScope): ActivationInput {
@@ -4038,6 +4149,9 @@ export class TeamRuntime {
 			blocked: current.filter((version, index) => version.state === "blocked" && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
 			held: current.filter((version, index) => !!version.hold && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
 			policy: copy(member.policy),
+			...(this.memberContext(member) ? { context: this.memberContext(member)! } : {}),
+			...(member.compaction?.state === "running" ? { compacting: true } : {}),
+			...(member.lastCompaction ? { lastCompaction: copy(member.lastCompaction) } : {}),
 			usage: copy(member.usage),
 		}));
 		const roots = this.rootRecords(team);

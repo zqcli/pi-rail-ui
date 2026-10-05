@@ -330,6 +330,7 @@ export type TeamControl =
 	| { command: "accept_result"; work: WorkRef; disposition: "accepted" | "waived"; reason?: string }
 	| { command: "close_member"; memberId: string }
 	| { command: "revive_member"; memberId: string }
+	| { command: "compact_member"; memberId: string; instructions?: string }
 	| { command: "close_team"; resultRefs: string[]; outcome: TeamOutcome; reason?: string };
 export type TeamControlCommand = TeamControl["command"];
 
@@ -342,7 +343,8 @@ export interface TeamError {
 export type TeamReceipt =
 	| { status: "accepted"; work: WorkRef; recipient: string; paused?: true }
 	| { status: "staged"; intent: EndIntent["kind"]; work?: WorkRef }
-	| { status: "applied"; command: TeamControlCommand; work?: WorkRef; memberId?: string }
+	| { status: "applied"; command: "compact_member"; memberId: string; compaction: "started" | "scheduled" }
+	| { status: "applied"; command: Exclude<TeamControlCommand, "compact_member">; work?: WorkRef; memberId?: string }
 	| { status: "unchanged"; command: TeamControlCommand; work?: WorkRef; memberId?: string }
 	| { status: "closing"; command: "close_member" | "close_team"; memberId?: string; closeId: string };
 
@@ -471,7 +473,7 @@ export interface ActivationInput {
 	member: { id: string; lead: boolean; roleDescription: string };
 	/** The full brief is in the member's system prompt (bind loadout); only the goal repeats here. */
 	goal: string;
-	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle }>;
+	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle; contextPercent?: number }>;
 	scope:
 		| {
 			kind: "work";
@@ -572,6 +574,9 @@ export interface TeamMemberView extends MemberRecord {
 	policy: TeamMemberPolicy;
 	/** Native usage of this member's settled activations, each counted once. */
 	usage: SubagentUsage;
+	context?: { used: number; window: number; percent: number };
+	compacting?: boolean;
+	lastCompaction?: { tokensBefore?: number; tokensAfter?: number };
 }
 export interface TeamBudgetGrantView {
 	id: string;

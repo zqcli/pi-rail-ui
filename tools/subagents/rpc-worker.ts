@@ -1,3 +1,5 @@
+import { estimateTokens } from "@earendil-works/pi-coding-agent";
+import { addCompactionUsage, emptySubagentUsage } from "./usage";
 import { TeamRpcV2Connection } from "./team-rpc-v2";
 import { fileURLToPath } from "node:url";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
@@ -49,7 +51,7 @@ interface RpcState {
 	sessionFile?: string;
 	sessionName?: string;
 	isStreaming?: boolean;
-	model?: { provider?: string; id?: string; name?: string; contextWindow?: number };
+	model?: { provider?: string; id?: string; name?: string; contextWindow?: number; maxTokens?: number };
 	thinkingLevel?: RailModelRef["thinkingLevel"];
 	isCompacting?: boolean;
 }
@@ -443,6 +445,19 @@ export class RpcSessionWorker implements SessionWorker {
 		await connection.bind();
 		let session!: TeamMemberProtocolSession;
 		session = {
+			nativeContextWindow: state.model!.contextWindow!,
+			compact: async (instructions) => {
+				const usage = emptySubagentUsage();
+				try {
+					const result = await this.transport.request({ type: "compact", ...(instructions !== undefined ? { customInstructions: instructions } : {}) }) as { tokensBefore?: number; usage?: unknown };
+					addCompactionUsage(usage, result);
+					// Pi reports unknown context usage until the next assistant turn after compaction.
+					const { messages } = await this.transport.request({ type: "get_messages" }) as { messages: Parameters<typeof estimateTokens>[0][] };
+					return { ok: true, ...(result.tokensBefore !== undefined ? { tokensBefore: result.tokensBefore } : {}),
+						tokensAfter: messages.reduce((sum, message) => sum + estimateTokens(message), 0), usage };
+				} catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+			},
+			abortCompaction: () => { void this.transport.request({ type: "abort" }).catch(() => undefined); },
 			runActivation: async (activation, onRequest, contextWindow, onNativeSettled, signal) => {
 				if (this.teamSession !== session || this.unusable) throw new ContextProtocolError("Team lifetime is not reusable");
 				if (this.runInFlight || this.modelChangeInFlight) throw new ContextProtocolError("Team member session received overlapping native sends");
@@ -452,7 +467,7 @@ export class RpcSessionWorker implements SessionWorker {
 				let restoreWindow: number | undefined;
 				try {
 					restoreWindow = await this.prepareContext(normalizeContextWindow(contextWindow));
-					const completion = await connection.sendActivation(activation, onRequest, signal);
+					const completion = await connection.sendActivation(activation, onRequest, signal, (await this.state()).model?.maxTokens);
 					try { await onNativeSettled(completion); } catch (error) { callbackError = error; }
 					// Reset the child context protocol after every settled send, even when this
 					// activation did not request a non-default contextWindow.

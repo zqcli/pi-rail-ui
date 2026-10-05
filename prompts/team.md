@@ -16,7 +16,7 @@ Run a Team: 2-9 members, all new persistent aliases with the same capabilities (
 
 ## tool_description
 
-Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control: revise_work, cancel_work, resume_work and accept_result are for the work's requester or the lead (never for your own current work); pause_member, resume_member, close_member and close_team are lead only; revive_member (lead only) reopens a faulted member whose process is alive, and its failed work stays failed. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.
+Team v2 work ledger. Actions: request creates owned work; reply stages the current WorkRef result; yield ends work while waiting, requests attention, or (lead only) ends an events activation (the lead never waits for WorkRefs or polls status: after dispatching it yields and is reactivated with new Team events); status reads Team/work/result/incident state; control: revise_work, cancel_work, resume_work and accept_result are for the work's requester or the lead (never for your own current work); pause_member, resume_member, close_member and close_team are lead only; compact_member {memberId, instructions?} (lead only) compacts any open member, including the lead, between activations and returns started|scheduled immediately; instructions are optional (max 2 KiB), and omitted uses Pi's default compaction prompt; revive_member (lead only) reopens a faulted member whose process is alive, and its failed work stays failed. WorkRef revisions are immutable. Business failures are tool errors containing the full JSON TeamError {code,message,blockers?}. status(result) is read-only and does not acknowledge that an owner observed a child result. Host cancellation, hold release and lead messages are separate host APIs, not model actions.
 
 ## member_tool_description_suffix
 
@@ -53,6 +53,7 @@ Team member: {{member}}. You are one member of a Team that coordinates through a
 - Constraints and your authorization are hard limits. If they conflict with each other or with the task, yield attention to ask instead of choosing.
 - Use the team tool for Team operations. A successful reply, yield, or close_team ends this native activation; each end intent must be the sole tool call in the finalized assistant batch.
 - Do not claim a result unless the runtime accepts the team reply.
+- As lead, compact a member before giving it unrelated work or when its ctx is high; use instructions to say what to keep.
 
 ## team_brief_none
 
@@ -124,6 +125,14 @@ A member shown as retrying is waiting out a temporary provider error; that is no
 ## transient_retry
 
 Your previous attempt stopped on a temporary provider error ({{error}}). Earlier tool results are still in this conversation: continue from where you stopped and do not repeat side effects that already completed.
+
+## overflow_notice
+
+Your previous attempt overflowed the model context, so a compaction was attempted before this retry. Continue the current work from what remains in the conversation and keep further reads small.
+
+## compaction_failed
+
+Compaction of {{member}} failed: {{reason}}. The member remains available.
 
 ## boot_outcome_rule
 

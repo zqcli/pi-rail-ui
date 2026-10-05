@@ -7,9 +7,9 @@ import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, 
 import { clock, type GrantPreview } from "./team-runtime";
 import { formatBudgetLimit, formatHistoryEntry, formatHistorySummary, formatTeamView, lifecycleText } from "./team-tool";
 
-const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "pause", "continue", "review"] as const;
+const SUBCOMMANDS = ["status", "results", "result", "budget", "cancel", "resume", "grant", "message", "lead", "revive", "compact", "pause", "continue", "review"] as const;
 const REVIEW_USAGE = "review [now|every <N> [by <alias>]|off]";
-const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|pause [reason]|continue|${REVIEW_USAGE}`;
+const USAGE = `Usage: /rail-team [list] | /rail-team <teamId> status|results [page:N]|result <resultRef>|budget|cancel [reason]|resume|grant [team|root:<rootId>] [counter=+N ...] [reason]|message <text>|lead <alias> [reason]|revive <alias>|compact <alias> [instructions]|pause [reason]|continue|${REVIEW_USAGE}`;
 
 /** Live and history Team IDs that equal or start with what the user typed (the popup shows only the first 8 characters). */
 function matchTeamIds(host: TeamSessionHost, typed: string): string[] {
@@ -28,7 +28,7 @@ function completionTeam(host: TeamSessionHost, typed: string) {
  */
 export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionHost | undefined): void {
 	pi.registerCommand("rail-team", {
-		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead, revive, pause, continue)",
+		description: "Inspect and control Rail Teams (status, budget, cancel, resume, grant, message, lead, revive, compact, pause, continue)",
 		getArgumentCompletions: (prefix) => {
 			const host = getHost();
 			if (!host) return null;
@@ -48,10 +48,10 @@ export function installTeamCommand(pi: ExtensionAPI, getHost: () => TeamSessionH
 				const matching = options.filter((option) => option.startsWith(parts.at(-1) ?? ""));
 				return matching.length ? matching.map((option) => ({ value: `${parts.slice(0, -1).join(" ")} ${option}`, label: option })) : null;
 			}
-			if (parts.length === 3 && (parts[1] === "lead" || parts[1] === "revive")) {
+			if (parts.length === 3 && (parts[1] === "lead" || parts[1] === "revive" || parts[1] === "compact")) {
 				const team = completionTeam(host, parts[0]!);
 				const aliases = (team?.members ?? []).filter((member) => member.id.startsWith(parts[2] ?? "")
-					&& (parts[1] === "lead" ? member.id !== team!.lead : member.lifecycle === "faulted" && member.resourceState === "owned")).map((member) => member.id);
+					&& (parts[1] === "compact" ? member.lifecycle === "open" : parts[1] === "lead" ? member.id !== team!.lead : member.lifecycle === "faulted" && member.resourceState === "owned")).map((member) => member.id);
 				return aliases.length ? aliases.map((alias) => ({ value: `${parts[0]} ${parts[1]} ${alias}`, label: alias })) : null;
 			}
 			return null;
@@ -73,6 +73,12 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 		if (choice.action === "message") {
 			text = (await ctx.ui.input("Message the lead", "What should the lead know?"))?.trim() ?? "";
 			if (!text) return;
+		} else if (choice.action === "compact") {
+			const aliases = host.runtime.getTeam(choice.teamId).members.filter((member) => member.lifecycle === "open").map((member) => member.id);
+			if (!aliases.length) { ctx.ui.notify(`${choice.teamId} has no open member to compact`, "info"); return; }
+			const alias = choice.memberId ?? await ctx.ui.select(`Compact which member of ${choice.teamId}?`, aliases);
+			if (!alias) return;
+			text = alias;
 		} else if (choice.action === "revive" || choice.action === "lead") {
 			const team = host.runtime.getTeam(choice.teamId);
 			const revive = choice.action === "revive";
@@ -199,6 +205,16 @@ export async function runTeamCommand(host: TeamSessionHost, args: string, ctx: E
 			if (!await confirm(ctx, `Revive ${alias} of ${teamId}?`, `${alias} is reopened and can receive work again. Its failed work stays failed: the lead must request or revise it again.${leadNote}`)) return;
 			host.runtime.reviveMember(teamId, alias);
 			ctx.ui.notify(`${alias} revived in ${teamId}`, "info");
+			return;
+		}
+		case "compact": {
+			const [alias, ...instructionsWords] = rest;
+			if (!alias) throw new Error("compact requires a member alias: /rail-team <teamId> compact <alias> [instructions]");
+			const instructions = instructionsWords.join(" ") || undefined;
+			if (instructions && Buffer.byteLength(instructions, "utf8") > 2048) throw new Error("compaction instructions exceed 2 KiB");
+			if (!await confirm(ctx, `Compact ${alias} of ${teamId}?`, `Compaction runs between activations and keeps the member available.${instructions ? `\nKeep: ${instructions}` : " Pi's default compaction prompt is used."}`)) return;
+			const receipt = host.runtime.compactMember(teamId, alias, instructions);
+			ctx.ui.notify(`${alias} compaction ${receipt.compaction} in ${teamId}`, "info");
 			return;
 		}
 		case "pause":

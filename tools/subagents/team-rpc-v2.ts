@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
+import { isContextOverflow, isRecoverableLength, isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { RpcEvent, RpcTransport } from "./rpc-worker";
 import {
 	TEAM_ACTIVATION_TRIGGER, TEAM_COMMAND, TEAM_COMMAND_CACHE, TEAM_COMMAND_DESCRIPTION, TEAM_MAX_FRAME_BYTES,
@@ -24,6 +24,7 @@ export class TeamActivationFailure extends Error {
 }
 
 interface ActiveRun {
+	maxTokens?: number;
 	activation: RuntimeActivation;
 	onRequest(frame: ChildRequestFrame, intentId?: string): Promise<PrivateReply>;
 	lastSequence: number;
@@ -150,6 +151,8 @@ function completionFor(run: ActiveRun): NativeCompletion {
 	const text = assistantText(message);
 	return {
 		status,
+		...(record(message) && ((status === "error" && isContextOverflow(message as unknown as AssistantMessage))
+			|| (status === "length" && run.maxTokens !== undefined && isRecoverableLength(message as unknown as AssistantMessage, run.maxTokens))) ? { overflow: true } : {}),
 		usage: run.usage.result("").usage,
 		...(text !== undefined ? { finalAssistantText: text } : {}),
 		...(pendingToolCalls ? { pendingToolCalls: true } : {}),
@@ -210,6 +213,7 @@ export class TeamRpcV2Connection {
 		activation: RuntimeActivation,
 		onRequest: (frame: ChildRequestFrame, intentId?: string) => Promise<PrivateReply>,
 		signal?: AbortSignal,
+		maxTokens?: number,
 	): Promise<NativeCompletion> {
 		await this.bind();
 		if (!this.bound || this.run || this.failure) throw this.failure ?? new Error("Team member session is not ready for an activation");
@@ -222,6 +226,7 @@ export class TeamRpcV2Connection {
 		// A transport request can fail before control reaches `await settled`; keep its rejection observed.
 		void settled.catch(() => undefined);
 		const run: ActiveRun = {
+			...(maxTokens !== undefined ? { maxTokens } : {}),
 			activation, onRequest, lastSequence: 0, started: false, policyStopRequested: false, usage: new RunResultCollector("", () => ""),
 			requests: new Map(), requestNativeToolCallIds: new Map(), nativeToolCalls: new Map(),
 			pendingNativeToolCalls: new Set(), claimedNativeToolCalls: new Set(), pendingRequests: 0,

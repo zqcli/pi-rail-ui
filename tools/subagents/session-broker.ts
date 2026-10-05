@@ -9,7 +9,7 @@ import { buildSubagentSessionName } from "./session-name";
 import type { SessionLease } from "./session-lease";
 import type { SubagentTranscriptSnapshot } from "./transcript";
 import { emptySubagentUsage } from "./usage";
-import type { NativeCompletion, RuntimeActivation } from "./team-runtime";
+import type { CompactionResult, NativeCompletion, RuntimeActivation } from "./team-runtime";
 import type { RpcEvent } from "./rpc-worker";
 import { parseBinding, sameBinding } from "./team-codec";
 
@@ -55,6 +55,9 @@ export interface WorkerStartSpec {
 }
 
 export interface TeamMemberProtocolSession {
+	readonly nativeContextWindow?: number;
+	compact?(instructions?: string): Promise<CompactionResult>;
+	abortCompaction?(): void;
 	runActivation(
 		activation: RuntimeActivation,
 		onRequest: (frame: ChildRequestFrame, intentId?: string) => Promise<PrivateReply>,
@@ -210,6 +213,9 @@ export interface TeamMemberOpenRequest {
 }
 
 export interface BrokeredTeamMemberHandle {
+	readonly nativeContextWindow?: number;
+	compact?(instructions?: string): Promise<CompactionResult>;
+	abortCompaction?(): void;
 	readonly instance: AgentInstance;
 	readonly sessionId: string;
 	runActivation(
@@ -679,6 +685,9 @@ export class SessionBroker {
 			};
 			const handle: BrokeredTeamMemberHandle = {
 				instance,
+				...(ownedProtocol.nativeContextWindow !== undefined ? { nativeContextWindow: ownedProtocol.nativeContextWindow } : {}),
+				compact: (instructions) => this.enqueue(ownedState, () => ownedProtocol.compact!(instructions), "maintenance"),
+				abortCompaction: () => ownedProtocol.abortCompaction?.(),
 				sessionId: instance.sessionId,
 				runActivation: async (activation, onRequest, onNativeSettled, signal) => {
 					if (closed || this.teamMemberHandles.get(ownedInstance.agentId)?.owner !== owner) throw new Error(`Team member ${alias} lifetime is closed`);

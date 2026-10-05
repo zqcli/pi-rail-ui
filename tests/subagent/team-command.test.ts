@@ -45,6 +45,46 @@ function commandContext(options: { hasUI?: boolean; mode?: "tui" | "rpc"; confir
 	return { ctx: ctx as any, notifications, confirmations, overlays };
 }
 
+test("compact completes open aliases, confirms instructions and reports the immediate receipt", async () => {
+	const { host, teamId } = setup();
+	host.runtime.launch(teamId);
+	let command: any;
+	installTeamCommand({ registerCommand: (_name: string, value: any) => { command = value; } } as any, () => host);
+	assert.deepEqual(command.getArgumentCompletions(`${teamId} compact `).map((item: any) => item.label), ["lead", "worker"]);
+	const calls: unknown[][] = [];
+	host.runtime.compactMember = (...args) => { calls.push(args); return { actor: "@host", status: "applied", teamId, memberId: args[1], compaction: "scheduled" }; };
+	const declined = commandContext({ confirmation: false });
+	await runTeamCommand(host, `${teamId} compact worker keep decisions`, declined.ctx);
+	assert.deepEqual(calls, []);
+	const ui = commandContext();
+	await runTeamCommand(host, `${teamId} compact worker keep decisions`, ui.ctx);
+	assert.deepEqual(calls, [[teamId, "worker", "keep decisions"]]);
+	assert.match(ui.confirmations[0]!.message, /keep decisions/u);
+	assert.match(ui.notifications.at(-1)!.text, /worker compaction scheduled/u);
+	await runTeamCommand(host, `${teamId} compact lead`, ui.ctx);
+	assert.deepEqual(calls[1], [teamId, "lead", undefined]);
+	await assert.rejects(runTeamCommand(host, `${teamId} compact`, ui.ctx), /requires a member alias/u);
+	await assert.rejects(runTeamCommand(host, `${teamId} compact worker ${"保".repeat(683)}`, ui.ctx), /2 KiB/u);
+	assert.equal(calls.length, 2);
+});
+
+test("popup z outside Members chooses an open member then confirms compaction", async () => {
+	const { host, teamId } = setup();
+	host.runtime.launch(teamId);
+	const calls: unknown[][] = [];
+	host.runtime.compactMember = (...args) => { calls.push(args); return { actor: "@host", status: "applied", teamId, memberId: args[1], compaction: "started" }; };
+	const ui = commandContext({ overlayKey: "z" });
+	ui.ctx.ui.select = async (title: string, aliases: string[]) => {
+		assert.match(title, /Compact which member/u);
+		assert.deepEqual(aliases, ["lead", "worker"]);
+		return "worker";
+	};
+	await runTeamCommand(host, "", ui.ctx);
+	assert.deepEqual(calls, [[teamId, "worker", undefined]]);
+	assert.match(ui.confirmations[0]!.title, /Compact worker/u);
+	assert.match(ui.notifications.at(-1)!.text, /compaction started/u);
+});
+
 test("rail-team registers ID/subcommand completion and prints every root budget", async () => {
 	const { host, teamId } = setup([{ to: "worker", task: "root one" }, { to: "worker", task: "root two" }]);
 	let command: any;

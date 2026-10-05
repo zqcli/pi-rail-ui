@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Check } from "typebox/value";
+import { TeamRuntime } from "../../tools/subagents/team-runtime";
 import {
 	errorReply, jsonBytes, jsonTextBytes, normalizeTeamAction, parseChildFrame, parseParentCommand, parseTeamReply,
 	projectActivationInput, projectErrorText, projectOwnedChildren, projectWorkChildren, projectWorkError,
@@ -44,6 +45,51 @@ test("revise_work description explains superseded sub-tasks without changing its
 	assert.deepEqual(normalizeTeamAction({ action: "control", command: "revise_work", workId: "root", expectedRevision: 1, task: "redo" }), {
 		action: "control", control: { command: "revise_work", workId: "root", expectedRevision: 1, task: "redo", inputRefs: [] },
 	});
+});
+
+test("compact_member accepts optional instructions bounded to 2 KiB and preserves immediate receipts", () => {
+	const args = { action: "control", command: "compact_member", memberId: "owner" };
+	assert.ok(Check(TEAM_TOOL_SCHEMA, args));
+	assert.deepEqual(normalizeTeamAction(args), { action: "control", control: { command: "compact_member", memberId: "owner" } });
+	const instructions = "保".repeat(682);
+	assert.deepEqual(normalizeTeamAction({ ...args, instructions }), { action: "control", control: { command: "compact_member", memberId: "owner", instructions } });
+	assert.throws(() => normalizeTeamAction({ ...args, instructions: instructions + "保" }), invalidArgument);
+	assert.throws(() => normalizeTeamAction({ ...args, instructions: 1 }), invalidArgument);
+	assert.throws(() => normalizeTeamAction({ ...args, command: "revive_member", instructions: "keep" }), invalidArgument);
+	for (const compaction of ["started", "scheduled"]) {
+		const reply = { ok: true, from: "@hub", to: "lead", receipt: { status: "applied", command: "compact_member", memberId: "owner", compaction } };
+		assert.deepEqual(parseTeamReply(reply), reply);
+		assert.throws(() => parseTeamReply({ ...reply, receipt: { ...reply.receipt, compaction: "done" } }), protocolFailure);
+		assert.throws(() => parseTeamReply({ ...reply, receipt: { ...reply.receipt, compaction: undefined } }), protocolFailure);
+	}
+});
+
+test("activation roster preserves context percent through projection and private parsing", () => {
+	const value = input();
+	value.roster[1]!.contextPercent = 87.2;
+	const projected = projectActivationInput(value);
+	assert.deepEqual(projected.roster, value.roster);
+	assert.deepEqual(parseParentCommand(activate(projected)), activate(projected));
+	for (const percent of [-1, NaN, Infinity]) {
+		value.roster[1]!.contextPercent = percent;
+		assert.throws(() => parseParentCommand(activate(value)), protocolFailure);
+	}
+});
+
+test("team view preserves context and compaction metadata and rejects malformed fields", () => {
+	const runtime = new TeamRuntime();
+	const { teamId } = runtime.prepare({ members: [{ alias: "lead", roleDescription: "Lead" }, { alias: "worker", roleDescription: "Work" }], lead: "lead", brief: { goal: "Test" }, timeoutSeconds: null });
+	const view = runtime.getTeam(teamId);
+	const member = view.members[1]!;
+	member.context = { used: 286000, window: 328000, percent: 87.2 };
+	member.compacting = true;
+	member.lastCompaction = { tokensBefore: 286000, tokensAfter: 41000 };
+	const reply = { ok: true, from: "@hub", to: "lead", data: view };
+	assert.deepEqual(parseTeamReply(reply), reply);
+	for (const context of [{ used: -1, window: 328000, percent: 0 }, { used: 1, window: 0, percent: 0 }, { used: 1, window: 100, percent: NaN }]) {
+		member.context = context;
+		assert.throws(() => parseTeamReply(reply), protocolFailure);
+	}
 });
 
 test("work view accepts accumulated outcomes beyond 512 while child previews stay bounded", () => {

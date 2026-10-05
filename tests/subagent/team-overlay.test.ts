@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { readCompactThreshold } from "../../tools/subagents/team-compaction-settings";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SessionBroker } from "../../tools/subagents/session-broker";
@@ -59,6 +63,61 @@ function overlay(host: TeamSessionHost, options: { rows?: number; now?: () => nu
 	const component = new TeamOverlayComponent(tui as any, options.theme ?? theme, { matches: (data: string, action: string) => bindings[action] === data } as any, (action) => closed.push(action), host, options.now);
 	return { component, closed, tui, renders: () => renders, text: (width = 120) => component.render(width).join("\n"), key: (key: keyof typeof keys) => component.handleInput(keys[key]) };
 }
+
+test("z selects the Members row or detail and opens the chooser from other tabs", (t) => {
+	const { host, teamId } = fixture();
+	for (const detail of [false, true]) {
+		const ui = overlay(host);
+		ui.key("tab"); ui.key("tab"); ui.text(); ui.key("down"); ui.text();
+		if (detail) { ui.key("enter"); ui.text(); }
+		ui.component.handleInput("z");
+		assert.deepEqual(ui.closed, [{ teamId, action: "compact", memberId: "runner" }]);
+	}
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.component.handleInput("z");
+	assert.deepEqual(ui.closed, [{ teamId, action: "compact" }]);
+});
+
+test("t cycles all thresholds, persists them in a temporary agent dir and updates wrapped help", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "team-overlay-compact-"));
+	const previous = process.env["PI_CODING_AGENT_DIR"];
+	process.env["PI_CODING_AGENT_DIR"] = dir;
+	t.after(() => {
+		if (previous === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previous;
+		rmSync(dir, { recursive: true, force: true });
+	});
+	const { host } = fixture();
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	assert.equal(readCompactThreshold(), 80);
+	for (const next of [90, 95, null, 60, 70, 80]) {
+		ui.component.handleInput("t");
+		assert.equal(readCompactThreshold(), next);
+		const lines = ui.component.render(73);
+		assert.ok(lines.some((line) => line.includes(`t compact at ${next === null ? "off" : `${next}%`}`)));
+		for (const line of lines) assert.equal(visibleWidth(line), 73);
+	}
+	assert.deepEqual(ui.closed, []);
+});
+
+test("Members show context, running compaction and the last reduction at popup width", (t) => {
+	const { host, teamId } = fixture();
+	const team = host.runtime.getTeam(teamId);
+	team.members[1]!.context = { used: 286000, window: 328000, percent: 87 };
+	team.members[1]!.compacting = true;
+	host.runtime.listTeams = () => [team];
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("tab"); ui.key("tab");
+	assert.match(ui.text(73), /ctx 286k\/328k 87% · compacting…/u);
+	team.members[1]!.compacting = false;
+	team.members[1]!.lastCompaction = { tokensBefore: 286000, tokensAfter: 41000 };
+	team.members[1]!.context = { used: 41000, window: 328000, percent: 13 };
+	assert.match(ui.text(73), /ctx 41k\/328k 13% · compacted 286k→41k/u);
+	for (const line of ui.component.render(73)) assert.equal(visibleWidth(line), 73);
+});
 
 test("five views show real running, waiting and held work, routes and attention", (t) => {
 	const { host, now } = fixture();
@@ -390,7 +449,7 @@ test("Timeline cursor uses aligned time, pages, Home/End, and follows only at ne
 	facts.timeline = Array.from({ length: 20 }, (_, index) => ({ at: index * 60_000, text: `milestone ${index}` }));
 	facts.timelineOmitted = 3;
 	host.runtime.panelFacts = () => facts;
-	const ui = overlay(host, { rows: 21 }); // two help rows: 21 terminal rows keep an 8-row Timeline page
+	const ui = overlay(host, { rows: 22 }); // Three help rows leave an 8-row Timeline page.
 	t.after(() => ui.component.dispose());
 	ui.key("left");
 	const cursor = () => ui.component.render(100).find((line) => line.startsWith("│ →"))!;
@@ -639,7 +698,7 @@ test("review works do not count in the Overview progress", (t) => {
 /** The popup is 92% of the terminal: 73 columns at 80. */
 const POPUP_WIDTH = 73;
 /** The action keys wrapped by whole keys at the popup width. */
-const ACTION_HELP = ["p pause · c cancel · r resume hold · g grant · m message · v revive", "l new lead"];
+const ACTION_HELP = ["p pause · c cancel · r resume hold · g grant · m message · v revive", "l new lead · z compact · t compact at 80%"];
 /** The text of each popup row, without the frame and its leading space. */
 const rowsOf = (lines: string[]) => lines.map((line) => stripTerminalSequences(line).slice(2, -1).trimEnd());
 /** The row starting with `label` and the rows that continue it: indented under a label, or up to the next blank row for an unlabeled wrap. */
@@ -705,7 +764,7 @@ test("a paused Team shows PAUSED in the summary and Overview; p pauses a running
 	assert.match(paused.text(), /Waiting for:\s+Paused by the host/u);
 	const lines = paused.component.render(POPUP_WIDTH);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
-	assert.deepEqual(helpOf(lines).slice(-2), ["p continue · c cancel · r resume hold · g grant · m message · v revive", "l new lead"]);
+	assert.deepEqual(helpOf(lines).slice(-2), ["p continue · c cancel · r resume hold · g grant · m message · v revive", "l new lead · z compact · t compact at 80%"]);
 	paused.component.handleInput("p");
 	assert.deepEqual(paused.closed, [{ teamId, action: "continue" }]);
 	host.runtime.cancelTeam(teamId, "done");

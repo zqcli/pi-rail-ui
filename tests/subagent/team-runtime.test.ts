@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeCompactThreshold } from "../../tools/subagents/team-compaction-settings";
+import { emptySubagentUsage } from "../../tools/subagents/usage";
+import type { CompactionResult, NativeCompletion } from "../../tools/subagents/team-runtime";
 import {
 	TeamProtocolError, encodeActivationInput, jsonBytes, normalizeTeamAction, normalizeTeamPlan, parseChildFrame, parseParentCommand, parseTeamReply,
 } from "../../tools/subagents/team-codec";
@@ -69,6 +75,317 @@ function reply(runtime: TeamRuntime, activation: RuntimeActivation, callId: stri
 function code(replyValue: ReturnType<typeof action>): string | undefined {
 	return replyValue.ok ? undefined : replyValue.error.code;
 }
+
+const compactTick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+async function compactionRuntime(t: TestContext, initialRequests: Array<{ to: string; task: string }> = []) {
+	const dir = mkdtempSync(join(tmpdir(), "team-compact-runtime-"));
+	const previous = process.env["PI_CODING_AGENT_DIR"];
+	process.env["PI_CODING_AGENT_DIR"] = dir;
+	t.after(() => {
+		if (previous === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = previous;
+		rmSync(dir, { recursive: true, force: true });
+	});
+	writeCompactThreshold(80);
+	const runtime = new TeamRuntime();
+	const { teamId } = runtime.prepare({
+		members: [{ alias: "lead", roleDescription: "Manage" }, { alias: "w1", roleDescription: "Work" }],
+		lead: "lead", brief: { goal: "Test compaction" }, initialRequests, timeoutSeconds: null,
+	});
+	const activations: RuntimeActivation[] = [];
+	const calls: Array<{ memberId: string; instructions?: string; resolve(result: CompactionResult): void }> = [];
+	const aborted: string[] = [];
+	runtime.attachExecutor(teamId, {
+		runActivation: async (activation) => { activations.push(activation); },
+		compactMember: (binding, instructions) => new Promise((resolve) => calls.push({ memberId: binding.memberId,
+			...(instructions !== undefined ? { instructions } : {}), resolve })),
+		abortCompaction: (binding) => { aborted.push(binding.memberId); },
+		closeMember: async () => ({ ok: true }),
+	});
+	runtime.setMemberContextWindow(teamId, "w1", 1000);
+	runtime.setMemberContextWindow(teamId, "lead", 1000);
+	runtime.launch(teamId);
+	await compactTick();
+	const boot = activations.find((activation) => activation.binding.memberId === "lead")!;
+	inputReady(runtime, boot);
+	action(runtime, boot, 1, "boot", { action: "yield" });
+	settle(runtime, boot, "boot");
+	await compactTick();
+	return { runtime, teamId, activations, calls, aborted };
+}
+
+function compactSettle(runtime: TeamRuntime, activation: RuntimeActivation, completion: NativeCompletion): void {
+	inputReady(runtime, activation);
+	assert.equal(runtime.nativeSettled(activation.binding, activation.scope.activationId, completion).ok, true);
+	assert.equal(runtime.cleanupFinished(activation.binding, activation.scope.activationId, { ok: true }).ok, true);
+}
+
+test("compaction: idle host requests start immediately, queue one replacement, fold usage without model requests", async (t) => {
+	const { runtime, teamId, calls } = await compactionRuntime(t);
+	const requests = runtime.getTeam(teamId).budget.used.teamModelRequests;
+	assert.equal(runtime.compactMember(teamId, "w1").compaction, "started");
+	await compactTick();
+	assert.equal(calls[0]!.instructions, undefined);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.compacting, true);
+	assert.equal(runtime.compactMember(teamId, "w1", "old").compaction, "scheduled");
+	assert.equal(runtime.compactMember(teamId, "w1", "keep decisions").compaction, "scheduled");
+	calls[0]!.resolve({ ok: true, tokensBefore: 900, tokensAfter: 100, usage: { ...emptySubagentUsage(), input: 20, output: 5, cost: 0.1 } });
+	await compactTick();
+	assert.equal(calls.length, 2);
+	assert.equal(calls[1]!.instructions, "keep decisions");
+	calls[1]!.resolve({ ok: true, tokensBefore: 100, tokensAfter: 80 });
+	await compactTick();
+	const member = runtime.getTeam(teamId).members.find((m) => m.id === "w1")!;
+	assert.deepEqual(member.context, { used: 80, window: 1000, percent: 8 });
+	assert.deepEqual(member.lastCompaction, { tokensBefore: 100, tokensAfter: 80 });
+	assert.equal(member.usage.input, 20);
+	assert.equal(runtime.getTeam(teamId).usage.cost, 0.1);
+	assert.equal(runtime.getTeam(teamId).budget.used.teamModelRequests, requests);
+	assert.ok(runtime.panelFacts(teamId).timeline.some((entry) => /w1 compacted \(host\) 900→100/.test(entry.text)));
+});
+
+test("compaction: active member waits for cleanup and later pending instructions win", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "work" }]);
+	const work = activations.find((activation) => activation.binding.memberId === "w1")!;
+	assert.equal(runtime.compactMember(teamId, "w1", "old").compaction, "scheduled");
+	assert.equal(runtime.compactMember(teamId, "w1", "new").compaction, "scheduled");
+	await compactTick();
+	assert.equal(calls.length, 0);
+	reply(runtime, work, "done", "finished");
+	await compactTick();
+	assert.equal(calls[0]!.instructions, "new");
+	calls[0]!.resolve({ ok: false, error: "summary failed" });
+	await compactTick();
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "open");
+});
+
+test("compaction: host pause defers lead requests, but explicit host compaction runs while paused", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t);
+	runtime.messageLead(teamId, "compact now");
+	await compactTick();
+	const lead = activations.at(-1)!;
+	inputReady(runtime, lead);
+	runtime.pauseTeam(teamId);
+	const result = action(runtime, lead, 1, "compact", { action: "control", command: "compact_member", memberId: "w1", instructions: "keep facts" });
+	assert.equal(result.ok, true);
+	if (result.ok && result.receipt && "compaction" in result.receipt) assert.equal(result.receipt.compaction, "scheduled");
+	await compactTick();
+	assert.equal(calls.length, 0);
+	runtime.continueTeam(teamId);
+	await compactTick();
+	assert.equal(calls[0]!.instructions, "keep facts");
+	calls[0]!.resolve({ ok: false, error: "cannot summarize" });
+	await compactTick();
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "open");
+	assert.ok(runtime.panelFacts(teamId).timeline.some((entry) => entry.text.includes("compaction failed (lead): cannot summarize")));
+	action(runtime, lead, 2, "yield", { action: "yield" });
+	settle(runtime, lead, "yield");
+	await compactTick();
+	const next = activations.at(-1)!.input.scope;
+	assert.ok(next.kind === "events" && next.events.some((event) => /compaction.*w1.*failed.*cannot summarize/i.test(event.message)));
+	runtime.pauseTeam(teamId);
+	assert.equal(runtime.compactMember(teamId, "w1").compaction, "started");
+	await compactTick();
+	assert.equal(calls.length, 2);
+	calls[1]!.resolve({ ok: true, tokensAfter: 10 });
+	await compactTick();
+});
+
+test("compaction: overflow retries the same work once with a notice, then faults; revive compacts before work", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "work" }]);
+	const work = activations.find((activation) => activation.binding.memberId === "w1")!;
+	compactSettle(runtime, work, { status: "length", overflow: true });
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "open");
+	calls[0]!.resolve({ ok: true, tokensAfter: 50 });
+	await compactTick();
+	const retry = activations.filter((activation) => activation.binding.memberId === "w1").at(-1)!;
+	assert.deepEqual(retry.scope.work, work.scope.work);
+	assert.match(retry.input.notice!, /overflowed the model context/i);
+	compactSettle(runtime, retry, { status: "length", overflow: true });
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.error?.code, "NATIVE_LENGTH");
+	runtime.reviveMember(teamId, "w1");
+	await compactTick();
+	assert.equal(calls.length, 2);
+	calls[1]!.resolve({ ok: true, tokensAfter: 30 });
+	await compactTick();
+});
+
+test("compaction: another queued work cannot consume an overflow notice or reset its recovery limit", async (t) => {
+	const { runtime, calls, activations, teamId } = await compactionRuntime(t, [{ to: "w1", task: "A" }, { to: "w1", task: "B" }]);
+	const first = activations.find((a) => a.binding.memberId === "w1")!;
+	compactSettle(runtime, first, { status: "length", overflow: true });
+	await compactTick();
+	calls[0]!.resolve({ ok: true, tokensAfter: 10 });
+	await compactTick();
+	const other = activations.filter((a) => a.binding.memberId === "w1").at(-1)!;
+	assert.notDeepEqual(other.scope.work, first.scope.work);
+	assert.doesNotMatch(other.input.notice!, /overflowed the model context/i);
+	reply(runtime, other, "done", "B is complete");
+	await compactTick();
+	const retry = activations.filter((a) => a.binding.memberId === "w1").at(-1)!;
+	assert.deepEqual(retry.scope.work, first.scope.work);
+	assert.match(retry.input.notice!, /overflowed the model context/i);
+	compactSettle(runtime, retry, { status: "length", overflow: true });
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "faulted");
+});
+
+test("compaction: threshold runs only at the next boundary, skips an immediate retrigger, and follows live off setting", async (t) => {
+	const { runtime, calls, activations } = await compactionRuntime(t, [
+		{ to: "w1", task: "first" }, { to: "w1", task: "second" }, { to: "w1", task: "third" },
+	]);
+	const work = activations.find((activation) => activation.binding.memberId === "w1")!;
+	assert.equal(calls.length, 0);
+	compactSettle(runtime, work, { status: "success", finalAssistantText: "finished", usage: { ...emptySubagentUsage(), contextTokens: 800 } });
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(activations.filter((a) => a.binding.memberId === "w1").length, 1);
+	calls[0]!.resolve({ ok: true, tokensBefore: 800, tokensAfter: 850 });
+	await compactTick();
+	assert.equal(calls.length, 1, "summary above threshold must not loop");
+	const second = activations.filter((a) => a.binding.memberId === "w1").at(-1)!;
+	assert.notEqual(second, work);
+	writeCompactThreshold(null);
+	compactSettle(runtime, second, { status: "success", finalAssistantText: "finished", usage: { ...emptySubagentUsage(), contextTokens: 900 } });
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(activations.filter((a) => a.binding.memberId === "w1").length, 3);
+});
+
+test("compaction: below threshold proceeds, live threshold change applies to lead events too", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "first" }, { to: "w1", task: "second" }]);
+	const work = activations.find((a) => a.binding.memberId === "w1")!;
+	compactSettle(runtime, work, { status: "success", finalAssistantText: "finished", usage: { ...emptySubagentUsage(), contextTokens: 799 } });
+	await compactTick();
+	assert.equal(calls.length, 0);
+	assert.equal(activations.filter((a) => a.binding.memberId === "w1").length, 2);
+	const lead = activations.filter((a) => a.binding.memberId === "lead").at(-1)!;
+	inputReady(runtime, lead);
+	action(runtime, lead, 1, "yield", { action: "yield" });
+	compactSettle(runtime, lead, { status: "success", appliedToolCallId: "yield", usage: { ...emptySubagentUsage(), contextTokens: 700 } });
+	writeCompactThreshold(70);
+	runtime.messageLead(teamId, "continue");
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0]!.memberId, "lead");
+	calls[0]!.resolve({ ok: true, tokensAfter: 10 });
+	await compactTick();
+});
+
+test("compaction: close_member aborts running compaction and discards its queued replacement", async (t) => {
+	const { runtime, teamId, calls, activations, aborted } = await compactionRuntime(t);
+	runtime.compactMember(teamId, "w1");
+	await compactTick();
+	runtime.compactMember(teamId, "w1", "queued");
+	runtime.messageLead(teamId, "close worker");
+	await compactTick();
+	const lead = activations.at(-1)!;
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "close", { action: "control", command: "close_member", memberId: "w1" }).ok, true);
+	await compactTick();
+	assert.deepEqual(aborted, ["w1"]);
+	calls[0]!.resolve({ ok: true, tokensAfter: 100 });
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "closed");
+});
+
+test("compaction: host cancel aborts a running compaction", async (t) => {
+	const { runtime, teamId, calls, aborted } = await compactionRuntime(t);
+	runtime.compactMember(teamId, "w1");
+	await compactTick();
+	runtime.cancelTeam(teamId, "stop");
+	await compactTick();
+	assert.deepEqual(aborted, ["w1"]);
+	calls[0]!.resolve({ ok: false, error: "aborted" });
+	await compactTick();
+});
+
+test("compaction: close_team aborts running compaction before lead settlement", async (t) => {
+	const { runtime, teamId, calls, activations, aborted } = await compactionRuntime(t);
+	runtime.compactMember(teamId, "w1");
+	await compactTick();
+	const lead = activations.filter((a) => a.binding.memberId === "lead").at(-1)!;
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "close", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "No work needed" }).ok, true);
+	await compactTick();
+	assert.deepEqual(aborted, ["w1"]);
+	calls[0]!.resolve({ ok: false, error: "aborted" });
+	settle(runtime, lead, "close");
+	await compactTick();
+	assert.equal(runtime.getTeam(teamId).lifecycle, "closed");
+});
+
+test("compaction: workers cannot request compaction; the lead can compact itself after its activation", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "work" }]);
+	const work = activations.find((a) => a.binding.memberId === "w1")!;
+	inputReady(runtime, work);
+	assert.equal(code(action(runtime, work, 1, "forbidden", { action: "control", command: "compact_member", memberId: "w1" })), "FORBIDDEN_ACTION");
+	reply(runtime, work, "done", "finished", 2);
+	await compactTick();
+	const lead = activations.filter((a) => a.binding.memberId === "lead").at(-1)!;
+	inputReady(runtime, lead);
+	const requested = action(runtime, lead, 1, "compact", { action: "control", command: "compact_member", memberId: "lead" });
+	assert.equal(requested.ok, true);
+	if (requested.ok) assert.deepEqual(requested.receipt, { status: "applied", command: "compact_member", memberId: "lead", compaction: "scheduled" });
+	assert.equal(calls.length, 0);
+	action(runtime, lead, 2, "yield", { action: "yield" });
+	settle(runtime, lead, "yield");
+	await compactTick();
+	assert.equal(calls[0]!.memberId, "lead");
+	calls[0]!.resolve({ ok: true, tokensAfter: 10 });
+	await compactTick();
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "lead")!.context!.used, 10);
+});
+
+test("compaction: staged end intent never triggers overflow recovery", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "work" }]);
+	const work = activations.find((activation) => activation.binding.memberId === "w1")!;
+	inputReady(runtime, work);
+	action(runtime, work, 1, "reply", { action: "reply", result: { status: "succeeded", summary: "done" } });
+	compactSettle(runtime, work, { status: "length", overflow: true });
+	await compactTick();
+	assert.equal(calls.length, 0);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "faulted");
+});
+
+test("compaction: lead overflow redelivers its events once, then faults", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t);
+	runtime.messageLead(teamId, "overflow request");
+	await compactTick();
+	const lead = activations.at(-1)!;
+	compactSettle(runtime, lead, { status: "error", overflow: true, error: { code: "NATIVE_FAILURE", message: "context length exceeded" } });
+	await compactTick();
+	assert.equal(calls[0]!.memberId, "lead");
+	calls[0]!.resolve({ ok: true, tokensAfter: 20 });
+	await compactTick();
+	const retry = activations.at(-1)!;
+	assert.equal(retry.input.scope.kind, "events");
+	if (retry.input.scope.kind === "events" && lead.input.scope.kind === "events") {
+		const events = retry.input.scope.events;
+		for (const event of lead.input.scope.events) assert.deepEqual(events.find((item) => item.id === event.id), event);
+	}
+	assert.match(retry.input.notice!, /overflowed the model context/i);
+	compactSettle(runtime, retry, { status: "error", overflow: true, error: { code: "NATIVE_FAILURE", message: "context length exceeded", transient: true } });
+	await compactTick();
+	assert.equal(calls.length, 1);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "lead")!.lifecycle, "faulted");
+});
+
+test("compaction: ordinary output exhaustion faults without recovery", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "work" }]);
+	const work = activations.find((activation) => activation.binding.memberId === "w1")!;
+	compactSettle(runtime, work, { status: "length" });
+	await compactTick();
+	assert.equal(calls.length, 0);
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "faulted");
+});
 
 function workRef(activation: RuntimeActivation): WorkRef {
 	assert.equal(activation.scope.kind, "work");

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,12 +50,22 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer" | "n08-cache-warming",
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer" | "n08-cache-warming" | "rail-compaction-threshold" | "rail-compaction-instructions" | "rail-compaction-host" | "rail-compaction-overflow" | "rail-compaction-length",
 	open?: readonly string[], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}, workerCount = 2, childTeamExtension?: string) {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
+	const oldAgentDir = process.env["PI_CODING_AGENT_DIR"];
+	process.env["PI_CODING_AGENT_DIR"] = root;
+	t.after(async () => {
+		if (oldAgentDir === undefined) delete process.env["PI_CODING_AGENT_DIR"];
+		else process.env["PI_CODING_AGENT_DIR"] = oldAgentDir;
+	});
+	await mkdir(join(root, "rail-team"));
+	await writeFile(join(root, "rail-team", "settings.json"), JSON.stringify({
+		version: 1, compactThreshold: scenario === "rail-compaction-threshold" ? 80 : null,
+	}));
 	const workerIds = Array.from({ length: workerCount }, (_value, index) => `w${index + 1}`);
 	await writeFile(join(root, "settings.json"), JSON.stringify({
-		compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 1 },
+		compaction: { enabled: !scenario.startsWith("rail-compaction-"), reserveTokens: 16384, keepRecentTokens: 1 },
 		retry: { enabled: true, maxRetries: 1, baseDelayMs: 10 },
 		...(scenario === "n08-cache-warming" ? { cacheWarming: "idle" } : {}),
 	}));
@@ -93,9 +103,11 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 	const runtime = new TeamRuntime(runtimeOptions);
 	const prepared = runtime.prepare({
 		members: [{ alias: "lead", roleDescription: "Review Team outcomes.", model: "rail-team-local/probe", cwd: root, fastMode: false }, ...workerIds.map((alias) => ({ alias, roleDescription: `Handle ${alias}'s assigned work and answer peer questions.`, model: "rail-team-local/probe", cwd: root, fastMode: false,
-			...((scenario === "compaction" || scenario === "n06-context-edit") && alias === "w1" ? { contextWindow: 64000 } : {}) }))], lead: "lead",
+			...((scenario === "compaction" || scenario === "n06-context-edit" || scenario.startsWith("rail-compaction-")) && alias === "w1" ? { contextWindow: 64000 } : {}) }))], lead: "lead",
 		brief: { goal: "Verify same-session Team v2 activation and result settlement." },
-		initialRequests: scenario === "close-loop" || scenario === "close-mixed" ? []
+		initialRequests: scenario === "rail-compaction-threshold"
+			? [{ to: "w1", task: "first threshold work", inputRefs: [] }, { to: "w1", task: "second threshold work", inputRefs: [] }]
+			: scenario === "close-loop" || scenario === "close-mixed" ? []
 			: scenario === "n01-role-only" ? [{ to: "w1", task: "N01 initial review", inputRefs: [] }]
 			: scenario === "cancel-live" ? [
 				{ to: "w1", task: "cancel target", inputRefs: [] },
@@ -1361,6 +1373,103 @@ test("real Pi threshold compaction occurs inside a Team activation without losin
 	const providerCalls = workerEntries.filter((entry) => entry.type === "custom" && entry.customType === "team-v2-provider");
 	assert.ok(providerCalls.some((entry) => entry.data.activationDeliveryId && entry.data.modelContextWindow === 64000));
 });
+
+test("real Pi Rail threshold compaction runs between activations with native auto-compaction disabled", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles, root } = await createHarness(t, "rail-compaction-threshold");
+	assert.equal(JSON.parse(await readFile(join(root, "settings.json"), "utf8")).compaction.enabled, false);
+	const lifetime = driver.launch(teamId);
+	await waitUntil(() => runtime.getTeam(teamId).works.resolved === 2, "both threshold roots to resolve").catch((error) => {
+		throw new Error(`${error}; ${JSON.stringify(runtime.getTeam(teamId))}; ${JSON.stringify(runtime.panelFacts(teamId))}`);
+	});
+	const entries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	const activations = entries.filter((entry) => promptInput(entry)?.scope.kind === "work");
+	assert.equal(activations.length, 2);
+	const compactions = entries.filter((entry) => entry.type === "compaction");
+	assert.equal(compactions.length, 1, JSON.stringify(runtime.panelFacts(teamId)));
+	const checkpointIndex = entries.indexOf(compactions[0]);
+	assert.ok(checkpointIndex > entries.indexOf(activations[0]) && checkpointIndex < entries.indexOf(activations[1]),
+		"the persisted checkpoint belongs between the two canonical activation inputs");
+	const calls = providerCalls(entries).filter((entry) => entry.data.activationDeliveryId);
+	assert.equal(calls.length, 2, "compaction must not interrupt or restart an activation");
+	assert.ok(calls.every((entry) => entry.data.modelContextWindow === 64000));
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.lifecycle, "open");
+	runtime.hostControl(teamId).cancel_team("Threshold integration verified");
+	await lifetime;
+});
+
+test("real Pi lead compact_member passes custom instructions to the actual summarization provider", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "rail-compaction-instructions");
+	const lifetime = driver.launch(teamId);
+	await waitUntil(() => runtime.getTeam(teamId).works.resolved === 1, "initial work to resolve before lead compaction");
+	const instructions = "Preserve the exact verification marker RAIL_KEEP_7C91 and completed root evidence.";
+	runtime.hostControl(teamId).message_lead(instructions);
+	let entries: any[] = [];
+	for (let attempt = 0; attempt < 500; attempt++) {
+		entries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+		if (entries.some((entry) => entry.type === "compaction")) break;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.equal(entries.filter((entry) => entry.type === "compaction").length, 1, JSON.stringify(runtime.panelFacts(teamId)));
+	const summary = entries.find((entry) => entry.type === "custom" && entry.customType === "team-v2-summary-request");
+	assert.ok(summary?.data.text.includes(instructions), "Pi's summarization request includes the lead's instructions verbatim");
+	assert.ok(providerCalls(entries).filter((entry) => entry.data.activationDeliveryId)
+		.every((entry) => entry.data.modelContextWindow === 64000), "member activations use the 64000-token policy window");
+	const leadEntries = parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8"));
+	const receipt = leadEntries.find((entry) => entry.type === "message" && entry.message?.role === "toolResult"
+		&& entry.message.toolCallId === "rail-compact-member");
+	assert.equal(JSON.parse(messageText(receipt?.message)).receipt.command, "compact_member");
+	runtime.hostControl(teamId).cancel_team("Lead instructions integration verified");
+	await lifetime;
+});
+
+test("real Pi host compacts an idle member without starting a new activation", { timeout: 90000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "rail-compaction-host");
+	const lifetime = driver.launch(teamId);
+	await waitUntil(() => {
+		const team = runtime.getTeam(teamId);
+		return team.works.resolved === 1 && team.members.every((member) => member.activity === "idle");
+	}, "worker and lead to become idle");
+	const before = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	const requestsBefore = runtime.getTeam(teamId).budget.used.teamModelRequests;
+	const receipt = runtime.compactMember(teamId, "w1");
+	assert.equal(receipt.status, "applied");
+	assert.ok("compaction" in receipt && receipt.compaction === "started");
+	await waitUntil(() => !!runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.lastCompaction,
+		"host compaction to finish");
+	const member = runtime.getTeam(teamId).members.find((member) => member.id === "w1")!;
+	assert.ok((member.lastCompaction?.tokensAfter ?? 0) > 0, "projected native messages provide usable post-compaction context tokens");
+	assert.equal(member.context?.used, member.lastCompaction?.tokensAfter);
+	const after = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	assert.equal(after.filter((entry) => entry.type === "compaction").length, 1);
+	assert.equal(after.filter(promptInput).length, before.filter(promptInput).length,
+		"host compaction runs on the existing idle native session without delivering more work");
+	const summary = after.find((entry) => entry.type === "custom" && entry.customType === "team-v2-summary-request");
+	assert.ok(summary);
+	assert.equal(summary.data.text.includes("Additional focus:"), false, "omitted instructions use Pi's default prompt");
+	assert.equal(runtime.getTeam(teamId).budget.used.teamModelRequests, requestsBefore,
+		"summarization does not consume a Team activation model-request budget");
+	runtime.hostControl(teamId).cancel_team("Host compaction integration verified");
+	await lifetime;
+});
+
+for (const scenario of ["rail-compaction-overflow", "rail-compaction-length"] as const) {
+	test(`real Pi ${scenario} compacts once and re-delivers the same work`, { timeout: 90000 }, async (t) => {
+		const { runtime, teamId, driver, handles } = await createHarness(t, scenario);
+		const lifetime = driver.launch(teamId);
+		await waitUntil(() => runtime.getTeam(teamId).works.resolved === 1, "overflowed root to recover and resolve");
+		const entries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+		const activations = entries.map(promptInput).filter((input) => input?.scope.kind === "work");
+		assert.equal(activations.length, 2);
+		assert.deepEqual(activations[1].scope.work, activations[0].scope.work);
+		assert.equal(activations[1].scope.task, activations[0].scope.task);
+		assert.match(activations[1].notice, /overflowed the model context, so a compaction was attempted before this retry/i);
+		assert.equal(entries.filter((entry) => entry.type === "compaction").length, 1);
+		assert.equal(runtime.getTeam(teamId).works.failed, 0);
+		assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.lifecycle, "open");
+		runtime.hostControl(teamId).cancel_team("Overflow integration verified");
+		await lifetime;
+	});
+}
 
 test("real Pi rejects a non-sole end intent and Runtime commits only the true natural final", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles } = await createHarness(t, "mixed-end");

@@ -186,6 +186,7 @@ export class TeamMemberDriver {
 		this.opening.set(id, opened);
 		try {
 			const handle = await opened;
+			if (handle.nativeContextWindow) this.runtime.setMemberContextWindow(request.teamId, request.memberId, handle.nativeContextWindow);
 			this.members.set(id, { binding, handle, ...(contextWindow !== undefined ? { contextWindow } : {}) });
 			return handle;
 		} catch (error) {
@@ -261,6 +262,11 @@ export class TeamMemberDriver {
 	private executor(): TeamRuntimeExecutor {
 		return {
 			runActivation: (activation) => this.trackActivation(activation),
+			compactMember: async (binding, instructions) => {
+				const handle = this.members.get(key(binding.teamId, binding.memberId))?.handle;
+				return handle?.compact ? handle.compact(instructions) : { ok: false, error: "Member compaction is unavailable" };
+			},
+			abortCompaction: (binding) => this.members.get(key(binding.teamId, binding.memberId))?.handle.abortCompaction?.(),
 			stopActivation: (binding, activationId, reason) => this.stopActivation(binding, activationId, reason),
 			terminateActivation: (binding, activationId, error) => this.terminateActivation(binding, activationId, error.message),
 			closeMember: async (binding) => {

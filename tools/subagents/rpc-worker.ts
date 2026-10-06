@@ -448,13 +448,17 @@ export class RpcSessionWorker implements SessionWorker {
 			nativeContextWindow: state.model!.contextWindow!,
 			compact: async (instructions) => {
 				const usage = emptySubagentUsage();
+				const estimate = async () => ((await this.transport.request({ type: "get_messages" })) as { messages: Parameters<typeof estimateTokens>[0][] })
+					.messages.reduce((sum, message) => sum + estimateTokens(message), 0);
 				try {
+					const messagesBefore = await estimate();
 					const result = await this.transport.request({ type: "compact", ...(instructions !== undefined ? { customInstructions: instructions } : {}) }) as { tokensBefore?: number; usage?: unknown };
 					addCompactionUsage(usage, result);
-					// Pi reports unknown context usage until the next assistant turn after compaction.
-					const { messages } = await this.transport.request({ type: "get_messages" }) as { messages: Parameters<typeof estimateTokens>[0][] };
+					// Pi reports unknown context usage until the next assistant turn after compaction, and the message
+					// estimate leaves out the system prompt and tool definitions: carry that part over from tokensBefore.
+					const overhead = result.tokensBefore === undefined ? 0 : Math.max(0, result.tokensBefore - messagesBefore);
 					return { ok: true, ...(result.tokensBefore !== undefined ? { tokensBefore: result.tokensBefore } : {}),
-						tokensAfter: messages.reduce((sum, message) => sum + estimateTokens(message), 0), usage };
+						tokensAfter: await estimate() + overhead, usage };
 				} catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
 			},
 			abortCompaction: () => { void this.transport.request({ type: "abort" }).catch(() => undefined); },

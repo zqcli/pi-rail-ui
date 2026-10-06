@@ -1437,7 +1437,8 @@ test("real Pi host compacts an idle member without starting a new activation", {
 	await waitUntil(() => !!runtime.getTeam(teamId).members.find((member) => member.id === "w1")?.lastCompaction,
 		"host compaction to finish");
 	const member = runtime.getTeam(teamId).members.find((member) => member.id === "w1")!;
-	assert.ok((member.lastCompaction?.tokensAfter ?? 0) > 0, "projected native messages provide usable post-compaction context tokens");
+	assert.ok((member.lastCompaction?.tokensAfter ?? 0) > 15000, `the system prompt and tools the provider counted stay in the post-compaction context (${member.lastCompaction?.tokensAfter})`);
+	assert.ok(member.lastCompaction!.tokensAfter! < member.lastCompaction!.tokensBefore!, "compaction still reports a reduction");
 	assert.equal(member.context?.used, member.lastCompaction?.tokensAfter);
 	const after = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
 	assert.equal(after.filter((entry) => entry.type === "compaction").length, 1);

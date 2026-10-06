@@ -467,7 +467,9 @@ export default function install(pi) {
 			const inputTokens = cacheWarming ? 50000 : (scenario === "rail-compaction-threshold" && activation?.input.member.id === "w1" && turns === 1)
 				|| (scenario === "compaction" && activation?.input.member.id === "w1" && turns === 1)
 				|| (scenario === "n06-context-edit" && activation?.input.member.id === "w1" && activation.input.scope.kind === "work"
-					&& activation.input.scope.task === "N06 root" && activation.input.outcomes.length > 0 && replies.length === 0) ? 60000 : 1;
+					&& activation.input.scope.task === "N06 root" && activation.input.outcomes.length > 0 && replies.length === 0) ? 60000
+				// Provider usage counts the system prompt and tools that a message-only estimate leaves out.
+				: scenario === "rail-compaction-host" ? 20000 : 1;
 			if (retry || overflow) content = [];
 			pi.appendEntry("team-v2-provider", {
 				turn: turns,

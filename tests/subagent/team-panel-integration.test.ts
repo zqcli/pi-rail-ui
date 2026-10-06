@@ -144,7 +144,9 @@ test("real Pi local-provider Team preserves titles in views and panel and accoun
 	const tasks = render();
 	assert.match(tasks, /\[Tasks\]/u);
 	assert.match(tasks, new RegExp(WORK_TITLE, "u"));
-	assert.match(tasks, new RegExp(CHILD_TITLE, "u"));
+	assert.doesNotMatch(tasks, new RegExp(CHILD_TITLE, "u"), "sub-tasks stay collapsed under their deliverable");
+	component.handleInput(keys.right);
+	assert.match(render(), new RegExp(CHILD_TITLE, "u"));
 	component.handleInput(keys.down);
 	component.handleInput(keys.down);
 	render();

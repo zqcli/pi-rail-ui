@@ -22,7 +22,7 @@ import { addActivationUsage, emptySubagentUsage } from "./usage";
 import type { SubagentUsage } from "./session-broker";
 import { TeamBudget, type ActivationBudget, type BudgetExhaustion, type BudgetScope } from "./team-budget";
 import type { TeamJournalGeneration, TeamJournalRecord } from "./team-journal";
-import { flowRows, flowStats, flowSummary, newFlow, pushFlow, tickFlow, type FlowState, type TeamFlowStats } from "./team-flow";
+import { flowRows, flowStats, flowSummary, newFlow, pushFlow, tickFlow, tokens as tokenText, type FlowState, type TeamFlowStats } from "./team-flow";
 
 /** Internal evidence keeps every code unit, including malformed Unicode; never compare public truncations. */
 function errorFingerprint(error: WorkError): string {
@@ -50,7 +50,7 @@ const RETRY_DELAYS_MS = [10_000, 30_000, 60_000, 120_000, 300_000];
 const LEAD_RETRY_WINDOW_MS = 30 * 60_000;
 /** Names the exact work, because a member's session outlives its works and a model may answer an earlier one. */
 /** Events that only advise the lead: they never block close_team and are marked processed when the Team closes. */
-const ADVISORY_EVENTS: readonly string[] = ["REVIEW_READY", "TEAM_QUIESCENT"];
+const ADVISORY_EVENTS: readonly string[] = ["REVIEW_READY", "TEAM_QUIESCENT", "COMPACTION"];
 const loopKey = (toolName: string, inputHash?: string): string | undefined => inputHash === undefined ? undefined : `${toolName}\0${inputHash}`;
 const workNotice = (work: WorkRef): string => `${prompt("team", "work_notice", { work: workRefKey(work) })} ${prompt("team", "brief_pointer")}`;
 
@@ -1464,11 +1464,14 @@ export class TeamRuntime {
 				if (result.ok) {
 					if (result.usage) this.foldUsage(team, member, result.usage);
 					if (result.tokensAfter !== undefined) member.usage.contextTokens = result.tokensAfter;
-					member.lastCompaction = { tokensBefore: result.tokensBefore ?? before, ...(result.tokensAfter !== undefined ? { tokensAfter: result.tokensAfter } : {}) };
-					this.note(team, `${member.id} compacted (${request.trigger}) ${member.lastCompaction.tokensBefore}→${result.tokensAfter ?? "?"}`);
+					const tokensBefore = result.tokensBefore ?? before;
+					member.lastCompaction = { tokensBefore, ...(result.tokensAfter !== undefined ? { tokensAfter: result.tokensAfter } : {}) };
+					this.note(team, `${member.id} compacted (${request.trigger}) ${tokensBefore}→${result.tokensAfter ?? "?"}`);
+					if (request.trigger === "lead") this.addEvent(team, { key: `compaction:${this.newId()}`, kind: "COMPACTION", memberId: member.id,
+						message: prompt("team", "compaction_done", { member: member.id, before: tokenText(tokensBefore), after: result.tokensAfter === undefined ? "?" : tokenText(result.tokensAfter) }) });
 				} else {
 					this.note(team, `${member.id} compaction failed (${request.trigger}): ${result.error}`);
-					if (request.trigger === "lead") this.addEvent(team, { key: `compaction:${this.newId()}`, kind: "USER_COMMAND", memberId: member.id,
+					if (request.trigger === "lead") this.addEvent(team, { key: `compaction:${this.newId()}`, kind: "COMPACTION", memberId: member.id,
 						message: prompt("team", "compaction_failed", { member: member.id, reason: result.error }) });
 				}
 				if (member.pendingCompaction) member.compaction = { ...member.pendingCompaction, state: "pending" };
@@ -4146,7 +4149,7 @@ export class TeamRuntime {
 
 	private roster(team: TeamState): ActivationInput["roster"] {
 		return [...team.members.values()].map((item) => ({ id: item.id, ...(item.id === team.lead ? { lead: true as const } : {}),
-			lifecycle: item.lifecycle, ...(this.memberContext(item) ? { contextPercent: this.memberContext(item)!.percent } : {}) }));
+			lifecycle: item.lifecycle, ...(this.memberContext(item) ? { contextPercent: this.memberContext(item)!.percent } : {}), contextTokens: item.usage.contextTokens }));
 	}
 
 	private previewInput(team: TeamState, member: RuntimeMember, deliveryId: string, scope: WorkScope): ActivationInput {

@@ -199,13 +199,81 @@ test("compaction: host pause defers lead requests, but explicit host compaction 
 	settle(runtime, lead, "yield");
 	await compactTick();
 	const next = activations.at(-1)!.input.scope;
-	assert.ok(next.kind === "events" && next.events.some((event) => /compaction.*w1.*failed.*cannot summarize/i.test(event.message)));
+	assert.ok(next.kind === "events" && next.events.some((event) => event.kind === "COMPACTION" && /compaction.*w1.*failed.*cannot summarize/i.test(event.message)));
 	runtime.pauseTeam(teamId);
 	assert.equal(runtime.compactMember(teamId, "w1").compaction, "started");
 	await compactTick();
 	assert.equal(calls.length, 2);
 	calls[1]!.resolve({ ok: true, tokensAfter: 10 });
 	await compactTick();
+});
+
+test("compaction: a lead-requested compaction reports before→after to the lead as a COMPACTION event", async (t) => {
+	const { runtime, calls, activations } = await compactionRuntime(t);
+	const lead = activations.at(-1)!;
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "compact", { action: "control", command: "compact_member", memberId: "w1" }).ok, true);
+	action(runtime, lead, 2, "yield", { action: "yield" });
+	settle(runtime, lead, "yield");
+	await compactTick();
+	calls[0]!.resolve({ ok: true, tokensBefore: 286_000, tokensAfter: 41_000 });
+	await compactTick();
+	const next = activations.at(-1)!.input.scope;
+	assert.ok(next.kind === "events");
+	assert.deepEqual(next.events.map((event) => [event.kind, event.memberId, event.message]), [["COMPACTION", "w1", "Compaction of w1 done: 286k→41k tokens"]]);
+});
+
+test("compaction: a COMPACTION event still pending does not block close_team", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t);
+	const lead = activations.at(-1)!;
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "compact", { action: "control", command: "compact_member", memberId: "w1" }).ok, true);
+	await compactTick();
+	calls[0]!.resolve({ ok: true, tokensBefore: 286_000, tokensAfter: 41_000 });
+	await compactTick();
+	const closed = action(runtime, lead, 2, "close", { action: "control", command: "close_team", resultRefs: [], outcome: "failed", reason: "No work needed" });
+	assert.equal(closed.ok, true, JSON.stringify(closed));
+	settle(runtime, lead, "close");
+	await compactTick();
+	assert.equal(runtime.getTeam(teamId).lifecycle, "closed");
+});
+
+test("compaction: host and threshold compactions never send the lead a COMPACTION event", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "first" }, { to: "w1", task: "second" }]);
+	const workActivations = () => activations.filter((a) => a.binding.memberId === "w1");
+	compactSettle(runtime, workActivations()[0]!, { status: "success", finalAssistantText: "finished", usage: { ...emptySubagentUsage(), contextTokens: 800 } });
+	await compactTick();
+	calls[0]!.resolve({ ok: true, tokensBefore: 800, tokensAfter: 100 });
+	await compactTick();
+	reply(runtime, workActivations()[1]!, "done", "second is complete");
+	await compactTick();
+	assert.equal(runtime.compactMember(teamId, "w1").compaction, "started");
+	await compactTick();
+	calls[1]!.resolve({ ok: true, tokensBefore: 100, tokensAfter: 50 });
+	await compactTick();
+	assert.equal(runtime.compactMember(teamId, "w1").compaction, "started");
+	await compactTick();
+	calls[2]!.resolve({ ok: false, error: "host failure" });
+	await compactTick();
+	// Finish every pending lead activation so a queued COMPACTION event would have been delivered.
+	for (let n = 0; runtime.getTeam(teamId).members.find((m) => m.id === "lead")!.activity === "running"; n++) {
+		const lead = activations.filter((a) => a.binding.memberId === "lead").at(-1)!;
+		inputReady(runtime, lead);
+		action(runtime, lead, 1, `yield${n}`, { action: "yield" });
+		settle(runtime, lead, `yield${n}`);
+		await compactTick();
+	}
+	const kinds = activations.filter((a) => a.binding.memberId === "lead").flatMap((a) => a.input.scope.kind === "events" ? a.input.scope.events.map((event) => event.kind) : []);
+	assert.ok(kinds.includes("ROOT_RESULT_READY"));
+	assert.equal(kinds.includes("COMPACTION"), false);
+});
+
+test("compaction: activation rosters carry each member's contextTokens next to contextPercent", async (t) => {
+	const { runtime, activations } = await compactionRuntime(t, [{ to: "w1", task: "first" }, { to: "w1", task: "second" }]);
+	compactSettle(runtime, activations.find((a) => a.binding.memberId === "w1")!, { status: "success", finalAssistantText: "finished", usage: { ...emptySubagentUsage(), contextTokens: 300 } });
+	await compactTick();
+	const second = activations.filter((a) => a.binding.memberId === "w1").at(-1)!;
+	assert.deepEqual(second.input.roster.map((entry) => [entry.id, entry.contextTokens, entry.contextPercent]), [["lead", 0, 0], ["w1", 300, 30]]);
 });
 
 test("compaction: overflow retries the same work once with a notice, then faults; revive compacts before work", async (t) => {

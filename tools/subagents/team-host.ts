@@ -65,6 +65,16 @@ export class TeamSessionHost {
 		return this.endedAt.get(teamId) ?? this.history.teams.find((team) => team.teamId === teamId)?.at;
 	}
 
+	/** The Team's run window (the 60 s before launch cover member setup); a live Team runs until now. */
+	private runWindow(teamId: string): { from: number; to: number } | undefined {
+		if (this.hasTeam(teamId)) {
+			const time = this.runtime.teamTime(teamId);
+			return { from: time.startedAt - 60_000, to: time.endedAt ?? Date.now() };
+		}
+		const entry = this.history.teams.find((team) => team.teamId === teamId);
+		return entry?.startedAt === undefined ? undefined : { from: entry.startedAt - 60_000, to: entry.at };
+	}
+
 	/** A reused alias is not enough: the saved session must belong to this Team. */
 	async memberSessions(teamId: string, aliases: readonly string[]): Promise<Map<string, TeamMemberSession>> {
 		const saved = await this.broker.listSaved();
@@ -82,8 +92,12 @@ export class TeamSessionHost {
 				sessions.set(alias, { instance, size });
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				// A failed store deletion can leave a verified descriptor after the file was removed.
-				sessions.set(alias, this.verifiedSessions.get(teamId)?.has(instance.agentId)
+				// A failed store deletion can leave a verified descriptor after the file was removed. A member that
+				// never ran has no session file (Pi writes it on the first message): its instance created during
+				// this Team's run belongs to the Team.
+				const window = this.runWindow(teamId);
+				const created = Date.parse(instance.createdAt);
+				sessions.set(alias, this.verifiedSessions.get(teamId)?.has(instance.agentId) || (window && created >= window.from && created <= window.to)
 					? { instance, size: 0 } : { size: 0, reason: "already deleted" });
 			}
 		}

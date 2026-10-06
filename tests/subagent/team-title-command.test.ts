@@ -145,7 +145,7 @@ test("delayed cancellation cleanup has the same Time row live and after history 
 	};
 	const live = overview(host);
 	const history = overview(restored);
-	assert.match(live, /Time:\s+0:01/u);
-	assert.match(history, /Time:\s+0:01/u);
+	assert.match(live, /Time\s+0:01/u);
+	assert.match(history, /Time\s+0:01/u);
 	assert.doesNotMatch(history, /paused 0:05/u);
 });

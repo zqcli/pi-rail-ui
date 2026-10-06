@@ -12,13 +12,14 @@ import type { TeamJournalRecord } from "../../tools/subagents/team-journal";
 import type { TeamOverlayComponent } from "../../tools/subagents/team-overlay";
 
 function setup(initialRequests: Array<{ to: string; task: string }> = [], budget?: "standard" | "long" | "unlimited") {
-	const broker = { assertAliasesAvailable: async () => undefined } as unknown as SessionBroker;
+	const saved: AgentInstance[] = [];
+	const broker = { assertAliasesAvailable: async () => undefined, listSaved: async () => saved } as unknown as SessionBroker;
 	const host = new TeamSessionHost(broker, () => undefined, []);
 	const prepared = host.runtime.prepare({
 		members: [{ alias: "lead", roleDescription: "Manage the Team." }, { alias: "worker", roleDescription: "Complete assigned work." }], lead: "lead",
 		brief: { goal: "Run host-control tests." }, initialRequests, timeoutSeconds: null, ...(budget ? { budget } : {}),
 	});
-	return { host, teamId: prepared.teamId };
+	return { host, teamId: prepared.teamId, saved };
 }
 
 function commandContext(options: { hasUI?: boolean; mode?: "tui" | "rpc"; confirmation?: boolean; overlayKey?: string; message?: string } = {}) {
@@ -197,11 +198,64 @@ test("retry real broker deletion after rm succeeds but store.delete fails remove
 	assert.equal(host.history.teams.length, 0);
 });
 
-test("a missing session file never verified for this Team is skipped even when its alias is saved", async (t) => {
+test("a missing session file is skipped when its alias was created outside the Team's run window", async (t) => {
 	const fixture = await deletionFixture(t);
 	await rm(fixture.saved[1]!.sessionFile);
+	// The Team ran from 1 to 20 ms; a later reuse of the alias is not its member.
+	fixture.saved[1]!.createdAt = new Date(120_000).toISOString();
 	const sessions = await fixture.host.memberSessions(fixture.teamId, ["worker"]);
 	assert.equal(sessions.get("worker")!.instance, undefined);
+	assert.equal(sessions.get("worker")!.reason, "already deleted");
+	const ui = commandContext();
+	await runTeamCommand(fixture.host, `delete ${fixture.teamId}`, ui.ctx);
+	assert.deepEqual(fixture.removed, ["agent-lead"]);
+	assert.deepEqual(fixture.saved.map((instance) => instance.agentId), ["agent-worker"]);
+	assert.match(ui.notifications[0]!.text, /Skipped worker: already deleted/u);
+});
+
+test("delete removes a never-run member's instance record and link although it has no session file", async (t) => {
+	const fixture = await deletionFixture(t);
+	await rm(fixture.saved[1]!.sessionFile);
+	const instances = new Map(fixture.saved.map((instance) => [instance.agentId, instance]));
+	const links = new Map(fixture.saved.map((instance) => [instance.alias, instance.agentId]));
+	const store: AgentInstanceStore = {
+		get: async (id) => instances.get(id), put: async (instance) => { instances.set(instance.agentId, instance); },
+		list: async () => [...instances.values()], delete: async (id) => { instances.delete(id); },
+	};
+	const roster: AgentRoster = {
+		resolve: (alias) => links.get(alias), link: (alias, id) => { links.set(alias, id); }, unlink: (alias) => { links.delete(alias); },
+		list: () => [...links].map(([alias, agentId]) => ({ alias, agentId })),
+	};
+	const broker = new SessionBroker({ store, roster, workerFactory: async () => { throw new Error("Deletion must not start a worker"); } });
+	const history = fixture.host.history.teams[0]!;
+	const records: TeamJournalRecord[] = [];
+	const host = new TeamSessionHost(broker, (record) => records.push(record), [
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "launched", teamId: history.teamId,
+			at: history.startedAt, roster: { lead: history.lead, members: history.members }, goal: history.goal } },
+		{ type: "custom", customType: TEAM_JOURNAL_ENTRY_TYPE, data: { version: 2, kind: "interrupted", teamId: history.teamId, at: history.at, reason: history.reason } },
+	]);
+	const sessions = await host.memberSessions(history.teamId, ["worker"]);
+	assert.equal(sessions.get("worker")!.instance!.agentId, "agent-worker");
+	assert.equal(sessions.get("worker")!.size, 0);
+	const ui = commandContext();
+	await runTeamCommand(host, `delete ${history.teamId}`, ui.ctx);
+	assert.match(ui.confirmations[0]!.message, /worker · 0 B/u);
+	assert.equal(instances.size, 0);
+	assert.equal(links.size, 0);
+	assert.match(ui.notifications[0]!.text, /Member sessions removed: 2/u);
+	assert.equal(records.length, 1);
+	assert.equal(host.history.teams.length, 0);
+});
+
+test("a never-run member of a live Team is deletable only when its instance was created during the Team's run", async () => {
+	const { host, teamId, saved } = setup();
+	host.runtime.launch(teamId);
+	const dir = join(tmpdir(), "rail-team-never-run-missing");
+	const instance = (alias: string, createdAt: number): AgentInstance => ({ version: 2, agentId: `agent-${alias}`, alias, model: { provider: "local", modelId: "test" },
+		sessionId: alias, sessionFile: join(dir, `${alias}.jsonl`), cwd: dir, createdAt: new Date(createdAt).toISOString(), updatedAt: new Date(createdAt).toISOString(), lastTask: "test" });
+	saved.push(instance("lead", Date.now() - 1000), instance("worker", Date.now() - 2 * 3600_000));
+	const sessions = await host.memberSessions(teamId, ["lead", "worker"]);
+	assert.equal(sessions.get("lead")!.instance!.agentId, "agent-lead");
 	assert.equal(sessions.get("worker")!.reason, "already deleted");
 });
 
@@ -689,7 +743,7 @@ test("/rail-team pause and continue confirm their effect; popup p toggles them; 
 
 	const popupContinue = commandContext({ overlayKey: "p" });
 	await runTeamCommand(host, "", popupContinue.ctx);
-	assert.match(popupContinue.overlays[0]!.output, /ACTIVE · PAUSED · ok/u, "the popup summary");
+	assert.match(popupContinue.overlays[0]!.output, /ACTIVE · PAUSED · \d\d-\d\d \d\d:\d\d → now/u, "the popup header");
 	assert.match(popupContinue.overlays[0]!.output, /p continue/u);
 	assert.match(popupContinue.confirmations[0]!.title, /Continue Team /u);
 	assert.match(popupContinue.confirmations[0]!.message, /Parked work resumes where it stopped.*The lead gets a message/u);

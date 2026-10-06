@@ -7,7 +7,7 @@ import { railModelReference } from "./models";
 import { COMPACT_THRESHOLD_CHOICES, readCompactThreshold, writeCompactThreshold } from "./team-compaction-settings";
 import { flowRows } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
-import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, shortWorkRef, workRefKey, type TeamMemberView, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
+import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
 
@@ -17,11 +17,12 @@ export type TeamOverlayAction = { action: "delete"; teamIds: string[] }
 	| { teamId: string; action: "title" }
 	| { teamId: string; action: "cancel" | "resume" | "grant" | "message" | "revive" | "compact" | "lead" | "pause" | "continue"; memberId?: string };
 type Facts = ReturnType<TeamSessionHost["runtime"]["panelFacts"]>;
-type Row = { text: string; lines?: string[]; teamId?: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string };
+/** `header` rows (task group titles) cannot be selected; `field` marks the first line of a selectable Overview field. */
+type Row = { text: string; lines?: string[]; teamId?: string; member?: string; fold?: string; work?: TeamWorkSummary; milestone?: string; review?: string; result?: string; header?: boolean; field?: string };
 const oneLine = (text: string) => stripTerminalSequences(text).replace(/\s+/gu, " ").trim();
-const compact = (text: string, width: number) => truncateToWidth(oneLine(text), Math.max(1, width));
+const compact = (text: string, width: number) => truncateToWidth(oneLine(text), Math.max(1, width), "…");
 const fit = (text: string, width: number) => truncateToWidth(text, Math.max(1, width), "", true);
-const column = (text: string, width: number) => fit(truncateToWidth(text, Math.max(1, width)), width);
+const column = (text: string, width: number) => fit(truncateToWidth(text, Math.max(1, width), "…"), width);
 const clock = (ms: number) => {
 	const seconds = Math.floor(Math.max(0, ms) / 1000);
 	const minutes = Math.floor(seconds / 60);
@@ -31,16 +32,33 @@ const tokens = (value: number) => value < 1000 ? String(value) : value < 1_000_0
 const usageText = (usage: SubagentUsage) => `in ${tokens(usage.input)} · out ${tokens(usage.output)} · cache ${tokens(usage.cacheRead)}${usage.cacheWrite ? `/${tokens(usage.cacheWrite)}` : ""}`;
 const teamTitle = (entry: { title?: string }, goal?: string) => entry.title ?? normalizeTitle(undefined, goal ?? "not retained");
 const workTitle = (work: TeamWorkSummary) => work.title ?? normalizeTitle(undefined, work.taskPreview);
-const startTime = (at: number | undefined, now: number) => {
+const stamp = (at: number | undefined) => {
 	if (at === undefined) return "—";
 	const date = new Date(at);
 	const pad = (value: number) => String(value).padStart(2, "0");
-	return date.toDateString() === new Date(now).toDateString() ? `${pad(date.getHours())}:${pad(date.getMinutes())}` : `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+	return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
+const OUTCOME_ICONS = { succeeded: ["✓", "success"], partial: ["⚠", "warning"], failed: ["✗", "error"] } as const;
+const outcomeIcon = (theme: Theme, outcome: TeamOutcome) => theme.fg(OUTCOME_ICONS[outcome][1], OUTCOME_ICONS[outcome][0]);
+const teamIcon = (theme: Theme, lifecycle: TeamHistoryEntry["lifecycle"], outcome?: TeamOutcome): string => lifecycle === "active" || lifecycle === "closing" ? theme.fg("accent", "▶")
+	: lifecycle === "prepared" ? theme.fg("muted", "○") : outcomeIcon(theme, lifecycle === "closed" || lifecycle === "completed" ? outcome ?? "succeeded" : "failed");
+const stateText = (entry: { lifecycle: string; outcome?: string }) => `${entry.lifecycle.toUpperCase()}${entry.outcome ? ` ${entry.outcome === "succeeded" ? "ok" : entry.outcome}` : ""}`;
+/** What the Team came to: `active` while it runs, then its outcome and the reason it closed with. */
+const outcomeText = (entry: { lifecycle: string; outcome?: string; reason?: string }) => ["prepared", "active", "closing"].includes(entry.lifecycle) ? entry.lifecycle
+	: `${entry.outcome ?? entry.lifecycle}${entry.reason ? ` · ${entry.reason}` : ""}`;
+const firstSentence = (summary: string) => oneLine(summary).split(/(?<=[.!?])\s/u)[0]!;
+const rootCounts = (works: readonly TeamWorkSummary[]) => {
+	const roots = works.filter((work) => !work.kind && !work.parent);
+	return { accepted: roots.filter((work) => work.review === "accepted").length, waived: roots.filter((work) => work.review === "waived").length, total: roots.length };
 };
 const writable = (team: TeamTeamView) => team.lifecycle === "prepared" || team.lifecycle === "active" || team.lifecycle === "closing";
 const VERDICTS = { on_track: ["on track", "success"], at_risk: ["at risk", "warning"], off_track: ["off track", "error"] } as const;
 const verdictOf = (review: TeamReviewRecord) => review.verdict ? VERDICTS[review.verdict] : ["no verdict", "muted"] as const;
 const BUDGET_COUNTERS = [["activations", "teamActivations"], ["lead", "leadActivations"], ["model requests", "teamModelRequests"], ["tool calls", "teamToolCalls"], ["works", "teamWorks"]] as const;
+const OVERVIEW_LABEL = 10;
+type Fact = [label: string, value: string, color?: "warning" | undefined];
+const rootsText = (counts: { accepted: number; waived: number; total: number }) => `${counts.accepted}/${counts.total} accepted · ${counts.waived} waived`;
+const timeText = (activeMs: number, wallMs: number, pausedMs: number) => `${clock(activeMs)}${pausedMs ? ` active · ${clock(wallMs)} wall (paused ${clock(pausedMs)})` : ""}`;
 const workState = (work: TeamWorkSummary) => `${work.hold ? "held" : work.state}${work.review ? `/${work.review}` : ""}`;
 
 function progress(works: readonly TeamWorkSummary[], done = true): string {
@@ -57,15 +75,14 @@ function memberStatus(member: TeamMemberView): keyof typeof ICONS {
 
 function workIcon(work: TeamWorkSummary, theme: Theme): string {
 	if (work.hold) return theme.fg(statusColor("held"), ICONS.held);
-	if (work.state === "resolved") return theme.fg(work.review === "accepted" ? "success" : "dim", !work.parent && !work.review ? "◐" : "✓");
+	if (work.state === "resolved") return work.review === "waived" ? theme.fg("warning", "✗") : theme.fg(work.review === "accepted" ? "success" : "dim", !work.parent && !work.review ? "◐" : "✓");
 	if (work.state === "cancelled" || work.state === "superseded") return theme.fg("muted", "–");
 	const status = work.state === "blocked" ? "waiting" : work.state === "queued" ? "idle" : work.state;
 	return theme.fg(statusColor(status), ICONS[status]);
 }
 
-/** Parent ownership survives revisions: keep older children under their owning work. */
-export function buildTeamTaskRows(works: readonly TeamWorkSummary[], expanded: ReadonlySet<string>, theme: Theme, width = 120,
-	describe: (work: TeamWorkSummary) => string = workState): Row[] {
+/** The latest revision of every deliverable and sub-task (review works excluded), and each work's children. */
+function workTree(works: readonly TeamWorkSummary[]) {
 	const latest = new Map<string, TeamWorkSummary>();
 	for (const work of works) if (!work.kind && (latest.get(work.work.workId)?.work.revision ?? 0) < work.work.revision) latest.set(work.work.workId, work);
 	const children = new Map<string, TeamWorkSummary[]>();
@@ -74,6 +91,13 @@ export function buildTeamTaskRows(works: readonly TeamWorkSummary[], expanded: R
 		siblings.push(work);
 		children.set(work.parent.workId, siblings);
 	}
+	return { latest, children };
+}
+
+/** Parent ownership survives revisions: keep older children under their owning work. `only` limits the rows to that root's subtree. */
+export function buildTeamTaskRows(works: readonly TeamWorkSummary[], expanded: ReadonlySet<string>, theme: Theme, width = 120,
+	describe: (work: TeamWorkSummary) => string = workState, only?: string): Row[] {
+	const { latest, children } = workTree(works);
 	const rows: Row[] = [];
 	const titleWidth = Math.max(10, Math.floor(width * 0.42));
 	const assigneeWidth = Math.min(Math.floor(width * 0.2), Math.max(1, ...[...latest.values()].map((work) => visibleWidth(work.assignee))));
@@ -97,7 +121,7 @@ export function buildTeamTaskRows(works: readonly TeamWorkSummary[], expanded: R
 		fold(cancelled, "cancelled", `– ${cancelled.length} cancelled/superseded`);
 		if (finished.length > 5) fold(finished, "done", `✓ ${finished.length} sub-tasks done`);
 	};
-	for (const work of latest.values()) if (!work.parent) visit(work, 0);
+	for (const work of latest.values()) if (!work.parent && (!only || work.work.workId === only)) visit(work, 0);
 	return rows;
 }
 
@@ -127,6 +151,12 @@ export class TeamOverlayComponent implements Focusable {
 	private detail: string | undefined;
 	private reviewing = false;
 	private expanded = new Set<string>();
+	/** The deliverable whose sub-tasks are listed, the Tasks filter and the selected Overview field. */
+	private root: string | undefined;
+	/** The deliverable whose row the cursor follows after a fold change moved rows above it. */
+	private follow: string | undefined;
+	private view: "all" | "active" = "all";
+	private field = 0;
 	private marked = new Set<string>();
 	private readonly sessions = new Map<string, Map<string, TeamMemberSession>>();
 	private followTimeline = true;
@@ -167,6 +197,30 @@ export class TeamOverlayComponent implements Focusable {
 		return [...live, ...this.host.history.teams.filter((entry) => !live.includes(entry.teamId)).toSorted((a, b) => b.at - a.at).map((entry) => entry.teamId)];
 	}
 
+	/** Only Teams of this session keep their work ledger; history has just the retained results. */
+	private ledger(): boolean {
+		return this.host.runtime.listTeams().some((team) => team.teamId === this.teamId);
+	}
+
+	/** Group headers cannot be selected: step past them in the direction of travel, or back the other way at an edge. */
+	private skipHeaders(direction: number): void {
+		for (const by of [direction, -direction]) {
+			while (this.rows[this.selected]?.header) this.selected += by;
+			this.selected = Math.max(0, Math.min(this.selected, this.rows.length - 1));
+		}
+	}
+
+	/** A different Team starts with every Tasks fold and filter reset. */
+	private openTeam(teamId: string | undefined): void {
+		this.teamId = teamId;
+		this.expanded.clear();
+		this.root = undefined;
+		this.view = "all";
+		this.reviewing = false;
+		this.field = 0;
+		this.resetPosition();
+	}
+
 	private resetPosition(): void {
 		this.selected = 0;
 		this.offset = 0;
@@ -183,10 +237,24 @@ export class TeamOverlayComponent implements Focusable {
 			else if (this.reviewing) { this.reviewing = false; this.resetPosition(); }
 			else if (this.tab !== 0) { this.tab = 0; this.resetPosition(); }
 			else { this.dispose(); this.done(undefined); return; }
+		} else if (this.tab === 3 && !this.detail && this.ledger() && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+			const row = this.rows[this.selected];
+			if (matchesKey(data, Key.right)) {
+				if (row?.fold) this.expanded.add(row.fold);
+				else if (row?.work && !row.work.parent) this.follow = this.root = row.work.work.workId;
+			} else if (row?.fold) this.expanded.delete(row.fold);
+			else if (this.root) {
+				this.follow = this.root;
+				this.root = undefined;
+			}
 		} else if (matchesKey(data, Key.tab) || matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left) || matchesKey(data, Key.right)) {
 			const back = matchesKey(data, Key.left) || matchesKey(data, Key.shift("tab"));
 			this.tab = (this.tab + (back ? TABS.length - 1 : 1)) % TABS.length;
 			this.reviewing = false;
+			this.field = 0;
+			this.resetPosition();
+		} else if (data === "f" && this.tab === 3 && !this.detail && this.ledger()) {
+			this.view = this.view === "all" ? "active" : "all";
 			this.resetPosition();
 		} else if (data === " " && this.tab === 0) {
 			const teamId = this.rows[this.selected]?.teamId;
@@ -205,22 +273,30 @@ export class TeamOverlayComponent implements Focusable {
 			catch (error) { this.notice = error instanceof Error ? error.message : String(error); }
 		} else if (data === "[" || data === "]") {
 			const ids = this.teamIds();
-			this.teamId = ids[(ids.indexOf(this.teamId!) + (data === "[" ? -1 : 1) + ids.length) % ids.length];
-			this.expanded.clear();
-			this.reviewing = false;
-			this.resetPosition();
+			this.openTeam(ids[(ids.indexOf(this.teamId!) + (data === "[" ? -1 : 1) + ids.length) % ids.length]);
 			if (this.tab === 0) this.selected = ids.indexOf(this.teamId!);
+		} else if (this.tab === 1 && !this.reviewing && !this.detail && (this.keybindings.matches(data, "tui.select.up") || this.keybindings.matches(data, "tui.select.down"))) {
+			// The Overview cursor moves between its fields; the scroll offset follows the field's first line.
+			const starts = this.rows.flatMap((row, index) => row.field ? [index] : []);
+			this.field = Math.max(0, Math.min(starts.length - 1, this.field + (this.keybindings.matches(data, "tui.select.up") ? -1 : 1)));
+			this.selected = starts[this.field] ?? 0;
 		} else if (this.keybindings.matches(data, "tui.select.up") || this.keybindings.matches(data, "tui.select.down") || matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown) || matchesKey(data, Key.home) || matchesKey(data, Key.end)) {
 			const step = this.keybindings.matches(data, "tui.select.up") ? -1 : this.keybindings.matches(data, "tui.select.down") ? 1 : matchesKey(data, Key.pageUp) ? -this.pageSize : this.pageSize;
 			this.selected = matchesKey(data, Key.home) ? 0 : matchesKey(data, Key.end) ? this.rows.length - 1 : this.selected + step;
 			this.selected = Math.max(0, Math.min(this.maxSelected, this.selected));
+			this.skipHeaders(step < 0 || matchesKey(data, Key.end) ? -1 : 1);
 			this.followTimeline = this.selected === this.rows.length - 1;
 			this.timelineCursor = this.rows[this.selected]?.milestone;
 		} else if (this.keybindings.matches(data, "tui.select.confirm")) {
 			const row = this.rows[this.selected];
-			if (row?.teamId) { this.teamId = row.teamId; this.tab = 1; this.resetPosition(); }
-			else if (this.tab === 1 && !this.reviewing) { this.reviewing = true; this.resetPosition(); }
-			else if (row?.member ?? row?.review) { this.resetPosition(); this.detail = row.member ?? row.review; }
+			if (row?.teamId) { this.openTeam(row.teamId); this.tab = 1; }
+			else if (this.tab === 1 && !this.reviewing && !this.detail) {
+				const field = this.rows.filter((item) => item.field)[this.field]?.field;
+				if (field === "review") this.reviewing = true;
+				this.resetPosition();
+				if (field && field !== "review") this.detail = field;
+			}
+			else if (row?.member ?? row?.review ?? row?.result) { this.resetPosition(); this.detail = row.member ?? row.review ?? row.result; }
 			else if (row?.fold) {
 				if (!this.expanded.delete(row.fold)) this.expanded.add(row.fold);
 			}
@@ -251,13 +327,14 @@ export class TeamOverlayComponent implements Focusable {
 		let rows: Row[] = [];
 		if (this.tab === 0) rows = ids.length ? this.teams(inner - 3) : [{ text: "No teams" }];
 		else if (this.reviewing && (team || history)) rows = this.detail ? this.reviewDetail(reviews, inner - 1) : this.reviewRows(reviews, inner - 3);
+		else if (this.tab === 1 && this.detail && (team || history)) rows = this.fullText(team ?? history!, team?.brief.goal ?? history?.goal ?? "", inner - 1);
 		else if (team && facts) {
 			if (this.detail) rows = this.tab === 3 ? this.taskDetail(team, works, facts, inner - 1) : this.memberDetail(team, works, facts, inner - 1);
 			else if (this.tab === 1) rows = this.overview(team, works, facts, inner - 1);
 			else if (this.tab === 2) rows = this.members(team, works, facts, inner - 3);
-			else if (this.tab === 3) rows = buildTeamTaskRows(works, this.expanded, this.theme, inner - 3, (work) => this.taskState(team.teamId, work, works));
+			else if (this.tab === 3) rows = this.taskRows(team, works, inner - 3);
 			else rows = this.timeline(facts, works);
-		} else if (history) rows = this.historyRows(history, inner - (this.tab === 2 && !this.detail ? 3 : 1));
+		} else if (history) rows = this.historyRows(history, inner - ((this.tab === 2 || this.tab === 3) && !this.detail ? 3 : 1));
 		else rows = [{ text: "No teams" }];
 		this.rows = rows;
 		if (this.tab === 4) {
@@ -267,40 +344,53 @@ export class TeamOverlayComponent implements Focusable {
 				if (index >= 0) this.selected = index;
 			}
 		}
+		if (this.follow) {
+			// The cursor stays where it is when that row is hidden (a folded Done group).
+			const index = rows.findIndex((row) => row.work?.work.workId === this.follow && !row.fold);
+			if (index >= 0) this.selected = index;
+			this.follow = undefined;
+		}
 		this.selected = Math.max(0, Math.min(this.selected, rows.length - 1));
+		this.skipHeaders(1);
 		this.timelineCursor = rows[this.selected]?.milestone;
 		// Overview already shows Waiting for in its body.
 		const notice = this.tab > 1 && /^Lead (decision|failed)/u.test(facts?.waitingFor ?? "") ? `Waiting for: ${facts!.waitingFor}`
 			: this.notice;
 		const omitted = this.tab === 4 && facts?.timelineOmitted ? `… ${facts.timelineOmitted} earlier milestones omitted …` : "";
 		const summary = this.tab === 0 ? `${ids.length} Team${ids.length === 1 ? "" : "s"} · ${this.host.runtime.listTeams().filter((item) => writable(item) && item.lifecycle !== "prepared").length} active`
-			: this.tab === 3 && team ? this.tasksSummary(works) : team && facts ? this.summaryText(team, works) : history ? `${history.lifecycle.toUpperCase()} · history (read-only) · ${history.results.length} results` : "No teams";
-		const summaryLines = wrapTextWithAnsi(summary, inner - 1);
+			: !team && !history ? "No teams" : this.tab === 1 ? this.overviewHeader(team, history, inner - 1)
+				: this.tab === 3 && team ? this.tasksSummary(works, inner - 1) : team && facts ? this.summaryText(team, works)
+					: `${history!.lifecycle.toUpperCase()} · history (read-only) · ${history!.results.length} results${this.tab === 3 ? " · ledger not retained" : ""}`;
+		const summaryLines = this.tab === 3 && team ? [summary] : wrapTextWithAnsi(summary, inner - 1);
 		const height = Math.max(1, Math.min(this.tui.terminal.rows - 2, Math.floor(this.tui.terminal.rows * 0.88)));
 		const live = !!team && writable(team) && this.host.active;
-		const help = this.helpLines(live, ids.length > 1, !!team?.paused, inner - 1).flatMap((text) => wrapTextWithAnsi(text, inner - 1));
-		const legend = this.tab === 3 && !this.detail ? wrapTextWithAnsi("▶ running ⧗ waiting ◐ awaiting acceptance ✓ done/accepted ✗ failed – cancelled", inner - 1) : [];
-		const room = height - 5 - summaryLines.length - help.length - legend.length - (notice ? 1 : 0) - (omitted ? 1 : 0);
+		const help = this.helpLines(live, ids.length > 1, !!team?.paused, !!team, inner - 1).flatMap((text) => wrapTextWithAnsi(text, inner - 1));
+		const room = height - 5 - summaryLines.length - help.length - (notice ? 1 : 0) - (omitted ? 1 : 0);
 		const schedule = team ? this.host.runtime.reviewSchedule(team.teamId) : history?.review;
 		const head = (!this.detail && this.reviewing ? [this.reviewHeading(reviews, schedule), ""]
 			: !this.detail && this.tab === 2 ? team ? this.progressHead(team, inner - 1) : history ? this.historyProgressHead(history, inner - 1) : [] : []).slice(0, Math.max(0, room - 3));
 		const available = Math.max(1, room - head.length);
-		const selectable = !this.detail && (this.reviewing ? reviews.length > 0 : this.tab === 0 ? ids.length > 0 : this.tab !== 1 && !!team || this.tab === 2 && !!history?.members.length);
+		const selectable = !this.detail && (this.reviewing ? reviews.length > 0 : this.tab === 0 ? ids.length > 0 : this.tab !== 1 && !!team || this.tab === 2 && !!history?.members.length || this.tab === 3 && !!history?.results.length);
 		const rowHeight = Math.max(1, ...rows.map((row) => 1 + (row.lines?.length ?? 0)));
 		const cap = this.tab === 4 ? 12 : this.tab === 0 ? available : Math.min(8, this.tui.terminal.rows - 13);
-		this.pageSize = selectable ? Math.max(1, Math.min(cap, Math.floor(available / rowHeight))) : available;
-		const details = this.detail ? [] : this.reviewing ? this.reviewDetails(reviews, inner - 1) : this.tab === 0 ? this.teamDetails(inner - 1) : team && facts ? this.selectionDetails(team, works, facts, inner - 1) : this.tab === 2 && history ? this.historyMembers(history).filter((text) => text.startsWith(`${this.rows[this.selected]?.member} ·`)).map((text) => compact(text, inner - 1)) : [];
-		const showDetails = details.length > 0 && available >= Math.min(rows.length, this.pageSize) * rowHeight + details.length + 1;
+		const rowsFor = (lines: number) => Math.max(1, Math.min(cap, Math.floor(lines / rowHeight)));
+		// Progress and Tasks mark the rows hidden above and below the page, which costs up to two lines.
+		const markers = selectable && (this.tab === 2 || this.tab === 3) && rows.length > rowsFor(available) ? 2 : 0;
+		this.pageSize = selectable ? rowsFor(available - markers) : available;
+		const details = this.detail || this.tab === 0 ? [] : this.reviewing ? this.reviewDetails(reviews, inner - 1) : team && facts ? this.selectionDetails(team, works, facts, inner - 1) : this.tab === 2 && history ? this.historyMembers(history).filter((text) => text.startsWith(`${this.rows[this.selected]?.member} ·`)).map((text) => compact(text, inner - 1)) : [];
+		const showDetails = details.length > 0 && available >= Math.min(rows.length, this.pageSize) * rowHeight + markers + details.length + 1;
 		this.offset = Math.max(0, Math.min(this.offset, rows.length - this.pageSize));
 		// Without a visible cursor the hidden cursor is the scroll offset, so every key scrolls at once.
 		this.maxSelected = selectable ? rows.length - 1 : Math.max(0, rows.length - this.pageSize);
 		if (!selectable) this.offset = this.selected = Math.min(this.selected, this.maxSelected);
-		if (this.selected < this.offset) this.offset = this.selected;
+		// A group header stays visible above its first row.
+		if (this.selected < this.offset) this.offset = this.selected - (rows[this.selected - 1]?.header ? 1 : 0);
 		if (this.selected >= this.offset + this.pageSize) this.offset = this.selected - this.pageSize + 1;
-		const body = rows.slice(this.offset, this.offset + this.pageSize).flatMap((row, index) => {
-			const prefix = row.review === "all" ? this.theme.fg("accent", "→") : !selectable ? " " : index + this.offset === this.selected ? this.theme.fg("accent", " → ") : "   ";
+		const more = (count: number, arrow: string) => markers && count > 0 ? [`   ${this.theme.fg("dim", `${arrow} ${count} more`)}`] : [];
+		const body = [...more(this.offset, "↑"), ...rows.slice(this.offset, this.offset + this.pageSize).flatMap((row, index) => {
+			const prefix = !selectable ? " " : index + this.offset === this.selected ? this.theme.fg("accent", " → ") : "   ";
 			return [`${prefix}${row.text}`, ...(row.lines ?? []).map((text) => `     ${text}`)];
-		});
+		}), ...more(rows.length - this.offset - this.pageSize, "↓")];
 		if (this.tab === 4 && !this.detail) while (body.length < this.pageSize) body.push("");
 		const selector = ids.length > 1 ? `‹ ${ids.indexOf(this.teamId!) + 1}/${ids.length} ›` : "";
 		const title = `${this.theme.fg("accent", this.theme.bold("Rail Team"))}  ${this.renderTabs(inner - 12 - (selector ? visibleWidth(selector) + 2 : 0))}`;
@@ -310,7 +400,6 @@ export class TeamOverlayComponent implements Focusable {
 		return [border(`╭${"─".repeat(inner)}╮`), line(` ${header}`), ...summaryLines.map((text) => line(` ${this.theme.fg("dim", text)}`)), line(),
 			...(omitted ? [line(` ${this.theme.fg("dim", omitted)}`)] : []), ...head.map((text) => line(` ${text}`)), ...body.map(line),
 			...(showDetails ? [line(), ...details.map((text) => line(` ${text}`))] : []), line(),
-			...legend.map((text) => line(` ${this.theme.fg("dim", text)}`)),
 			...(notice ? [line(` ${this.theme.fg("warning", compact(notice, inner - 1))}`)] : []),
 			...help.map((text) => line(` ${this.theme.fg("dim", text)}`)), border(`╰${"─".repeat(inner)}╯`)];
 	}
@@ -339,46 +428,35 @@ export class TeamOverlayComponent implements Focusable {
 		return this.teamIds().map((teamId) => {
 			const team = live.find((item) => item.teamId === teamId);
 			const history = this.host.history.teams.find((item) => item.teamId === teamId);
-			const lifecycle = team?.lifecycle ?? history!.lifecycle;
-			const outcome = team?.outcome ?? history?.outcome;
-			const active = lifecycle === "active" || lifecycle === "closing";
-			const closed = lifecycle === "closed" || lifecycle === "completed";
-			const icon = active ? ICONS.running : closed ? ICONS.completed : lifecycle === "prepared" ? ICONS.idle : ICONS.failed;
-			const color = active ? "accent" : closed ? "success" : lifecycle === "prepared" ? "muted" : "error";
-			const started = team ? this.host.runtime.teamTime(teamId).startedAt : history?.startedAt;
-			const duration = team ? clock(this.host.runtime.teamTime(teamId).activeMs) : history?.activeMs !== undefined ? clock(history.activeMs) : history?.startedAt !== undefined ? clock(history.at - history.startedAt) : "—";
-			const label = outcome ? ` ${outcome === "succeeded" ? "ok" : outcome}` : "";
-			const suffix = ` ${column(teamId.slice(0, 8), 8)} ${column(`${lifecycle.toUpperCase()}${label}`, Math.max(12, visibleWidth(`${lifecycle.toUpperCase()}${label}`)))} ${duration.padStart(7)} ${startTime(started, this.now())}`;
-			const title = team ? teamTitle(team, team.brief.goal) : teamTitle(history!, history?.goal);
-			return { teamId, text: `${this.marked.has(teamId) ? "*" : this.theme.fg(color, icon)} ${column(title, width - visibleWidth(suffix) - 2)}${suffix}` };
+			const source = team ?? history!;
+			const time = team ? this.host.runtime.teamTime(teamId) : undefined;
+			const duration = time ? clock(time.activeMs) : history!.activeMs !== undefined ? clock(history!.activeMs) : history!.startedAt !== undefined ? clock(history!.at - history!.startedAt) : "—";
+			const counts = team ? rootCounts(this.host.runtime.listWorks(teamId)) : history!.rootCounts;
+			const facts = [teamId.slice(0, 8), stateText(source), duration, stamp(time?.startedAt ?? history?.startedAt)];
+			const roots = `roots ${counts ? `${counts.accepted}/${counts.total}` : "—"}`;
+			// The member count is the first fact to go when the line is too narrow.
+			const full = [...facts, `${team?.members.length ?? history!.members.length} members`, roots].join(" · ");
+			const meta = visibleWidth(full) <= width - 4 ? full : [...facts, roots].join(" · ");
+			return { teamId, text: `${this.marked.has(teamId) ? "*" : teamIcon(this.theme, source.lifecycle, source.outcome)} ${compact(teamTitle(source, team?.brief.goal ?? history?.goal), width - 2)}`,
+				lines: [`  ${this.theme.fg("dim", compact(meta, width - 4))}`] };
 		});
 	}
 
-	private teamDetails(width: number): string[] {
-		const id = this.rows[this.selected]?.teamId;
-		if (!id) return [];
-		const team = this.host.runtime.listTeams().find((item) => item.teamId === id);
-		const history = this.host.history.teams.find((item) => item.teamId === id);
-		const goal = team?.brief.goal ?? history?.goal;
-		const members = team?.members.length ?? history!.members.length;
-		const roots = team ? `${this.host.runtime.listWorks(id).filter((work) => !work.parent && !work.kind && work.review === "accepted").length}/${team.works.roots}` : history?.rootCounts ? `${history.rootCounts.accepted}/${history.rootCounts.total}` : "—";
-		const suffix = ` · ${members} members · roots ${roots} accepted`;
-		return [`${team ? "▶" : "✓"} ${compact(teamTitle(team ?? history!, goal), width - suffix.length - 2)}${suffix}`, `  ${compact(goal ?? "Goal not retained", width - 2)}`];
-	}
-
 	/** Navigation for the current view, then (live Teams only) every action key with its name; the caller wraps rows wider than the popup. */
-	private helpLines(live: boolean, multiple: boolean, paused: boolean, width: number): string[] {
+	private helpLines(live: boolean, multiple: boolean, paused: boolean, ledger: boolean, width: number): string[] {
 		if (this.tab === 0) return ["↑↓ select · enter open · n rename · space mark · d delete · esc close", "←→/tab views" + (multiple ? " · [ ] teams" : "")];
 		if (this.reviewing) return [this.detail ? "↑↓/pgup/dn scroll · esc reviews" : "↑↓ select · enter details · esc overview"];
-		if (this.detail) return [`↑↓/pgup/dn scroll · esc ${this.tab === 3 ? "tasks" : "progress"}`];
-		const view = this.tab === 1 ? "↑↓ scroll · enter reviews · n rename" : this.tab === 2 || this.tab === 3 ? "↑↓ select · enter details"
+		if (this.detail) return [`↑↓/pgup/dn scroll · esc ${["", "overview", "progress", "tasks"][this.tab]}`];
+		const view = this.tab === 1 ? "↑↓ select · enter open · n rename" : this.tab === 2 ? "↑↓ select · enter details" : this.tab === 3 ? `↑↓ select · enter details${ledger ? " · → expand · f filter" : ""}`
 			: "↑↓ cursor · pgup/dn page · home/end";
-		const navigation = [view, ...(live && this.tab === 2 ? ["z compact"] : []), "←→/tab views", "esc teams"].join(" · ");
+		// ← and → fold the Tasks list, so only Tab switches views there; that hint moves to a second row.
+		const folding = this.tab === 3 && ledger;
+		const navigation = [view, ...(live && this.tab === 2 ? ["z compact"] : []), ...(folding ? [] : ["←→/tab views"]), "esc teams"].join(" · ");
 		// Whole keys per row: a key is never split or left with a dangling separator.
 		const threshold = readCompactThreshold();
 		const keys = [paused ? "p continue" : "p pause", "c cancel", "r resume hold", "g grant", "m message", "v revive", "l new lead", "z compact", `t compact at ${threshold === null ? "off" : `${threshold}%`}`, "d delete"];
 		const rows = keys.reduce<string[]>((packed, key) => packed.length && packed.at(-1)!.length + 3 + key.length <= width ? [...packed.slice(0, -1), `${packed.at(-1)} · ${key}`] : [...packed, key], []);
-		return live && this.tab === 1 ? [navigation, ...rows] : [navigation];
+		return live && this.tab === 1 ? [navigation, ...rows] : folding ? [navigation, "← collapse · tab views"] : [navigation];
 	}
 
 	/** Budget meters: a bar with eighth-cell resolution, so even a small share of a large limit is visible. */
@@ -396,37 +474,92 @@ export class TeamOverlayComponent implements Focusable {
 		});
 	}
 
-	private overview(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
-		const lines: string[] = [];
-		const labelWidth = 13;
-		const add = (label: string, value: string, color?: "warning") => {
-			wrapTextWithAnsi(value, width - labelWidth).forEach((line, index) => {
-				const text = `${(index === 0 && label ? `${label}:` : "").padEnd(labelWidth)}${line}`;
-				lines.push(color ? this.theme.fg(color, text) : text);
-			});
-		};
-		add("Team", `${teamTitle(team, team.brief.goal)} · ${team.shortId ?? team.teamId.slice(0, 8)}`);
-		wrapTextWithAnsi(oneLine(team.brief.goal), Math.max(1, width - labelWidth)).slice(0, 3).forEach((line, index) => add(index ? "" : "Goal", line));
-		const time = this.host.runtime.teamTime(team.teamId);
-		add("Time", `${clock(time.activeMs)}${time.pausedMs ? ` active · ${clock(time.wallMs)} wall (paused ${clock(time.pausedMs)})` : ""}`);
-		add("Tokens", usageText(team.usage));
-		add("Waiting for", this.overviewWaitingFor(team, works, facts), /^Lead (decision|failed)/u.test(facts.waitingFor ?? "") ? "warning" : undefined);
-		const holds = this.host.runtime.listHolds(team.teamId);
-		const incidents = team.incidents.filter((incident) => incident.state === "open");
-		add("Attention", holds.length || incidents.length ? `${holds.length} open holds · ${incidents.length} open incidents` : "none", holds.length || incidents.length ? "warning" : undefined);
-		for (const hold of holds) add("", `${hold.assignee} · ${shortWorkRef(hold.work)} · ${oneLine(hold.message)}`, "warning");
-		for (const incident of incidents) if (!holds.some((hold) => hold.incidentId === incident.id)) add("", `${incident.code}: ${oneLine(incident.message)}`, "warning");
-		const reviews = this.host.runtime.listReviews(team.teamId);
-		const schedule = this.host.runtime.reviewSchedule(team.teamId);
+	/** Two header lines for the summary slot: the title, then short id · state · start → end. */
+	private overviewHeader(team: TeamTeamView | undefined, history: TeamHistoryEntry | undefined, width: number): string {
+		const source = team ?? history!;
+		const time = team ? this.host.runtime.teamTime(team.teamId) : undefined;
+		const startedAt = time?.startedAt ?? history?.startedAt;
+		const endedAt = time ? time.endedAt : history!.at;
+		const range = startedAt === undefined ? [] : [`${stamp(startedAt)} → ${endedAt === undefined ? "now" : stamp(endedAt).slice(6)}`];
+		return `${compact(teamTitle(source, team?.brief.goal ?? history?.goal), width)}\n${[source.shortId ?? source.teamId.slice(0, 8), `${stateText(source)}${team?.paused ? " · PAUSED" : ""}`, ...range].join(" · ")}`;
+	}
+
+	/** At most two wrapped lines of a long value; a cut ends in … and a right-aligned dim ›. */
+	private clip(text: string, width: number): string[] {
+		const lines = wrapTextWithAnsi(oneLine(text), width);
+		return lines.length <= 2 ? lines : [lines[0]!, this.more(truncateToWidth(`${lines[1]}…`, width - 2, "…"), width)];
+	}
+
+	private more(line: string, width: number): string {
+		return `${fit(line, width - 1)}${this.theme.fg("dim", "›")}`;
+	}
+
+	private nextReview(schedule: { nextAt?: number | null } | undefined): string {
+		return schedule?.nextAt ? ` · next in ${Math.max(0, Math.ceil((schedule.nextAt - this.now()) / 60_000))}m` : "";
+	}
+
+	/** The latest verdict on one line, then the review count; › when the review list can be opened. */
+	private reviewLines(reviews: readonly TeamReviewRecord[], schedule: (TeamReviewPlan & { nextAt?: number | null }) | undefined, width: number): string[] {
 		const review = reviews.at(-1);
 		const [verdict, color] = review ? verdictOf(review) : ["", "muted"] as const;
-		const reviewIndex = lines.length;
-		add("Review", schedule ? review ? `${clock(review.snapshot.elapsedMs)} ${review.by} ${this.theme.fg(review.verdict === "off_track" ? "warning" : color, verdict.toUpperCase())} · ${compact(reviewAssessment(review.summary), width - labelWidth - 26)}` : "No reviews yet" : "off");
-		if (schedule) add("", `${reviews.length} review${reviews.length === 1 ? "" : "s"} · ${reviews.filter((item) => item.verdict === "at_risk" || item.verdict === "off_track").length} at risk${schedule.nextAt ? ` · next in ${Math.max(0, Math.ceil((schedule.nextAt - this.now()) / 60_000))}m` : ""} · enter: all reviews`);
+		const latest = review ? `${clock(review.snapshot.elapsedMs)} ${review.by} ${this.theme.fg(review.verdict === "off_track" ? "warning" : color, verdict.toUpperCase())} · ${oneLine(reviewAssessment(review.summary))}` : schedule ? `No reviews yet · ${schedule.by} every ${schedule.everyMinutes} min${this.nextReview(schedule)}` : "off";
+		const count = `${reviews.length} review${reviews.length === 1 ? "" : "s"} · ${reviews.filter((item) => item.verdict === "at_risk" || item.verdict === "off_track").length} at risk${this.nextReview(schedule)}`;
+		const lines = [truncateToWidth(latest, width, "…"), ...(review ? [count] : [])];
+		return review ? [...lines.slice(0, -1), this.more(lines.at(-1)!, width)] : lines;
+	}
+
+	/** The foldable fields (` → ` marks the selected one) and the plain facts below them, one row per line with a hanging indent under the value column. */
+	private overviewRows(width: number, fields: Array<{ field: string; label: string; lines: string[] }>, facts: Fact[]): Row[] {
+		const labeled = (marker: string, label: string, lines: string[], color?: "warning") => lines.map((line, index) => {
+			const text = `${index ? "  " : `${marker} `}${(index ? "" : label).padEnd(OVERVIEW_LABEL)}${line}`;
+			return { text: color ? this.theme.fg(color, text) : text };
+		});
+		this.field = Math.min(this.field, fields.length - 1);
+		return [...fields.flatMap(({ field, label, lines }, index) => labeled(index === this.field ? this.theme.fg("accent", "→") : " ", label, lines).map((row, line) => line ? row : { ...row, field })),
+			...(facts.length ? [{ text: "" }] : []), ...facts.flatMap(([label, value, color]) => labeled(" ", label, wrapTextWithAnsi(value, width - OVERVIEW_LABEL - 2), color))];
+	}
+
+	private overview(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
+		const value = width - OVERVIEW_LABEL - 2;
+		const time = this.host.runtime.teamTime(team.teamId);
+		const holds = this.host.runtime.listHolds(team.teamId);
+		const incidents = team.incidents.filter((incident) => incident.state === "open");
 		const { used, limits } = this.host.runtime.inspectBudget(team.teamId);
-		if (BUDGET_COUNTERS.slice(0, 4).every(([, key]) => limits[key] >= TEAM_BUDGET_UNLIMITED)) add("Budget", `all counters unlimited · works ${used.teamWorks}/${limits.teamWorks >= TEAM_BUDGET_UNLIMITED ? "unlimited" : limits.teamWorks}`);
-		else this.budget(team.teamId, Math.max(6, Math.min(20, width - labelWidth - 16 - 22))).forEach(({ label, meter }, index) => add(index ? "" : "Budget", `${label.padEnd(15)} ${meter}`));
-		return lines.map((text, index) => ({ text, ...(index === reviewIndex ? { review: "all" } : {}) }));
+		const budget: Fact[] = BUDGET_COUNTERS.slice(0, 4).every(([, key]) => limits[key] >= TEAM_BUDGET_UNLIMITED)
+			? [["Budget", `all counters unlimited · works ${used.teamWorks}/${limits.teamWorks >= TEAM_BUDGET_UNLIMITED ? "unlimited" : limits.teamWorks}`]]
+			: this.budget(team.teamId, Math.max(6, Math.min(20, value - 16 - 22))).map(({ label, meter }, index) => [index ? "" : "Budget", `${label.padEnd(15)} ${meter}`]);
+		return this.overviewRows(width, [
+			{ field: "goal", label: "Goal", lines: this.clip(team.brief.goal, value) },
+			{ field: "outcome", label: "Outcome", lines: this.clip(outcomeText(team), value) },
+			{ field: "review", label: "Review", lines: this.reviewLines(this.host.runtime.listReviews(team.teamId), this.host.runtime.reviewSchedule(team.teamId), value) },
+		], [
+			["Time", timeText(time.activeMs, time.wallMs, time.pausedMs)], ["Tokens", usageText(team.usage)], ["Roots", rootsText(rootCounts(works))],
+			["Waiting", this.overviewWaitingFor(team, works, facts), /^Lead (decision|failed)/u.test(facts.waitingFor ?? "") ? "warning" : undefined],
+			["Attention", holds.length || incidents.length ? `${holds.length} open holds · ${incidents.length} open incidents` : "none", holds.length || incidents.length ? "warning" : undefined],
+			...holds.map((hold): Fact => ["", `${hold.assignee} · ${shortWorkRef(hold.work)} · ${oneLine(hold.message)}`, "warning"]),
+			...incidents.filter((incident) => !holds.some((hold) => hold.incidentId === incident.id)).map((incident): Fact => ["", `${incident.code}: ${oneLine(incident.message)}`, "warning"]),
+			...budget,
+		]);
+	}
+
+	private historyOverview(entry: TeamHistoryEntry, width: number): Row[] {
+		const value = width - OVERVIEW_LABEL - 2;
+		const wall = entry.startedAt === undefined ? undefined : entry.at - entry.startedAt;
+		const active = entry.activeMs ?? wall;
+		return this.overviewRows(width, [
+			...(entry.goal ? [{ field: "goal", label: "Goal", lines: this.clip(entry.goal, value) }] : []),
+			{ field: "outcome", label: "Outcome", lines: this.clip(outcomeText(entry), value) },
+			{ field: "review", label: "Review", lines: this.reviewLines(entry.reviews ?? [], entry.review, value) },
+		], [
+			...(active === undefined ? [] : [["Time", timeText(active, wall ?? active, wall === undefined || entry.activeMs === undefined ? 0 : Math.max(0, wall - entry.activeMs))] as Fact]),
+			...(entry.usage ? [["Tokens", usageText(entry.usage)] as Fact] : []), ...(entry.rootCounts ? [["Roots", rootsText(entry.rootCounts)] as Fact] : []),
+		]);
+	}
+
+	/** The full Goal or Outcome text on a scrollable page. */
+	private fullText(source: TeamTeamView | TeamHistoryEntry, goal: string, width: number): Row[] {
+		return [this.detail === "goal" ? "Goal · Esc back" : "Outcome · Esc back", "", this.detail === "goal" ? goal : outcomeText(source)]
+			.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((line) => ({ text: line })));
 	}
 
 	private overviewWaitingFor(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts): string {
@@ -472,8 +605,11 @@ export class TeamOverlayComponent implements Focusable {
 		if (this.tab === 3 && row?.work) {
 			const work = row.work;
 			const stats = this.host.runtime.workStats(team.teamId, work.work);
-			return [...wrapTextWithAnsi(`${workTitle(work)} · ${work.requester} → ${work.assignee} · ${shortWorkRef(work.work)}`, width).map(title),
-				dim(`active ${clock(stats.activeMs)} · ${usageText(stats.usage)}`)];
+			const result = work.resultRef ? this.host.runtime.getResult(team.teamId, work.resultRef)?.result : undefined;
+			// Two lines: a long title is cut so the route and work ref stay visible.
+			const route = ` · ${work.requester} → ${work.assignee} · ${shortWorkRef(work.work)}${work.work.revision > 1 ? ` (rev ${work.work.revision - 1}×)` : ""}`;
+			return [title(`${compact(workTitle(work), width - visibleWidth(route))}${route}`),
+				dim(`active ${clock(stats.activeMs)} · ${usageText(stats.usage)}${result ? ` · "${firstSentence(result.summary)}"` : ""}`)];
 		}
 		return [];
 	}
@@ -503,23 +639,58 @@ export class TeamOverlayComponent implements Focusable {
 	}
 
 	private reviewHeading(reviews: readonly TeamReviewRecord[], schedule: (TeamReviewPlan & { nextAt?: number | null }) | undefined): string {
-		const next = schedule?.nextAt ? ` · next in ${Math.max(0, Math.ceil((schedule.nextAt - this.now()) / 60_000))}m` : "";
-		return `Reviews · ${reviews.length} · ${schedule ? `${schedule.by} every ${schedule.everyMinutes} min${next}` : "off"}`;
+		return `Reviews · ${reviews.length} · ${schedule ? `${schedule.by} every ${schedule.everyMinutes} min${this.nextReview(schedule)}` : "off"}`;
 	}
 
-	private tasksSummary(works: readonly TeamWorkSummary[]): string {
+	/** Deliverable counts with the list filter right-aligned. */
+	private tasksSummary(works: readonly TeamWorkSummary[], width: number): string {
 		const plain = works.filter((work) => !work.kind);
 		const roots = plain.filter((work) => !work.parent);
-		return `${roots.length} deliverables · ${roots.filter((work) => work.state === "running" && !work.hold).length} running · ${roots.filter((work) => work.state === "resolved" && !work.review).length} awaiting acceptance · ${roots.filter((work) => work.review === "accepted").length} accepted · ${plain.length - roots.length} sub-tasks`;
+		const counts = `${roots.length} deliverables · ${plain.length - roots.length} sub-task${plain.length - roots.length === 1 ? "" : "s"} · ${roots.filter((work) => work.state === "running" && !work.hold).length} running · ${roots.filter((work) => work.review === "waived").length} waived`;
+		const view = `view: ${this.view} (f)`;
+		return visibleWidth(counts) + 2 + visibleWidth(view) <= width ? `${fit(counts, width - visibleWidth(view))}${view}` : `${counts} · ${view}`;
 	}
 
-	private taskState(teamId: string, work: TeamWorkSummary, works: readonly TeamWorkSummary[]): string {
+	/** One row per deliverable under Needs attention / In progress / Done (folded); the expanded deliverable lists its sub-tasks. */
+	private taskRows(team: TeamTeamView, works: TeamWorkSummary[], width: number): Row[] {
+		const { latest, children } = workTree(works);
+		const describe = (work: TeamWorkSummary) => this.taskState(team.teamId, work, works, true);
+		const descendants = (work: TeamWorkSummary): TeamWorkSummary[] => (children.get(work.work.workId) ?? []).flatMap((child) => [child, ...descendants(child)]);
+		const roots = [...latest.values()].filter((work) => !work.parent);
+		const rank = (work: TeamWorkSummary) => work.hold || work.state === "failed" || work.review === "waived" || work.state === "resolved" && !work.review ? 0
+			: work.state === "running" || work.state === "blocked" || work.state === "queued" ? 1 : 2;
+		const groups = ([["⚠", "warning", "Needs attention"], ["▶", "accent", "In progress"], ["✓", "success", "Done"]] as const)
+			.map(([icon, color, label], index) => ({ icon, color, label, done: index === 2, items: roots.filter((work) => rank(work) === index) }))
+			.filter((group) => group.items.length && !(group.done && this.view === "active"));
+		const listed = groups.flatMap((group) => group.done && !this.expanded.has("done") ? [] : group.items);
+		const cells = new Map(listed.map((work) => {
+			const sub = descendants(work);
+			return [work, { state: describe(work), suffix: sub.length ? ` · ${sub.filter((item) => item.state === "resolved").length}/${sub.length} sub-tasks ${this.root === work.work.workId ? "‹" : "›"}` : "" }];
+		}));
+		// The columns fit the listed rows: assignee, then the longest state up to 55% of the width, and the title gets the rest.
+		const assigneeWidth = Math.min(Math.floor(width * 0.2), Math.max(1, ...listed.map((work) => visibleWidth(work.assignee))));
+		const stateWidth = Math.min(Math.floor(width * 0.55), Math.max(0, ...[...cells.values()].map(({ state, suffix }) => visibleWidth(state + suffix))));
+		const titleWidth = Math.max(10, width - assigneeWidth - stateWidth - 4);
+		// A deliverable's row, followed by its sub-tasks while it is the expanded one.
+		const listing = (work: TeamWorkSummary): Row[] => {
+			const { state, suffix } = cells.get(work)!;
+			return [{ work, text: `${column(` ${workIcon(work, this.theme)} ${workTitle(work)}`, titleWidth)}  ${column(work.assignee, assigneeWidth)}  ${compact(state, width - titleWidth - assigneeWidth - 4 - visibleWidth(suffix))}${suffix}` },
+				...(this.root === work.work.workId ? buildTeamTaskRows(works, this.expanded, this.theme, width - 1, describe, work.work.workId).slice(1).map((child) => ({ ...child, text: ` ${child.text}` })) : [])];
+		};
+		return groups.flatMap((group) => {
+			const open = !group.done || this.expanded.has("done");
+			const title = `${this.theme.fg(group.color, group.icon)} ${group.label} · ${group.items.length}`;
+			return [group.done ? { fold: "done", text: `${fit(title, width - 3)}[${open ? "−" : "+"}]` } : { header: true, text: title }, ...(open ? group.items.flatMap(listing) : [])];
+		});
+	}
+
+	private taskState(teamId: string, work: TeamWorkSummary, works: readonly TeamWorkSummary[], brief = false): string {
 		const version = this.host.runtime.getWork(teamId, work.work)!.current;
 		if (work.hold) return `held: ${{ attention: "attention", budget: "budget", protocol: "loop", lead_unavailable: "lead fault" }[work.hold]}`;
 		if (work.review) {
-			const summary = work.resultRef ? this.host.runtime.getResult(teamId, work.resultRef)?.result.summary : undefined;
+			const summary = work.resultRef && !brief ? this.host.runtime.getResult(teamId, work.resultRef)?.result.summary : undefined;
 			const reason = version.review?.reason;
-			return `${work.review}${reason ? ` · ${oneLine(reason)}` : summary ? ` · "${oneLine(summary).split(/(?<=[.!?])\s/u)[0]}"` : ""}`;
+			return `${work.review}${reason ? ` · ${oneLine(reason)}` : summary ? ` · "${firstSentence(summary)}"` : ""}`;
 		}
 		if (work.state === "failed") return `failed: ${version.error?.code ?? "unknown"}`;
 		if (work.state === "blocked") {
@@ -533,8 +704,8 @@ export class TeamOverlayComponent implements Focusable {
 		}
 		if (work.state === "resolved") {
 			if (!work.parent) return "delivered · awaiting acceptance";
-			const result = work.resultRef ? this.host.runtime.getResult(teamId, work.resultRef)?.result : undefined;
-			return `done ${clock(this.host.runtime.workStats(teamId, work.work).activeMs)}${result ? ` · "${oneLine(result.summary).split(/(?<=[.!?])\s/u)[0]}"` : ""}`;
+			const result = work.resultRef && !brief ? this.host.runtime.getResult(teamId, work.resultRef)?.result : undefined;
+			return `done ${clock(this.host.runtime.workStats(teamId, work.work).activeMs)}${result ? ` · "${firstSentence(result.summary)}"` : ""}`;
 		}
 		return work.state === "running" ? `running ${clock(this.host.runtime.workStats(teamId, work.work).activeMs)}` : work.state;
 	}
@@ -629,26 +800,24 @@ export class TeamOverlayComponent implements Focusable {
 				const stats = entry.memberStats?.find((member) => member.id === id);
 				const busy = entry.activeMs && stats ? Math.round(stats.activeMs / entry.activeMs * 100) : undefined;
 				const status = state === "faulted" ? "failed" : state === "closed" ? "completed" : "idle";
+				// Members without retained stats are one line each; the Σ row says so once.
 				return { member: id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${id}${id === entry.lead ? " (lead)" : ""}  ${state}`,
-					lines: wrapTextWithAnsi(stats ? `active ${clock(stats.activeMs)} · ${busy !== undefined && busy >= 90 ? this.theme.fg("warning", `busy ${busy}%`) : `busy ${busy ?? "—"}%`} · ${usageText(stats.usage)}` : "active — · busy — · tokens not retained", width - 2) };
+					...(stats ? { lines: wrapTextWithAnsi(`active ${clock(stats.activeMs)} · ${busy !== undefined && busy >= 90 ? this.theme.fg("warning", `busy ${busy}%`) : `busy ${busy ?? "—"}%`} · ${usageText(stats.usage)}`, width - 2) } : {}) };
 			});
 		}
-		const heading = `Team:        ${teamTitle(entry, entry.goal)} · ${entry.shortId ?? entry.teamId.slice(0, 8)}`;
-		const wall = entry.startedAt === undefined ? undefined : entry.at - entry.startedAt;
-		const paused = wall === undefined || entry.activeMs === undefined ? 0 : Math.max(0, wall - entry.activeMs);
-		const lines = this.tab === 1 ? [heading, `Goal:        ${entry.goal ?? "not retained"}`,
-			`Time:        ${entry.activeMs !== undefined ? clock(entry.activeMs) : wall === undefined ? "not retained" : clock(wall)}${paused ? ` active · ${clock(wall!)} wall (paused ${clock(paused)})` : ""}`,
-			...(entry.usage ? [`Tokens:      ${usageText(entry.usage)}`] : []), `Outcome:     ${entry.outcome ?? entry.lifecycle}${entry.reason ? ` · ${entry.reason}` : ""}`,
-			...(entry.rootCounts ? [`Roots:       ${entry.rootCounts.accepted}/${entry.rootCounts.total} accepted · ${entry.rootCounts.waived} waived`] : []),
-			`Review:      ${entry.reviews?.length ? `${clock(entry.reviews.at(-1)!.snapshot.elapsedMs)} ${entry.reviews.at(-1)!.by} ${verdictOf(entry.reviews.at(-1)!)[0].toUpperCase()} · ${compact(reviewAssessment(entry.reviews.at(-1)!.summary), width - 39)}` : entry.review ? "No reviews" : "off"}`,
-			...(entry.reviews?.length ? [`             ${entry.reviews.length} review${entry.reviews.length === 1 ? "" : "s"} · enter: all reviews`] : [])]
-			: this.tab === 3 ? [heading, "Work ledger not retained; retained results:", ...entry.results.map((result) => `${shortWorkRef(result.work)} · ${result.author} · ${result.result.status} · ${result.id}: ${oneLine(result.result.summary)}`)]
-				: [heading, "Timeline not retained in history"];
-		return lines.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((text) => ({ text, ...(text.startsWith("Review:") ? { review: "all" } : {}) })));
+		if (this.tab === 1) return this.historyOverview(entry, width);
+		if (this.tab === 3) {
+			if (!this.detail) return entry.results.map((record) => ({ result: record.id, text: `${outcomeIcon(this.theme, record.result.status)} ${compact(`${shortWorkRef(record.work).slice(5)} · ${record.author} · "${firstSentence(record.result.summary)}"`, width - 2)}` }));
+			const { work, author, id, result } = entry.results.find((record) => record.id === this.detail)!;
+			return [`${shortWorkRef(work)} · ${author} · ${result.status} · ${id} · Esc back`, "", `Result: ${result.summary}`, ...(result.findings ?? []).map((line) => `Finding: ${line}`),
+				...(result.evidence ?? []).map((item) => `Evidence: ${item.source}${item.locator ? ` · ${item.locator}` : ""} · ${item.basis}`)]
+				.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((line) => ({ text: line })));
+		}
+		return [{ text: "Timeline not retained in history" }];
 	}
 
 	private historyProgressHead(entry: TeamHistoryEntry, width: number): string[] {
-		return [`Σ Team ${entry.activeMs === undefined ? "—" : clock(entry.activeMs)} · history · ${entry.members.length} members`,
+		return [`Σ Team ${entry.activeMs === undefined ? "—" : clock(entry.activeMs)} · history · ${entry.members.length} members${entry.memberStats ? "" : " · stats not retained"}`,
 			...(entry.usage ? wrapTextWithAnsi(`     ${usageText(entry.usage)}`, width) : []), ...(entry.flow ? wrapTextWithAnsi(entry.flow.split(" · ").slice(0, 2).join(" · "), width) : []), ""];
 	}
 }

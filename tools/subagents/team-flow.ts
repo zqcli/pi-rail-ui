@@ -149,7 +149,7 @@ export function flowDuration(ms: number | undefined): string {
 }
 const percent = (value: number | undefined) => value === undefined ? "—" : `${Math.round(100 * value)}%`;
 const decimal = (value: number | undefined) => value === undefined ? "—" : value.toFixed(1);
-const tokens = (value: number) => value < 1000 ? String(value) : value < 1_000_000 ? `${Math.round(value / 1000)}k` : `${(value / 1_000_000).toFixed(1)}M`.replace(/\.0M$/u, "M");
+export const tokens = (value: number) => value < 1000 ? String(value) : value < 1_000_000 ? `${Math.round(value / 1000)}k` : `${(value / 1_000_000).toFixed(1)}M`.replace(/\.0M$/u, "M");
 
 /** The Progress rows (without their labels), each within 69 columns; also the Flow, Lead and Waits facts of a review snapshot. */
 export function flowRows(stats: TeamFlowStats): { flow: string; lead: string; queue: string; waits: string; cost: string } {

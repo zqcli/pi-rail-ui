@@ -76,6 +76,34 @@ test("activation roster preserves context percent through projection and private
 	}
 });
 
+test("activation roster preserves contextTokens as a non-negative integer and keeps its keys strict", () => {
+	const value = input();
+	value.roster[1]!.contextTokens = 41_000;
+	const projected = projectActivationInput(value);
+	assert.deepEqual(projected.roster, value.roster);
+	assert.deepEqual(parseParentCommand(activate(projected)), activate(projected));
+	for (const tokens of [-1, 1.5, NaN, "41000"]) {
+		value.roster[1]!.contextTokens = tokens as number;
+		assert.throws(() => parseParentCommand(activate(value)), protocolFailure);
+	}
+	value.roster[1]!.contextTokens = 1;
+	(value.roster[1] as Record<string, unknown>)["contextWindow"] = 1;
+	assert.throws(() => parseParentCommand(activate(value)), protocolFailure);
+});
+
+test("compact_member and its COMPACTION events are described to the lead", () => {
+	assert.match(JSON.stringify(TEAM_TOOL_SCHEMA), /under about 40k contextTokens/u);
+	const event = { id: "event", kind: "COMPACTION", message: "Compaction of owner done: 286k→41k tokens", memberId: "owner" } as const;
+	const value = input();
+	value.roster[0] = { id: "lead", lead: true, lifecycle: "open", contextTokens: 0 };
+	value.member = { id: "lead", lead: true, roleDescription: "Lead." };
+	value.scope = { kind: "events", eventBatchId: "batch", events: [event], emergency: false };
+	const command = { ...activate(value), binding: { ...binding, memberId: "lead" }, activation: { activationId: "activation", kind: "events", eventBatchId: "batch" } } as ParentCommand;
+	assert.deepEqual(parseParentCommand(command), command);
+	const unknownKind = { ...command, input: { ...value, scope: { ...value.scope, events: [{ ...event, kind: "COMPACTED" }] } } };
+	assert.throws(() => parseParentCommand(unknownKind as unknown as ParentCommand), protocolFailure);
+});
+
 test("team view preserves context and compaction metadata and rejects malformed fields", () => {
 	const runtime = new TeamRuntime();
 	const { teamId } = runtime.prepare({ members: [{ alias: "lead", roleDescription: "Lead" }, { alias: "worker", roleDescription: "Work" }], lead: "lead", brief: { goal: "Test" }, timeoutSeconds: null });

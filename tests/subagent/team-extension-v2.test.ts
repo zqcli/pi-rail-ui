@@ -393,6 +393,13 @@ test("oversized local reply can be corrected in the same connected scope and com
 	await connection.close();
 });
 
+test("team_brief tells the lead to check contextTokens and skip compacting members under about 40k", () => {
+	const lead = renderTeamBrief("lead", { tools: null, teamTool: true, brief: { goal: "G" }, roster: [{ id: "lead", rolePreview: "Coordinates." }] });
+	assert.match(lead, /compact a member before giving it unrelated work or when its ctx is high \(about 40% or more\)/u);
+	assert.match(lead, /compaction keeps roughly the most recent 20k tokens, so a member under about 40k contextTokens has nothing worth compacting/u);
+	assert.match(lead, /check contextTokens in the roster first; use instructions to say what to keep/u);
+});
+
 test("team_brief renders only the member's own authorization and fills absent parts with none", () => {
 	const brief = { goal: "Ship it.", acceptanceCriteria: ["Tests pass"], constraints: ["No new deps", "Keep API"],
 		authorizations: [{ member: "dev", allowed: ["edit src"], forbidden: ["git push"] }, { member: "qa", allowed: ["run tests"] }] };

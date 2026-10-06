@@ -445,7 +445,7 @@ export interface TeamEventView {
 	resultRef?: string;
 }
 export const TEAM_EVENT_KINDS = ["BOOT", "USER_COMMAND", "ROOT_RESULT_READY", "REVIEW_READY", "WORK_HELD", "MEMBER_FAULTED",
-	"MEMBER_CLOSED", "DEPENDENCY_UNAVAILABLE", "BUDGET_HIT", "TEAM_QUIESCENT"] as const;
+	"MEMBER_CLOSED", "DEPENDENCY_UNAVAILABLE", "BUDGET_HIT", "TEAM_QUIESCENT", "COMPACTION"] as const;
 export type TeamEventKind = typeof TEAM_EVENT_KINDS[number];
 
 export interface OutcomeView {
@@ -475,7 +475,7 @@ export interface ActivationInput {
 	member: { id: string; lead: boolean; roleDescription: string };
 	/** The full brief is in the member's system prompt (bind loadout); only the goal repeats here. */
 	goal: string;
-	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle; contextPercent?: number }>;
+	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle; contextPercent?: number; contextTokens?: number }>;
 	scope:
 		| {
 			kind: "work";

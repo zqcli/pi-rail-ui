@@ -509,7 +509,7 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Root's requester or the lead: explicitly accept a successful root or waive a terminal outcome with a reason."),
 	controlAction("close_member", { memberId: aliasSchema }, "Lead only: close an idle member with no unresolved obligations, or stop a faulted member's process."),
 	controlAction("revive_member", { memberId: aliasSchema }, "Lead only: reopen a faulted member whose process is alive; its failed work stays failed, so revise or re-request it."),
-	controlAction("compact_member", { memberId: aliasSchema, instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })) }, "Lead only: compact any open member, including yourself, between activations. Optional instructions (max 2 KiB) say what to keep; omitted uses Pi's default prompt. Returns immediately."),
+	controlAction("compact_member", { memberId: aliasSchema, instructions: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })) }, "Lead only: compact any open member, including yourself, between activations; a member under about 40k contextTokens (see the roster) has nothing worth compacting. Optional instructions (max 2 KiB) say what to keep; omitted uses Pi's default prompt. Returns immediately; a COMPACTION event reports the result."),
 	controlAction("close_team", { resultRefs: Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS }),
 		outcome: Type.Union([Type.Literal("succeeded"), Type.Literal("partial"), Type.Literal("failed")]),
 		reason: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })),
@@ -1367,11 +1367,12 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	const roster = array(value["roster"], "activation input.roster", TEAM_MAX_MEMBERS).map((raw, index) => {
 		const field = `activation input.roster[${index}]`;
 		if (!isRecord(raw)) return protocol(`${field} must be an object`);
-		frameKeys(raw, ["id", "lead", "lifecycle", "contextPercent"], field);
+		frameKeys(raw, ["id", "lead", "lifecycle", "contextPercent", "contextTokens"], field);
 		if (raw["lead"] !== undefined && raw["lead"] !== true) return protocol(`${field}.lead must be true when present`);
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(raw["lifecycle"]))) return protocol(`${field}.lifecycle is invalid`);
 		return { id: normalizeAlias(raw["id"], `${field}.id`), ...(raw["lead"] === true ? { lead: true as const } : {}), lifecycle: raw["lifecycle"] as MemberLifecycle,
-			...(raw["contextPercent"] !== undefined ? { contextPercent: finiteNumber(raw["contextPercent"], `${field}.contextPercent`, 0) } : {}) };
+			...(raw["contextPercent"] !== undefined ? { contextPercent: finiteNumber(raw["contextPercent"], `${field}.contextPercent`, 0) } : {}),
+			...(raw["contextTokens"] !== undefined ? { contextTokens: safeInteger(raw["contextTokens"], `${field}.contextTokens`, 0) } : {}) };
 	});
 	const rosterIds = roster.map((item) => item.id);
 	if (!rosterIds.includes(binding.memberId) || new Set(rosterIds).size !== rosterIds.length || roster.filter((item) => item.lead).length !== 1

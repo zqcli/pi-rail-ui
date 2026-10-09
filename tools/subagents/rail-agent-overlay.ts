@@ -4,7 +4,7 @@ import { Input, Key, matchesKey, stripTerminalSequences, truncateToWidth, wrapTe
 import type { CreateRailAgentRequest, RailAgentManager, RailAgentManagerSnapshot, RailAgentPhase, RailAgentView } from "./agent-manager";
 import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { assertValidAgentAlias } from "./identity";
-import { statusColor } from "./transcript";
+import { retryCountText, retryStatusText, statusColor } from "./transcript";
 import {
 	availableThinkingLevels,
 	railModelKey,
@@ -70,6 +70,7 @@ function modelSearchText(model: RailModelRef): string {
 }
 
 function phaseLabel(agent: RailAgentView): string {
+	if (agent.retry) return retryStatusText(agent.retry);
 	if (agent.isCompacting) return agent.queued > 0 ? `COMPACTING +${agent.queued}` : "COMPACTING";
 	if (agent.phase === "running" && agent.queued > 0) return `RUNNING +${agent.queued}`;
 	if (agent.phase === "in-use-elsewhere") return "IN USE ELSEWHERE";
@@ -257,7 +258,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			const agent = agents[index]!;
 			const selected = index === this.selectedIndex;
 			const prefix = selected ? this.theme.fg("accent", " → ") : "   ";
-			const phase = this.theme.fg(phaseColor(agent.phase, agent.isCompacting), phaseLabel(agent));
+			const phase = this.theme.fg(agent.retry ? "warning" : phaseColor(agent.phase, agent.isCompacting), phaseLabel(agent));
 			const alias = agent.linkedAliases[0] ?? agent.instance.alias;
 			const fast = agent.instance.fastMode === true
 				? `  ${this.theme.fg(this.fastModeEligible(agent.instance.model) ? "success" : "warning", this.fastModeEligible(agent.instance.model) ? "FAST" : "FAST inactive")}`
@@ -273,6 +274,8 @@ export class RailAgentOverlayComponent implements Focusable {
 			lines.push(` ${this.theme.fg("dim", `Last task: ${compact(selected.instance.lastTask, innerWidth - 13)}`)}`);
 			if (selected.instance.lastOutput) lines.push(` ${this.theme.fg("dim", `Last answer: ${compact(selected.instance.lastOutput, innerWidth - 15)}`)}`);
 			if (selected.instance.fastMode === true) lines.push(` ${this.theme.fg(this.fastModeEligible(selected.instance.model) ? "success" : "warning", this.fastModeEligible(selected.instance.model) ? "Fast mode: active" : "Fast mode: inactive for current model")}`);
+			if (selected.retry) lines.push(` ${this.theme.fg("warning", compact(selected.retry.error, innerWidth - 2))}`);
+			else if (selected.retryCount) lines.push(` ${this.theme.fg("dim", retryCountText(selected.retryCount, selected.phase === "idle"))}`);
 			if (selected.errorMessage) lines.push(` ${this.theme.fg("error", compact(selected.errorMessage, innerWidth - 2))}`);
 		}
 		if (this.control) {
@@ -577,6 +580,11 @@ export class RailAgentOverlayComponent implements Focusable {
 	}
 
 	private startControl(agent: RailAgentView, delivery: "steer" | "followUp"): void {
+		if (agent.retry && agent.retry.source !== "pi") {
+			this.notice = "Live controls are unavailable during retry backoff; wait for the next attempt";
+			this.renderSoon();
+			return;
+		}
 		if (agent.phase !== "running") {
 			this.notice = agent.phase === "in-use-elsewhere"
 				? "Live controls cannot reach a worker owned by another process"

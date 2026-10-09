@@ -118,6 +118,38 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	return { component, controls, ctx, manager, notifications, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
 }
 
+test("rail-agent renders live retry countdown and final recovered count", (t) => {
+	t.mock.method(Date, "now", () => 10_000);
+	const state = setup("running");
+	try {
+		state.snapshot.agents[0].retry = { attempt: 2, maxAttempts: 5, nextAt: 40_000, error: "503 temporary", source: "rail" };
+		state.snapshot.agents[0].retryCount = 2;
+		const during = state.component.render(160).join("\n");
+		assert.match(during, /Retrying 2\/5.*next in 30s/);
+		assert.match(during, /503 temporary/);
+		assert.doesNotMatch(during, /IDLE|ERROR/);
+		state.component.handleInput("g");
+		assert.match(state.component.render(160).join("\n"), /controls are unavailable during retry backoff/);
+		assert.equal(state.component["control"], undefined);
+		t.mock.method(Date, "now", () => 25_000);
+		assert.match(state.component.render(160).join("\n"), /next in 15s/);
+		for (const width of [12, 35, 60]) for (const line of state.component.render(width)) assert.ok(visibleWidth(line) <= width);
+		state.snapshot.agents[0].phase = "idle";
+		delete state.snapshot.agents[0].retry;
+		const after = state.component.render(160).join("\n");
+		assert.match(after, /recovered after 2 retries/);
+		assert.doesNotMatch(after, /Retrying/);
+		for (const phase of ["stopped", "error"]) {
+			state.snapshot.agents[0].phase = phase;
+			const terminal = state.component.render(160).join("\n");
+			assert.match(terminal, /2 retries/);
+			assert.doesNotMatch(terminal, /Retrying|recovered after/);
+		}
+	} finally {
+		state.component.dispose();
+	}
+});
+
 test("agent filtering preserves fields, input order, current-tab scope, selection, and fresh snapshots", async () => {
 	const state = setup();
 	const agents: RailAgentView[] = ["zulu", "alpha", "foreign", "unmatched"].map((alias) => ({

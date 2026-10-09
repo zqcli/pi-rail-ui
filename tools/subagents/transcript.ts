@@ -1,6 +1,7 @@
 import type { Component, MarkdownTheme } from "@earendil-works/pi-tui";
 import { Markdown, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { SubagentRetry } from "./retry";
 
 const DEFAULT_MAX_ENTRIES = 18;
 const MAX_ENTRY_CHARS = 4000;
@@ -45,6 +46,8 @@ export interface SubagentTranscriptRun {
 	model?: string;
 	status: SubagentTranscriptStatus;
 	isCompacting?: boolean;
+	retry?: SubagentRetry;
+	retryCount?: number;
 	output: string;
 	persistent: boolean;
 	transcript?: SubagentTranscriptSnapshot;
@@ -795,8 +798,18 @@ function runtimeText(run: SubagentTranscriptRun): string {
 	return parts.join(" · ");
 }
 
+export function retryStatusText(retry: SubagentRetry): string {
+	const seconds = Math.max(0, Math.ceil((retry.nextAt - Date.now()) / 1000));
+	return `${retry.source === "pi" ? "Pi " : ""}Retrying ${retry.attempt}/${retry.maxAttempts} · next in ${seconds}s`;
+}
+
+export function retryCountText(count: number, recovered: boolean): string {
+	return `${recovered ? "recovered after " : ""}${count} ${count === 1 ? "retry" : "retries"}`;
+}
+
 function statusText(run: SubagentTranscriptRun): string {
-	if (run.status === "failed") return "Failed";
+	if (run.status === "running" && run.retry) return retryStatusText(run.retry);
+	if (run.status === "failed") return run.stopReason === "aborted" ? "Cancelled" : "Failed";
 	if (run.status === "running" && run.isCompacting) return "Compacting";
 	if (run.status === "running") return "Running";
 	if (run.status === "idle") return "Idle";
@@ -921,6 +934,18 @@ class SubagentRunPanel implements Component {
 			? `${this.theme.fg(statusColor(this.run.status, this.run.isCompacting), this.theme.bold(statusText(this.run)))}${this.theme.fg("toolTitle", this.theme.bold(` · ${runtimeText(this.run)}`))}`
 			: `${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run, this.layout, this.sequenceTotal)))}`;
 		const lines = [truncateToWidth(header, innerWidth, "", true)];
+		if (this.layout === "grouped" && this.run.retry && this.run.status === "running") {
+			lines.push(truncateToWidth(this.theme.fg("warning", retryStatusText(this.run.retry)), innerWidth, "", true));
+		}
+		if (this.layout === "grouped" && this.run.status === "failed" && this.run.stopReason === "aborted") {
+			lines.push(this.theme.fg("error", "Cancelled"));
+		}
+		if (this.run.retryCount && this.run.status !== "running") {
+			lines.push(truncateToWidth(this.theme.fg("dim", retryCountText(this.run.retryCount, this.run.status === "completed")), innerWidth, "", true));
+		}
+		if (this.run.retry && this.run.status === "running") {
+			lines.push(truncateToWidth(this.theme.fg("warning", cleanDisplayText(this.run.retry.error, "").slice(0, 240)), innerWidth, "", true));
+		}
 		const metrics = this.layout === "single"
 			? usageText(this.run)
 			: this.layout === "grouped"
@@ -1106,11 +1131,11 @@ export function renderSubagentTranscript(
 		);
 	}
 	const only = boundedRuns[0];
-	if (only && (only.status !== "running" || options.mode === "control" || options.control)) {
+	if (only && (only.status !== "running" || only.retry || options.mode === "control" || options.control)) {
 		return new SubagentRunPanel(
 			only,
 			expanded,
-			true,
+			only.status !== "running",
 			false,
 			theme,
 			options.markdownTheme,

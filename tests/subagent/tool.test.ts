@@ -168,6 +168,146 @@ function setupTool(options: {
 	return { tool, broker, hook };
 }
 
+test("parallel keeps recovered item live and folds its cumulative usage exactly once", async () => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const calls: string[] = [];
+	const retry = { attempt: 1, maxAttempts: 5, nextAt: Date.now() + 30_000, error: "503 retry", source: "rail" as const };
+	const firstUsage = { input: 10, output: 2, cacheRead: 3, cacheWrite: 1, cost: 0.1, contextTokens: 16, turns: 1 };
+	const finalUsage = { input: 30, output: 6, cacheRead: 9, cacheWrite: 3, cost: 0.3, contextTokens: 28, turns: 3 };
+	const updates: any[] = [];
+	const { tool } = setupTool({ runStateless: async (request) => {
+		calls.push(request.task);
+		if (request.task === "recover") {
+			request.onUpdate?.({ output: "", usage: firstUsage, exitCode: 0, retry, retryCount: 1 } as any);
+			await gate;
+			return { output: "recovered", usage: finalUsage, exitCode: 0, retryCount: 1 } as any;
+		}
+		return { output: "sibling", usage: firstUsage, exitCode: 0 };
+	} });
+	const operation = tool.execute("parallel-retry", { tasks: [{ task: "recover" }, { task: "success" }] }, undefined, (update: any) => updates.push(update), context());
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(calls, ["recover", "success"]);
+	const during = updates.at(-1).details.results;
+	assert.equal(during[0].status, "running");
+	assert.deepEqual(during[0].retry, retry);
+	assert.equal(during[1].status, "completed");
+	release();
+	const result = await operation;
+	assert.deepEqual(calls, ["recover", "success"]);
+	assert.equal(result.details.results[0].retry, undefined);
+	assert.equal(result.details.results[0].retryCount, 1);
+	assert.equal(result.details.results[0].usage.contextTokens, 28);
+	assert.equal(result.usage.input, 40);
+	assert.equal(result.usage.output, 8);
+	assert.equal(result.usage.cacheRead, 12);
+	assert.equal(result.usage.cacheWrite, 4);
+	assert.equal(result.usage.cost.total, 0.4);
+	const panel = tool.renderResult(result, { expanded: false }, themeForRetry()).render(250).join("\n");
+	assert.match(panel, /40 in.*8 out.*12 cached.*4 cache write/);
+	assert.match(panel, /recovered after 1 retry/);
+});
+
+function themeForRetry() { return { fg: (_color: string, text: string) => text, bold: (text: string) => text }; }
+
+test("quiet grouped retry uses one countdown refresh and cleans it on recovery or abort", async (t) => {
+	t.mock.timers.enable({ apis: ["setInterval"] });
+	let now = 10_000;
+	t.mock.method(Date, "now", () => now);
+	for (const cancelled of [false, true]) {
+		const controller = new AbortController();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const updates: any[] = [];
+		const usage = { input: 10, output: 2, cacheRead: 3, cacheWrite: 1, cost: 0, contextTokens: 16, turns: 1 };
+		const { tool } = setupTool({ runStateless: async (request) => {
+			request.onUpdate?.({ output: "", usage, exitCode: 0, retry: { attempt: 1, maxAttempts: 5, nextAt: now + 30_000, error: "503" } });
+			await gate;
+			if (request.signal?.aborted) throw new Error("Subagent request was aborted");
+			return { output: "done", usage, exitCode: 0, retryCount: 1 };
+		} });
+		const operation = tool.execute(`refresh-${cancelled}`, { tasks: [{ task: "one" }, { task: "two" }] }, controller.signal, (update: any) => updates.push(update), context());
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const before = updates.length;
+		now += 1500;
+		t.mock.timers.tick(1500);
+		assert.equal(updates.length, before + 1, "two retrying items share one publisher");
+		const refreshed = updates.at(-1);
+		assert.match(tool.renderResult(refreshed, { expanded: false, isPartial: true }, themeForRetry()).render(160).join("\n"), /next in 29s/);
+		assert.equal(refreshed.details.results.reduce((total: number, run: any) => total + run.usage.input, 0), 20);
+		if (cancelled) {
+			controller.abort();
+			const atAbort = updates.length;
+			t.mock.timers.tick(3000);
+			assert.equal(updates.length, atAbort, "abort stops the timer without waiting for the runner");
+		}
+		release();
+		const result = await operation;
+		assert.equal(result.usage.input, 20);
+		const terminal = updates.length;
+		t.mock.timers.tick(30_000);
+		assert.equal(updates.length, terminal, "terminal recovery or cancellation clears the timer");
+	}
+});
+
+test("persistent retry progress and count reach details and cancellation clears backoff", async () => {
+	for (const cancelled of [false, true]) {
+		const { tool, broker, hook } = setupTool();
+		const original = broker.dispatch.bind(broker);
+		const retry = { attempt: 1, maxAttempts: 5, nextAt: Date.now() + 10_000, error: "503 transient", source: "rail" as const };
+		const updates: any[] = [];
+		broker.dispatch = async (request) => {
+			const { onUpdate: _onUpdate, ...withoutUpdate } = request;
+			const result = await original(withoutUpdate);
+			request.onUpdate?.({ instance: result.instance, run: { ...result.run, retry, retryCount: 1 } } as any);
+			if (cancelled) throw new Error("Subagent request was aborted");
+			return { ...result, run: { ...result.run, retryCount: 1 } } as any;
+		};
+		const execution = tool.execute(`persistent-${cancelled}`, { alias: "review", task: "review" }, undefined, (update: any) => updates.push(update), context());
+		if (cancelled) await assert.rejects(execution, /aborted/);
+		else {
+			const result = await execution;
+			assert.equal(result.details.results[0].retryCount, 1);
+			assert.equal(result.details.results[0].retry, undefined);
+		}
+		assert.deepEqual(updates.find((update) => update.details.results[0].retry)?.details.results[0].retry, retry);
+		if (cancelled) {
+			const restored = hook!({ toolName: "subagent", toolCallId: "persistent-true", isError: true }).details.results[0];
+			assert.equal(restored.retry, undefined);
+			assert.equal(restored.retryCount, 1);
+			assert.equal(restored.status, "failed");
+		}
+	}
+});
+
+test("chain waits for current recovery and uses final output; exhaustion stops subsequent steps", async () => {
+	for (const exhausted of [false, true]) {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const calls: string[] = [];
+		const usage = { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 12, turns: 1 };
+		const { tool } = setupTool({ runStateless: async (request) => {
+			calls.push(request.task);
+			if (request.task === "recover") {
+				request.onUpdate?.({ output: "", usage, exitCode: 0, retry: { attempt: 5, maxAttempts: 5, nextAt: Date.now(), error: "503" }, retryCount: 5 } as any);
+				await gate;
+				return { output: exhausted ? "" : "final recovered output", usage: { ...usage, input: 60, turns: 6 }, exitCode: 0, retryCount: 5, ...(exhausted ? { stopReason: "error", errorMessage: "503 exhausted" } : {}) } as any;
+			}
+			return { output: "next done", usage, exitCode: 0 };
+		} });
+		const operation = tool.execute(`chain-${exhausted}`, { chain: [{ task: "recover" }, { task: "next {previous}" }] }, undefined, undefined, context());
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.deepEqual(calls, ["recover"]);
+		release();
+		const result = await operation;
+		assert.deepEqual(calls, exhausted ? ["recover"] : ["recover", "next final recovered output"]);
+		assert.equal(result.details.results[0].retryCount, 5);
+		assert.equal(result.details.results[0].retry, undefined);
+		assert.equal(result.details.results[0].status, exhausted ? "failed" : "completed");
+		assert.equal(result.usage.input, exhausted ? 60 : 70);
+	}
+});
+
 test("empty teamId placeholders use ordinary dispatch without looking up a team runtime", async () => {
 	for (const teamId of ["", "   ", null]) {
 		const { tool, broker } = setupTool();

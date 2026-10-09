@@ -15,6 +15,7 @@ import type {
 	WorkerControlRequest,
 } from "./session-broker";
 import { sessionLeaseKey } from "./worker-factory";
+import type { SubagentRetry } from "./retry";
 
 export type RailAgentPhase = AgentRuntimePhase | "in-use-elsewhere" | "unknown";
 
@@ -25,6 +26,8 @@ export interface RailAgentView {
 	phase: RailAgentPhase;
 	queued: number;
 	isCompacting?: boolean;
+	retry?: SubagentRetry;
+	retryCount?: number;
 	ownerPid?: number;
 	errorMessage?: string;
 }
@@ -94,6 +97,8 @@ export class RailAgentManager {
 					phase: local.phase,
 					queued: local.queued,
 					...(local.isCompacting ? { isCompacting: true } : {}),
+					...(local.retry ? { retry: local.retry } : {}),
+					...(local.retryCount ? { retryCount: local.retryCount } : {}),
 					...(local.errorMessage ? { errorMessage: local.errorMessage } : {}),
 				};
 			}
@@ -114,6 +119,7 @@ export class RailAgentManager {
 				linkedToCurrentSession: linkedAliases.length > 0,
 				phase: lease.state === "unknown" ? "unknown" : "stopped",
 				queued: 0,
+				...(local.retryCount ? { retryCount: local.retryCount } : {}),
 			};
 		}));
 		agents.sort((left, right) => {
@@ -150,6 +156,9 @@ export class RailAgentManager {
 
 	async control(target: string, request: WorkerControlRequest, signal?: AbortSignal): Promise<ControlResult> {
 		const agent = await this.assertLocallyControllable(target);
+		if (agent.retry && agent.retry.source !== "pi") {
+			throw new Error(`Subagent ${agent.instance.alias} is retrying; wait for the next attempt before sending controls`);
+		}
 		if (agent.phase !== "running") {
 			throw new Error(`Subagent ${agent.instance.alias} is not currently running; use continue for an idle or stopped session`);
 		}

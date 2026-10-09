@@ -255,15 +255,15 @@ test("keeps an active turn live and untouched after a non-assistant message_end"
 	});
 });
 
-test("noteError and message_end folding share one error message slot", () => {
+test("host failure freezes late message_end folding until explicit continuation", () => {
 	const collector = new RunResultCollector("shared slot", strictAssistantText);
 	collector.noteError("spawn failed");
 	collector.ingest({
 		type: "message_end",
 		message: { role: "assistant", content: [{ type: "text", text: "late" }], stopReason: "stop", errorMessage: "folded later" },
 	});
-	assert.equal(collector.errorMessage, "folded later");
-	assert.equal(collector.result("(no output)").errorMessage, "folded later");
+	assert.equal(collector.errorMessage, "spawn failed");
+	assert.equal(collector.result("(no output)").errorMessage, "spawn failed");
 });
 
 test("ingest returns a boolean update-change signal", () => {
@@ -491,4 +491,53 @@ test("keeps hosted search counts across active, completed, and compaction usage"
 		turns: 1,
 		searches: 3,
 	});
+});
+
+test("outer continuation preserves usage and completed tool history, but clears attempt state", () => {
+	const collector = new RunResultCollector("original task", assistantText);
+	const warm = usageEvent();
+	collector.ingest(warm);
+	collector.ingest({ type: "message_end", message: toolResultMessage() });
+	collector.ingest({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "503 service unavailable", usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.25 } } } });
+	assert.equal(collector.retryableError, undefined, "message_end is not a settled boundary");
+	collector.ingest({ type: "agent_end", willRetry: true });
+	assert.equal(collector.retryableError, undefined, "native retries finish first");
+	collector.ingest({ type: "agent_settled" });
+	assert.equal(collector.retryableError, "503 service unavailable");
+	collector.beginAttempt();
+	assert.equal(collector.retryableError, undefined);
+	assert.equal(collector.result("running").errorMessage, undefined);
+	collector.ingest(warm);
+	collector.ingest({ type: "message_end", message: toolResultMessage() });
+	collector.ingest({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop", usage: { input: 20, output: 3, totalTokens: 23, cost: { total: 0.5 } } } });
+	collector.ingest({ type: "agent_settled" });
+	const final = collector.result("");
+	assert.deepEqual(final.usage, { input: 40, output: 8, cacheRead: 116, cacheWrite: 8, cost: 1.375, contextTokens: 23, turns: 2 });
+	assert.equal(final.output, "recovered");
+	assert.equal(final.stopReason, "stop");
+	assert.equal(final.errorMessage, undefined);
+	assert.equal(final.transcript?.entries[0]?.text, "original task");
+	assert.equal(final.transcript?.entries.filter((entry) => entry.kind === "toolResult").length, 1);
+});
+
+test("only a real settled assistant transient failure permits outer retry", () => {
+	for (const [stopReason, errorMessage] of [
+		["error", "401 unauthorized"], ["error", "429 quota exceeded"], ["error", "400 invalid argument"],
+		["error", "503 input exceeds the context window"], ["length", "503 service unavailable"], ["aborted", "503 service unavailable"],
+	]) {
+		const collector = new RunResultCollector("terminal", assistantText);
+		collector.ingest({ type: "message_end", message: { role: "assistant", content: [], stopReason, errorMessage } });
+		collector.ingest({ type: "agent_settled" });
+		assert.equal(collector.retryableError, undefined, `${stopReason}: ${errorMessage}`);
+	}
+	for (const terminal of ["compaction", "transport", "abort", "host"]) {
+		const collector = new RunResultCollector("failure", assistantText);
+		collector.ingest({ type: "message_end", message: { role: "assistant", content: [], stopReason: "stop" } });
+		if (terminal === "compaction") collector.ingest({ type: "compaction_end", errorMessage: "503 service unavailable" });
+		else if (terminal === "transport") collector.ingest({ type: "transport_error", error: "503 service unavailable" });
+		else if (terminal === "abort") collector.markAborted();
+		else collector.noteError("503 service unavailable");
+		collector.ingest({ type: "agent_settled" });
+		assert.equal(collector.retryableError, undefined, terminal);
+	}
 });

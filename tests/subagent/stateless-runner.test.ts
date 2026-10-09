@@ -1,23 +1,25 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { resolve, join } from "node:path";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { railFastExtensionPath, RAIL_FAST_MODE_FLAG } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath, RAIL_OAI_SEARCH_MODE_FLAG } from "../../commands/rail-oai-search";
 import { railResponsesWebSocketExtensionPath } from "../../openai/responses-websocket";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
-import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
+import { createStatelessAgentRunner, type StatelessRunResult } from "../../tools/subagents/stateless-runner";
+import { RETRY_DELAYS_MS } from "../../tools/subagents/retry";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools/subagents/context-window";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
 function inlineScript(events: unknown[]): string {
-	const body = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+	const settledEvents = [...events, { type: "agent_end", messages: [], willRetry: false }, { type: "agent_settled" }];
+	const body = settledEvents.map((event) => `${JSON.stringify(event)}\n`).join("");
 	return `process.stdout.write(${JSON.stringify(body)});`;
 }
 
-test("stateless runner uses Pi JSON mode without creating a session", async () => {
+test("stateless runner uses Pi JSON mode with a private session cleaned after exit", async () => {
 	const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
 	const agentDir = await mkdtemp(join(tmpdir(), "rail-stateless-ws-route-"));
 	process.env["PI_CODING_AGENT_DIR"] = agentDir;
@@ -50,8 +52,12 @@ test("stateless runner uses Pi JSON mode without creating a session", async () =
 		await rm(agentDir, { recursive: true, force: true });
 	}
 
+	assert.notEqual(capturedArgs.indexOf("--session"), -1);
+	const sessionPath = capturedArgs[capturedArgs.indexOf("--session") + 1];
+	assert.ok(sessionPath);
+	await assert.rejects(access(dirname(sessionPath)), /ENOENT/);
 	assert.deepEqual(capturedArgs, [
-		"--mode", "json", "-p", "--no-session",
+		"--mode", "json", "-p", "--session", sessionPath,
 		"--model", "cus-resp/gpt-5.6-luna",
 		"-e", railResponsesWebSocketExtensionPath(),
 		"--thinking", "xhigh",
@@ -181,7 +187,7 @@ test("stateless runner forwards fastMode only for an explicit true GPT dispatch"
 	assert.equal(capturedArgs.includes(railOaiSearchExtensionPath()), false);
 });
 
-test("production stateless runner enables an ephemeral session from the persisted GPT setting", async (t) => {
+test("production stateless runner reuses its private session for persisted GPT compaction", async (t) => {
 	const agentDir = await mkdtemp(join(tmpdir(), "rail-stateless-gpt-setting-"));
 	t.after(() => rm(agentDir, { recursive: true, force: true }));
 	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
@@ -222,11 +228,12 @@ test("production stateless runner enables an ephemeral session from the persiste
 	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "off" }));
 	capturedArgs = [];
 	await runner({ model, task: "setting changed between dispatches", cwd: process.cwd() });
-	assert.equal(capturedArgs.includes("--no-session"), true);
+	assert.equal(capturedArgs.includes("--no-session"), false);
+	assert.equal(capturedArgs.includes("--session"), true);
 	assert.equal(capturedArgs.some((arg) => arg.endsWith("standalone-extension.ts")), false);
 });
 
-test("GPT setting does not change native stateless semantics for a non-GPT model", async (t) => {
+test("GPT setting does not enable GPT compaction for a non-GPT private session", async (t) => {
 	const agentDir = await mkdtemp(join(tmpdir(), "rail-stateless-non-gpt-setting-"));
 	t.after(() => rm(agentDir, { recursive: true, force: true }));
 	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
@@ -245,7 +252,8 @@ test("GPT setting does not change native stateless semantics for a non-GPT model
 		},
 	});
 	await runner({ model: { provider: "cus-resp", modelId: "deepseek-v4" }, task: "native only", cwd: process.cwd() });
-	assert.equal(capturedArgs.includes("--no-session"), true);
+	assert.equal(capturedArgs.includes("--no-session"), false);
+	assert.equal(capturedArgs.includes("--session"), true);
 	assert.equal(capturedArgs.some((arg) => arg.endsWith("standalone-extension.ts")), false);
 });
 
@@ -347,6 +355,279 @@ test("drops throttle-only updates when the process ends before an assistant mess
 	assert.equal(updates.length, 0);
 });
 
+async function retryFixture(t: TestContext, config: Record<string, unknown> = {}) {
+	const cwd = await mkdtemp(join(tmpdir(), "rail-stateless-retry-test-"));
+	t.after(() => rm(cwd, { recursive: true, force: true }));
+	const calls: string[][] = [];
+	const resolveInvocation = (args: string[]) => {
+		calls.push(args);
+		return { command: process.execPath, args: [resolve("tests/fixtures/fake-pi-json-retry.mjs"), JSON.stringify(config), ...args] };
+	};
+	const sessionPath = () => calls[0]![calls[0]!.indexOf("--session") + 1]!;
+	const invocations = async () => (await readFile(join(cwd, "invocations.jsonl"), "utf8")).trim().split("\n")
+		.map((line) => JSON.parse(line) as { prompt: string; pid: number });
+	const assertCleaned = async () => {
+		assert.ok(calls[0]?.includes("--session"));
+		await assert.rejects(access(dirname(sessionPath())), /ENOENT/);
+	};
+	return { cwd, calls, resolveInvocation, sessionPath, invocations, assertCleaned };
+}
+
+test("stateless retry reopens the same private session with completed tool results and unchanged options", async (t) => {
+	const fixture = await retryFixture(t);
+	const waits: number[] = [];
+	const updates: StatelessRunResult[] = [];
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: fixture.resolveInvocation,
+		waitForRetry: async (delayMs) => {
+			waits.push(delayMs);
+			await access(fixture.sessionPath());
+			assert.match(await readFile(fixture.sessionPath(), "utf8"), /appended marker once/u);
+			const last = (await fixture.invocations()).at(-1)!;
+			assert.throws(() => process.kill(last.pid, 0), /ESRCH/u, "retry waits until the prior print child has exited");
+		},
+	});
+	const result = await runner({ model, task: "append marker exactly once", cwd: fixture.cwd, fastMode: true, contextWindow: 64_000, onUpdate: (update) => updates.push(update) });
+	assert.deepEqual(waits, [10_000]);
+	assert.equal(fixture.calls.length, 2);
+	assert.deepEqual(fixture.calls[0]!.slice(0, -1), fixture.calls[1]!.slice(0, -1));
+	assert.ok(fixture.calls[1]!.includes(railFastExtensionPath()));
+	assert.ok(fixture.calls[1]!.includes(railOaiSearchExtensionPath()));
+	assert.ok(fixture.calls[1]!.includes(contextExtensionPath()));
+	assert.ok(fixture.calls[1]!.includes("64000"));
+	assert.ok(fixture.calls[1]!.includes("xhigh"));
+	assert.equal((await fixture.invocations()).filter((call) => call.prompt === "Task: append marker exactly once").length, 1);
+	assert.equal(await readFile(join(fixture.cwd, "side-effect.txt"), "utf8"), "once\n");
+	assert.equal(result.output, "continued with recorded tool result");
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.stopReason, "stop");
+	assert.equal(result.errorMessage, undefined);
+	assert.equal(result.retry, undefined);
+	assert.equal(result.retryCount, 1);
+	assert.deepEqual(result.usage, { input: 32, output: 6, cacheRead: 3, cacheWrite: 0, cost: 0.32, contextTokens: 24, turns: 3 });
+	assert.equal(result.transcript?.entries.filter((entry) => entry.kind === "toolResult").length, 1);
+	assert.equal(result.transcript?.entries.some((entry) => entry.kind === "note" && /Continuing/u.test(entry.text)), true);
+	assert.equal(updates.some((update) => update.retry?.attempt === 1 && update.retry.error === "503 Service Unavailable" && update.retry.source === "rail"), true);
+	assert.equal(updates.some((update) => update.retryCount === 1 && update.usage.input === 32), true);
+	const sessionEntries = result.transcript?.entries.filter((entry) => entry.kind === "user") ?? [];
+	assert.equal(sessionEntries[0]?.text, "append marker exactly once");
+	await fixture.assertCleaned();
+});
+
+test("stateless retry exhausts exactly five continuations and folds every attempt once", async (t) => {
+	const fixture = await retryFixture(t, { failures: 20 });
+	const waits: number[] = [];
+	const runner = createStatelessAgentRunner({ resolveInvocation: fixture.resolveInvocation, waitForRetry: async (delay) => { waits.push(delay); } });
+	const result = await runner({ model, task: "exhaust", cwd: fixture.cwd });
+	assert.deepEqual(waits, [...RETRY_DELAYS_MS]);
+	assert.equal(fixture.calls.length, 6);
+	assert.equal(result.retryCount, 5);
+	assert.equal(result.retry, undefined);
+	assert.equal(result.stopReason, "error");
+	assert.equal(result.errorMessage, "503 Service Unavailable");
+	assert.equal(result.usage.input, 62);
+	assert.equal(result.usage.output, 13);
+	assert.equal(result.usage.cacheRead, 7);
+	assert.equal(result.usage.turns, 7);
+	assert.equal(result.usage.contextTokens, 13);
+	assert.equal(await readFile(join(fixture.cwd, "side-effect.txt"), "utf8"), "once\n");
+	await fixture.assertCleaned();
+});
+
+test("stateless terminal native and uncertain process outcomes never retry", async (t) => {
+	const cases = [
+		{ error: "401 unauthorized" },
+		{ error: "429 quota exceeded" },
+		{ error: "400 invalid argument" },
+		{ error: "503 context length exceeded" },
+		{ stopReason: "length" },
+		{ stopReason: "aborted" },
+		{ noSettled: true },
+		{ exitCode: 1 },
+		{ signalExit: true },
+		{ protocolError: "helper failed" },
+		{ malformedLine: true },
+		{ malformedAssistant: true },
+	];
+	for (const config of cases) {
+		await t.test(JSON.stringify(config), async (child) => {
+			const fixture = await retryFixture(child, config);
+			const runner = createStatelessAgentRunner({
+				resolveInvocation: fixture.resolveInvocation,
+				waitForRetry: async () => assert.fail("terminal or uncertain outcome must not retry"),
+			});
+			const result = await runner({ model, task: "terminal failure", cwd: fixture.cwd });
+			assert.equal(fixture.calls.length, 1);
+			assert.equal(result.retryCount, undefined);
+			assert.equal(result.retry, undefined);
+			assert.ok(result.errorMessage);
+			if (config.protocolError) assert.equal(result.transcript, undefined);
+			await fixture.assertCleaned();
+		});
+	}
+});
+
+test("stateless apparent success without settlement or with malformed protocol is terminal failure", async (t) => {
+	const cases = [
+		{ config: { noSettled: true }, error: /without native agent_settled/u },
+		{ config: { malformedLine: true }, error: /malformed JSON or message events/u },
+		{ config: { malformedAssistant: true }, error: /malformed JSON or message events/u },
+	];
+	for (const { config, error } of cases) {
+		await t.test(JSON.stringify(config), async (child) => {
+			const fixture = await retryFixture(child, { failures: 0, ...config });
+			const runner = createStatelessAgentRunner({
+				resolveInvocation: fixture.resolveInvocation,
+				waitForRetry: async () => assert.fail("uncertain completion must not continue"),
+			});
+			const result = await runner({ model, task: "uncertain completion", cwd: fixture.cwd });
+			assert.equal(result.output, "continued with recorded tool result");
+			assert.match(result.errorMessage ?? "", error);
+			assert.equal(result.usage.input, 22);
+			assert.equal(result.usage.turns, 2);
+			assert.equal(result.retryCount, undefined);
+			assert.equal(fixture.calls.length, 1);
+			await fixture.assertCleaned();
+		});
+	}
+});
+
+test("stateless native Pi retry finishes before considering a Rail continuation", async (t) => {
+	const fixture = await retryFixture(t, { nativeRecovery: true });
+	const updates: StatelessRunResult[] = [];
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: fixture.resolveInvocation,
+		waitForRetry: async () => assert.fail("native recovery succeeded; no outer retry"),
+	});
+	const result = await runner({ model, task: "native retry", cwd: fixture.cwd, onUpdate: (update) => updates.push(update) });
+	assert.equal(fixture.calls.length, 1);
+	assert.equal(result.output, "native recovery done");
+	assert.equal(result.retryCount, undefined);
+	assert.equal(result.errorMessage, undefined);
+	assert.equal(updates.some((update) => update.retry?.source === "pi"), true);
+	assert.equal(updates.some((update) => update.retry?.source === "rail"), false);
+	await fixture.assertCleaned();
+});
+
+test("stateless retry fails closed when its session disappears before or during backoff", async (t) => {
+	for (const duringBackoff of [false, true]) {
+		await t.test(duringBackoff ? "during backoff" : "before backoff", async (child) => {
+			const fixture = await retryFixture(child, { removeSession: !duringBackoff });
+			const runner = createStatelessAgentRunner({
+				resolveInvocation: fixture.resolveInvocation,
+				waitForRetry: async () => {
+					assert.equal(duringBackoff, true);
+					await rm(fixture.sessionPath());
+				},
+			});
+			const result = await runner({ model, task: "missing history", cwd: fixture.cwd });
+			assert.equal(fixture.calls.length, 1);
+			assert.match(result.errorMessage ?? "", /private session is missing/u);
+			assert.equal(result.retry, undefined);
+			assert.equal(result.retryCount, undefined);
+			await fixture.assertCleaned();
+		});
+	}
+});
+
+test("stateless backoff abort wakes promptly, preserves usage and clears retry state before cleanup", async (t) => {
+	const fixture = await retryFixture(t);
+	const controller = new AbortController();
+	const updates: StatelessRunResult[] = [];
+	const runner = createStatelessAgentRunner({ resolveInvocation: fixture.resolveInvocation });
+	const started = Date.now();
+	await assert.rejects(runner({
+		model, task: "abort retry", cwd: fixture.cwd, signal: controller.signal,
+		onUpdate: (update) => {
+			updates.push(update);
+			if (update.retry?.source === "rail") controller.abort();
+		},
+	}), /aborted/u);
+	assert.ok(Date.now() - started < 2000, "abort must not wait for 10s backoff");
+	assert.equal(fixture.calls.length, 1);
+	assert.equal(updates.at(-1)?.retry, undefined);
+	assert.equal(updates.at(-1)?.stopReason, "aborted");
+	assert.equal(updates.at(-1)?.usage.input, 12);
+	const count = updates.length;
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+	assert.equal(updates.length, count, "no transcript/countdown updates after rejection");
+	await fixture.assertCleaned();
+});
+
+test("stateless active abort reaps the child before deleting its private session", async (t) => {
+	const fixture = await retryFixture(t, { stall: true });
+	const controller = new AbortController();
+	const runner = createStatelessAgentRunner({ resolveInvocation: fixture.resolveInvocation });
+	await assert.rejects(runner({
+		model, task: "abort active process", cwd: fixture.cwd, signal: controller.signal,
+		onUpdate: (update) => {
+			if (update.transcript?.entries.some((entry) => entry.kind === "toolResult")) controller.abort();
+		},
+	}), /aborted/u);
+	const child = (await fixture.invocations())[0]!;
+	assert.throws(() => process.kill(child.pid, 0), /ESRCH/u);
+	assert.equal(await readFile(join(fixture.cwd, "side-effect.txt"), "utf8"), "once\n");
+	assert.equal(fixture.calls.length, 1);
+	await fixture.assertCleaned();
+});
+
+test("stateless concurrent calls never share their private retry sessions", async (t) => {
+	const first = await retryFixture(t);
+	const second = await retryFixture(t);
+	const runFirst = createStatelessAgentRunner({ resolveInvocation: first.resolveInvocation, waitForRetry: async () => {} });
+	const runSecond = createStatelessAgentRunner({ resolveInvocation: second.resolveInvocation, waitForRetry: async () => {} });
+	const results = await Promise.all([
+		runFirst({ model, task: "first isolated call", cwd: first.cwd }),
+		runSecond({ model, task: "second isolated call", cwd: second.cwd }),
+	]);
+	assert.notEqual(first.sessionPath(), second.sessionPath());
+	assert.equal(results.every((result) => result.retryCount === 1 && !result.errorMessage), true);
+	await first.assertCleaned();
+	await second.assertCleaned();
+});
+
+test("stateless continuation invocation failure clears retry metadata and preserves prior usage", async (t) => {
+	const fixture = await retryFixture(t);
+	const updates: StatelessRunResult[] = [];
+	const runner = createStatelessAgentRunner({
+		resolveInvocation: (args) => {
+			if (fixture.calls.length > 0) throw new Error("continuation invocation failed");
+			return fixture.resolveInvocation(args);
+		},
+		waitForRetry: async () => {},
+	});
+	await assert.rejects(runner({ model, task: "resolver retry failure", cwd: fixture.cwd, onUpdate: (update) => updates.push(update) }), /continuation invocation failed/u);
+	assert.equal(updates.at(-1)?.retry, undefined);
+	assert.equal(updates.at(-1)?.retryCount, 1);
+	assert.equal(updates.at(-1)?.usage.input, 12);
+	assert.equal(updates.at(-1)?.usage.turns, 2);
+	assert.equal(updates.at(-1)?.errorMessage, "continuation invocation failed");
+	await fixture.assertCleaned();
+});
+
+test("stateless private session is cleaned on first-attempt success, resolver failure and spawn failure", async (t) => {
+	const fixture = await retryFixture(t, { failures: 0 });
+	const runner = createStatelessAgentRunner({ resolveInvocation: fixture.resolveInvocation });
+	const result = await runner({ model, task: "first success", cwd: fixture.cwd });
+	assert.equal(fixture.calls.length, 1);
+	assert.equal(result.retryCount, undefined);
+	await fixture.assertCleaned();
+	for (const failBeforeSpawn of [true, false]) {
+		let privatePath = "";
+		const failing = createStatelessAgentRunner({
+			resolveInvocation: (args) => {
+				privatePath = args[args.indexOf("--session") + 1]!;
+				if (failBeforeSpawn) throw new Error("resolver failed");
+				return { command: "/nonexistent/rail-pi", args: [] };
+			},
+		});
+		const run = failing({ model, task: "startup failure", cwd: fixture.cwd });
+		if (failBeforeSpawn) await assert.rejects(run, /resolver failed/u);
+		else assert.match((await run).errorMessage ?? "", /ENOENT/u);
+		await assert.rejects(access(dirname(privatePath)), /ENOENT/u);
+	}
+});
+
 test("stateless JSON events expose native compaction while it is active and clear it at compaction_end", async () => {
 	const secret = "PRIVATE MODEL SUMMARY";
 	const runner = createStatelessAgentRunner({
@@ -418,7 +699,7 @@ test("flushes exactly once on the final assistant message_end", async (t) => {
 	});
 });
 
-test("ignores the tail of a malformed assistant message_end but keeps its transcript", async (t) => {
+test("fails a malformed assistant tail while keeping observed output, usage and transcript", async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const start = { type: "message_start", message: { role: "assistant", content: [] } };
 	const first = {
@@ -439,7 +720,7 @@ test("ignores the tail of a malformed assistant message_end but keeps its transc
 			updates: ["first done", "third done"],
 			output: "third done",
 			stopReason: "stop",
-			errorMessage: undefined,
+			errorMessage: "Subagent process emitted malformed JSON or message events",
 			usage: { input: 15, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 2 },
 			transcript: ["malformed tail", "first done", "second text", "boom", "third done"],
 		},
@@ -448,7 +729,7 @@ test("ignores the tail of a malformed assistant message_end but keeps its transc
 			updates: ["first done"],
 			output: "first done",
 			stopReason: "stop",
-			errorMessage: undefined,
+			errorMessage: "Subagent process emitted malformed JSON or message events",
 			usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
 			transcript: ["malformed tail", "first done", "second text", "boom"],
 		},

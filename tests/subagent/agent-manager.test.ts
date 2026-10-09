@@ -24,6 +24,36 @@ function instance(agentId: string, alias: string, sessionFile: string) {
 	};
 }
 
+test("manager preserves retry runtime metadata while backoff remains running", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-retry-"));
+	try {
+		const agent = instance("agt_retry", "retry-review", join(dir, "retry.jsonl"));
+		const retry = { attempt: 2, maxAttempts: 5, nextAt: Date.now() + 30_000, error: "503 temporary", source: "rail" as const };
+		let phase: "running" | "idle" | "stopped" = "running";
+		const manager = new RailAgentManager(
+			{ runtimeStatus: () => ({ phase, queued: 1, retryCount: 2, ...(phase === "running" ? { retry } : {}) }) } as any,
+			{ list: async () => [agent] } as any,
+			{ list: () => [{ alias: agent.alias, agentId: agent.agentId }] } as any,
+			dir,
+		);
+		const during = await manager.snapshot();
+		assert.deepEqual((during.agents[0] as any).retry, retry);
+		assert.equal(during.counts.running, 1);
+		assert.equal(during.counts.errors, 0);
+		await assert.rejects(manager.control(agent.agentId, { delivery: "steer", message: "control during backoff" }), /retrying.*next attempt/);
+		phase = "idle";
+		const after = await manager.snapshot();
+		assert.equal((after.agents[0] as any).retry, undefined);
+		assert.equal((after.agents[0] as any).retryCount, 2);
+		phase = "stopped";
+		const stopped = await manager.snapshot();
+		assert.equal(stopped.agents[0]?.phase, "stopped");
+		assert.equal(stopped.agents[0]?.retryCount, 2, "a cancelled stopped worker retains its final count");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("manager create and continue propagate failed or aborted run outcomes", async () => {
 	for (const run of [
 		{ stopReason: "error", errorMessage: "HTTP 401" },

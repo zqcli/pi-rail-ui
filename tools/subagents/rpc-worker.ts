@@ -33,6 +33,7 @@ import type {
 } from "./session-broker";
 import type { BindingV2, MemberLoadoutRequest } from "./team-protocol";
 import { isSharedImmediateEvent, RunResultCollector, assistantText } from "./run-result";
+import { RETRY_DELAYS_MS, retryContinuation, waitForRetry } from "./retry";
 
 export interface RpcEvent {
 	type: string;
@@ -86,8 +87,10 @@ export class RpcSessionWorker implements SessionWorker {
 	private runInFlight = false;
 	private modelChangeInFlight = false;
 	private teamSession: TeamMemberProtocolSession | undefined;
+	private runCancellation: AbortController | undefined;
+	private retryWait = waitForRetry;
 
-	static async connect(spec: WorkerStartSpec, transport: RpcTransport): Promise<RpcSessionWorker> {
+	static async connect(spec: WorkerStartSpec, transport: RpcTransport, retryWait = waitForRetry): Promise<RpcSessionWorker> {
 		const state = await transport.request({ type: "get_state" }) as RpcState;
 		if (!state?.sessionId || !state.sessionFile) {
 			await transport.stop();
@@ -125,6 +128,7 @@ export class RpcSessionWorker implements SessionWorker {
 			stateModel.provider,
 			stateModel.id,
 		);
+		worker.retryWait = retryWait;
 		return worker;
 	}
 
@@ -242,23 +246,83 @@ export class RpcSessionWorker implements SessionWorker {
 		if (this.modelChangeInFlight) throw new ContextProtocolError("Subagent model change is in progress");
 		if (options.signal?.aborted) throw new Error("Subagent request was aborted before dispatch");
 		this.runInFlight = true;
-		let restoreWindow: number | undefined;
+		const cancellation = new AbortController();
+		this.runCancellation = cancellation;
+		const cancel = () => cancellation.abort();
+		options.signal?.addEventListener("abort", cancel, { once: true });
+		const collector = new RunResultCollector(task, assistantText);
+		let transportFailure: ContextProtocolError | undefined;
+		// An idle child can exit during Rail backoff too. Keep exit observation
+		// through the entire logical send, not only its native attempts.
+		const unsubscribeFailure = this.transport.onEvent((event) => {
+			if (event.type !== "transport_error" || cancellation.signal.aborted) return;
+			transportFailure = this.protocolFailure(event.error ?? "Subagent RPC transport failed");
+			cancellation.abort();
+		});
+		let retryCount = 0;
+		let message = task;
+		const canContinue = async () => !cancellation.signal.aborted && !this.unusable
+			&& (await options.shouldContinue?.() ?? true) && !cancellation.signal.aborted && !this.unusable;
 		try {
-			restoreWindow = await this.prepareContext(normalizeContextWindow(options.contextWindow));
+			for (;;) {
+				if (!await canContinue()) {
+					collector.markAborted();
+					break;
+				}
+				await this.sendAttempt(message, collector, { ...options, signal: cancellation.signal });
+				const error = collector.retryableError;
+				if (!error || retryCount === RETRY_DELAYS_MS.length) break;
+				if (!await canContinue()) {
+					if (cancellation.signal.aborted) collector.markAborted();
+					break;
+				}
+				const delayMs = RETRY_DELAYS_MS[retryCount]!;
+				collector.setRetry({ attempt: retryCount + 1, maxAttempts: RETRY_DELAYS_MS.length, nextAt: Date.now() + delayMs, error, source: "rail" }, retryCount);
+				options.onUpdate?.(collector.result("(retrying...)"));
+				try { await this.retryWait(delayMs, cancellation.signal); }
+				catch (waitError) {
+					if (transportFailure) throw transportFailure;
+					if (!cancellation.signal.aborted) throw waitError;
+					collector.markAborted();
+					break;
+				}
+				if (!await canContinue()) {
+					if (cancellation.signal.aborted) collector.markAborted();
+					break;
+				}
+				collector.beginAttempt();
+				collector.setRetry(undefined, ++retryCount);
+				message = retryContinuation(error);
+				options.onUpdate?.(collector.result("(running...)"));
+			}
+			if (transportFailure) throw transportFailure;
+			collector.setRetry(undefined, retryCount);
+			const result = collector.result("(no output)");
+			options.onUpdate?.(result);
+			return result;
 		} catch (error) {
-			this.runInFlight = false;
+			collector.noteError(error instanceof Error ? error.message : String(error));
+			options.onUpdate?.(collector.result("(no output)"));
 			throw error;
+		} finally {
+			unsubscribeFailure();
+			options.signal?.removeEventListener("abort", cancel);
+			this.runCancellation = undefined;
+			this.runInFlight = false;
 		}
+	}
+
+	private async sendAttempt(task: string, collector: RunResultCollector, options: WorkerSendOptions): Promise<void> {
+		const restoreWindow = await this.prepareContext(normalizeContextWindow(options.contextWindow));
 		const prepared = restoreWindow !== undefined;
 		if (options.signal?.aborted) {
 			try {
 				if (prepared) await this.resetContext(restoreWindow);
 			} finally {
-				this.runInFlight = false;
+				collector.markAborted();
 			}
 			throw new Error("Subagent request was aborted before dispatch");
 		}
-		const collector = new RunResultCollector(task, assistantText);
 		let settled = false;
 		let settledNotified = false;
 		let started = false;
@@ -351,10 +415,9 @@ export class RpcSessionWorker implements SessionWorker {
 			if (protocolError) throw protocolError;
 			if (aborted) collector.markAborted();
 			if (prepared) {
-				const settledState = await this.confirmContextWindow();
-				await this.resetContext(settledState.model!.contextWindow);
+				await this.confirmContextWindow();
+				await this.resetContext(restoreWindow);
 			}
-			return collector.result("(no output)");
 		} catch (error) {
 			if (!settled && prepared && !this.unusable) await this.resetContext(restoreWindow);
 			throw error;
@@ -363,7 +426,6 @@ export class RpcSessionWorker implements SessionWorker {
 			if (updateTimer) clearTimeout(updateTimer);
 			options.signal?.removeEventListener("abort", abort);
 			unsubscribe();
-			this.runInFlight = false;
 		}
 	}
 
@@ -429,6 +491,8 @@ export class RpcSessionWorker implements SessionWorker {
 	}
 
 	async stop(): Promise<void> {
+		this.unusable = true;
+		this.runCancellation?.abort();
 		await this.transport.stop();
 	}
 

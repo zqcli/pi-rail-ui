@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,7 @@ import {
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools/subagents/context-window";
 import { gptCompactionExtensionPath } from "../../tools/gpt-compaction/extension";
 import type { RailModelRef } from "../../tools/subagents/models";
-import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
+import { SessionBroker, type AgentInstance, type WorkerStartSpec } from "../../tools/subagents/session-broker";
 import { loadoutFor } from "../fixtures/team-loadout";
 
 // createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
@@ -278,6 +278,352 @@ function hostedSearchEntryEvent(id: string, callIds: string[]): RpcEvent {
 		},
 	};
 }
+
+class RetryTransport extends FakeTransport {
+	readonly history: Array<Record<string, unknown>> = [];
+	readonly prompts: string[] = [];
+	sideEffects = 0;
+	constructor(private readonly failures = 1, private readonly failure = "503 service unavailable", private readonly reason = "error") { super(); }
+	override async request(command: Record<string, unknown>): Promise<unknown> {
+		if (command["type"] !== "prompt" || isContextPrompt(command)) return super.request(command);
+		this.commands.push(command);
+		const text = String(command["message"]);
+		this.prompts.push(text);
+		this.emit({ type: "agent_start" });
+		this.history.push({ role: "user", content: text });
+		if (this.prompts.length === 1) {
+			this.sideEffects++;
+			const tool = { role: "toolResult", toolCallId: "append-once", toolName: "append", content: [{ type: "text", text: "Recorded completed append: marker-1" }], isError: false };
+			this.history.push(tool);
+			this.emit({ type: "message_end", message: tool });
+		} else {
+			assert.match(text, /Continue from where you stopped/);
+			assert.equal(this.history.some((message) => message["role"] === "toolResult" && JSON.stringify(message).includes("marker-1")), true, "continuation sees the completed side-effect result");
+		}
+		const failed = this.prompts.length <= this.failures;
+		this.emit({ type: "message_end", message: { role: "assistant", content: failed ? [] : [{ type: "text", text: "recovered" }], stopReason: failed ? this.reason : "stop", ...(failed ? { errorMessage: this.failure } : {}), usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.1 } } } });
+		this.emit({ type: "agent_settled" });
+		return undefined;
+	}
+}
+
+test("persistent outer retry continues the same session and folds every attempt exactly once", async () => {
+	const transport = new RetryTransport();
+	transport.retainPreparedContextWindow = true;
+	const delays: number[] = [];
+	const worker = await RpcSessionWorker.connect(spec("new"), transport, async (delay) => { delays.push(delay); });
+	const updates: any[] = [];
+	let settledCount = 0;
+	const result = await worker.send("append once", { contextWindow: 64000, onUpdate: (run) => updates.push(run), onSettled: () => { settledCount++; } });
+	assert.equal(result.output, "recovered");
+	assert.equal(result.errorMessage, undefined);
+	assert.equal(result.retry, undefined);
+	assert.equal(result.retryCount, 1);
+	assert.deepEqual(delays, [10000]);
+	assert.equal(settledCount, 2);
+	assert.equal(transport.sideEffects, 1);
+	assert.equal(transport.prompts.filter((task) => task === "append once").length, 1);
+	assert.equal(worker.sessionId, "child-session");
+	assert.equal(worker.sessionFile, "/tmp/child.jsonl");
+	assert.deepEqual(result.usage, { input: 20, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0.2, contextTokens: 12, turns: 2 });
+	assert.equal(result.transcript?.entries[0]?.text, "append once");
+	assert.equal(result.transcript?.entries.some((entry) => entry.kind === "toolResult" && entry.text.includes("marker-1")), true);
+	assert.equal(updates.some((run) => run.retry?.attempt === 1 && run.retry.source === "rail"), true);
+	assert.deepEqual(transport.commands.filter(isContextPrompt).map((command) => command["message"]), [
+		"/rail-context-internal-v1 prepare 64000", "/rail-context-internal-v1 reset",
+		"/rail-context-internal-v1 prepare 64000", "/rail-context-internal-v1 reset",
+	]);
+	assert.equal(transport.currentContextWindow, 128000);
+});
+
+test("persistent retry exhausts five continuations without redispatching the original task", async () => {
+	const transport = new RetryTransport(99);
+	const delays: number[] = [];
+	const worker = await RpcSessionWorker.connect(spec("new"), transport, async (delay) => { delays.push(delay); });
+	const run = await worker.send("original");
+	assert.equal(run.stopReason, "error");
+	assert.equal(run.retryCount, 5);
+	assert.equal(run.retry, undefined);
+	assert.deepEqual(delays, [10000, 30000, 60000, 120000, 300000]);
+	assert.equal(transport.prompts.length, 6);
+	assert.equal(transport.sideEffects, 1);
+	assert.equal(run.usage.turns, 6);
+	assert.equal(run.usage.input, 60);
+});
+
+test("persistent auth quota invalid overflow length and abort failures never retry", async () => {
+	for (const [reason, error] of [["error", "401 unauthorized"], ["error", "429 insufficient_quota"], ["error", "400 invalid argument"], ["error", "503 input exceeds the context window"], ["length", "503 service unavailable"], ["aborted", "503 service unavailable"]]) {
+		const transport = new RetryTransport(99, error, reason);
+		let waits = 0;
+		const worker = await RpcSessionWorker.connect(spec("new"), transport, async () => { waits++; });
+		const run = await worker.send("terminal");
+		assert.equal(waits, 0, error);
+		assert.equal(transport.prompts.length, 1);
+		assert.equal(run.retryCount, undefined);
+	}
+});
+
+test("abort and worker stop interrupt persistent backoff promptly without another prompt", { timeout: 2000 }, async () => {
+	for (const operation of ["abort", "stop"]) {
+		const transport = new RetryTransport(99);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport);
+		const controller = new AbortController();
+		const waiting = Promise.withResolvers<void>();
+		const pending = worker.send("wait", { signal: controller.signal, onUpdate: (run) => { if (run.retry) waiting.resolve(); } });
+		await waiting.promise;
+		if (operation === "abort") controller.abort();
+		else await worker.stop();
+		const run = await pending;
+		assert.equal(run.stopReason, "aborted", operation);
+		assert.equal(run.retry, undefined);
+		assert.equal(run.retryCount, undefined, "scheduled backoff is not a begun retry");
+		assert.equal(transport.prompts.length, 1);
+	}
+});
+
+test("process loss during persistent backoff terminates immediately without a continuation", { timeout: 2000 }, async () => {
+	const transport = new RetryTransport(99);
+	const worker = await RpcSessionWorker.connect(spec("new"), transport);
+	const waiting = Promise.withResolvers<void>();
+	const pending = worker.send("original", { onUpdate: (run) => { if (run.retry) waiting.resolve(); } });
+	const rejected = assert.rejects(pending, /503 child process lost/);
+	await waiting.promise;
+	transport.emit({ type: "transport_error", error: "503 child process lost" });
+	await rejected;
+	assert.equal(transport.prompts.length, 1);
+	assert.equal(worker.isReusable(), false);
+	assert.equal(transport.listeners.size, 0);
+});
+
+test("native agent_end and auto_retry events do not trigger an outer continuation before agent_settled", async () => {
+	const transport = new FakeTransport(false, undefined, true);
+	const delays: number[] = [];
+	const worker = await RpcSessionWorker.connect(spec("new"), transport, async (delay) => { delays.push(delay); });
+	const accepted = Promise.withResolvers<void>();
+	const updates: any[] = [];
+	const pending = worker.send("native", { onAccepted: () => accepted.resolve(), onUpdate: (run) => updates.push(run) });
+	await accepted.promise;
+	transport.emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "503 service unavailable" } });
+	transport.emit({ type: "agent_end", willRetry: true });
+	transport.emit({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: "503 service unavailable" });
+	assert.equal(updates.at(-1)?.retry?.source, "pi", "native retry status is not hidden behind the ordinary progress throttle");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(delays, []);
+	transport.emit({ type: "agent_start" });
+	transport.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "native recovered" }], stopReason: "stop" } });
+	transport.emit({ type: "auto_retry_end", attempt: 1, success: true });
+	transport.emit({ type: "agent_settled" });
+	const run = await pending;
+	assert.equal(run.output, "native recovered");
+	assert.equal(run.retryCount, undefined);
+	assert.equal(updates.some((update) => update.retry?.source === "pi"), true);
+	assert.deepEqual(delays, []);
+});
+
+class ControlledRetryTransport extends FakeTransport {
+	readonly prompts: string[] = [];
+	controlGate: Promise<void> | undefined;
+	controlStarted = Promise.withResolvers<void>();
+	constructor(private readonly sessionFile: string) { super(false, undefined, true); }
+	override async request(command: Record<string, unknown>): Promise<unknown> {
+		if (command["type"] === "prompt" && !isContextPrompt(command)) {
+			this.commands.push(command);
+			this.prompts.push(String(command["message"]));
+			this.emit({ type: "agent_start" });
+			return undefined;
+		}
+		if (command["type"] === "steer") { this.controlStarted.resolve(); await this.controlGate; }
+		const result = await super.request(command);
+		return command["type"] === "get_state" ? { ...(result as object), sessionFile: this.sessionFile } : result;
+	}
+	settle(error?: string): void {
+		this.emit({ type: "message_end", message: { role: "assistant", content: error ? [] : [{ type: "text", text: "done" }], stopReason: error ? "error" : "stop", ...(error ? { errorMessage: error } : {}) } });
+		this.emit({ type: "agent_settled" });
+	}
+	override async stop(): Promise<void> { await super.stop(); this.emit({ type: "transport_error", error: "child stopped" }); }
+}
+
+async function retryBroker(retryWait?: typeof import("../../tools/subagents/retry").waitForRetry) {
+	const root = await mkdtemp(join(tmpdir(), "rail-rpc-retry-broker-"));
+	const file = join(root, "child.jsonl");
+	await writeFile(file, "test session");
+	const transport = new ControlledRetryTransport(file);
+	const worker = await RpcSessionWorker.connect(spec("new"), transport, retryWait);
+	let nextWorker = worker;
+	const instances = new Map<string, AgentInstance>();
+	const aliases = new Map<string, string>();
+	const broker = new SessionBroker({
+		store: { get: async (id) => instances.get(id), put: async (instance) => { instances.set(instance.agentId, instance); }, delete: async (id) => { instances.delete(id); }, list: async () => [...instances.values()] },
+		roster: { resolve: (target) => aliases.get(target), link: (alias, id) => { aliases.set(alias, id); }, unlink: (alias) => { aliases.delete(alias); }, list: () => [...aliases].map(([alias, agentId]) => ({ alias, agentId })) },
+		workerFactory: async () => nextWorker,
+	});
+	const instance = await broker.attach({ model: model(), alias: "retry-child" });
+	return { root, file, transport, worker, broker, instance, replaceWorker: (replacement: RpcSessionWorker) => { nextWorker = replacement; } };
+}
+
+async function waitUntil(check: () => boolean): Promise<void> {
+	for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(check(), true, "expected state became ready");
+}
+
+test("broker keeps queue ownership through backoff and rearms controls only for the new native attempt", { timeout: 2000 }, async () => {
+	const waiting = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const { root, broker, instance, transport } = await retryBroker(async () => { waiting.resolve(); await release.promise; });
+	try {
+		const first = broker.dispatch({ target: instance.agentId, task: "original task" });
+		await waitUntil(() => broker.runtimeStatus(instance.agentId).phase === "running");
+		const queued = broker.dispatch({ target: instance.agentId, task: "queued task" });
+		void first.catch(() => undefined);
+		void queued.catch(() => undefined);
+		await waitUntil(() => broker.runtimeStatus(instance.agentId).queued === 1);
+		const changing = broker.changeModel(instance.agentId, { provider: "deepseek", modelId: "deepseek-v4-flash" });
+		void changing.catch(() => undefined);
+		transport.settle("503 service unavailable");
+		await waiting.promise;
+		await waitUntil(() => broker.runtimeStatus(instance.agentId).queued === 2);
+		assert.equal(broker.runtimeStatus(instance.agentId).retry?.attempt, 1);
+		assert.equal(broker.runtimeStatus(instance.agentId).phase, "running");
+		assert.deepEqual(transport.prompts, ["original task"]);
+		await assert.rejects(broker.control({ target: instance.agentId, delivery: "steer", message: "during backoff" }), /not currently running/);
+		release.resolve();
+		await waitUntil(() => transport.prompts.length === 2 && broker.runtimeStatus(instance.agentId).phase === "running" && !broker.runtimeStatus(instance.agentId).retry);
+		await broker.control({ target: instance.agentId, delivery: "steer", message: "new attempt control" });
+		transport.settle();
+		const recovered = await first;
+		assert.equal(recovered.run.retryCount, 1);
+		assert.equal(recovered.instance.lastTask, "original task");
+		await waitUntil(() => transport.prompts.length === 3);
+		assert.equal(transport.prompts[2], "queued task");
+		assert.equal(transport.commands.some((command) => command["type"] === "set_model"), false);
+		transport.settle();
+		await queued;
+		await changing;
+		assert.deepEqual(transport.commands.filter((command) => command["type"] === "steer").map((command) => command["message"]), ["new attempt control"]);
+	} finally { release.resolve(); await broker.shutdown(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("stop delete and shutdown wake backoff before draining a queued model change", { timeout: 2000 }, async () => {
+	for (const operation of ["stop", "delete", "shutdown"] as const) {
+		const { root, file, broker, instance, transport } = await retryBroker();
+		try {
+			const first = broker.dispatch({ target: instance.agentId, task: "original task" });
+			await waitUntil(() => broker.runtimeStatus(instance.agentId).phase === "running");
+			transport.settle("503 service unavailable");
+			await waitUntil(() => !!broker.runtimeStatus(instance.agentId).retry);
+			const changing = broker.changeModel(instance.agentId, { provider: "deepseek", modelId: "deepseek-v4-flash" });
+			const rejected = assert.rejects(changing, /shutting down|stopping|being deleted/);
+			await waitUntil(() => broker.runtimeStatus(instance.agentId).queued === 1);
+			if (operation === "shutdown") await broker.shutdown();
+			else await broker[operation](instance.agentId);
+			assert.equal((await first).run.stopReason, "aborted", operation);
+			await rejected;
+			assert.deepEqual(transport.prompts, ["original task"]);
+			assert.equal(transport.commands.some((command) => command["type"] === "set_model"), false);
+			if (operation === "delete") await assert.rejects(access(file));
+		} finally { await broker.shutdown(); await rm(root, { recursive: true, force: true }); }
+	}
+});
+
+test("a control acknowledgment crossing settlement suppresses continuation and is never replayed", { timeout: 2000 }, async () => {
+	let waits = 0;
+	const { root, broker, instance, transport } = await retryBroker(async () => { waits++; });
+	const release = Promise.withResolvers<void>();
+	transport.controlGate = release.promise;
+	const updates: any[] = [];
+	try {
+		const pending = broker.dispatch({ target: instance.agentId, task: "original", onUpdate: ({ run }) => updates.push(run) });
+		const runRejected = assert.rejects(pending, /acknowledged (?:a|the) control after the target run ended/);
+		await waitUntil(() => broker.runtimeStatus(instance.agentId).phase === "running");
+		const control = broker.control({ target: instance.agentId, delivery: "steer", message: "uncertain" });
+		const rejected = assert.rejects(control, /acknowledged the control after the target run ended/);
+		await transport.controlStarted.promise;
+		transport.settle("503 service unavailable");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(waits, 0, "retry waits for control outcome, not just native settlement");
+		release.resolve();
+		await rejected;
+		await runRejected;
+		assert.equal(updates.at(-1)?.stopReason, "error", "unknown delivery is a failure, not cancellation");
+		assert.match(updates.at(-1)?.errorMessage, /acknowledged (?:a|the) control after the target run ended/);
+		assert.equal(updates.at(-1)?.retryCount, undefined);
+		assert.equal(updates.some((run) => run.stopReason === "aborted"), false);
+		assert.equal(broker.runtimeStatus(instance.agentId).phase, "error");
+		assert.deepEqual(transport.prompts, ["original"]);
+		assert.equal(transport.commands.filter((command) => command["type"] === "steer").length, 1);
+	} finally { release.resolve(); await broker.shutdown(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("stopped and retired workers retain final retry count until deletion", { timeout: 2000 }, async () => {
+	for (const outcome of ["stop", "process-loss"] as const) {
+		let waits = 0;
+		const { root, broker, instance, transport, replaceWorker } = await retryBroker(async (_delay, signal) => {
+			if (++waits === 1) return;
+			await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+		});
+		try {
+			const pending = broker.dispatch({ target: instance.agentId, task: "original" });
+			const rejected = outcome === "process-loss" ? assert.rejects(pending, /child process lost/) : undefined;
+			await waitUntil(() => transport.prompts.length === 1);
+			transport.settle("503 service unavailable");
+			await waitUntil(() => transport.prompts.length === 2);
+			transport.settle("503 service unavailable again");
+			await waitUntil(() => broker.runtimeStatus(instance.agentId).retry?.attempt === 2);
+			assert.equal(broker.runtimeStatus(instance.agentId).retryCount, 1);
+			if (outcome === "stop") {
+				await broker.stop(instance.agentId);
+				const final = await pending;
+				assert.equal(final.run.stopReason, "aborted");
+				assert.equal(final.run.retryCount, 1);
+			} else {
+				transport.emit({ type: "transport_error", error: "503 child process lost" });
+				await rejected;
+			}
+			assert.equal(broker.runtimeStatus(instance.agentId).phase, outcome === "stop" ? "stopped" : "error");
+			assert.equal(broker.runtimeStatus(instance.agentId).retryCount, 1);
+			assert.equal(broker.runtimeStatus(instance.agentId).retry, undefined);
+			if (outcome === "stop") {
+				const reopenedTransport = new ControlledRetryTransport(instance.sessionFile);
+				replaceWorker(await RpcSessionWorker.connect(spec("open", instance.sessionFile), reopenedTransport));
+				const next = broker.dispatch({ target: instance.agentId, task: "next logical run" });
+				await waitUntil(() => reopenedTransport.prompts.length === 1);
+				assert.equal(broker.runtimeStatus(instance.agentId).retryCount, undefined);
+				reopenedTransport.settle();
+				assert.equal((await next).run.retryCount, undefined);
+			}
+			await broker.delete(instance.agentId);
+			assert.equal(broker.runtimeStatus(instance.agentId).retryCount, undefined);
+		} finally { await broker.shutdown(); await rm(root, { recursive: true, force: true }); }
+	}
+});
+
+test("cancellation and context-reset retirement retain the begun retry count", { timeout: 2000 }, async () => {
+	for (const outcome of ["abort", "context-failure"] as const) {
+		const { root, broker, instance, transport } = await retryBroker(async () => undefined);
+		const cancellation = new AbortController();
+		try {
+			const pending = broker.dispatch({ target: instance.agentId, task: "original", signal: cancellation.signal, contextWindow: 64000 });
+			const rejected = outcome === "context-failure" ? assert.rejects(pending, /confirmation failed/) : undefined;
+			await waitUntil(() => transport.prompts.length === 1);
+			transport.settle("503 service unavailable");
+			await waitUntil(() => transport.prompts.length === 2);
+			assert.equal(broker.runtimeStatus(instance.agentId).retryCount, 1);
+			if (outcome === "context-failure") {
+				transport.failResetCommand = true;
+				transport.settle();
+				await rejected;
+				assert.equal(broker.hasLocalWorker(instance.agentId), false);
+			} else {
+				cancellation.abort();
+				const final = await pending;
+				assert.equal(final.run.stopReason, "aborted");
+				assert.equal(final.run.retryCount, 1);
+			}
+			assert.equal(broker.runtimeStatus(instance.agentId).retryCount, 1);
+			assert.equal(broker.runtimeStatus(instance.agentId).retry, undefined);
+		} finally { await broker.shutdown(); await rm(root, { recursive: true, force: true }); }
+	}
+});
 
 test("Team v2 restores the pre-activation context window after native compaction keeps the temporary budget", async () => {
 	const transport = new FakeTransport();

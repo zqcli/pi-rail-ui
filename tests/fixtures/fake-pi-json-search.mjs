@@ -64,6 +64,9 @@ write({ type: "message_update", usage: secondUsage, assistantMessageEvent: { typ
 write(entry("search-entry-2", "resp_search_2", ["ws_4"]));
 write({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "search done" }], usage: secondUsage, stopReason: "stop" } });
 
+write({ type: "agent_end", messages: [], willRetry: false });
+write({ type: "agent_settled" });
+
 function write(value) {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
 }

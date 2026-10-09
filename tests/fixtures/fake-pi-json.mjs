@@ -60,6 +60,9 @@ write({
 	},
 });
 
+write({ type: "agent_end", messages: [], willRetry: false });
+write({ type: "agent_settled" });
+
 function write(value) {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
 }

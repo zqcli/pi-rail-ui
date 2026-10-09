@@ -243,6 +243,7 @@ function boundDetailOutputs(results: StatefulSubagentRunDetails[]): StatefulSuba
 		task: truncateUtf8(result.task, 8 * 1024, "\n[task truncated]").value,
 		...(result.transcript ? { transcript: boundDetailTranscript(result.transcript) } : {}),
 		...(result.errorMessage ? { errorMessage: truncateUtf8(result.errorMessage, 8 * 1024, "\n[error truncated]").value } : {}),
+		...(result.retry ? { retry: { ...result.retry, error: truncateUtf8(result.retry.error, 8 * 1024, "\n[error truncated]").value } } : {}),
 	}));
 	const baseBytes = Buffer.byteLength(JSON.stringify(metadataBounded.map((result) => ({ ...result, output: "" }))), "utf8");
 	const outputBudget = Math.max(0, DETAILS_TOTAL_CAP - 4096 - baseBytes);
@@ -269,6 +270,7 @@ function compactPersistentResult(result: DispatchResult, task: string, durationM
 		status: runErrorMessage(result.run) ? "failed" : "completed",
 		output: result.run.output,
 		...(result.run.transcript ? { transcript: result.run.transcript } : {}),
+		...(result.run.retryCount ? { retryCount: result.run.retryCount } : {}),
 		usage: result.run.usage,
 		durationMs,
 		...(result.run.stopReason ? { stopReason: result.run.stopReason } : {}),
@@ -287,6 +289,7 @@ function compactStatelessResult(alias: string, model: RailModelRef, task: string
 		status: run.exitCode !== 0 || runErrorMessage(run) ? "failed" : "completed",
 		output: run.output,
 		...(run.transcript ? { transcript: run.transcript } : {}),
+		...(run.retryCount ? { retryCount: run.retryCount } : {}),
 		usage: run.usage,
 		durationMs,
 		...(run.stopReason ? { stopReason: run.stopReason } : {}),
@@ -305,7 +308,7 @@ function errorResult(
 	previous?: StatefulSubagentRunDetails,
 ): StatefulSubagentRunDetails {
 	const message = error instanceof Error ? error.message : String(error);
-	const { isCompacting: _isCompacting, ...previousRun } = previous ?? {};
+	const { isCompacting: _isCompacting, retry: _retry, ...previousRun } = previous ?? {};
 	return {
 		...previousRun,
 		alias: previous?.alias ?? item.target ?? item.alias ?? item.model ?? "current-model",
@@ -866,14 +869,32 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		const orderedLiveResults = () => [...liveResults.entries()]
 			.sort(([left], [right]) => left - right)
 			.map(([slot, item]) => ({ ...item, slot }));
-		const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
-			liveResults.set(slot, result);
+		let retryRefresh: NodeJS.Timeout | undefined;
+		const stopRetryRefresh = () => {
+			if (retryRefresh) clearInterval(retryRefresh);
+			retryRefresh = undefined;
+		};
+		const publishSnapshot = (output: string) => {
 			const details = resultDetails(orderedLiveResults());
 			latestDetails.set(toolCallId, details);
 			onUpdate?.({
-				content: [{ type: "text", text: truncateParentContent(result.output || "(running...)") }],
+				content: [{ type: "text", text: truncateParentContent(output || "(running...)") }],
 				details,
 			});
+		};
+		const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
+			liveResults.set(slot, result);
+			if (![...liveResults.values()].some((run) => run.retry)) stopRetryRefresh();
+			else if (onUpdate && !retryRefresh && !signal?.aborted) {
+				retryRefresh = setInterval(() => {
+					for (const [liveSlot, run] of liveResults) {
+						if (run.status === "running") liveResults.set(liveSlot, { ...run, durationMs: runDuration(liveSlot) });
+					}
+					publishSnapshot("(retrying...)");
+				}, 1500);
+				retryRefresh.unref();
+			}
+			publishSnapshot(result.output);
 		};
 		const requestedItems: TaskParams[] = mode === "single"
 			? [{ ...params, task: params.task! } as TaskParams]
@@ -948,6 +969,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						output: partial.output,
 						...(partial.transcript ? { transcript: partial.transcript } : {}),
 						...(partial.isCompacting ? { isCompacting: true } : {}),
+						...(partial.retry ? { retry: partial.retry } : {}),
+						...(partial.retryCount ? { retryCount: partial.retryCount } : {}),
 						usage: partial.usage,
 						durationMs: duration(),
 						...(step !== undefined ? { step } : {}),
@@ -982,6 +1005,8 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						output: partial.output,
 						...(partial.transcript ? { transcript: partial.transcript } : {}),
 						...(partial.isCompacting ? { isCompacting: true } : {}),
+						...(partial.retry ? { retry: partial.retry } : {}),
+						...(partial.retryCount ? { retryCount: partial.retryCount } : {}),
 						usage: partial.usage,
 						durationMs: duration(),
 						...(step !== undefined ? { step } : {}),
@@ -1007,35 +1032,41 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			}
 		};
 
-		if (mode === "single") {
-			const result = await runTask(requestedItems[0]!, 0);
-			if (result.status === "failed") throw new Error(finalText(result));
-			const details = resultDetails([result]);
-			latestDetails.set(toolCallId, details);
-			const usage = nestedToolUsage(details.results);
-			return { content: [{ type: "text", text: finalText(result) }], details, ...(usage ? { usage } : {}) };
-		}
-		if (mode === "parallel") {
-			const results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
+		signal?.addEventListener("abort", stopRetryRefresh, { once: true });
+		try {
+			if (mode === "single") {
+				const result = await runTask(requestedItems[0]!, 0);
+				if (result.status === "failed") throw new Error(finalText(result));
+				const details = resultDetails([result]);
+				latestDetails.set(toolCallId, details);
+				const usage = nestedToolUsage(details.results);
+				return { content: [{ type: "text", text: finalText(result) }], details, ...(usage ? { usage } : {}) };
+			}
+			if (mode === "parallel") {
+				const results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
+				const details = resultDetails(results);
+				latestDetails.set(toolCallId, details);
+				const usage = nestedToolUsage(details.results);
+				return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
+			}
+			const results: StatefulSubagentRunDetails[] = [];
+			let previous = "";
+			for (let index = 0; index < requestedItems.length; index++) {
+				const raw = requestedItems[index]!;
+				const item = { ...raw, task: raw.task.replaceAll("{previous}", previous) };
+				const result = await runTask(item, index, index + 1);
+				results.push(result);
+				if (result.status === "failed") break;
+				previous = result.output;
+			}
 			const details = resultDetails(results);
 			latestDetails.set(toolCallId, details);
 			const usage = nestedToolUsage(details.results);
 			return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
+		} finally {
+			stopRetryRefresh();
+			signal?.removeEventListener("abort", stopRetryRefresh);
 		}
-		const results: StatefulSubagentRunDetails[] = [];
-		let previous = "";
-		for (let index = 0; index < requestedItems.length; index++) {
-			const raw = requestedItems[index]!;
-			const item = { ...raw, task: raw.task.replaceAll("{previous}", previous) };
-			const result = await runTask(item, index, index + 1);
-			results.push(result);
-			if (result.status === "failed") break;
-			previous = result.output;
-		}
-		const details = resultDetails(results);
-		latestDetails.set(toolCallId, details);
-		const usage = nestedToolUsage(details.results);
-		return { content: [{ type: "text", text: aggregateText(mode, results) }], details, ...(usage ? { usage } : {}) };
 	};
 
 	const renderDispatchResult = (

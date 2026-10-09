@@ -34,6 +34,10 @@ Delegate self-contained work to one-off or persistent helper model sessions (sin
 - Keep orchestration in this session. If a helper's answer asks for input or another specialist (for example needs_input or specialist_request), resolve it here, then continue the same helper with target+task.
 - A deleted persistent helper (removed in /rail-agent) cannot be continued; a target call to it fails with an unknown persistent subagent error.
 
+## retry_continuation
+
+Your previous request stopped on a temporary provider error ({{error}}); earlier tool results are still in this conversation. Continue from where you stopped and do not repeat completed side effects.
+
 ## roster_intro
 
 Use the subagent tool with `target` to continue a linked session, or `model` plus `alias` to create one.

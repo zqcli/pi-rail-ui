@@ -1,3 +1,5 @@
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { retryableAssistantError, type SubagentRetry } from "./retry";
 import { hostedSearchCallsFromEntry } from "../../openai/hosted-search-activity";
 import { SubagentTranscript } from "./transcript";
 import type { SubagentUsage, WorkerRunResult } from "./session-broker";
@@ -51,6 +53,8 @@ export function isSharedImmediateEvent(type: string | undefined): boolean {
 		|| type === "tool_execution_end"
 		|| type === "compaction_start"
 		|| type === "compaction_end"
+		|| type === "auto_retry_start"
+		|| type === "auto_retry_end"
 		|| type === "summarization_retry_scheduled"
 		|| type === "summarization_retry_attempt_start"
 		|| type === "summarization_retry_finished";
@@ -64,6 +68,10 @@ export class RunResultCollector {
 	private readonly usageEntryIds = new Set<string>();
 	private readonly toolUsageCallIds = new Set<string>();
 	private settled = false;
+	private nativeSettled = false;
+	private lastAssistant: AssistantMessage | undefined;
+	private retryValue: SubagentRetry | undefined;
+	private retryCountValue = 0;
 	private activeUsage: SubagentUsage | undefined;
 	private output = "";
 	private stopReasonValue: string | undefined;
@@ -80,11 +88,42 @@ export class RunResultCollector {
 		return this.errorMessageValue;
 	}
 
+	get retryableError(): string | undefined {
+		return this.nativeSettled && this.lastAssistant && retryableAssistantError(this.lastAssistant)
+			? this.lastAssistant.errorMessage : undefined;
+	}
+
+	beginAttempt(): void {
+		if (!this.nativeSettled) throw new Error("Subagent continuation requires native settlement");
+		this.settled = false;
+		this.nativeSettled = false;
+		this.lastAssistant = undefined;
+		this.activeUsage = undefined;
+		this.output = "";
+		this.stopReasonValue = undefined;
+		this.errorMessageValue = undefined;
+		this.isCompactingValue = false;
+		this.compactionUsageAdded = false;
+		this.retryValue = undefined;
+		this.transcript.mark("Continuing after a temporary provider error");
+	}
+
+	setRetry(retry?: SubagentRetry, retryCount = this.retryCountValue): void {
+		this.retryValue = retry;
+		this.retryCountValue = retryCount;
+	}
+
 	// Returns whether a throttled update is warranted. Immediate flushes are the
 	// adapters' call based on event type. Strict extraction may throw here after
 	// the transcript was ingested, restoring the stateless malformed-tail behavior.
 	ingest(event: SubagentRunEvent): boolean {
+		if (this.settled) return false;
 		let usageChanged = this.ingestUsageEntry(event);
+		if (event.type === "agent_settled") {
+			this.nativeSettled = true;
+			this.retryValue = undefined;
+		}
+		if (event.type === "transport_error") this.lastAssistant = undefined;
 		if (event.type === "agent_settled" || event.type === "transport_error") this.settled = true;
 		// A persistent transport can still deliver events while send() cleans up.
 		// Freeze all accounting, including an unfinished active-turn snapshot.
@@ -104,6 +143,7 @@ export class RunResultCollector {
 				usageChanged = this.ingestToolResultUsage(message) || usageChanged;
 			}
 			if (isAssistantMessage(message)) {
+				this.lastAssistant = message as AssistantMessage;
 				if (!this.settled) this.activeUsage = undefined;
 				this.stopReasonValue = message.stopReason;
 				this.errorMessageValue = message.errorMessage;
@@ -122,6 +162,8 @@ export class RunResultCollector {
 		this.settled = true;
 		this.isCompactingValue = false;
 		this.errorMessageValue = message;
+		this.lastAssistant = undefined;
+		this.retryValue = undefined;
 	}
 
 	markAborted(): void {
@@ -129,6 +171,8 @@ export class RunResultCollector {
 		this.isCompactingValue = false;
 		this.stopReasonValue = "aborted";
 		this.errorMessageValue = "Subagent request was aborted";
+		this.lastAssistant = undefined;
+		this.retryValue = undefined;
 	}
 
 	markSettled(): void {
@@ -180,6 +224,15 @@ export class RunResultCollector {
 
 	private ingestActivity(event: SubagentRunEvent): boolean {
 		switch (event.type) {
+			case "auto_retry_start":
+				this.retryValue = {
+					attempt: Number(event["attempt"]), maxAttempts: Number(event["maxAttempts"]),
+					nextAt: Date.now() + Number(event["delayMs"]), error: String(event["errorMessage"] ?? "Temporary provider error"), source: "pi",
+				};
+				return true;
+			case "auto_retry_end":
+				this.retryValue = undefined;
+				return true;
 			case "compaction_start":
 				return this.setCompacting(true);
 			case "compaction_end":
@@ -216,6 +269,8 @@ export class RunResultCollector {
 			usage: usageWithActiveTurn(this.usage, this.activeUsage),
 			transcript: this.transcript.snapshot(),
 			...(this.isCompactingValue ? { isCompacting: true } : {}),
+			...(this.retryValue ? { retry: this.retryValue } : {}),
+			...(this.retryCountValue ? { retryCount: this.retryCountValue } : {}),
 			...(this.stopReasonValue ? { stopReason: this.stopReasonValue } : {}),
 			...(this.errorMessageValue ? { errorMessage: this.errorMessageValue } : {}),
 		};

@@ -15,6 +15,38 @@ const theme = {
 	bold: (text: string) => text,
 };
 
+test("single and grouped retry panels show countdowns and final recovery without a false failure", (t) => {
+	t.mock.method(Date, "now", () => 10_000);
+	const retry = { attempt: 2, maxAttempts: 5, nextAt: 40_000, error: "503 temporarily unavailable", source: "rail" as const };
+	const run = { alias: "review", model: "local/model", status: "running", output: "", persistent: true, retry, retryCount: 2 } as SubagentTranscriptRun;
+	const { retry: _retry, ...terminal } = run;
+	for (const mode of ["single", "parallel", "chain"] as const) {
+		const panel = renderSubagentTranscript([run], false, theme as any, { mode });
+		const text = panel.render(160).join("\n");
+		assert.match(text, /Retrying 2\/5.*next in 30s/);
+		assert.match(text, /503 temporarily unavailable/);
+		assert.doesNotMatch(text, /Failed|Final answer/);
+		t.mock.method(Date, "now", () => 25_000);
+		assert.match(panel.render(160).join("\n"), /next in 15s/);
+		t.mock.method(Date, "now", () => 10_000);
+		for (const width of [1, 8, 24, 60]) {
+			for (const line of panel.render(width)) assert.ok(visibleWidth(line) <= width);
+		}
+		const recovered = renderSubagentTranscript([{ ...terminal, status: "completed", output: "Recovered result" }], false, theme as any, { mode }).render(160).join("\n");
+		assert.match(recovered, /recovered after 2 retries/);
+		assert.doesNotMatch(recovered, /Retrying|Failed/);
+		const exhausted = renderSubagentTranscript([{ ...terminal, status: "failed", stopReason: "error", errorMessage: "503 exhausted" }], false, theme as any, { mode }).render(160).join("\n");
+		assert.match(exhausted, /2 retries/);
+		assert.doesNotMatch(exhausted, /Retrying|recovered after/);
+		const cancelled = renderSubagentTranscript([{ ...terminal, status: "failed", stopReason: "aborted" }], false, theme as any, { mode }).render(160).join("\n");
+		assert.match(cancelled, /Cancelled/);
+		assert.doesNotMatch(cancelled, /Retrying|recovered after/);
+	}
+	const { retryCount: _retryCount, ...nativeRun } = run;
+	const native = renderSubagentTranscript([{ ...nativeRun, retry: { ...retry, source: "pi" } }], false, theme as any).render(160).join("\n");
+	assert.match(native, /Pi Retrying 2\/5/);
+});
+
 const markdownTheme: MarkdownTheme = {
 	heading: (text) => text,
 	link: (text) => text,

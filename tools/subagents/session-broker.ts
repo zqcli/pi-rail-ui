@@ -12,6 +12,7 @@ import { emptySubagentUsage } from "./usage";
 import type { CompactionResult, NativeCompletion, RuntimeActivation } from "./team-runtime";
 import type { RpcEvent } from "./rpc-worker";
 import { parseBinding, sameBinding } from "./team-codec";
+import type { SubagentRetry } from "./retry";
 
 export interface SubagentUsage {
 	input: number;
@@ -28,6 +29,9 @@ export interface SubagentUsage {
 export interface WorkerRunResult {
 	output: string;
 	usage: SubagentUsage;
+	retry?: SubagentRetry;
+	/** Rail continuations started; excludes the original attempt and native Pi retries. */
+	retryCount?: number;
 	isCompacting?: boolean;
 	transcript?: SubagentTranscriptSnapshot;
 	stopReason?: string;
@@ -84,6 +88,8 @@ export interface WorkerSendOptions {
 	onUpdate?: (result: WorkerRunResult) => void;
 	onAccepted?: () => void;
 	onSettled?: () => void;
+	/** Await pending control acknowledgment; stop or uncertain delivery suppresses continuation. */
+	shouldContinue?: () => boolean | Promise<boolean>;
 }
 
 export type WorkerControlDelivery = "steer" | "followUp";
@@ -253,6 +259,8 @@ interface WorkerState {
 	controlErrorMessage: string | undefined;
 	queued: number;
 	isCompacting: boolean;
+	retry: SubagentRetry | undefined;
+	retryCount: number;
 }
 
 interface OwnedTeamMember {
@@ -297,6 +305,8 @@ export type AgentRuntimePhase = "starting" | "running" | "queued" | "idle" | "st
 export interface AgentRuntimeStatus {
 	phase: AgentRuntimePhase;
 	queued: number;
+	retry?: SubagentRetry;
+	retryCount?: number;
 	isCompacting?: boolean;
 	errorMessage?: string;
 }
@@ -339,6 +349,8 @@ function freshWorkerState(instance: AgentInstance, worker: SessionWorker): Worke
 		controlErrorMessage: undefined,
 		queued: 0,
 		isCompacting: false,
+		retry: undefined,
+		retryCount: 0,
 	};
 }
 
@@ -366,6 +378,7 @@ export class SessionBroker {
 	private shutdownTask: Promise<void> | undefined;
 	private readonly lifecycleEpochs = new Map<string, number>();
 	private readonly runtimeErrors = new Map<string, string>();
+	private readonly stoppedRetryCounts = new Map<string, number>();
 	private readonly stoppingAgents = new Set<string>();
 	/** Children that outlived SIGKILL: their session file may still be written until the OS reaps them. */
 	private readonly unreaped = new Map<string, Promise<void>>();
@@ -452,16 +465,27 @@ export class SessionBroker {
 				const run = await currentState.worker.send(request.task, {
 					...(contextWindow !== undefined ? { contextWindow } : {}),
 					...(signal ? { signal } : {}),
+					shouldContinue: async () => {
+						await currentState.controlTail;
+						if (currentState.stopping) return false;
+						if (currentState.controlPoisoned) {
+							throw new WorkerControlError(currentState.controlErrorMessage ?? "Subagent control delivery outcome is unknown", "unknown");
+						}
+						return true;
+					},
 					onUpdate: (partial) => {
 						const isCompacting = partial.isCompacting === true;
-						if (currentState.isCompacting !== isCompacting) {
-							currentState.isCompacting = isCompacting;
-							this.emitRuntimeChange();
-						}
+						const activityChanged = currentState.retry !== partial.retry
+							|| currentState.retryCount !== (partial.retryCount ?? 0) || currentState.isCompacting !== isCompacting;
+						currentState.retry = partial.retry;
+						currentState.retryCount = partial.retryCount ?? 0;
+						currentState.isCompacting = isCompacting;
+						if (activityChanged) this.emitRuntimeChange();
 						request.onUpdate?.({ instance: resolvedInstance, run: partial });
 					},
 					onAccepted: () => {
-						if (currentState.activeRunId !== undefined && !currentState.stopping) {
+						if (!currentState.stopping && !currentState.controlPoisoned) {
+							currentState.activeRunId ??= ++currentState.nextRunId;
 							currentState.activeRunAccepted = true;
 							this.emitRuntimeChange();
 						}
@@ -475,6 +499,8 @@ export class SessionBroker {
 				currentState.activeRunId = undefined;
 				currentState.activeRunAccepted = false;
 				currentState.isCompacting = false;
+				currentState.retry = undefined;
+				currentState.retryCount = run.retryCount ?? 0;
 				this.emitRuntimeChange();
 				const stored = await this.store.get(resolvedInstance.agentId) ?? resolvedInstance;
 				const persisted: AgentInstance = {
@@ -486,7 +512,9 @@ export class SessionBroker {
 				await this.store.put(persisted);
 				this.commitInstanceSnapshot(persisted);
 				currentState.instance = persisted;
-				this.runtimeErrors.delete(resolvedInstance.agentId);
+				const runError = runErrorMessage(run);
+				if (runError) this.runtimeErrors.set(resolvedInstance.agentId, runError);
+				else this.runtimeErrors.delete(resolvedInstance.agentId);
 				return { instance: { ...persisted, alias: resolvedInstance.alias }, run };
 			}, "run");
 		} catch (error) {
@@ -826,7 +854,13 @@ export class SessionBroker {
 		if (this.workerStarts.has(agentId)) return { phase: "starting", queued: 0 };
 		const state = this.workers.get(agentId);
 		if (state) {
-			const activity = state.isCompacting ? { isCompacting: true as const } : {};
+			const retryCount = state.retryCount || this.stoppedRetryCounts.get(agentId);
+			const activity = {
+				...(state.isCompacting ? { isCompacting: true as const } : {}),
+				...(state.retry ? { retry: state.retry } : {}),
+				...(retryCount ? { retryCount } : {}),
+			};
+			if (state.retry) return { phase: "running", queued: state.queued, ...activity };
 			if (state.activeRunId !== undefined) return { phase: state.activeRunAccepted ? "running" : "starting", queued: state.queued, ...activity };
 			if (state.controlPoisoned) return { phase: "error", queued: state.queued, ...activity, errorMessage: state.controlErrorMessage ?? "Subagent control delivery outcome is unknown" };
 			if (state.active || state.queued > 0) return { phase: "queued", queued: Math.max(1, state.queued), ...activity };
@@ -834,8 +868,10 @@ export class SessionBroker {
 			return stateError ? { phase: "error", queued: 0, ...activity, errorMessage: stateError } : { phase: "idle", queued: 0, ...activity };
 		}
 		const errorMessage = this.runtimeErrors.get(agentId);
-		if (errorMessage) return { phase: "error", queued: 0, errorMessage };
-		return { phase: "stopped", queued: 0 };
+		const retryCount = this.stoppedRetryCounts.get(agentId);
+		const activity = retryCount ? { retryCount } : {};
+		if (errorMessage) return { phase: "error", queued: 0, ...activity, errorMessage };
+		return { phase: "stopped", queued: 0, ...activity };
 	}
 
 	subscribeRuntime(listener: () => void): () => void {
@@ -868,7 +904,8 @@ export class SessionBroker {
 
 	async stop(target: string): Promise<AgentInstance | undefined> {
 		const agentId = this.roster.resolve(target) ?? target;
-		if (this.fastModeChanges.has(agentId) || this.modelChanges.has(agentId)) {
+		if (this.teamMemberHandles.has(agentId) && !this.teamRouter) throw new TeamOwnedError("Team-owned members must be released by TeamRuntime");
+		if (this.fastModeChanges.has(agentId)) {
 			throw new Error("Subagent maintenance operation is already pending");
 		}
 		if (this.stoppingAgents.has(agentId) || this.deletingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
@@ -1072,6 +1109,7 @@ export class SessionBroker {
 
 	async delete(target: string): Promise<AgentInstance | undefined> {
 		const agentId = this.roster.resolve(target) ?? target;
+		if (this.teamMemberHandles.has(agentId) && !this.teamRouter) throw new TeamOwnedError("Team-owned members must be released by TeamRuntime");
 		if (this.deletingAgents.has(agentId)) throw new Error("Subagent is already being deleted");
 		this.deletingAgents.add(agentId);
 		this.lifecycleEpochs.set(agentId, this.lifecycleEpoch(agentId) + 1);
@@ -1080,6 +1118,9 @@ export class SessionBroker {
 		this.emitRuntimeChange();
 		try {
 			await this.releaseTeamOwnership(agentId, "delete");
+			// A queued model change owns the same tail as a retrying send. Wake and
+			// drain that send before waiting for maintenance, not the other way round.
+			await this.stopWorker(agentId);
 			const pending = [this.fastModeChanges.get(agentId), this.modelChanges.get(agentId)]
 				.filter((operation): operation is Promise<AgentInstance> => operation !== undefined);
 			if (pending.length > 0) await Promise.allSettled(pending);
@@ -1094,6 +1135,7 @@ export class SessionBroker {
 			this.commitDeletedSnapshot(instance.agentId);
 			for (const link of this.roster.list().filter((item) => item.agentId === instance.agentId)) this.roster.unlink(link.alias);
 			this.runtimeErrors.delete(instance.agentId);
+			this.stoppedRetryCounts.delete(instance.agentId);
 			this.emitRuntimeChange();
 			return instance;
 		} finally {
@@ -1283,15 +1325,20 @@ export class SessionBroker {
 				}
 			}
 			state.queued--;
-			if (this.shuttingDown && !allowDuringShutdown) {
+			if ((this.shuttingDown || state.stopping) && !allowDuringShutdown) {
 				this.emitRuntimeChange();
-				throw new Error("Subagent broker is shutting down");
+				throw new Error(this.shuttingDown ? "Subagent broker is shutting down" : "Subagent worker is stopping");
 			}
 			state.active = true;
 			const runId = kind === "run" ? ++state.nextRunId : undefined;
 			state.activeRunId = runId;
 			state.activeRunAccepted = false;
-			if (runId !== undefined) state.unknownControlRunId = undefined;
+			if (runId !== undefined) {
+				this.stoppedRetryCounts.delete(state.instance.agentId);
+				state.unknownControlRunId = undefined;
+				state.retry = undefined;
+				state.retryCount = 0;
+			}
 			this.emitRuntimeChange();
 			try {
 				return await operation();
@@ -1300,6 +1347,7 @@ export class SessionBroker {
 				state.activeRunId = undefined;
 				state.activeRunAccepted = false;
 				state.isCompacting = false;
+				state.retry = undefined;
 				this.emitRuntimeChange();
 			}
 		};
@@ -1328,6 +1376,7 @@ export class SessionBroker {
 
 	/** Detaches and stops a worker; a child that outlives SIGKILL is recorded before any waiter resumes. */
 	private stopProcess(agentId: string, state: WorkerState): Promise<void> {
+		if (state.retryCount) this.stoppedRetryCounts.set(agentId, state.retryCount);
 		this.workers.delete(agentId);
 		state.stopping = true;
 		const stop = state.worker.stop().catch((error: unknown) => {
@@ -1357,6 +1406,7 @@ export class SessionBroker {
 		try {
 			await this.store.delete(agent.agentId);
 			this.commitDeletedSnapshot(agent.agentId);
+			this.stoppedRetryCounts.delete(agent.agentId);
 		} catch {
 			// Keep the snapshot when descriptor cleanup did not succeed.
 		}

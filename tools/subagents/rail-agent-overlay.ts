@@ -4,6 +4,8 @@ import { Input, Key, matchesKey, stripTerminalSequences, truncateToWidth, wrapTe
 import type { CreateRailAgentRequest, RailAgentManager, RailAgentManagerSnapshot, RailAgentPhase, RailAgentView } from "./agent-manager";
 import { supportsNativeGptFastMode, type NativeFastModel } from "../../commands/rail-fast";
 import { assertValidAgentAlias } from "./identity";
+import { prompt } from "../../core/prompts";
+import type { DispatchResult } from "./session-broker";
 import { retryCountText, retryStatusText, statusColor } from "./transcript";
 import {
 	availableThinkingLevels,
@@ -25,9 +27,8 @@ type Confirmation = { title: string; detail: string; action: () => Promise<void>
 type ControlComposer = {
 	agentId: string;
 	alias: string;
-	delivery: "steer" | "followUp";
 	input: Input;
-};
+} & ({ delivery: "continue"; model: RailModelRef } | { delivery: "steer" | "followUp" });
 
 export interface RailAgentOverlayOptions {
 	manager: RailAgentManager;
@@ -165,6 +166,10 @@ export class RailAgentOverlayComponent implements Focusable {
 	handleInput(data: string): void {
 		if (this.busy) {
 			if (this.isCancel(data)) {
+				if (this.control?.delivery === "continue") {
+					this.done();
+					return;
+				}
 				this.operationAbort?.abort();
 				this.notice = "Cancelling operation...";
 			}
@@ -196,6 +201,8 @@ export class RailAgentOverlayComponent implements Focusable {
 		const innerWidth = Math.max(1, width - 2);
 		const border = (value: string) => this.theme.fg("borderAccent", value);
 		const line = (content = "") => `${this.theme.fg("border", "│")}${fit(content, innerWidth)}${this.theme.fg("border", "│")}`;
+		const notice = this.busy ? this.notice : this.refreshError ?? this.notice;
+		const help = this.helpLines();
 		const lines = [border(`╭${"─".repeat(innerWidth)}╮`)];
 		lines.push(line(` ${this.theme.fg("accent", this.theme.bold("Rail Agents"))}  ${this.renderTabs()}`));
 		lines.push(line(` ${this.theme.fg("dim", this.summaryText())}`));
@@ -203,10 +210,9 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.confirmation) lines.push(...this.renderConfirmation(innerWidth).map(line));
 		else if (this.picker) lines.push(...this.renderPicker(innerWidth).map(line));
 		else if (this.tab === "create") lines.push(...this.renderForm(innerWidth).map(line));
-		else lines.push(...this.renderAgents(innerWidth).map(line));
-		const notice = this.busy ? this.notice : this.refreshError ?? this.notice;
+		else lines.push(...this.renderAgents(innerWidth, 5 + help.length + (notice ? 1 : 0)).map(line));
 		if (notice) lines.push(line(` ${this.theme.fg("warning", compact(notice, innerWidth - 2))}`));
-		for (const help of this.helpLines()) lines.push(line(` ${this.theme.fg("dim", help)}`));
+		for (const text of help) lines.push(line(` ${this.theme.fg("dim", text)}`));
 		lines.push(border(`╰${"─".repeat(innerWidth)}╯`));
 		return lines;
 	}
@@ -239,20 +245,37 @@ export class RailAgentOverlayComponent implements Focusable {
 		return parts.join(" · ") || "no agents";
 	}
 
-	private renderAgents(innerWidth: number): string[] {
+	private renderAgents(innerWidth: number, reservedRows: number): string[] {
 		const agents = this.filteredAgents();
 		const lines: string[] = [];
 		if (this.searching || this.searchInput.getValue()) {
 			const search = this.searchInput.render(Math.max(1, innerWidth - 11))[0] ?? "";
 			lines.push(` Search: ${search}`);
-			lines.push("");
+			if (!this.control) lines.push("");
 		}
 		if (agents.length === 0) {
 			lines.push(` ${this.theme.fg("muted", this.tab === "current" ? "No persistent agents are linked to this conversation" : "No matching persistent agents")}`);
-			lines.push("");
-			return lines;
+			if (!this.control) return [...lines, ""];
 		}
-		const visibleRows = this.maxVisibleRows();
+		const selected = agents[this.selectedIndex];
+		const details: string[] = [];
+		if (selected) {
+			details.push("");
+			details.push(` ${this.theme.fg("toolTitle", this.theme.bold(selected.linkedAliases[0] ?? selected.instance.alias))} ${this.theme.fg("dim", `· ${selected.instance.agentId}`)}`);
+			details.push(` ${this.theme.fg("muted", compact(selected.instance.cwd, innerWidth - 2))}`);
+			details.push(` ${this.theme.fg("dim", `Last task: ${compact(selected.instance.lastTask, innerWidth - 13)}`)}`);
+			if (selected.instance.lastOutput) details.push(` ${this.theme.fg("dim", `Last answer: ${compact(selected.instance.lastOutput, innerWidth - 15)}`)}`);
+			if (selected.instance.fastMode === true) details.push(` ${this.theme.fg(this.fastModeEligible(selected.instance.model) ? "success" : "warning", this.fastModeEligible(selected.instance.model) ? "Fast mode: active" : "Fast mode: inactive for current model")}`);
+			if (selected.retry) details.push(` ${this.theme.fg("warning", compact(selected.retry.error, innerWidth - 2))}`);
+			else if (selected.retryCount) details.push(` ${this.theme.fg("dim", retryCountText(selected.retryCount, selected.phase === "idle"))}`);
+			if (selected.errorMessage) details.push(` ${this.theme.fg("error", compact(selected.errorMessage, innerWidth - 2))}`);
+		}
+		// Match the popup's 88% maxHeight and one-row top/bottom margins.
+		const terminalRows = this.tui.terminal?.rows ?? 30;
+		const height = Math.max(1, Math.min(Math.floor(terminalRows * 0.88), terminalRows - 2));
+		reservedRows += lines.length + (this.control ? this.control.delivery === "continue" ? 4 : 3 : 0);
+		const hideDetails = this.compactControlLayout(reservedRows + details.length + 1, height);
+		const visibleRows = this.maxVisibleRows(reservedRows + (hideDetails ? 0 : details.length), height);
 		const start = Math.max(0, Math.min(this.selectedIndex - Math.floor(visibleRows / 2), agents.length - visibleRows));
 		for (let index = start; index < Math.min(start + visibleRows, agents.length); index++) {
 			const agent = agents[index]!;
@@ -266,22 +289,12 @@ export class RailAgentOverlayComponent implements Focusable {
 			const row = `${alias}  ${phase}${fast}  ${railModelReference(agent.instance.model)}`;
 			lines.push(`${prefix}${selected ? this.theme.fg("accent", row) : row}`);
 		}
-		const selected = agents[this.selectedIndex];
-		if (selected && !this.compactControlLayout()) {
-			lines.push("");
-			lines.push(` ${this.theme.fg("toolTitle", this.theme.bold(selected.linkedAliases[0] ?? selected.instance.alias))} ${this.theme.fg("dim", `· ${selected.instance.agentId}`)}`);
-			lines.push(` ${this.theme.fg("muted", compact(selected.instance.cwd, innerWidth - 2))}`);
-			lines.push(` ${this.theme.fg("dim", `Last task: ${compact(selected.instance.lastTask, innerWidth - 13)}`)}`);
-			if (selected.instance.lastOutput) lines.push(` ${this.theme.fg("dim", `Last answer: ${compact(selected.instance.lastOutput, innerWidth - 15)}`)}`);
-			if (selected.instance.fastMode === true) lines.push(` ${this.theme.fg(this.fastModeEligible(selected.instance.model) ? "success" : "warning", this.fastModeEligible(selected.instance.model) ? "Fast mode: active" : "Fast mode: inactive for current model")}`);
-			if (selected.retry) lines.push(` ${this.theme.fg("warning", compact(selected.retry.error, innerWidth - 2))}`);
-			else if (selected.retryCount) lines.push(` ${this.theme.fg("dim", retryCountText(selected.retryCount, selected.phase === "idle"))}`);
-			if (selected.errorMessage) lines.push(` ${this.theme.fg("error", compact(selected.errorMessage, innerWidth - 2))}`);
-		}
+		if (!hideDetails) lines.push(...details);
 		if (this.control) {
-			const label = this.control.delivery === "steer" ? "Steer" : "Follow-up";
+			const label = this.control.delivery === "continue" ? "Continue" : this.control.delivery === "steer" ? "Steer" : "Follow-up";
 			lines.push("");
 			lines.push(` ${this.theme.fg("toolTitle", this.theme.bold(`${label} ${this.control.alias}`))}`);
+			if (this.control.delivery === "continue") lines.push(` ${this.theme.fg("dim", railModelReference(this.control.model))}`);
 			lines.push(` Message: ${this.control.input.render(Math.max(1, innerWidth - 11))[0] ?? ""}`);
 		}
 		return lines;
@@ -362,11 +375,13 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.confirmation) return ["y confirm · n/esc cancel"];
 		if (this.picker) return ["type to filter · ↑↓ navigate · enter select · esc back"];
 		if (this.edit) return ["enter apply · esc cancel"];
+		if (this.busy && this.control?.delivery === "continue") return ["starting continuation · esc close (does not stop task)"];
 		if (this.control) return ["type message · enter send · esc cancel"];
 		if (this.tab === "create") return ["↑↓ fields · enter edit/open · shift+f fast · ←→/tab switch tabs · esc close"];
 		return [
-			"↑↓ select · enter continue · / search · g steer · f follow-up · n new",
-			"s stop · d detach · x delete · m model · t thinking · shift+f fast",
+			"↑↓ select · enter Continue · i Mention · / search · n new",
+			"g steer · f follow-up · s stop · d detach · x delete",
+			"m model · t thinking · shift+f fast · ←→/tab tabs · esc close",
 		];
 	}
 
@@ -389,7 +404,8 @@ export class RailAgentOverlayComponent implements Focusable {
 		else {
 			const selected = agents[this.selectedIndex];
 			if (!selected) return;
-			if (this.keybindings.matches(data, "tui.select.confirm")) void this.continueAgent(selected);
+			if (this.keybindings.matches(data, "tui.select.confirm")) this.startContinue(selected);
+			else if (matchesKey(data, "i")) void this.mentionAgent(selected);
 			else if (matchesKey(data, "shift+f")) void this.toggleFastMode(selected);
 			else if (matchesKey(data, "m")) {
 				if (this.options.models.length === 0) {
@@ -504,8 +520,21 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.keybindings.matches(data, "tui.select.confirm")) {
 			const message = control.input.getValue().trim();
 			if (!message) {
-				this.notice = "Control message cannot be empty";
+				this.notice = "Message cannot be empty";
 				this.renderSoon();
+				return;
+			}
+			if (control.delivery === "continue") {
+				void this.runOperation("Starting continuation...", async () => {
+					const current = (await this.options.manager.snapshot()).agents.find((agent) => agent.instance.agentId === control.agentId);
+					if (this.disposed) return;
+					const error = this.continueError(current);
+					if (error) throw new Error(error);
+					await this.startInBackground(control.alias, "continuation", (onAccepted) => this.options.manager.continue(control.agentId, message, undefined, onAccepted));
+					if (this.notice === "Starting continuation...") this.notice = "";
+					this.control = undefined;
+					this.syncInputFocus();
+				});
 				return;
 			}
 			this.control = undefined;
@@ -568,15 +597,47 @@ export class RailAgentOverlayComponent implements Focusable {
 		this.renderSoon();
 	}
 
-	private async continueAgent(agent: RailAgentView): Promise<void> {
-		if (agent.phase === "in-use-elsewhere") {
+	private continueError(agent: RailAgentView | undefined): string | undefined {
+		if (!agent) return "Unknown persistent subagent; the selected agent is no longer available";
+		if (agent.phase === "in-use-elsewhere" || agent.phase === "unknown") return "Session ownership is foreign or unknown; Continue cannot take it over";
+		if (agent.retry) return "Agent is retrying; wait for the next attempt before Continue";
+		if (agent.isCompacting || agent.queued > 0 || !["idle", "error", "stopped"].includes(agent.phase)) {
+			return "Continue requires an idle, error or stopped agent; use Steer / Follow-up while running, or wait";
+		}
+		return undefined;
+	}
+
+	private startContinue(agent: RailAgentView): void {
+		const error = this.continueError(agent);
+		if (error) {
+			this.notice = error;
+			return;
+		}
+		try {
+			const input = new Input();
+			if (agent.phase !== "idle") {
+				// Paste uses Input's cursor/undo handling, leaving the cursor at the end.
+				input.handleInput(`\u001b[200~${prompt("subagent", "manual_continue")}\u001b[201~`);
+			}
+			this.control = { delivery: "continue", agentId: agent.instance.agentId, alias: agent.linkedAliases[0] ?? agent.instance.alias, model: agent.instance.model, input };
+			this.notice = "";
+			this.syncInputFocus();
+		} catch (error) {
+			this.notice = error instanceof Error ? error.message : String(error);
+		}
+	}
+
+	private async mentionAgent(agent: RailAgentView): Promise<void> {
+		if (agent.phase === "in-use-elsewhere" || agent.phase === "unknown") {
 			this.notice = `Session is owned by process ${agent.ownerPid ?? "unknown"}; use Create / Adopt to make a safe copy`;
 			this.renderSoon();
 			return;
 		}
-		if (!agent.linkedToCurrentSession) await this.options.manager.link(agent.instance.agentId);
-		this.options.insertMention(agent.linkedAliases[0] ?? agent.instance.alias);
-		this.done();
+		await this.runOperation("Linking mention...", async () => {
+			if (!agent.linkedToCurrentSession) await this.options.manager.link(agent.instance.agentId);
+			this.options.insertMention(agent.linkedAliases[0] ?? agent.instance.alias);
+			this.done();
+		});
 	}
 
 	private startControl(agent: RailAgentView, delivery: "steer" | "followUp"): void {
@@ -766,7 +827,8 @@ export class RailAgentOverlayComponent implements Focusable {
 				}
 				this.notice = `Adopted ${this.form.alias} as ${this.form.adoptMode === "fork" ? "a safe copy" : "an exclusive session"}`;
 			} else {
-				await this.startInBackground({ model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, fastMode: this.form.fastMode });
+				const request: CreateRailAgentRequest = { model, alias: this.form.alias, task: this.form.task, cwd: this.form.cwd, fastMode: this.form.fastMode };
+				await this.startInBackground(request.alias, "first task", (onAccepted) => this.options.manager.create({ ...request, onAccepted }));
 				this.notice = `Started ${this.form.alias}; its first task is running`;
 			}
 			this.tab = "current";
@@ -777,26 +839,28 @@ export class RailAgentOverlayComponent implements Focusable {
 		});
 	}
 
-	/** Resolves once the instance exists; the first run settles later, independent of the popup, and reports via notify. */
-	private startInBackground(request: CreateRailAgentRequest): Promise<void> {
+	/** Startup resolves separately from completion; no popup-owned abort signal reaches the run. */
+	private startInBackground(alias: string, task: string, start: (onAccepted: () => void) => Promise<DispatchResult>): Promise<void> {
 		return new Promise<void>((resolve, reject) => {
 			let started = false;
-			this.options.manager.create({ ...request, onUpdate: () => { started = true; resolve(); } }).then(
+			start(() => {
+				started = true;
+				resolve();
+			}).then(
 				(result) => {
 					resolve();
 					const answer = compact(result.run.output);
-					this.notice = `${request.alias} finished its first task`;
+					this.notice = `Agent ${alias} finished its ${task}${answer ? `: ${answer}` : ""}`;
 					this.renderSoon();
-					this.ctx.ui.notify(`Agent ${request.alias} finished its first task${answer ? `: ${answer}` : ""}`, "info");
+					this.ctx.ui.notify(this.notice, "info");
 				},
 				(error) => {
 					if (!started) return reject(error);
-					const message = `Agent ${request.alias} failed its first task: ${error instanceof Error ? error.message : String(error)}`;
-					this.notice = message;
+					this.notice = `Agent ${alias} failed its ${task}: ${error instanceof Error ? error.message : String(error)}`;
 					this.renderSoon();
-					this.ctx.ui.notify(message, "error");
+					this.ctx.ui.notify(this.notice, "error");
 				},
-			).catch(() => undefined); // notify throws once the session context is stale
+			).catch(reject); // notify throws once the session context is stale; startup is already resolved
 		});
 	}
 
@@ -940,13 +1004,12 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (!this.disposed) this.tui.requestRender();
 	}
 
-	private maxVisibleRows(): number {
-		const rows = this.tui.terminal?.rows ?? 30;
-		return Math.max(1, Math.min(MAX_VISIBLE_ROWS, rows - (this.control ? 16 : 14)));
+	private maxVisibleRows(reservedRows = 14, height = this.tui.terminal?.rows ?? 30): number {
+		return Math.max(1, Math.min(MAX_VISIBLE_ROWS, height - reservedRows));
 	}
 
-	private compactControlLayout(): boolean {
-		return this.control !== undefined && (this.tui.terminal?.rows ?? 30) < 22;
+	private compactControlLayout(requiredRows: number, height: number): boolean {
+		return this.control !== undefined && requiredRows > height;
 	}
 
 	private isCancel(data: string): boolean {

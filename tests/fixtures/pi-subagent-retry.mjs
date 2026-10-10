@@ -29,19 +29,33 @@ function streamLocal(model, context, options) {
     message.errorMessage = "400 recorded tool result missing from continuation";
   } else if (previousRequests === 1) {
     message.stopReason = "error";
-    message.errorMessage = "503 temporary local provider failure";
+    message.errorMessage = existsSync(join(process.cwd(), "manual-continue-test")) ? "401 manual continuation required" : "503 temporary local provider failure";
   } else {
     message.stopReason = "stop";
     message.content = [{ type: "text", text: "continued with recorded tool result" }];
   }
   stream.push({ type: "start", partial: { ...message, stopReason: "pending" } });
-  if (message.stopReason === "error" || message.stopReason === "aborted") stream.push({ type: "error", reason: message.stopReason, error: message });
-  else stream.push({ type: "done", reason: message.stopReason, message });
-  stream.end();
+  void (async () => {
+    // Hold only the manual-Continue fixture so the test can close the popup mid-run.
+    if (previousRequests >= 2 && existsSync(join(process.cwd(), "manual-continue-test"))) {
+      while (!existsSync(join(process.cwd(), "release-continuation")) && !options?.signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
+      if (options?.signal?.aborted) {
+        message.stopReason = "aborted";
+        message.errorMessage = "aborted";
+      }
+    }
+    if (message.stopReason === "error" || message.stopReason === "aborted") stream.push({ type: "error", reason: message.stopReason, error: message });
+    else stream.push({ type: "done", reason: message.stopReason, message });
+    stream.end();
+  })();
   return stream;
 }
 
 export default function (pi) {
+  pi.registerCommand("reject-continue-test", {
+    description: "Local-only fixture prompt rejection",
+    handler: async () => { throw new Error("local prompt rejected before acceptance"); },
+  });
   pi.registerProvider("rail-retry-local", {
     name: "Rail retry local provider", baseUrl: "http://127.0.0.1:9/v1", apiKey: "local-test-only",
     api: "openai-completions", streamSimple: streamLocal,

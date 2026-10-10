@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
 import { RailAgentOverlayComponent, showRailAgentOverlay } from "../../tools/subagents/rail-agent-overlay";
 import { RailAgentManager, type RailAgentView } from "../../tools/subagents/agent-manager";
 import { railModelReference, type RailModelRef } from "../../tools/subagents/models";
+import { prompt } from "../../core/prompts";
+import { SessionBroker } from "../../tools/subagents/session-broker";
+import { FileAgentInstanceStore } from "../../tools/subagents/instance-store";
+import { SessionAgentRoster } from "../../tools/subagents/session-links";
+import { loadoutFor } from "../fixtures/team-loadout";
+import { createRpcWorkerFactory } from "../../tools/subagents/worker-factory";
 
 const piModel = {
 	provider: "cus-resp",
@@ -49,6 +59,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	let closed = false;
 	let subscribed: (() => void) | undefined;
 	let unsubscribed = false;
+	const continuations: any[] = [];
 	const currentSnapshot: any = structuredClone(snapshot);
 	currentSnapshot.agents[0]!.phase = phase;
 	currentSnapshot.agents[0]!.isCompacting = compacting;
@@ -66,6 +77,14 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	const manager = {
 		snapshot: async () => currentSnapshot,
 		subscribe: (listener: () => void) => { subscribed = listener; return () => { unsubscribed = true; }; },
+		continue: async (...args: any[]) => {
+			continuations.push(args);
+			currentSnapshot.agents[0].phase = "running";
+			args[3]?.();
+			subscribed?.();
+			currentSnapshot.agents[0].phase = "idle";
+			return { instance: currentSnapshot.agents[0].instance, run: { output: "done" } };
+		},
 		changeModel: async () => snapshot.agents[0]!.instance,
 		link: async () => snapshot.agents[0]!.instance,
 		stop: async () => snapshot.agents[0]!.instance,
@@ -115,7 +134,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 		},
 		currentSnapshot,
 	);
-	return { component, controls, ctx, manager, notifications, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
+	return { component, controls, continuations, ctx, manager, notifications, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
 }
 
 test("rail-agent renders live retry countdown and final recovered count", (t) => {
@@ -197,7 +216,7 @@ test("agent filtering preserves fields, input order, current-tab scope, selectio
 		await ui["refresh"]();
 		assert.deepEqual(ui["filteredAgents"](), [refreshed]);
 		assert.match(ui.render(160).join("\n"), /→ refreshed-foreign/);
-		ui.handleInput("\r");
+		ui.handleInput("i");
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.deepEqual(state.mentions, ["refreshed-foreign"]);
 		assert.equal(state.closed, true);
@@ -372,10 +391,10 @@ for (const mode of ["fork", "exclusive"] as const) test(`${mode} ${mode === "for
 test("Create & Run displays a provider failure instead of reporting success", async () => {
 	const state = setup();
 	const manager = new RailAgentManager({
-		dispatch: async () => ({
-			instance: snapshot.agents[0]!.instance,
-			run: { output: "", stopReason: "error", errorMessage: "HTTP 401" },
-		}),
+		dispatch: async (request: any) => {
+			request.onAccepted?.();
+			return { instance: snapshot.agents[0]!.instance, run: { output: "", stopReason: "error", errorMessage: "HTTP 401" } };
+		},
 	} as any, {} as any, {} as any, "/tmp");
 	state.manager.create = manager.create.bind(manager) as typeof state.manager.create;
 	try {
@@ -396,18 +415,22 @@ test("Create & Run displays a provider failure instead of reporting success", as
 	}
 });
 
-function startBackgroundCreate(state: ReturnType<typeof setup>) {
+function startBackgroundCreate(state: ReturnType<typeof setup>, delayedAcceptance = false) {
 	const run = Promise.withResolvers<any>();
 	const requests: any[] = [];
+	const accept = () => {
+		state.snapshot.agents[0].phase = "running";
+		requests[0].onAccepted();
+	};
 	state.manager.create = ((request: any) => {
 		requests.push(request);
 		state.snapshot.agents.unshift({
 			...structuredClone(state.snapshot.agents[0]),
 			instance: { ...state.snapshot.agents[0]!.instance, agentId: "agt_new", alias: request.alias },
 			linkedAliases: [request.alias],
-			phase: "running",
+			phase: "starting",
 		});
-		request.onUpdate?.({ instance: state.snapshot.agents[0]!.instance, run: { output: "(starting...)" } });
+		if (!delayedAcceptance) accept();
 		return run.promise;
 	}) as typeof state.manager.create;
 	const ui = state.component;
@@ -419,10 +442,441 @@ function startBackgroundCreate(state: ReturnType<typeof setup>) {
 	ui.handleInput("\u001b[B");
 	ui.handleInput("\u001b[B");
 	ui.handleInput("\r");
-	return { run, requests };
+	return { run, requests, accept };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+function backgroundContinue(state: ReturnType<typeof setup>) {
+	const run = Promise.withResolvers<any>();
+	state.manager.continue = (...args: any[]) => {
+		state.continuations.push(args);
+		return run.promise;
+	};
+	const accept = () => {
+		const target = state.snapshot.agents.find((agent: RailAgentView) => agent.instance.agentId === state.continuations[0][0]);
+		target.phase = "running";
+		state.continuations[0][3]();
+		state.subscribed!();
+	};
+	return { run, accept };
+}
+
+test("Continue composer opens inline, idle is empty, empty submit and Escape never dispatch or mention", async () => {
+	const state = setup();
+	try {
+		state.component.focused = true;
+		state.component.handleInput("\r");
+		const composer = state.component["control"]!;
+		assert.equal(composer.delivery, "continue");
+		assert.equal(composer.input.getValue(), "");
+		assert.equal(composer.input.focused, true);
+		assert.match(state.component.render(100).join("\n"), /Continue auth-review/);
+		state.component.handleInput("   ");
+		state.component.handleInput("\r");
+		await tick();
+		assert.match(state.component.render(100).join("\n"), /Message cannot be empty/);
+		assert.equal(state.component["control"], composer);
+		state.component.handleInput("\u001b");
+		assert.equal(state.component["control"], undefined);
+		assert.deepEqual(state.continuations, []);
+		assert.deepEqual(state.mentions, []);
+		assert.equal(state.closed, false);
+	} finally { state.component.dispose(); }
+});
+
+for (const phase of ["error", "stopped"] as const) test(`Continue ${phase} prefill is editable at the end, focused and visible in narrow short terminals`, () => {
+	const state = setup(phase, 15);
+	try {
+		state.snapshot.agents[0].errorMessage = "STALE ERROR";
+		state.component.focused = true;
+		state.component.handleInput("\r");
+		const composer = state.component["control"]!;
+		const prefill = prompt("subagent", "manual_continue");
+		assert.equal(composer.input.getValue(), prefill);
+		assert.doesNotMatch(prefill, /STALE ERROR|Review authentication/);
+		state.component.handleInput(" 继续检查");
+		assert.equal(composer.input.getValue(), `${prefill} 继续检查`);
+		for (const width of [73, 80]) {
+			const lines = state.component.render(width);
+			assert.ok(lines.length <= 13);
+			assert.ok(lines.every((line) => visibleWidth(line) <= width));
+			assert.match(lines.join("\n"), /Continue auth-review/);
+			assert.match(lines.join("\n"), /cus-resp\/gpt-5.6-sol:xhigh/);
+			assert.ok(lines.find((line) => line.includes("Message:"))?.includes(CURSOR_MARKER));
+		}
+		state.component.focused = false;
+		assert.equal(composer.input.focused, false);
+		assert.equal(state.component.render(73).some((line) => line.includes(CURSOR_MARKER)), false);
+	} finally { state.component.dispose(); }
+});
+
+test("Continue rejects active, compacting, retrying and foreign/unknown agents without linking", async () => {
+	for (const phase of ["running", "starting", "queued", "in-use-elsewhere", "unknown", "compacting", "retrying"] as const) {
+		const state = setup(phase === "compacting" || phase === "retrying" ? "idle" : phase);
+		let links = 0;
+		state.manager.link = async () => { links++; return state.snapshot.agents[0].instance; };
+		if (phase === "compacting") state.snapshot.agents[0].isCompacting = true;
+		if (phase === "retrying") state.snapshot.agents[0].retry = { attempt: 1, maxAttempts: 5, nextAt: Date.now() + 10_000, source: "rail", error: "503" };
+		try {
+			state.component.handleInput("\r");
+			await tick();
+			assert.equal(state.component["control"], undefined, phase);
+			assert.match(state.component.render(160).join("\n"), /ownership|wait|Steer \/ Follow-up/);
+			assert.equal(links, 0);
+			assert.deepEqual(state.continuations, []);
+			assert.deepEqual(state.mentions, []);
+		} finally { state.component.dispose(); }
+	}
+});
+
+for (const rows of [15, 22, 23, 24, 30]) test(`Continue composer fits the overlay at ${rows} rows with multiple agents and retained metadata`, () => {
+	const state = setup("error", rows);
+	state.snapshot.agents = Array.from({ length: 8 }, (_, index) => ({
+		...structuredClone(state.snapshot.agents[0]),
+		instance: { ...state.snapshot.agents[0].instance, agentId: `agt_${index}`, alias: `review-${index}`, lastOutput: "Retained final answer with 中文 metadata", fastMode: true },
+		linkedAliases: [`review-${index}`],
+		errorMessage: "Retained provider error",
+		retryCount: 2,
+	}));
+	state.snapshot.counts.linked = state.snapshot.counts.global = 8;
+	try {
+		state.component["selectedIndex"] = 4;
+		state.component.focused = true;
+		state.component.handleInput("\r");
+		state.component.handleInput(" 继续检查");
+		// Pi clamps maxHeight against the terminal height and the two one-row margins.
+		const height = Math.min(Math.floor(rows * 88 / 100), rows - 2);
+		for (const search of ["", "project", "no matching rows"]) {
+			state.component["searchInput"].setValue(search);
+			for (const notice of ["", "Retained startup rejection"]) {
+				state.component["notice"] = notice;
+				for (const width of [73, Math.floor(73 * 92 / 100)]) {
+					const lines = state.component.render(width);
+					const screen = lines.slice(0, height);
+					assert.ok(screen.find((line) => line.includes("Message:"))?.includes(CURSOR_MARKER), `${rows} rows, ${width} columns, search=${search}: cursor must survive overlay clipping`);
+					assert.ok(lines.length <= height, `${rows} rows: ${lines.length} lines exceed the ${height}-line overlay`);
+					assert.ok(screen.every((line) => visibleWidth(line) <= width));
+					assert.match(screen.join("\n"), /Continue review-4/);
+					assert.match(screen.join("\n"), /cus-resp\/gpt-5.6-sol:xhigh/);
+					assert.match(screen.join("\n"), /enter send · esc cancel/);
+					if (search !== "no matching rows") assert.match(screen.join("\n"), /→ review-4/);
+				}
+			}
+		}
+		assert.equal(state.component["control"]?.agentId, "agt_4");
+		assert.ok(state.snapshot.agents.every((agent: RailAgentView) => agent.instance.lastOutput && agent.errorMessage));
+	} finally { state.component.dispose(); }
+});
+
+test("accepted Continue clears its startup notice while the run remains pending", async () => {
+	const state = setup();
+	const { run, accept } = backgroundContinue(state);
+	try {
+		state.component.handleInput("\r");
+		state.component.handleInput("next task");
+		state.component.handleInput("\r");
+		await tick();
+		assert.match(state.component.render(100).join("\n"), /Starting continuation/);
+		accept();
+		await tick();
+		assert.equal(state.component["control"], undefined);
+		assert.equal(state.component["busy"], false);
+		assert.match(state.component.render(100).join("\n"), /RUNNING/);
+		assert.doesNotMatch(state.component.render(100).join("\n"), /Starting continuation/);
+		assert.deepEqual(state.notifications, []);
+		run.resolve({ instance: state.snapshot.agents[0].instance, run: { output: "done" } });
+		await tick();
+		assert.match(state.component.render(100).join("\n"), /finished its continuation: done/);
+	} finally { state.component.dispose(); }
+});
+
+for (const failed of [false, true]) test(`accepted Continue preserves an immediately settled ${failed ? "failure" : "success"} notice`, async () => {
+	const state = setup();
+	state.manager.continue = (...args: any[]) => {
+		state.continuations.push(args);
+		args[3]();
+		return failed ? Promise.reject(new Error("HTTP 401")) : Promise.resolve({ instance: state.snapshot.agents[0].instance, run: { output: "done" } });
+	};
+	try {
+		state.component.handleInput("\r");
+		state.component.handleInput("next task");
+		state.component.handleInput("\r");
+		await tick();
+		assert.equal(state.component["control"], undefined);
+		assert.equal(state.component["busy"], false);
+		const message = failed ? "Agent auth-review failed its continuation: HTTP 401" : "Agent auth-review finished its continuation: done";
+		assert.equal(state.component["notice"], message);
+		assert.ok(state.component.render(100).join("\n").includes(message));
+		assert.deepEqual(state.notifications, [{ message, type: failed ? "error" : "info" }]);
+	} finally { state.component.dispose(); }
+});
+
+test("Continue revalidates a fresh pinned target before submission and retains text on state changes", async () => {
+	for (const phase of ["running", "starting", "queued", "in-use-elsewhere", "unknown", "compacting", "retrying", "deleted"] as const) {
+		const state = setup();
+		try {
+			state.component.handleInput("\r");
+			state.component.handleInput("my continuation");
+			const next = structuredClone(state.snapshot);
+			if (phase === "deleted") next.agents = [];
+			else if (phase === "compacting") next.agents[0].isCompacting = true;
+			else if (phase === "retrying") next.agents[0].retry = { attempt: 1, maxAttempts: 5, source: "pi", error: "503" };
+			else next.agents[0].phase = phase;
+			state.manager.snapshot = async () => next;
+			state.component.handleInput("\r");
+			await tick();
+			assert.equal(state.component["control"]?.input.getValue(), "my continuation", phase);
+			assert.deepEqual(state.continuations, []);
+			assert.deepEqual(state.mentions, []);
+		} finally { state.component.dispose(); }
+	}
+});
+
+test("Continue pins original agentId across reordered or empty lists and double Enter dispatches exactly once", async () => {
+	const state = setup();
+	const { run, accept } = backgroundContinue(state);
+	try {
+		state.component.handleInput("\r");
+		state.component.handleInput("  next task  ");
+		state.snapshot.agents.unshift({ ...structuredClone(state.snapshot.agents[0]), instance: { ...state.snapshot.agents[0].instance, agentId: "agt_other", alias: "other" }, linkedAliases: ["other"] });
+		state.component["searchInput"].setValue("no matching rows");
+		assert.match(state.component.render(100).join("\n"), /Continue auth-review/);
+		state.component.handleInput("\r");
+		state.component.handleInput("\r");
+		await tick();
+		assert.equal(state.continuations.length, 1);
+		assert.deepEqual(state.continuations[0].slice(0, 3), ["agt_auth", "next task", undefined]);
+		assert.equal(typeof state.continuations[0][3], "function");
+		assert.equal(state.component["control"]?.input.getValue(), "  next task  ", "delayed acceptance retains the composer");
+		state.snapshot.agents[1].phase = "running";
+		state.subscribed!();
+		await tick();
+		assert.equal(state.component["busy"], true, "an unrelated running snapshot is not this dispatch's acceptance");
+		assert.equal(state.component["control"]?.input.getValue(), "  next task  ");
+		accept();
+		await tick();
+		assert.equal(state.component["busy"], false, "returns promptly without provider output or completion");
+		assert.equal(state.component["control"], undefined);
+		state.component.handleInput("\r");
+		assert.equal(state.continuations.length, 1);
+		assert.deepEqual(state.mentions, []);
+		run.resolve({ instance: state.snapshot.agents[1].instance, run: { output: "All\ngood" } });
+		await tick();
+		assert.deepEqual(state.notifications, [{ message: "Agent auth-review finished its continuation: All good", type: "info" }]);
+	} finally { state.component.dispose(); }
+});
+
+test("Continue rejection before acceptance preserves editable text and does not notify completion", async () => {
+	const state = setup();
+	const { run } = backgroundContinue(state);
+	try {
+		state.component.handleInput("\r");
+		state.component.handleInput("my task");
+		state.component.handleInput("\r");
+		await tick();
+		run.reject(new Error("lease unavailable"));
+		await tick();
+		assert.match(state.component.render(100).join("\n"), /lease unavailable/);
+		state.component.handleInput(" edited");
+		assert.equal(state.component["control"]?.input.getValue(), "my task edited");
+		assert.deepEqual(state.notifications, []);
+	} finally { state.component.dispose(); }
+});
+
+for (const mode of ["startup", "rpc-startup", "rpc-prompt", "team"] as const) test(`Continue retains text on real broker ${mode} rejection`, async () => {
+	const dir = await mkdtemp(join(tmpdir(), "rail-continue-guard-"));
+	const store = new FileAgentInstanceStore(dir);
+	const roster = new SessionAgentRoster();
+	let sends = 0;
+	const rpcFixture = fileURLToPath(new URL("../fixtures/fake-pi-rpc.mjs", import.meta.url));
+	const rpcFactory = createRpcWorkerFactory({ stateDir: dir, resolveInvocation: (args) => ({ command: process.execPath, args: mode === "rpc-prompt" ? [rpcFixture, ...args] : ["-e", "process.exit(1)"] }) });
+	const broker = new SessionBroker({ store, roster, defaultCwd: dir, workerFactory: async (spec) => {
+		if (mode === "startup") throw new Error("worker startup failed");
+		if (mode === "rpc-startup" || mode === "rpc-prompt") return rpcFactory(spec);
+		return {
+			sessionId: "team-child", sessionFile: join(dir, "team.jsonl"), stop: async () => undefined,
+			send: async () => { sends++; return { output: "must not run", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } }; },
+			openTeamMemberV2: async () => ({ runActivation: async () => undefined, terminate: () => undefined, close: async () => undefined }),
+		};
+	} });
+	const state = setup("stopped");
+	try {
+		if (mode === "team") await broker.openTeamMember({ binding: { version: 2, teamId: "team-test", memberId: "auth-review", epoch: "test" }, model: models[0], cwd: dir, loadout: loadoutFor("auth-review") });
+		else {
+			const saved = { ...structuredClone(snapshot.agents[0]!.instance), cwd: dir, sessionFile: join(dir, "session.jsonl"), model: mode === "rpc-prompt" ? { ...models[0], modelId: "gpt-5.6-luna" } : models[0] };
+			await store.put(saved);
+			roster.link(saved.alias, saved.agentId);
+		}
+		const manager = new RailAgentManager(broker, store, roster, dir);
+		state.component["options"].manager = manager;
+		state.component["snapshot"] = await manager.snapshot();
+		state.component.handleInput("\r");
+		const composer = state.component["control"]!;
+		assert.ok(composer);
+		const text = mode === "rpc-prompt" ? "reject prompt before acceptance" : "keep my continuation";
+		composer.input.setValue(text);
+		state.component.handleInput("\r");
+		for (let attempt = 0; attempt < 100 && state.component["busy"]; attempt++) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(state.component["busy"], false);
+		assert.equal(state.component["control"], composer);
+		assert.equal(composer.input.getValue(), text);
+		assert.match(state.component.render(160).join("\n"), mode === "team" ? /Team-owned/ : mode === "rpc-startup" ? /exited/ : mode === "rpc-prompt" ? /fixture prompt rejected/ : /worker startup failed/);
+		assert.equal(sends, 0);
+		assert.deepEqual(state.notifications, []);
+		assert.deepEqual(state.mentions, []);
+	} finally {
+		state.component.dispose();
+		await broker.shutdown();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+for (const failed of [false, true]) test(`Continue stays alive after close and reports ${failed ? "failure" : "success"} during normal retry`, async () => {
+	const state = setup();
+	const { run, accept } = backgroundContinue(state);
+	state.component.handleInput("\r");
+	state.component.handleInput("next task");
+	state.component.handleInput("\r");
+	await tick();
+	accept();
+	await tick();
+	state.snapshot.agents[0].retry = { attempt: 1, maxAttempts: 5, nextAt: Date.now() + 10_000, source: "rail", error: "503 temporary" };
+	state.subscribed!();
+	await tick();
+	assert.match(state.component.render(160).join("\n"), /Retrying 1\/5/);
+	state.component.handleInput("\u001b");
+	assert.equal(state.closed, true);
+	state.component.dispose();
+	assert.equal(state.continuations[0][2], undefined, "no popup abort signal");
+	if (failed) run.reject(new Error("HTTP 401"));
+	else run.resolve({ instance: state.snapshot.agents[0].instance, run: { output: "finished" } });
+	await tick();
+	assert.deepEqual(state.notifications, [{ message: failed ? "Agent auth-review failed its continuation: HTTP 401" : "Agent auth-review finished its continuation: finished", type: failed ? "error" : "info" }]);
+});
+
+test("closing during Continue startup does not cancel a dispatched run; stale notify cannot reject unhandled", async () => {
+	for (const failed of [false, true]) {
+		const state = setup();
+		const { run } = backgroundContinue(state);
+		state.component.handleInput("\r");
+		state.component.handleInput("next task");
+		state.component.handleInput("\r");
+		await tick();
+		state.component.handleInput("\u001b");
+		assert.equal(state.closed, true);
+		state.component.dispose();
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			state.ctx.ui.notify = () => { throw new Error("stale UI"); };
+			state.continuations[0][3]();
+			if (failed) run.reject(new Error("HTTP 401"));
+			else run.resolve({ instance: state.snapshot.agents[0].instance, run: { output: "finished" } });
+			await tick();
+			await tick();
+			assert.deepEqual(unhandled, []);
+		} finally { process.off("unhandledRejection", onUnhandled); }
+	}
+});
+
+test("All Persistent Continue does not link before dispatch; separate i Mention links and closes", async () => {
+	const state = setup();
+	state.snapshot.agents[0].linkedToCurrentSession = false;
+	state.snapshot.agents[0].linkedAliases = [];
+	let links = 0;
+	state.manager.link = async () => { links++; return state.snapshot.agents[0].instance; };
+	try {
+		state.component.handleInput("\u001b[C");
+		state.component.handleInput("\r");
+		assert.equal(state.component["control"]?.agentId, "agt_auth");
+		state.component.handleInput("\u001b");
+		assert.equal(links, 0);
+		state.component.handleInput("i");
+		await tick();
+		assert.equal(links, 1);
+		assert.deepEqual(state.mentions, ["auth-review"]);
+		assert.equal(state.closed, true);
+		assert.deepEqual(state.continuations, []);
+	} finally { state.component.dispose(); }
+});
+
+test("Create & Run waits for explicit acceptance and repeated Enter starts only one dispatch", async () => {
+	const state = setup();
+	const { run, requests, accept } = startBackgroundCreate(state, true);
+	try {
+		state.component.handleInput("\r");
+		await tick();
+		assert.equal(requests.length, 1);
+		assert.equal(requests[0].onUpdate, undefined, "progress is not used as an acceptance signal");
+		assert.equal(typeof requests[0].onAccepted, "function");
+		assert.equal(state.component["busy"], true);
+		assert.equal(state.component["form"].task, "review");
+		accept();
+		await tick();
+		assert.equal(state.component["busy"], false);
+		assert.equal(state.component["form"].task, "");
+		run.resolve({ instance: state.snapshot.agents[0].instance, run: { output: "done" } });
+		await tick();
+		assert.equal(state.notifications.length, 1);
+	} finally { state.component.dispose(); }
+});
+
+test("Create & Run rejection before acceptance retains its first task and reports only inline", async () => {
+	const state = setup();
+	const { run } = startBackgroundCreate(state, true);
+	try {
+		await tick();
+		run.reject(new Error("prompt rejected before acceptance"));
+		await tick();
+		assert.equal(state.component["busy"], false);
+		assert.equal(state.component["form"].task, "review");
+		assert.equal(state.component["tab"], "create");
+		assert.match(state.component.render(100).join("\n"), /prompt rejected before acceptance/);
+		assert.deepEqual(state.notifications, []);
+	} finally { state.component.dispose(); }
+});
+
+for (const action of ["Continue", "Create"] as const) test(`${action} notifies an immediate native error even without a worker acceptance event`, async () => {
+	const dir = await mkdtemp(join(tmpdir(), "rail-immediate-error-"));
+	const store = new FileAgentInstanceStore(dir);
+	const roster = new SessionAgentRoster();
+	const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 };
+	let sends = 0;
+	const broker = new SessionBroker({ store, roster, defaultCwd: dir, workerFactory: async () => ({
+		sessionId: "immediate-session", sessionFile: join(dir, "immediate.jsonl"), stop: async () => undefined,
+		send: async () => { sends++; return { output: "", usage, stopReason: "error", errorMessage: "HTTP 401" }; },
+	}) });
+	const state = setup();
+	try {
+		if (action === "Continue") await broker.attach({ model: models[0], alias: "auth-review", cwd: dir });
+		const manager = new RailAgentManager(broker, store, roster, dir);
+		state.component["options"].manager = manager;
+		state.component["snapshot"] = await manager.snapshot();
+		if (action === "Continue") {
+			state.component.handleInput("\r");
+			state.component.handleInput("next task");
+		} else {
+			state.component.handleInput("n");
+			state.component["form"].cwd = dir;
+			state.component["form"].task = "first task";
+			state.component["formIndex"] = state.component["formFields"]().length - 1;
+		}
+		const alias = action === "Continue" ? "auth-review" : state.component["form"].alias;
+		state.component.handleInput("\r");
+		state.component.handleInput("\r");
+		for (let attempt = 0; attempt < 100 && state.component["busy"]; attempt++) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(state.component["busy"], false);
+		assert.equal(state.component["control"], undefined);
+		assert.equal(sends, 1);
+		assert.deepEqual(state.notifications, [{ message: `Agent ${alias} failed its ${action === "Continue" ? "continuation" : "first task"}: HTTP 401`, type: "error" }]);
+	} finally {
+		state.component.dispose();
+		await broker.shutdown();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
 
 test("Create & Run returns control while the first task runs and notifies when it finishes", async () => {
 	const state = setup();
@@ -948,12 +1402,14 @@ for (const [key, title, method] of [
 	}
 });
 
-test("every action key stays visible in the help rows at 80 columns", () => {
+test("every action key stays visible in the help rows at 73 and 80 columns", () => {
 	const state = setup();
 	try {
-		const agentHelp = state.component.render(80).join("\n");
-		for (const label of ["↑↓ select", "enter continue", "/ search", "g steer", "f follow-up", "n new", "s stop", "d detach", "x delete", "m model", "t thinking", "shift+f fast"]) {
-			assert.ok(agentHelp.includes(label), label);
+		for (const width of [73, 80]) {
+			const agentHelp = state.component.render(width).join("\n");
+			for (const label of ["↑↓ select", "enter Continue", "i Mention", "/ search", "g steer", "f follow-up", "n new", "s stop", "d detach", "x delete", "m model", "t thinking", "shift+f fast", "esc close"]) {
+				assert.ok(agentHelp.includes(label), `${width}: ${label}`);
+			}
 		}
 		state.component.handleInput("n");
 		const createHelp = state.component.render(80).join("\n");
@@ -982,8 +1438,10 @@ test("search mode: enter acts on the first match and down keeps the first match 
 		ui.handleInput("/");
 		ui.handleInput("\r");
 		await new Promise((resolve) => setImmediate(resolve));
-		assert.deepEqual(state.mentions, ["beta"]);
-		assert.equal(state.closed, true);
+		assert.match(ui.render(100).join("\n"), /Continue beta/);
+		assert.equal(ui["control"]?.agentId, "agt_beta");
+		assert.deepEqual(state.mentions, []);
+		assert.equal(state.closed, false);
 	} finally {
 		state.component.dispose();
 	}

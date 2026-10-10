@@ -41,6 +41,11 @@ process.stdin.on("data", (chunk) => {
 				write({ type: "response", id: command.id, command: "prompt", success: true });
 				continue;
 			}
+			if (command.message === "reject prompt before acceptance") {
+				for (let index = 0; index < 2; index++) write({ type: "message_end", message: { role: "user", content: command.message } });
+				write({ type: "response", id: command.id, command: "prompt", success: false, error: "fixture prompt rejected" });
+				continue;
+			}
 			write({ type: "response", id: command.id, command: "prompt", success: true });
 			write({ type: "agent_start" });
 			write({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fixture done" }] } });

@@ -68,6 +68,26 @@ test("manager create and continue propagate failed or aborted run outcomes", asy
 	}
 });
 
+test("manager Continue and Create forward logical acceptance while preserving signal and existing callers", async () => {
+	const agent = instance("agt_test", "test", "/tmp/test.jsonl");
+	const controller = new AbortController();
+	let accepted = 0;
+	const requests: unknown[] = [];
+	const result = { instance: agent, run: { output: "done" } };
+	const manager = new RailAgentManager({ dispatch: async (request: any) => {
+		requests.push(request);
+		request.onAccepted?.();
+		return result;
+	} } as any, {} as any, {} as any, "/tmp");
+	const onAccepted = () => { accepted++; };
+	assert.equal(await manager.continue(agent.agentId, "next", controller.signal, onAccepted), result);
+	await manager.continue(agent.agentId, "old caller");
+	const create = { model: agent.model, alias: agent.alias, cwd: agent.cwd, task: "first", signal: controller.signal, onAccepted };
+	assert.equal(await manager.create(create), result);
+	assert.deepEqual(requests, [{ target: agent.agentId, task: "next", signal: controller.signal, onAccepted }, { target: agent.agentId, task: "old caller" }, create]);
+	assert.equal(accepted, 2);
+});
+
 test("manager exposes compaction activity without changing the running phase or count", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-compacting-"));
 	try {

@@ -54,6 +54,7 @@ export interface CreateRailAgentRequest {
 	session?: SessionSource;
 	fastMode?: boolean;
 	onUpdate?: (progress: DispatchProgress) => void;
+	onAccepted?: () => void;
 	signal?: AbortSignal;
 }
 
@@ -150,8 +151,8 @@ export class RailAgentManager {
 		return this.dispatch(request);
 	}
 
-	continue(target: string, task: string, signal?: AbortSignal): Promise<DispatchResult> {
-		return this.dispatch({ target, task, ...(signal ? { signal } : {}) });
+	continue(target: string, task: string, signal?: AbortSignal, onAccepted?: () => void): Promise<DispatchResult> {
+		return this.dispatch({ target, task, ...(signal ? { signal } : {}), ...(onAccepted ? { onAccepted } : {}) });
 	}
 
 	async control(target: string, request: WorkerControlRequest, signal?: AbortSignal): Promise<ControlResult> {

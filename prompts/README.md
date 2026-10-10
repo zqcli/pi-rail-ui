@@ -7,6 +7,12 @@ notices and event messages, compaction instructions) lives here; code reads it w
 
 Files: `apply-patch.md`, `subagent.md`, `team.md`, `gpt-compaction.md`.
 
+`subagent.md#manual_continue` is the editable `/rail-agent` Continue prefill for error/stopped persistent
+members. Idle members start blank. This manual new dispatch is distinct from `retry_continuation` (automatic
+provider recovery); it takes no error/task placeholders and does not repeat the original task.
+`subagent.md#manual_continue` 是 error/stopped persistent 成员的可编辑 Continue 预填文本；idle 默认为空。
+它是新的手动 dispatch，与自动 provider 恢复的 `retry_continuation` 分开，不插入旧错误或重放原任务。
+
 ## Format / 格式
 
 - `## <key>` starts an entry (`[a-z0-9_.-]+`, unique per file); its body runs to the next `## ` heading or EOF.

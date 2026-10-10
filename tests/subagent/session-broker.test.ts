@@ -50,6 +50,75 @@ test("ordinary dispatch preserves the native run and usage objects", async () =>
 	} finally { await broker.shutdown(); }
 });
 
+test("dispatch acknowledges once while each accepted retry attempt still rearms live controls", async () => {
+	const { broker, workers } = setup();
+	let accepted = 0;
+	try {
+		const agent = await broker.attach({ model: reviewerModel(), alias: "accept-once" });
+		const worker = workers[0]!;
+		worker.send = async (_task, options) => {
+			options?.onUpdate?.({ output: "pre-accept progress", usage: emptyUsage() });
+			assert.equal(accepted, 0, "neither initial nor worker progress is acceptance");
+			for (const message of ["first attempt", "retry attempt"]) {
+				options?.onAccepted?.();
+				assert.equal(accepted, 1);
+				assert.equal(broker.runtimeStatus(agent.agentId).phase, "running");
+				await broker.control({ target: agent.agentId, delivery: "steer", message });
+				options?.onSettled?.();
+				await assert.rejects(broker.control({ target: agent.agentId, delivery: "steer", message: "between attempts" }), /not currently running/);
+			}
+			return { output: "recovered", usage: emptyUsage() };
+		};
+		await broker.dispatch({ target: agent.agentId, task: "recover", onAccepted: () => { accepted++; }, onUpdate: () => { assert.ok(accepted <= 1); } });
+		assert.equal(accepted, 1, "normal return does not acknowledge a second time");
+		assert.deepEqual(worker.controls.map((control) => control.message), ["first attempt", "retry attempt"]);
+	} finally { await broker.shutdown(); }
+});
+
+test("dispatch acknowledges normally returned immediate success/error without a worker acceptance event", async () => {
+	for (const error of [false, true]) {
+		const { broker, workers } = setup();
+		let accepted = 0;
+		try {
+			const agent = await broker.attach({ model: reviewerModel(), alias: "immediate" });
+			workers[0]!.send = async () => {
+				assert.equal(accepted, 0);
+				return { output: error ? "" : "done", usage: emptyUsage(), ...(error ? { stopReason: "error" as const, errorMessage: "HTTP 401" } : {}) };
+			};
+			const result = await broker.dispatch({ target: agent.agentId, task: "immediate", onAccepted: () => { accepted++; } });
+			assert.equal(accepted, 1);
+			assert.equal(result.run.errorMessage, error ? "HTTP 401" : undefined);
+		} finally { await broker.shutdown(); }
+	}
+});
+
+test("dispatch never acknowledges worker startup or prompt/transport rejection even after progress", async () => {
+	for (const startup of [false, true]) {
+		let rejectStartup = false;
+		const worker = new FakeWorker("rejected-session", "/tmp/rejected-session.jsonl");
+		const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory: async () => {
+			if (rejectStartup) throw new Error("worker startup rejected");
+			return worker;
+		} });
+		let accepted = 0;
+		let updates = 0;
+		try {
+			const agent = await broker.attach({ model: reviewerModel(), alias: "reject" });
+			if (startup) {
+				await broker.stop(agent.agentId);
+				rejectStartup = true;
+			} else worker.send = async (_task, options) => {
+				options?.onUpdate?.({ output: "pre-accept event", usage: emptyUsage() });
+				options?.onUpdate?.({ output: "another pre-accept event", usage: emptyUsage() });
+				throw new Error("prompt rejected");
+			};
+			await assert.rejects(broker.dispatch({ target: agent.agentId, task: "rejected", onAccepted: () => { accepted++; }, onUpdate: () => { updates++; } }), /rejected/);
+			assert.equal(accepted, 0);
+			assert.equal(updates, startup ? 1 : 3);
+		} finally { await broker.shutdown(); }
+	}
+});
+
 test("direct broker callers get the normalized contextWindow, never a raw null", async () => {
 	const worker = new FakeWorker("normalized", "/tmp/normalized.jsonl");
 	const options: Array<WorkerSendOptions | undefined> = [];

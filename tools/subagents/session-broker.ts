@@ -174,6 +174,8 @@ export interface DispatchRequest {
 	fastMode?: boolean | null;
 	signal?: AbortSignal;
 	onUpdate?: (progress: DispatchProgress) => void;
+	/** Once per logical dispatch: worker acceptance or a normally returned run, never startup/progress. */
+	onAccepted?: () => void;
 }
 
 export interface DispatchResult {
@@ -454,6 +456,12 @@ export class SessionBroker {
 			const currentState = await this.workerState(resolvedInstance, expectedEpoch);
 			state = currentState;
 			return await this.enqueue(currentState, async () => {
+				let accepted = false;
+				const acknowledge = () => {
+					if (accepted) return;
+					accepted = true;
+					request.onAccepted?.();
+				};
 				// Model changes share this queue. Validate the descriptor paired with
 				// this worker, not the earlier store snapshot used to resolve the target.
 				if (contextWindow !== undefined) {
@@ -489,6 +497,7 @@ export class SessionBroker {
 							currentState.activeRunAccepted = true;
 							this.emitRuntimeChange();
 						}
+						acknowledge();
 					},
 					onSettled: () => {
 						currentState.activeRunId = undefined;
@@ -496,6 +505,8 @@ export class SessionBroker {
 						this.emitRuntimeChange();
 					},
 				});
+				// An immediate native result can settle before the worker emits onAccepted.
+				acknowledge();
 				currentState.activeRunId = undefined;
 				currentState.activeRunAccepted = false;
 				currentState.isCompacting = false;

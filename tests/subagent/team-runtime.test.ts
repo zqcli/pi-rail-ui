@@ -1487,11 +1487,11 @@ test("C07/C08/C10: cancel only the selected subtree, keep same-member roots, and
 
 	assert.equal(runtime.nativeSettled(target.binding, target.scope.activationId, { status: "success" }).ok, true);
 	assert.equal(runtime.cleanupFinished(target.binding, target.scope.activationId, { ok: true }).ok, true);
+	const releasedConsumer = runtime.takeNextActivation(teamId)!;
+	assert.deepEqual(workRef(releasedConsumer), consumerRef, "the resumed dependent is scheduled ahead of a fresh root");
 	const unrelated = runtime.takeNextActivation(teamId)!;
 	assert.equal(unrelated.binding.memberId, "w1");
 	assert.equal(unrelated.input.scope.kind === "work" && unrelated.input.scope.task, "keep this unrelated root");
-	const releasedConsumer = runtime.takeNextActivation(teamId)!;
-	assert.deepEqual(workRef(releasedConsumer), consumerRef);
 	assert.ok(releasedConsumer.input.outcomes.some((outcome) => outcome.work.workId === targetRef.workId
 		&& outcome.work.revision === targetRef.revision && outcome.state === "cancelled"),
 	"the dependent receives the cancelled outcome only after target cleanup is confirmed");
@@ -2420,7 +2420,7 @@ test("prepare takes members plus a lead pointer; the retired manager/workers sha
 	assert.equal(code(action(runtime, boot, 4, "pause-other", { action: "control", command: "pause_member", memberId: "lead" })), undefined, "any other member can be paused");
 });
 
-test("the lead takes a work request from another member as a work activation, and its pending Team events are processed first", () => {
+test("the lead takes a work request from another member as a work activation, alternating it with its pending Team events", () => {
 	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "first root" }, { to: "w2", task: "second root" }]);
 	finishManagerBoot(runtime, teamId);
 	const w1 = runtime.takeNextActivation(teamId)!;
@@ -2435,16 +2435,8 @@ test("the lead takes a work request from another member as a work activation, an
 	settle(runtime, w1, "wait-lead");
 	reply(runtime, w2, "w2-reply", "second done");
 
-	// The lead has a queued work and a pending Team event (w2's root result): the event comes first.
-	const events = runtime.takeNextActivation(teamId)!;
-	assert.equal(events.scope.kind, "events");
-	assert.equal(events.binding.memberId, "lead");
-	assert.ok(events.input.scope.kind === "events" && events.input.scope.events.some((event) => event.kind === "ROOT_RESULT_READY"));
-	inputReady(runtime, events);
-	assert.equal(action(runtime, events, 1, "events-yield", { action: "yield" }).ok, true);
-	settle(runtime, events, "events-yield");
-	assert.equal(runtime.panelFacts(teamId).pendingEvents, 0, "the event batch was processed");
-
+	// The lead has a queued work and a pending Team event (w2's root result). Its last activation was the
+	// boot events batch, so the work w1 waits on goes first; the advisory result event follows.
 	const work = runtime.takeNextActivation(teamId)!;
 	assert.equal(work.scope.kind, "work");
 	assert.equal(work.binding.memberId, "lead");
@@ -2453,43 +2445,53 @@ test("the lead takes a work request from another member as a work activation, an
 		&& work.input.scope.parent?.workId === w1.scope.work!.workId);
 	assert.match(work.input.notice, /^Current work: /u, "a work activation of the lead carries the work notice, not the events notice");
 	reply(runtime, work, "lead-reply", "Use fixture A.");
+	const events = runtime.takeNextActivation(teamId)!;
+	assert.equal(events.scope.kind, "events");
+	assert.equal(events.binding.memberId, "lead");
+	assert.ok(events.input.scope.kind === "events" && events.input.scope.events.some((event) => event.kind === "ROOT_RESULT_READY"));
+	inputReady(runtime, events);
 	const woken = runtime.takeNextActivation(teamId)!;
-	assert.equal(woken.binding.memberId, "w1");
+	assert.equal(woken.binding.memberId, "w1", "the woken requester runs beside the lead's events activation");
 	assert.deepEqual(woken.input.outcomes.map((outcome) => outcome.work), [child], "the requester receives the lead's result like any other member's");
+	assert.equal(action(runtime, events, 1, "events-yield", { action: "yield" }).ok, true);
+	settle(runtime, events, "events-yield");
+	assert.equal(runtime.panelFacts(teamId).pendingEvents, 0, "the event batch was processed");
 	runtime.assertInvariants(teamId);
 });
 
-test("workPermits bounds work activations of every member, the lead's included; the lead's event activation has its own slot", () => {
+test("workPermits bounds work activations of the other members; the lead's event and work activations share their own slot", () => {
 	const { runtime, teamId } = makeRuntime([{ to: "w1", task: "root" }], { limits: { workPermits: 1 } });
 	finishManagerBoot(runtime, teamId);
 	const w1 = runtime.takeNextActivation(teamId)!;
 	inputReady(runtime, w1);
-	const toLead = action(runtime, w1, 1, "to-lead", { action: "request", to: "lead", task: "lead sub-task" });
-	const toW2 = action(runtime, w1, 2, "to-w2", { action: "request", to: "w2", task: "w2 sub-task" });
+	const toW2 = action(runtime, w1, 1, "to-w2", { action: "request", to: "w2", task: "w2 sub-task" });
+	const toLead = action(runtime, w1, 2, "to-lead", { action: "request", to: "lead", task: "lead sub-task" });
 	assert.ok(toLead.ok && toLead.receipt?.status === "accepted" && toW2.ok && toW2.receipt?.status === "accepted");
-	assert.equal(runtime.takeNextActivation(teamId), undefined, "w1 holds the only work permit");
+	// w1 holds the only permit, yet the lead's work starts: the lead is one serial actor outside workPermits.
+	const leadWork = runtime.takeNextActivation(teamId)!;
+	assert.equal(leadWork.scope.kind, "work");
+	assert.equal(leadWork.binding.memberId, "lead", "the lead's sub-task needs no work permit, though w2's was requested first");
+	inputReady(runtime, leadWork);
+	assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "lead")?.currentWork?.workId, toLead.receipt.work.workId);
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "w1 holds the only work permit, so w2's work waits");
+	runtime.assertInvariants(teamId);
+	assert.equal(action(runtime, leadWork, 1, "lead-reply", { action: "reply", result: { status: "succeeded", summary: "done" } }).ok, true);
+	settle(runtime, leadWork, "lead-reply");
 
-	// An event for the lead does not need a work permit.
+	// An event for the lead does not need a work permit either.
 	runtime.hostControl(teamId).message_lead("check in");
 	const events = runtime.takeNextActivation(teamId)!;
 	assert.equal(events.scope.kind, "events");
 	inputReady(runtime, events);
 	assert.equal(action(runtime, events, 1, "events-yield", { action: "yield" }).ok, true);
 	settle(runtime, events, "events-yield");
-	assert.equal(runtime.takeNextActivation(teamId), undefined, "still no permit for the queued sub-tasks");
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "still no permit for w2's queued sub-task");
 
 	assert.equal(action(runtime, w1, 3, "wait-both", { action: "yield", waitingFor: [toLead.receipt.work, toW2.receipt.work], checkpoint: "waiting" }).ok, true);
 	settle(runtime, w1, "wait-both");
-	const leadWork = runtime.takeNextActivation(teamId)!;
-	assert.equal(leadWork.scope.kind, "work");
-	assert.equal(leadWork.binding.memberId, "lead", "FIFO: the lead's sub-task was requested first");
-	inputReady(runtime, leadWork);
-	assert.equal(runtime.takeNextActivation(teamId), undefined, "the lead's work activation holds the permit, so w2's work waits");
-	runtime.assertInvariants(teamId);
-	assert.equal(action(runtime, leadWork, 1, "lead-reply", { action: "reply", result: { status: "succeeded", summary: "done" } }).ok, true);
-	settle(runtime, leadWork, "lead-reply");
 	const w2Work = runtime.takeNextActivation(teamId)!;
-	assert.equal(w2Work.binding.memberId, "w2", "the permit freed by the lead's work goes to the next member");
+	assert.equal(w2Work.binding.memberId, "w2", "the permit freed by w1's yield goes to the next member");
+	runtime.assertInvariants(teamId);
 });
 
 const pausesOf = (runtime: TeamRuntime, teamId: string) => runtime.getTeam(teamId).members.map((member) => `${member.id}:${member.pause}`);

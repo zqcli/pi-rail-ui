@@ -48,6 +48,8 @@ export const TEAM_TIMELINE_HEAD = 30;
 /** Waits before each in-place retry of a transient provider error; the lead keeps retrying every 5 minutes until its window ends. */
 const RETRY_DELAYS_MS = [10_000, 30_000, 60_000, 120_000, 300_000];
 const LEAD_RETRY_WINDOW_MS = 30 * 60_000;
+/** A fresh work queued this long competes for a work permit like resumed work, so priority never starves it. */
+const READY_AGING_MS = 10 * 60_000;
 /** Names the exact work, because a member's session outlives its works and a model may answer an earlier one. */
 /** Events that only advise the lead: they never block close_team and are marked processed when the Team closes. */
 const ADVISORY_EVENTS: readonly string[] = ["REVIEW_READY", "TEAM_QUIESCENT", "COMPACTION"];
@@ -233,6 +235,8 @@ interface RuntimeMember extends MemberRecord {
 	policy: TeamMemberPolicy;
 	epoch: string;
 	active?: ActiveActivation;
+	/** Kind of the last activation reserved for this member: an idle lead alternates its runnable work with event batches. */
+	lastActivationKind?: "events" | "work";
 	lastActivation?: CompletedActivationTombstone;
 	lastLostActivation?: { activationId: string; error: WorkError; resourceReleased: boolean; reason: ActivationCompletionReason };
 	/** Transient provider errors since the last successful completion; nothing is scheduled for this member before `nextAt`. */
@@ -913,6 +917,8 @@ export class TeamRuntime {
 			fail("INVALID_ARGUMENT", `${previous.id} is handling Team events; hand over when its events activation has ended`);
 		}
 		this.writeJournal(team, { version: 2, kind: "handover", teamId, at: this.timestamp(), lead: target.id });
+		// Permits stay as reserved: a work run of the previous lead finishes without one (one bounded extra run),
+		// and a parked one takes a permit when it resumes; the new lead's running work keeps its permit until it ends.
 		team.lead = target.id;
 		// A batch the previous lead never finished is processed again by the new lead.
 		for (const event of team.events) delete event.batchId;
@@ -1498,6 +1504,9 @@ export class TeamRuntime {
 		if (team.lifecycle !== "active") return undefined;
 		const lead = team.members.get(team.lead)!;
 		if (lead.lifecycle !== "open") return undefined;
+		// Before the lead's work turn is decided: a work held here raises its event in this same pass.
+		this.holdUnknownDependencies(team);
+		team.ready = team.ready.filter((ref) => this.isReady(team, ref));
 		if (!lead.active && !lead.compaction && lead.pause === "none" && !this.retryWaitMs(lead)) {
 			const pendingEvents = () => team.events.map((event, index) => ({ event, index }))
 				.filter(({ event }) => !event.processed && event.batchId === undefined)
@@ -1505,7 +1514,12 @@ export class TeamRuntime {
 					|| left.index - right.index)
 				.slice(0, TEAM_MAX_EVENT_BATCH)
 				.map(({ event }) => event);
-			if (pendingEvents().length) {
+			const events = pendingEvents();
+			// After an events activation, a runnable lead work goes first unless a fault, budget or host event waits:
+			// a steady stream of result events must not starve the lead's own (usually unblocking) work.
+			const workTurn = lead.lastActivationKind === "events" && events.every((event) => this.eventPriority(event.kind) > 1)
+				&& this.hasRunnableLeadWork(team);
+			if (events.length && !workTurn) {
 				const exhausted = team.budget.teamExhausted(true);
 				// An exhausted lead gets a bounded number of restricted emergency activations; after
 				// that only the host can grant or cancel. Members with remaining budget keep running.
@@ -1520,34 +1534,72 @@ export class TeamRuntime {
 				}
 			}
 		}
-		this.holdUnknownDependencies(team);
 		const workPermits = this.usedWorkPermits(team);
-		for (let index = 0; index < team.ready.length; index++) {
-			const ref = team.ready[index]!;
-			const entry = team.ledger.get(ref.workId);
-			const version = team.ledger.version(ref);
-			if (!entry || !version || version.state !== "queued" || !sameWorkRef(team.ledger.currentRef(ref.workId)!, ref)) {
-				team.ready.splice(index--, 1);
-				continue;
-			}
+		for (const ref of this.readyOrder(team)) {
+			const entry = team.ledger.get(ref.workId)!;
 			const member = team.members.get(entry.record.assignee)!;
 			if (member.lifecycle !== "open" || member.pause !== "none" || member.active || member.compaction || this.retryWaitMs(member)) continue;
-			if (workPermits >= team.limits.workPermits) continue;
+			if (this.needsWorkPermit(team, member) && workPermits >= team.limits.workPermits) continue;
 			const exhausted = team.budget.exhausted(entry.record.rootId, member.id === team.lead);
 			if (exhausted) {
 				this.holdForBudget(team, ref, exhausted);
-				index--;
 				continue;
 			}
 			if (this.thresholdCompaction(team, member)) continue;
 			member.compactedAtBoundary = false;
 			const activation = this.reserveWork(team, member, ref);
-			team.ready.splice(index, 1);
+			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
 			this.check(team);
 			return activation;
 		}
 		this.check(team);
 		return undefined;
+	}
+
+	private isReady(team: TeamState, ref: WorkRef): boolean {
+		const version = team.ledger.version(ref);
+		return !!team.ledger.get(ref.workId) && version?.state === "queued" && sameWorkRef(team.ledger.currentRef(ref.workId)!, ref);
+	}
+
+	/**
+	 * The order in which ready works compete for members and work permits (stable within a class):
+	 * 0. works named by an un-held blocked work's dependency wait: finishing them unblocks someone;
+	 * 1. continuations (a checkpoint or observed outcomes from an earlier activation), revisions of already assigned work,
+	 *    and works queued for READY_AGING_MS;
+	 * 2. other fresh works, first come first served.
+	 * A member's blocked work never sits in the ready list, so it never holds back that member's later works.
+	 */
+	private readyOrder(team: TeamState): WorkRef[] {
+		if (team.ready.length < 2) return [...team.ready];
+		const waitedOn = new Set<string>();
+		for (const id of team.ledger.order) {
+			const version = team.ledger.version(team.ledger.currentRef(id)!)!;
+			// A held waiter stays held whatever it waits on, so it confers no priority.
+			if (version.state === "blocked" && !version.hold) for (const ref of version.waitingFor) waitedOn.add(workRefKey(ref));
+		}
+		const now = this.timestamp();
+		const rank = (ref: WorkRef): number => {
+			if (waitedOn.has(workRefKey(ref))) return 0;
+			const version = team.ledger.version(ref)!;
+			return version.checkpoint !== undefined || version.observedOutcomes.length || ref.revision > 1
+				|| now - version.updatedAt >= READY_AGING_MS ? 1 : 2;
+		};
+		return team.ready.map((ref, index) => ({ ref, index, rank: rank(ref) }))
+			.sort((left, right) => left.rank - right.rank || left.index - right.index)
+			.map(({ ref }) => ref);
+	}
+
+	/** The lead is one serial actor whose activations (events or work) share one slot outside workPermits. */
+	private needsWorkPermit(team: TeamState, member: RuntimeMember): boolean {
+		return member.id !== team.lead;
+	}
+
+	/** A queued lead work the work loop below would start now (not budget-held). */
+	private hasRunnableLeadWork(team: TeamState): boolean {
+		return team.ready.some((ref) => {
+			const entry = team.ledger.get(ref.workId);
+			return entry?.record.assignee === team.lead && this.isReady(team, ref) && !team.budget.exhausted(entry.record.rootId, true);
+		});
 	}
 
 	private eventPriority(kind: TeamEventView["kind"]): number {
@@ -1807,7 +1859,7 @@ export class TeamRuntime {
 		active.providerGatePending = false;
 		active.parked = true;
 		this.tickFlow(team);
-		// The lead's events activation holds no work permit.
+		// The lead's activations hold no work permit.
 		if (active.workPermitHeld) {
 			active.workPermitHeld = false;
 			team.flow.slots--;
@@ -1882,7 +1934,8 @@ export class TeamRuntime {
 			if (!oldest || version.updatedAt < oldest.at) oldest = { at: version.updatedAt, assignee: entry.record.assignee };
 		}
 		const slotLimit = team.limits.workPermits;
-		const reason = this.usedWorkPermits(team) >= slotLimit ? "slots full" : oldest && team.members.get(oldest.assignee)?.active ? "member busy" : "starting";
+		const permitLimited = oldest?.assignee !== team.lead && this.usedWorkPermits(team) >= slotLimit;
+		const reason = permitLimited ? "slots full" : oldest && team.members.get(oldest.assignee)?.active ? "member busy" : "starting";
 		const members = [...team.members.values()].filter((member) => member.usage.contextTokens > 0);
 		const largest = members.reduce<RuntimeMember | undefined>((top, member) => !top || member.usage.contextTokens > top.usage.contextTokens ? member : top, undefined);
 		return flowStats(team.flow, this.timestamp(), { slotLimit, pendingEvents: this.pendingLeadEvents(team),
@@ -1903,8 +1956,9 @@ export class TeamRuntime {
 			const active = member.active;
 			if (!active?.parked || !active.resumeRequested) continue;
 			if (member.lifecycle !== "open" || active.stopReason) continue;
-			if (active.scope.kind === "work") {
-				if (permits >= team.limits.workPermits) break;
+			if (active.scope.kind === "work" && this.needsWorkPermit(team, member)) {
+				// Full permits stop only other workers; the lead's parked run needs none.
+				if (permits >= team.limits.workPermits) continue;
 				permits++;
 				this.tickFlow(team);
 				active.workPermitHeld = true;
@@ -2841,8 +2895,10 @@ export class TeamRuntime {
 		delete version.hold;
 		version.resumeInstruction = instruction;
 		version.updatedAt = this.timestamp();
-		// Releasing a hold never satisfies an AND wait: unmet dependencies keep the work blocked.
-		if (version.waitingFor.length && !version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency))) {
+		// Releasing a hold never satisfies an AND wait: unmet dependencies keep the work blocked,
+		// unless an undelivered child issue needs its owner's answer (as in wakeWaiters).
+		if (version.waitingFor.length && !version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency))
+			&& !this.pendingChildIssues(team, version).length) {
 			version.state = "blocked";
 		} else {
 			version.state = "queued";
@@ -3194,6 +3250,7 @@ export class TeamRuntime {
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(undefined, true, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
+		member.lastActivationKind = "events";
 		this.startFlow(team, member, activation);
 		member.activity = "running";
 		this.note(team, `${member.id} events activation (${eventKinds(selected)})`);
@@ -3218,7 +3275,8 @@ export class TeamRuntime {
 		version.state = "running";
 		version.updatedAt = at;
 		this.tickFlow(team);
-		member.active = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: true, parked: false, resumeRequested: false,
+		member.lastActivationKind = "work";
+		member.active = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: this.needsWorkPermit(team, member), parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false),
 			budgetBlockedToolCalls: 0, postIntentContinuations: 0 };

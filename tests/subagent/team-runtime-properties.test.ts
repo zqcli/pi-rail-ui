@@ -329,14 +329,17 @@ test("D08: more outcomes than previews or one input can carry stay referenced, u
 		assert.ok(accepted.ok && accepted.receipt?.status === "accepted");
 		children.push(accepted.receipt.work);
 	}
-	assert.equal(call(runtime, parent, count + 1, "wait-first", { action: "yield", waitingFor: children.slice(0, 32), checkpoint: "collect children" }).ok, true);
-	settleClean(runtime, parent, "wait-first");
+	// Every child resolves while the parent still runs, so all of them are ready when it resumes
+	// (a resumed parent would otherwise be scheduled ahead of the two children it does not wait on).
 	const longSummary = `${"界".repeat(300)} full-result-tail`;
 	for (let index = 0; index < count; index++) {
 		const child = start(runtime, teamId);
+		assert.deepEqual(child.scope.work, children[index]);
 		assert.equal(call(runtime, child, 1, `reply-${index}`, { action: "reply", result: { status: "succeeded", summary: `${index}:${longSummary}` } }).ok, true);
 		settleClean(runtime, child, `reply-${index}`);
 	}
+	assert.equal(call(runtime, parent, count + 1, "wait-first", { action: "yield", waitingFor: children.slice(0, 32), checkpoint: "collect children" }).ok, true);
+	settleClean(runtime, parent, "wait-first");
 	const resumed = start(runtime, teamId);
 	assert.equal(resumed.scope.kind, "work");
 	assert.equal(resumed.input.outcomes.length, TEAM_MAX_DELIVERED_OUTCOMES);

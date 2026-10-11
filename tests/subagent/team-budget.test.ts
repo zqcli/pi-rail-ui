@@ -217,10 +217,11 @@ test("G05/G08: new child IDs accumulate on the same root until it holds; unrelat
 	const child2 = acceptedWork(ok(runtime, rootA, { action: "request", to: "w2", task: "another fresh id" }).reply);
 	end(runtime, rootA, { action: "yield", waitingFor: [child1, child2], checkpoint: "wait for both children" });
 
-	const rootB = nextWork(runtime, teamId)!;
-	assert.equal(rootB.scope.work!.workId !== refA.workId && rootB.binding.memberId, "w1");
+	// The children root A waits on are scheduled ahead of the unrelated, earlier-queued root B.
 	const first = nextWork(runtime, teamId)!;
 	assert.deepEqual(first.scope.work, child1);
+	const rootB = nextWork(runtime, teamId)!;
+	assert.equal(rootB.scope.work!.workId !== refA.workId && rootB.binding.memberId, "w1");
 	end(runtime, first, replyWith("child 1 done"));
 	// Root A has now used both of its activations; its next child cannot start.
 	assert.equal(nextWork(runtime, teamId), undefined);

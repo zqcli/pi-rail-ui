@@ -207,7 +207,8 @@ export function memberDetail(member: TeamTeamView["members"][number], facts: Pan
 	return [
 		member.lifecycle === "open" ? "" : member.lifecycle,
 		now,
-		member.currentWork && member.queued ? `${member.queued} queued` : "",
+		// A waiting or held work never holds back the member's other works: show that they are queued.
+		(member.currentWork || member.held || member.blocked) && member.queued ? `${member.queued} queued` : "",
 		member.pause === "none" ? "" : `pause ${member.pause}`,
 		member.id === lead && facts.pendingEvents ? `${facts.pendingEvents} pending events` : "",
 		resultText,

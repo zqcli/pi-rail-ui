@@ -158,6 +158,8 @@ interface InternalEvent extends TeamEventView {
 	key: string;
 	processed: boolean;
 	batchId?: string;
+	/** Report-only: never starts an events activation by itself, it rides along with the lead's next batch. */
+	passive?: true;
 }
 
 interface EventBatch {
@@ -1473,7 +1475,8 @@ export class TeamRuntime {
 					const tokensBefore = result.tokensBefore ?? before;
 					member.lastCompaction = { tokensBefore, ...(result.tokensAfter !== undefined ? { tokensAfter: result.tokensAfter } : {}) };
 					this.note(team, `${member.id} compacted (${request.trigger}) ${tokensBefore}→${result.tokensAfter ?? "?"}`);
-					if (request.trigger === "lead") this.addEvent(team, { key: `compaction:${this.newId()}`, kind: "COMPACTION", memberId: member.id,
+					// A done report needs no decision, so it waits for the lead's next batch; a failure wakes the lead.
+					if (request.trigger === "lead") this.addEvent(team, { key: `compaction:${this.newId()}`, kind: "COMPACTION", memberId: member.id, passive: true,
 						message: prompt("team", "compaction_done", { member: member.id, before: tokenText(tokensBefore), after: result.tokensAfter === undefined ? "?" : tokenText(result.tokensAfter) }) });
 				} else {
 					this.note(team, `${member.id} compaction failed (${request.trigger}): ${result.error}`);
@@ -1511,7 +1514,7 @@ export class TeamRuntime {
 			const pendingEvents = () => team.events.map((event, index) => ({ event, index }))
 				.filter(({ event }) => !event.processed && event.batchId === undefined)
 				.sort((left, right) => this.eventPriority(left.event.kind) - this.eventPriority(right.event.kind)
-					|| left.index - right.index)
+					|| Number(!!left.event.passive) - Number(!!right.event.passive) || left.index - right.index)
 				.slice(0, TEAM_MAX_EVENT_BATCH)
 				.map(({ event }) => event);
 			const events = pendingEvents();
@@ -1519,7 +1522,8 @@ export class TeamRuntime {
 			// a steady stream of result events must not starve the lead's own (usually unblocking) work.
 			const workTurn = lead.lastActivationKind === "events" && events.every((event) => this.eventPriority(event.kind) > 1)
 				&& this.hasRunnableLeadWork(team);
-			if (events.length && !workTurn) {
+			// Passive reports alone never wake the lead; the sort puts any waking event first.
+			if (events.length && !events[0]!.passive && !workTurn) {
 				const exhausted = team.budget.teamExhausted(true);
 				// An exhausted lead gets a bounded number of restricted emergency activations; after
 				// that only the host can grant or cancel. Members with remaining budget keep running.
@@ -1945,7 +1949,7 @@ export class TeamRuntime {
 	}
 
 	private pendingLeadEvents(team: TeamState): number {
-		return team.lifecycle === "active" ? team.events.filter((event) => !event.processed && event.batchId === undefined).length : 0;
+		return team.lifecycle === "active" ? team.events.filter((event) => !event.processed && event.batchId === undefined && !event.passive).length : 0;
 	}
 
 	/** Parked native gates have priority over new work when a work permit becomes available. */
@@ -3233,7 +3237,7 @@ export class TeamRuntime {
 		for (;;) {
 			try {
 				input = this.activationInput(team, member, deliveryId, { kind: "events", eventBatchId: batchId,
-					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, ...view }) => view), emergency },
+					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, passive: _passive, ...view }) => view), emergency },
 				team.budget.inputSummary(undefined, true, emergency));
 				break;
 			} catch (error) {

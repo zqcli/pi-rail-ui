@@ -208,19 +208,25 @@ test("compaction: host pause defers lead requests, but explicit host compaction 
 	await compactTick();
 });
 
-test("compaction: a lead-requested compaction reports before→after to the lead as a COMPACTION event", async (t) => {
-	const { runtime, calls, activations } = await compactionRuntime(t);
+test("compaction: a lead-requested compaction reports before→after with the lead's next event batch, without waking it alone", async (t) => {
+	const { runtime, teamId, calls, activations } = await compactionRuntime(t);
 	const lead = activations.at(-1)!;
 	inputReady(runtime, lead);
 	assert.equal(action(runtime, lead, 1, "compact", { action: "control", command: "compact_member", memberId: "w1" }).ok, true);
 	action(runtime, lead, 2, "yield", { action: "yield" });
 	settle(runtime, lead, "yield");
 	await compactTick();
+	const before = activations.length;
 	calls[0]!.resolve({ ok: true, tokensBefore: 286_000, tokensAfter: 41_000 });
+	await compactTick();
+	assert.equal(activations.length, before, "a done report alone starts no events activation");
+	assert.equal(runtime.panelFacts(teamId).pendingEvents, 0, "and is not shown as a pending lead event");
+	runtime.hostControl(teamId).message_lead("next step?");
 	await compactTick();
 	const next = activations.at(-1)!.input.scope;
 	assert.ok(next.kind === "events");
-	assert.deepEqual(next.events.map((event) => [event.kind, event.memberId, event.message]), [["COMPACTION", "w1", "Compaction of w1 done: 286k→41k tokens"]]);
+	assert.deepEqual(next.events.map((event) => [event.kind, event.memberId]), [["USER_COMMAND", undefined], ["COMPACTION", "w1"]]);
+	assert.equal(next.events[1]!.message, "Compaction of w1 done: 286k→41k tokens");
 });
 
 test("compaction: a COMPACTION event still pending does not block close_team", async (t) => {

@@ -61,3 +61,13 @@ blocked 与 held 的 work 本就不在 ready 中，所以排序只影响“谁�
 - 调整的既有用例（原先固化了 FIFO 或“lead work 占许可”的断言）：`team-runtime.test.ts` 的 lead 请求与 workPermits 两例、C07/C08/C10 的恢复顺序；`team-budget.test.ts` G05/G08 的取出顺序；`team-runtime-properties.test.ts` D08 改为子任务在父任务 yield 前全部完成，保持原有断言含义。
 - 独立审查（Claude Sonnet 5.5）后补充：held 的 waiter 不再赋予类别 0；`flowStats` 不再把 lead 的排队 work 归因为 `slots full`；轻量提前返回（ready 少于 2 项时不扫描 ledger）。
 - `npm run check` 全部通过（1380 项）。
+
+## 7. 后续：减轻 lead 负载
+
+同一会话中 lead 处理事件 53 轮、约 83 分钟，其中 21 轮只含建议性事件（16 轮只有 `COMPACTION`），约 22.5 分钟；lead 还亲自做了大量核验（169 次 `read`、90 次 `bash`）。据此做了三项调整：
+
+- **压缩完成报告不单独唤醒 lead。** lead 请求的压缩成功后，`COMPACTION` 事件标为被动（`passive`）：不单独开启 events activation、不计入待处理事件数，随下一批事件送达；压缩失败仍立即唤醒。`REVIEW_READY`（AT RISK/OFF TRACK 巡检）与 `TEAM_QUIESCENT` 需要 lead 决定，仍照常唤醒。
+- **核验交给 verifier。** `subagent_team` 指引建议需要独立核验时配置 verifier 成员，并在 lead 的 roleDescription 中写明依据 verifier 的证据验收；Team brief 规则要求 lead 不重复核验 verifier 已检查的内容，只亲自查看决定结论的部分。
+- **用子协调者分层。** 指引建议较大的 Team 给成员配置领域协调者角色，用已有的子任务机制拆分、回答子任务提问并汇总回复，只有 root、故障和 Team 级决定才回到 lead；brief 规则同步告诉协调者这样做。
+
+后两项只改模型可见的提示词（`prompts/team.md`），不改变 Runtime 行为。

@@ -146,6 +146,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 - 等待依赖或被 hold 的 work 不在 ready 列表里：成员 `yield {waitingFor}` 后立即释放成员和许可，它排在后面的 work 可马上运行，依赖满足后原 work 再回到 ready。
 - 许可和成员空出来时，ready 项按类别竞争（类别内按入队先后）：(0) 被某个未被 hold 的 blocked work 的 `waitingFor` 点名的 work——完成它能解除别人的等待；(1) 继续执行的 work（有 checkpoint 或已观察过 outcome）、修订版（revision > 1）、以及排队已满 10 分钟的新 work（老化，防止新 work 被持续饿死）；(2) 其余新 work，先来先服务。
 - 同一成员同一时间只有一个 activation。lead 空闲时：上一次是 events activation、又有可运行的 lead work、且待处理事件都不是 `MEMBER_FAULTED`/`BUDGET_HIT`/`USER_COMMAND` 时，先运行 lead 的 work，之后再处理事件；否则待处理事件先于它的 work。lead 正在运行 work activation 时，事件等它结束。
+- lead 请求的压缩成功后产生的 `COMPACTION` 事件是只报告的被动事件：它单独存在时不开启 events activation，也不计入面板的待处理事件数，而是随 lead 的下一批事件一起送达（同一优先级内排在其他事件之后）；压缩失败的 `COMPACTION` 照常唤醒 lead。
 - 面板中成员有等待中或 held 的 work、同时还有排队 work 时，状态行附 `N queued`（例如 `waiting on 1 sub-task: w2 (running work …) · 1 queued`）。
 - yield 完整结束后释放许可，排在后面的成员（例如第 8 个成员）因此有机会运行。
 - BOOT 事件列出由 `initialRequests` 建立、无需 lead 派发即会运行的 root（assignee、WorkRef、任务预览），并提示不要重复请求、每个 root 最终都须 accepted 或 waived；`ROOT_RESULT_READY` 注明结果状态和作者。

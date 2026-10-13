@@ -134,7 +134,7 @@ test("the snapshot carries the Flow, Lead and Waits facts with one line saying t
 	const { runtime, teamId } = world({ initial: [{ to: "w1", task: "Build it." }] });
 	bootIdle(runtime, teamId);
 	const task = runtime.getWork(teamId, runtime.runReviewTick(teamId)!)!.current.task;
-	assert.match(task, /^Flow: workers avg \S+ \(last 10m \S+\) · all 4 slots busy \S+$/mu);
+	assert.match(task, /^Flow: workers avg \S+ \(last 10m \S+\) · all \d+ slots busy \S+$/mu);
 	assert.match(task, /^Lead: busy \S+ · only lead \S+ · accept p50 \S+ · p90 \S+ · \d+ pending$/mu);
 	assert.match(task, /^Waits: p50 \S+ · p90 \S+ · most: \S+/mu);
 	assert.match(task, /^The Flow, Lead and Waits numbers locate bottlenecks .*not a risk by themselves\.$/mu);

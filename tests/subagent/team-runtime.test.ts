@@ -305,25 +305,25 @@ test("compaction: overflow retries the same work once with a notice, then faults
 	await compactTick();
 });
 
-test("compaction: another queued work cannot consume an overflow notice or reset its recovery limit", async (t) => {
+test("compaction: an overflow-interrupted work retries before other queued work, and only it carries the overflow notice", async (t) => {
 	const { runtime, calls, activations, teamId } = await compactionRuntime(t, [{ to: "w1", task: "A" }, { to: "w1", task: "B" }]);
 	const first = activations.find((a) => a.binding.memberId === "w1")!;
 	compactSettle(runtime, first, { status: "length", overflow: true });
 	await compactTick();
 	calls[0]!.resolve({ ok: true, tokensAfter: 10 });
 	await compactTick();
+	const retry = activations.filter((a) => a.binding.memberId === "w1").at(-1)!;
+	assert.deepEqual(retry.scope.work, first.scope.work, "the interrupted work goes before B, which was queued too");
+	assert.match(retry.input.notice!, /overflowed the model context/i);
+	reply(runtime, retry, "a-done", "A is complete");
+	await compactTick();
 	const other = activations.filter((a) => a.binding.memberId === "w1").at(-1)!;
 	assert.notDeepEqual(other.scope.work, first.scope.work);
 	assert.doesNotMatch(other.input.notice!, /overflowed the model context/i);
-	reply(runtime, other, "done", "B is complete");
-	await compactTick();
-	const retry = activations.filter((a) => a.binding.memberId === "w1").at(-1)!;
-	assert.deepEqual(retry.scope.work, first.scope.work);
-	assert.match(retry.input.notice!, /overflowed the model context/i);
-	compactSettle(runtime, retry, { status: "length", overflow: true });
+	reply(runtime, other, "b-done", "B is complete");
 	await compactTick();
 	assert.equal(calls.length, 1);
-	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "faulted");
+	assert.equal(runtime.getTeam(teamId).members.find((m) => m.id === "w1")!.lifecycle, "open");
 });
 
 test("compaction: threshold runs only at the next boundary, skips an immediate retrigger, and follows live off setting", async (t) => {

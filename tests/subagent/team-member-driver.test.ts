@@ -1595,7 +1595,8 @@ test("N01 real Pi: BOOT and initial work run while a role-only writer receives n
 });
 
 test("N03 real Pi: four workers yielding for the eighth free their permits, the eighth runs, and the Manager never uses a worker permit", { timeout: 180000 }, async (t) => {
-	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n03-eight", undefined, {}, 8);
+	// A host override caps permits below the member count (the default lets every member run at once).
+	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n03-eight", undefined, { limits: { workPermits: 4 } }, 8);
 	let maxRunningWorkers = 0;
 	let maxWorkersBesideManager = 0;
 	let blockedWhenEighthStarted: number | undefined;

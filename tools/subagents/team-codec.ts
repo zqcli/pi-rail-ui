@@ -1367,12 +1367,17 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	const roster = array(value["roster"], "activation input.roster", TEAM_MAX_MEMBERS).map((raw, index) => {
 		const field = `activation input.roster[${index}]`;
 		if (!isRecord(raw)) return protocol(`${field} must be an object`);
-		frameKeys(raw, ["id", "lead", "lifecycle", "contextPercent", "contextTokens"], field);
+		frameKeys(raw, ["id", "lead", "lifecycle", "contextPercent", "contextTokens", "running", "queued", "waiting", "idleMinutes"], field);
 		if (raw["lead"] !== undefined && raw["lead"] !== true) return protocol(`${field}.lead must be true when present`);
+		if (raw["running"] !== undefined && raw["running"] !== true) return protocol(`${field}.running must be true when present`);
 		if (!["starting", "open", "closing", "closed", "faulted"].includes(String(raw["lifecycle"]))) return protocol(`${field}.lifecycle is invalid`);
 		return { id: normalizeAlias(raw["id"], `${field}.id`), ...(raw["lead"] === true ? { lead: true as const } : {}), lifecycle: raw["lifecycle"] as MemberLifecycle,
 			...(raw["contextPercent"] !== undefined ? { contextPercent: finiteNumber(raw["contextPercent"], `${field}.contextPercent`, 0) } : {}),
-			...(raw["contextTokens"] !== undefined ? { contextTokens: safeInteger(raw["contextTokens"], `${field}.contextTokens`, 0) } : {}) };
+			...(raw["contextTokens"] !== undefined ? { contextTokens: safeInteger(raw["contextTokens"], `${field}.contextTokens`, 0) } : {}),
+			...(raw["running"] === true ? { running: true as const } : {}),
+			...(raw["queued"] !== undefined ? { queued: safeInteger(raw["queued"], `${field}.queued`, 0) } : {}),
+			...(raw["waiting"] !== undefined ? { waiting: safeInteger(raw["waiting"], `${field}.waiting`, 0) } : {}),
+			...(raw["idleMinutes"] !== undefined ? { idleMinutes: safeInteger(raw["idleMinutes"], `${field}.idleMinutes`, 0) } : {}) };
 	});
 	const rosterIds = roster.map((item) => item.id);
 	if (!rosterIds.includes(binding.memberId) || new Set(rosterIds).size !== rosterIds.length || roster.filter((item) => item.lead).length !== 1

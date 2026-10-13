@@ -71,3 +71,19 @@ blocked 与 held 的 work 本就不在 ready 中，所以排序只影响“谁�
 - **用子协调者分层。** 指引建议较大的 Team 给成员配置领域协调者角色，用已有的子任务机制拆分、回答子任务提问并汇总回复，只有 root、故障和 Team 级决定才回到 lead；brief 规则同步告诉协调者这样做。
 
 后两项只改模型可见的提示词（`prompts/team.md`），不改变 Runtime 行为。
+
+## 8. 第三次 Team（qxmqocgx，10-12）后的调整
+
+该 Team（1 lead + 7 成员，156 分钟，outcome partial）中，lead 的 work 已不再等许可，但仍有四个问题：
+
+1. 采集成员各做一轮 bounded 采集就交回 partial，lead 在 20–40 秒内豁免，没有针对可解决的缺口（币种、地区映射等）开第二轮；asia、indie、eub、ui 在 15:16–15:40 之后空闲到 17:21。
+2. 收尾 55 分钟串行：lead 在一次 events activation 中集成 29 分钟，随后 audit 最终核验 21 分钟；开场 lead 在 BOOT activation 里实现 17 分钟，期间成员请求等待。
+3. 7 个成员只有 4 张许可，开场 3 个成员各等约 20 分钟。
+4. 临时错误（`WebSocket closed 1006`）重试后丢失许可重新排队：ui 等 12 分钟、eub 等 14 分钟，而退避本身只有 10 秒。
+
+对应调整：
+
+- `workPermits` 默认等于 lead 以外的成员数，宿主 `limits` 覆盖仍有效。
+- 临时错误重试与溢出恢复重新入队的 work 排在 ready 顺序最前（类别 0）。
+- roster 增加 `running`/`queued`/`waiting`/`idleMinutes`，events notice 要求 lead 给空闲成员派活。
+- 提示词：partial root 先区分可解决缺口，可解决的用 `revise_work` 或给空闲成员派后续，只豁免被阻断、超范围或不值得的缺口；成员回复 partial 前先继续处理可解决的缺口，并逐项标明缺口性质；root 任务写明停止条件；集成交给成员并随 root 到达增量进行；lead 的 events activation 保持简短。

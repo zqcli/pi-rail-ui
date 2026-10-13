@@ -142,9 +142,10 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 
 ## 6. 调度与 Team 事件
 
-- Runtime 通过唯一的 effect drain 调度：`workPermits`（默认 4）限制 lead 以外成员并发的 **work** activation。lead 是单个串行 actor，它的 events 与 work activation 共用 workPermits 之外的 1 个槽位，因此事件不会被饿死，lead 的协调性 work 也不必排在长时间运行的成员 work 后面等许可。每个 WorkRef 最多一个 ready 项。
+- Runtime 通过唯一的 effect drain 调度：`workPermits` 限制 lead 以外成员并发的 **work** activation，默认等于 lead 以外的成员数（即每个成员都可同时运行；宿主构造 Runtime 时的 `limits` 覆盖仍然生效）。lead 是单个串行 actor，它的 events 与 work activation 共用 workPermits 之外的 1 个槽位，因此事件不会被饿死，lead 的协调性 work 也不必排在长时间运行的成员 work 后面等许可。每个 WorkRef 最多一个 ready 项。
 - 等待依赖或被 hold 的 work 不在 ready 列表里：成员 `yield {waitingFor}` 后立即释放成员和许可，它排在后面的 work 可马上运行，依赖满足后原 work 再回到 ready。
-- 许可和成员空出来时，ready 项按类别竞争（类别内按入队先后）：(0) 被某个未被 hold 的 blocked work 的 `waitingFor` 点名的 work——完成它能解除别人的等待；(1) 继续执行的 work（有 checkpoint 或已观察过 outcome）、修订版（revision > 1）、以及排队已满 10 分钟的新 work（老化，防止新 work 被持续饿死）；(2) 其余新 work，先来先服务。
+- 许可和成员空出来时，ready 项按类别竞争（类别内按入队先后）：(0) 因临时 provider 错误重试或上下文溢出恢复而重新入队的 work——它原本已持有许可，退避结束后不再排到新 work 后面；(1) 被某个未被 hold 的 blocked work 的 `waitingFor` 点名的 work——完成它能解除别人的等待；(2) 继续执行的 work（有 checkpoint 或已观察过 outcome）、修订版（revision > 1）、以及排队已满 10 分钟的新 work（老化，防止新 work 被持续饿死）；(3) 其余新 work，先来先服务。
+- activation 输入的 roster 带每个成员的负载：`running`（正在运行，含本次输入的接收者）、`queued`（排队的当前 work 数）、`waiting`（blocked 或 held 的当前 work 数），以及对开放、未运行且没有排队 work 的成员给出 `idleMinutes`（自上次 activation 结束以来的 Team 活跃分钟数，不含宿主暂停）。events notice 要求 lead 给空闲成员派有用的工作，并对 partial root 先区分可继续解决的缺口与已被阻断的缺口。
 - 同一成员同一时间只有一个 activation。lead 空闲时：上一次是 events activation、又有可运行的 lead work、且待处理事件都不是 `MEMBER_FAULTED`/`BUDGET_HIT`/`USER_COMMAND` 时，先运行 lead 的 work，之后再处理事件；否则待处理事件先于它的 work。lead 正在运行 work activation 时，事件等它结束。
 - lead 请求的压缩成功后产生的 `COMPACTION` 事件是只报告的被动事件：它单独存在时不开启 events activation，也不计入面板的待处理事件数，而是随 lead 的下一批事件一起送达（同一优先级内排在其他事件之后）；压缩失败的 `COMPACTION` 照常唤醒 lead。
 - 面板中成员有等待中或 held 的 work、同时还有排队 work 时，状态行附 `N queued`（例如 `waiting on 1 sub-task: w2 (running work …) · 1 queued`）。
@@ -184,7 +185,7 @@ Delivery 只记录**实际 `input.outcomes`** 的 WorkRef；`input_ready` 只把
 | Team works / root children / work revisions | 512 / 64 / 32 | 4096 / 512 / 128 | 20000 / 2048 / 512 |
 | 结果预留 | 16 MiB | 64 MiB | 256 MiB |
 
-各档均保留：`workPermits` 4（lead 以外成员的并发 work activation；lead 另有 1 个串行槽位）、每成员未解决工作 64、深度 8、紧急 lead activation 3（`emergencyLeadActivations`）。`leadActivations` 计 lead 的全部 activation（events 与 work）。预算计数器曾叫 `managerActivations`/`emergencyManagerActivations`/`workerPermits`，旧 journal 的 grant 读取时会映射到新名字。`unlimited` 的累计执行计数采用有限哨兵值 1,000,000,000；works、修订和结果字节仍有上限，限制内存与 session journal 增长。
+各档的 `workPermits` 都在 prepare 时设为 lead 以外的成员数（lead 另有 1 个串行槽位；预设里的 4 只在无法得知成员数时作为字段默认值）；各档均保留每成员未解决工作 64、深度 8、紧急 lead activation 3（`emergencyLeadActivations`）。`leadActivations` 计 lead 的全部 activation（events 与 work）。预算计数器曾叫 `managerActivations`/`emergencyManagerActivations`/`workerPermits`，旧 journal 的 grant 读取时会映射到新名字。`unlimited` 的累计执行计数采用有限哨兵值 1,000,000,000；works、修订和结果字节仍有上限，限制内存与 session journal 增长。
 
 运行中可用 `/rail-team <id> grant`（或弹窗 `g`）选择 `Raise to long`、`Raise to unlimited` 或 `Custom grant…`；已达到的预设不显示。确认前展示各项 used、limit → new 及将解除的预算 hold；升级只取各项 max，不降低已有额度，root 默认值与容量上限一起升级，按带 preset 标记的 grant 写 journal。显式 `grant team teamActivations=+64 …` 不变。
 

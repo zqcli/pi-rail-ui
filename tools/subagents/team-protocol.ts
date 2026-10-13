@@ -475,7 +475,9 @@ export interface ActivationInput {
 	member: { id: string; lead: boolean; roleDescription: string };
 	/** The full brief is in the member's system prompt (bind loadout); only the goal repeats here. */
 	goal: string;
-	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle; contextPercent?: number; contextTokens?: number }>;
+	/** Per member: lifecycle, context use and load (running now, queued and waiting works, idle minutes when free). */
+	roster: Array<{ id: string; lead?: true; lifecycle: MemberLifecycle; contextPercent?: number; contextTokens?: number;
+		running?: true; queued?: number; waiting?: number; idleMinutes?: number }>;
 	scope:
 		| {
 			kind: "work";

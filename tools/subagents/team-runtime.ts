@@ -237,6 +237,8 @@ interface RuntimeMember extends MemberRecord {
 	policy: TeamMemberPolicy;
 	epoch: string;
 	active?: ActiveActivation;
+	/** Team active time (flow.activeMs) when the member's last activation ended; the lead's roster shows idle minutes from it. */
+	idleSinceActiveMs?: number;
 	/** Kind of the last activation reserved for this member: an idle lead alternates its runnable work with event batches. */
 	lastActivationKind?: "events" | "work";
 	lastActivation?: CompletedActivationTombstone;
@@ -292,6 +294,8 @@ interface TeamState {
 	members: Map<string, RuntimeMember>;
 	ledger: WorkLedger;
 	ready: WorkRef[];
+	/** Ready works requeued by a transient-error retry or overflow recovery: they lead the ready order. */
+	interrupted: Set<string>;
 	deliveries: Map<string, DeliveryRecord>;
 	events: InternalEvent[];
 	eventBatches: Map<string, EventBatch>;
@@ -456,7 +460,8 @@ export class TeamRuntime {
 	 */
 	prepare(rawPlan: unknown, resolvedPolicies?: ReadonlyMap<string, TeamMemberPolicy>): TeamTeamView {
 		const plan = normalizeTeamPlan(rawPlan);
-		const limits = { ...TEAM_BUDGET_PRESETS[plan.budget ?? "long"], ...this.limitOverrides };
+		// Every member other than the lead (which has its own slot) may run at once; a host override still applies.
+		const limits = { ...TEAM_BUDGET_PRESETS[plan.budget ?? "long"], workPermits: Math.max(1, plan.members.length - 1), ...this.limitOverrides };
 		if (resolvedPolicies) {
 			for (const member of plan.members) {
 				const policy = resolvedPolicies.get(member.alias);
@@ -503,7 +508,7 @@ export class TeamRuntime {
 		const team: TeamState = {
 			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt, workStats: new Map(), pausedMs: 0,
 			deadline: null,
-			plan: copy(plan), lead: plan.lead, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], deliveries: new Map(), unknownAcknowledged: new Set(),
+			plan: copy(plan), lead: plan.lead, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], interrupted: new Set(), deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
 			review: { schedule: copy(plan.review), nextAt: null, startedAt: createdAt, signature: "", finished: new Set(), wall: 0, records: [] },
@@ -1510,6 +1515,7 @@ export class TeamRuntime {
 		// Before the lead's work turn is decided: a work held here raises its event in this same pass.
 		this.holdUnknownDependencies(team);
 		team.ready = team.ready.filter((ref) => this.isReady(team, ref));
+		for (const key of team.interrupted) if (!team.ready.some((ref) => workRefKey(ref) === key)) team.interrupted.delete(key);
 		if (!lead.active && !lead.compaction && lead.pause === "none" && !this.retryWaitMs(lead)) {
 			const pendingEvents = () => team.events.map((event, index) => ({ event, index }))
 				.filter(({ event }) => !event.processed && event.batchId === undefined)
@@ -1553,6 +1559,7 @@ export class TeamRuntime {
 			member.compactedAtBoundary = false;
 			const activation = this.reserveWork(team, member, ref);
 			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+			team.interrupted.delete(workRefKey(ref));
 			this.check(team);
 			return activation;
 		}
@@ -1567,10 +1574,11 @@ export class TeamRuntime {
 
 	/**
 	 * The order in which ready works compete for members and work permits (stable within a class):
-	 * 0. works named by an un-held blocked work's dependency wait: finishing them unblocks someone;
-	 * 1. continuations (a checkpoint or observed outcomes from an earlier activation), revisions of already assigned work,
+	 * 0. works interrupted by a transient-error retry or overflow recovery: they had a permit already;
+	 * 1. works named by an un-held blocked work's dependency wait: finishing them unblocks someone;
+	 * 2. continuations (a checkpoint or observed outcomes from an earlier activation), revisions of already assigned work,
 	 *    and works queued for READY_AGING_MS;
-	 * 2. other fresh works, first come first served.
+	 * 3. other fresh works, first come first served.
 	 * A member's blocked work never sits in the ready list, so it never holds back that member's later works.
 	 */
 	private readyOrder(team: TeamState): WorkRef[] {
@@ -1583,10 +1591,12 @@ export class TeamRuntime {
 		}
 		const now = this.timestamp();
 		const rank = (ref: WorkRef): number => {
-			if (waitedOn.has(workRefKey(ref))) return 0;
+			const key = workRefKey(ref);
+			if (team.interrupted.has(key)) return 0;
+			if (waitedOn.has(key)) return 1;
 			const version = team.ledger.version(ref)!;
 			return version.checkpoint !== undefined || version.observedOutcomes.length || ref.revision > 1
-				|| now - version.updatedAt >= READY_AGING_MS ? 1 : 2;
+				|| now - version.updatedAt >= READY_AGING_MS ? 2 : 3;
 		};
 		return team.ready.map((ref, index) => ({ ref, index, rank: rank(ref) }))
 			.sort((left, right) => left.rank - right.rank || left.index - right.index)
@@ -3326,7 +3336,7 @@ export class TeamRuntime {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
 			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription },
 			goal: team.plan.brief.goal,
-			roster: this.roster(team),
+			roster: this.roster(team, member.id),
 			scope: copy(scope), outcomes, omittedOutcomes: 0, ...(childIssues.length ? { childIssues: copy(childIssues) } : {}),
 			ownedChildren, budget, notice: (scope.kind === "work" ? workNotice(scope.work) : `${prompt("team", "events_notice")} ${prompt("team", "brief_pointer")}`)
 				+ (member.overflowRecoveries?.has(scope.kind === "work" ? workRefKey(scope.work) : "events") ? `\n${prompt("team", "overflow_notice")}` : ""),
@@ -3401,6 +3411,8 @@ export class TeamRuntime {
 		if (member.active === active) delete member.active;
 		delete member.currentWork;
 		member.activity = "idle";
+		this.tickFlow(team);
+		member.idleSinceActiveMs = team.flow.activeMs;
 		this.resumeParkedActivations(team);
 		if (member.lifecycle === "open" && member.pause === "requested") member.pause = "confirmed";
 		if (member.lifecycle === "closing" && member.id === team.lead) member.resourceState = "stopping";
@@ -3476,6 +3488,8 @@ export class TeamRuntime {
 				version.state = "queued";
 				version.updatedAt = this.timestamp();
 				if (!team.ready.some((queued) => sameWorkRef(queued, ref))) team.ready.push(copy(ref));
+				// It already held a permit: after the backoff it must not queue behind fresh work again.
+				team.interrupted.add(workRefKey(ref));
 				this.wakeWaiters(team);
 				return;
 			}
@@ -4209,16 +4223,37 @@ export class TeamRuntime {
 		this.previewInput(team, member, `input-check:${work.id}`, scope);
 	}
 
-	private roster(team: TeamState): ActivationInput["roster"] {
-		return [...team.members.values()].map((item) => ({ id: item.id, ...(item.id === team.lead ? { lead: true as const } : {}),
-			lifecycle: item.lifecycle, ...(this.memberContext(item) ? { contextPercent: this.memberContext(item)!.percent } : {}), contextTokens: item.usage.contextTokens }));
+	/** `self` is the member this input is for: it is about to run. */
+	private roster(team: TeamState, self?: string): ActivationInput["roster"] {
+		// Load per member, so the lead can see who is free: queued and waiting (blocked or held) current works.
+		const load = new Map<string, { queued: number; waiting: number }>();
+		for (const id of team.ledger.order) {
+			const entry = team.ledger.get(id)!;
+			const state = currentVersion(entry.record).state;
+			if (state !== "queued" && state !== "blocked") continue;
+			const counts = load.get(entry.record.assignee) ?? { queued: 0, waiting: 0 };
+			if (state === "queued") counts.queued++;
+			else counts.waiting++;
+			load.set(entry.record.assignee, counts);
+		}
+		this.tickFlow(team);
+		return [...team.members.values()].map((item) => {
+			const counts = load.get(item.id);
+			const running = !!item.active || item.id === self;
+			const free = item.lifecycle === "open" && !running && !counts?.queued;
+			return { id: item.id, ...(item.id === team.lead ? { lead: true as const } : {}),
+				lifecycle: item.lifecycle, ...(this.memberContext(item) ? { contextPercent: this.memberContext(item)!.percent } : {}), contextTokens: item.usage.contextTokens,
+				...(running ? { running: true as const } : {}), ...(counts?.queued ? { queued: counts.queued } : {}),
+				...(counts?.waiting ? { waiting: counts.waiting } : {}),
+				...(free ? { idleMinutes: Math.floor(Math.max(0, team.flow.activeMs - (item.idleSinceActiveMs ?? 0)) / 60_000) } : {}) };
+		});
 	}
 
 	private previewInput(team: TeamState, member: RuntimeMember, deliveryId: string, scope: WorkScope): ActivationInput {
 		const input: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
 			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription }, goal: team.plan.brief.goal,
-			roster: this.roster(team),
+			roster: this.roster(team, member.id),
 			scope, outcomes: [], omittedOutcomes: 0, ownedChildren: [],
 			// Size check only: the largest possible budget summary.
 			budget: { emergency: false, modelRequests: Number.MAX_SAFE_INTEGER, toolCalls: Number.MAX_SAFE_INTEGER, activations: Number.MAX_SAFE_INTEGER },

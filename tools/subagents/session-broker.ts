@@ -13,6 +13,7 @@ import type { CompactionResult, NativeCompletion, RuntimeActivation } from "./te
 import type { RpcEvent } from "./rpc-worker";
 import { parseBinding, sameBinding } from "./team-codec";
 import type { SubagentRetry } from "./retry";
+import type { PauseGate, SubagentPause } from "./pause";
 
 export interface SubagentUsage {
 	input: number;
@@ -32,6 +33,8 @@ export interface WorkerRunResult {
 	retry?: SubagentRetry;
 	/** Rail continuations started; excludes the original attempt and native Pi retries. */
 	retryCount?: number;
+	/** Present while the host has paused this run. */
+	paused?: SubagentPause;
 	isCompacting?: boolean;
 	transcript?: SubagentTranscriptSnapshot;
 	stopReason?: string;
@@ -118,6 +121,8 @@ export interface SessionWorker {
 	setModel?(model: RailModelRef): Promise<RailModelRef>;
 	openTeamMemberV2?(binding: BindingV2, loadout: MemberLoadoutRequest, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession>;
 	isReusable?(): boolean;
+	/** Host pause of an ordinary (not Team-owned) worker; it persists across sends until resumed or stopped. */
+	readonly pauseGate?: PauseGate;
 	stop(): Promise<void>;
 }
 
@@ -309,6 +314,7 @@ export interface AgentRuntimeStatus {
 	queued: number;
 	retry?: SubagentRetry;
 	retryCount?: number;
+	paused?: SubagentPause;
 	isCompacting?: boolean;
 	errorMessage?: string;
 }

@@ -2,6 +2,7 @@ import type { Component, MarkdownTheme } from "@earendil-works/pi-tui";
 import { Markdown, stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SubagentRetry } from "./retry";
+import { pauseStatusText, type SubagentPause } from "./pause";
 
 const DEFAULT_MAX_ENTRIES = 18;
 const MAX_ENTRY_CHARS = 4000;
@@ -48,6 +49,7 @@ export interface SubagentTranscriptRun {
 	isCompacting?: boolean;
 	retry?: SubagentRetry;
 	retryCount?: number;
+	paused?: SubagentPause;
 	output: string;
 	persistent: boolean;
 	transcript?: SubagentTranscriptSnapshot;
@@ -808,6 +810,7 @@ export function retryCountText(count: number, recovered: boolean): string {
 }
 
 function statusText(run: SubagentTranscriptRun): string {
+	if (run.status === "running" && run.paused) return pauseStatusText(run.paused);
 	if (run.status === "running" && run.retry) return retryStatusText(run.retry);
 	if (run.status === "failed") return run.stopReason === "aborted" ? "Cancelled" : "Failed";
 	if (run.status === "running" && run.isCompacting) return "Compacting";

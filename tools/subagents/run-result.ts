@@ -1,5 +1,6 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { retryableAssistantError, type SubagentRetry } from "./retry";
+import type { SubagentPause } from "./pause";
 import { hostedSearchCallsFromEntry } from "../../openai/hosted-search-activity";
 import { SubagentTranscript } from "./transcript";
 import type { SubagentUsage, WorkerRunResult } from "./session-broker";
@@ -72,6 +73,7 @@ export class RunResultCollector {
 	private lastAssistant: AssistantMessage | undefined;
 	private retryValue: SubagentRetry | undefined;
 	private retryCountValue = 0;
+	private pausedValue: SubagentPause | undefined;
 	private activeUsage: SubagentUsage | undefined;
 	private output = "";
 	private stopReasonValue: string | undefined;
@@ -111,6 +113,13 @@ export class RunResultCollector {
 	setRetry(retry?: SubagentRetry, retryCount = this.retryCountValue): void {
 		this.retryValue = retry;
 		this.retryCountValue = retryCount;
+	}
+
+	/** Mirrors the run's PauseGate state; returns whether it changed. */
+	setPaused(paused: SubagentPause | undefined): boolean {
+		if (this.pausedValue?.state === paused?.state && this.pausedValue?.since === paused?.since) return false;
+		this.pausedValue = paused;
+		return true;
 	}
 
 	// Returns whether a throttled update is warranted. Immediate flushes are the
@@ -271,6 +280,7 @@ export class RunResultCollector {
 			...(this.isCompactingValue ? { isCompacting: true } : {}),
 			...(this.retryValue ? { retry: this.retryValue } : {}),
 			...(this.retryCountValue ? { retryCount: this.retryCountValue } : {}),
+			...(this.pausedValue ? { paused: this.pausedValue } : {}),
 			...(this.stopReasonValue ? { stopReason: this.stopReasonValue } : {}),
 			...(this.errorMessageValue ? { errorMessage: this.errorMessageValue } : {}),
 		};

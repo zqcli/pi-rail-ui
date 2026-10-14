@@ -16,6 +16,7 @@ import {
 	okReply, jsonTextBytes, previewText, projectActivationInput, projectErrorText, projectWorkChildren, projectWorkError,
 } from "./team-codec";
 import { readCompactThreshold } from "./team-compaction-settings";
+import { RETRY_DELAYS_MS } from "./retry";
 import { WorkLedger } from "./team-work-ledger";
 import { prompt } from "../../core/prompts";
 import { addActivationUsage, emptySubagentUsage } from "./usage";
@@ -45,8 +46,7 @@ const TEAM_MAX_GRANT_REASON_BYTES = 512;
 const TEAM_MAX_TIMELINE = 1000;
 /** Once the timeline is full its first entries stay (a long run keeps its start); the oldest after them go. */
 export const TEAM_TIMELINE_HEAD = 30;
-/** Waits before each in-place retry of a transient provider error; the lead keeps retrying every 5 minutes until its window ends. */
-const RETRY_DELAYS_MS = [10_000, 30_000, 60_000, 120_000, 300_000];
+/** In-place retries of a transient provider error use the subagent RETRY_DELAYS_MS; the lead keeps retrying every 5 minutes until its window ends. */
 const LEAD_RETRY_WINDOW_MS = 30 * 60_000;
 /** A fresh work queued this long competes for a work permit like resumed work, so priority never starves it. */
 const READY_AGING_MS = 10 * 60_000;

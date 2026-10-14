@@ -22,6 +22,7 @@ import {
 import { availableRailModels, railModelReference } from "./models";
 import type { RpcEvent } from "./rpc-worker";
 import { runRailAgentManager } from "./rail-agent-manager";
+import { subagentPauses } from "./pause";
 import { SessionBroker, type TeamLifecycleRequest } from "./session-broker";
 import { SessionAgentRoster } from "./session-links";
 import { FileSessionLeaseManager } from "./session-lease";
@@ -171,9 +172,42 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 		}));
 	};
 
+	/** Without an alias, every running subagent pauses and new runs wait for continue; with one, only that persistent agent. */
+	const pauseAgents = async (action: "pause" | "continue", alias: string | undefined, ctx: ExtensionContext): Promise<void> => {
+		const pausing = action === "pause";
+		if (alias) {
+			const manager = getRuntime().manager;
+			const { status } = await (pausing ? manager.pause(alias) : manager.resume(alias));
+			const done = pausing ? "paused" : "continued";
+			ctx.ui.notify(`Subagent ${alias} ${status === "applied" ? done : pausing ? "was already paused" : "was not paused"}`, "info");
+			return;
+		}
+		const count = pausing ? subagentPauses.pauseAll() : subagentPauses.resumeAll();
+		ctx.ui.notify(pausing
+			? `Paused ${count} subagent(s); new subagent runs wait until /rail-agent continue`
+			: `Continued ${count} subagent(s)`, "info");
+	};
+
 	pi.registerCommand("rail-agent", {
-		description: "Start, link, and manage Rail persistent model sessions",
-		handler: (_args, ctx) => runRailAgentManager(ctx, getRuntime()),
+		description: "Start, link, and manage Rail persistent model sessions (pause [alias], continue [alias])",
+		getArgumentCompletions: (prefix) => {
+			const parts = prefix.split(/\s+/u);
+			const options = parts.length <= 1 ? ["pause", "continue"]
+				: parts.length === 2 && (parts[0] === "pause" || parts[0] === "continue") ? (runtime?.roster.list().map((link) => link.alias) ?? []) : [];
+			const typed = parts.at(-1) ?? "";
+			const matching = options.filter((option) => option.startsWith(typed));
+			return matching.length ? matching.map((option) => ({ value: [...parts.slice(0, -1), option].join(" "), label: option })) : null;
+		},
+		handler: async (args, ctx) => {
+			const [action, alias, ...extra] = args.trim().split(/\s+/u);
+			if (!action) return runRailAgentManager(ctx, getRuntime());
+			if ((action !== "pause" && action !== "continue") || extra.length) {
+				ctx.ui.notify("Usage: /rail-agent [pause [alias] | continue [alias]]", "warning");
+				return;
+			}
+			try { await pauseAgents(action, alias, ctx); }
+			catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
+		},
 	});
 
 	const createTeamHost = (ctx: ExtensionContext, broker: SessionBroker): TeamSessionHost => {

@@ -22,6 +22,7 @@ import { gptCompactionExtensionPath } from "../../tools/gpt-compaction/extension
 import type { RailModelRef } from "../../tools/subagents/models";
 import { SessionBroker, type AgentInstance, type WorkerStartSpec } from "../../tools/subagents/session-broker";
 import { loadoutFor } from "../fixtures/team-loadout";
+import { PAUSE_ENTRY_TYPE, PAUSE_GATE_FLAG, PauseGate, pauseGateArgs } from "../../tools/subagents/pause";
 
 // createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
 let isolatedAgentDir = "";
@@ -1255,5 +1256,82 @@ describe("RpcSessionWorker", () => {
 		// The guard is cleared and the worker is retired: the next run fails fast, not as "in progress".
 		await assert.rejects(() => worker.send("after failed switch", { contextWindow: 64000 }), /not reusable/);
 		assert.equal(transport.commands.some((command) => command["type"] === "prompt"), false);
+	});
+});
+
+describe("host pause", () => {
+	let pauseDir = "";
+	before(async () => { pauseDir = await mkdtemp(join(tmpdir(), "rail-rpc-pause-")); });
+	after(async () => { await rm(pauseDir, { recursive: true, force: true }); });
+	const parked = (value: boolean): RpcEvent => ({ type: "entry_appended", entry: { type: "custom", customType: PAUSE_ENTRY_TYPE, data: { parked: value } } });
+
+	test("child arguments carry the gate only when the factory provides one", () => {
+		const gateFile = join(pauseDir, "args.gate");
+		assert.equal(buildRpcWorkerArgs(spec("new")).includes(`--${PAUSE_GATE_FLAG}`), false);
+		const args = buildRpcWorkerArgs(spec("new"), gateFile);
+		assert.deepEqual(args.slice(-4), pauseGateArgs(gateFile));
+	});
+
+	test("a pause is requested while the child runs, confirmed when it parks, and never leaks into the final result", async () => {
+		const transport = new FakeTransport(false, undefined, true);
+		const gate = new PauseGate(join(pauseDir, "run.gate"));
+		const worker = await RpcSessionWorker.connect(spec("new"), transport, undefined, gate);
+		assert.equal(worker.pauseGate, gate);
+		const accepted = Promise.withResolvers<void>();
+		const updates: any[] = [];
+		const pending = worker.send("pausable", { onAccepted: () => accepted.resolve(), onUpdate: (run) => updates.push(run) });
+		await accepted.promise;
+		assert.equal(gate.pause(), true);
+		assert.equal(updates.at(-1).paused.state, "requested");
+		transport.emit(parked(true));
+		assert.equal(updates.at(-1).paused.state, "confirmed");
+		assert.equal(gate.paused?.state, "confirmed");
+		gate.resume();
+		assert.equal(updates.at(-1).paused, undefined);
+		gate.pause();
+		transport.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } });
+		transport.emit({ type: "agent_settled" });
+		const result = await pending;
+		assert.equal(result.output, "done");
+		assert.equal("paused" in result, false, "the pause is host state, not part of the run's result");
+		assert.equal(gate.paused?.state, "confirmed", "an idle worker stays paused for its next run");
+		await worker.stop();
+		assert.equal(transport.listeners.size, 0);
+	});
+
+	test("a retry after its backoff waits for continue before the next attempt", { timeout: 2000 }, async () => {
+		const transport = new RetryTransport(1);
+		const gate = new PauseGate(join(pauseDir, "retry.gate"));
+		const backoff = Promise.withResolvers<void>();
+		const worker = await RpcSessionWorker.connect(spec("new"), transport, () => backoff.promise, gate);
+		const waiting = Promise.withResolvers<void>();
+		const updates: any[] = [];
+		const pending = worker.send("retry me", { onUpdate: (run) => { updates.push(run); if (run.retry) waiting.resolve(); } });
+		await waiting.promise;
+		gate.pause();
+		assert.equal(updates.at(-1).paused.state, "confirmed", "a parent in backoff is already parked");
+		assert.equal(updates.at(-1).retry.attempt, 1);
+		backoff.resolve();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(transport.prompts.length, 1, "no continuation while paused");
+		gate.resume();
+		const result = await pending;
+		assert.equal(result.output, "recovered");
+		assert.equal(transport.prompts.length, 2);
+		assert.equal("paused" in result, false);
+	});
+
+	test("stopping the worker ends a pause wait and removes the gate file", { timeout: 2000 }, async () => {
+		const transport = new RetryTransport(99);
+		const file = join(pauseDir, "stop.gate");
+		const gate = new PauseGate(file);
+		const worker = await RpcSessionWorker.connect(spec("new"), transport, async () => undefined, gate);
+		const paused = Promise.withResolvers<void>();
+		const pending = worker.send("stop me", { onUpdate: (run) => { if (run.retry && !gate.paused) { gate.pause(); paused.resolve(); } } });
+		await paused.promise;
+		await worker.stop();
+		const result = await pending;
+		assert.equal(result.stopReason, "aborted");
+		await assert.rejects(access(file), /ENOENT/);
 	});
 });

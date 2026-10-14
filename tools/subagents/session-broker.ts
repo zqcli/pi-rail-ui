@@ -13,7 +13,7 @@ import type { CompactionResult, NativeCompletion, RuntimeActivation } from "./te
 import type { RpcEvent } from "./rpc-worker";
 import { parseBinding, sameBinding } from "./team-codec";
 import type { SubagentRetry } from "./retry";
-import type { PauseGate, SubagentPause } from "./pause";
+import { subagentPauses, type PauseGate, type SubagentPause, type SubagentPauseRegistry } from "./pause";
 
 export interface SubagentUsage {
 	input: number;
@@ -268,6 +268,8 @@ interface WorkerState {
 	isCompacting: boolean;
 	retry: SubagentRetry | undefined;
 	retryCount: number;
+	/** Removes the worker's pause gate from the registry and its display subscription. */
+	releasePause?: () => void;
 }
 
 interface OwnedTeamMember {
@@ -319,6 +321,11 @@ export interface AgentRuntimeStatus {
 	errorMessage?: string;
 }
 
+export interface PauseOutcome {
+	instance: AgentInstance;
+	status: "applied" | "unchanged";
+}
+
 export interface SessionBrokerOptions {
 	store: AgentInstanceStore;
 	roster: AgentRoster;
@@ -326,6 +333,8 @@ export interface SessionBrokerOptions {
 	defaultCwd?: string;
 	parentSessionLabel?: string;
 	aliasLeaseManager?: { acquire(key: string): Promise<SessionLease> };
+	/** Where ordinary workers' pause gates are listed for `/rail-agent pause`; defaults to the process singleton. */
+	pauses?: SubagentPauseRegistry;
 }
 
 function generatedAlias(modelId: string, agentId: string): string {
@@ -380,6 +389,7 @@ export class SessionBroker {
 	private readonly defaultCwd: string;
 	private readonly parentSessionLabel: string;
 	private readonly aliasLeaseManager: { acquire(key: string): Promise<SessionLease> } | undefined;
+	private readonly pauses: SubagentPauseRegistry;
 	private readonly runtimeListeners = new Set<() => void>();
 	private shuttingDown = false;
 	private teamRouter: TeamLifecycleRouter | undefined;
@@ -405,6 +415,7 @@ export class SessionBroker {
 		this.defaultCwd = options.defaultCwd ?? process.cwd();
 		this.parentSessionLabel = options.parentSessionLabel ?? "main";
 		this.aliasLeaseManager = options.aliasLeaseManager;
+		this.pauses = options.pauses ?? subagentPauses;
 	}
 
 	/** Diagnostic: Team-owned member aliases (owners are released only after a confirmed native exit). */
@@ -872,7 +883,9 @@ export class SessionBroker {
 		const state = this.workers.get(agentId);
 		if (state) {
 			const retryCount = state.retryCount || this.stoppedRetryCounts.get(agentId);
+			const paused = state.worker.pauseGate?.paused;
 			const activity = {
+				...(paused ? { paused } : {}),
 				...(state.isCompacting ? { isCompacting: true as const } : {}),
 				...(state.retry ? { retry: state.retry } : {}),
 				...(retryCount ? { retryCount } : {}),
@@ -889,6 +902,31 @@ export class SessionBroker {
 		const activity = retryCount ? { retryCount } : {};
 		if (errorMessage) return { phase: "error", queued: 0, ...activity, errorMessage };
 		return { phase: "stopped", queued: 0, ...activity };
+	}
+
+	/** Host pause of one ordinary worker: in-flight work finishes, then the child parks until `resume`. */
+	pause(target: string): Promise<PauseOutcome> {
+		return this.setPaused(target, true);
+	}
+
+	resume(target: string): Promise<PauseOutcome> {
+		return this.setPaused(target, false);
+	}
+
+	private async setPaused(target: string, paused: boolean): Promise<PauseOutcome> {
+		const verb = paused ? "pause" : "resume";
+		const agentId = this.roster.resolve(target) ?? target;
+		if (this.teamAliases.has(target) || this.teamMemberHandles.has(agentId)) {
+			throw new TeamOwnedError("Team-owned members are paused through their Team (/rail-team pause)");
+		}
+		const instance = await this.resolveInstance(target);
+		if (this.shuttingDown || this.stoppingAgents.has(agentId) || this.deletingAgents.has(agentId)) throw new Error("Subagent worker is stopping");
+		const state = this.workers.get(agentId);
+		if (!state || state.stopping) throw new Error(`Subagent ${instance.alias} is not running; nothing to ${verb}`);
+		const gate = state.worker.pauseGate;
+		if (!gate) throw new Error(`Subagent ${instance.alias} does not support pause`);
+		const applied = paused ? gate.pause() : gate.resume();
+		return { instance: { ...state.instance, alias: instance.alias }, status: applied ? "applied" : "unchanged" };
 	}
 
 	subscribeRuntime(listener: () => void): () => void {
@@ -1098,7 +1136,10 @@ export class SessionBroker {
 		for (const state of this.workers.values()) if (this.teamAliases.has(state.instance.alias)) teamOwnedAgentIds.add(state.instance.agentId);
 		const ordinaryStates = [...this.workers.entries()].filter(([agentId]) => !teamOwnedAgentIds.has(agentId));
 		for (const [agentId] of ordinaryStates) this.workers.delete(agentId);
-		for (const [, state] of ordinaryStates) state.stopping = true;
+		for (const [, state] of ordinaryStates) {
+			state.stopping = true;
+			state.releasePause?.();
+		}
 		const ordinary = ordinaryStates.map(([, state]) => state);
 		const stopped = await Promise.allSettled(ordinary.map((state) => state.worker.stop()));
 		for (const outcome of stopped) if (outcome.status === "rejected") failures.push(outcome.reason);
@@ -1219,7 +1260,7 @@ export class SessionBroker {
 				throw new Error("Subagent broker is shutting down");
 			}
 			this.roster.link(alias, agentId);
-			this.workers.set(agentId, freshWorkerState(instance, worker));
+			this.workers.set(agentId, this.adoptWorker(instance, worker));
 			this.emitRuntimeChange();
 			return instance;
 		} catch (error) {
@@ -1243,6 +1284,18 @@ export class SessionBroker {
 		const normalized: AgentInstance = { ...instance, fastMode: instance.fastMode === true };
 		this.rememberInstanceAtEpoch(normalized, snapshotEpoch);
 		return linkedAgentId && target !== agentId ? { ...normalized, alias: target } : normalized;
+	}
+
+	/** Lists an ordinary worker's pause gate for host-wide pause and refreshes displays on gate changes. */
+	private adoptWorker(instance: AgentInstance, worker: SessionWorker): WorkerState {
+		const state = freshWorkerState(instance, worker);
+		const gate = worker.pauseGate;
+		if (gate) {
+			const unsubscribe = gate.subscribe(() => this.emitRuntimeChange());
+			const unregister = this.pauses.register({ gate, agentId: instance.agentId, label: instance.alias });
+			state.releasePause = () => { unregister(); unsubscribe(); };
+		}
+		return state;
 	}
 
 	private async workerState(instance: AgentInstance, expectedEpoch = this.lifecycleEpoch(instance.agentId)): Promise<WorkerState> {
@@ -1280,7 +1333,7 @@ export class SessionBroker {
 				await worker.stop().catch(() => undefined);
 				throw new Error("Subagent dispatch was interrupted by stop or shutdown");
 			}
-			const state = freshWorkerState({ ...instance, sessionName }, worker);
+			const state = this.adoptWorker({ ...instance, sessionName }, worker);
 			this.workers.set(instance.agentId, state);
 			this.emitRuntimeChange();
 			return state;
@@ -1396,6 +1449,7 @@ export class SessionBroker {
 		if (state.retryCount) this.stoppedRetryCounts.set(agentId, state.retryCount);
 		this.workers.delete(agentId);
 		state.stopping = true;
+		state.releasePause?.();
 		const stop = state.worker.stop().catch((error: unknown) => {
 			if (error instanceof RpcProcessExitTimeoutError) {
 				this.unreaped.set(agentId, error.exited);

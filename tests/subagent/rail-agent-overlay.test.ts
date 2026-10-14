@@ -66,6 +66,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 	currentSnapshot.counts.running = phase === "running" ? 1 : 0;
 	currentSnapshot.counts.idle = phase === "idle" ? 1 : 0;
 	const controls: unknown[] = [];
+	const pauseCalls: string[] = [];
 	const notifications: Array<{ message: string; type: string | undefined }> = [];
 	const availableModels = structuredClone(models);
 	const mentions: string[] = [];
@@ -96,6 +97,16 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 			return currentSnapshot.agents[0]!.instance;
 		},
 		control: async (target: string, request: unknown) => { controls.push({ target, request }); return { instance: currentSnapshot.agents[0]!.instance, delivery: "steer" }; },
+		pause: async (target: string) => {
+			pauseCalls.push(`pause ${target}`);
+			currentSnapshot.agents[0]!.paused = { state: "requested", since: Date.now() };
+			return { instance: currentSnapshot.agents[0]!.instance, status: "applied" };
+		},
+		resume: async (target: string) => {
+			pauseCalls.push(`resume ${target}`);
+			delete currentSnapshot.agents[0]!.paused;
+			return { instance: currentSnapshot.agents[0]!.instance, status: "applied" };
+		},
 	};
 	const ctx = {
 		cwd: "/tmp/project",
@@ -134,7 +145,7 @@ function setup(phase: "idle" | "running" | "starting" | "queued" | "stopped" | "
 		},
 		currentSnapshot,
 	);
-	return { component, controls, continuations, ctx, manager, notifications, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
+	return { component, controls, pauseCalls, continuations, ctx, manager, notifications, models: availableModels, mentions, sessions, snapshot: currentSnapshot, get renders() { return renders; }, get closed() { return closed; }, get subscribed() { return subscribed; }, get unsubscribed() { return unsubscribed; } };
 }
 
 test("rail-agent renders live retry countdown and final recovered count", (t) => {
@@ -1047,6 +1058,42 @@ test("running agents show compacting as an activity status while remaining contr
 	}
 });
 
+test("p pauses the selected agent and continues it again, showing the pause in its phase", async () => {
+	const state = setup("running");
+	try {
+		state.component.handleInput("p");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(state.pauseCalls, ["pause agt_auth"]);
+		let text = state.component.render(100).join("\n");
+		assert.match(text, /Pausing · finishing current step/);
+		assert.match(text, /p continue/);
+		assert.match(text, /Paused auth-review/);
+		state.snapshot.agents[0]!.paused = { state: "confirmed", since: Date.now() };
+		await new Promise((resolve) => setImmediate(resolve));
+		state.component.handleInput("p");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(state.pauseCalls, ["pause agt_auth", "resume agt_auth"]);
+		text = state.component.render(100).join("\n");
+		assert.doesNotMatch(text, /Pausing|Paused ·/);
+		assert.match(text, /p pause/);
+		assert.match(text, /Continued auth-review/);
+	} finally {
+		state.component.dispose();
+	}
+});
+
+test("a refused pause surfaces the broker's reason in the panel", async () => {
+	const state = setup("idle");
+	try {
+		(state.manager as any).pause = async () => { throw new Error("Subagent auth-review is not running; nothing to pause"); };
+		state.component.handleInput("p");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(state.component.render(100).join("\n"), /not running; nothing to pause/);
+	} finally {
+		state.component.dispose();
+	}
+});
+
 test("running agents accept inline steer and follow-up controls", async () => {
 	const state = setup("running");
 	try {
@@ -1407,7 +1454,7 @@ test("every action key stays visible in the help rows at 73 and 80 columns", () 
 	try {
 		for (const width of [73, 80]) {
 			const agentHelp = state.component.render(width).join("\n");
-			for (const label of ["↑↓ select", "enter Continue", "i Mention", "/ search", "g steer", "f follow-up", "n new", "s stop", "d detach", "x delete", "m model", "t thinking", "shift+f fast", "esc close"]) {
+			for (const label of ["↑↓ select", "enter Continue", "i Mention", "/ search", "g steer", "f follow-up", "p pause", "n new", "s stop", "d detach", "x delete", "m model", "t thinking", "shift+f fast", "esc close"]) {
 				assert.ok(agentHelp.includes(label), `${width}: ${label}`);
 			}
 		}

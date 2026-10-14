@@ -10,12 +10,14 @@ import type {
 	DispatchRequest,
 	DispatchResult,
 	ControlResult,
+	PauseOutcome,
 	SessionBroker,
 	SessionSource,
 	WorkerControlRequest,
 } from "./session-broker";
 import { sessionLeaseKey } from "./worker-factory";
 import type { SubagentRetry } from "./retry";
+import type { SubagentPause } from "./pause";
 
 export type RailAgentPhase = AgentRuntimePhase | "in-use-elsewhere" | "unknown";
 
@@ -28,6 +30,7 @@ export interface RailAgentView {
 	isCompacting?: boolean;
 	retry?: SubagentRetry;
 	retryCount?: number;
+	paused?: SubagentPause;
 	ownerPid?: number;
 	errorMessage?: string;
 }
@@ -100,6 +103,7 @@ export class RailAgentManager {
 					...(local.isCompacting ? { isCompacting: true } : {}),
 					...(local.retry ? { retry: local.retry } : {}),
 					...(local.retryCount ? { retryCount: local.retryCount } : {}),
+					...(local.paused ? { paused: local.paused } : {}),
 					...(local.errorMessage ? { errorMessage: local.errorMessage } : {}),
 				};
 			}
@@ -164,6 +168,17 @@ export class RailAgentManager {
 			throw new Error(`Subagent ${agent.instance.alias} is not currently running; use continue for an idle or stopped session`);
 		}
 		return this.broker.control({ target: agent.instance.agentId, ...request, ...(signal ? { signal } : {}) });
+	}
+
+	/** Unlike controls, pausing is allowed during a retry backoff: the next attempt then waits for continue. */
+	async pause(target: string): Promise<PauseOutcome> {
+		const agent = await this.assertLocallyControllable(target);
+		return this.broker.pause(agent.instance.agentId);
+	}
+
+	async resume(target: string): Promise<PauseOutcome> {
+		const agent = await this.assertLocallyControllable(target);
+		return this.broker.resume(agent.instance.agentId);
 	}
 
 	adopt(request: AdoptRailAgentRequest): Promise<AgentInstance> {

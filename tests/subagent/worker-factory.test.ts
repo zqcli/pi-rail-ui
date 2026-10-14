@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -8,6 +9,7 @@ import { FileSessionLeaseManager } from "../../tools/subagents/session-lease";
 import { createRpcWorkerFactory, sessionLeaseKey } from "../../tools/subagents/worker-factory";
 import { PiRpcProcessTransport, RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 import { RpcSessionWorker } from "../../tools/subagents/rpc-worker";
+import { PAUSE_GATE_FLAG } from "../../tools/subagents/pause";
 
 const model: RailModelRef = { provider: "cus-resp", modelId: "gpt-5.6-luna", thinkingLevel: "xhigh" };
 
@@ -43,6 +45,37 @@ test("new workers migrate from a startup lease to the same session lease used by
 			sessionPath: first.sessionFile,
 		});
 		await resumed.stop();
+	} finally {
+		await rm(stateDir, { recursive: true, force: true });
+	}
+});
+
+test("only ordinary workers get a pause gate; its file ends with the worker", async () => {
+	const stateDir = await mkdtemp(join(tmpdir(), "pi-subagent-worker-factory-"));
+	const fixture = resolve("tests/fixtures/fake-pi-rpc.mjs");
+	const argv = new Map<string, string[]>();
+	let current = "";
+	const factory = createRpcWorkerFactory({
+		stateDir,
+		resolveInvocation: (args) => { argv.set(current, args); return { command: process.execPath, args: [fixture, ...args] }; },
+	});
+	try {
+		current = "ordinary";
+		const ordinary = await factory({ agentId: "agt_pausable", mode: "new", model, alias: "pausable", cwd: process.cwd() });
+		const file = join(stateDir, "pause", "agt_pausable.gate");
+		const args = argv.get("ordinary")!;
+		assert.equal(args[args.indexOf(`--${PAUSE_GATE_FLAG}`) + 1], file);
+		assert.equal(ordinary.pauseGate?.file, file);
+		ordinary.pauseGate!.pause();
+		assert.equal(existsSync(file), true);
+		await ordinary.stop();
+		assert.equal(existsSync(file), false);
+
+		current = "team";
+		const member = await factory({ agentId: "agt_member", mode: "new", model, alias: "member", cwd: process.cwd(), teamProtocolVersion: 2 });
+		assert.equal(argv.get("team")!.includes(`--${PAUSE_GATE_FLAG}`), false);
+		assert.equal(member.pauseGate, undefined);
+		await member.stop();
 	} finally {
 		await rm(stateDir, { recursive: true, force: true });
 	}

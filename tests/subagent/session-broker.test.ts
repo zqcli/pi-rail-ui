@@ -23,6 +23,8 @@ import {
 import type { RailModelRef } from "../../tools/subagents/models";
 import { RpcProcessExitTimeoutError } from "../../tools/subagents/rpc-transport";
 import type { BindingV2 } from "../../tools/subagents/team-protocol";
+import { PauseGate, SubagentPauseRegistry } from "../../tools/subagents/pause";
+import { TeamOwnedError } from "../../tools/subagents/session-broker";
 import { loadoutFor } from "../fixtures/team-loadout";
 
 // createChildContextSettings reads the agent dir; keep the developer's real settings out of these tests.
@@ -1668,4 +1670,130 @@ test("a cleanup that races an in-flight stop waits for its outcome before removi
 		await assert.rejects(access(sessionFile), /ENOENT/u);
 		await broker.shutdown();
 	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+function pausableSetup(dir: string) {
+	const pauses = new SubagentPauseRegistry();
+	const gates: PauseGate[] = [];
+	const workers: FakeWorker[] = [];
+	const workerFactory: SessionWorkerFactory = async (spec) => {
+		const worker = new FakeWorker(`session-${spec.agentId}`, spec.mode === "open" ? spec.sessionPath! : `/tmp/${spec.agentId}.jsonl`);
+		const gate = new PauseGate(join(dir, `${spec.agentId}.gate`));
+		gates.push(gate);
+		workers.push(worker);
+		return Object.assign(worker, { pauseGate: gate });
+	};
+	const broker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), workerFactory, pauses });
+	return { broker, pauses, gates, workers };
+}
+
+test("host pause parks one ordinary worker, shows in runtime status and registry, and resumes it", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "broker-pause-"));
+	const { broker, pauses, gates } = pausableSetup(dir);
+	try {
+		const agent = await broker.attach({ model: reviewerModel(), alias: "pausable" });
+		assert.deepEqual(pauses.list().map((target) => [target.agentId, target.label]), [[agent.agentId, "pausable"]]);
+		let changes = 0;
+		broker.subscribeRuntime(() => { changes++; });
+		assert.equal((await broker.pause("pausable")).status, "applied");
+		assert.equal((await broker.pause("pausable")).status, "unchanged");
+		const outcome = await broker.pause(agent.agentId);
+		assert.equal(outcome.instance.agentId, agent.agentId);
+		assert.equal(broker.runtimeStatus(agent.agentId).paused?.state, "confirmed", "an idle worker is parked at once");
+		assert.ok(changes > 0, "displays refresh on gate changes");
+		assert.equal(pauses.allPaused, false, "pausing one agent holds no new runs");
+		assert.equal((await broker.resume("pausable")).status, "applied");
+		assert.equal((await broker.resume("pausable")).status, "unchanged");
+		assert.equal(broker.runtimeStatus(agent.agentId).paused, undefined);
+		assert.equal(gates[0]!.paused, undefined);
+		// A host-wide pause reaches the persistent worker through the registry too.
+		assert.equal(pauses.pauseAll(), 1);
+		assert.equal(broker.runtimeStatus(agent.agentId).paused?.state, "confirmed");
+		pauses.resumeAll();
+	} finally {
+		await broker.shutdown();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("a queued dispatch to a paused worker still starts; the pause is the child's to hold", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "broker-pause-"));
+	const { broker, workers } = pausableSetup(dir);
+	try {
+		const agent = await broker.attach({ model: reviewerModel(), alias: "held" });
+		await broker.pause(agent.agentId);
+		const result = await broker.dispatch({ target: agent.agentId, task: "start anyway" });
+		assert.equal(result.run.output, "done: start anyway");
+		assert.deepEqual(workers[0]!.tasks, ["start anyway"]);
+	} finally {
+		await broker.shutdown();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("host pause is refused for stopped, unknown, gate-less, and Team-owned agents", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "broker-pause-"));
+	const { broker } = pausableSetup(dir);
+	try {
+		const agent = await broker.attach({ model: reviewerModel(), alias: "stopped" });
+		await broker.stop(agent.agentId);
+		await assert.rejects(broker.pause("stopped"), /not running; nothing to pause/);
+		await assert.rejects(broker.resume("stopped"), /not running; nothing to resume/);
+		await assert.rejects(broker.pause("nobody"), /Unknown persistent subagent/);
+	} finally {
+		await broker.shutdown();
+		await rm(dir, { recursive: true, force: true });
+	}
+	const plain = setup();
+	try {
+		const agent = await plain.broker.attach({ model: reviewerModel(), alias: "plain" });
+		await assert.rejects(plain.broker.pause(agent.agentId), /does not support pause/);
+	} finally { await plain.broker.shutdown(); }
+
+	const root = await mkdtemp(join(tmpdir(), "broker-pause-team-"));
+	const teamBroker = new SessionBroker({ store: new MemoryInstanceStore(), roster: new MemoryRoster(), defaultCwd: root,
+		workerFactory: async () => Object.assign(brokerOwnedV2Worker("team-pause", join(root, "member.jsonl")), { pauseGate: new PauseGate(join(root, "member.gate")) }),
+		pauses: new SubagentPauseRegistry() });
+	try {
+		const handle = await teamBroker.openTeamMember({ binding: teamBinding("member-a"), model: reviewerModel(), cwd: root, loadout: loadoutFor("member-a") });
+		await assert.rejects(teamBroker.pause("member-a"), TeamOwnedError);
+		await assert.rejects(teamBroker.resume(handle.instance.agentId), TeamOwnedError);
+		await handle.close();
+	} finally {
+		await teamBroker.shutdown();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("stop, retire and shutdown remove the worker's gate from the registry", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "broker-pause-"));
+	const { broker, pauses } = pausableSetup(dir);
+	try {
+		const first = await broker.attach({ model: reviewerModel(), alias: "first" });
+		await broker.attach({ model: reviewerModel(), alias: "second" });
+		assert.equal(pauses.list().length, 2);
+		await broker.stop(first.agentId);
+		assert.deepEqual(pauses.list().map((target) => target.label), ["second"]);
+		// A restarted worker registers a fresh gate.
+		await broker.dispatch({ target: first.agentId, task: "again" });
+		assert.equal(pauses.list().length, 2);
+		await broker.shutdown();
+		assert.equal(pauses.list().length, 0);
+	} finally {
+		await broker.shutdown();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("a worker that starts while all subagents are paused is held at once", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "broker-pause-"));
+	const { broker, pauses, gates } = pausableSetup(dir);
+	try {
+		pauses.pauseAll();
+		await broker.attach({ model: reviewerModel(), alias: "late" });
+		assert.equal(gates[0]!.paused?.state, "confirmed");
+	} finally {
+		await broker.shutdown();
+		await rm(dir, { recursive: true, force: true });
+	}
 });

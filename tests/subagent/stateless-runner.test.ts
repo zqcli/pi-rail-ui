@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import { railResponsesWebSocketExtensionPath } from "../../openai/responses-webs
 import { test, type TestContext } from "node:test";
 import type { RailModelRef } from "../../tools/subagents/models";
 import { createStatelessAgentRunner, type StatelessRunResult } from "../../tools/subagents/stateless-runner";
+import { PAUSE_ENTRY_TYPE, PAUSE_GATE_FLAG, pauseGateArgs, SubagentPauseRegistry } from "../../tools/subagents/pause";
 import { RETRY_DELAYS_MS } from "../../tools/subagents/retry";
 import { CONTEXT_PROTOCOL_ERROR_PREFIX, contextExtensionPath } from "../../tools/subagents/context-window";
 
@@ -63,6 +65,7 @@ test("stateless runner uses Pi JSON mode with a private session cleaned after ex
 		"--thinking", "xhigh",
 		"-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live",
 		"--exclude-tools", "subagent",
+		...pauseGateArgs(join(dirname(sessionPath), "pause.gate")),
 		"Task: inspect auth",
 	]);
 	assert.equal(result.output, "stateless done");
@@ -775,4 +778,111 @@ test("surfaces a spawn failure through the run's shared error slot", async () =>
 	assert.match(result.errorMessage ?? "", /ENOENT/);
 	assert.equal(result.output, result.errorMessage);
 	assert.equal(updates.length, 0);
+});
+/** A child that reports one message, then parks at the gate like the real pause extension and finishes after resume. */
+function pausableChild(args: string[]) {
+	const gate = args[args.indexOf(`--${PAUSE_GATE_FLAG}`) + 1]!;
+	const parked = (value: boolean) => ({ type: "entry_appended", entry: { type: "custom", customType: PAUSE_ENTRY_TYPE, data: { parked: value } } });
+	const script = `
+const fs = require("node:fs");
+const gate = ${JSON.stringify(gate)};
+const out = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+setTimeout(() => process.exit(1), 15000).unref();
+out({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working" }], usage: { input: 1, output: 1 }, stopReason: "stop" } });
+let isParked = false;
+setInterval(() => {
+	const held = fs.existsSync(gate);
+	if (held && !isParked) { isParked = true; out(${JSON.stringify(parked(true))}); }
+	else if (!held && isParked) {
+		out(${JSON.stringify(parked(false))});
+		out({ type: "agent_end", messages: [], willRetry: false });
+		out({ type: "agent_settled" });
+		process.exit(0);
+	}
+}, 10);
+`;
+	return { command: process.execPath, args: ["-e", script] };
+}
+
+async function until(condition: () => boolean): Promise<void> {
+	for (let i = 0; i < 500 && !condition(); i++) await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+	assert.equal(condition(), true, "condition was not met in time");
+}
+
+test("stateless run registers a pause target, reports requested then confirmed pause, and unregisters after resume", async () => {
+	const pauses = new SubagentPauseRegistry();
+	let capturedArgs: string[] = [];
+	const runner = createStatelessAgentRunner({
+		pauses,
+		resolveInvocation: (args) => {
+			capturedArgs = args;
+			return pausableChild(args);
+		},
+	});
+	const updates: StatelessRunResult[] = [];
+	const run = runner({ model, task: "pause\nme please", cwd: process.cwd(), onUpdate: (update) => updates.push(update) });
+
+	await until(() => updates.some((update) => update.output === "working"));
+	assert.equal(pauses.list().length, 1);
+	assert.equal(pauses.list()[0]!.label, "one-off · pause me please");
+	const gateFile = pauses.list()[0]!.gate.file;
+	assert.deepEqual(capturedArgs.slice(capturedArgs.indexOf("-e", capturedArgs.indexOf("--exclude-tools")), -1), pauseGateArgs(gateFile));
+	assert.equal(existsSync(gateFile), false);
+	assert.equal(updates.at(-1)!.paused, undefined);
+
+	assert.equal(pauses.pauseAll(), 1);
+	assert.equal(existsSync(gateFile), true);
+	assert.equal(updates.at(-1)!.paused?.state, "requested", "the child is still running until it parks");
+	await until(() => updates.at(-1)!.paused?.state === "confirmed");
+
+	assert.equal(pauses.resumeAll(), 1);
+	assert.equal(updates.at(-1)!.paused, undefined);
+	const result = await run;
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.paused, undefined);
+	assert.equal(pauses.list().length, 0);
+	assert.equal(existsSync(gateFile), false);
+});
+
+test("stateless run uses an explicit label and holds a run that starts while the registry is paused", async () => {
+	const pauses = new SubagentPauseRegistry();
+	pauses.pauseAll();
+	const runner = createStatelessAgentRunner({ pauses, resolveInvocation: pausableChild });
+	const updates: StatelessRunResult[] = [];
+	const run = runner({ model, task: "late", label: "chain step 2 · late", cwd: process.cwd(), onUpdate: (update) => updates.push(update) });
+	await until(() => updates.some((update) => update.output === "working"));
+	assert.equal(pauses.list()[0]!.label, "chain step 2 · late");
+	assert.ok(updates.some((update) => update.paused));
+	await until(() => updates.at(-1)!.paused?.state === "confirmed");
+	pauses.resumeAll();
+	assert.equal((await run).paused, undefined);
+});
+
+test("stateless retry waits for resume after its backoff when paused", async (t) => {
+	const fixture = await retryFixture(t);
+	const pauses = new SubagentPauseRegistry();
+	let backoffReached!: () => void;
+	const reached = new Promise<void>((resolvePromise) => { backoffReached = resolvePromise; });
+	const updates: StatelessRunResult[] = [];
+	const runner = createStatelessAgentRunner({
+		pauses,
+		resolveInvocation: fixture.resolveInvocation,
+		waitForRetry: async () => {
+			pauses.pauseAll();
+			backoffReached();
+		},
+	});
+	const run = runner({ model, task: "append marker exactly once", cwd: fixture.cwd, onUpdate: (update) => updates.push(update) });
+	await reached;
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+	assert.equal(fixture.calls.length, 1, "no continuation starts while paused");
+	assert.equal(updates.at(-1)!.paused?.state, "confirmed", "the parent waiting between attempts counts as parked");
+	assert.ok(updates.at(-1)!.retry, "the pending retry stays visible");
+
+	pauses.resumeAll();
+	const result = await run;
+	assert.equal(fixture.calls.length, 2);
+	assert.equal(result.retryCount, 1);
+	assert.equal(result.paused, undefined);
+	await fixture.assertCleaned();
 });

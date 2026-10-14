@@ -86,6 +86,8 @@ fi
 
 `/rail-agent` 默认使用安全的 **Safe copy**（`fork`），对已经由 Rail 管理的 session 也会创建副本。需要不复制而继续已有 agent 时，使用 **Current** / **All Persistent**，按 `Enter` 直接 Continue，或按 `i` link 并 Mention。**Exclusive in place** 是带明确警告的表单选项，且只有确认没有其他 Pi 进程打开该 session 时才可使用。面板可继续/link agent、在本地可控时修改 model 或 thinking level、停止 worker 但保留 session、从当前父 session detach 并保留 child JSONL，也可以永久删除 Rail descriptor 与 child JSONL。永久删除刻意不扫描或改写其他父 session；那些 session 中的旧 link 会继续保留，之后调用时直接报 unknown persistent subagent。另一个 TUI 正在使用的 session 不会被 live attach 或删除。旧 `/agents` 与 `/subagents` alias 不再注册。
 
+宿主暂停与 Team 的暂停一致：在 `/rail-agent` 面板中，`p` 暂停选中的、在本地运行的 persistent agent；已暂停时再按 `p` 继续。命令行下 `/rail-agent pause [alias]` 与 `/rail-agent continue [alias]` 效果相同；不带 alias 时暂停或继续当前 pi 进程内所有运行中的 subagent（one-off 运行与 persistent agent），并在 `continue` 之前挂起新启动的运行。已在进行的工作会先完成，child 随后在下一次 provider 请求或工具调用处停住（`Pausing` 变为 `Paused`），不再启动任何新工作，包括 backoff 之后的 Rail 重试；`continue` 恢复同一个 native run。Team 成员请改用 `/rail-team pause`；重启 pi 后不保留暂停状态。
+
 Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instance 保存的是 model reference，而不是 agent profile。Session lease 与短期 alias reservation 同时保证 single writer 和跨 Rail 进程的 persistent alias 唯一性。完整 child transcript 仍保留在 child Pi session 中。父 tool content 继续限制为 50KB；Tool Call details 只保留有界 final answer 与近期事件窗口，不复制无界 child 历史。
 
 #### 协作 Team（按需启用）

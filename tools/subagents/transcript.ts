@@ -822,6 +822,11 @@ function statusText(run: SubagentTranscriptRun): string {
 	return "Completed";
 }
 
+/** A paused run needs the same attention color as a compacting one. */
+function needsAttention(run: SubagentTranscriptRun): boolean {
+	return run.isCompacting === true || run.paused !== undefined;
+}
+
 /**
  * One color per state, shared by every subagent panel and the /rail-agent list: running blue,
  * completed green, needs attention yellow, failed red, idle or waiting gray. Blue and green stay
@@ -877,7 +882,7 @@ function statusIcon(run: SubagentTranscriptRun, theme: Theme): string {
 		: run.status === "running" ? (run.isCompacting ? "◐" : "▶")
 			: run.status === "idle" ? "○" : run.status === "waiting" ? "⧗" : run.status === "held" ? "⏸"
 				: run.status === "accepted" ? "↪" : "✓";
-	return theme.fg(statusColor(run.status, run.isCompacting), icon);
+	return theme.fg(statusColor(run.status, needsAttention(run)), icon);
 }
 
 /** Collapsed answers skip headings and blank lines, so the preview starts with content. */
@@ -934,11 +939,11 @@ class SubagentRunPanel implements Component {
 		const boxed = this.boxed && width >= 3;
 		const innerWidth = Math.max(1, width - (boxed ? 2 : 0));
 		const header = this.layout === "single"
-			? `${this.theme.fg(statusColor(this.run.status, this.run.isCompacting), this.theme.bold(statusText(this.run)))}${this.theme.fg("toolTitle", this.theme.bold(` · ${runtimeText(this.run)}`))}`
+			? `${this.theme.fg(statusColor(this.run.status, needsAttention(this.run)), this.theme.bold(statusText(this.run)))}${this.theme.fg("toolTitle", this.theme.bold(` · ${runtimeText(this.run)}`))}`
 			: `${statusIcon(this.run, this.theme)} ${this.theme.fg("toolTitle", this.theme.bold(identityText(this.run, this.layout, this.sequenceTotal)))}`;
 		const lines = [truncateToWidth(header, innerWidth, "", true)];
-		if (this.layout === "grouped" && this.run.retry && this.run.status === "running") {
-			lines.push(truncateToWidth(this.theme.fg("warning", retryStatusText(this.run.retry)), innerWidth, "", true));
+		if (this.layout === "grouped" && this.run.status === "running" && (this.run.paused || this.run.retry)) {
+			lines.push(truncateToWidth(this.theme.fg("warning", statusText(this.run)), innerWidth, "", true));
 		}
 		if (this.layout === "grouped" && this.run.status === "failed" && this.run.stopReason === "aborted") {
 			lines.push(this.theme.fg("error", "Cancelled"));
@@ -962,7 +967,7 @@ class SubagentRunPanel implements Component {
 			? [line]
 			: new Text(line, 0, 0).render(width).map((rendered) => truncateToWidth(rendered, width, "", true)));
 
-		const color = statusColor(this.run.status, this.run.isCompacting);
+		const color = statusColor(this.run.status, needsAttention(this.run));
 		const borderColor = color === "muted" ? "borderMuted" : color;
 		const border = (value: string) => this.theme.fg(borderColor, value);
 		const result = [border(`╭${"─".repeat(innerWidth)}╮`)];
@@ -1134,7 +1139,7 @@ export function renderSubagentTranscript(
 		);
 	}
 	const only = boundedRuns[0];
-	if (only && (only.status !== "running" || only.retry || options.mode === "control" || options.control)) {
+	if (only && (only.status !== "running" || only.retry || only.paused || options.mode === "control" || options.control)) {
 		return new SubagentRunPanel(
 			only,
 			expanded,
@@ -1163,7 +1168,7 @@ export function renderSubagentTranscript(
 		});
 	}
 	groups.sort((left, right) => left.order - right.order);
-	const header = `${theme.fg(statusColor(only.status, only.isCompacting), theme.bold(statusText(only)))}${theme.fg("toolTitle", theme.bold(` · ${runtimeText(only)}`))}`;
+	const header = `${theme.fg(statusColor(only.status, needsAttention(only)), theme.bold(statusText(only)))}${theme.fg("toolTitle", theme.bold(` · ${runtimeText(only)}`))}`;
 	const usage = usageText(only);
 	return new BoundedTranscriptView(
 		header,

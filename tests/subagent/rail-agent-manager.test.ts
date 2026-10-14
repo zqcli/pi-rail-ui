@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { PauseGate, subagentPauses } from "../../tools/subagents/pause";
 import { installRailSubagent } from "../../tools/subagents";
 import { runRailAgentManager } from "../../tools/subagents/rail-agent-manager";
 
@@ -79,6 +83,47 @@ test("Rail subagent registers an input hook and consumes direct controls before 
 
 	assert.deepEqual(result, { action: "handled" });
 	assert.deepEqual(notifications, [{ message: "Persistent subagent runtime is not ready", type: "error" }]);
+});
+
+test("/rail-agent pause and continue hold or release every subagent, or one named agent", async (t) => {
+	let command: any;
+	const previousDepth = process.env["PI_SUBAGENT_DEPTH"];
+	process.env["PI_SUBAGENT_DEPTH"] = "0";
+	try {
+		installRailSubagent({
+			registerTool: () => undefined,
+			registerCommand: (name: string, definition: unknown) => { if (name === "rail-agent") command = definition; },
+			on: () => undefined,
+			appendEntry: () => undefined,
+		} as any);
+	} finally {
+		if (previousDepth === undefined) delete process.env["PI_SUBAGENT_DEPTH"];
+		else process.env["PI_SUBAGENT_DEPTH"] = previousDepth;
+	}
+	const dir = await mkdtemp(join(tmpdir(), "rail-agent-pause-"));
+	const gate = new PauseGate(join(dir, "run.gate"));
+	const unregister = subagentPauses.register({ gate, label: "one-off" });
+	t.after(async () => { subagentPauses.resumeAll(); unregister(); await rm(dir, { recursive: true, force: true }); });
+	const notifications: Array<{ message: string; type: string | undefined }> = [];
+	const ctx = { ui: { notify: (message: string, type?: string) => notifications.push({ message, type }) } };
+
+	await command.handler("pause", ctx);
+	assert.equal(gate.paused?.state, "confirmed");
+	assert.equal(subagentPauses.allPaused, true, "new runs wait for continue");
+	assert.match(notifications.at(-1)!.message, /Paused 1 subagent/);
+	await command.handler("continue", ctx);
+	assert.equal(gate.paused, undefined);
+	assert.equal(subagentPauses.allPaused, false);
+	assert.match(notifications.at(-1)!.message, /Continued 1 subagent/);
+
+	await command.handler("pause auth-review", ctx);
+	assert.deepEqual(notifications.at(-1), { message: "Persistent subagent runtime is not ready", type: "error" });
+	await command.handler("pause a b", ctx);
+	assert.equal(notifications.at(-1)!.type, "warning");
+
+	assert.deepEqual(command.getArgumentCompletions("pa"), [{ value: "pause", label: "pause" }]);
+	assert.deepEqual(command.getArgumentCompletions("continue").map((item: any) => item.value), ["continue"]);
+	assert.equal(command.getArgumentCompletions("zzz"), null);
 });
 
 for (const mode of ["rpc", "print"] as const) {

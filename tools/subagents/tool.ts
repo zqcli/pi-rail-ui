@@ -299,6 +299,13 @@ function compactStatelessResult(alias: string, model: RailModelRef, task: string
 	};
 }
 
+/** Names a one-off run in the pause registry, so /rail-agent can tell concurrent runs apart. */
+function statelessLabel(mode: SubagentMode, slot: number, step: number | undefined, task: string): string {
+	const preview = task.replace(/\s+/gu, " ").trim().slice(0, 40);
+	const prefix = step !== undefined ? `chain step ${step}` : mode === "parallel" ? `parallel #${slot + 1}` : "one-off";
+	return `${prefix} · ${preview}`;
+}
+
 function errorResult(
 	item: TaskParams,
 	error: unknown,
@@ -308,7 +315,7 @@ function errorResult(
 	previous?: StatefulSubagentRunDetails,
 ): StatefulSubagentRunDetails {
 	const message = error instanceof Error ? error.message : String(error);
-	const { isCompacting: _isCompacting, retry: _retry, ...previousRun } = previous ?? {};
+	const { isCompacting: _isCompacting, retry: _retry, paused: _paused, ...previousRun } = previous ?? {};
 	return {
 		...previousRun,
 		alias: previous?.alias ?? item.target ?? item.alias ?? item.model ?? "current-model",
@@ -884,13 +891,13 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 		};
 		const publishLive = (slot: number, result: StatefulSubagentRunDetails) => {
 			liveResults.set(slot, result);
-			if (![...liveResults.values()].some((run) => run.retry)) stopRetryRefresh();
+			if (![...liveResults.values()].some((run) => run.retry || run.paused)) stopRetryRefresh();
 			else if (onUpdate && !retryRefresh && !signal?.aborted) {
 				retryRefresh = setInterval(() => {
 					for (const [liveSlot, run] of liveResults) {
 						if (run.status === "running") liveResults.set(liveSlot, { ...run, durationMs: runDuration(liveSlot) });
 					}
-					publishSnapshot("(retrying...)");
+					publishSnapshot([...liveResults.values()].some((run) => run.retry) ? "(retrying...)" : "(running...)");
 				}, 1500);
 				retryRefresh.unref();
 			}
@@ -957,6 +964,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				const run = await options.runStateless({
 					model,
 					task: item.task,
+					label: statelessLabel(mode, slot, step, item.task),
 					cwd: item.cwd ?? ctx.cwd,
 					...(item.contextWindow != null ? { contextWindow: item.contextWindow } : {}),
 					...(fastMode !== undefined ? { fastMode } : {}),
@@ -970,6 +978,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						...(partial.transcript ? { transcript: partial.transcript } : {}),
 						...(partial.isCompacting ? { isCompacting: true } : {}),
 						...(partial.retry ? { retry: partial.retry } : {}),
+						...(partial.paused ? { paused: partial.paused } : {}),
 						...(partial.retryCount ? { retryCount: partial.retryCount } : {}),
 						usage: partial.usage,
 						durationMs: duration(),
@@ -1006,6 +1015,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 						...(partial.transcript ? { transcript: partial.transcript } : {}),
 						...(partial.isCompacting ? { isCompacting: true } : {}),
 						...(partial.retry ? { retry: partial.retry } : {}),
+						...(partial.paused ? { paused: partial.paused } : {}),
 						...(partial.retryCount ? { retryCount: partial.retryCount } : {}),
 						usage: partial.usage,
 						durationMs: duration(),

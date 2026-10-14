@@ -33,7 +33,8 @@ import type {
 } from "./session-broker";
 import type { BindingV2, MemberLoadoutRequest } from "./team-protocol";
 import { isSharedImmediateEvent, RunResultCollector, assistantText } from "./run-result";
-import { RETRY_DELAYS_MS, retryContinuation, waitForRetry } from "./retry";
+import { nextRailRetry, retryContinuation, waitBeforeRetry, waitForRetry } from "./retry";
+import { pauseGateArgs, type PauseGate } from "./pause";
 
 export interface RpcEvent {
 	type: string;
@@ -57,7 +58,8 @@ interface RpcState {
 	isCompacting?: boolean;
 }
 
-export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
+/** `pauseGateFile` is given to ordinary workers only; Team members keep their own gate. */
+export function buildRpcWorkerArgs(spec: WorkerStartSpec, pauseGateFile?: string): string[] {
 	const args = ["--mode", "rpc"];
 	if (spec.mode === "fork") args.push("--fork", spec.sessionPath!);
 	else if (spec.mode === "open" || spec.mode === "exclusive") args.push("--session", spec.sessionPath!);
@@ -71,6 +73,7 @@ export function buildRpcWorkerArgs(spec: WorkerStartSpec): string[] {
 	args.push("-e", railResponsesWebSocketExtensionPath());
 	args.push("-e", gptCompactionExtensionPath());
 	args.push("-e", contextExtensionPath(), `--${CONTEXT_PROTOCOL_FLAG}`, CONTEXT_PROTOCOL_VERSION);
+	if (pauseGateFile) args.push(...pauseGateArgs(pauseGateFile));
 	return args;
 }
 
@@ -82,7 +85,14 @@ export class RpcSessionWorker implements SessionWorker {
 		private readonly cwd: string,
 		private modelProvider: string,
 		private modelId: string,
-	) {}
+		gate: PauseGate | undefined,
+	) {
+		if (!gate) return;
+		this.pauseGate = gate;
+		this.stopObservingGate = transport.onEvent((event) => { gate.observe(event); });
+	}
+	readonly pauseGate?: PauseGate;
+	private readonly stopObservingGate?: () => void;
 	private unusable = false;
 	private runInFlight = false;
 	private modelChangeInFlight = false;
@@ -90,7 +100,7 @@ export class RpcSessionWorker implements SessionWorker {
 	private runCancellation: AbortController | undefined;
 	private retryWait = waitForRetry;
 
-	static async connect(spec: WorkerStartSpec, transport: RpcTransport, retryWait = waitForRetry): Promise<RpcSessionWorker> {
+	static async connect(spec: WorkerStartSpec, transport: RpcTransport, retryWait = waitForRetry, pauseGate?: PauseGate): Promise<RpcSessionWorker> {
 		const state = await transport.request({ type: "get_state" }) as RpcState;
 		if (!state?.sessionId || !state.sessionFile) {
 			await transport.stop();
@@ -127,6 +137,7 @@ export class RpcSessionWorker implements SessionWorker {
 			await resolveChildContextCwd(spec.cwd, { mode: "open", path: state.sessionFile }),
 			stateModel.provider,
 			stateModel.id,
+			pauseGate,
 		);
 		worker.retryWait = retryWait;
 		return worker;
@@ -261,6 +272,17 @@ export class RpcSessionWorker implements SessionWorker {
 		});
 		let retryCount = 0;
 		let message = task;
+		let fallback = "(running...)";
+		const gate = this.pauseGate;
+		// The host can pause mid-run; surface the state change even when the child emits nothing.
+		const unsubscribePause = gate?.subscribe(() => {
+			if (collector.setPaused(gate.paused)) options.onUpdate?.(collector.result(fallback));
+		});
+		// Final and error results describe the run, not the pause that happened to be active.
+		const endPauseUpdates = () => {
+			unsubscribePause?.();
+			collector.setPaused(undefined);
+		};
 		const canContinue = async () => !cancellation.signal.aborted && !this.unusable
 			&& (await options.shouldContinue?.() ?? true) && !cancellation.signal.aborted && !this.unusable;
 		try {
@@ -269,17 +291,20 @@ export class RpcSessionWorker implements SessionWorker {
 					collector.markAborted();
 					break;
 				}
-				await this.sendAttempt(message, collector, { ...options, signal: cancellation.signal });
+				gate?.setRunning(true);
+				try { await this.sendAttempt(message, collector, { ...options, signal: cancellation.signal }); }
+				finally { gate?.setRunning(false); }
 				const error = collector.retryableError;
-				if (!error || retryCount === RETRY_DELAYS_MS.length) break;
+				const next = error ? nextRailRetry(error, retryCount) : undefined;
+				if (!error || !next) break;
 				if (!await canContinue()) {
 					if (cancellation.signal.aborted) collector.markAborted();
 					break;
 				}
-				const delayMs = RETRY_DELAYS_MS[retryCount]!;
-				collector.setRetry({ attempt: retryCount + 1, maxAttempts: RETRY_DELAYS_MS.length, nextAt: Date.now() + delayMs, error, source: "rail" }, retryCount);
-				options.onUpdate?.(collector.result("(retrying...)"));
-				try { await this.retryWait(delayMs, cancellation.signal); }
+				collector.setRetry(next.retry, retryCount);
+				fallback = "(retrying...)";
+				options.onUpdate?.(collector.result(fallback));
+				try { await waitBeforeRetry(next.delayMs, cancellation.signal, gate, this.retryWait); }
 				catch (waitError) {
 					if (transportFailure) throw transportFailure;
 					if (!cancellation.signal.aborted) throw waitError;
@@ -293,18 +318,22 @@ export class RpcSessionWorker implements SessionWorker {
 				collector.beginAttempt();
 				collector.setRetry(undefined, ++retryCount);
 				message = retryContinuation(error);
-				options.onUpdate?.(collector.result("(running...)"));
+				fallback = "(running...)";
+				options.onUpdate?.(collector.result(fallback));
 			}
 			if (transportFailure) throw transportFailure;
+			endPauseUpdates();
 			collector.setRetry(undefined, retryCount);
 			const result = collector.result("(no output)");
 			options.onUpdate?.(result);
 			return result;
 		} catch (error) {
+			endPauseUpdates();
 			collector.noteError(error instanceof Error ? error.message : String(error));
 			options.onUpdate?.(collector.result("(no output)"));
 			throw error;
 		} finally {
+			unsubscribePause?.();
 			unsubscribeFailure();
 			options.signal?.removeEventListener("abort", cancel);
 			this.runCancellation = undefined;
@@ -493,7 +522,12 @@ export class RpcSessionWorker implements SessionWorker {
 	async stop(): Promise<void> {
 		this.unusable = true;
 		this.runCancellation?.abort();
-		await this.transport.stop();
+		try {
+			await this.transport.stop();
+		} finally {
+			this.stopObservingGate?.();
+			this.pauseGate?.dispose();
+		}
 	}
 
 	async openTeamMemberV2(binding: BindingV2, loadout: MemberLoadoutRequest, onFailure: (error: Error) => void, onActivity?: (event: RpcEvent) => void): Promise<TeamMemberProtocolSession> {

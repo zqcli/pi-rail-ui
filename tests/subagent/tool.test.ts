@@ -250,6 +250,38 @@ test("quiet grouped retry uses one countdown refresh and cleans it on recovery o
 	}
 });
 
+test("one-off pause state reaches live details, refreshes while paused, and is absent from the final result", async (t) => {
+	t.mock.timers.enable({ apis: ["setInterval"] });
+	let now = 10_000;
+	t.mock.method(Date, "now", () => now);
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const updates: any[] = [];
+	const labels: Array<string | undefined> = [];
+	const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 };
+	const { tool } = setupTool({ runStateless: async (request) => {
+		labels.push(request.label);
+		request.onUpdate?.({ output: "", usage, exitCode: 0, paused: { state: "confirmed", since: now } });
+		await gate;
+		return { output: "done", usage, exitCode: 0 };
+	} });
+	const operation = tool.execute("paused-one-off", { tasks: [{ task: "first   task" }, { task: "second" }] }, undefined, (update: any) => updates.push(update), context());
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(labels, ["parallel #1 · first task", "parallel #2 · second"]);
+	assert.equal(updates.at(-1).details.results[0].paused.state, "confirmed");
+	const before = updates.length;
+	now += 60_000;
+	t.mock.timers.tick(1500);
+	assert.equal(updates.length, before + 1, "a paused run keeps the panel's pause duration fresh");
+	assert.match(tool.renderResult(updates.at(-1), { expanded: false, isPartial: true }, themeForRetry()).render(160).join("\n"), /Paused · 1m/);
+	release();
+	const result = await operation;
+	assert.equal(result.details.results.every((run: any) => run.paused === undefined), true);
+	const terminal = updates.length;
+	t.mock.timers.tick(30_000);
+	assert.equal(updates.length, terminal, "the refresh timer stops once nothing is paused or retrying");
+});
+
 test("persistent retry progress and count reach details and cancellation clears backoff", async () => {
 	for (const cancelled of [false, true]) {
 		const { tool, broker, hook } = setupTool();

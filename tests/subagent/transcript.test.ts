@@ -47,6 +47,26 @@ test("single and grouped retry panels show countdowns and final recovery without
 	assert.match(native, /Pi Retrying 2\/5/);
 });
 
+test("a paused running run shows Pausing then Paused in every layout and uses the warning color", (t) => {
+	t.mock.method(Date, "now", () => 5 * 60_000);
+	const colors: string[] = [];
+	const colored = { fg: (color: string, text: string) => { colors.push(color); return text; }, bold: (text: string) => text };
+	const run = { alias: "review", model: "local/model", status: "running", output: "", persistent: false } as SubagentTranscriptRun;
+	for (const mode of ["single", "parallel", "chain"] as const) {
+		const requested = renderSubagentTranscript([{ ...run, paused: { state: "requested", since: 0 } }], false, theme as any, { mode }).render(160).join("\n");
+		assert.match(requested, /Pausing · finishing current step/);
+		const confirmed = renderSubagentTranscript([{ ...run, paused: { state: "confirmed", since: 0 } }], false, theme as any, { mode }).render(160).join("\n");
+		assert.match(confirmed, /Paused · 5m/);
+		assert.doesNotMatch(confirmed, /Pausing|Failed/);
+	}
+	colors.length = 0;
+	renderSubagentTranscript([{ ...run, paused: { state: "confirmed", since: 0 } }], false, colored as any, { mode: "single" }).render(160);
+	assert.ok(colors.includes("warning"));
+	assert.ok(!colors.includes("border"), "a paused run is not drawn as plainly running");
+	const unpaused = renderSubagentTranscript([run], false, theme as any, { mode: "single" }).render(160).join("\n");
+	assert.doesNotMatch(unpaused, /Paus/);
+});
+
 const markdownTheme: MarkdownTheme = {
 	heading: (text) => text,
 	link: (text) => text,

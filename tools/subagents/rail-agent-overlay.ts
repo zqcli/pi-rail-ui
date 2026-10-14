@@ -7,6 +7,7 @@ import { assertValidAgentAlias } from "./identity";
 import { prompt } from "../../core/prompts";
 import type { DispatchResult } from "./session-broker";
 import { retryCountText, retryStatusText, statusColor } from "./transcript";
+import { pauseStatusText } from "./pause";
 import {
 	availableThinkingLevels,
 	railModelKey,
@@ -71,6 +72,7 @@ function modelSearchText(model: RailModelRef): string {
 }
 
 function phaseLabel(agent: RailAgentView): string {
+	if (agent.paused) return pauseStatusText(agent.paused);
 	if (agent.retry) return retryStatusText(agent.retry);
 	if (agent.isCompacting) return agent.queued > 0 ? `COMPACTING +${agent.queued}` : "COMPACTING";
 	if (agent.phase === "running" && agent.queued > 0) return `RUNNING +${agent.queued}`;
@@ -281,7 +283,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			const agent = agents[index]!;
 			const selected = index === this.selectedIndex;
 			const prefix = selected ? this.theme.fg("accent", " → ") : "   ";
-			const phase = this.theme.fg(agent.retry ? "warning" : phaseColor(agent.phase, agent.isCompacting), phaseLabel(agent));
+			const phase = this.theme.fg(agent.retry || agent.paused ? "warning" : phaseColor(agent.phase, agent.isCompacting), phaseLabel(agent));
 			const alias = agent.linkedAliases[0] ?? agent.instance.alias;
 			const fast = agent.instance.fastMode === true
 				? `  ${this.theme.fg(this.fastModeEligible(agent.instance.model) ? "success" : "warning", this.fastModeEligible(agent.instance.model) ? "FAST" : "FAST inactive")}`
@@ -380,7 +382,7 @@ export class RailAgentOverlayComponent implements Focusable {
 		if (this.tab === "create") return ["↑↓ fields · enter edit/open · shift+f fast · ←→/tab switch tabs · esc close"];
 		return [
 			"↑↓ select · enter Continue · i Mention · / search · n new",
-			"g steer · f follow-up · s stop · d detach · x delete",
+			`g steer · f follow-up · ${this.filteredAgents()[this.selectedIndex]?.paused ? "p continue" : "p pause"} · s stop · d detach · x delete`,
 			"m model · t thinking · shift+f fast · ←→/tab tabs · esc close",
 		];
 	}
@@ -420,6 +422,7 @@ export class RailAgentOverlayComponent implements Focusable {
 			else if (matchesKey(data, "t")) void this.cycleAgentThinking(selected);
 			else if (matchesKey(data, "g")) this.startControl(selected, "steer");
 			else if (matchesKey(data, "f")) this.startControl(selected, "followUp");
+			else if (matchesKey(data, "p")) void this.togglePause(selected);
 			else if (matchesKey(data, "s")) this.stopAgent(selected);
 			else if (matchesKey(data, "d") && selected.linkedToCurrentSession) this.detachAgent(selected);
 			else if (matchesKey(data, "x")) this.deleteAgent(selected);
@@ -697,6 +700,16 @@ export class RailAgentOverlayComponent implements Focusable {
 	private confirm(title: string, detail: string, action: () => Promise<void>): void {
 		this.confirmation = { title, detail, action };
 		this.renderSoon();
+	}
+
+	/** Like the Team overlay's `p`: the same key pauses a running agent and continues a paused one. */
+	private async togglePause(agent: RailAgentView): Promise<void> {
+		const resuming = agent.paused !== undefined;
+		await this.runOperation(resuming ? "Continuing..." : "Pausing...", async () => {
+			const { status } = await (resuming ? this.options.manager.resume(agent.instance.agentId) : this.options.manager.pause(agent.instance.agentId));
+			const alias = agent.instance.alias;
+			this.notice = status === "applied" ? `${resuming ? "Continued" : "Paused"} ${alias}` : `${alias} ${resuming ? "was not paused" : "was already paused"}`;
+		});
 	}
 
 	private stopAgent(agent: RailAgentView): void {

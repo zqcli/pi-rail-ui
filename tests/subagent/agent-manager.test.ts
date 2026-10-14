@@ -54,6 +54,37 @@ test("manager preserves retry runtime metadata while backoff remains running", a
 	}
 });
 
+test("manager pauses and continues through the broker, even during a retry backoff", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-rail-agent-manager-pause-"));
+	try {
+		const agent = instance("agt_pause", "pause-review", join(dir, "pause.jsonl"));
+		const retry = { attempt: 1, maxAttempts: 5, nextAt: Date.now() + 10_000, error: "503 temporary", source: "rail" as const };
+		const paused = { state: "confirmed" as const, since: 1_000 };
+		let isPaused = false;
+		const calls: string[] = [];
+		const broker = {
+			runtimeStatus: () => ({ phase: "running", queued: 0, retry, ...(isPaused ? { paused } : {}) }),
+			pause: async (target: string) => { calls.push(`pause ${target}`); isPaused = true; return { instance: agent, status: "applied" }; },
+			resume: async (target: string) => { calls.push(`resume ${target}`); isPaused = false; return { instance: agent, status: "applied" }; },
+		};
+		const manager = new RailAgentManager(
+			broker as any,
+			{ list: async () => [agent] } as any,
+			{ list: () => [{ alias: "linked", agentId: agent.agentId }] } as any,
+			dir,
+		);
+		await assert.rejects(manager.control("linked", { delivery: "steer", message: "no" }), /retrying/);
+		assert.equal((await manager.pause("linked")).status, "applied");
+		assert.deepEqual((await manager.snapshot()).agents[0]!.paused, paused);
+		assert.equal((await manager.resume(agent.alias)).status, "applied");
+		assert.equal((await manager.snapshot()).agents[0]!.paused, undefined);
+		assert.deepEqual(calls, ["pause agt_pause", "resume agt_pause"]);
+		await assert.rejects(manager.pause("missing"), /Unknown persistent subagent/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("manager create and continue propagate failed or aborted run outcomes", async () => {
 	for (const run of [
 		{ stopReason: "error", errorMessage: "HTTP 401" },

@@ -4,6 +4,7 @@ import { resolvePiInvocation } from "./pi-invocation";
 import type { RpcEvent } from "./rpc-worker";
 import { buildRpcWorkerArgs, RpcSessionWorker } from "./rpc-worker";
 import { PiRpcProcessTransport, RpcProcessExitTimeoutError } from "./rpc-transport";
+import { PauseGate } from "./pause";
 import type { SessionLease } from "./session-lease";
 import { FileSessionLeaseManager } from "./session-lease";
 import type { SessionWorker, SessionWorkerFactory, TeamMemberProtocolSession, WorkerControlRequest, WorkerSendOptions, WorkerRunResult } from "./session-broker";
@@ -61,6 +62,7 @@ class LeasedSessionWorker implements SessionWorker {
 	readonly sessionId: string;
 	readonly sessionFile: string;
 	private stopped = false;
+	readonly pauseGate?: PauseGate;
 
 	constructor(
 		private readonly worker: RpcSessionWorker,
@@ -68,6 +70,7 @@ class LeasedSessionWorker implements SessionWorker {
 	) {
 		this.sessionId = worker.sessionId;
 		this.sessionFile = worker.sessionFile;
+		if (worker.pauseGate) this.pauseGate = worker.pauseGate;
 	}
 
 	send(task: string, options?: WorkerSendOptions): Promise<WorkerRunResult> {
@@ -107,8 +110,11 @@ export function createRpcWorkerFactory(options: RpcWorkerFactoryOptions): Sessio
 			? sessionLeaseKey(spec.sessionPath!)
 			: `agent:${spec.agentId}`);
 		let transport: PiRpcProcessTransport | undefined;
+		// Team members keep their own gate; every other worker is pausable from the host.
+		const gate = spec.teamProtocolVersion === 2 ? undefined
+			: new PauseGate(path.join(options.stateDir, "pause", `${spec.agentId}.gate`));
 		try {
-			const invocation = (options.resolveInvocation ?? resolvePiInvocation)(buildRpcWorkerArgs(spec));
+			const invocation = (options.resolveInvocation ?? resolvePiInvocation)(buildRpcWorkerArgs(spec, gate?.file));
 			transport = new PiRpcProcessTransport({
 				command: invocation.command,
 				args: invocation.args,
@@ -122,7 +128,7 @@ export function createRpcWorkerFactory(options: RpcWorkerFactoryOptions): Sessio
 				} : {}),
 			});
 			await transport.start();
-			const worker = await withTimeout(RpcSessionWorker.connect(spec, transport), options.startupTimeoutMs ?? 15_000);
+			const worker = await withTimeout(RpcSessionWorker.connect(spec, transport, undefined, gate), options.startupTimeoutMs ?? 15_000);
 			if (!startsWithSessionLease) {
 				const sessionLease = await leases.acquire(sessionLeaseKey(worker.sessionFile));
 				const startupLease = lease;
@@ -134,6 +140,7 @@ export function createRpcWorkerFactory(options: RpcWorkerFactoryOptions): Sessio
 			// The startup error is the useful one; a stop failure must still not free a live child's lease.
 			const started = transport;
 			await stopThenRelease(() => started?.stop() ?? Promise.resolve(), lease).catch(() => undefined);
+			gate?.dispose();
 			throw error;
 		}
 	};

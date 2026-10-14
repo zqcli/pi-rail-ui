@@ -14,7 +14,8 @@ import { railModelKey, type RailModelRef } from "./models";
 import { resolvePiInvocation, type PiInvocation } from "./pi-invocation";
 import type { WorkerRunResult } from "./session-broker";
 import { isAssistantMessage, isSharedImmediateEvent, RunResultCollector, strictAssistantText, type SubagentRunEvent } from "./run-result";
-import { RETRY_DELAYS_MS, retryContinuation, waitForRetry } from "./retry";
+import { nextRailRetry, retryContinuation, waitBeforeRetry, waitForRetry } from "./retry";
+import { PauseGate, pauseGateArgs, subagentPauses, type SubagentPauseRegistry } from "./pause";
 
 const STDERR_CAP = 50 * 1024;
 
@@ -25,6 +26,8 @@ export interface StatelessRunRequest {
 	contextWindow?: number;
 	fastMode?: boolean;
 	signal?: AbortSignal;
+	/** Name shown for this run's pause target; defaults to a preview of the task. */
+	label?: string;
 	onUpdate?: (result: StatelessRunResult) => void;
 }
 
@@ -37,6 +40,8 @@ export type StatelessAgentRunner = (request: StatelessRunRequest) => Promise<Sta
 export interface StatelessAgentRunnerOptions {
 	resolveInvocation?: (args: string[]) => PiInvocation;
 	waitForRetry?: typeof waitForRetry;
+	/** Where each run registers its pause gate; defaults to the process-wide registry. */
+	pauses?: SubagentPauseRegistry;
 }
 
 export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions = {}): StatelessAgentRunner {
@@ -70,6 +75,15 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 			}
 			if (!updateTimer) updateTimer = setTimeout(publishUpdate, 80);
 		};
+		// The gate lives in the private dir so it is removed with the session and never outlives the run.
+		const gate = new PauseGate(join(ephemeralSessionDir, "pause.gate"));
+		const unsubscribeGate = gate.subscribe(() => {
+			if (collector.setPaused(gate.paused)) queueUpdate(true);
+		});
+		const unregisterGate = (options.pauses ?? subagentPauses).register({
+			gate,
+			label: request.label ?? `one-off · ${request.task.replace(/\s+/gu, " ").trim().slice(0, 40)}`,
+		});
 		const canResume = async () => {
 			try {
 				const session = await stat(ephemeralSessionPath);
@@ -85,7 +99,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 			if (request.model.thinkingLevel) args.push("--thinking", request.model.thinkingLevel);
 			if (gptModel && request.fastMode === true) args.push("-e", railFastExtensionPath(), `--${RAIL_FAST_MODE_FLAG}`);
 			if (gptModel) args.push("-e", railOaiSearchExtensionPath(), `--${RAIL_OAI_SEARCH_MODE_FLAG}`, "live");
-			args.push("--exclude-tools", "subagent");
+			args.push("--exclude-tools", "subagent", ...pauseGateArgs(gate.file));
 			if (contextWindow !== undefined) {
 				args.push(
 					"-e", contextExtensionPath(),
@@ -106,6 +120,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 				let malformedEvent = false;
 				let nativeSettled = false;
 				const exitCode = await new Promise<number>((resolve) => {
+					gate.setRunning(true);
 					const proc = spawn(invocation.command, invocation.args, {
 						cwd: request.cwd,
 						env: {
@@ -127,6 +142,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 							if (!line.trim()) continue;
 							try {
 								const event = JSON.parse(line) as SubagentRunEvent;
+								gate.observe(event);
 								if (event.type === "extension_error") {
 									const detail = readContextProtocolError(event["error"]);
 									if (detail !== undefined) protocolErrorEvent = detail;
@@ -167,6 +183,7 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 					proc.once("close", (code) => {
 						request.signal?.removeEventListener("abort", abort);
 						if (killTimer) clearTimeout(killTimer);
+						gate.setRunning(false);
 						resolve(code !== null && code >= 0 ? code : 1);
 					});
 				});
@@ -184,20 +201,21 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 					const failure = `Subagent context protocol failed before the run started: ${protocolError}`;
 					collector.noteError(failure);
 					collector.setRetry(undefined);
+					collector.setPaused(undefined);
 					const { transcript: _transcript, ...collected } = collector.result(failure);
 					return { ...collected, output: failure, exitCode, errorMessage: failure };
 				}
 				if (malformedEvent) collector.noteError("Subagent process emitted malformed JSON or message events");
 				else if (exitCode === 0 && !nativeSettled) collector.noteError("Subagent process exited without native agent_settled");
 				const retryError = exitCode === 0 ? collector.retryableError : undefined;
-				if (retryError && retryCount < RETRY_DELAYS_MS.length) {
+				const scheduled = retryError ? nextRailRetry(retryError, retryCount) : undefined;
+				if (retryError && scheduled) {
 					if (!(await canResume())) {
 						collector.noteError("Subagent retry cannot continue because its private session is missing or empty");
 					} else {
-						const delayMs = RETRY_DELAYS_MS[retryCount]!;
-						collector.setRetry({ attempt: retryCount + 1, maxAttempts: RETRY_DELAYS_MS.length, nextAt: Date.now() + delayMs, error: retryError, source: "rail" }, retryCount);
+						collector.setRetry(scheduled.retry, retryCount);
 						queueUpdate(true);
-						await (options.waitForRetry ?? waitForRetry)(delayMs, request.signal);
+						await waitBeforeRetry(scheduled.delayMs, request.signal, gate, options.waitForRetry ?? waitForRetry);
 						if (request.signal?.aborted) {
 							aborted = true;
 							throw new Error("Subagent request was aborted");
@@ -214,11 +232,13 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 				}
 				collector.markSettled();
 				collector.setRetry(undefined);
+				collector.setPaused(undefined);
 				const failure = collector.errorMessage ?? (exitCode === 0 ? undefined : stderr.trim() || `Subagent process exited with code ${exitCode}`);
 				return { ...collector.result(failure || "(no output)"), exitCode, ...(failure ? { errorMessage: failure } : {}) };
 			}
 		} catch (error) {
 			collector.setRetry(undefined);
+			collector.setPaused(undefined);
 			if (aborted || request.signal?.aborted) {
 				collector.markAborted();
 				publishUpdate();
@@ -231,6 +251,10 @@ export function createStatelessAgentRunner(options: StatelessAgentRunnerOptions 
 			throw error;
 		} finally {
 			if (updateTimer) clearTimeout(updateTimer);
+			// Stop the gate before the temp dir goes so a late pause cannot recreate the file.
+			unsubscribeGate();
+			unregisterGate();
+			gate.dispose();
 			await rm(ephemeralSessionDir, { recursive: true, force: true });
 		}
 	};

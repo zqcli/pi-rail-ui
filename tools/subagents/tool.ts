@@ -36,9 +36,7 @@ import {
 import { fairShares } from "./text-budget";
 import { emptySubagentUsage } from "./usage";
 
-const MAX_PARALLEL_TASKS = 8;
 const MAX_CHAIN_TASKS = 8;
-const MAX_CONCURRENCY = 4;
 const OUTPUT_CAP = 50 * 1024;
 const DETAILS_TOTAL_CAP = 512 * 1024;
 
@@ -119,7 +117,7 @@ const SubagentParams = Type.Object({
 	control: Type.Optional(Type.Union([ControlSchema, Type.Null()], {
 		description: "CONTROL mode only (with target, no task). Otherwise omit it (or null); any non-empty message makes the call a control.",
 	})),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: up to 8 independent helpers in one grouped panel; each item takes the single-mode fields. Leave top-level task empty." })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: independent helpers run at the same time in one grouped panel; each item takes the single-mode fields. Leave top-level task empty." })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "CHAIN mode: up to 8 steps run in order; {previous} in a step's task is replaced by the previous step's final answer. Leave top-level task empty." })),
 	confirmSessionAttach: Type.Optional(Type.Boolean({
 		default: true,
@@ -619,19 +617,6 @@ async function validateTaskContextWindows(items: TaskParams[], models: (RailMode
 	}
 }
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-	const results = new Array<R>(items.length);
-	let next = 0;
-	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-		while (true) {
-			const index = next++;
-			if (index >= items.length) return;
-			results[index] = await fn(items[index]!, index);
-		}
-	}));
-	return results;
-}
-
 function finalText(result: StatefulSubagentRunDetails): string {
 	if (result.status === "failed") return truncateParentContent(`Subagent ${result.alias} failed: ${result.errorMessage ?? result.output}`);
 	if (!result.persistent) return truncateParentContent(`Stateless model session ${result.model ?? result.alias} completed.\n\n${result.output}`);
@@ -907,9 +892,6 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 			? [{ ...params, task: params.task! } as TaskParams]
 			: (mode === "parallel" ? params.tasks! : params.chain!) as TaskParams[];
 		requestedItems.forEach((item, index) => setDispatchMetadata(item, index));
-		if (mode === "parallel" && requestedItems.length > MAX_PARALLEL_TASKS) {
-			throw new Error(`Too many parallel tasks (${requestedItems.length}); max is ${MAX_PARALLEL_TASKS}`);
-		}
 		if (mode === "chain" && requestedItems.length > MAX_CHAIN_TASKS) {
 			throw new Error(`Too many chain tasks (${requestedItems.length}); max is ${MAX_CHAIN_TASKS}`);
 		}
@@ -1053,7 +1035,7 @@ export function installStatefulSubagentTool(pi: ExtensionAPI, options: StatefulS
 				return { content: [{ type: "text", text: finalText(result) }], details, ...(usage ? { usage } : {}) };
 			}
 			if (mode === "parallel") {
-				const results = await mapWithConcurrency(requestedItems, MAX_CONCURRENCY, (item, index) => runTask(item, index));
+				const results = await Promise.all(requestedItems.map((item, index) => runTask(item, index)));
 				const details = resultDetails(results);
 				latestDetails.set(toolCallId, details);
 				const usage = nestedToolUsage(details.results);

@@ -63,7 +63,8 @@ export function railContinueLabel(manager: Manager): string | undefined {
 	const tasks = state?.scheduler.snapshot().tasks;
 	if (!tasks?.length) return undefined;
 	const nearest = tasks.reduce((next, task) => Math.min(next, task.nextCheckAt), Infinity);
-	return `CONT ${tasks.length} · ${formatRailContinueCountdown(nearest)}`;
+	const minutes = Math.max(0, Math.ceil((nearest - Date.now()) / 60_000));
+	return `CONT-${tasks.length}-${minutes}m`;
 }
 
 export function railContinueStatus(manager: Manager): string {

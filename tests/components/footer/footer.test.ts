@@ -144,15 +144,15 @@ test("continue footer stays visible while working, refreshes countdown and dispo
  try {
   await emit("session_start");
   await commands.get("rail-continue").handler("3s continue", ctx);
-  assert.match(stripAnsi(footer.render(90)[0]!), /CONT 1 · 3s/);
+  assert.match(stripAnsi(footer.render(90)[0]!), /CONT-1-1m/);
   for (const width of [0, 1, 10, 20, 40, 90]) assert.ok(visibleWidth(footer.render(width)[0]!) <= width);
-  assert.match(stripAnsi(footer.render(20)[0]!), /CONT 1 · 3s/, "countdown has priority over workspace and usage");
+  assert.match(stripAnsi(footer.render(20)[0]!), /CONT-1-1m/, "countdown has priority over workspace and usage");
   const afterCreate = renders;
   t.mock.timers.tick(1000);
   assert.ok(renders > afterCreate);
-  assert.match(stripAnsi(footer.render(90)[0]!), /CONT 1 · 2s/);
+  assert.match(stripAnsi(footer.render(90)[0]!), /CONT-1-1m/);
   t.mock.timers.tick(2000);
-  assert.match(stripAnsi(footer.render(90)[0]!), /CONT 1 · 3s/, "busy deadline starts a fresh interval, not an early send");
+  assert.match(stripAnsi(footer.render(90)[0]!), /CONT-1-1m/, "busy deadline starts a fresh interval, not an early send");
   idle = true;
   t.mock.timers.tick(3000);
   assert.doesNotMatch(stripAnsi(footer.render(90)[0]!), /CONT/);
@@ -164,7 +164,7 @@ test("continue footer stays visible while working, refreshes countdown and dispo
  } finally { footer.dispose(); await emit("session_shutdown"); }
 });
 
-test("RailFooterComponent redraws on keep-alive transitions and disposes its subscriber", async (t) => {
+test("RailFooterComponent places CONT after KA, redraws on keep-alive transitions and disposes its subscribers", async (t) => {
  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
  const originalPrompt = AgentSession.prototype.prompt;
  AgentSession.prototype.prompt = async () => {};
@@ -203,11 +203,14 @@ test("RailFooterComponent redraws on keep-alive transitions and disposes its sub
  };
  const emit = async (name: string) => { for (const fn of handlers.get(name) ?? []) await fn({}, ctx); };
  installRailKeepAlive(pi);
+ installRailContinue(pi);
  const footer = createRailFooter(ctx, pi)({ requestRender() { renders++; } }, undefined, footerData);
  try {
   await emit("session_start");
   await session.prompt("bind only; no provider request");
   await commands.get("rail-keep-alive").handler("1", ctx);
+  await commands.get("rail-continue").handler("9m continue later", ctx);
+  assert.match(stripAnsi(footer.render(120)[0]!), /KA 1\|- · CONT-1-9m/);
   assert.match(stripAnsi(footer.render(90)[0]!), /KA 1\|-/);
   warmer.start({ model, context: { messages: [] }, options: {} }, () => true);
   warmer.onAgentSettled();

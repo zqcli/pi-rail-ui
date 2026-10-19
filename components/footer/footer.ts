@@ -140,11 +140,11 @@ function renderSimpleFooter(width: number, state: FooterLiveState, stats: Footer
 	const separator = `${style.muted} · `;
 	const prefixParts = [identity, `${style.sky}${state.modelShort}`];
 	const priorityParts = [
-		continuation ? `${style.amber}${continuation}` : undefined,
 		`${style.amber}${state.thinking}`,
 		fastLabel ? `${style.sky}${fastLabel}` : undefined,
 		searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
 		ka ? `${style.amber}${ka}` : undefined,
+		continuation ? `${style.amber}${continuation}` : undefined,
 	];
 	const suffixParts = [
 		turnDurationText(state, style),

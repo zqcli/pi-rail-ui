@@ -63,7 +63,7 @@ test("/rail-ui disabling the custom interface never pauses or cancels an armed c
 		await commands.get("rail-continue")!("2s continue without Rail UI", ctx);
 		t.mock.timers.tick(500);
 		await commands.get("rail-ui")!("", ctx);
-		assert.equal(statuses.get("rail-continue"), "CONT 1 · 2s");
+		assert.equal(statuses.get("rail-continue"), "CONT-1-1m");
 		t.mock.timers.tick(1499);
 		assert.equal(sends.length, 0);
 		t.mock.timers.tick(1);

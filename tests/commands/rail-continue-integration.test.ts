@@ -154,11 +154,11 @@ test("real pinned Pi remains busy through assistant/tool/turn/agent gaps and res
 			await gate.entered;
 			assert.equal(h.ctx.isIdle(), false, `${point} must not expose idle inside the same run`);
 			await h.command(`1s deferred ${point}`);
-			assert.match(h.label() ?? "", /^CONT 1/);
+			assert.equal(h.label(), "CONT-1-1m");
 			await sleep(1150);
 			assert.equal(h.requests.includes(`deferred ${point}`), false, h.status());
 			assert.match(h.status(), /resets 1\b/, "only the due check performs the full restart");
-			assert.match(h.label() ?? "", /^CONT 1/, "busy deadline must retain the task");
+			assert.equal(h.label(), "CONT-1-1m", "busy deadline must retain the task");
 			gate.release();
 			await run;
 			await sleep(100);

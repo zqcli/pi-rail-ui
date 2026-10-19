@@ -78,13 +78,13 @@ test("arming while busy starts immediately; normal events do not poll/reset; bec
 	await h.command("10s 继续检查 MixedCase");
 	assert.equal(h.waitCalls, 0);
 	assert.equal(h.idleChecks, 0);
-	assert.equal(railContinueLabel(h.manager), "CONT 1 · 10s");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-1m");
 	t.mock.timers.tick(3000);
 	for (const event of ["input", "before_agent_start", "agent_start", "message_start", "message_end", "turn_start", "turn_end", "agent_end", "agent_settled"]) {
 		await h.emit(event, { message: { role: "assistant", stopReason: "stop" } });
 	}
 	assert.equal(h.idleChecks, 0);
-	assert.equal(railContinueLabel(h.manager), "CONT 1 · 7s");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-1m");
 	h.setIdle(true);
 	await h.emit("agent_end");
 	t.mock.timers.tick(6999);
@@ -106,7 +106,7 @@ test("busy and queued deadline checks restart a full interval and expose reset r
 	t.mock.timers.tick(5000);
 	assert.equal(h.sends.length, 0);
 	assert.match(railContinueStatus(h.manager), /resets 1 \(session busy\)/);
-	assert.equal(railContinueLabel(h.manager), "CONT 1 · 5s");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-1m");
 	h.setIdle(true);
 	h.setPending(true);
 	t.mock.timers.tick(5000);
@@ -163,7 +163,7 @@ test("failed idle checks report a pending full-interval retry, never a consumed 
 	t.mock.timers.tick(2000);
 	assert.equal(h.sends.length, 0);
 	assert.match(h.notices.at(-1)![0], /check failed; task remains pending.*idle probe failed/);
-	assert.equal(railContinueLabel(h.manager), "CONT 1 · 2s");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-1m");
 	h.ctx.isIdle = original;
 	t.mock.timers.tick(2000);
 	assert.equal(h.sends.length, 1);
@@ -206,11 +206,11 @@ test("countdown notifications refresh default footer, stop at zero and unsubscri
 	let changes = 0;
 	const unsubscribe = onRailContinueChange(h.manager, () => { changes++; });
 	await h.command("3s countdown");
-	assert.equal(h.statuses.get("rail-continue"), "CONT 1 · 3s");
+	assert.equal(h.statuses.get("rail-continue"), "CONT-1-1m");
 	const afterCreate = changes;
 	t.mock.timers.tick(1000);
 	assert.ok(changes > afterCreate);
-	assert.equal(h.statuses.get("rail-continue"), "CONT 1 · 2s");
+	assert.equal(h.statuses.get("rail-continue"), "CONT-1-1m");
 	unsubscribe();
 	const afterUnsubscribe = changes;
 	t.mock.timers.tick(2000);
@@ -229,7 +229,7 @@ test("panel opening/closing does not cancel tasks; non-TUI panel use gives usefu
 	h.ctx.ui.custom = async () => { opens++; t.mock.timers.tick(1000); };
 	await h.command("");
 	assert.equal(opens, 1);
-	assert.equal(railContinueLabel(h.manager), "CONT 1 · 4s");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-1m");
 	h.ctx.mode = "rpc";
 	await h.command("");
 	assert.equal(opens, 1);
@@ -243,10 +243,28 @@ test("invalid commands and unsafe deadlines leave existing tasks untouched; comp
 	await h.emit("session_start");
 	await h.command("10s existing");
 	for (const value of ["0s bad", "10s \n ", "9007199254740s out of range"]) await h.command(value);
-	assert.equal(railContinueLabel(h.manager), "CONT 1 · 10s");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-1m");
 	assert.ok(h.notices.slice(-3).every((notice) => notice[1] === "warning"));
 	assert.deepEqual(h.commands.get("rail-continue").getArgumentCompletions("cancel").map((item: any) => item.value), ["cancel all"]);
 	assert.equal(formatRailContinueCountdown(0, 1000), "0s");
 	assert.equal(formatRailContinueCountdown(61_000, 0), "1m01s");
 	assert.equal(formatRailContinueCountdown(3_661_000, 0), "1h01m");
+});
+
+test("footer label uses the nearest check rounded up to whole minutes; detailed status retains seconds", async (t) => {
+	const h = harness(t);
+	await h.emit("session_start");
+	await h.command("9m first");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-9m");
+	t.mock.timers.tick(59_999);
+	assert.equal(railContinueLabel(h.manager), "CONT-1-9m");
+	t.mock.timers.tick(1);
+	assert.equal(railContinueLabel(h.manager), "CONT-1-8m");
+	t.mock.timers.tick(1000);
+	assert.match(railContinueStatus(h.manager), /CHECK 7m59s/);
+	assert.equal(railContinueLabel(h.manager), "CONT-1-8m");
+	await h.command("1h second");
+	assert.equal(railContinueLabel(h.manager), "CONT-2-8m");
+	await h.command("cancel 1");
+	assert.equal(railContinueLabel(h.manager), "CONT-1-60m");
 });

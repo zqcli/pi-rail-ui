@@ -6,6 +6,7 @@ import { AgentSession, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { installRailFast } from "../../../commands/rail-fast";
 import { installRailOaiSearch } from "../../../commands/rail-oai-search";
 import { installRailKeepAlive } from "../../../commands/rail-keep-alive";
+import { installRailContinue } from "../../../commands/rail-continue";
 import { createRailFooter } from "../../../components/footer";
 import { stripAnsi } from "../../../core/utils";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -116,6 +117,51 @@ test("keep-alive footer respects narrow widths, off hides label, and footer disp
   assert.doesNotMatch(stripAnsi(footer.render(90).join("")), /KA 1\|/);
  } finally { footer.dispose(); await emit("session_shutdown"); }
  assert.equal(unsubscribed, 1);
+});
+
+test("continue footer stays visible while working, refreshes countdown and disposes its subscription", async (t) => {
+ t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+ const handlers = new Map<string, Function[]>();
+ const commands = new Map<string, any>();
+ const statuses = new Map<string, string>();
+ let renders = 0;
+ let idle = false;
+ const ctx: any = {
+  cwd: "/tmp/rail", mode: "tui", isIdle: () => idle, hasPendingMessages: () => false,
+  getContextUsage: () => undefined,
+  sessionManager: { getEntries: () => [], getBranch: () => [], getSessionId: () => "footer-cont", getCwd: () => "/tmp/rail" },
+  ui: { notify() {}, setStatus(key: string, text?: string) { text === undefined ? statuses.delete(key) : statuses.set(key, text); } },
+ };
+ const pi: any = {
+  on: (name: string, fn: Function) => handlers.set(name, [...(handlers.get(name) ?? []), fn]),
+  registerCommand: (name: string, command: any) => commands.set(name, command),
+  getThinkingLevel: () => "xhigh", sendUserMessage() {},
+ };
+ const emit = async (name: string) => { for (const fn of handlers.get(name) ?? []) await fn({}, ctx); };
+ const footerData: any = { getGitBranch: () => null, getExtensionStatuses: () => statuses, onBranchChange: () => () => {} };
+ installRailContinue(pi);
+ const footer = createRailFooter(ctx, pi)({ requestRender() { renders++; } }, undefined, footerData);
+ try {
+  await emit("session_start");
+  await commands.get("rail-continue").handler("3s continue", ctx);
+  assert.match(stripAnsi(footer.render(90)[0]!), /CONT 1 · 3s/);
+  for (const width of [0, 1, 10, 20, 40, 90]) assert.ok(visibleWidth(footer.render(width)[0]!) <= width);
+  assert.match(stripAnsi(footer.render(20)[0]!), /CONT 1 · 3s/, "countdown has priority over workspace and usage");
+  const afterCreate = renders;
+  t.mock.timers.tick(1000);
+  assert.ok(renders > afterCreate);
+  assert.match(stripAnsi(footer.render(90)[0]!), /CONT 1 · 2s/);
+  t.mock.timers.tick(2000);
+  assert.match(stripAnsi(footer.render(90)[0]!), /CONT 1 · 3s/, "busy deadline starts a fresh interval, not an early send");
+  idle = true;
+  t.mock.timers.tick(3000);
+  assert.doesNotMatch(stripAnsi(footer.render(90)[0]!), /CONT/);
+  footer.dispose();
+  const afterDispose = renders;
+  await commands.get("rail-continue").handler("2s later", ctx);
+  t.mock.timers.tick(1000);
+  assert.equal(renders, afterDispose);
+ } finally { footer.dispose(); await emit("session_shutdown"); }
 });
 
 test("RailFooterComponent redraws on keep-alive transitions and disposes its subscriber", async (t) => {

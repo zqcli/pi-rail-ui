@@ -173,7 +173,7 @@ Only `wss:` endpoints ending in `/responses` are accepted. Models not listed in 
 
 ### `/rail-ui`
 
-Toggles the extension on or off. It requires the interactive TUI (elsewhere it only prints a warning). The toggle is not persistent: `/new`, `/resume` and `/reload` reset it to on.
+Toggles Rail's UI on or off. It requires the interactive TUI (elsewhere it only prints a warning). The toggle is not persistent: `/new`, `/resume` and `/reload` reset it to on. Session commands such as `/rail-continue` remain active when Rail's UI is off.
 
 ### `/rail-oai-compaction`
 
@@ -216,6 +216,26 @@ This is useful for exploring alternative approaches or experimenting with differ
 `N` is a positive integer **post-response refresh interval**, not a TTL or a total duration. Each successful parent model response (including a tool-call response) starts the N-minute countdown. Refreshing continues while the parent waits for subagents, Team launch, bash or other tools, even if Pi still shows “working”. Tool progress/results and queued steering/follow-up messages do not reset this countdown: they have not refreshed the parent's provider cache. A completed refresh starts a new N-minute wait; `agent_settled` preserves an existing countdown rather than restarting it. There is no 30/60-minute or total-duration cap. Enabling after an old turn does not replay session history: status shows `WAIT` until a fresh real request. The next parent turn cancels the old timer/in-flight refresh before request preparation, and the next response starts a new countdown; no refresh is scheduled during model generation. Cancellation, failed/aborted responses, model/branch changes and compaction invalidate the request snapshot. Timer delays after sleep and replay, authentication, provider or timeout failures show `PAUSED` and require a new real request. Unsafe Anthropic thinking replay and explicit `cacheRetention: none` pause without a request. This can incur **unknown charges** on every refresh; a cache hit is never guaranteed (especially if N exceeds the provider's unverified TTL). No model pricing or cache lifetime is invented. Other extensions' `cache_warming_decision` stop veto remains effective.
 
 Rail reuses Pi 0.87.1's live session CacheWarmer, its provider request with a one-token *output budget intent* (including original auth, headers and hooks; adapters may enforce a higher minimum, such as 16 for Responses), and its standalone `cache_warm` usage entry; it does not send a chat message or call a tool. The setting is stored only as a non-context entry in the same session. A fork, clone, duplicate or subagent with a new session ID does not inherit the authorization, even if it copies those entries. `/reload` keeps the same live session, so a scheduled **idle** refresh continues at its planned time (an interrupted active run requires a fresh request); resuming the **same** session in a new process restores the setting but waits for a fresh request. Output appended after the request (such as `!cmd`) keeps the snapshot, since the cached prefix is unchanged. A session that never uses the command retains native behavior; explicit `off` overrides native `streaming`/`idle` without changing global settings. While enabled the footer shows `KA N|M`: `N` is the interval and `M` the whole minutes left until the next refresh (`0` while refreshing, `-` before a fresh response or during model generation, `PAUSED` when paused); `/rail-session` and the status command provide details. Unsupported Pi runtime/warmer internals cannot be controlled: commands refuse to change or persist the setting and warn that native warming may still run. Pi's `/session` Mode remains the global setting; Rail's session-local manual interval and truthful status appear in `/rail-session` or `/rail-keep-alive status`. No real paid request is made by the test suite. Short-interval live validation is recorded in [Keep-alive validation](docs/keep-alive-validation.md).
+
+### `/rail-continue`
+
+```text
+/rail-continue                       # Pending / Create task panel (TUI)
+/rail-continue 30s Continue the review
+/rail-continue 5m /literal-message    # slash text is sent literally
+/rail-continue 2 Continue in Chinese: 继续检查
+/rail-continue status
+/rail-continue cancel <id>
+/rail-continue cancel all
+```
+
+Each task is an independent **one-shot submission attempt**, not a recurring message or a background job. Durations are positive integer `s`, `m` or `h`; a bare integer means minutes. Unsafe numeric durations/deadlines are rejected, and long waits use safe timer chunks rather than overflowing JavaScript's timer limit. Message case and multiline text are preserved; prompt templates, skills and slash commands are not expanded.
+
+Creation starts the countdown immediately, even while Pi is working. Normal input, messages, tools, turns and agent events never change its deadline. **Only at the next CHECK** does Rail ask `ctx.isIdle()` and check that no messages are pending. If busy or queued, that task restarts one full interval from the actual check time. Becoming idle sooner never sends early. Sleeping or delayed timers check overdue tasks once on wake, not once per missed interval. A due batch attempts at most one message; other due tasks restart their own full intervals to avoid bursts.
+
+The panel shows stable task IDs, the next **CHECK** countdown/time (not guaranteed execution time), interval, reset count/reason, previews and scrollable full message details. Its Create tab supports multiline text and retains invalid drafts; only explicit creation arms a task. Canceling a selected task asks for confirmation by ID. Closing the panel does not pause or cancel tasks. The footer shows `CONT <count> · <nearest countdown>` while tasks exist, including during work. When `/rail-ui` is off, the normal Pi footer receives the same extension status.
+
+Tasks exist only in memory for the current runtime/session. Shutdown, `/reload`, new/resumed/forked sessions and tree navigation cancel them; they are never restored from history. Navigation invalidates old tasks before its asynchronous work, even if navigation is later canceled. Run the command again to authorize new tasks. Rail does not patch Pi's private host or queue a steering/follow-up: it calls public `sendUserMessage(message, { expandPromptTemplates: false })` once and consumes the task, including on failure. That public API returns `void`, so “submission attempted” is **not delivery confirmation** and there is no automatic retry. Pi 0.87.1 has asynchronous prompt preflight: another prompt or session change can race after the final idle/ownership check and before Pi starts the run. Rail guards stale callbacks and lifecycle generations but cannot make that public operation transactional or retract an attempt already handed to Pi.
 
 ### `/rail-session`
 

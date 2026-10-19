@@ -4,6 +4,7 @@ import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config
 import { fitToWidth } from "../../core/utils";
 import { railFastFooterLabel } from "../../commands/rail-fast";
 import { keepAliveLabel, keepAliveStatus, onKeepAliveChange } from "../../commands/rail-keep-alive";
+import { railContinueLabel, onRailContinueChange } from "../../commands/rail-continue";
 import { railOaiSearchFooterLabel } from "../../commands/rail-oai-search";
 import {
 	collectFooterLiveState,
@@ -132,13 +133,14 @@ function latestFooterData(): ReadonlyFooterDataProvider | undefined {
 	return footerStore().footerData;
 }
 
-function renderSimpleFooter(width: number, state: FooterLiveState, stats: FooterUsageStats, style: FooterStyle, ka?: string): string[] {
+function renderSimpleFooter(width: number, state: FooterLiveState, stats: FooterUsageStats, style: FooterStyle, ka?: string, continuation?: string): string[] {
 	const identity = `${style.text}▸ ${fitToWidth(state.cwdShort, FOOTER_LAYOUT.cwdMaxWidth)}${state.branch ? `${style.mint}@${fitToWidth(state.branch, FOOTER_LAYOUT.branchMaxWidth)}` : ""}`;
 	const fastLabel = railFastFooterLabel();
 	const searchLabel = railOaiSearchFooterLabel();
 	const separator = `${style.muted} · `;
 	const prefixParts = [identity, `${style.sky}${state.modelShort}`];
 	const priorityParts = [
+		continuation ? `${style.amber}${continuation}` : undefined,
 		`${style.amber}${state.thinking}`,
 		fastLabel ? `${style.sky}${fastLabel}` : undefined,
 		searchLabel ? `${searchLabel === "SEARCHING" ? style.amber : style.sky}${searchLabel}` : undefined,
@@ -273,6 +275,7 @@ class RailFooterComponent {
 	private disposed = false;
 	private readonly unsubscribe?: () => void;
 	private readonly unsubscribeKeepAlive: () => void;
+	private readonly unsubscribeContinue: () => void;
 
 	constructor(
 		private readonly tui: any,
@@ -285,6 +288,7 @@ class RailFooterComponent {
 			requestFooterRender(this.tui);
 		});
 		this.unsubscribeKeepAlive = onKeepAliveChange(ctx.sessionManager, () => requestFooterRender(this.tui));
+		this.unsubscribeContinue = onRailContinueChange(ctx.sessionManager, () => requestFooterRender(this.tui));
 	}
 
 	dispose(): void {
@@ -292,6 +296,7 @@ class RailFooterComponent {
 		this.disposed = true;
 		this.unsubscribe?.();
 		this.unsubscribeKeepAlive();
+		this.unsubscribeContinue();
 	}
 
 	invalidate(): void {
@@ -312,7 +317,8 @@ class RailFooterComponent {
 
 	render(width: number): string[] {
 		const state = collectFooterLiveState(this.ctx, this.pi, this.footerData);
-		return renderSimpleFooter(width, state, this.usageStats(), RAIL_FOOTER_STYLE, keepAliveLabel(this.ctx.sessionManager));
+		return renderSimpleFooter(width, state, this.usageStats(), RAIL_FOOTER_STYLE,
+			keepAliveLabel(this.ctx.sessionManager), railContinueLabel(this.ctx.sessionManager));
 	}
 
 }

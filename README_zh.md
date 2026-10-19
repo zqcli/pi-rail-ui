@@ -170,7 +170,7 @@ Rail 可按 provider/model 白名单把 HTTP SSE 替换为原生 Responses WebSo
 
 ### `/rail-ui`
 
-用于启用或禁用该扩展，需要交互式 TUI（其他模式下只会给出警告）。开关不持久：`/new`、`/resume` 和 `/reload` 都会将其重置为开启。
+用于启用或禁用 Rail 的界面，需要交互式 TUI（其他模式下只会给出警告）。开关不持久：`/new`、`/resume` 和 `/reload` 都会将其重置为开启。关闭界面不影响 `/rail-continue` 等会话命令。
 
 ### `/rail-oai-compaction`
 
@@ -213,6 +213,26 @@ Rail 可按 provider/model 白名单把 HTTP SSE 替换为原生 Responses WebSo
 `N` 必须是正整数分钟，表示**模型响应结束后的刷新间隔**，不是 TTL 或总保活时长。每次主模型成功完成响应（包括返回工具调用）就开始 N 分钟倒计时；等待 subagent、Team launch、bash 或其他工具期间，即使 Pi 显示 working 也会继续保活。工具进度、工具结果以及排队的 steering/follow-up 消息不会重置倒计时，因为这些活动没有刷新主会话的 provider 缓存。每次保活完成后重新等待 N 分钟；`agent_settled` 保留已经开始的倒计时，不额外重置。不受 Pi 原生 30/60 分钟窗口或总时长限制。开启后如没有新鲜真实请求，仅显示 `WAIT`，不从 JSONL 重建请求。下一轮主模型请求开始准备前会撤销旧计时和在途刷新，新的响应结束后再计时；模型生成期间不安排保活。取消运行、失败或中止的响应、切换模型/分支以及压缩会让旧请求快照失效。睡眠导致的迟到、重放不安全、认证/协议失败和超时都会进入 `PAUSED`，等待下一次真实请求。Anthropic 不安全的 thinking 重放及显式 `cacheRetention: none` 不发送刷新。**每次刷新可能产生未知费用**；不保证缓存命中，特别是 N 超过未知的实际 TTL 时。不伪造模型费用或缓存时长；其他扩展的 `cache_warming_decision` stop 否决仍有效。
 
 Rail 复用 Pi 0.87.1 当前实例的 CacheWarmer、以一 token 为*输出预算意图*的原生 provider 请求（保留认证、headers、hooks；Responses 等 adapter 可能强制至少 16 token，不能保证实际仅输出一 token）以及独立 `cache_warm` usage entry；不生成聊天消息或工具调用。授权只保存为当前会话的非上下文 entry；新 ID 的 fork/clone/duplicate/subagent 即使复制该 entry 也不会继承。`/reload` 保留同一个 live session，已排定的**空闲**刷新按原时间继续（运行中的任务若被中断，须等新的真实请求）；在新进程中恢复**同一**会话可恢复开关，但仍须等新请求。请求之后追加的输出（如 `!cmd`）不改变已缓存的前缀，快照仍有效。未使用命令的会话保持 Pi 原生行为；显式 `off` 仅覆盖该会话的原生预热，不改全局设置。启用后 footer 显示 `KA N|M`：`N` 是设定间隔，`M` 是距下次刷新的剩余整分钟（刷新中为 `0`，尚无新响应或模型正在生成时为 `-`，暂停时为 `PAUSED`）；`/rail-session` 和状态命令提供详情。不支持的 Pi 版本或 warmer 结构无法控制原生计时器：命令拒绝修改或持久化设置，并明确警告原生预热仍可能运行。Pi 原生 `/session` 的 Mode 仍显示全局设置；Rail 的当前会话 manual 间隔与状态以 `/rail-session` 或 `/rail-keep-alive status` 为准。测试套件不产生真实付费请求。短间隔真实调用的验证记录见 [Keep-alive validation](docs/keep-alive-validation.md)。
+
+### `/rail-continue`
+
+```text
+/rail-continue                       # 打开 Pending / Create 任务面板（TUI）
+/rail-continue 30s 继续检查
+/rail-continue 5m /literal-message    # 斜杠开头的内容按字面发送
+/rail-continue 2 Continue: 继续检查    # 无单位的整数表示分钟
+/rail-continue status
+/rail-continue cancel <id>
+/rail-continue cancel all
+```
+
+每个任务都是独立的**单次提交尝试**，不是周期消息或后台任务。时长支持正整数 `s`、`m`、`h`，无单位时按分钟计算；拒绝不安全的数值和截止时间，长等待采用安全分段计时，避免 JavaScript timer 溢出。保留消息大小写与多行内容，不展开 prompt template、skill 或斜杠命令。
+
+创建后立即倒计时，即使 Pi 正在 working。普通输入、消息、工具、turn 和 agent 事件均不改变截止时间。**仅在下次 CHECK 到期时**调用 `ctx.isIdle()` 并检查没有排队消息；若忙碌或有排队消息，从实际检查时刻重新等待一个完整间隔。提前变为空闲绝不提前发送。休眠或事件循环延迟后仅按当前时间检查一次，不补跑错过的周期。同一批到期任务最多尝试发送一条，其余任务分别重新等待完整间隔，避免集中连发。
+
+面板提供稳定 ID、下次 **CHECK** 倒计时和时间（并非保证执行时间）、间隔、重置次数及原因、消息预览和可滚动的完整消息详情。Create 页支持中文多行输入，校验失败会保留草稿；只有显式创建才开始计时。取消选中任务须按 ID 确认。关闭面板不会暂停或取消任务。存在任务时，footer 持续显示 `CONT <数量> · <最近倒计时>`，working 时也可见；关闭 `/rail-ui` 后，Pi 默认 footer 通过扩展状态显示同样信息。
+
+任务仅保存在当前 runtime/session 的内存中。退出、`/reload`、新建／恢复／fork 会话以及树导航都会取消，绝不从历史恢复。导航开始异步操作之前就会使旧任务失效，即使之后取消导航也不会恢复；需要重新执行命令显式授权新任务。Rail 不修改 Pi 私有 host，也不排入 steering/follow-up，而是仅调用一次公开 `sendUserMessage(message, { expandPromptTemplates: false })`，随即消耗任务，失败也不自动重试。该公开 API 返回 `void`，因此“已尝试提交”**不等于送达确认**。Pi 0.87.1 的 prompt preflight 包含异步步骤：最终空闲／所有权检查之后、真正开始 run 之前，仍可能与其他 prompt 或会话变更竞争。Rail 会防护过期回调与生命周期 generation，但无法把公开调用变为事务，也无法撤回已交给 Pi 的尝试。
 
 ### `/rail-session`
 

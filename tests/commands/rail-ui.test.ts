@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import installRailUi from "../../index";
 
-async function railUiHandler() {
+async function railUiCommands(sendUserMessage: (...args: any[]) => void = () => {}) {
 	const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
 	const channels = new Map<string, Set<(data: unknown) => void>>();
 	await installRailUi({
 		registerTool: () => undefined,
+		sendUserMessage,
 		registerCommand: (name: string, options: any) => { commands.set(name, options.handler); },
 		registerProvider: () => undefined,
 		on: () => undefined,
@@ -20,7 +21,7 @@ async function railUiHandler() {
 			},
 		},
 	} as any);
-	return commands.get("rail-ui")!;
+	return commands;
 }
 
 function context(mode: string) {
@@ -37,7 +38,7 @@ function context(mode: string) {
 }
 
 test("/rail-ui outside the TUI warns and leaves the toggle untouched", async () => {
-	const handler = await railUiHandler();
+	const handler = (await railUiCommands()).get("rail-ui")!;
 	const rpc = context("rpc");
 	await handler("", rpc.ctx);
 	assert.deepEqual(rpc.notifications, [["/rail-ui requires interactive TUI mode.", "warning"]]);
@@ -46,4 +47,27 @@ test("/rail-ui outside the TUI warns and leaves the toggle untouched", async () 
 	const tui = context("tui");
 	await handler("", tui.ctx);
 	assert.deepEqual(tui.notifications, [["Pi rail UI disabled", "info"]]);
+});
+
+test("/rail-ui disabling the custom interface never pauses or cancels an armed continuation", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	const sends: Array<[string, unknown]> = [];
+	const commands = await railUiCommands((message, options) => sends.push([message, options]));
+	const { ctx } = context("tui");
+	const statuses = new Map<string, string>();
+	ctx.sessionManager = { getSessionId: () => "rail-toggle-continue" };
+	ctx.isIdle = () => true;
+	ctx.hasPendingMessages = () => false;
+	ctx.ui.setStatus = (key: string, value?: string) => value === undefined ? statuses.delete(key) : statuses.set(key, value);
+	try {
+		await commands.get("rail-continue")!("2s continue without Rail UI", ctx);
+		t.mock.timers.tick(500);
+		await commands.get("rail-ui")!("", ctx);
+		assert.equal(statuses.get("rail-continue"), "CONT 1 · 2s");
+		t.mock.timers.tick(1499);
+		assert.equal(sends.length, 0);
+		t.mock.timers.tick(1);
+		assert.deepEqual(sends, [["continue without Rail UI", { expandPromptTemplates: false }]]);
+		assert.equal(statuses.has("rail-continue"), false);
+	} finally { await commands.get("rail-continue")!("cancel all", ctx); }
 });

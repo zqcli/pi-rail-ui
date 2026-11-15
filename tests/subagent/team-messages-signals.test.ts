@@ -292,3 +292,90 @@ test("signals: private outcome codec requires the same title contract as open", 
 		assert.throws(() => parseParentCommand({ version: 2, commandId: "bad", operation: "activate", binding: resumed.binding, activation: resumed.scope, deliveryId: resumed.deliveryId, input }), /name/);
 	}
 });
+
+function interruptedParent() {
+	const f = fixture(["a"]); const parent = f.next(); const signal = f.open(parent);
+	assert.equal(f.act(parent, { action: "request", to: "b", task: "ask before continuing" }).ok, true);
+	const child = f.next();
+	assert.equal(f.act(parent, { action: "yield", waitingFor: [ref(child)], checkpoint: "wait for child" }).ok, true); f.settle(parent);
+	assert.equal(f.act(child, { action: "yield", attention: "need a decision", checkpoint: "paused child" }).ok, true); f.settle(child);
+	const incidentId = f.runtime.getWork(f.teamId, ref(child))!.current.hold!.incidentId;
+	const resumeChild = (activation: RuntimeActivation) => {
+		assert.equal(f.act(activation, { action: "control", command: "resume_work", workId: ref(child).workId,
+			expectedRevision: ref(child).revision, incidentId, instruction: "continue after the parent's phase" }).ok, true);
+	};
+	assert.equal(f.runtime.getWork(f.teamId, ref(parent))!.current.state, "queued");
+	assert.deepEqual(f.runtime.getWork(f.teamId, ref(parent))!.current.waitingFor, [ref(child)], "child issue keeps undelivered dependency IDs");
+	return { ...f, parent, child, signal, resumeChild };
+}
+
+for (const producerState of ["running", "queued"] as const) test(`signals: a ${producerState} producer's interrupted Work wait does not block publication`, () => {
+	const f = interruptedParent();
+	let parent: RuntimeActivation | undefined;
+	let lead: RuntimeActivation | undefined;
+	if (producerState === "running") {
+		parent = f.next(); assert.deepEqual(ref(parent), ref(f.parent)); f.resumeChild(parent);
+	} else {
+		f.runtime.messageLead(f.teamId, "resume the child before the queued parent starts"); lead = f.next();
+		assert.equal(lead.binding.memberId, "lead");
+		assert.equal(f.act(lead, { action: "control", command: "pause_member", memberId: "a" }).ok, true);
+		f.resumeChild(lead);
+	}
+	const child = f.next(); assert.deepEqual(ref(child), ref(f.child));
+	assert.equal(f.runtime.getWork(f.teamId, ref(f.parent))!.current.state, producerState);
+	assert.equal(error(f.act(child, { action: "yield", waitingFor: [ref(f.parent)], checkpoint: "cannot wait for parent completion" })), "DEPENDENCY_CYCLE", "owned-child completion constraints are unchanged");
+	assert.equal(f.yieldSignals(child, [f.signal.id]).ok, true, "an interrupted old wait is not a phase-publication prerequisite"); f.settle(child);
+	if (lead) {
+		assert.equal(f.act(lead, { action: "control", command: "resume_member", memberId: "a" }).ok, true);
+		f.act(lead, { action: "yield" }); f.settle(lead);
+	}
+	parent ??= f.next(); assert.deepEqual(ref(parent), ref(f.parent));
+	assert.equal(f.act(parent, { action: "signal", operation: "publish", signalId: f.signal.id, text: "phase completed before child" }).ok, true);
+	const awakened = f.next(); assert.deepEqual(ref(awakened), ref(f.child)); assert.equal(awakened.input.signalOutcomes?.[0]?.id, f.signal.id);
+	f.runtime.assertInvariants(f.teamId);
+});
+
+for (const wait of ["work", "signal"] as const) test(`signals: a resumed producer's new staged ${wait} wait still rejects a real phase cycle`, () => {
+	const f = interruptedParent(); const parent = f.next(); f.resumeChild(parent); const child = f.next();
+	if (wait === "work") assert.equal(f.act(parent, { action: "yield", waitingFor: [ref(child)], checkpoint: "wait again" }).ok, true);
+	else { const childSignal = f.open(child, "child phase"); assert.equal(f.yieldSignals(parent, [childSignal.id]).ok, true); }
+	assert.equal(error(f.yieldSignals(child, [f.signal.id])), "DEPENDENCY_CYCLE", "staged intent participates before cleanup changes running state");
+	f.runtime.assertInvariants(f.teamId);
+});
+
+test("signals: a resumed producer's staged wait replaces historical publication blockers", () => {
+	const f = interruptedParent(); const parent = f.next(); f.resumeChild(parent); const child = f.next();
+	assert.equal(f.act(parent, { action: "request", to: "c", task: "independent prerequisite for the phase" }).ok, true);
+	const prerequisite = f.next(); assert.equal(prerequisite.binding.memberId, "c");
+	assert.equal(f.act(parent, { action: "yield", waitingFor: [ref(prerequisite)], checkpoint: "wait for the new prerequisite" }).ok, true);
+	assert.equal(f.yieldSignals(child, [f.signal.id]).ok, true, "the superseded wait on this child must not leak into phase edges");
+	f.settle(parent); f.settle(child);
+	assert.equal(f.act(prerequisite, { action: "reply", result: { status: "succeeded", summary: "prerequisite finished" } }).ok, true); f.settle(prerequisite);
+	const resumed = f.next(); assert.deepEqual(ref(resumed), ref(parent));
+	assert.equal(f.act(resumed, { action: "signal", operation: "publish", signalId: f.signal.id, text: "phase now complete" }).ok, true);
+	assert.deepEqual(ref(f.next()), ref(child)); f.runtime.assertInvariants(f.teamId);
+});
+
+test("signals: publication dependencies do not revive a runnable prerequisite's historical peer wait", () => {
+	const f = fixture(); const parent = f.next(), peer = f.next(); const signal = f.open(parent);
+	assert.equal(f.act(parent, { action: "request", to: "c", task: "phase prerequisite" }).ok, true); const prerequisite = f.next();
+	assert.equal(f.act(prerequisite, { action: "request", to: "lead", task: "ask for a prerequisite decision" }).ok, true); const questioner = f.next();
+	assert.equal(questioner.scope.kind, "work");
+	assert.equal(f.act(parent, { action: "yield", waitingFor: [ref(prerequisite)], checkpoint: "phase needs this prerequisite" }).ok, true); f.settle(parent);
+	assert.equal(f.act(prerequisite, { action: "yield", waitingFor: [ref(peer)], checkpoint: "old peer wait" }).ok, true); f.settle(prerequisite);
+	assert.equal(f.act(questioner, { action: "yield", attention: "need a decision", checkpoint: "question" }).ok, true); f.settle(questioner);
+	const interrupted = f.next(); assert.deepEqual(ref(interrupted), ref(prerequisite));
+	assert.deepEqual(f.runtime.getWork(f.teamId, ref(interrupted))!.current.waitingFor, [ref(peer)]);
+	assert.equal(f.yieldSignals(peer, [signal.id]).ok, true, "a runnable prerequisite can finish without its interrupted peer wait"); f.settle(peer);
+	const incidentId = f.runtime.getWork(f.teamId, ref(questioner))!.current.hold!.incidentId;
+	assert.equal(f.act(interrupted, { action: "control", command: "resume_work", workId: ref(questioner).workId,
+		expectedRevision: 1, incidentId, instruction: "continue" }).ok, true);
+	assert.equal(f.act(interrupted, { action: "yield", waitingFor: [ref(questioner)], checkpoint: "finish owned child" }).ok, true); f.settle(interrupted);
+	const answer = f.next(); assert.deepEqual(ref(answer), ref(questioner));
+	assert.equal(f.act(answer, { action: "reply", result: { status: "succeeded", summary: "decision handled" } }).ok, true); f.settle(answer);
+	const completedPrerequisite = f.next(); assert.deepEqual(ref(completedPrerequisite), ref(prerequisite));
+	assert.equal(f.act(completedPrerequisite, { action: "reply", result: { status: "succeeded", summary: "prerequisite complete" } }).ok, true); f.settle(completedPrerequisite);
+	const producer = f.next(); assert.deepEqual(ref(producer), ref(parent));
+	assert.equal(f.act(producer, { action: "signal", operation: "publish", signalId: signal.id, text: "phase complete" }).ok, true);
+	assert.deepEqual(ref(f.next()), ref(peer)); f.runtime.assertInvariants(f.teamId);
+});

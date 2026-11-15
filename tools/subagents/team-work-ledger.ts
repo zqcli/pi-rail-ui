@@ -139,8 +139,10 @@ export class WorkLedger {
 			if (workRefKey(ref) === workRefKey(from)) return [...targets.map(workNode), ...signalIds.map(signalNode)];
 			const version = this.version(ref);
 			const staged = this.get(ref.workId)?.stagedWait;
-			return [...(version?.waitingFor ?? []).map(workNode), ...(version?.waitingForSignals ?? []).map(signalNode),
-				...(staged?.revision === ref.revision ? [...staged.refs.map(workNode), ...(staged.signals ?? []).map(signalNode)] : [])];
+			// A child issue can wake a producer (or a prerequisite) with undelivered wait IDs.
+			// Runnable history is not a wait edge; a new staged wait supersedes it immediately.
+			if (staged?.revision === ref.revision) return [...staged.refs.map(workNode), ...(staged.signals ?? []).map(signalNode)];
+			return version?.state === "blocked" ? [...version.waitingFor.map(workNode), ...(version.waitingForSignals ?? []).map(signalNode)] : [];
 		};
 		const edges = (node: Node): Node[] => {
 			if ("signal" in node) {

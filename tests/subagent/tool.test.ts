@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { installStatefulSubagentTool, type StatefulSubagentToolOptions } from "../../tools/subagents/tool";
 import { WorkerControlError, type ControlRequest, type ControlResult, type DispatchRequest, type DispatchResult, type SessionBroker } from "../../tools/subagents/session-broker";
 import type { RailModelRef } from "../../tools/subagents/models";
@@ -167,6 +168,25 @@ function setupTool(options: {
 	});
 	return { tool, broker, hook };
 }
+
+test("Pi validates subagent enums and nullable fields with the migrated TypeBox schema", () => {
+	const { tool } = setupTool();
+	const validate = (raw: any) => validateToolArguments(tool, { type: "toolCall", id: "schema-test", name: "subagent", arguments: tool.prepareArguments(raw) });
+	for (const mode of ["fork", "exclusive"]) {
+		const raw = { task: "review", session: { mode, path: "/tmp/saved.jsonl" }, contextWindow: null, fastMode: null };
+		assert.deepEqual(validate(raw), { task: "review", session: raw.session, fastMode: null });
+	}
+	for (const delivery of ["steer", "followUp"]) {
+		const raw = { target: "reviewer", control: { delivery, message: "Focus on tests" } };
+		assert.deepEqual(validate(raw), raw);
+	}
+	for (const raw of [
+		{ task: "review", session: { mode: "replace", path: "/tmp/saved.jsonl" } },
+		{ target: "reviewer", control: { delivery: "immediate", message: "Focus" } },
+		{ task: "review", fastMode: "invalid-boolean" },
+		{ task: "review", contextWindow: "invalid-number" },
+	]) assert.throws(() => validate(raw), /Validation failed for tool/u);
+});
 
 test("parallel keeps recovered item live and folds its cumulative usage exactly once", async () => {
 	let release!: () => void;

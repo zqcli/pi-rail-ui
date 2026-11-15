@@ -111,6 +111,7 @@ test("Team v2 tool schema is a strict action union and bind gives every member b
 	await lead.command(bindCommand(lead));
 	assert.deepEqual(lead.activeTools(), ["read", "bash", "team"], "the lead gets the same base tools plus team, never subagent tools");
 	assert.match(lead.tools.get("team").description, /reply, yield, and close_team must be the only tool call/u);
+	assert.equal(lead.tools.get("team").exposure, "model-only", "Team actions require a model-issued native tool call");
 
 	const restricted = harness("member");
 	await restricted.command(bindCommand(restricted, "bind-1", restricted.binding, ["read", "write"]));
@@ -169,7 +170,7 @@ test("native custom activation is persisted and verified before input_ready/prov
 	assert.equal(h.lastPrivate().ok, true, "same activation under a new command id is idempotent");
 
 	const sections: Record<string, string> = {};
-	const before = await h.handlers.get("before_agent_start")!({ prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native system", systemPromptOptions: { sections } }, h.ctx);
+	const before = await h.handlers.get("before_agent_start")!({ messageType: "user", prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native system", systemPromptOptions: { sections } }, h.ctx);
 	assert.equal(before.systemPrompt, undefined, "the brief is a system prompt section, never a forced systemPrompt");
 	assert.match(sections["team_brief"]!, /^Team member: lead\./u);
 	assert.match(sections["team_brief"]!, /### Goal\nTest goal\./u);
@@ -208,12 +209,50 @@ test("wrong native context aborts before private readiness or provider continuat
 	const h = harness();
 	await h.command(bindCommand(h));
 	await h.command(activateCommand(h));
-	const before = await h.handlers.get("before_agent_start")!({ prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native", systemPromptOptions: { sections: {} } }, h.ctx);
+	const before = await h.handlers.get("before_agent_start")!({ messageType: "user", prompt: TEAM_ACTIVATION_TRIGGER, systemPrompt: "native", systemPromptOptions: { sections: {} } }, h.ctx);
 	const messages = appendNativeActivation(h, before);
 	h.branch[h.branch.length - 1].content = "forged input";
 	await h.handlers.get("context")!({ messages }, h.ctx);
 	assert.equal(h.aborts(), 1);
 	assert.equal(h.privateFrames().filter((frame) => frame.kind === "request").length, 0);
+});
+
+test("custom-triggered and ordinary user runs are untouched while unbound and rejected during a Team activation", async () => {
+	for (const trigger of [
+		{ messageType: "custom", message: { customType: "other-extension", content: "new custom run", display: false } },
+		{ messageType: "user", prompt: "ordinary user task" },
+	]) {
+		const h = harness();
+		const event = { ...trigger, systemPrompt: "native", systemPromptOptions: { sections: {} } };
+		assert.equal(await h.handlers.get("before_agent_start")!(event, h.ctx), undefined);
+		assert.equal(h.aborts(), 0);
+		await h.command(bindCommand(h));
+		await h.command(activateCommand(h));
+		assert.equal(await h.handlers.get("before_agent_start")!(event, h.ctx), undefined);
+		assert.equal(h.aborts(), 1);
+		assert.deepEqual(event.systemPromptOptions.sections, {});
+		assert.equal(h.privateFrames().filter((frame) => frame.kind === "request").length, 0);
+	}
+});
+
+test("explicit Team allowlists block direct and nested calls even if discovery later activates the tool", async () => {
+	const h = harness();
+	h.tools.set("allowed_deferred", { name: "allowed_deferred", exposure: "deferred" });
+	h.tools.set("denied_deferred", { name: "denied_deferred", exposure: "deferred" });
+	await h.command(bindCommand(h, "bind-1", h.binding, ["read", "allowed_deferred"]));
+	await h.command(activateCommand(h));
+	h.activeTools().push("denied_deferred");
+	for (const parentToolCallId of [undefined, "codemode-call"]) {
+		const result = await h.handlers.get("tool_call")!({ toolName: "denied_deferred", toolCallId: "denied", parentToolCallId, input: {} }, h.ctx);
+		assert.equal(result.block, true);
+		assert.match(result.reason, /outside this Team member's tools allowlist/u);
+	}
+	assert.equal(h.privateFrames().filter((frame) => frame.kind === "request").length, 0, "rejected calls consume no Runtime slots");
+	const pending = h.handlers.get("tool_call")!({ toolName: "allowed_deferred", toolCallId: "codemode-call/1", parentToolCallId: "codemode-call", input: {} }, h.ctx);
+	const gate = await waitForRequest(h, "tool_gate");
+	await replyToRequest(h, gate, { kind: "gate", decision: { allow: true } }, "allow-nested");
+	assert.equal(await pending, undefined);
+	assert.equal(gate.request.toolCallId, "codemode-call/1");
 });
 
 test("tool_call sends a stable fingerprint of the input and tool_result reports isError, both parsed by the frame codec", async () => {
@@ -380,7 +419,7 @@ test("oversized local reply can be corrected in the same connected scope and com
 	emit({ type: "tool_execution_end", toolCallId: "corrected", toolName: "team", isError: false, result });
 	emit({ type: "turn_end", message: assistant, toolResults: [{ toolCallId: "corrected", toolName: "team", isError: false }] });
 	emit({ type: "agent_settled" });
-	promptDone.resolve({});
+	promptDone.resolve({ disposition: "started" });
 	const completion = await running;
 	assert.ok(completion.appliedToolCallId);
 	assert.equal(h.runtime.nativeSettled(h.binding, h.activation.scope.activationId, completion).ok, true);

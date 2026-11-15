@@ -120,9 +120,9 @@ async function startWorker(agentDir: string, sessionPath: string, alias: string)
 	}
 }
 
-test("Pi 0.87.1 compaction lifecycle is local, visible, and settled at the correct boundary", { timeout: 30_000 }, async (t) => {
+test("Pi 1.5.2 compaction lifecycle is local, visible, and settled at the correct boundary", { timeout: 30_000 }, async (t) => {
 	const { version } = JSON.parse(await readFile(piPackage, "utf8")) as { version: string };
-	assert.equal(version, "0.87.1", "repo-local 0.87.1 bundle expected");
+	assert.equal(version, "1.5.2", "repo-local 1.5.2 bundle expected");
 	const tempParent = join(process.cwd(), ".tmp");
 	await mkdir(tempParent, { recursive: true });
 	const sandbox = await mkdtemp(join(tempParent, "pi-compaction-stage1-"));

@@ -101,7 +101,7 @@ class FakeTransport implements RpcTransport {
 		}
 		if (command["type"] === "steer" || command["type"] === "follow_up") {
 			if (this.failControl) throw new Error("connection lost after write");
-			return undefined;
+			return { disposition: "queued" };
 		}
 		if (command["type"] === "prompt") {
 			if (this.teamV2Mode && command["message"] === TEAM_ACTIVATION_TRIGGER) {
@@ -110,7 +110,7 @@ class FakeTransport implements RpcTransport {
 					this.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Team done" }] }, toolResults: [] });
 					this.emit({ type: "agent_settled" });
 				});
-				return undefined;
+				return { disposition: "started" };
 			}
 			if (String(command["message"]).startsWith("/rail-context-internal-v1 ")) {
 				if (this.failContextCommand) {
@@ -134,7 +134,7 @@ class FakeTransport implements RpcTransport {
 				return undefined;
 			}
 			this.emit({ type: "agent_start" });
-			if (this.waitForAbort) return undefined;
+			if (this.waitForAbort) return { disposition: "started" };
 			queueMicrotask(() => {
 				if (this.failPrompt) {
 					this.emit({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -206,6 +206,7 @@ class FakeTransport implements RpcTransport {
 				if (!this.retainPreparedContextWindow) this.contextWindow = this.restoreContextWindow;
 				this.emit({ type: "agent_settled" });
 			});
+			return { disposition: "started" };
 		}
 		return undefined;
 	}
@@ -304,7 +305,7 @@ class RetryTransport extends FakeTransport {
 		const failed = this.prompts.length <= this.failures;
 		this.emit({ type: "message_end", message: { role: "assistant", content: failed ? [] : [{ type: "text", text: "recovered" }], stopReason: failed ? this.reason : "stop", ...(failed ? { errorMessage: this.failure } : {}), usage: { input: 10, output: 2, totalTokens: 12, cost: { total: 0.1 } } } });
 		this.emit({ type: "agent_settled" });
-		return undefined;
+		return { disposition: "started" };
 	}
 }
 
@@ -431,7 +432,7 @@ class ControlledRetryTransport extends FakeTransport {
 			this.commands.push(command);
 			this.prompts.push(String(command["message"]));
 			this.emit({ type: "agent_start" });
-			return undefined;
+			return { disposition: "started" };
 		}
 		if (command["type"] === "steer") { this.controlStarted.resolve(); await this.controlGate; }
 		const result = await super.request(command);
@@ -827,7 +828,7 @@ describe("RpcSessionWorker", () => {
 	test("a handled prompt without a run fails without opening control admission", async () => {
 		const transport = new FakeTransport();
 		const request = transport.request.bind(transport);
-		transport.request = async (command) => command["type"] === "prompt" && !isContextPrompt(command) ? undefined : request(command);
+		transport.request = async (command) => command["type"] === "prompt" && !isContextPrompt(command) ? { disposition: "handled" } : request(command);
 		const worker = await RpcSessionWorker.connect(spec("new"), transport);
 		let accepted = false;
 		const pending = worker.send("/handled-command", { onAccepted: () => { accepted = true; } });
@@ -851,7 +852,7 @@ describe("RpcSessionWorker", () => {
 			if (isContextPrompt(command) && String(command["message"]).endsWith(" reset")) handled = false;
 			if (command["type"] === "prompt" && !isContextPrompt(command)) {
 				handled = true;
-				return undefined;
+				return { disposition: "handled" };
 			}
 			if (command["type"] === "get_state" && connected && handled) {
 				return { ...(await request(command) as any), isStreaming: false, isCompacting: true };
@@ -877,6 +878,25 @@ describe("RpcSessionWorker", () => {
 		assert.match(outcome, /handled without starting/);
 		assert.equal(accepted, false);
 		assert.equal(transport.listeners.size, 0);
+	});
+
+	test("handled disposition rejects unrelated start events and queued or missing disposition retires the worker", async () => {
+		for (const disposition of ["handled", "queued", undefined]) {
+			const transport = new FakeTransport();
+			const request = transport.request.bind(transport);
+			transport.request = async (command) => {
+				if (command["type"] !== "prompt" || isContextPrompt(command)) return request(command);
+				transport.emit({ type: "agent_start" });
+				return { disposition };
+			};
+			const worker = await RpcSessionWorker.connect(spec("new"), transport);
+			let accepted = false;
+			await assert.rejects(worker.send("own run only", { onAccepted: () => { accepted = true; } }),
+				disposition === "handled" ? /handled without starting/ : /did not start its own run/);
+			assert.equal(accepted, false);
+			assert.equal(worker.isReusable(), disposition === "handled");
+			await worker.stop();
+		}
 	});
 
 	test("publishes compaction as a running subphase without settling the child run", async () => {
@@ -951,11 +971,9 @@ describe("RpcSessionWorker", () => {
 		transport.request = async (command) => {
 			if (command["type"] === "prompt" && !isContextPrompt(command)) {
 				taskStarted = true;
-				return undefined;
+				return { disposition: "started" };
 			}
-			if (command["type"] === "get_state") return taskStarted && !taskSettled
-				? { isStreaming: true, model: { provider: "cus-resp", id: "gpt-5.6-sol", contextWindow: 128000 } }
-				: request(command);
+			if (command["type"] === "get_state" && taskStarted && !taskSettled) throw new Error("Prompt acceptance must use its disposition, not a later state snapshot");
 			return request(command);
 		};
 		const phaseUnsubscribe = transport.onEvent((event) => { if (event.type === "agent_settled") taskSettled = true; });
@@ -1121,7 +1139,7 @@ describe("RpcSessionWorker", () => {
 		transport.request = async (command) => {
 			if (command["type"] === "prompt" && !isContextPrompt(command)) {
 				taskStarted = true;
-				return undefined;
+				return { disposition: "started" };
 			}
 			if (command["type"] === "get_state") return taskStarted && !taskSettled
 				? { isStreaming: true, model: { provider: "cus-resp", id: "gpt-5.6-sol", contextWindow: 128000 } }
@@ -1172,7 +1190,7 @@ describe("RpcSessionWorker", () => {
 		transport.request = async (command) => {
 			if (command["type"] === "prompt" && !isContextPrompt(command)) {
 				taskStarted = true;
-				return undefined;
+				return { disposition: "started" };
 			}
 			if (command["type"] === "get_state") return taskStarted && !taskSettled
 				? { isStreaming: true, model: { provider: "cus-resp", id: "gpt-5.6-sol", contextWindow: 128000 } }

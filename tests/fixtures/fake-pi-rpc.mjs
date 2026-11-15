@@ -38,7 +38,7 @@ process.stdin.on("data", (chunk) => {
 				const parts = command.message.trim().split(/\s+/u);
 				if (parts[1] === "prepare" && parts[2] !== "omit") contextWindow = Number(parts[2]);
 				if (parts[1] === "reset" || (parts[1] === "prepare" && parts[2] === "omit")) contextWindow = 128000;
-				write({ type: "response", id: command.id, command: "prompt", success: true });
+				write({ type: "response", id: command.id, command: "prompt", success: true, data: { disposition: "handled" } });
 				continue;
 			}
 			if (command.message === "reject prompt before acceptance") {
@@ -46,14 +46,14 @@ process.stdin.on("data", (chunk) => {
 				write({ type: "response", id: command.id, command: "prompt", success: false, error: "fixture prompt rejected" });
 				continue;
 			}
-			write({ type: "response", id: command.id, command: "prompt", success: true });
+			write({ type: "response", id: command.id, command: "prompt", success: true, data: { disposition: "started" } });
 			write({ type: "agent_start" });
 			write({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "fixture done" }] } });
 			write({ type: "agent_settled" });
 			continue;
 		}
 		if (command.type === "steer" || command.type === "follow_up") {
-			write({ type: "response", id: command.id, command: command.type, success: true });
+			write({ type: "response", id: command.id, command: command.type, success: true, data: { disposition: "queued" } });
 			continue;
 		}
 		write({ type: "response", id: command.id, command: command.type, success: false, error: "unsupported" });

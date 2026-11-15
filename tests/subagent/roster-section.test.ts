@@ -53,7 +53,7 @@ test("before_agent_start puts the roster in a stable section instead of forcing 
 		createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), lastTask,
 	});
 	const run = async (prompt: string, sections: Record<string, string> = {}) => {
-		const event = { prompt, systemPrompt: "native", systemPromptOptions: { sections } };
+		const event = { messageType: "user", prompt, systemPrompt: "native", systemPromptOptions: { sections } };
 		return { result: await handlers.get("before_agent_start")!(event, ctx), sections };
 	};
 
@@ -69,6 +69,10 @@ test("before_agent_start puts the roster in a stable section instead of forcing 
 
 	const mentioned = await run("ask @agent/auth-review");
 	assert.match(mentioned.sections["rail_model_sessions"]!, /must call subagent with target="auth-review"/);
+	const customSections: Record<string, string> = {};
+	await handlers.get("before_agent_start")!({ messageType: "custom", message: { customType: "test", content: "@agent/auth-review", display: false },
+		systemPrompt: "native", systemPromptOptions: { sections: customSections } }, ctx);
+	assert.equal(customSections["rail_model_sessions"], section, "custom turns retain the roster without interpreting extension text as user mentions");
 
 	linked = [];
 	const empty = await run("hello", { rail_model_sessions: "stale" });

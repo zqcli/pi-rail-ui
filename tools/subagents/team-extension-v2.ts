@@ -110,6 +110,7 @@ export default function install(pi: ExtensionAPI): void {
 	let teamBrief = "";
 	let active: ActiveActivation | undefined;
 	let previousTools: string[] = [];
+	let allowedTools: ReadonlySet<string> | undefined;
 	let registered = false;
 	const pending = new Map<string, PendingRequest>();
 	const commands = new Map<string, CommandRecord>();
@@ -179,6 +180,7 @@ export default function install(pi: ExtensionAPI): void {
 			label: "Team",
 			description: `${TEAM_TOOL_DESCRIPTION} ${prompt("team", "member_tool_description_suffix")}`,
 			parameters: TEAM_TOOL_SCHEMA,
+			exposure: "model-only",
 			executionMode: "sequential",
 			async execute(toolCallId, params, signal, _update, ctx) {
 				if (!binding || !active) throw new Error("Team tool is unavailable outside an active Team activation");
@@ -249,6 +251,7 @@ export default function install(pi: ExtensionAPI): void {
 						// An allowlist may name any available tool (prepare validates against getAllTools), not only the default-active ones.
 						const available = allowed ? new Set(pi.getAllTools().map((tool) => tool.name)) : undefined;
 						const memberTools = (available ? allowed!.filter((name) => available.has(name)) : previousTools).filter((name) => !TEAM_RESERVED_TOOLS.includes(name));
+						allowedTools = allowed ? new Set([...memberTools, "team"]) : undefined;
 						pi.setActiveTools([...memberTools, "team"]);
 						teamBrief = renderTeamBrief(binding.memberId, command.loadout);
 						break;
@@ -301,6 +304,7 @@ export default function install(pi: ExtensionAPI): void {
 						pi.setActiveTools(previousTools.filter((name) => name !== "team"));
 						unboundBinding = binding;
 						binding = undefined;
+						allowedTools = undefined;
 						teamBrief = "";
 						break;
 				}
@@ -321,7 +325,7 @@ export default function install(pi: ExtensionAPI): void {
 			ctx.abort();
 			return;
 		}
-		if (event.prompt !== TEAM_ACTIVATION_TRIGGER) {
+		if (event.messageType !== "user" || event.prompt !== TEAM_ACTIVATION_TRIGGER) {
 			fail(ctx, new Error("Team activation used an unexpected native trigger prompt"));
 			return;
 		}
@@ -365,6 +369,8 @@ export default function install(pi: ExtensionAPI): void {
 		if (!binding) return;
 		if (!active) return { block: true, reason: "Team tool use requires an active Team activation" };
 		if (event.toolName === "subagent" || event.toolName === "subagent_team") return { block: true, reason: "Team members cannot spawn subagents" };
+		// Pi's active set controls declarations; codemode/deferred tools remain callable while inactive.
+		if (allowedTools && !allowedTools.has(event.toolName)) return { block: true, reason: `Tool ${event.toolName} is outside this Team member's tools allowlist` };
 		try {
 			const reply = await request({ action: "tool_gate", toolCallId: event.toolCallId, toolName: event.toolName,
 				endIntent: event.toolName === "team" && isRecord(event.input) && isEndIntent(event.input),

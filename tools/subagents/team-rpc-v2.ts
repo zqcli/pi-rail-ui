@@ -32,7 +32,6 @@ interface ActiveRun {
 	policyStopRequested: boolean;
 	/** Native usage of this activation only; frozen by the collector at agent_settled. */
 	usage: RunResultCollector;
-	started: boolean;
 	settled?: NativeCompletion;
 	lastTurn?: { message: unknown; toolResults: unknown[] };
 	candidateEndIntentTurn?: { message: unknown; toolResults: unknown[] };
@@ -227,7 +226,7 @@ export class TeamRpcV2Connection {
 		void settled.catch(() => undefined);
 		const run: ActiveRun = {
 			...(maxTokens !== undefined ? { maxTokens } : {}),
-			activation, onRequest, lastSequence: 0, started: false, policyStopRequested: false, usage: new RunResultCollector("", () => ""),
+			activation, onRequest, lastSequence: 0, policyStopRequested: false, usage: new RunResultCollector("", () => ""),
 			requests: new Map(), requestNativeToolCallIds: new Map(), nativeToolCalls: new Map(),
 			pendingNativeToolCalls: new Set(), claimedNativeToolCalls: new Set(), pendingRequests: 0,
 			resolveSettled, rejectSettled,
@@ -248,11 +247,8 @@ export class TeamRpcV2Connection {
 				activation: activation.scope, deliveryId: activation.deliveryId, input: activation.input });
 			const prompt = this.transport.request({ type: "prompt", message: TEAM_ACTIVATION_TRIGGER });
 			if (signal?.aborted) abortNativeRun();
-			await prompt;
-			if (!run.started && !run.settled) {
-				const state = await this.transport.request({ type: "get_state" }) as { isStreaming?: boolean } | undefined;
-				if (!run.started && !run.settled && state?.isStreaming !== true) throw new Error("Team activation prompt did not start a native Pi run");
-			}
+			const response = await prompt as { disposition?: string } | undefined;
+			if (response?.disposition !== "started") throw new Error(`Team activation prompt did not start a native Pi run: ${response?.disposition ?? "missing disposition"}`);
 			// Only command/application ACKs are bounded. Native work may legitimately
 			// include provider retries, compaction, and multiple tool turns.
 			await settled;
@@ -363,7 +359,6 @@ export class TeamRpcV2Connection {
 				run.usage.ingest(event);
 				try { this.onActivity?.(event); } catch { /* A display observer failure never affects the member. */ }
 			}
-			if (event.type === "agent_start") run.started = true;
 			if (event.type === "tool_execution_start" && typeof event["toolCallId"] === "string" && typeof event["toolName"] === "string") {
 				const toolCallId = event["toolCallId"];
 				const toolName = event["toolName"];

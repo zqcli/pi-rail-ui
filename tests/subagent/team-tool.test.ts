@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { test } from "node:test";
 import { formatTeamView, installTeamTool, TeamLaunchWaitAbortedError } from "../../tools/subagents/team-tool";
 import * as teamTool from "../../tools/subagents/team-tool";
@@ -56,6 +57,22 @@ const prepareArgs = {
 	initialRequests: [{ to: "worker", task: "Inspect the changed files.", inputRefs: null }],
 	timeoutSeconds: null,
 };
+
+test("Pi validates Team action and budget enums without losing nested type checks", () => {
+	const { tool } = setup();
+	const validate = (raw: any) => validateToolArguments(tool, { type: "toolCall", id: "schema-test", name: "subagent_team", arguments: tool.prepareArguments(raw) });
+	for (const budget of [null, "standard", "long", "unlimited"]) {
+		const raw = { ...prepareArgs, budget };
+		assert.deepEqual(validate(raw), raw);
+	}
+	for (const raw of [
+		{ action: "start" }, { action: 1 }, { ...prepareArgs, budget: "huge" },
+		{ ...prepareArgs, members: [{ ...prepareArgs.members[0], fastMode: "invalid-boolean" }, prepareArgs.members[1]] },
+	]) assert.throws(() => validate(raw), /Validation failed for tool/u);
+	assert.throws(() => validate({ action: "status", unrelated: "must reject" }), /unsupported field/u);
+	assert.equal(tool.parameters.properties.action.type, "string");
+	assert.deepEqual(tool.parameters.properties.action.enum, ["prepare", "launch", "status", "cancel"]);
+});
 
 test("prepare selects per-Team presets, defaults to long, and prints unlimited limits in all parent views", async () => {
 	for (const budget of [undefined, null, "standard", "long", "unlimited"] as const) {

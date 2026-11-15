@@ -366,7 +366,7 @@ export function installRailSubagent(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event) => {
 		const active = runtime;
 		if (!active) return;
-		const mentions = extractSubagentMentions(event.prompt);
+		const mentions = extractSubagentMentions(event.messageType === "user" ? event.prompt : "");
 		const prompt = buildSubagentRosterPrompt(await active.broker.listLinked(), mentions);
 		// A section (not a returned systemPrompt, which Pi forces as the leading prompt) lets Pi append
 		// a small system delta when the roster changes instead of invalidating the whole cached prefix.

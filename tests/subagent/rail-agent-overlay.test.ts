@@ -877,7 +877,8 @@ for (const action of ["Continue", "Create"] as const) test(`${action} notifies a
 		const alias = action === "Continue" ? "auth-review" : state.component["form"].alias;
 		state.component.handleInput("\r");
 		state.component.handleInput("\r");
-		for (let attempt = 0; attempt < 100 && state.component["busy"]; attempt++) await new Promise((resolve) => setTimeout(resolve, 5));
+		// The panel releases its busy state at acceptance; the final notification is delivered separately.
+		for (let attempt = 0; attempt < 100 && (state.component["busy"] || state.notifications.length === 0); attempt++) await new Promise((resolve) => setTimeout(resolve, 5));
 		assert.equal(state.component["busy"], false);
 		assert.equal(state.component["control"], undefined);
 		assert.equal(sends, 1);

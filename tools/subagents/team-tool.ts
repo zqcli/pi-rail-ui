@@ -1,4 +1,3 @@
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, Text, TruncatedText } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
@@ -624,7 +623,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 		promptGuidelines: promptList("team", "subagent_team_guidelines"),
 		executionMode: "parallel",
 		parameters: Type.Object({
-			action: StringEnum(["prepare", "launch", "status", "cancel"]),
+			action: Type.Enum(["prepare", "launch", "status", "cancel"], { type: "string" }),
 			title: nullable(Type.String({ minLength: 1, maxLength: 60, description: "prepare: short single-line Team title; defaults to the first sentence of the goal" })),
 			teamId: nullable(Type.String({ description: "launch/status/cancel: the teamId returned by prepare (status without it lists Teams). For a resultRef lookup, provide the owning teamId." })),
 			cursor: nullable(Type.String({ description: "status: next result-ref page cursor returned by the prior status page; requires teamId" })),
@@ -633,7 +632,7 @@ export function installTeamTool(pi: ExtensionAPI, deps: { host: () => TeamSessio
 			lead: nullable(Type.String({ minLength: 1, maxLength: 64, description: "prepare: alias of the member that is the Team's lead; must be one of members" })),
 			brief: nullable(BriefSchema),
 			initialRequests: nullable(Type.Array(InitialRequestSchema, { maxItems: TEAM_MAX_INITIAL_REQUESTS })),
-			budget: nullable(StringEnum(["standard", "long", "unlimited"], { description: "prepare: null = long. unlimited removes activation, model-request and tool-call caps (works stay capped at 20000)." })),
+			budget: nullable(Type.Enum(["standard", "long", "unlimited"], { type: "string", description: "prepare: null = long. unlimited removes activation, model-request and tool-call caps (works stay capped at 20000)." })),
 			review: nullable(Type.Object({
 				by: Type.String({ minLength: 1, maxLength: 64, description: "A member alias other than the lead" }),
 				everyMinutes: Type.Integer({ minimum: 1, maximum: TEAM_MAX_REVIEW_MINUTES }),

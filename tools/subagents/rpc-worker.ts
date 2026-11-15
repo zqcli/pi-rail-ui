@@ -354,7 +354,6 @@ export class RpcSessionWorker implements SessionWorker {
 		}
 		let settled = false;
 		let settledNotified = false;
-		let started = false;
 		let aborted = false;
 		let protocolError: ContextProtocolError | undefined;
 		let resolveSettled!: () => void;
@@ -384,7 +383,6 @@ export class RpcSessionWorker implements SessionWorker {
 					protocolError = this.protocolFailure(`Rail context helper failed during the child run: ${error}`);
 				}
 			}
-			if (event.type === "agent_start") started = true;
 			const changed = collector.ingest(event);
 			const immediate = event.type === "message_end" || isSharedImmediateEvent(event.type);
 			if (immediate) {
@@ -430,13 +428,9 @@ export class RpcSessionWorker implements SessionWorker {
 
 		try {
 			if (options.signal?.aborted) throw new Error("Subagent request was aborted before prompt");
-			await this.transport.request({ type: "prompt", message: task });
-			if (!started && !settled) {
-				const state = await this.transport.request({ type: "get_state" }) as RpcState;
-				if (!started && !settled && state?.isStreaming !== true) {
-					throw new Error("Subagent prompt was handled without starting an agent run");
-				}
-			}
+			const response = await this.transport.request({ type: "prompt", message: task }) as { disposition?: string } | undefined;
+			if (response?.disposition === "handled") throw new Error("Subagent prompt was handled without starting an agent run");
+			if (response?.disposition !== "started") throw this.protocolFailure(`Subagent prompt did not start its own run: ${response?.disposition ?? "missing disposition"}`);
 			if (!settled) options.onAccepted?.();
 			await settledPromise;
 			await abortRequest;

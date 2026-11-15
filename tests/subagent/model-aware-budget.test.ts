@@ -82,8 +82,9 @@ class BudgetTransport implements RpcTransport {
 					this.emit({ type: "agent_start" });
 					this.model.contextWindow = 128_000;
 					this.emit({ type: "agent_settled" });
+					return { disposition: "started" };
 				}
-				return undefined;
+				return { disposition: "handled" };
 			}
 		}
 		return undefined;

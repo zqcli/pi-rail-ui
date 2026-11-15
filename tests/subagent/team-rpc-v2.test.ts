@@ -85,14 +85,14 @@ class FakeTransport implements RpcTransport {
 						result: { terminate: staged } });
 				}
 			}
-			return {};
+			return { disposition: "handled" };
 		}
 		if (message !== TEAM_ACTIVATION_TRIGGER) throw new Error(`Unexpected activation trigger: ${message}`);
 		if (this.triggerFailure) throw this.triggerFailure;
 		this.emit({ type: "agent_start" });
 		this.triggerStarted.resolve();
 		return await new Promise((resolve, reject) => {
-			this.triggerDone = () => { resolve({}); };
+			this.triggerDone = () => { resolve({ disposition: "started" }); };
 			this.triggerLost = reject;
 			this.triggerTimer = setTimeout(() => this.finishTrigger("stop"), this.triggerDelayMs);
 		});
@@ -156,6 +156,41 @@ function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
 function replyCount(transport: FakeTransport): number {
 	return transport.commands.filter((command) => command.operation === "reply").length;
 }
+
+test("Team accepts only started prompt disposition and still waits for agent_settled", async () => {
+	for (const disposition of ["handled", "queued", undefined, "started"]) {
+		const transport = new FakeTransport();
+		const request = transport.request.bind(transport);
+		const accepted = Promise.withResolvers<void>();
+		transport.request = async (command) => {
+			if (command["type"] === "get_state") throw new Error("Prompt acceptance must not probe state");
+			if (command["type"] !== "prompt" || command["message"] !== TEAM_ACTIVATION_TRIGGER) return request(command);
+			accepted.resolve();
+			return { disposition };
+		};
+		const connection = new TeamRpcV2Connection(transport, binding, loadoutFor(binding.memberId), () => undefined);
+		let finished = false;
+		const run = connection.sendActivation(activation(), async () => ({ kind: "ack" })).finally(() => { finished = true; });
+		void run.catch(() => undefined);
+		await accepted.promise;
+		if (disposition !== "started") {
+			await assert.rejects(run, /did not start a native Pi run/);
+			assert.equal(transport.stopCalls, 1);
+			continue;
+		}
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(finished, false, "the public acceptance response does not release the activation");
+		transport.emit({ type: "agent_start" });
+		transport.emit({ type: "turn_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }, toolResults: [] });
+		transport.emit({ type: "agent_end", messages: [] });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(finished, false, "agent_end is not the settled boundary");
+		transport.emit({ type: "agent_settled" });
+		assert.equal((await run).finalAssistantText, "done");
+		await connection.deactivate(activation());
+		await connection.close();
+	}
+});
 
 async function startConnection(transport: FakeTransport, onRequest: (frame: ChildRequestFrame, intentId?: string) => Promise<PrivateReply>, onFailure: (error: Error) => void = () => undefined,
 	signal?: AbortSignal) {

@@ -275,7 +275,7 @@ test("real Pi member activity feeds the launch panel across activations and free
 	assert.ok(driver.memberActivity(teamId, "w1")!.transcript.entries.length > 0, "activity outlives the closed member");
 });
 
-test("real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member", { timeout: 60000 }, async (t) => {
+test("real Pi 1.5.2 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n02");
 	runtime.launch(teamId);
 	await assert.rejects(broker.dispatch({ target: "w1", task: "ordinary writer intrusion" }), /active team operation/u);
@@ -349,7 +349,7 @@ test("real Pi 0.87.1 Team v2 lifetime supports W1/W2 return-trip work with settl
 		for (const call of providerCalls) {
 			// The bind-time brief reaches every provider request as a <team_brief> section of Pi's own system prompt.
 			assert.match(call.data.systemPrompt, new RegExp(`<team_brief>\\nTeam member: ${memberId}\\.[\\s\\S]*### Goal\\nVerify same-session Team v2 activation and result settlement\\.[\\s\\S]*### Team roster\\n- lead: [\\s\\S]*</team_brief>`, "u"));
-			assert.match(call.data.systemPrompt, /You are an expert coding assistant/u, "Pi's default system prompt is kept, not replaced");
+			assert.match(call.data.systemPrompt, /You are a coding assistant running inside pi, a coding agent harness\./u, "Pi's default system prompt is kept, not replaced");
 			const input = call.data.messages.map((message: any) => {
 				if (message.role !== "user") return undefined;
 				const text = typeof message.content === "string" ? message.content : (message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");

@@ -1,4 +1,4 @@
-import { StringEnum, type Usage } from "@earendil-works/pi-ai";
+import type { Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentToolResult, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type Theme,
 	type ToolRenderResultOptions,
@@ -41,14 +41,16 @@ const OUTPUT_CAP = 50 * 1024;
 const DETAILS_TOTAL_CAP = 512 * 1024;
 
 const SessionSourceSchema = Type.Object({
-	mode: StringEnum(["fork", "exclusive"] as const, {
+	mode: Type.Enum(["fork", "exclusive"], {
+		type: "string",
 		description: "fork (default) continues in a copy and leaves the original file untouched; exclusive takes over the original, only when the user explicitly asks and no other Pi process has it open",
 	}),
 	path: Type.String({ description: "Path of the saved Pi session .jsonl file to continue" }),
 });
 
 const ControlSchema = Type.Object({
-	delivery: StringEnum(["steer", "followUp"] as const, {
+	delivery: Type.Enum(["steer", "followUp"], {
+		type: "string",
 		description: "steer: deliver before the helper's next model call (redirect now). followUp: queue until its current run finishes",
 	}),
 	message: Type.String({ description: "Message for the running persistent helper" }),

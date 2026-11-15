@@ -476,7 +476,7 @@ test("launch panel says who a waiting member waits on, what a held one asks, and
 	const update = updates.at(-1);
 	const detail = (alias: string): string => update.details.members.find((member: any) => member.alias === alias).detail;
 	assert.equal(detail("source"), 'held · asks: "Which fixture should I use?" · queued for lead');
-	assert.equal(detail("writer"), `waiting on source (held ${shortWorkRef(source.scope.work!)})`);
+	assert.equal(detail("writer"), `waiting on source (held ${shortWorkRef(source.scope.work!)} · needs lead's decision)`);
 	assert.equal(update.details.waitingFor, "Lead decision on source's question");
 	assert.match(update.content[0].text, /^Works: [^\n]*\nWaiting for: Lead decision on source's question\n/mu, "the Team header carries the reason under the work counts");
 	const status = await tool.execute("status", { action: "status", teamId }, undefined, undefined, context());
@@ -643,7 +643,7 @@ for (const state of ["cancelled", "failed"] as const) {
 	});
 }
 
-test("launch panel keeps the generic wait text while every dependency is terminal but its native cleanup is pending", async () => {
+test("launch panel names exact terminal dependencies while their native cleanup is pending", async () => {
 	const { host, tool } = setup();
 	const prepared = await tool.execute("prepare", sourceWriterArgs, undefined, undefined, context());
 	const teamId = prepared.details.view.teamId;
@@ -667,7 +667,8 @@ test("launch panel keeps the generic wait text while every dependency is termina
 	const cancel = { action: "control", command: "cancel_work", workId: source.scope.work!.workId, expectedRevision: 1, reason: "Not needed." };
 	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "cancel-source", cancel, "cancel-source").ok, true);
 	await new Promise((resolve) => setTimeout(resolve, 300));
-	assert.equal(detail("writer"), "waiting on other work", "source is cancelled, so it is no longer something to wait on");
+	assert.equal(detail("writer"), `waiting on source (cancelled ${shortWorkRef(source.scope.work!)} · cleanup pending)`,
+		"the exact cancelled outcome remains unavailable until its native cleanup is confirmed");
 	assert.equal(detail("source"), `running ${shortWorkRef(source.scope.work!)}`, "until its activation confirms cleanup");
 
 	host.runtime.nativeSettled(source.binding, source.scope.activationId, { status: "aborted" });

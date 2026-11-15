@@ -10,7 +10,7 @@ import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, reviewTiming, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
-import { waitFactText } from "./team-runtime";
+import { waitFactText, type TeamWaitFact } from "./team-runtime";
 
 const TABS = ["Teams", "Overview", "Progress", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
@@ -333,7 +333,7 @@ export class TeamOverlayComponent implements Focusable {
 			if (this.detail) rows = this.tab === 3 ? this.taskDetail(team, works, facts, inner - 1) : this.memberDetail(team, works, facts, inner - 1);
 			else if (this.tab === 1) rows = this.overview(team, works, facts, inner - 1);
 			else if (this.tab === 2) rows = this.members(team, works, facts, inner - 3);
-			else if (this.tab === 3) rows = this.taskRows(team, works, inner - 3);
+			else if (this.tab === 3) rows = this.taskRows(team, works, facts, inner - 3);
 			else rows = this.timeline(facts, works);
 		} else if (history) rows = this.historyRows(history, inner - ((this.tab === 2 || this.tab === 3) && !this.detail ? 3 : 1));
 		else rows = [{ text: "No teams" }];
@@ -653,9 +653,10 @@ export class TeamOverlayComponent implements Focusable {
 	}
 
 	/** One row per deliverable under Needs attention / In progress / Done (folded); the expanded deliverable lists its sub-tasks. */
-	private taskRows(team: TeamTeamView, works: TeamWorkSummary[], width: number): Row[] {
+	private taskRows(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
 		const { latest, children } = workTree(works);
-		const describe = (work: TeamWorkSummary) => this.taskState(team.teamId, work, works, true);
+		// Exact wait targets and their creation order were already resolved once for this render.
+		const describe = (work: TeamWorkSummary) => this.taskState(team.teamId, work, works, facts.dependencies.get(workRefKey(work.work)) ?? [], true);
 		const descendants = (work: TeamWorkSummary): TeamWorkSummary[] => (children.get(work.work.workId) ?? []).flatMap((child) => [child, ...descendants(child)]);
 		const roots = [...latest.values()].filter((work) => !work.parent);
 		const rank = (work: TeamWorkSummary) => work.hold || work.state === "failed" || work.review === "waived" || work.state === "resolved" && !work.review ? 0
@@ -685,7 +686,7 @@ export class TeamOverlayComponent implements Focusable {
 		});
 	}
 
-	private taskState(teamId: string, work: TeamWorkSummary, works: readonly TeamWorkSummary[], brief = false): string {
+	private taskState(teamId: string, work: TeamWorkSummary, works: readonly TeamWorkSummary[], waits: readonly TeamWaitFact[], brief = false): string {
 		const version = this.host.runtime.getWork(teamId, work.work)!.current;
 		if (work.hold) return `held: ${{ attention: "attention", budget: "budget", protocol: "loop", lead_unavailable: "lead fault" }[work.hold]}`;
 		if (work.review) {
@@ -695,8 +696,7 @@ export class TeamOverlayComponent implements Focusable {
 		}
 		if (work.state === "failed") return `failed: ${version.error?.code ?? "unknown"}`;
 		if (work.state === "blocked") {
-			const waits = this.host.runtime.workWaits(teamId, work.work).filter((wait) => wait.blocking);
-			const names = [...new Set(waits.map((wait) => `${wait.assignee}${wait.reason ? ` (${wait.reason})` : ""}`))];
+			const names = [...new Set(waits.filter((wait) => wait.blocking).map((wait) => `${wait.assignee}${wait.reason ? ` (${wait.reason})` : ""}`))];
 			return `waiting for ${names.join(", ") || "sub-tasks"}`;
 		}
 		if (work.state === "queued") {
@@ -719,9 +719,10 @@ export class TeamOverlayComponent implements Focusable {
 		const children = works.filter((item) => item.parent?.workId === work.work.workId && !item.kind);
 		const result = work.resultRef ? this.host.runtime.getResult(team.teamId, work.resultRef)?.result : undefined;
 		const stats = this.host.runtime.workStats(team.teamId, work.work);
-		const waits = this.host.runtime.workWaits(team.teamId, work.work);
+		// Reuse this render's exact facts; a running parent without a wait can still have child obligations.
+		const waits = facts.dependencies.get(workRefKey(work.work)) ?? this.host.runtime.workWaits(team.teamId, work.work);
 		const lines = [`${workTitle(work)} · ${shortWorkRef(work.work)}${work.work.revision > 1 ? ` (revised ${work.work.revision - 1}×)` : ""}`,
-			`${work.requester} → ${work.assignee} · ${this.taskState(team.teamId, work, works)} · ${usageText(stats.usage)}`, `Task: ${view.current.task}`, "Lifecycle:",
+			`${work.requester} → ${work.assignee} · ${this.taskState(team.teamId, work, works, waits)} · ${usageText(stats.usage)}`, `Task: ${view.current.task}`, "Lifecycle:",
 			...(facts.timelineOmitted ? ["  … earlier steps omitted"] : []), ...milestones.map((row) => `  ${row.text}`),
 			...(waits.length ? ["Dependencies (exact versions):", ...waits.map((wait) => `  ${waitFactText(wait)}`)] : []),
 			`Sub-tasks: ${children.length} · ${children.filter((item) => item.state === "resolved").length} done · ${children.filter((item) => item.state === "blocked").length} waiting`,

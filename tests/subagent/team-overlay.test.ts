@@ -1142,9 +1142,13 @@ test("Tasks rows use waiting/held/delivered/accepted/reason/error words; result 
 	const originalResult = host.runtime.getResult.bind(host.runtime);
 	const root = originalWorks(teamId)[0]!;
 	const child = originalWorks(teamId).find((work) => work.parent)!;
-	const originalWaits = host.runtime.workWaits.bind(host.runtime);
-	host.runtime.workWaits = (id, ref) => originalWaits(id, ref).map((wait) => wait.work.workId === child.work.workId
-		? { ...wait, state: "resolved", blocking: false, reason: "outcome ready; awaiting delivery" } : wait);
+	const originalFacts = host.runtime.panelFacts.bind(host.runtime);
+	host.runtime.panelFacts = (id) => {
+		const facts = originalFacts(id);
+		facts.dependencies = new Map([...facts.dependencies].map(([key, waits]) => [key, waits.map((wait) => wait.work.workId === child.work.workId
+			? { ...wait, state: "resolved", blocking: false, reason: "outcome ready; awaiting delivery" } : wait)]));
+		return facts;
+	};
 	host.runtime.listWorks = (id) => originalWorks(id).map((work) => work.work.workId === root.work.workId ? { ...work, review: "accepted" } : work.parent ? { ...work, state: "resolved", resultRef: "result:synthetic" } : work);
 	host.runtime.getResult = (id, ref) => ref === "result:synthetic" ? { id: ref, author: child.assignee, work: child.work, committedAt: 1, source: "explicit_reply", result: { status: "succeeded", summary: "3 fixed. Second sentence." } } : originalResult(id, ref);
 	text = ui.text(POPUP_WIDTH);
@@ -1432,6 +1436,61 @@ test("Overview wraps a valid 60-character title with short ID and enriches runni
 	host.runtime.panelFacts = () => facts;
 	assert.match(ui.text(POPUP_WIDTH), /Lead failed: revive it or hand the lead over/u);
 	for (const line of lines) assert.equal(visibleWidth(line), POPUP_WIDTH);
+});
+
+test("Tasks reuse one render-local dependency snapshot for 1000 blocked roots and refresh exact outcomes on the next render", (t) => {
+	const count = 1000;
+	let id = 0;
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `many${++id}`, now: () => 1_700_000_000_000,
+		limits: { teamWorks: 2000, memberUnresolvedWork: count, teamActivations: 2000 } });
+	const runtime = host.runtime;
+	const { teamId } = runtime.prepare({ members: ["lead", "a", "b", "c"].map((alias) => ({ alias, roleDescription: alias })),
+		lead: "lead", brief: { goal: "Many blocked roots, one diagnostic pass." }, timeoutSeconds: null, review: null,
+		initialRequests: [{ to: "b", task: "Peer B" }, { to: "c", task: "Peer C" }] });
+	runtime.launch(teamId);
+	const take = () => {
+		const activation = runtime.takeNextActivation(teamId)!;
+		assert.ok(activation);
+		assert.equal(runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
+		return activation;
+	};
+	const [lead, b, c] = [take(), take(), take()];
+	for (let index = 0; index < count; index++) {
+		assert.equal(runtime.handleAction(lead.binding, lead.scope, index + 1, `request${index}`, { action: "request", to: "a", task: `Blocked ${index}` }).ok, true);
+		const consumer = take();
+		assert.equal(runtime.handleAction(consumer.binding, consumer.scope, 1, "wait", { action: "yield", waitingFor: [b.scope.work!, c.scope.work!], checkpoint: "Both exact peers." }).ok, true);
+		assert.equal(runtime.nativeSettled(consumer.binding, consumer.scope.activationId, { status: "success", appliedToolCallId: "wait" }).ok, true);
+		assert.equal(runtime.cleanupFinished(consumer.binding, consumer.scope.activationId, { ok: true }).ok, true);
+	}
+	const originalFacts = runtime.panelFacts.bind(runtime);
+	const originalWaits = runtime.workWaits.bind(runtime);
+	let snapshots = 0;
+	let extraWaits = 0;
+	runtime.panelFacts = (id) => { snapshots++; return originalFacts(id); };
+	runtime.workWaits = (id, work) => { extraWaits++; return originalWaits(id, work); };
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right");
+	const render = () => {
+		snapshots = 0; extraWaits = 0;
+		const text = stripTerminalSequences(ui.text(200));
+		assert.equal(snapshots, 1, "each render computes the dependency snapshot once");
+		assert.equal(extraWaits, 0, "blocked task rows/details must reuse it, not rebuild a full-ledger ordering index per row");
+		return text;
+	};
+	assert.match(render(), /Blocked 0.*waiting for b, c/u);
+	ui.key("end");
+	assert.match(render(), /Blocked 999.*waiting for b, c/u);
+	ui.key("enter");
+	assert.match(render(), /Blocked 999 · work/u);
+	assert.equal(runtime.handleAction(lead.binding, lead.scope, count + 1, "revise-peer", { action: "control", command: "revise_work", workId: b.scope.work!.workId, expectedRevision: 1, task: "Peer B revision two." }).ok, true);
+	assert.match(render(), /waiting for b \(cleanup pending\), c/u);
+	assert.equal(runtime.nativeSettled(b.binding, b.scope.activationId, { status: "aborted" }).ok, true);
+	assert.equal(runtime.cleanupFinished(b.binding, b.scope.activationId, { ok: true }).ok, true);
+	assert.match(render(), /waiting for c/u);
+	ui.key("end");
+	assert.match(render(), /@1 → b · superseded · outcome ready; awaiting delivery · current @2/u);
+	runtime.assertInvariants(teamId);
 });
 
 test("perf: flowStats and the Progress render stay fast for a Team with ~5000 works", (t) => {

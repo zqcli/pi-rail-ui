@@ -451,3 +451,18 @@ test("team_brief renders only the member's own authorization and fills absent pa
 	assert.match(lead, /### Acceptance criteria\nnone\n\n### Constraints\nnone\n\n### Your authorization\nnone\n/u);
 	assert.match(renderTeamBrief("qa", { tools: null, teamTool: true, brief, roster }), /Allowed:\n- run tests\nForbidden:\nnone/u);
 });
+
+test("signal publish is a sole-batch phase boundary but not an end intent", async () => {
+	const h = harness("member");
+	await h.command(bindCommand(h)); await h.command(activateCommand(h));
+	h.branch.push({ type: "message", message: { role: "assistant", content: [
+		{ type: "toolCall", id: "publish", name: "team" }, { type: "toolCall", id: "sdk", name: "bash" },
+	] } });
+	await assert.rejects(h.tools.get("team").execute("publish", { action: "signal", operation: "publish", signalId: "signal:phase", text: "released" }, h.ctx.signal, () => undefined, h.ctx), /only tool call/);
+	assert.equal(h.privateFrames().filter((frame) => frame.kind === "request").length, 0);
+	h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "publish-alone", name: "team" }] } });
+	const executing = h.tools.get("team").execute("publish-alone", { action: "signal", operation: "publish", signalId: "signal:phase", text: "released" }, h.ctx.signal, () => undefined, h.ctx);
+	const frame = await waitForRequest(h, "business");
+	await replyToRequest(h, frame, { kind: "business", reply: { ok: true, from: "@hub", to: h.binding.memberId, receipt: { status: "published", signalId: "signal:phase" } } }, "published");
+	assert.equal((await executing).terminate, undefined, "publishing a phase leaves the native work running");
+});

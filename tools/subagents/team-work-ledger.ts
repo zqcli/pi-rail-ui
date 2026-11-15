@@ -4,7 +4,7 @@
  */
 import {
 	isTerminalWorkState, workRefKey,
-	type DependencyOutcome, type ResultRecord, type WorkRecord, type WorkRef, type WorkVersion,
+	type DependencyOutcome, type ResultRecord, type SignalRecord, type WorkRecord, type WorkRef, type WorkVersion,
 } from "./team-protocol";
 
 export interface RejectedCandidate { revision: number; reason: string; summary: string }
@@ -16,7 +16,7 @@ export interface LedgerWork {
 	children: string[][];
 	rejectedCandidates: RejectedCandidate[];
 	/** Staged (not yet committed) wait edges of a running version, reserved for cycle checks. */
-	stagedWait?: { revision: number; refs: WorkRef[] };
+	stagedWait?: { revision: number; refs: WorkRef[]; signals?: string[] };
 }
 
 function deepFreeze<T>(value: T): T {
@@ -33,6 +33,7 @@ export class WorkLedger {
 	readonly order: string[] = [];
 	readonly results = new Map<string, ResultRecord>();
 	readonly resultOrder: string[] = [];
+	readonly signals = new Map<string, SignalRecord>();
 	/** Terminal versions whose native activation has not finished cleanup yet. */
 	readonly cleanupPending = new Set<string>();
 
@@ -125,37 +126,42 @@ export class WorkLedger {
 	}
 
 	/**
-	 * Edges out of a non-terminal version: completion constraints (to each owned child's current
-	 * version) plus suspended or staged waits. Terminal versions have none.
+	 * Completion edges include owned children. Signal publication only needs the producer to run,
+	 * not to finish those children: a parent may publish a phase before its child completes.
+	 * Staged waits participate immediately, so two concurrent yields cannot admit a cycle.
 	 */
-	private edges(ref: WorkRef): WorkRef[] {
-		const version = this.version(ref);
-		const work = this.works.get(ref.workId);
-		if (!version || !work || isTerminalWorkState(version.state)) return [];
-		const next = [...this.ownedChildren(ref), ...version.waitingFor];
-		if (work.stagedWait?.revision === ref.revision) next.push(...work.stagedWait.refs);
-		return next;
-	}
-
-	/** Path from→target→…→from if adding wait edges from→targets would close a cycle. */
-	findCycle(from: WorkRef, targets: readonly WorkRef[]): WorkRef[] | undefined {
-		const goal = workRefKey(from);
-		const seen = new Set<string>();
-		const visit = (ref: WorkRef, path: WorkRef[]): WorkRef[] | undefined => {
-			const key = workRefKey(ref);
-			if (key === goal) return path;
-			if (seen.has(key)) return undefined;
-			seen.add(key);
-			for (const next of this.edges(ref)) {
-				const found = visit(next, [...path, next]);
-				if (found) return found;
+	findCycle(from: WorkRef, targets: readonly WorkRef[], signalIds: readonly string[] = []): string[] | undefined {
+		type Node = { work: WorkRef } | { signal: string };
+		const workNode = (work: WorkRef): Node => ({ work });
+		const signalNode = (signal: string): Node => ({ signal });
+		const key = (node: Node): string => "work" in node ? workRefKey(node.work) : node.signal;
+		const waits = (ref: WorkRef): Node[] => {
+			if (workRefKey(ref) === workRefKey(from)) return [...targets.map(workNode), ...signalIds.map(signalNode)];
+			const version = this.version(ref);
+			const staged = this.get(ref.workId)?.stagedWait;
+			return [...(version?.waitingFor ?? []).map(workNode), ...(version?.waitingForSignals ?? []).map(signalNode),
+				...(staged?.revision === ref.revision ? [...staged.refs.map(workNode), ...(staged.signals ?? []).map(signalNode)] : [])];
+		};
+		const edges = (node: Node): Node[] => {
+			if ("signal" in node) {
+				const signal = this.signals.get(node.signal);
+				return signal?.state === "pending" ? waits(signal.work) : [];
 			}
+			const version = this.version(node.work);
+			return !version || isTerminalWorkState(version.state) ? [] : [...this.ownedChildren(node.work).map(workNode), ...waits(node.work)];
+		};
+		const done = new Set<string>();
+		const visit = (node: Node, path: string[]): string[] | undefined => {
+			const id = key(node);
+			if (path.includes(id)) return [...path, id];
+			if (done.has(id)) return undefined;
+			for (const next of edges(node)) {
+				const cycle = visit(next, [...path, id]);
+				if (cycle) return cycle;
+			}
+			done.add(id);
 			return undefined;
 		};
-		for (const target of targets) {
-			const found = visit(target, [from, target]);
-			if (found) return found;
-		}
-		return undefined;
+		return visit(workNode(from), []);
 	}
 }

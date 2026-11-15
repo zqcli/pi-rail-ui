@@ -348,6 +348,22 @@ test("compaction: threshold runs only at the next boundary, skips an immediate r
 	assert.equal(activations.filter((a) => a.binding.memberId === "w1").length, 3);
 });
 
+test("compaction: worker mailbox honors the same threshold boundary and does not immediately retrigger", async (t) => {
+	const { runtime, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "work" }]);
+	const work = activations.find((activation) => activation.binding.memberId === "w1")!;
+	compactSettle(runtime, work, { status: "success", finalAssistantText: "finished", usage: { ...emptySubagentUsage(), contextTokens: 800 } });
+	await compactTick();
+	const lead = activations.filter((activation) => activation.binding.memberId === "lead").at(-1)!;
+	inputReady(runtime, lead);
+	assert.equal(action(runtime, lead, 1, "message", { action: "message", to: "w1", text: "follow-up question" }).ok, true);
+	await compactTick();
+	assert.equal(calls.length, 1); assert.equal(calls[0]!.memberId, "w1");
+	calls[0]!.resolve({ ok: true, tokensBefore: 800, tokensAfter: 850 });
+	await compactTick();
+	const mailbox = activations.filter((activation) => activation.binding.memberId === "w1").at(-1)!;
+	assert.equal(mailbox.scope.kind, "events"); assert.equal(calls.length, 1);
+});
+
 test("compaction: below threshold proceeds, live threshold change applies to lead events too", async (t) => {
 	const { runtime, teamId, calls, activations } = await compactionRuntime(t, [{ to: "w1", task: "first" }, { to: "w1", task: "second" }]);
 	const work = activations.find((a) => a.binding.memberId === "w1")!;

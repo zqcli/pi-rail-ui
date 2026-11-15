@@ -9,7 +9,7 @@ import { isValidAgentAlias } from "./identity";
 import {
 	TEAM_ERROR_CODES, TEAM_MAX_ACTIVATION_INPUT_BYTES, TEAM_MAX_ALIAS_LENGTH, TEAM_MAX_BRIEF_BYTES, TEAM_MAX_FRAME_BYTES,
 	TEAM_MAX_ACTION_BYTES, TEAM_MAX_PUBLIC_CHILDREN, TEAM_MAX_OWNED_CHILD_PREVIEWS,
-	TEAM_MAX_CHILD_ISSUES, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES,
+	TEAM_MAX_CHILD_ISSUES, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES, TEAM_MAX_SIGNAL_TEXT_BYTES, TEAM_MAX_WORK_SIGNALS, TEAM_MAX_SIGNALS,
 	TEAM_MAX_ID_LENGTH, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_INPUT_REFS, TEAM_MAX_MEMBERS, TEAM_MAX_NOTE_BYTES,
 	TEAM_MAX_EVENT_MESSAGE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_RESULT_ITEMS, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_DELIVERED_TASK_BYTES, TEAM_MAX_TEXT_ITEM_BYTES,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_TERMINAL_INCIDENTS,
@@ -24,7 +24,7 @@ import {
 	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReceipt, type TeamReply, type TeamReplyData,
 	type TeamStatusPage, type TeamTeamView, type TeamWorkSummary, type TeamWorkView, type MemberRecord, type ResultRecord,
 	type WorkError, type WorkRef, type WorkResult, type WorkState, type WorkVersion, type TeamBudgetGrantView, type TeamRootBudgetView,
-	type TeamResult, type TeamReviewPlan, type TeamReviewRecord,
+	type TeamResult, type TeamReviewPlan, type TeamReviewRecord, type SignalRecord,
 } from "./team-protocol";
 import type { SubagentUsage } from "./session-broker";
 
@@ -418,8 +418,10 @@ export function normalizeTeamPlan(value: unknown): TeamPlan {
 
 const ACTION_FIELDS = {
 	request: ["to", "task", "title", "inputRefs"],
+	message: ["to", "text", "replyTo"],
+	signal: ["operation", "name", "signalId", "text"],
 	reply: ["result"],
-	yield: ["waitingFor", "checkpoint", "attention"],
+	yield: ["waitingFor", "waitingForSignals", "checkpoint", "attention"],
 	status: ["view", "id", "cursor", "limit"],
 	control: ["command", "memberId", "workId", "expectedRevision", "task", "title", "inputRefs", "reason", "incidentId", "instruction", "instructions", "work", "disposition", "resultRefs", "outcome"],
 } as const;
@@ -464,6 +466,17 @@ const controlAction = (command: string, properties: Record<string, unknown>, des
 
 /** Strict model-facing discriminated union. Runtime normalization remains authoritative. */
 export const TEAM_TOOL_SCHEMA = Type.Union([
+	schemaObject({ action: Type.Literal("message"), to: aliasSchema,
+		text: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }), replyTo: Type.Optional(idSchema),
+	}, "Queue a notice or question without creating work or waiting for an answer. Sent means accepted, not read. Delivery uses a subsequent serialized mailbox/events activation, never an interruption. Use replyTo for a conversational answer, not reply(result)."),
+	schemaObject({ action: Type.Literal("signal"), operation: Type.Literal("open"), name: Type.String({ minLength: 1, maxLength: 60 }) },
+		"Open a fresh one-shot phase signal owned by this exact WorkRef. Share its returned signalId. Each new phase needs a new ID; a signal is not a resource lock."),
+	schemaObject({ action: Type.Literal("signal"), operation: Type.Literal("publish"), signalId: idSchema,
+		text: Type.String({ minLength: 1, maxLength: TEAM_MAX_SIGNAL_TEXT_BYTES }) },
+		"Publish an owned pending signal immediately while continuing this work. A published fact is historical, not proof a resource is currently free."),
+	schemaObject({ action: Type.Literal("yield"), waitingForSignals: Type.Array(idSchema, { minItems: 1, maxItems: TEAM_MAX_WAITING_FOR }),
+		checkpoint: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }) },
+		"End this work activation until all exact signal IDs publish or become unavailable. Does not wait for their Work results. Cannot combine with waitingFor or attention."),
 	schemaObject({ action: Type.Literal("request"), to: aliasSchema, title: titleSchema,
 		task: Type.String({ minLength: 1, maxLength: TEAM_MAX_TASK_BYTES }),
 		inputRefs: Type.Optional(Type.Array(resultIdSchema, { maxItems: TEAM_MAX_INPUT_REFS })),
@@ -476,11 +489,11 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 		checkpoint: Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES }),
 	}, "Hold this work and ask for input: the member that requested a sub-task answers it (with resume_work, revise_work or cancel_work); the lead or host answers a root."),
 	schemaObject({ action: Type.Literal("yield"), checkpoint: Type.Optional(Type.String({ minLength: 1, maxLength: TEAM_MAX_NOTE_BYTES })) },
-		"Lead only: end this events activation. The lead never waits in-run; new Team events start its next activation automatically."),
+		"Events activations: end this activation. The lead never waits in-run; new Team events start its next activation automatically."),
 	schemaObject({ action: Type.Literal("status"), view: Type.Optional(Type.Literal("team")),
 		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
 	"Read the bounded Team summary. Team view does not accept an id or cursor."),
-	...(["work", "result", "incident"] as const).flatMap((view) => [
+	...(["work", "result", "incident", "signal"] as const).flatMap((view) => [
 		schemaObject({ action: Type.Literal("status"), view: Type.Literal(view),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: TEAM_STATUS_MAX_LIMIT })) },
 		`Read a bounded ${view} page; status(result) is read-only and does not acknowledge child-result observation.`),
@@ -528,7 +541,6 @@ const LEGACY_ACTIONS: Record<string, string> = {
 const LEGACY_FIELDS: Record<string, string> = {
 	afterSeq: "afterSeq was removed: deliveries are acknowledged by the runtime, not by a model cursor",
 	supersedes: "supersedes was removed: the lead revises work with control revise_work",
-	replyTo: "replyTo was removed: reply is bound to the current work automatically",
 	message: "message was removed: use request.task, reply.result or yield.attention",
 	wait: "wait was removed: use yield {waitingFor}",
 };
@@ -540,8 +552,9 @@ export function normalizeTeamAction(value: unknown): TeamAction {
 	if (!isRecord(value)) return invalid("team arguments must be an object with an action");
 	for (const [key, message] of Object.entries(LEGACY_FIELDS)) if (present(value[key])) invalid(message);
 	const action = value["action"];
+	if (action !== "message" && present(value["replyTo"])) return invalid("replyTo was removed from work actions: reply is bound to the current WorkRef; only message accepts conversational replyTo");
 	if (typeof action === "string" && LEGACY_ACTIONS[action]) return invalid(LEGACY_ACTIONS[action]);
-	if (typeof action !== "string" || !Object.hasOwn(ACTION_FIELDS, action)) return invalid("action must be request, reply, yield, status or control");
+	if (typeof action !== "string" || !Object.hasOwn(ACTION_FIELDS, action)) return invalid("action must be request, message, signal, reply, yield, status or control");
 	const allowed: readonly string[] = ACTION_FIELDS[action as keyof typeof ACTION_FIELDS];
 	for (const key of Object.keys(value)) {
 		if (key === "action") continue;
@@ -549,6 +562,17 @@ export function normalizeTeamAction(value: unknown): TeamAction {
 		if (!allowed.includes(key) && present(value[key])) invalid(`${key} is not used by ${action}; omit it or pass null`);
 	}
 	switch (action) {
+		case "message":
+			return { action, to: normalizeAlias(value["to"], "to"), text: text(value["text"], "text", TEAM_MAX_NOTE_BYTES),
+				...(present(value["replyTo"]) ? { replyTo: normalizeId(value["replyTo"], "replyTo") } : {}) };
+		case "signal":
+			if (value["operation"] === "open") {
+				if (typeof value["name"] !== "string") return invalid("signal open requires name");
+				if (present(value["signalId"]) || present(value["text"])) return invalid("signal open accepts only name");
+				return { action, operation: "open", name: normalizeTitle(value["name"], "", "name") };
+			}
+			if (value["operation"] !== "publish" || present(value["name"])) return invalid("signal requires open(name) or publish(signalId,text)");
+			return { action, operation: "publish", signalId: normalizeId(value["signalId"], "signalId"), text: text(value["text"], "text", TEAM_MAX_SIGNAL_TEXT_BYTES) };
 		case "request":
 			return { action, to: normalizeAlias(value["to"], "to"), task: text(value["task"], "task", TEAM_MAX_TASK_BYTES),
 				...(value["title"] == null ? {} : { title: normalizeTitle(value["title"], "") }), inputRefs: idList(value["inputRefs"], "inputRefs", TEAM_MAX_INPUT_REFS) };
@@ -560,14 +584,16 @@ export function normalizeTeamAction(value: unknown): TeamAction {
 			const unique = new Map(refs.map((ref) => [`${ref.workId}@${ref.revision}`, ref]));
 			const waitingFor = [...unique.values()].sort((left, right) => left.workId < right.workId ? -1
 				: left.workId > right.workId ? 1 : left.revision - right.revision);
+			const waitingForSignals = present(value["waitingForSignals"]) ? idList(value["waitingForSignals"], "waitingForSignals", TEAM_MAX_WAITING_FOR) : [];
+			if (waitingForSignals.length && waitingFor.length) return invalid("waitingFor and waitingForSignals are mutually exclusive");
 			const checkpoint = optionalText(value["checkpoint"], "checkpoint", TEAM_MAX_NOTE_BYTES);
 			const attention = optionalText(value["attention"], "attention", TEAM_MAX_NOTE_BYTES);
-			if (waitingFor.length && attention !== undefined) return invalid("waitingFor and attention are mutually exclusive");
-			return { action, waitingFor, ...(checkpoint !== undefined ? { checkpoint } : {}), ...(attention !== undefined ? { attention } : {}) };
+			if ((waitingFor.length || waitingForSignals.length) && attention !== undefined) return invalid("waitingFor and attention are mutually exclusive");
+			return { action, waitingFor, ...(waitingForSignals.length ? { waitingForSignals: [...new Set(waitingForSignals)].sort() } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}), ...(attention !== undefined ? { attention } : {}) };
 		}
 		case "status": {
 			const view = value["view"] ?? "team";
-			if (view !== "team" && view !== "work" && view !== "result" && view !== "incident") return invalid("view must be team, work, result or incident");
+			if (view !== "team" && view !== "work" && view !== "result" && view !== "incident" && view !== "signal") return invalid("view must be team, work, result, incident or signal");
 			const limit = present(value["limit"]) ? safeInteger(value["limit"], "limit", 1, TEAM_STATUS_MAX_LIMIT) : TEAM_STATUS_DEFAULT_LIMIT;
 			const id = present(value["id"]) ? normalizeId(value["id"], "id") : undefined;
 			const cursor = present(value["cursor"]) ? normalizeId(value["cursor"], "cursor") : undefined;
@@ -825,7 +851,7 @@ function parseTeamError(value: unknown): TeamError {
 
 function parseWorkVersion(value: unknown, field: string): WorkVersion {
 	if (!isRecord(value)) return protocol(`${field} must be a work version`);
-	frameKeys(value, ["revision", "task", "inputRefs", "state", "waitingFor", "observedOutcomes", "childIssues", "checkpoint", "resumeInstruction", "hold", "resultRef", "review", "error", "createdAt", "updatedAt"], field);
+	frameKeys(value, ["revision", "task", "inputRefs", "state", "waitingFor", "observedOutcomes", "waitingForSignals", "observedSignals", "childIssues", "checkpoint", "resumeInstruction", "hold", "resultRef", "review", "error", "createdAt", "updatedAt"], field);
 	const state = value["state"];
 	if (!(WORK_STATES as readonly unknown[]).includes(state)) return protocol(`${field}.state is invalid`);
 	const parseRefs = (raw: unknown, name: string, max: number): WorkRef[] => {
@@ -863,6 +889,8 @@ function parseWorkVersion(value: unknown, field: string): WorkVersion {
 		revision: safeInteger(value["revision"], `${field}.revision`, 1), task: text(value["task"], `${field}.task`, TEAM_MAX_DELIVERED_TASK_BYTES),
 		inputRefs: idList(value["inputRefs"], `${field}.inputRefs`, TEAM_MAX_INPUT_REFS), state: state as WorkState,
 		waitingFor: parseRefs(value["waitingFor"], `${field}.waitingFor`, TEAM_MAX_WAITING_FOR),
+		...(value["waitingForSignals"] !== undefined ? { waitingForSignals: idList(value["waitingForSignals"], `${field}.waitingForSignals`, TEAM_MAX_WAITING_FOR) } : {}),
+		...(value["observedSignals"] !== undefined ? { observedSignals: idList(value["observedSignals"], `${field}.observedSignals`, TEAM_MAX_SIGNALS) } : {}),
 		observedOutcomes: parseRefs(value["observedOutcomes"], `${field}.observedOutcomes`, TEAM_MAX_RESULT_RECORDS),
 		...(childIssues?.length ? { childIssues } : {}),
 		...(checkpoint !== undefined ? { checkpoint } : {}), ...(resumeInstruction !== undefined ? { resumeInstruction } : {}),
@@ -1274,9 +1302,9 @@ function parseStatusPage(value: unknown): TeamStatusPage {
 	if (!isRecord(value)) return protocol("status page must be an object");
 	frameKeys(value, ["view", "items", "cursor", "hasMore"], "status page");
 	const view = value["view"];
-	if (view !== "work" && view !== "result" && view !== "incident") return protocol("status page view is invalid");
+	if (view !== "work" && view !== "result" && view !== "incident" && view !== "signal") return protocol("status page view is invalid");
 	const rawItems = array(value["items"], "status page.items", TEAM_STATUS_MAX_LIMIT);
-	const items: TeamStatusPage["items"] = view === "work" ? rawItems.map(parseWorkSummary)
+	const items: TeamStatusPage["items"] = view === "signal" ? rawItems.map(parseSignal) : view === "work" ? rawItems.map(parseWorkSummary)
 		: view === "result" ? rawItems.map((item) => {
 			if (!isRecord(item)) return protocol("result summary must be an object");
 			frameKeys(item, ["id", "work", "author", "status", "summaryPreview"], "result summary");
@@ -1294,6 +1322,12 @@ function parseStatusPage(value: unknown): TeamStatusPage {
 function parseReceipt(value: unknown): TeamReceipt {
 	if (!isRecord(value)) return protocol("team reply receipt must be an object");
 	switch (value["status"]) {
+		case "sent":
+			frameKeys(value, ["status", "messageId", "recipient"], "message receipt");
+			return { status: "sent", messageId: frameId(value["messageId"], "messageId"), recipient: normalizeAlias(value["recipient"], "recipient") };
+		case "opened": case "published":
+			frameKeys(value, ["status", "signalId"], "signal receipt");
+			return { status: value["status"], signalId: frameId(value["signalId"], "signalId") };
 		case "accepted":
 			frameKeys(value, ["status", "work", "recipient", "paused"], "accepted receipt");
 			if (value["paused"] !== undefined && value["paused"] !== true) return protocol("accepted receipt paused must be true when present");
@@ -1301,7 +1335,7 @@ function parseReceipt(value: unknown): TeamReceipt {
 		case "staged": {
 			frameKeys(value, ["status", "intent", "work"], "staged receipt");
 			const intent = value["intent"];
-			if (!["reply", "yield_dependencies", "yield_attention", "idle", "close_team"].includes(String(intent))) return protocol("staged receipt intent is invalid");
+			if (!["reply", "yield_dependencies", "yield_signals", "yield_attention", "idle", "close_team"].includes(String(intent))) return protocol("staged receipt intent is invalid");
 			return { status: "staged", intent: intent as Extract<TeamReceipt, { status: "staged" }>["intent"], ...(value["work"] !== undefined ? { work: normalizeWorkRef(value["work"], "receipt.work") } : {}) };
 		}
 		case "applied": case "unchanged": {
@@ -1324,10 +1358,23 @@ function parseReceipt(value: unknown): TeamReceipt {
 	}
 }
 
+function parseSignal(value: unknown): SignalRecord {
+	if (!isRecord(value)) return protocol("signal must be an object");
+	frameKeys(value, ["id", "work", "author", "name", "state", "text", "createdAt"], "signal");
+	if (typeof value["name"] !== "string") return protocol("signal requires name");
+	if (value["state"] !== "pending" && value["state"] !== "published" && value["state"] !== "unavailable") return protocol("invalid signal state");
+	if (value["state"] === "pending" ? value["text"] !== undefined : value["text"] === undefined) return protocol("signal text does not match its state");
+	return { id: frameId(value["id"], "signal.id"), work: normalizeWorkRef(value["work"], "signal.work"),
+		author: normalizeAlias(value["author"], "signal.author"), name: normalizeTitle(value["name"], "", "signal.name"),
+		state: value["state"], createdAt: safeInteger(value["createdAt"], "signal.createdAt", 0),
+		...(value["text"] !== undefined ? { text: text(value["text"], "signal.text", TEAM_MAX_SIGNAL_TEXT_BYTES) } : {}) };
+}
+
 function parseReplyData(value: unknown): TeamReplyData {
 	if (!isRecord(value)) return protocol("team reply data must be an object");
 	if (value["version"] === TEAM_PROTOCOL_VERSION && value["teamId"] !== undefined) return parseTeamTeamView(value);
 	if (value["view"] !== undefined && value["items"] !== undefined) return parseStatusPage(value);
+	if (value["author"] !== undefined && value["name"] !== undefined) return parseSignal(value);
 	if (value["author"] !== undefined && value["result"] !== undefined) return normalizeResultRecord(value);
 	if (value["current"] !== undefined && value["currentRevision"] !== undefined) return parseTeamWorkView(value);
 	if (value["code"] !== undefined && value["createdAt"] !== undefined) return parseIncident(value);
@@ -1358,7 +1405,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (!isRecord(value) || value["version"] !== TEAM_PROTOCOL_VERSION || value["teamId"] !== binding.teamId || value["deliveryId"] !== deliveryId) {
 		return protocol("activation input does not match its binding/delivery");
 	}
-	frameKeys(value, ["version", "teamId", "deliveryId", "member", "goal", "roster", "scope", "outcomes", "omittedOutcomes", "childIssues", "childIssuesOmitted", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
+	frameKeys(value, ["version", "teamId", "deliveryId", "member", "goal", "roster", "scope", "outcomes", "signalOutcomes", "omittedSignalOutcomes", "omittedOutcomes", "childIssues", "childIssuesOmitted", "ownedChildren", "ownedChildrenOmitted", "budget", "notice"], "activation input");
 	const member = value["member"];
 	if (!isRecord(member)) return protocol("activation input member is malformed");
 	frameKeys(member, ["id", "lead", "roleDescription"], "activation input member");
@@ -1389,7 +1436,7 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	if (!isRecord(rawScope)) return protocol("activation input scope is malformed");
 	let scope: ActivationInput["scope"];
 	if (rawScope["kind"] === "work") {
-		frameKeys(rawScope, ["kind", "work", "task", "requester", "rootId", "parent", "depth", "inputRefs", "waitingFor", "checkpoint", "resumeInstruction", "previous"], "activation input work scope");
+		frameKeys(rawScope, ["kind", "work", "task", "requester", "rootId", "parent", "depth", "inputRefs", "waitingFor", "waitingForSignals", "checkpoint", "resumeInstruction", "previous"], "activation input work scope");
 		const previous = rawScope["previous"];
 		let previousView: Extract<ActivationInput["scope"], { kind: "work" }>["previous"];
 		if (previous !== undefined) {
@@ -1412,20 +1459,25 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 			...(rawScope["parent"] !== undefined ? { parent: normalizeWorkRef(rawScope["parent"], "activation input parent") } : {}),
 			depth: safeInteger(rawScope["depth"], "activation input depth", 0),
 			inputRefs: idList(rawScope["inputRefs"], "activation input inputRefs", TEAM_MAX_INPUT_REFS), waitingFor,
+			...(rawScope["waitingForSignals"] !== undefined ? { waitingForSignals: idList(rawScope["waitingForSignals"], "scope.waitingForSignals", TEAM_MAX_WAITING_FOR) } : {}),
 			...(checkpoint !== undefined ? { checkpoint } : {}), ...(resumeInstruction !== undefined ? { resumeInstruction } : {}),
 			...(previousView ? { previous: previousView } : {}) };
 	} else if (rawScope["kind"] === "events") {
-		if (!lead) return protocol("only the lead may receive events activations");
 		frameKeys(rawScope, ["kind", "eventBatchId", "events", "checkpoint", "emergency"], "activation input events scope");
 		if (typeof rawScope["emergency"] !== "boolean") return protocol("activation input emergency must be boolean");
 		const events = array(rawScope["events"], "activation input events", TEAM_MAX_EVENT_BATCH).map((raw, index): TeamEventView => {
 			const field = `activation input events[${index}]`;
 			if (!isRecord(raw)) return protocol(`${field} must be an object`);
-			frameKeys(raw, ["id", "kind", "message", "actor", "work", "memberId", "incidentId", "resultRef"], field);
+			frameKeys(raw, ["id", "kind", "message", "actor", "work", "memberId", "incidentId", "resultRef", "sender", "recipient", "replyTo"], field);
 			if (!(TEAM_EVENT_KINDS as readonly unknown[]).includes(raw["kind"])) return protocol(`${field}.kind is invalid`);
+			if (raw["kind"] === "MESSAGE") {
+				if (raw["recipient"] !== binding.memberId || !rosterIds.includes(String(raw["sender"]))) return protocol(`${field} message identity is invalid`);
+			} else if (!lead || raw["sender"] !== undefined || raw["recipient"] !== undefined || raw["replyTo"] !== undefined) return protocol(`${field} event recipient is invalid`);
 			if (raw["actor"] !== undefined && (raw["actor"] !== "@host" || raw["kind"] !== "USER_COMMAND")) return protocol(`${field}.actor is only valid as @host on USER_COMMAND`);
 			return { id: frameId(raw["id"], `${field}.id`), kind: raw["kind"] as TeamEventView["kind"],
-				message: text(raw["message"], `${field}.message`, TEAM_MAX_EVENT_MESSAGE_BYTES),
+				message: text(raw["message"], `${field}.message`, raw["kind"] === "MESSAGE" ? TEAM_MAX_NOTE_BYTES : TEAM_MAX_EVENT_MESSAGE_BYTES),
+				...(raw["sender"] !== undefined ? { sender: normalizeAlias(raw["sender"], `${field}.sender`), recipient: normalizeAlias(raw["recipient"], `${field}.recipient`) } : {}),
+				...(raw["replyTo"] !== undefined ? { replyTo: frameId(raw["replyTo"], `${field}.replyTo`) } : {}),
 				...(raw["actor"] === "@host" ? { actor: "@host" as const } : {}),
 				...(raw["work"] !== undefined ? { work: normalizeWorkRef(raw["work"], `${field}.work`) } : {}),
 				...(raw["memberId"] !== undefined ? { memberId: normalizeAlias(raw["memberId"], `${field}.memberId`) } : {}),
@@ -1481,8 +1533,13 @@ function parseActivationInput(value: unknown, binding: BindingV2, deliveryId: st
 	const budget = { emergency: rawBudget["emergency"], modelRequests: safeInteger(rawBudget["modelRequests"], "activation input budget.modelRequests", 0),
 		toolCalls: safeInteger(rawBudget["toolCalls"], "activation input budget.toolCalls", 0),
 		activations: safeInteger(rawBudget["activations"], "activation input budget.activations", 0) };
+	const signalOutcomes = value["signalOutcomes"] === undefined ? undefined : array(value["signalOutcomes"], "signalOutcomes", TEAM_MAX_WORK_SIGNALS).map(parseSignal);
+	if (signalOutcomes && (scope.kind !== "work" || signalOutcomes.some((signal) => signal.state === "pending" || !scope.waitingForSignals?.includes(signal.id))
+		|| new Set(signalOutcomes.map((signal) => signal.id)).size !== signalOutcomes.length)) return protocol("signal outcomes do not match this work's exact waits");
+	const omittedSignalOutcomes = value["omittedSignalOutcomes"] === undefined ? undefined : safeInteger(value["omittedSignalOutcomes"], "omittedSignalOutcomes", 0, TEAM_MAX_WORK_SIGNALS);
+	if (omittedSignalOutcomes && scope.kind !== "work") return protocol("events cannot omit signal outcomes");
 	const input: ActivationInput = { version: TEAM_PROTOCOL_VERSION, teamId: binding.teamId, deliveryId,
-		member: { id: binding.memberId, lead, roleDescription }, goal, roster, scope, outcomes, omittedOutcomes, ownedChildren, budget,
+		member: { id: binding.memberId, lead, roleDescription }, goal, roster, scope, outcomes, ...(signalOutcomes ? { signalOutcomes } : {}), ...(omittedSignalOutcomes !== undefined ? { omittedSignalOutcomes } : {}), omittedOutcomes, ownedChildren, budget,
 		...(childIssues ? { childIssues } : {}), ...(childIssuesOmitted !== undefined ? { childIssuesOmitted } : {}),
 		...(ownedChildrenOmitted !== undefined ? { ownedChildrenOmitted } : {}),
 		notice: text(value["notice"], "activation input.notice", TEAM_MAX_NOTE_BYTES) };
@@ -1597,6 +1654,7 @@ export function projectActivationInput(input: ActivationInput): ActivationInput 
 			projected.ownedChildrenOmitted++;
 			continue;
 		}
+		if (projected.signalOutcomes?.length) { projected.signalOutcomes.pop(); projected.omittedSignalOutcomes = (projected.omittedSignalOutcomes ?? 0) + 1; continue; }
 		if (projected.outcomes.length) {
 			projected.outcomes.pop();
 			projected.omittedOutcomes++;

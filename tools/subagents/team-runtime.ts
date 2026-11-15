@@ -1,12 +1,12 @@
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import {
 	TEAM_COMMAND_CACHE, TEAM_LOOP_REPEATS, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_EVENT_BATCH,
-	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
+	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS, TEAM_MAX_MESSAGES, TEAM_MAX_MEMBER_MESSAGES, TEAM_MAX_SIGNALS, TEAM_MAX_WORK_SIGNALS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_PROTOCOL_VERSION,
 	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_BUDGET_UNLIMITED, TEAM_MAX_REVIEWS, isTerminalWorkState, reviewVerdict, reviewTiming, sameWorkRef,
 	workRefKey, shortWorkRef, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type ActivationInput, type ActivationScope, type ChildIssue, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
-	type TeamEventView, type MemberRecord, type OutcomeView, type ResultRecord,
+	type TeamEventView, type MemberRecord, type OutcomeView, type ResultRecord, type SignalRecord,
 	type TeamAction, type TeamBudgetLimits, type TeamBudgetView, type TeamErrorCode, type TeamIncidentView, type TeamLifecycle, type GateDecision,
 	type TeamBudgetPreset, type TeamMemberPolicy, type TeamMemberView, type TeamPlan, type TeamReply, type TeamResult, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView,
 	type TeamWorkSummary, type TeamWorkView, type WorkError, type WorkRecord, type WorkRef, type WorkResult, type WorkVersion,
@@ -157,6 +157,8 @@ interface CachedAction {
 interface InternalEvent extends TeamEventView {
 	key: string;
 	processed: boolean;
+	/** An explicit failed disposition, not a read receipt. */
+	deliveryFailure?: string;
 	batchId?: string;
 	/** Report-only: never starts an events activation by itself, it rides along with the lead's next batch. */
 	passive?: true;
@@ -306,6 +308,8 @@ interface TeamState {
 	deliveries: Map<string, DeliveryRecord>;
 	events: InternalEvent[];
 	eventBatches: Map<string, EventBatch>;
+	/** A mailbox admission yields the next available worker permit to runnable Work. */
+	mailboxLast?: boolean;
 	incidents: TeamIncidentView[];
 	/**
 	 * `${consumer WorkRef}>${dependency WorkRef}` pairs whose outcome-unknown dependency was explicitly
@@ -343,12 +347,12 @@ interface TeamState {
  * make a mistyped code almost never another valid ID.
  */
 const ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz";
-type ModelIdKind = "work" | "result" | "incident" | "event" | "review";
+type ModelIdKind = "work" | "result" | "incident" | "event" | "review" | "signal";
 /**
  * An ID in that form quoted in text. Every code has a digit, so a word such as `result:pass` is not read as
  * an ID; longer (old UUID-format) IDs do not fit and are left alone.
  */
-const QUOTED_ID = new RegExp(`\\b(?:work|result|incident|event|review):(?=[a-z]{0,3}[2-9])[${ID_ALPHABET}]{4}\\b`, "gu");
+const QUOTED_ID = new RegExp(`\\b(?:work|result|incident|event|review|signal):(?=[a-z]{0,3}[2-9])[${ID_ALPHABET}]{4}\\b`, "gu");
 
 /** One substitution or one adjacent transposition apart: the slips made when copying an ID. */
 function isTypo(left: string, right: string): boolean {
@@ -362,6 +366,8 @@ function forwardedText(action: TeamAction): string | undefined {
 	switch (action.action) {
 		case "reply": return formatWorkResult(action.result);
 		case "request": return action.task;
+		case "message": return action.text;
+		case "signal": return action.operation === "publish" ? action.text : undefined;
 		case "yield": return action.attention;
 		case "status": return undefined;
 		case "control": {
@@ -653,6 +659,7 @@ export class TeamRuntime {
 		member.lifecycle = "faulted";
 		member.resourceState = member.resourceState === "starting" ? "owned" : member.resourceState;
 		member.error = { code: "HOST_MEMBER_STOPPED", message: reason };
+		this.failMessages(team, member, reason);
 		this.setMemberPause(team, member, "none");
 		team.health = "needs_attention";
 		if (member.id === team.lead) {
@@ -819,6 +826,7 @@ export class TeamRuntime {
 				version.state = lifecycle;
 				version.error = copy(error);
 				version.waitingFor = [];
+				delete version.waitingForSignals;
 				delete version.hold;
 				version.updatedAt = this.timestamp();
 				delete entry.stagedWait;
@@ -941,8 +949,7 @@ export class TeamRuntime {
 		// and a parked one takes a permit when it resumes; the new lead's running work keeps its permit until it ends.
 		team.lead = target.id;
 		// A batch the previous lead never finished is processed again by the new lead.
-		for (const event of team.events) delete event.batchId;
-		team.eventBatches.clear();
+		this.requeueOrphanEventBatches(team);
 		const stranded = team.ledger.order.map((id) => team.ledger.currentRef(id)!).find((ref) => team.ledger.version(ref)!.hold?.reason === "lead_unavailable");
 		if (stranded) this.failMemberWork(team, previous, stranded);
 		for (const incident of team.incidents) if (incident.code === "LEAD_UNAVAILABLE" && incident.state === "open") this.resolveIncident(team, incident.id);
@@ -969,8 +976,7 @@ export class TeamRuntime {
 		if (!member) fail("UNKNOWN_MEMBER", `Unknown member ${aliasValue}`);
 		this.revive(team, member, "host");
 		if (member.id === team.lead) {
-			for (const event of team.events) delete event.batchId;
-			team.eventBatches.clear();
+			this.requeueOrphanEventBatches(team);
 			for (const id of team.ledger.order) {
 				const ref = team.ledger.currentRef(id)!;
 				const version = team.ledger.version(ref)!;
@@ -1536,11 +1542,16 @@ export class TeamRuntime {
 		if (lead.lifecycle !== "open") return undefined;
 		// Before the lead's work turn is decided: a work held here raises its event in this same pass.
 		this.holdUnknownDependencies(team);
+		if (team.budget.teamExhausted(false)) {
+			// Advisory mail is not a Work obligation: once no new ordinary activation can run,
+			// close its idle recipients' pending mail explicitly instead of forcing a host grant.
+			for (const member of team.members.values()) if (!member.active) this.failMessages(team, member, "Team budget cannot admit a mailbox activation");
+		}
 		team.ready = team.ready.filter((ref) => this.isReady(team, ref));
 		for (const key of team.interrupted) if (!team.ready.some((ref) => workRefKey(ref) === key)) team.interrupted.delete(key);
 		if (!lead.active && !lead.compaction && lead.pause === "none" && !this.retryWaitMs(lead)) {
 			const pendingEvents = () => team.events.map((event, index) => ({ event, index }))
-				.filter(({ event }) => !event.processed && event.batchId === undefined)
+				.filter(({ event }) => !event.processed && event.batchId === undefined && (event.recipient ?? team.lead) === lead.id)
 				.sort((left, right) => this.eventPriority(left.event.kind) - this.eventPriority(right.event.kind)
 					|| Number(!!left.event.passive) - Number(!!right.event.passive) || left.index - right.index)
 				.slice(0, TEAM_MAX_EVENT_BATCH)
@@ -1567,6 +1578,10 @@ export class TeamRuntime {
 			}
 		}
 		const workPermits = this.usedWorkPermits(team);
+		if (!team.mailboxLast) {
+			const mailbox = this.reserveMailbox(team, workPermits);
+			if (mailbox) return mailbox;
+		}
 		for (const ref of this.readyOrder(team)) {
 			const entry = team.ledger.get(ref.workId)!;
 			const member = team.members.get(entry.record.assignee)!;
@@ -1580,12 +1595,33 @@ export class TeamRuntime {
 			if (this.thresholdCompaction(team, member)) continue;
 			member.compactedAtBoundary = false;
 			const activation = this.reserveWork(team, member, ref);
+			if (member.id !== team.lead) team.mailboxLast = false;
 			this.dequeueWork(team, ref);
 			team.interrupted.delete(workRefKey(ref));
 			this.check(team);
 			return activation;
 		}
+		const mailbox = this.reserveMailbox(team, workPermits);
+		if (mailbox) return mailbox;
 		this.check(team);
+		return undefined;
+	}
+
+	private reserveMailbox(team: TeamState, workPermits: number): RuntimeActivation | undefined {
+		if (workPermits >= team.limits.workPermits || team.budget.teamExhausted(false)) return undefined;
+		// Global event order is FIFO between recipients; mailbox and Work admissions alternate.
+		for (const event of team.events) {
+			if (event.processed || event.batchId || !event.recipient || event.recipient === team.lead) continue;
+			const member = team.members.get(event.recipient)!;
+			if (member.lifecycle !== "open" || member.pause !== "none" || member.active || member.compaction || this.retryWaitMs(member)) continue;
+			if (this.thresholdCompaction(team, member)) continue;
+			member.compactedAtBoundary = false;
+			const messages = team.events.filter((message) => !message.processed && !message.batchId && message.recipient === member.id).slice(0, TEAM_MAX_EVENT_BATCH);
+			const activation = this.reserveEvents(team, member, messages, false);
+			team.mailboxLast = true;
+			this.check(team);
+			return activation;
+		}
 		return undefined;
 	}
 
@@ -1669,6 +1705,10 @@ export class TeamRuntime {
 			version!.observedOutcomes = [...observed.values()];
 			const deliveredKeys = new Set(delivery.dependencyOutcomes.map(workRefKey));
 			version!.waitingFor = version!.waitingFor.filter((ref) => !deliveredKeys.has(workRefKey(ref)));
+			if (delivery.signalOutcomes?.length) {
+				version!.observedSignals = [...new Set([...(version!.observedSignals ?? []), ...delivery.signalOutcomes])];
+				version!.waitingForSignals = version!.waitingForSignals?.filter((id) => !delivery.signalOutcomes!.includes(id)) ?? [];
+			}
 			const undelivered = this.pendingChildIssues(team, version!).filter((issue) => !delivery.childIssueIds?.includes(issue.incidentId));
 			if (undelivered.length) version!.childIssues = undelivered;
 			else delete version!.childIssues;
@@ -1737,6 +1777,9 @@ export class TeamRuntime {
 				active.budgetStop ??= exhausted;
 				decision = { allow: false, reason: "budget", message: this.budgetMessage(exhausted) };
 			}
+		}
+		if (decision.allow && phase === "tool_gate" && scope.kind === "events" && member.id !== team.lead && toolName !== "team") {
+			decision = { allow: false, reason: "policy_stop", message: "Mailbox activations only communicate; base tools require a Work activation" };
 		}
 		if (nativeToolCallId) {
 			active.toolCalls.set(nativeToolCallId, { toolName: toolName ?? "", ...(inputHash ? { inputHash } : {}), allowed: decision.allow, ...(!decision.allow ? { denial: decision } : {}) });
@@ -2054,7 +2097,7 @@ export class TeamRuntime {
 	}
 
 	private pendingLeadEvents(team: TeamState): number {
-		return team.lifecycle === "active" ? team.events.filter((event) => !event.processed && event.batchId === undefined && !event.passive).length : 0;
+		return team.lifecycle === "active" ? team.events.filter((event) => !event.processed && event.batchId === undefined && !event.passive && (event.recipient ?? team.lead) === team.lead).length : 0;
 	}
 
 	/** Parked native gates have priority over new work when a work permit becomes available. */
@@ -2065,7 +2108,7 @@ export class TeamRuntime {
 			const active = member.active;
 			if (!active?.parked || !active.resumeRequested) continue;
 			if (member.lifecycle !== "open" || active.stopReason) continue;
-			if (active.scope.kind === "work" && this.needsWorkPermit(team, member)) {
+			if (this.needsWorkPermit(team, member)) {
 				// Full permits stop only other workers; the lead's parked run needs none.
 				if (permits >= team.limits.workPermits) continue;
 				permits++;
@@ -2339,6 +2382,7 @@ export class TeamRuntime {
 		member.error = { code: error.code, message: error.message };
 		member.lastLostActivation = { activationId, error: copy(error), resourceReleased, reason: "transport_failure" };
 		this.note(team, `${member.id} activation lost (${error.code})`);
+		this.failMessages(team, member, "Recipient transport was lost");
 		this.endFlow(team, active);
 		delete member.active;
 		delete member.currentWork;
@@ -2351,7 +2395,7 @@ export class TeamRuntime {
 		if (member.id === team.lead) {
 			this.holdLeadWork(team);
 			this.pauseMembersForLeadFault(team);
-		} else if (ref) this.failMemberWork(team, member, ref);
+		} else this.failMemberWork(team, member, ref);
 		this.createIncident(team, resourceReleased ? "NATIVE_OUTCOME_UNKNOWN" : "CLEANUP_FAILED",
 			`${member.id} lost its native activation before settlement: ${error.message}`, ref, member.id);
 		this.changed(team);
@@ -2642,6 +2686,11 @@ export class TeamRuntime {
 		for (const hold of holds) if (!oldestHolds.has(hold.assignee)) oldestHolds.set(hold.assignee, hold);
 		const leadBatch = team.members.get(team.lead)!.active?.scope.eventBatchId;
 		const stalled = new Map([...waits].map(([member, waited]) => [member, waitingOnText(waited)] as const));
+		if (team.ledger.signals.size) for (const id of team.ledger.order) {
+			const record = team.ledger.get(id)!.record;
+			const version = currentVersion(record);
+			if (version.state === "blocked" && version.waitingForSignals?.length) stalled.set(record.assignee, `waiting on phase ${capped(version.waitingForSignals, 3)}`);
+		}
 		// A hold outranks a wait.
 		for (const hold of oldestHolds.values()) stalled.set(hold.assignee, this.holdText(team, hold, leadBatch));
 		// In the batch's own (priority) order, like the activation input.
@@ -2730,6 +2779,13 @@ export class TeamRuntime {
 		const running = [...team.members.values()].filter((member) => member.activity !== "idle" && !this.isReview(team, member.currentWork)).map((member) => member.id);
 		// Members that are not running: what each waits on, or (a hold outranks a wait) why its work is held.
 		const stalls = new Map<string, string>([...waits].map(([member, waited]) => [member, `waiting on ${capped([...new Set(waited.map((wait) => wait.assignee))], 3)}`]));
+		if (team.ledger.signals.size) for (const id of team.ledger.order) {
+			const record = team.ledger.get(id)!.record;
+			const version = currentVersion(record);
+			if (version.state === "blocked" && !version.hold && version.waitingForSignals?.length) {
+				stalls.set(record.assignee, `waiting on phase ${capped(version.waitingForSignals, 3)}`);
+			}
+		}
 		for (const [member, hold] of oldestHolds) if (hold.reason !== "attention") stalls.set(member, `held: ${HELD_REASON[hold.reason]}`);
 		const stalled = [...stalls].filter(([member]) => team.members.get(member)!.activity === "idle").map(([member, why]) => `${member} (${why})`);
 		return [...(running.length ? [`${capped(running, 4)} (running)`] : []), ...(stalled.length ? [capped(stalled, 4, " · ")] : [])].join(" · ") || undefined;
@@ -2793,22 +2849,111 @@ export class TeamRuntime {
 	}
 
 	private applyAction(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: TeamAction, toolCallId: string): TeamReply {
+		if (action.action === "message" || action.action === "signal") {
+			if (active.native || active.cleanup || active.stopReason) fail("ACTIVATION_ENDING", "This activation cannot publish new coordination side effects after it has stopped");
+			if (active.scope.kind === "work") this.requireWorkScope(team, member, active);
+		}
+		if (active.scope.kind === "events" && member.id !== team.lead && !["message", "status", "yield"].includes(action.action)) {
+			fail("FORBIDDEN_ACTION", "A mailbox activation only communicates: message, status or yield; it does not assign or perform work");
+		}
 		// Emergency lead activations may only diagnose, cancel, review/waive, close or yield.
 		if (active.budget.emergency && action.action !== "status" && action.action !== "yield"
 			&& !(action.action === "control" && ["cancel_work", "accept_result", "close_member", "close_team"].includes(action.control.command))) {
 			fail("BUDGET_BLOCKED", "Emergency lead activations cannot create or revise work; only status, cancel_work, accept_result, close_member, close_team and yield are allowed");
 		}
-		if ((action.action === "request" || action.action === "control") && active.scope.kind === "work" && this.isReview(team, active.scope.work)) {
+		if ((action.action === "request" || action.action === "control" || action.action === "message" || action.action === "signal") && active.scope.kind === "work" && this.isReview(team, active.scope.work)) {
 			fail("FORBIDDEN_ACTION", "A review only advises");
 		}
 		this.requireKnownIds(team, forwardedText(action));
 		switch (action.action) {
 			case "status": return this.status(team, member, action);
 			case "request": return this.acceptRequest(team, member, active, action);
+			case "message": return this.sendMessage(team, member, active, action);
+			case "signal": return this.signalAction(team, member, active, action);
 			case "reply": return this.stageReply(team, member, active, action.result, toolCallId);
 			case "yield": return this.stageYield(team, member, active, action, toolCallId);
 			case "control": return this.control(team, member, active, action.control, toolCallId);
 		}
+	}
+
+	private sendMessage(team: TeamState, sender: RuntimeMember, active: ActiveActivation, action: Extract<TeamAction, { action: "message" }>): TeamReply {
+		if (action.to === sender.id) fail("SELF_REQUEST", "A member cannot message itself");
+		const recipient = team.members.get(action.to);
+		if (!recipient) fail("UNKNOWN_MEMBER", `Unknown recipient ${action.to}`);
+		if (recipient.lifecycle === "closing") fail("RECIPIENT_CLOSING", `Recipient ${action.to} is closing`);
+		if (recipient.lifecycle !== "open") fail("RECIPIENT_CLOSED", `Recipient ${action.to} is not open`);
+		if (action.replyTo) {
+			const original = team.events.find((event) => event.id === action.replyTo && event.kind === "MESSAGE");
+			if (!original) fail("UNKNOWN_MESSAGE", `Unknown message ${action.replyTo}`);
+			if (original.recipient !== sender.id || original.sender !== action.to) fail("FORBIDDEN_ACTION", "A conversational reply must return to that message's authenticated sender");
+		}
+		const messages = team.events.filter((event) => event.kind === "MESSAGE");
+		if (messages.length >= TEAM_MAX_MESSAGES) fail("TEAM_CAPACITY", "Team message history is full; use work for further obligations");
+		if (messages.filter((event) => event.recipient === recipient.id && !event.processed).length >= TEAM_MAX_MEMBER_MESSAGES) fail("REQUEST_QUEUE_FULL", `Recipient ${recipient.id} message queue is full`);
+		const event = this.addEvent(team, { key: this.id("message"), kind: "MESSAGE", message: action.text,
+			sender: sender.id, recipient: recipient.id, ...(active.scope.work ? { work: copy(active.scope.work) } : {}),
+			...(action.replyTo ? { replyTo: action.replyTo } : {}) });
+		this.note(team, `${sender.id} sent ${event.id} → ${recipient.id} (queued, not read)`);
+		return okReply(sender.id, { receipt: { status: "sent", messageId: event.id, recipient: recipient.id } });
+	}
+
+	private failMessages(team: TeamState, member: RuntimeMember, reason: string, batchId?: string): void {
+		const messages = team.events.filter((event) => event.kind === "MESSAGE" && event.recipient === member.id
+			&& !event.processed && (batchId === undefined || event.batchId === batchId));
+		if (!messages.length) return;
+		for (const event of messages) {
+			event.processed = true;
+			event.deliveryFailure = reason;
+			delete event.batchId;
+		}
+		const ids = messages.map((event) => event.id).join(", ");
+		const previews = messages.map((event) => `${event.id} from ${event.sender}: ${previewText(event.message, 96)}`).join("; ");
+		this.note(team, `${member.id} messages unavailable (${ids}): ${reason}`);
+		this.addEvent(team, { key: `message-failure:${messages[0]!.id}`, kind: "MESSAGE_UNAVAILABLE", memberId: member.id,
+			message: `Message handling by ${member.id} was not confirmed: ${previews}. ${previewText(reason, 256)}. This is not a read/answer receipt; check already-sent replies before resending.` });
+	}
+
+	private signalAction(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: Extract<TeamAction, { action: "signal" }>): TeamReply {
+		const work = this.requireWorkScope(team, member, active);
+		if (action.operation === "open") {
+			if (team.ledger.signals.size >= TEAM_MAX_SIGNALS || [...team.ledger.signals.values()].filter((signal) => sameWorkRef(signal.work, work)).length >= TEAM_MAX_WORK_SIGNALS) {
+				fail("TEAM_CAPACITY", "Signal capacity reached for this Team or WorkRef");
+			}
+			const signal: SignalRecord = { id: this.modelId(team, "signal"), work: copy(work), author: member.id,
+				name: action.name, state: "pending", createdAt: this.timestamp() };
+			team.ledger.signals.set(signal.id, signal);
+			this.note(team, `${member.id} opened ${signal.id} «${signal.name}» for ${shortWorkRef(work)}`);
+			this.changed(team);
+			return okReply(member.id, { receipt: { status: "opened", signalId: signal.id }, data: copy(signal) });
+		}
+		const signal = team.ledger.signals.get(action.signalId);
+		if (!signal) fail("UNKNOWN_SIGNAL", `Unknown signal ${action.signalId}`);
+		if (signal.author !== member.id || !sameWorkRef(signal.work, work)) fail("WRONG_WORK_OWNER", "Only the signal's exact owning WorkRef may publish it");
+		if (signal.state === "published" && signal.text === action.text) return okReply(member.id, { receipt: { status: "published", signalId: signal.id }, data: copy(signal) });
+		if (signal.state !== "pending") fail("SIGNAL_CLOSED", "This single-use signal is already closed; open a new signal for another phase");
+		signal.state = "published";
+		signal.text = action.text;
+		this.note(team, `${member.id} published ${signal.id} «${signal.name}» (phase fact, not a resource lock)`);
+		this.wakeWaiters(team);
+		this.changed(team);
+		return okReply(member.id, { receipt: { status: "published", signalId: signal.id }, data: copy(signal) });
+	}
+
+	/** Pending phases cannot survive their exact Work revision. Published facts are never rewritten. */
+	private settleSignals(team: TeamState): void {
+		for (const signal of team.ledger.signals.values()) {
+			const version = team.ledger.version(signal.work)!;
+			if (signal.state !== "pending" || (!isTerminalWorkState(version.state) && team.lifecycle === "active")) continue;
+			signal.state = "unavailable";
+			signal.text = `Not published: producer ${workRefKey(signal.work)} is ${version.state}; Team is ${team.lifecycle}. No resource release is implied.`;
+		}
+	}
+
+	private signalsReady(team: TeamState, version: WorkVersion): boolean {
+		return !!version.waitingForSignals?.length && version.waitingForSignals.every((id) => {
+			const state = team.ledger.signals.get(id)?.state;
+			return state === "published" || state === "unavailable";
+		});
 	}
 
 	private acceptRequest(team: TeamState, requester: RuntimeMember, active: ActiveActivation, action: Extract<TeamAction, { action: "request" }>): TeamReply {
@@ -2896,13 +3041,29 @@ export class TeamRuntime {
 
 	private stageYield(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: Extract<TeamAction, { action: "yield" }>, toolCallId: string): TeamReply {
 		if (active.scope.kind === "events") {
-			if (action.waitingFor.length || action.attention !== undefined) fail("INVALID_ARGUMENT", "The lead never waits inside an activation: end it with yield {checkpoint?} and no waitingFor/attention. New results, failures and incidents start the next events activation automatically; do not poll status to wait.");
+			if (action.waitingFor.length || action.waitingForSignals?.length || action.attention !== undefined) fail("INVALID_ARGUMENT", "An events activation never waits inside an activation: end it with yield {checkpoint?} and no waitingFor/waitingForSignals/attention. New messages and Team events start the next events activation automatically; do not poll status to wait.");
 			active.intent = { kind: "idle", ...(action.checkpoint ? { checkpoint: action.checkpoint } : {}), toolCallId };
 			member.activity = "settling";
 			this.changed(team);
 			return okReply(member.id, { receipt: { status: "staged", intent: "idle" } });
 		}
 		const ref = this.requireWorkScope(team, member, active);
+		if (action.waitingForSignals?.length) {
+			if (!action.checkpoint) fail("INVALID_ARGUMENT", "Signal yield requires a checkpoint");
+			this.settleSignals(team);
+			const version = team.ledger.version(ref)!;
+			const ids = action.waitingForSignals.filter((id) => !version.observedSignals?.includes(id));
+			if (!ids.length) fail("NO_NEW_DEPENDENCY", "All requested signal outcomes were already delivered to this work version");
+			for (const id of ids) if (!team.ledger.signals.has(id)) fail("UNKNOWN_SIGNAL", `Unknown signal ${id}`);
+			const cycle = team.ledger.findCycle(ref, [], ids);
+			if (cycle) fail("DEPENDENCY_CYCLE", `Dependency cycle: ${cycle.join(" -> ")}`);
+			team.ledger.get(ref.workId)!.stagedWait = { revision: ref.revision, refs: [], signals: [...ids] };
+			active.intent = { kind: "yield_signals", work: ref, waitingForSignals: [...action.waitingForSignals], checkpoint: action.checkpoint, toolCallId };
+			version.updatedAt = this.timestamp();
+			member.activity = "settling";
+			this.changed(team);
+			return okReply(member.id, { receipt: { status: "staged", intent: "yield_signals", work: ref } });
+		}
 		if (action.attention !== undefined) {
 			if (!action.checkpoint) fail("INVALID_ARGUMENT", "Attention yield requires a checkpoint");
 			active.intent = { kind: "yield_attention", work: ref, attention: action.attention, checkpoint: action.checkpoint, toolCallId };
@@ -2926,8 +3087,8 @@ export class TeamRuntime {
 		const newWaits = action.waitingFor.filter((target) => !version.observedOutcomes.some((observed) => sameWorkRef(observed, target)));
 		const cycle = team.ledger.findCycle(ref, newWaits);
 		if (cycle) {
-			this.note(team, `${member.id} wait rejected: dependency cycle ${capped(cycle.map(shortWorkRef), 8, " → ")}`);
-			fail("DEPENDENCY_CYCLE", `Dependency cycle: ${cycle.map(workRefKey).join(" -> ")}`, [{ kind: "cycle", reason: cycle.map(workRefKey).join(" -> ") }]);
+			this.note(team, `${member.id} wait rejected: dependency cycle ${capped(cycle, 8, " → ")}`);
+			fail("DEPENDENCY_CYCLE", `Dependency cycle: ${cycle.join(" -> ")}`, [{ kind: "cycle", reason: cycle.join(" -> ") }]);
 		}
 		const entry = team.ledger.get(ref.workId)!;
 		entry.stagedWait = { revision: ref.revision, refs: copy(newWaits) };
@@ -3066,8 +3227,8 @@ export class TeamRuntime {
 		version.updatedAt = this.timestamp();
 		// Releasing a hold never satisfies an AND wait: unmet dependencies keep the work blocked,
 		// unless an undelivered child issue needs its owner's answer (as in wakeWaiters).
-		if (version.waitingFor.length && !version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency))
-			&& !this.pendingChildIssues(team, version).length) {
+		if (((version.waitingFor.length && !version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency)))
+			|| (version.waitingForSignals?.length && !this.signalsReady(team, version))) && !this.pendingChildIssues(team, version).length) {
 			version.state = "blocked";
 		} else {
 			version.state = "queued";
@@ -3105,6 +3266,7 @@ export class TeamRuntime {
 			this.cancelDescendants(team, currentRef, "superseded");
 			current.state = "superseded";
 			current.waitingFor = [];
+			delete current.waitingForSignals;
 			this.dropHold(team, current);
 			current.updatedAt = this.timestamp();
 		}
@@ -3147,6 +3309,7 @@ export class TeamRuntime {
 		version.state = "cancelled";
 		version.error = { code: "CANCELLED", message: reason };
 		version.waitingFor = [];
+		delete version.waitingForSignals;
 		this.dropHold(team, version);
 		version.updatedAt = this.timestamp();
 		delete team.ledger.get(work.workId)!.stagedWait;
@@ -3218,6 +3381,8 @@ export class TeamRuntime {
 	}
 
 	private closeMember(team: TeamState, lead: RuntimeMember, memberId: string): TeamReply {
+		const unread = team.events.filter((event) => event.recipient === memberId && !event.processed);
+		if (unread.length) fail("CLOSE_BLOCKED", "Member has undelivered messages; let its mailbox activation finish before closing", unread.map((event) => ({ kind: "message", id: event.id, reason: "message not processed" })));
 		if (memberId === lead.id) fail("FORBIDDEN_ACTION", "The lead cannot close itself; use close_team");
 		const target = team.members.get(memberId);
 		if (!target) fail("UNKNOWN_MEMBER", `Unknown member ${memberId}`);
@@ -3376,6 +3541,12 @@ export class TeamRuntime {
 				}
 				return okReply(member.id, { data: this.getWork(team.id, { workId: action.id, revision: entry.record.currentRevision })! });
 			}
+			if (action.view === "signal") {
+				this.settleSignals(team);
+				const record = team.ledger.signals.get(action.id);
+				if (!record) fail("UNKNOWN_SIGNAL", `Unknown signal ${action.id}`);
+				return okReply(member.id, { data: copy(record) });
+			}
 			if (action.view === "result") {
 				const result = team.ledger.results.get(action.id);
 				if (!result) fail("UNKNOWN_RESULT", `Unknown result ${action.id}`);
@@ -3386,7 +3557,8 @@ export class TeamRuntime {
 			return okReply(member.id, { data: incidentView(incident) });
 		}
 		const offset = action.cursor ? this.cursorOffset(action.cursor) : 0;
-		const items = action.view === "work" ? this.workSummaries(team)
+		this.settleSignals(team);
+		const items = action.view === "signal" ? [...team.ledger.signals.values()].map(copy) : action.view === "work" ? this.workSummaries(team)
 			: action.view === "result" ? this.resultSummaries(team)
 			: team.incidents.map(incidentView);
 		const pageItems = items.slice(offset, offset + action.limit);
@@ -3403,8 +3575,8 @@ export class TeamRuntime {
 		for (;;) {
 			try {
 				input = this.activationInput(team, member, deliveryId, { kind: "events", eventBatchId: batchId,
-					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, passive: _passive, ...view }) => view), emergency },
-				team.budget.inputSummary(undefined, true, emergency));
+					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, passive: _passive, deliveryFailure: _failure, ...view }) => view), emergency },
+				team.budget.inputSummary(undefined, member.id === team.lead, emergency));
 				break;
 			} catch (error) {
 				if (!(error instanceof TeamProtocolError) || error.code !== "INPUT_BUDGET_EXCEEDED" || selected.length <= 1) throw error;
@@ -3416,9 +3588,9 @@ export class TeamRuntime {
 		for (const event of selected) event.batchId = batchId;
 		team.eventBatches.set(batchId, eventBatch);
 		this.tickFlow(team);
-		const activation: ActiveActivation = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: false, parked: false, resumeRequested: false,
+		const activation: ActiveActivation = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: this.needsWorkPermit(team, member), parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
-			budget: team.budget.recordActivation(undefined, true, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
+			budget: team.budget.recordActivation(undefined, member.id === team.lead, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
 		member.lastActivationKind = "events";
 		this.startFlow(team, member, activation);
@@ -3445,6 +3617,7 @@ export class TeamRuntime {
 			rootId: team.ledger.get(ref.workId)!.record.rootId,
 			...(team.ledger.get(ref.workId)!.record.parent ? { parent: copy(team.ledger.get(ref.workId)!.record.parent!) } : {}),
 			depth: team.ledger.get(ref.workId)!.record.depth, inputRefs: copy(version.inputRefs), waitingFor: copy(version.waitingFor),
+			...(version.waitingForSignals?.length ? { waitingForSignals: [...version.waitingForSignals] } : {}),
 			...(version.checkpoint ? { checkpoint: version.checkpoint } : {}), ...(version.resumeInstruction ? { resumeInstruction: version.resumeInstruction } : {}),
 			...(ref.revision > 1 ? { previous: this.previousVersion(team, ref) } : {}),
 		}, team.budget.inputSummary(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false));
@@ -3498,13 +3671,16 @@ export class TeamRuntime {
 					} } : {}) });
 			}
 		}
+		const signalOutcomes = scope.kind === "work" ? (team.ledger.version(scope.work)!.waitingForSignals ?? [])
+			.filter((id) => !team.ledger.version(scope.work)!.observedSignals?.includes(id))
+			.map((id) => team.ledger.signals.get(id)!).filter((signal) => signal.state !== "pending") : [];
 		const result: ActivationInput = {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, deliveryId,
 			member: { id: member.id, lead: member.id === team.lead, roleDescription: member.roleDescription },
 			goal: team.plan.brief.goal,
 			roster: this.roster(team, member.id),
-			scope: copy(scope), outcomes, omittedOutcomes: 0, ...(childIssues.length ? { childIssues: copy(childIssues) } : {}),
-			ownedChildren, budget, notice: (scope.kind === "work" ? workNotice(scope.work) : `${prompt("team", "events_notice")} ${prompt("team", "brief_pointer")}`)
+			scope: copy(scope), outcomes, ...(signalOutcomes.length ? { signalOutcomes: copy(signalOutcomes), omittedSignalOutcomes: 0 } : {}), omittedOutcomes: 0, ...(childIssues.length ? { childIssues: copy(childIssues) } : {}),
+			ownedChildren, budget, notice: (scope.kind === "work" ? workNotice(scope.work) : `${member.id === team.lead ? prompt("team", "events_notice") : prompt("team", "messages_notice")} ${prompt("team", "brief_pointer")}`)
 				+ (member.overflowRecoveries?.has(scope.kind === "work" ? workRefKey(scope.work) : "events") ? `\n${prompt("team", "overflow_notice")}` : ""),
 		};
 		const projected = projectActivationInput(result);
@@ -3519,7 +3695,7 @@ export class TeamRuntime {
 		const dependencyOutcomes = input.outcomes.map((outcome) => copy(outcome.work));
 		team.deliveries.set(input.deliveryId, { id: input.deliveryId, memberId: member.id, activationId: scope.activationId,
 			...(scope.kind === "work" ? { work: copy(scope.work!) } : {}),
-			state: "in_flight", dependencyOutcomes, ...(input.childIssues ? { childIssueIds: input.childIssues.map((issue) => issue.incidentId) } : {}) });
+			state: "in_flight", dependencyOutcomes, ...(input.signalOutcomes?.length ? { signalOutcomes: input.signalOutcomes.map((signal) => signal.id) } : {}), ...(input.childIssues ? { childIssueIds: input.childIssues.map((issue) => issue.incidentId) } : {}) });
 	}
 
 	private finishActivation(team: TeamState, member: RuntimeMember, active: ActiveActivation): void {
@@ -3550,11 +3726,12 @@ export class TeamRuntime {
 			if (member.id === team.lead) {
 				this.holdLeadWork(team);
 				this.pauseMembersForLeadFault(team);
-			} else if (scope.kind === "work") this.failMemberWork(team, member, scope.work!);
+			} else this.failMemberWork(team, member, scope.work);
 			delivery.state = "unknown";
 			this.createIncident(team, "CLEANUP_FAILED", `${member.id} could not confirm activation cleanup: ${member.error.message}`,
 				scope.kind === "work" ? scope.work : undefined, member.id);
 			this.note(team, `${member.id} activation cleanup failed`);
+			this.failMessages(team, member, "Recipient activation cleanup failed");
 			member.activity = "settling";
 			this.changed(team);
 			this.wakeWaiters(team);
@@ -3733,6 +3910,7 @@ export class TeamRuntime {
 			team.dependencyWaits++;
 			const record = team.ledger.get(ref.workId)!;
 			delete record.stagedWait;
+			delete version.waitingForSignals;
 			version.waitingFor = intent.waitingFor.filter((dependency) => !version.observedOutcomes.some((observed) => sameWorkRef(observed, dependency)));
 			version.checkpoint = intent.checkpoint;
 			const allReady = version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency));
@@ -3744,11 +3922,21 @@ export class TeamRuntime {
 			}
 			if (allReady && !team.ready.some((item) => sameWorkRef(item, ref))) this.enqueueWork(team, ref);
 			this.updateQuiescence(team);
+		} else if (intent?.kind === "yield_signals") {
+			team.dependencyWaits++;
+			delete entry.stagedWait;
+			version.waitingFor = [];
+			version.waitingForSignals = intent.waitingForSignals.filter((id) => !version.observedSignals?.includes(id));
+			version.checkpoint = intent.checkpoint;
+			version.state = this.signalsReady(team, version) ? "queued" : "blocked";
+			version.updatedAt = this.timestamp();
+			if (version.state === "queued") this.enqueueWork(team, ref);
 		} else if (intent?.kind === "yield_attention") {
 			team.questions++;
 			this.holdWork(team, member, ref, "WORK_HELD", intent.attention, "attention");
 			version.checkpoint = intent.checkpoint;
 			version.waitingFor = [];
+			delete version.waitingForSignals;
 		} else if (intent?.kind === "idle") {
 			version.state = "failed";
 			version.error = { code: "PROTOCOL_FAILURE", message: "A work activation cannot use the events-activation idle intent" };
@@ -3767,6 +3955,7 @@ export class TeamRuntime {
 		const intentApplied = !intent || active.native?.appliedToolCallId === intent.toolCallId;
 		const budgetStopped = active.native?.status === "aborted" && active.completion?.reason === "budget_hold";
 		if (budgetStopped && !intent) {
+			this.failMessages(team, member, "Activation stopped before confirmed handling because its budget was exhausted", active.scope.eventBatchId);
 			// The lead's own budget stopped it before any decision. It stays open; the delivered batch
 			// is not replayed automatically. The deduplicated budget incident drives any emergency activation.
 			this.consumeBatch(team, active.scope.eventBatchId);
@@ -3781,6 +3970,7 @@ export class TeamRuntime {
 		}
 		// A legal end intent already confirmed in the transcript survives a later budget stop of a continuation.
 		if ((active.native?.status !== "success" && !(budgetStopped && intentApplied)) || !intentApplied) {
+			this.failMessages(team, member, "Recipient activation did not confirm message handling");
 			const closing = member.lifecycle === "closing";
 			if (team.lifecycle === "closing") {
 				team.lifecycle = "failed";
@@ -3791,9 +3981,12 @@ export class TeamRuntime {
 				message: active.native?.error?.message ?? (intentApplied ? "Lead activation failed" : "Staged intent was not confirmed in the native transcript") };
 			if (!closing) member.resourceState = "owned";
 			team.health = "needs_attention";
-			this.addEvent(team, { key: `lead-fault:${active.scope.activationId}`, kind: "MEMBER_FAULTED", message: prompt("team", "event_lead_failed"), memberId: member.id });
-			this.holdLeadWork(team);
-			this.pauseMembersForLeadFault(team);
+			this.addEvent(team, { key: `lead-fault:${active.scope.activationId}`, kind: "MEMBER_FAULTED", message: (member.id === team.lead ? prompt("team", "event_lead_failed") : prompt("team", "event_member_failed", { member: member.id })), memberId: member.id });
+			if (member.id === team.lead) {
+				this.holdLeadWork(team);
+				this.pauseMembersForLeadFault(team);
+			} else this.failMemberWork(team, member);
+			this.wakeWaiters(team);
 			return;
 		}
 		member.overflowRecoveries?.delete("events");
@@ -3920,6 +4113,7 @@ export class TeamRuntime {
 	}
 
 	private wakeWaiters(team: TeamState): void {
+		this.settleSignals(team);
 		this.flowDependenciesReady(team);
 		this.holdUnknownDependencies(team);
 		for (const id of team.ledger.order) {
@@ -3928,7 +4122,7 @@ export class TeamRuntime {
 			if (version.state !== "blocked" || version.hold) continue;
 			// A held sub-task also wakes its parent, whose dependencies may still be unresolved.
 			const dependenciesReady = version.waitingFor.length > 0 && version.waitingFor.every((waited) => team.ledger.outcomeReady(waited));
-			if (!dependenciesReady && !this.pendingChildIssues(team, version).length) continue;
+			if (!dependenciesReady && !this.signalsReady(team, version) && !this.pendingChildIssues(team, version).length) continue;
 			version.state = "queued";
 			version.updatedAt = this.timestamp();
 			if (!team.ready.some((item) => sameWorkRef(item, ref))) this.enqueueWork(team, ref);
@@ -3955,6 +4149,7 @@ export class TeamRuntime {
 			const active = member.active?.scope.kind === "work" && sameWorkRef(member.active.scope.work!, child);
 			version.state = state;
 			version.waitingFor = [];
+			delete version.waitingForSignals;
 			this.dropHold(team, version);
 			version.updatedAt = this.timestamp();
 			version.error = { code: state.toUpperCase(), message: `Parent work ${workRefKey(ref)} was ${state}`,
@@ -3970,6 +4165,7 @@ export class TeamRuntime {
 	}
 
 	private stopMemberWork(team: TeamState, member: RuntimeMember, reason: string): void {
+		this.failMessages(team, member, `Recipient stopped: ${reason}`);
 		for (const id of team.ledger.order) {
 			const entry = team.ledger.get(id)!;
 			const record = entry.record;
@@ -3984,6 +4180,7 @@ export class TeamRuntime {
 			version.error = { code: "MEMBER_UNAVAILABLE", message: `${member.id} stopped by the host: ${reason}`,
 				...(active ? { outcomeUnknown: true } : {}) };
 			version.waitingFor = [];
+			delete version.waitingForSignals;
 			delete version.hold;
 			version.updatedAt = this.timestamp();
 			delete entry.stagedWait;
@@ -3997,8 +4194,9 @@ export class TeamRuntime {
 		}
 	}
 
-	private failMemberWork(team: TeamState, member: RuntimeMember, failedRef: WorkRef): void {
-		this.cancelDescendants(team, failedRef, "cancelled");
+	private failMemberWork(team: TeamState, member: RuntimeMember, failedRef?: WorkRef): void {
+		this.failMessages(team, member, "Recipient activation failed");
+		if (failedRef) this.cancelDescendants(team, failedRef, "cancelled");
 		for (const id of team.ledger.order) {
 			const entry = team.ledger.get(id)!;
 			if (entry.record.assignee !== member.id) continue;
@@ -4007,6 +4205,7 @@ export class TeamRuntime {
 			if (isTerminalWorkState(version.state)) continue;
 			version.state = "failed";
 			version.waitingFor = [];
+			delete version.waitingForSignals;
 			delete version.hold;
 			version.error = { code: "MEMBER_UNAVAILABLE", message: `${member.id} faulted before this work could finish` };
 			version.updatedAt = this.timestamp();
@@ -4034,6 +4233,7 @@ export class TeamRuntime {
 			const incident = this.createIncident(team, "LEAD_UNAVAILABLE", "The lead is unavailable; host cancellation or a new Team is required", ref, team.lead);
 			version.state = "blocked";
 			version.waitingFor = [];
+			delete version.waitingForSignals;
 			version.hold = { reason: "lead_unavailable", incidentId: incident.id };
 			version.updatedAt = this.timestamp();
 			delete entry.stagedWait;
@@ -4125,6 +4325,14 @@ export class TeamRuntime {
 		team.eventSeq++;
 		this.changed(team);
 		return created;
+	}
+
+	private requeueOrphanEventBatches(team: TeamState): void {
+		const active = new Set([...team.members.values()].flatMap((member) => member.lifecycle === "open" && member.active?.scope.eventBatchId ? [member.active.scope.eventBatchId] : []));
+		for (const id of team.eventBatches.keys()) if (!active.has(id)) {
+			for (const event of team.events) if (event.batchId === id) delete event.batchId;
+			team.eventBatches.delete(id);
+		}
 	}
 
 	private consumeBatch(team: TeamState, batchId: string | undefined): void {
@@ -4307,8 +4515,14 @@ export class TeamRuntime {
 	}
 
 	private settleCompletion(team: TeamState): void {
+		this.settleSignals(team);
 		if (!this.completionReady(team)) return;
 		if (!team.terminalJournaled) {
+			const unread = team.events.filter((event) => event.kind === "MESSAGE" && !event.processed);
+			if (unread.length) {
+				for (const event of unread) { event.processed = true; event.deliveryFailure = `Team ${team.lifecycle}`; }
+				this.note(team, `${unread.length} messages unavailable because Team ${team.lifecycle}: ${unread.map((event) => event.id).join(", ")}`);
+			}
 			team.endedAt ??= this.timestamp();
 			team.terminalJournaled = true;
 			this.note(team, `Team ${team.lifecycle}${team.outcome ? ` · outcome ${team.outcome}` : ""}`);
@@ -4490,16 +4704,18 @@ export class TeamRuntime {
 		}
 		if (action.action === "yield") {
 			const expected: EndIntent | undefined = active.scope.kind === "events"
-				? action.waitingFor.length === 0 && action.attention === undefined
+				? action.waitingFor.length === 0 && !action.waitingForSignals?.length && action.attention === undefined
 					? { kind: "idle", ...(action.checkpoint ? { checkpoint: action.checkpoint } : {}), toolCallId }
 					: undefined
-				: action.attention !== undefined && action.checkpoint
+				: action.waitingForSignals?.length && action.checkpoint
+					? { kind: "yield_signals", work: active.scope.work!, waitingForSignals: action.waitingForSignals, checkpoint: action.checkpoint, toolCallId }
+					: action.attention !== undefined && action.checkpoint
 					? { kind: "yield_attention", work: active.scope.work!, attention: action.attention, checkpoint: action.checkpoint, toolCallId }
 					: action.waitingFor.length && action.checkpoint
 						? { kind: "yield_dependencies", work: active.scope.work!, waitingFor: action.waitingFor, checkpoint: action.checkpoint, toolCallId }
 						: undefined;
 			if (expected && canonicalJson(current) === canonicalJson(expected)) {
-				return okReply(member.id, { receipt: { status: "staged", intent: current.kind, ...(current.kind === "yield_attention" || current.kind === "yield_dependencies" ? { work: current.work } : {}) } });
+				return okReply(member.id, { receipt: { status: "staged", intent: current.kind, ...(current.kind === "yield_attention" || current.kind === "yield_dependencies" || current.kind === "yield_signals" ? { work: current.work } : {}) } });
 			}
 		}
 		if (action.action === "control" && action.control.command === "close_team" && current.kind === "close_team"
@@ -4598,6 +4814,7 @@ export class TeamRuntime {
 			case "incident": return team.incidents.map((incident) => incident.id);
 			case "event": return team.events.map((event) => event.id);
 			case "review": return team.review.records.map((record) => record.id);
+			case "signal": return [...team.ledger.signals.keys()];
 		}
 	}
 
@@ -4788,6 +5005,9 @@ export class TeamRuntime {
 				if (version.hold && isTerminalWorkState(version.state)) throw new Error(`Invariant I15: terminal ${workRefKey(ref)} still carries a scheduling hold`);
 				if (new Set(version.waitingFor.map(workRefKey)).size !== version.waitingFor.length
 					|| new Set(version.observedOutcomes.map(workRefKey)).size !== version.observedOutcomes.length) throw new Error(`Invariant I14: duplicate dependency observation on ${workRefKey(ref)}`);
+				const signalIds = [...(version.waitingForSignals ?? []), ...(version.observedSignals ?? [])];
+				if (signalIds.some((id) => !team.ledger.signals.has(id))) throw new Error(`Invariant: unknown signal on ${workRefKey(ref)}`);
+				if (version.state === "blocked" && !version.hold && this.signalsReady(team, version)) throw new Error(`Invariant: ready signals not scheduled for ${workRefKey(ref)}`);
 				if (version.waitingFor.some((dependency) => !team.ledger.version(dependency))) throw new Error(`Invariant I11: unknown dependency on ${workRefKey(ref)}`);
 				if (version.state === "queued" && !ready.has(workRefKey(ref))) throw new Error(`Invariant I14: queued work ${workRefKey(ref)} has no ready item`);
 				if (version.revision === record.currentRevision && (version.state === "queued" || (version.state === "blocked" && !version.hold))
@@ -4799,7 +5019,7 @@ export class TeamRuntime {
 				if (entry.stagedWait?.revision === version.revision) {
 					const assignee = team.members.get(record.assignee)!;
 					if (assignee.active?.scope.kind !== "work" || !sameWorkRef(assignee.active.scope.work!, ref)
-						|| assignee.active.intent?.kind !== "yield_dependencies") throw new Error(`Invariant I09: staged wait has no matching activation intent for ${workRefKey(ref)}`);
+						|| (assignee.active.intent?.kind !== "yield_dependencies" && assignee.active.intent?.kind !== "yield_signals")) throw new Error(`Invariant I09: staged wait has no matching activation intent for ${workRefKey(ref)}`);
 				}
 				if (version.state === "resolved" && version.resultRef) {
 					const result = team.ledger.results.get(version.resultRef);

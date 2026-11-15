@@ -192,8 +192,8 @@ export default function install(pi: ExtensionAPI): void {
 					if (!(error instanceof TeamProtocolError)) throw error;
 					throw new Error(JSON.stringify(errorReply(binding.memberId, error).error));
 				}
-				if (isEndIntent(params) && !finalAssistantIsSoleToolCall(ctx, toolCallId)) {
-					throw new Error("Team reply/yield/close_team must be the only tool call in the finalized assistant batch");
+				if ((isEndIntent(params) || (params["action"] === "signal" && params["operation"] === "publish")) && !finalAssistantIsSoleToolCall(ctx, toolCallId)) {
+					throw new Error("Team reply/yield/close_team and signal publish must be the only tool call in the finalized assistant batch");
 				}
 				const reply = await request({ action: "business", args: params }, ctx, signal ?? ctx.signal, toolCallId);
 				if (reply.kind !== "business") throw new Error("Team runtime returned a non-business reply for a team action");

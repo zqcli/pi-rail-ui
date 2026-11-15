@@ -71,6 +71,12 @@ export const TEAM_MAX_REVIEWS = 200;
 /** Completed idempotency entries kept per active member; pending entries are never evicted. */
 export const TEAM_COMMAND_CACHE = 128;
 export const TEAM_MAX_PENDING_OPERATIONS = 32;
+/** Bounded coordination facts; none creates a Work or reserves result capacity. */
+export const TEAM_MAX_MESSAGES = 1024;
+export const TEAM_MAX_MEMBER_MESSAGES = 32;
+export const TEAM_MAX_SIGNALS = 4096;
+export const TEAM_MAX_WORK_SIGNALS = 32;
+export const TEAM_MAX_SIGNAL_TEXT_BYTES = 1024;
 
 export const TEAM_ERROR_CODES = [
 	"INVALID_ARGUMENT", "UNSUPPORTED_PROTOCOL", "UNKNOWN_MEMBER", "FORBIDDEN_ACTION", "SELF_REQUEST", "RECIPIENT_CLOSING",
@@ -78,6 +84,7 @@ export const TEAM_ERROR_CODES = [
 	"WRONG_WORK_OWNER", "REQUEST_QUEUE_FULL", "TEAM_CAPACITY", "INPUT_BUDGET_EXCEEDED", "BUDGET_BLOCKED", "DEPENDENCY_CYCLE",
 	"NO_NEW_DEPENDENCY", "UNRESOLVED_CHILDREN", "UNOBSERVED_CHILD_RESULTS", "INTENT_CONFLICT", "ACTIVATION_ENDING",
 	"WORK_NOT_RUNNING", "CLOSE_BLOCKED", "INVALID_TEAM_OUTCOME", "CLEANUP_FAILED", "DELIVERY_UNKNOWN", "PROTOCOL_FAILURE",
+	"UNKNOWN_MESSAGE", "UNKNOWN_SIGNAL", "SIGNAL_CLOSED",
 ] as const;
 export type TeamErrorCode = typeof TEAM_ERROR_CODES[number];
 
@@ -94,6 +101,16 @@ export type HoldReason = "attention" | "budget" | "protocol" | "lead_unavailable
 export type TeamOutcome = "succeeded" | "partial" | "failed";
 
 export interface WorkRef { workId: string; revision: number }
+/** A one-shot phase fact, not a resource lock or a statement of current availability. */
+export interface SignalRecord {
+	id: string;
+	work: WorkRef;
+	author: string;
+	name: string;
+	state: "pending" | "published" | "unavailable";
+	text?: string;
+	createdAt: number;
+}
 export interface TeamEvidence {
 	source: string;
 	locator?: string;
@@ -129,6 +146,8 @@ export interface WorkVersion {
 	state: WorkState;
 	waitingFor: WorkRef[];
 	observedOutcomes: WorkRef[];
+	waitingForSignals?: string[];
+	observedSignals?: string[];
 	/** Held sub-tasks not yet delivered to the owner of this work; an issue ends when its incident is resolved. */
 	childIssues?: ChildIssue[];
 	checkpoint?: string;
@@ -326,9 +345,12 @@ export type RootGrantCounter = typeof ROOT_GRANTABLE_COUNTERS[number];
 
 export type TeamAction =
 	| { action: "request"; to: string; task: string; title?: string; inputRefs: string[] }
+	| { action: "message"; to: string; text: string; replyTo?: string }
+	| { action: "signal"; operation: "open"; name: string }
+	| { action: "signal"; operation: "publish"; signalId: string; text: string }
 	| { action: "reply"; result: WorkResult }
-	| { action: "yield"; waitingFor: WorkRef[]; checkpoint?: string; attention?: string }
-	| { action: "status"; view: "team" | "work" | "result" | "incident"; id?: string; cursor?: string; limit: number }
+	| { action: "yield"; waitingFor: WorkRef[]; waitingForSignals?: string[]; checkpoint?: string; attention?: string }
+	| { action: "status"; view: "team" | "work" | "result" | "incident" | "signal"; id?: string; cursor?: string; limit: number }
 	| { action: "control"; control: TeamControl };
 
 export type TeamControl =
@@ -352,13 +374,15 @@ export interface TeamError {
 
 export type TeamReceipt =
 	| { status: "accepted"; work: WorkRef; recipient: string; paused?: true }
+	| { status: "sent"; messageId: string; recipient: string }
+	| { status: "opened" | "published"; signalId: string }
 	| { status: "staged"; intent: EndIntent["kind"]; work?: WorkRef }
 	| { status: "applied"; command: "compact_member"; memberId: string; compaction: "started" | "scheduled" }
 	| { status: "applied"; command: Exclude<TeamControlCommand, "compact_member">; work?: WorkRef; memberId?: string }
 	| { status: "unchanged"; command: TeamControlCommand; work?: WorkRef; memberId?: string }
 	| { status: "closing"; command: "close_member" | "close_team"; memberId?: string; closeId: string };
 
-export type TeamReplyData = TeamStatusPage | TeamTeamView | TeamWorkView | ResultRecord | TeamIncidentView;
+export type TeamReplyData = TeamStatusPage | TeamTeamView | TeamWorkView | ResultRecord | TeamIncidentView | SignalRecord;
 
 export type TeamReply =
 	| { ok: true; from: "@hub"; to: string; receipt?: TeamReceipt; data?: TeamReplyData }
@@ -378,7 +402,7 @@ export interface ActivationScope {
 	kind: "work" | "events";
 	/** Required for kind=work, forbidden for events. */
 	work?: WorkRef;
-	/** Required for kind=events (the lead's Team events). */
+	/** Required for kind=events (lead Team events or member mailbox). */
 	eventBatchId?: string;
 }
 
@@ -451,9 +475,13 @@ export interface TeamEventView {
 	memberId?: string;
 	incidentId?: string;
 	resultRef?: string;
+	/** MESSAGE only. Sender and originating WorkRef are assigned by Runtime, never by the model. */
+	sender?: string;
+	recipient?: string;
+	replyTo?: string;
 }
 export const TEAM_EVENT_KINDS = ["BOOT", "USER_COMMAND", "ROOT_RESULT_READY", "REVIEW_READY", "WORK_HELD", "MEMBER_FAULTED",
-	"MEMBER_CLOSED", "DEPENDENCY_UNAVAILABLE", "BUDGET_HIT", "TEAM_QUIESCENT", "COMPACTION"] as const;
+	"MEMBER_CLOSED", "DEPENDENCY_UNAVAILABLE", "BUDGET_HIT", "TEAM_QUIESCENT", "COMPACTION", "MESSAGE", "MESSAGE_UNAVAILABLE"] as const;
 export type TeamEventKind = typeof TEAM_EVENT_KINDS[number];
 
 export interface OutcomeView {
@@ -497,12 +525,16 @@ export interface ActivationInput {
 			depth: number;
 			inputRefs: string[];
 			waitingFor: WorkRef[];
+			waitingForSignals?: string[];
 			checkpoint?: string;
 			resumeInstruction?: string;
 			previous?: { revision: number; state: WorkState; checkpoint?: string; resultRef?: string; error?: WorkError };
 		}
 		| { kind: "events"; eventBatchId: string; events: TeamEventView[]; checkpoint?: string; emergency: boolean };
 	outcomes: OutcomeView[];
+	/** Independently acknowledged phase outcomes; observing one never observes a Work result. */
+	signalOutcomes?: SignalRecord[];
+	omittedSignalOutcomes?: number;
 	/** Outcomes that did not fit this input; they stay undelivered for a later activation. */
 	omittedOutcomes: number;
 	/** Held sub-tasks of this work (work scopes only); the owner answers with resume_work, revise_work or cancel_work. */
@@ -520,6 +552,7 @@ export interface ActivationInput {
 export type EndIntent =
 	| { kind: "reply"; work: WorkRef; result: WorkResult; toolCallId: string }
 	| { kind: "yield_dependencies"; work: WorkRef; waitingFor: WorkRef[]; checkpoint: string; toolCallId: string }
+	| { kind: "yield_signals"; work: WorkRef; waitingForSignals: string[]; checkpoint: string; toolCallId: string }
 	| { kind: "yield_attention"; work: WorkRef; attention: string; checkpoint: string; toolCallId: string }
 	| { kind: "idle"; checkpoint?: string; toolCallId: string }
 	| { kind: "close_team"; closeId: string; toolCallId: string };
@@ -532,6 +565,7 @@ export interface DeliveryRecord {
 	work?: WorkRef;
 	state: "in_flight" | "delivered" | "cancelled" | "unknown";
 	dependencyOutcomes: WorkRef[];
+	signalOutcomes?: string[];
 	childIssueIds?: string[];
 }
 
@@ -651,8 +685,8 @@ export interface TeamTeamView {
 	reason?: string;
 }
 export interface TeamStatusPage {
-	view: "work" | "result" | "incident";
-	items: Array<TeamWorkSummary | { id: string; work: WorkRef; author: string; status: WorkResult["status"]; summaryPreview: string } | TeamIncidentView>;
+	view: "work" | "result" | "incident" | "signal";
+	items: Array<TeamWorkSummary | { id: string; work: WorkRef; author: string; status: WorkResult["status"]; summaryPreview: string } | TeamIncidentView | SignalRecord>;
 	cursor?: string;
 	hasMore: boolean;
 }

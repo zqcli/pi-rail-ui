@@ -29,13 +29,6 @@ export function findEntryIndex(entries: readonly SessionEntry[], entryId: string
 	return entries.findIndex((entry) => entry.id === entryId);
 }
 
-export function findLatestCompactionIndex(entries: readonly SessionEntry[]): number | undefined {
-	for (let index = entries.length - 1; index >= 0; index -= 1) {
-		if (entries[index]?.type === "compaction") return index;
-	}
-	return undefined;
-}
-
 /**
  * Locate a remote checkpoint on the branch and validate every replay
  * prerequisite. Returns undefined when the checkpoint cannot be replayed:

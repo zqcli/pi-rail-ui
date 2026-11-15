@@ -3,6 +3,7 @@ import { Markdown, stripTerminalSequences, Text, truncateToWidth } from "@earend
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SubagentRetry } from "./retry";
 import { pauseStatusText, type SubagentPause } from "./pause";
+import { previewTail, ToolCallPreview } from "./tool-call-preview";
 
 const DEFAULT_MAX_ENTRIES = 18;
 const MAX_ENTRY_CHARS = 4000;
@@ -146,7 +147,7 @@ function normalizedText(value: string): string {
 function cleanText(value: string): string {
 	const clean = normalizedText(value);
 	if (clean.length <= MAX_ENTRY_CHARS) return clean;
-	return `[… earlier text omitted]\n${clean.slice(-(MAX_ENTRY_CHARS - 28))}`;
+	return `[… earlier text omitted]\n${previewTail(clean, MAX_ENTRY_CHARS - 28)}`;
 }
 
 function cleanFullText(value: string): string {
@@ -163,7 +164,7 @@ function cleanStreamingText(value: string): string {
 		.replaceAll("\r", "\n")
 		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "");
 	if (clean.length <= MAX_ENTRY_CHARS) return clean;
-	return `[… earlier text omitted]\n${clean.slice(-(MAX_ENTRY_CHARS - 28))}`;
+	return `[… earlier text omitted]\n${previewTail(clean, MAX_ENTRY_CHARS - 28)}`;
 }
 
 function safeJson(value: unknown): string {
@@ -239,7 +240,7 @@ export class SubagentTranscript {
 	private noteSequence = 0;
 	private initialUserEchoPending = false;
 	private activeAssistant: number | undefined;
-	private readonly toolCallDrafts = new Map<string, string>();
+	private readonly toolCallDrafts = new Map<string, ToolCallPreview>();
 	private readonly toolCalls = new Map<string, { label: string; text: string }>();
 
 	constructor(task: string, options: SubagentTranscriptOptions = {}) {
@@ -282,6 +283,7 @@ export class SubagentTranscript {
 
 	private messageStart(message: UnknownRecord | undefined): boolean {
 		if (message?.["role"] === "assistant") {
+			this.toolCallDrafts.clear();
 			this.initialUserEchoPending = false;
 			this.activeAssistant = ++this.assistantSequence;
 			return false;
@@ -308,7 +310,7 @@ export class SubagentTranscript {
 		}
 		if (update["type"] === "toolcall_start") {
 			const draftId = `toolDraft:${messageId}:${contentIndex}`;
-			this.toolCallDrafts.set(draftId, "");
+			this.toolCallDrafts.set(draftId, new ToolCallPreview(MAX_ENTRY_CHARS));
 			return this.upsert(draftId, {
 				kind: "tool",
 				label: "tool",
@@ -321,13 +323,13 @@ export class SubagentTranscript {
 			const draftId = `toolDraft:${messageId}:${contentIndex}`;
 			const delta = typeof update["delta"] === "string" ? update["delta"] : "";
 			if (!delta) return false;
-			const args = `${this.toolCallDrafts.get(draftId) ?? ""}${delta}`;
-			this.toolCallDrafts.set(draftId, args);
+			const preview = this.toolCallDrafts.get(draftId) ?? new ToolCallPreview(MAX_ENTRY_CHARS);
+			this.toolCallDrafts.set(draftId, preview);
 			return this.upsert(draftId, {
 				kind: "tool",
 				label: "tool",
 				groupId: draftId,
-				text: args,
+				text: preview.append(delta),
 				status: "running",
 			});
 		}
@@ -382,7 +384,7 @@ export class SubagentTranscript {
 					label: typeof part["name"] === "string" ? part["name"] : "tool",
 					text: toolCallText(part),
 				});
-				changed = this.upsert(`tool:${part["id"]}`, {
+				changed = this.promote(`toolDraft:${messageId}:${index}`, `tool:${part["id"]}`, {
 					kind: "tool",
 					label: typeof part["name"] === "string" ? part["name"] : "tool",
 					groupId: `tool:${part["id"]}`,
@@ -398,6 +400,7 @@ export class SubagentTranscript {
 				status: "failed",
 			}) || changed;
 		}
+		this.toolCallDrafts.clear();
 		this.activeAssistant = undefined;
 		return changed;
 	}
@@ -545,6 +548,10 @@ export class SubagentTranscript {
 		const existing = this.byId.get(oldId);
 		if (!existing) return this.upsert(newId, value);
 		this.byId.delete(oldId);
+		if (this.byId.has(newId)) {
+			this.entries.splice(this.entries.indexOf(existing), 1);
+			return this.upsert(newId, value);
+		}
 		existing.id = newId;
 		this.byId.set(newId, existing);
 		return this.upsert(newId, value);

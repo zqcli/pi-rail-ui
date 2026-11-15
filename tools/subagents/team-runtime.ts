@@ -1236,8 +1236,7 @@ export class TeamRuntime {
 
 	/** A member fault can end an already-started review while it waits outside its own activation. */
 	private recordFailedReview(team: TeamState, member: RuntimeMember, ref: WorkRef, message: string): void {
-		if (!this.isReview(team, ref) || ![...team.deliveries.values()].some((delivery) => delivery.work && sameWorkRef(delivery.work, ref))
-			|| team.review.records.some((record) => sameWorkRef(record.work, ref))) return;
+		if (!this.isReview(team, ref) || !team.review.pending.has(workRefKey(ref))) return;
 		this.recordReview(team, member, ref, undefined, { status: "failed", summary: message });
 	}
 

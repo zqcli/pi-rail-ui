@@ -271,18 +271,33 @@ interface CloseDecision {
 	roots: TeamResult["roots"];
 }
 
-/** Periodic review: the (host-changeable) schedule and what the last review already saw. */
+interface ReviewSnapshot {
+	sequence: number;
+	baseline: { finished: ReadonlySet<string>; wall: number };
+	snapshotAt: number;
+	snapshot: TeamReviewRecord["snapshot"];
+	signature: string;
+	finished: Set<string>;
+	wall: number;
+}
+
+/** Periodic review: the (host-changeable) schedule and what completed reviews already saw. */
 interface ReviewState {
 	schedule: TeamReviewPlan | null;
 	nextAt: number | null;
 	startedAt: number;
-	/** Non-review works seen by the last completed review: change detection. */
+	/** Non-review works seen by the newest completed snapshot: change detection. */
 	signature: string;
 	/** Non-review works already terminal then, and the wall clock then (timeline cut). */
 	finished: Set<string>;
 	wall: number;
-	/** The open review's latest snapshot; the comparison baseline above stays fixed across its retries/resumes. */
-	pending?: { snapshotAt: number; snapshot: TeamReviewRecord["snapshot"]; signature: string; finished: Set<string>; wall: number; focus?: string };
+	/** Capture order, so a late result cannot move the comparison baseline backwards, even when timestamps tie. */
+	sequence: number;
+	reviewedSequence: number;
+	/** Only started, unfinished WorkRefs; each keeps its own baseline across retries/resumes. */
+	pending: Map<string, ReviewSnapshot>;
+	/** Original focus survives completion so revising an old review cannot inherit another review's schedule. */
+	focus: Map<string, string>;
 	records: TeamReviewRecord[];
 }
 
@@ -536,7 +551,8 @@ export class TeamRuntime {
 			plan: copy(plan), lead: plan.lead, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], interrupted: new Set(), deliveries: new Map(), unknownAcknowledged: new Set(),
 			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
-			review: { schedule: copy(plan.review), nextAt: null, startedAt: createdAt, signature: "", finished: new Set(), wall: 0, records: [] },
+			review: { schedule: copy(plan.review), nextAt: null, startedAt: createdAt, signature: "", finished: new Set(), wall: 0,
+				sequence: 0, reviewedSequence: 0, pending: new Map(), focus: new Map(), records: [] },
 			flow: newFlow(createdAt), dependencyWaits: 0, questions: 0, toolErrors: 0, transientRetries: 0,
 		};
 		for (const initial of plan.initialRequests) {
@@ -771,6 +787,7 @@ export class TeamRuntime {
 		}
 		team.cancelRequested = true;
 		this.cancelAllWork(team, lifecycle === "failed" ? "failed" : "cancelled", workError);
+		team.review.pending.clear();
 		for (const member of team.members.values()) {
 			if (member.resourceState === "cleanup_failed" || member.lifecycle === "closed") continue;
 			// A faulted member whose exit was already confirmed has nothing left to close.
@@ -1113,7 +1130,7 @@ export class TeamRuntime {
 		const ref = { workId: work.id, revision: 1 };
 		this.enqueueWork(team, ref);
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
-		team.review.pending = pending;
+		if (team.review.schedule!.focus) team.review.focus.set(work.id, team.review.schedule!.focus);
 		this.note(team, `review ${shortWorkRef(ref)} → ${reviewer.id}`);
 		this.changed(team);
 		this.check(team);
@@ -1121,11 +1138,11 @@ export class TeamRuntime {
 		return copy(ref);
 	}
 
-	private captureReview(team: TeamState, focus?: string): { task: string; pending: NonNullable<ReviewState["pending"]> } {
+	private captureReview(team: TeamState, focus?: string, baseline: ReviewSnapshot["baseline"] = { finished: team.review.finished, wall: team.review.wall }): { task: string; pending: ReviewSnapshot } {
 		const at = this.timestamp();
 		const records = this.plainRecords(team);
 		const done = records.filter((record) => isTerminalWorkState(currentVersion(record).state));
-		const fresh = done.filter((record) => !team.review.finished.has(record.id));
+		const fresh = done.filter((record) => !baseline.finished.has(record.id));
 		const state = (pick: (version: WorkVersion) => boolean) => records.filter((record) => pick(currentVersion(record))).length;
 		const used: Record<string, number> = { teamWorks: team.ledger.order.length, ...team.budget.used };
 		const snapshot: TeamReviewRecord["snapshot"] = {
@@ -1137,13 +1154,13 @@ export class TeamRuntime {
 			budget: (["teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "teamWorks"] as const)
 				.map((counter) => ({ counter, used: used[counter]!, limit: team.limits[counter] })),
 		};
-		return { task: this.reviewTask(team, snapshot, fresh, records, at, focus),
-			pending: { snapshotAt: at, snapshot, signature: this.reviewSignature(team), finished: new Set(done.map((record) => record.id)),
-				wall: Date.now(), ...(focus ? { focus } : {}) } };
+		return { task: this.reviewTask(team, snapshot, fresh, records, at, baseline.wall, focus),
+			pending: { sequence: ++team.review.sequence, baseline, snapshotAt: at, snapshot, signature: this.reviewSignature(team),
+				finished: new Set(done.map((record) => record.id)), wall: Date.now() } };
 	}
 
 	/** The host-built snapshot (bounded well under 16 KiB: every list is capped and previewed) plus the instructions. */
-	private reviewTask(team: TeamState, snapshot: TeamReviewRecord["snapshot"], fresh: readonly WorkRecord[], records: readonly WorkRecord[], now: number, focus?: string): string {
+	private reviewTask(team: TeamState, snapshot: TeamReviewRecord["snapshot"], fresh: readonly WorkRecord[], records: readonly WorkRecord[], now: number, since: number, focus?: string): string {
 		const facts = this.panelFacts(team.id);
 		const minutes = (ms: number) => `${Math.round(ms / 60_000)} min`;
 		const w = snapshot.works;
@@ -1174,7 +1191,7 @@ export class TeamRuntime {
 			last_finished: finishedAt ? `${minutes(now - finishedAt)} ago` : "none yet", stale: String(stale),
 			held: held.length ? `${held.slice(0, 8).join("\n")}${held.length > 8 ? `\n+${held.length - 8} more` : ""}` : "none",
 		});
-		const timeline = formatTimeline(facts.timeline.filter((entry) => entry.at > team.review.wall).slice(-25), 0, facts.timeline[0]?.at ?? 0);
+		const timeline = formatTimeline(facts.timeline.filter((entry) => entry.at > since).slice(-25), 0, facts.timeline[0]?.at ?? 0);
 		return [
 			`Team progress review · elapsed ${minutes(snapshot.elapsedMs)}`,
 			`Goal: ${previewText(team.plan.brief.goal, 600)}`,
@@ -1199,7 +1216,7 @@ export class TeamRuntime {
 		result: Pick<WorkResult, "status" | "summary" | "findings" | "limitations">): TeamReviewRecord {
 		const verdict = reviewVerdict(result.summary);
 		const at = this.timestamp();
-		const pending = team.review.pending!;
+		const pending = team.review.pending.get(workRefKey(ref))!;
 		const record: TeamReviewRecord = { id: this.modelId(team, "review"), at, snapshotAt: pending.snapshotAt, reviewedAt: at, by: member.id, work: copy(ref),
 			...(resultRef ? { resultRef } : {}), status: result.status, ...(verdict ? { verdict } : {}),
 			summary: previewText(result.summary, TEAM_MAX_TEXT_ITEM_BYTES), ...(result.findings ? { findings: copy(result.findings) } : {}),
@@ -1207,9 +1224,13 @@ export class TeamRuntime {
 		this.tryJournal(team, { version: 2, kind: "review", teamId: team.id, at: record.at, review: copy(record) });
 		team.review.records.push(record);
 		if (team.review.records.length > TEAM_MAX_REVIEWS) team.review.records.shift();
-		team.review.signature = pending.signature;
-		team.review.finished = pending.finished;
-		team.review.wall = pending.wall;
+		if (pending.sequence > team.review.reviewedSequence) {
+			team.review.reviewedSequence = pending.sequence;
+			team.review.signature = pending.signature;
+			team.review.finished = pending.finished;
+			team.review.wall = pending.wall;
+		}
+		team.review.pending.delete(workRefKey(ref));
 		return record;
 	}
 
@@ -3298,6 +3319,7 @@ export class TeamRuntime {
 			this.requestActivationStop(team, assignee, "policy_superseded");
 		}
 		this.dequeueWork(team, currentRef);
+		team.review.pending.delete(workRefKey(currentRef));
 		team.ledger.addRevision(entry.record.id, candidate);
 		this.enqueueWork(team, { workId: entry.record.id, revision: nextRevision });
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
@@ -3334,6 +3356,7 @@ export class TeamRuntime {
 		version.updatedAt = this.timestamp();
 		delete team.ledger.get(work.workId)!.stagedWait;
 		this.dequeueWork(team, work);
+		team.review.pending.delete(workRefKey(work));
 		const assignee = team.members.get(team.ledger.get(work.workId)!.record.assignee)!;
 		if (assignee.active?.scope.kind === "work" && sameWorkRef(assignee.active.scope.work!, work)) {
 			assignee.active.stopReason = "cancelled";
@@ -3623,7 +3646,7 @@ export class TeamRuntime {
 
 	private reserveWork(team: TeamState, member: RuntimeMember, ref: WorkRef): RuntimeActivation {
 		const version = team.ledger.version(ref)!;
-		const review = this.isReview(team, ref) ? this.captureReview(team, team.review.pending!.focus) : undefined;
+		const review = this.isReview(team, ref) ? this.captureReview(team, team.review.focus.get(ref.workId), team.review.pending.get(workRefKey(ref))?.baseline) : undefined;
 		// A lead-authored revision replaces the original instructions. Keep all of it (up to 8 KiB),
 		// adding only the compact current snapshot so the delivered task stays below 16 KiB.
 		const task = !review ? version.task : ref.revision === 1 ? review.task : `${version.task}\n\n${prompt("team", "review_revised_snapshot", {
@@ -3643,7 +3666,7 @@ export class TeamRuntime {
 		}, team.budget.inputSummary(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false));
 		if (review) {
 			if (ref.revision === 1) version.task = review.task;
-			team.review.pending = review.pending;
+			team.review.pending.set(workRefKey(ref), review.pending);
 		}
 		version.state = "running";
 		version.updatedAt = at;

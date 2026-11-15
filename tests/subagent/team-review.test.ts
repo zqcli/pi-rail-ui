@@ -8,12 +8,13 @@ import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-
 
 const MEMBERS = ["lead", "w1", "w2"].map((alias) => ({ alias, roleDescription: `Member ${alias}.` }));
 
-function world(options: { initial?: Array<{ to: string; task: string }>; review?: unknown; journal?: TeamJournalGeneration; claim?: string[] } = {}) {
+function world(options: { initial?: Array<{ to: string; task: string }>; review?: unknown; journal?: TeamJournalGeneration; claim?: string[]; members?: string[] } = {}) {
 	let ids = 0;
 	let time = 1_700_000_000_000;
 	const runtime = new TeamRuntime({ now: () => time, createId: () => `id${++ids}`, ...(options.journal ? { journal: options.journal } : {}) });
 	const { teamId } = runtime.prepare({
-		members: MEMBERS, lead: "lead", brief: { goal: "Ship the feature." }, initialRequests: options.initial ?? [], timeoutSeconds: null,
+		members: options.members?.map((alias) => ({ alias, roleDescription: `Member ${alias}.` })) ?? MEMBERS,
+		lead: "lead", brief: { goal: "Ship the feature." }, initialRequests: options.initial ?? [], timeoutSeconds: null,
 		review: "review" in options ? options.review : { by: "w2", everyMinutes: 60 },
 	});
 	for (const alias of options.claim ?? []) runtime.claimNativeLifetime(teamId, alias);
@@ -259,6 +260,88 @@ test("progress after a review's snapshot remains eligible for the next tick", ()
 	const next = runtime.runReviewTick(teamId);
 	assert.ok(next, "committing a review must not swallow changes it did not see");
 	assert.match(runtime.getWork(teamId, next)!.current.task, /Finished since the last review \(1\):/u);
+});
+
+/** A new scheduled review overlaps a lead-authorized revision of an older, completed review. */
+function overlappingReviews(step: number) {
+	const context = world({ members: ["lead", "builder", "w1", "w2"], initial: [{ to: "builder", task: "Build it." }], review: { by: "w1", everyMinutes: 60 } });
+	const { runtime, teamId, advance } = context;
+	const lead = take(runtime, teamId);
+	const builder = take(runtime, teamId);
+	const first = runtime.reviewNow(teamId).work;
+	end(runtime, take(runtime, teamId), { action: "reply", result: { status: "succeeded", summary: "ON TRACK: build is running." } });
+	advance(step);
+	runtime.setReview(teamId, { by: "w2", everyMinutes: 60 });
+	runtime.reviewNow(teamId);
+	const older = take(runtime, teamId);
+	advance(step);
+	end(runtime, builder, { action: "reply", result: { status: "succeeded", summary: "Build done." } });
+	assert.equal(act(runtime, lead, { action: "control", command: "revise_work", workId: first.workId, expectedRevision: 1,
+		task: "Recheck the original review.", inputRefs: [] }).ok, true);
+	const newer = take(runtime, teamId);
+	assert.equal(older.binding.memberId, "w2");
+	assert.equal(newer.binding.memberId, "w1");
+	assert.equal(newer.scope.work!.revision, 2);
+	return { ...context, older, newer };
+}
+
+test("overlapping review revisions keep exact snapshots and never rewind the consumed baseline, even with equal timestamps", () => {
+	for (const step of [0, 1000]) for (const newestFirst of [false, true]) {
+		const { runtime, teamId, older, newer } = overlappingReviews(step);
+		for (const review of newestFirst ? [newer, older] : [older, newer]) {
+			end(runtime, review, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: reviewed the delivered snapshot." } });
+			assert.equal(runtime.cleanupFinished(review.binding, review.scope.activationId, { ok: true }).ok, true, "duplicate cleanup is harmless");
+		}
+		const records = runtime.listReviews(teamId);
+		assert.equal(records.length, 3, "each WorkRef is recorded once");
+		assert.equal(new Set(records.map((record) => `${record.work.workId}@${record.work.revision}`)).size, 3);
+		const oldRecord = records.find((record) => record.work.workId === older.scope.work!.workId)!;
+		const newRecord = records.find((record) => record.work.workId === newer.scope.work!.workId && record.work.revision === 2)!;
+		assert.equal(oldRecord.snapshotAt, 1_700_000_000_000 + step);
+		assert.equal(oldRecord.snapshot.works.running, 1);
+		assert.equal(oldRecord.snapshot.works.resolved, 0, "an older review cannot claim progress seen only by another review");
+		assert.equal(newRecord.snapshotAt, 1_700_000_000_000 + 2 * step);
+		assert.equal(newRecord.snapshot.works.resolved, 1);
+		assert.equal(newRecord.snapshot.finishedSinceLast, 1);
+		assert.equal(runtime.runReviewTick(teamId), undefined, "a late older result cannot make already-reviewed progress look new");
+		const forced = runtime.reviewNow(teamId).work;
+		assert.match(runtime.getWork(teamId, forced)!.current.task, /Finished since the last review \(0\):/u);
+		runtime.assertInvariants(teamId);
+	}
+});
+
+test("a review retains its own comparison baseline when another review completes before it resumes", () => {
+	const { runtime, teamId, advance, older, newer } = overlappingReviews(1000);
+	end(runtime, newer, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: build finished." } });
+	end(runtime, older, { action: "yield", attention: "Confirm the build criterion.", checkpoint: "Awaiting confirmation." });
+	advance(1000);
+	runtime.releaseHold(teamId, older.scope.work!, runtime.getWork(teamId, older.scope.work!)!.current.hold!.incidentId, "Criterion confirmed.");
+	const resumed = take(runtime, teamId);
+	assert.deepEqual(resumed.scope.work, older.scope.work);
+	assert.equal(resumed.input.scope.kind, "work");
+	if (resumed.input.scope.kind !== "work") return;
+	assert.match(resumed.input.scope.task, /Finished since the last review \(1\):/u);
+	end(runtime, resumed, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: build criterion confirmed." } });
+	const record = runtime.listReviews(teamId).at(-1)!;
+	assert.equal(record.snapshotAt, 1_700_000_003_000);
+	assert.equal(record.snapshot.finishedSinceLast, 1);
+	assert.equal(runtime.listReviews(teamId).length, 3);
+	assert.equal(runtime.runReviewTick(teamId), undefined);
+});
+
+test("a failed overlapping review records its own snapshot once, not another revision's snapshot", () => {
+	const { runtime, teamId, older, newer } = overlappingReviews(1000);
+	assert.equal(runtime.nativeSettled(older.binding, older.scope.activationId, { status: "error", error: { code: "NATIVE_FAILURE", message: "Review failed." } }).ok, true);
+	assert.equal(runtime.cleanupFinished(older.binding, older.scope.activationId, { ok: true }).ok, true);
+	assert.equal(runtime.cleanupFinished(older.binding, older.scope.activationId, { ok: true }).ok, true);
+	end(runtime, newer, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: build finished." } });
+	const records = runtime.listReviews(teamId);
+	const failed = records.find((record) => record.work.workId === older.scope.work!.workId)!;
+	assert.equal(failed.status, "failed");
+	assert.equal(failed.snapshotAt, 1_700_000_001_000);
+	assert.equal(failed.snapshot.works.resolved, 0);
+	assert.equal(records.length, 3);
+	runtime.assertInvariants(teamId);
 });
 
 test("review timestamp decoding preserves old history without inventing a snapshot time", () => {

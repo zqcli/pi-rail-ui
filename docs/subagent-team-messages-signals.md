@@ -33,6 +33,8 @@ A signal transitions once from `pending` to `published` or `unavailable`. Publis
 
 Dependency cycle checks distinguish **Work completion** (including owned children) from **phase publication** (the producer must be able to run). A parent can publish a phase needed by its child before that child finishes. Actual Work/signal wait cycles, including concurrent staged yields and waiting for one's own pending signal, are rejected.
 
+Host status and the Team panel use the same read-only dependency facts for Work and signal waits. Phase details identify the exact handle, name and producer revision. Pending phases show the producer's current state and queue/decision blocker; distinct handles are never merged by producer or display name. Published and unavailable outcomes remain visible until delivered, but are no longer reported as blockers, even while the producer's native cleanup or unknown Work outcome needs attention. Signal waits do not invent an additional producer/child-completion prerequisite. Cycle rejection adds bounded Timeline evidence, not a committed edge, new incident or automatic recovery action.
+
 ## SDK handoff boundary
 
 A signal says that a specific phase was declared complete. It does not prove the SDK is currently free, acquire it, reserve it, transfer ownership, or fence a competing process. A later SDK use requires a new phase handle. When concurrent consumers need exclusion, the actual SDK/file/process lock or an explicit ownership handoff remains authoritative. Messages and phase signals must not be presented as a resource-locking platform.

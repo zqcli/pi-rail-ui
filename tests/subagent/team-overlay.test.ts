@@ -13,7 +13,7 @@ import { TEAM_JOURNAL_ENTRY_TYPE } from "../../tools/subagents/team-journal";
 import { TeamOverlayComponent, buildTeamTaskRows, type TeamOverlayAction } from "../../tools/subagents/team-overlay";
 import type { TeamFlowStats } from "../../tools/subagents/team-flow";
 import type { RuntimeActivation } from "../../tools/subagents/team-runtime";
-import type { TeamReviewRecord, TeamWorkSummary } from "../../tools/subagents/team-protocol";
+import type { SignalRecord, TeamReviewRecord, TeamWorkSummary } from "../../tools/subagents/team-protocol";
 
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
 const keys = { tab: "\t", backTab: "\x1b[Z", up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D", enter: "\r", escape: "\x1b", pageUp: "\x1b[5~", pageDown: "\x1b[6~", home: "\x1b[H", end: "\x1b[F" };
@@ -1242,6 +1242,64 @@ test("Tasks use exact peer revisions and show ready older outcomes separately fr
 	assert.match(detail, /Dependencies \(exact versions\):/u);
 	assert.match(detail, /@1 → b · superseded · outcome ready; awaiting delivery · current @2/u);
 	for (const width of [60, 73, 120, 200]) for (const line of ui.component.render(width)) assert.equal(visibleWidth(line), width);
+	runtime.assertInvariants(teamId);
+});
+
+test("Tasks reuse exact phase facts, distinguish ready outcomes from pending phases, and never imply a resource release", (t) => {
+	let id = 0;
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `s${++id}` });
+	const runtime = host.runtime;
+	const { teamId } = runtime.prepare({ members: ["lead", "a", "b"].map((alias) => ({ alias, roleDescription: alias })),
+		lead: "lead", brief: { goal: "Exact phase display." }, timeoutSeconds: null,
+		initialRequests: ["a", "b"].map((to) => ({ to, task: `${to} root` })) });
+	runtime.launch(teamId);
+	const take = () => {
+		const activation = runtime.takeNextActivation(teamId)!;
+		assert.equal(runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
+		return activation;
+	};
+	const [lead, a, b] = [take(), take(), take()];
+	const open = (sequence: number) => {
+		const result = runtime.handleAction(b.binding, b.scope, sequence, `open${sequence}`, { action: "signal", operation: "open", name: "Repeated phase" });
+		assert.ok(result.ok);
+		return result.data as SignalRecord;
+	};
+	const first = open(1), second = open(2);
+	assert.equal(runtime.handleAction(b.binding, b.scope, 3, "publish", { action: "signal", operation: "publish", signalId: first.id, text: "Phase complete; producer continues." }).ok, true);
+	assert.equal(runtime.handleAction(a.binding, a.scope, 1, "wait", { action: "yield", waitingForSignals: [first.id, second.id], checkpoint: "Both exact phases." }).ok, true);
+	runtime.nativeSettled(a.binding, a.scope.activationId, { status: "success", appliedToolCallId: "wait" });
+	runtime.cleanupFinished(a.binding, a.scope.activationId, { ok: true });
+	let factReads = 0, waitReads = 0;
+	const originalFacts = runtime.panelFacts.bind(runtime), originalWaits = runtime.workWaits.bind(runtime);
+	runtime.panelFacts = (id) => { factReads++; return originalFacts(id); };
+	runtime.workWaits = (id, ref) => { waitReads++; return originalWaits(id, ref); };
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	const render = (width = 200) => {
+		factReads = waitReads = 0;
+		const lines = ui.component.render(width);
+		assert.equal(factReads, 1, "the render has one shared dependency snapshot");
+		assert.equal(waitReads, 0, "phase rows and details must reuse that snapshot");
+		for (const line of lines) assert.equal(visibleWidth(line), width);
+		return stripTerminalSequences(lines.join("\n"));
+	};
+	ui.key("right"); ui.key("right");
+	const row = render().split("\n").find((line) => line.includes("a root"))!;
+	assert.ok(row.includes(`waiting for phase ${second.id} from b (producer running)`));
+	assert.ok(!row.includes(first.id));
+	assert.doesNotMatch(row, /sub-task/u);
+	ui.key("enter");
+	let detail = rowsOf(render().split("\n")).join(" ");
+	assert.ok(detail.includes(`${first.id} «Repeated phase»`));
+	assert.ok(detail.includes(`${second.id} «Repeated phase»`));
+	assert.match(detail, /@1\) → b · pending · producer running/u);
+	assert.match(detail, /published · phase outcome ready; awaiting delivery; no resource release implied/u);
+	assert.equal(runtime.handleAction(lead.binding, lead.scope, 1, "revise", { action: "control", command: "revise_work", workId: b.scope.work!.workId, expectedRevision: 1, task: "A new producer revision." }).ok, true);
+	detail = rowsOf(render().split("\n")).join(" ");
+	assert.match(detail, /@1\) → b · unavailable · not published; phase outcome ready; awaiting delivery; no resource release implied · current @2/u);
+	assert.doesNotMatch(detail, /cleanup pending|outcome unknown|producer running/u);
+	assert.equal(runtime.getWork(teamId, a.scope.work!)!.current.state, "queued");
+	for (const width of [60, 73, 120, 200]) render(width);
 	runtime.assertInvariants(teamId);
 });
 

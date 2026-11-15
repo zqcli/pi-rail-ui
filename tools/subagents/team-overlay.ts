@@ -10,7 +10,7 @@ import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, reviewTiming, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
-import { waitFactText, type TeamWaitFact } from "./team-runtime";
+import { waitFactText, waitTargetText, type TeamWaitFact } from "./team-runtime";
 
 const TABS = ["Teams", "Overview", "Progress", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
@@ -696,7 +696,7 @@ export class TeamOverlayComponent implements Focusable {
 		}
 		if (work.state === "failed") return `failed: ${version.error?.code ?? "unknown"}`;
 		if (work.state === "blocked") {
-			const names = [...new Set(waits.filter((wait) => wait.blocking).map((wait) => `${wait.assignee}${wait.reason ? ` (${wait.reason})` : ""}`))];
+			const names = [...new Set(waits.filter((wait) => wait.blocking).map((wait) => `${waitTargetText(wait)}${wait.reason ? ` (${wait.reason})` : ""}`))];
 			return `waiting for ${names.join(", ") || "sub-tasks"}`;
 		}
 		if (work.state === "queued") {

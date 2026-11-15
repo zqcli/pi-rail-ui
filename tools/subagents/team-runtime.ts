@@ -174,11 +174,13 @@ type WorkScope = Extract<ActivationInput["scope"], { kind: "work" }>;
 export interface TeamWaitFact {
 	work: WorkRef;
 	assignee: string;
-	/** The work state, or "held" when a hold is what keeps it from finishing. */
+	/** A phase handle is distinct from completion of its exact producer WorkRef. */
+	signal?: { id: string; name: string };
+	/** Signal state, or Work state ("held" when a hold keeps the Work from finishing). */
 	state: string;
 	/** One of the waiting version's own children rather than a peer's work. */
 	child: boolean;
-	/** Outcome unavailable, not a claim that the consumer itself is blocked. Terminal cleanup/unknown outcomes still count. */
+	/** Outcome not ready, not a claim that the consumer itself is blocked. Work cleanup/unknown gates never apply to signal outcomes. */
 	blocking: boolean;
 	reason?: string;
 	/** An exact older dependency is never silently retargeted to this revision. */
@@ -408,15 +410,19 @@ const HELD_REASON = { budget: "budget exhausted", protocol: "protocol", lead_una
 
 /** Panel phrase for what a member waits on; one dependency also shows its ref. */
 function waitingOnText(waits: readonly TeamWaitFact[]): string {
-	const named = waits.map((wait) => `${wait.assignee} (${wait.state}${waits.length === 1 ? ` ${shortWorkRef(wait.work)}` : ""}${wait.reason ? ` · ${wait.reason}` : ""})`);
+	const named = waits.map((wait) => `${waitTargetText(wait)} (${wait.state}${waits.length === 1 ? ` ${shortWorkRef(wait.work)}` : ""}${wait.reason ? ` · ${wait.reason}` : ""})`);
 	return waits.every((wait) => wait.child)
 		? `waiting on ${waits.length} sub-task${plural(waits.length)}: ${capped(named, 3)}`
 		: `waiting on ${capped(named, 3)}`;
 }
 
+/** Brief identity shared by member, Team and task rows; phase names never substitute for handles. */
+export const waitTargetText = (wait: TeamWaitFact): string => wait.signal ? `phase ${wait.signal.id} from ${wait.assignee}` : wait.assignee;
+
 /** One exact target, including ready outcomes that no longer block scheduling. */
 export function waitFactText(wait: TeamWaitFact): string {
-	return `${shortWorkRef(wait.work)} → ${wait.assignee} · ${wait.state}${wait.reason ? ` · ${wait.reason}` : ""}`
+	const target = wait.signal ? `${wait.signal.id} «${previewText(wait.signal.name, 64)}» (${shortWorkRef(wait.work)})` : shortWorkRef(wait.work);
+	return `${target} → ${wait.assignee} · ${wait.state}${wait.reason ? ` · ${wait.reason}` : ""}`
 		+ (wait.latestRevision === undefined ? "" : ` · current @${wait.latestRevision}`);
 }
 
@@ -2584,39 +2590,55 @@ export class TeamRuntime {
 	private workWaitFacts(team: TeamState, ref: WorkRef, creationOrder?: ReadonlyMap<string, number>): TeamWaitFact[] {
 		const version = team.ledger.version(ref);
 		if (!version || isTerminalWorkState(version.state)) return [];
+		if (version.waitingForSignals?.length) {
+			// A phase wait is not a wait for producer/owned-child completion. Its outcome has no cleanup gate.
+			const observed = new Set(version.observedSignals ?? []);
+			const waits = version.waitingForSignals.filter((id) => !observed.has(id)).map((id): TeamWaitFact => {
+				const signal = team.ledger.signals.get(id)!;
+				const producer = this.waitedWorkFact(team, ref, signal.work, false);
+				const pending = signal.state === "pending";
+				return { ...producer, signal: { id, name: signal.name }, state: signal.state, blocking: pending,
+					reason: pending ? `producer ${producer.state}${producer.reason ? ` · ${producer.reason}` : ""}`
+						: `${signal.state === "unavailable" ? "not published; " : ""}phase outcome ready; awaiting delivery; no resource release implied` };
+			});
+			return this.byCreation(team, waits, (wait) => wait.work, creationOrder);
+		}
 		const children = team.ledger.ownedChildren(ref);
 		const childKeys = new Set(children.map(workRefKey));
 		const observed = new Set(version.observedOutcomes.map(workRefKey));
 		const targets = new Map([...version.waitingFor, ...children].map((work) => [workRefKey(work), work]));
-		return this.byCreation(team, [...targets].flatMap(([key, work]): TeamWaitFact[] => {
-			if (observed.has(key)) return [];
-			const entry = team.ledger.get(work.workId)!;
-			const waited = team.ledger.version(work)!;
-			const member = team.members.get(entry.record.assignee)!;
-			const cleanup = team.ledger.cleanupPending.has(key);
-			const unknown = this.isUnknownOutcome(team, work) && !team.unknownAcknowledged.has(`${workRefKey(ref)}>${key}`);
-			const ready = team.ledger.outcomeReady(work) && !unknown;
-			let reason: string | undefined;
-			if (cleanup || unknown) reason = [cleanup ? "cleanup pending" : "", unknown ? "outcome unknown; explicit decision required" : ""].filter(Boolean).join(" · ");
-			else if (ready) reason = "outcome ready; awaiting delivery";
-			else if (waited.hold) {
-				const incident = team.incidents.find((item) => item.id === waited.hold!.incidentId && item.state === "open");
-				if (incident && (waited.hold.reason === "attention" || waited.hold.reason === "protocol")) {
-					const owner = team.events.some((event) => event.incidentId === incident.id) ? team.lead : entry.record.requester;
-					reason = `needs ${owner}'s decision`;
-				} else reason = waited.hold.reason === "attention" ? "attention" : HELD_REASON[waited.hold.reason];
-			} else if (waited.state === "queued") {
-				reason = team.hostPause ? "host paused" : member.pause !== "none" ? "member paused"
-					: this.retryWaitMs(member) ? "retry backoff"
-					: member.active ? member.active.scope.kind === "work" ? `member busy on ${shortWorkRef(member.active.scope.work!)}` : "member handling Team events"
-						: member.compaction ? member.compaction.state === "running" ? "compacting" : "compaction scheduled"
-							: this.needsWorkPermit(team, member) && this.usedWorkPermits(team) >= team.limits.workPermits ? "slots full" : undefined;
-			} else if (waited.state === "running" && member.activity === "settling"
-				&& member.currentWork && sameWorkRef(member.currentWork, work)) reason = "settling";
-			return [{ work: { ...work }, assignee: entry.record.assignee, state: waited.hold ? "held" : waited.state,
-				child: childKeys.has(key), blocking: !ready, ...(reason ? { reason } : {}),
-				...(entry.record.currentRevision !== work.revision ? { latestRevision: entry.record.currentRevision } : {}) }];
-		}), (wait) => wait.work, creationOrder);
+		return this.byCreation(team, [...targets].filter(([key]) => !observed.has(key))
+			.map(([key, work]) => this.waitedWorkFact(team, ref, work, childKeys.has(key))), (wait) => wait.work, creationOrder);
+	}
+
+	private waitedWorkFact(team: TeamState, consumer: WorkRef, work: WorkRef, child: boolean): TeamWaitFact {
+		const key = workRefKey(work);
+		const entry = team.ledger.get(work.workId)!;
+		const waited = team.ledger.version(work)!;
+		const member = team.members.get(entry.record.assignee)!;
+		const cleanup = team.ledger.cleanupPending.has(key);
+		const unknown = this.isUnknownOutcome(team, work) && !team.unknownAcknowledged.has(`${workRefKey(consumer)}>${key}`);
+		const ready = team.ledger.outcomeReady(work) && !unknown;
+		let reason: string | undefined;
+		if (cleanup || unknown) reason = [cleanup ? "cleanup pending" : "", unknown ? "outcome unknown; explicit decision required" : ""].filter(Boolean).join(" · ");
+		else if (ready) reason = "outcome ready; awaiting delivery";
+		else if (waited.hold) {
+			const incident = team.incidents.find((item) => item.id === waited.hold!.incidentId && item.state === "open");
+			if (incident && (waited.hold.reason === "attention" || waited.hold.reason === "protocol")) {
+				const owner = team.events.some((event) => event.incidentId === incident.id) ? team.lead : entry.record.requester;
+				reason = `needs ${owner}'s decision`;
+			} else reason = waited.hold.reason === "attention" ? "attention" : HELD_REASON[waited.hold.reason];
+		} else if (waited.state === "queued") {
+			reason = team.hostPause ? "host paused" : member.pause !== "none" ? "member paused"
+				: this.retryWaitMs(member) ? "retry backoff"
+				: member.active ? member.active.scope.kind === "work" ? `member busy on ${shortWorkRef(member.active.scope.work!)}` : "member handling Team events"
+					: member.compaction ? member.compaction.state === "running" ? "compacting" : "compaction scheduled"
+						: this.needsWorkPermit(team, member) && this.usedWorkPermits(team) >= team.limits.workPermits ? "slots full" : undefined;
+		} else if (waited.state === "running" && member.activity === "settling"
+			&& member.currentWork && sameWorkRef(member.currentWork, work)) reason = "settling";
+		return { work: { ...work }, assignee: entry.record.assignee, state: waited.hold ? "held" : waited.state,
+			child, blocking: !ready, ...(reason ? { reason } : {}),
+			...(entry.record.currentRevision !== work.revision ? { latestRevision: entry.record.currentRevision } : {}) };
 	}
 
 	getResult(teamId: string, resultRef: string): ResultRecord | undefined {
@@ -2674,7 +2696,7 @@ export class TeamRuntime {
 			const ref = team.ledger.currentRef(id)!;
 			const version = team.ledger.version(ref)!;
 			// A running parent may own thousands of children without having yielded. It is not waiting.
-			if (version.state !== "blocked" && !version.waitingFor.length) return [];
+			if (version.state !== "blocked" && !version.waitingFor.length && !version.waitingForSignals?.length) return [];
 			creationOrder ??= new Map(team.ledger.order.map((workId, index) => [workId, index]));
 			const facts = this.workWaitFacts(team, ref, creationOrder);
 			return facts.length ? [[workRefKey(ref), facts] as const] : [];
@@ -2686,11 +2708,6 @@ export class TeamRuntime {
 		for (const hold of holds) if (!oldestHolds.has(hold.assignee)) oldestHolds.set(hold.assignee, hold);
 		const leadBatch = team.members.get(team.lead)!.active?.scope.eventBatchId;
 		const stalled = new Map([...waits].map(([member, waited]) => [member, waitingOnText(waited)] as const));
-		if (team.ledger.signals.size) for (const id of team.ledger.order) {
-			const record = team.ledger.get(id)!.record;
-			const version = currentVersion(record);
-			if (version.state === "blocked" && version.waitingForSignals?.length) stalled.set(record.assignee, `waiting on phase ${capped(version.waitingForSignals, 3)}`);
-		}
 		// A hold outranks a wait.
 		for (const hold of oldestHolds.values()) stalled.set(hold.assignee, this.holdText(team, hold, leadBatch));
 		// In the batch's own (priority) order, like the activation input.
@@ -2704,7 +2721,7 @@ export class TeamRuntime {
 			...(waitingFor ? { waitingFor } : {}), timeline: copy(team.timeline), timelineOmitted: team.timelineOmitted };
 	}
 
-	/** Per member, the unresolved works its blocked, un-held versions wait on: their waitingFor and owned children, once each. */
+	/** Per member, unresolved exact Work/signal targets of blocked, un-held versions, once per handle. */
 	private memberWaits(team: TeamState, dependencies: ReadonlyMap<string, TeamWaitFact[]>, creationOrder?: ReadonlyMap<string, number>): Map<string, TeamWaitFact[]> {
 		const waits = new Map<string, Map<string, TeamWaitFact>>();
 		for (const id of team.ledger.order) {
@@ -2715,7 +2732,7 @@ export class TeamRuntime {
 			for (const wait of dependencies.get(workRefKey(ref)) ?? []) {
 				if (!wait.blocking) continue;
 				const found = waits.get(assignee) ?? new Map<string, TeamWaitFact>();
-				found.set(workRefKey(wait.work), wait);
+				found.set(wait.signal?.id ?? workRefKey(wait.work), wait);
 				waits.set(assignee, found);
 			}
 		}
@@ -2778,14 +2795,7 @@ export class TeamRuntime {
 		}
 		const running = [...team.members.values()].filter((member) => member.activity !== "idle" && !this.isReview(team, member.currentWork)).map((member) => member.id);
 		// Members that are not running: what each waits on, or (a hold outranks a wait) why its work is held.
-		const stalls = new Map<string, string>([...waits].map(([member, waited]) => [member, `waiting on ${capped([...new Set(waited.map((wait) => wait.assignee))], 3)}`]));
-		if (team.ledger.signals.size) for (const id of team.ledger.order) {
-			const record = team.ledger.get(id)!.record;
-			const version = currentVersion(record);
-			if (version.state === "blocked" && !version.hold && version.waitingForSignals?.length) {
-				stalls.set(record.assignee, `waiting on phase ${capped(version.waitingForSignals, 3)}`);
-			}
-		}
+		const stalls = new Map<string, string>([...waits].map(([member, waited]) => [member, `waiting on ${capped([...new Set(waited.map(waitTargetText))], 3)}`]));
 		for (const [member, hold] of oldestHolds) if (hold.reason !== "attention") stalls.set(member, `held: ${HELD_REASON[hold.reason]}`);
 		const stalled = [...stalls].filter(([member]) => team.members.get(member)!.activity === "idle").map(([member, why]) => `${member} (${why})`);
 		return [...(running.length ? [`${capped(running, 4)} (running)`] : []), ...(stalled.length ? [capped(stalled, 4, " · ")] : [])].join(" · ") || undefined;
@@ -3056,7 +3066,10 @@ export class TeamRuntime {
 			if (!ids.length) fail("NO_NEW_DEPENDENCY", "All requested signal outcomes were already delivered to this work version");
 			for (const id of ids) if (!team.ledger.signals.has(id)) fail("UNKNOWN_SIGNAL", `Unknown signal ${id}`);
 			const cycle = team.ledger.findCycle(ref, [], ids);
-			if (cycle) fail("DEPENDENCY_CYCLE", `Dependency cycle: ${cycle.join(" -> ")}`);
+			if (cycle) {
+				this.note(team, `${member.id} wait rejected: dependency cycle ${capped(cycle, 8, " → ")}`);
+				fail("DEPENDENCY_CYCLE", `Dependency cycle: ${cycle.join(" -> ")}`, [{ kind: "cycle", reason: cycle.join(" -> ") }]);
+			}
 			team.ledger.get(ref.workId)!.stagedWait = { revision: ref.revision, refs: [], signals: [...ids] };
 			active.intent = { kind: "yield_signals", work: ref, waitingForSignals: [...action.waitingForSignals], checkpoint: action.checkpoint, toolCallId };
 			version.updatedAt = this.timestamp();

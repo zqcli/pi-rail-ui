@@ -17,7 +17,7 @@ import {
 	writeWebSocketRoute,
 } from "../helpers/native-loader-harness";
 
-// Regression for native extension loading with the Pi 0.87.1 runtime. The
+// Regression for native extension loading with the Pi 1.5.2 runtime. The
 // production-only layout ensures the host's package resolution is exercised.
 // Pi's native extension loader (jiti) virtualizes only the pi-ai
 // root/compat/oauth/providers entrypoints, so any `@earendil-works/pi-ai/api/*`
@@ -29,7 +29,7 @@ import {
 // runtime dependency closure, no pi-ai.
 //
 // The Pi runtime is passed in explicitly rather than derived from the repo, so
-// the same cases run against the repo's pinned 0.87.1 devDependency without the
+// the same cases run against the repo's pinned 1.5.2 devDependency without the
 // repo copy leaking into the run. The default suite never downloads anything.
 //
 // A generation is never started: children receive only a `get_state` RPC and the
@@ -70,7 +70,7 @@ interface LoadedExtensions {
 }
 
 function repoRuntime(): RuntimePackage {
-	return { packageDir: join(REPO_ROOT, "node_modules/@earendil-works/pi-coding-agent"), version: "0.87.1" };
+	return { packageDir: join(REPO_ROOT, "node_modules/@earendil-works/pi-coding-agent"), version: "1.5.2" };
 }
 
 /** Read the installed version so a mismatched runtime path cannot pass silently. */
@@ -356,7 +356,7 @@ async function runPositiveMatrix(t: TestContext, runtime: RuntimePackage, source
 	});
 }
 
-test("Pi 0.87.1 native loaders boot the real installed extension from a production-only layout", { timeout: 300_000 }, async (t) => {
+test("Pi 1.5.2 native loaders boot the real installed extension from a production-only layout", { timeout: 300_000 }, async (t) => {
 	await runPositiveMatrix(t, repoRuntime(), REPO_ROOT);
 });
 

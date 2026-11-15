@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
-import { createAssistantMessageEventStream, Type, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
@@ -16,6 +16,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { installRailContinue, railContinueLabel, railContinueStatus } from "../../commands/rail-continue";
 
 type HoldPoint = "input" | "message_end" | "turn_end" | "agent_end" | "agent_before_settle" | "tool" | "compaction";

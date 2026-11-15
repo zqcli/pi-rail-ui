@@ -103,6 +103,7 @@ class FakeTerminal {
 	clearScreen(): void {}
 	setTitle(): void {}
 	setProgress(): void {}
+	setProgramStatus(): void {}
 	get kittyProtocolActive(): boolean { return false; }
 }
 

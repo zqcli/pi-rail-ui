@@ -1,4 +1,4 @@
-import { type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ReadonlyFooterDataProvider, type Theme } from "@earendil-works/pi-coding-agent";
+import { type ContextUsage, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ReadonlyFooterDataProvider, type Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { FOOTER_LAYOUT, RAIL_FOOTER_STYLE, type FooterStyle } from "../../config";
 import { fitToWidth } from "../../core/utils";
@@ -270,8 +270,19 @@ export async function openRailSessionModal(ctx: ExtensionCommandContext, pi: Ext
 	}
 }
 
+type FooterSessionStats = {
+	manager: ExtensionContext["sessionManager"];
+	sessionId: string;
+	leafId: string | null | undefined;
+	entryCount: number | undefined;
+	model: ExtensionContext["model"];
+	contextWindow: number | undefined;
+	usage: FooterUsageStats;
+	contextUsage: ContextUsage | undefined;
+};
+
 class RailFooterComponent {
-	private usageCache?: { entryCount: number; lastEntry: any; stats: FooterUsageStats } | undefined;
+	private sessionStats?: FooterSessionStats;
 	private disposed = false;
 	private readonly unsubscribe?: () => void;
 	private readonly unsubscribeKeepAlive: () => void;
@@ -300,24 +311,37 @@ class RailFooterComponent {
 	}
 
 	invalidate(): void {
-		// Usage stats are keyed by session entries below; recomputing them on
-		// every invalidate would rescan the whole session each frame.
+		// Like Pi's native footer, session stats survive ordinary TUI invalidation.
 	}
 
-	private usageStats(): FooterUsageStats {
-		const entries = footerUsageEntries(this.ctx);
-		const lastEntry = entries[entries.length - 1];
-		let cache = this.usageCache;
-		if (!cache || cache.entryCount !== entries.length || cache.lastEntry !== lastEntry) {
-			cache = { entryCount: entries.length, lastEntry, stats: usageStatsFromEntries(entries) };
-			this.usageCache = cache;
+	private getSessionStats(): FooterSessionStats {
+		const manager = this.ctx.sessionManager;
+		// Pi 1.5.2 exposes this O(1) method at runtime but omits it from ReadonlySessionManager.
+		const entryCount = (manager as typeof manager & { getEntryCount?: () => number }).getEntryCount?.();
+		const sessionId = manager.getSessionId();
+		const leafId = manager.getLeafId?.();
+		const model = this.ctx.model;
+		const contextWindow = model?.contextWindow;
+		const cached = this.sessionStats;
+		if (entryCount !== undefined && leafId !== undefined && cached
+			&& cached.manager === manager && cached.sessionId === sessionId && cached.leafId === leafId
+			&& cached.entryCount === entryCount && cached.model === model && cached.contextWindow === contextWindow) {
+			return cached;
 		}
-		return cache.stats;
+		// Entries are append-only. No history copy/projection occurs before the cache check.
+		return this.sessionStats = {
+			manager, sessionId, leafId, entryCount, model, contextWindow,
+			usage: usageStatsFromEntries(footerUsageEntries(this.ctx)),
+			contextUsage: model?.api === "pi-virtual" ? undefined : this.ctx.getContextUsage(),
+		};
 	}
 
 	render(width: number): string[] {
-		const state = collectFooterLiveState(this.ctx, this.pi, this.footerData);
-		return renderSimpleFooter(width, state, this.usageStats(), RAIL_FOOTER_STYLE,
+		const stats = this.getSessionStats();
+		// ExtensionContext does not expose the routed physical model; its limits can change independently.
+		const contextUsage = this.ctx.model?.api === "pi-virtual" ? this.ctx.getContextUsage() : stats.contextUsage;
+		const state = collectFooterLiveState(this.ctx, this.pi, this.footerData, { contextUsage });
+		return renderSimpleFooter(width, state, stats.usage, RAIL_FOOTER_STYLE,
 			keepAliveLabel(this.ctx.sessionManager), railContinueLabel(this.ctx.sessionManager));
 	}
 

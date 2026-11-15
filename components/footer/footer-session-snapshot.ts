@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
+import type { ContextUsage, ExtensionAPI, ExtensionContext, ReadonlyFooterDataProvider } from "@earendil-works/pi-coding-agent";
 import { FOOTER_LAYOUT } from "../../config";
 import { fitToWidth } from "../../core/utils";
 
@@ -147,11 +147,12 @@ export function collectFooterUsageStats(ctx: ExtensionContext): FooterUsageStats
 	return usageStatsFromEntries(footerUsageEntries(ctx));
 }
 
-export function collectFooterLiveState(ctx: ExtensionContext, pi: ExtensionAPI, footerData?: ReadonlyFooterDataProvider, options: { details?: boolean } = {}): FooterLiveState {
+export function collectFooterLiveState(ctx: ExtensionContext, pi: ExtensionAPI, footerData?: ReadonlyFooterDataProvider, options: { details?: boolean; contextUsage?: ContextUsage | undefined } = {}): FooterLiveState {
 	const rawCwd = ctx.sessionManager.getCwd?.() ?? ctx.cwd;
 	const home = process.env["HOME"] || process.env["USERPROFILE"];
 	const includeDetails = options.details === true;
-	const contextUsage = ctx.getContextUsage();
+	// An explicitly cached undefined (no model/known window) is also a cache hit.
+	const contextUsage = "contextUsage" in options ? options.contextUsage : ctx.getContextUsage();
 	let activeTools: string[] = [];
 	let allToolCount = 0;
 	let usingSubscription = false;
@@ -195,7 +196,8 @@ export function collectFooterLiveState(ctx: ExtensionContext, pi: ExtensionAPI, 
 		cwd: home && rawCwd.startsWith(home) ? `~${rawCwd.slice(home.length)}` : rawCwd,
 		cwdShort: path.basename(ctx.cwd) || ctx.cwd,
 		branch: footerData?.getGitBranch?.(),
-		sessionName: ctx.sessionManager.getSessionName?.(),
+		// Only the modal displays the name; Pi searches the session history for it.
+		sessionName: includeDetails ? ctx.sessionManager.getSessionName?.() : undefined,
 		idle: ctx.isIdle(),
 		pending: ctx.hasPendingMessages?.() === true,
 		modelId,

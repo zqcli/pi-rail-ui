@@ -464,8 +464,9 @@ async function retryBroker(retryWait?: typeof import("../../tools/subagents/retr
 }
 
 async function waitUntil(check: () => boolean): Promise<void> {
-	for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(check(), true, "expected state became ready");
+	const deadline = performance.now() + 1000;
+	while (!check() && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 1));
+	assert.equal(check(), true, "expected state became ready within 1000 ms");
 }
 
 test("broker keeps queue ownership through backoff and rearms controls only for the new native attempt", { timeout: 2000 }, async () => {
@@ -603,9 +604,10 @@ test("cancellation and context-reset retirement retain the begun retry count", {
 	for (const outcome of ["abort", "context-failure"] as const) {
 		const { root, broker, instance, transport } = await retryBroker(async () => undefined);
 		const cancellation = new AbortController();
+		const pending = broker.dispatch({ target: instance.agentId, task: "original", signal: cancellation.signal, contextWindow: 64000 });
+		// Drain shutdown rejection if readiness fails; the original promise is still asserted below.
+		const settled = pending.catch(() => undefined);
 		try {
-			const pending = broker.dispatch({ target: instance.agentId, task: "original", signal: cancellation.signal, contextWindow: 64000 });
-			const rejected = outcome === "context-failure" ? assert.rejects(pending, /confirmation failed/) : undefined;
 			await waitUntil(() => transport.prompts.length === 1);
 			transport.settle("503 service unavailable");
 			await waitUntil(() => transport.prompts.length === 2);
@@ -613,7 +615,7 @@ test("cancellation and context-reset retirement retain the begun retry count", {
 			if (outcome === "context-failure") {
 				transport.failResetCommand = true;
 				transport.settle();
-				await rejected;
+				await assert.rejects(pending, /confirmation failed/);
 				assert.equal(broker.hasLocalWorker(instance.agentId), false);
 			} else {
 				cancellation.abort();
@@ -623,7 +625,7 @@ test("cancellation and context-reset retirement retain the begun retry count", {
 			}
 			assert.equal(broker.runtimeStatus(instance.agentId).retryCount, 1);
 			assert.equal(broker.runtimeStatus(instance.agentId).retry, undefined);
-		} finally { await broker.shutdown(); await rm(root, { recursive: true, force: true }); }
+		} finally { await broker.shutdown(); await settled; await rm(root, { recursive: true, force: true }); }
 	}
 });
 

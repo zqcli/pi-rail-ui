@@ -3,8 +3,7 @@ import { test } from "node:test";
 import {
 	HOSTED_SEARCH_ENTRY_TYPE,
 	HostedSearchActivity,
-	HostedSearchSseObserver,
-	observeActiveHostedSearchEvent,
+	observeHostedSearchEvent,
 	hostedSearchActivityForMessage,
 	hostedSearchCallsFromEntry,
 	resetHostedSearchActivities,
@@ -13,90 +12,35 @@ import {
 	type HostedSearchSnapshot,
 } from "../../openai/hosted-search-activity";
 
-function sse(event: string, data: unknown): string {
-	return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-test("active hosted search observation accepts transport-neutral Responses events", () => {
+test("observes hosted search calls, actions, sources, and terminal response", () => {
 	resetHostedSearchActivities();
 	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
 	setActiveHostedSearchActivity(activity);
-	observeActiveHostedSearchEvent("custom", "gpt-5.6-luna", {
-		type: "response.output_item.done",
-		item: { id: "ws_native", type: "web_search_call", status: "completed", action: { type: "search", query: "native ws" } },
-	});
-	observeActiveHostedSearchEvent("other", "gpt-5.6-luna", {
-		type: "response.output_item.done",
-		item: { id: "ignored", type: "web_search_call", status: "completed" },
-	});
-	assert.equal(activity.observed, true);
-	assert.equal(activity.snapshot().callCount, 1);
-	assert.equal(activity.snapshot().calls[0]?.query, "native ws");
-});
-
-test("parses chunked hosted search calls, actions, sources, and terminal response", () => {
-	resetHostedSearchActivities();
-	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
-	setActiveHostedSearchActivity(activity);
-	const observer = new HostedSearchSseObserver(activity);
-	const payload = [
-		sse("response.created", { type: "response.created", response: { id: "resp_1" } }),
-		sse("response.output_item.added", {
-			type: "response.output_item.added",
-			item: { id: "ws_1", type: "web_search_call", status: "in_progress" },
-		}),
-		sse("response.web_search_call.searching", {
-			type: "response.web_search_call.searching",
-			item_id: "ws_1",
-		}),
-		sse("response.output_item.done", {
+	for (const event of [
+		{ type: "response.created", response: { id: "resp_1" } },
+		{ type: "response.output_item.added", item: { id: "ws_1", type: "web_search_call", status: "in_progress" } },
+		{ type: "response.web_search_call.searching", item_id: "ws_1" },
+		{
 			type: "response.output_item.done",
 			item: {
-				id: "ws_1",
-				type: "web_search_call",
-				status: "completed",
-				action: {
-					type: "search",
-					query: "latest codex commit",
-					sources: [{ title: "Codex", url: "https://github.com/openai/codex" }],
-				},
+				id: "ws_1", type: "web_search_call", status: "completed",
+				action: { type: "search", query: "latest codex commit", sources: [{ title: "Codex", url: "https://github.com/openai/codex" }] },
 			},
-		}),
-		sse("response.output_item.done", {
+		},
+		{
 			type: "response.output_item.done",
-			item: {
-				id: "ws_2",
-				type: "web_search_call",
-				status: "completed",
-				action: { type: "open_page", url: "https://github.com/openai/codex/commits/main" },
-			},
-		}),
-		sse("response.content_part.done", {
+			item: { id: "ws_2", type: "web_search_call", status: "completed", action: { type: "open_page", url: "https://github.com/openai/codex/commits/main" } },
+		},
+		{
 			type: "response.content_part.done",
-			part: {
-				type: "output_text",
-				annotations: [{ type: "url_citation", title: "Commit", url: "https://github.com/openai/codex/commit/abc" }],
-			},
-		}),
-		sse("response.completed", {
-			type: "response.completed",
-			response: { id: "resp_1", completed_at: 2, output: [] },
-		}),
-	].join("");
-	const bytes = new TextEncoder().encode(payload);
-	for (const byte of bytes) observer.push(Uint8Array.of(byte));
-	observer.end();
+			part: { type: "output_text", annotations: [{ type: "url_citation", title: "Commit", url: "https://github.com/openai/codex/commit/abc" }] },
+		},
+		{ type: "response.completed", response: { id: "resp_1", completed_at: 2, output: [] } },
+	]) observeHostedSearchEvent(activity, event);
 
 	assert.deepEqual(activity.snapshot(), {
-		version: 1,
-		responseId: "resp_1",
-		assistantTimestamp: undefined,
-		callCount: 2,
-		provider: "custom",
-		model: "gpt-5.6-luna",
-		phase: "completed",
-		startedAt: 1000,
-		endedAt: 2000,
+		version: 1, responseId: "resp_1", assistantTimestamp: undefined, callCount: 2,
+		provider: "custom", model: "gpt-5.6-luna", phase: "completed", startedAt: 1000, endedAt: 2000,
 		calls: [
 			{ id: "ws_1", status: "completed", type: "search", query: "latest codex commit", url: undefined },
 			{ id: "ws_2", status: "completed", type: "open_page", query: undefined, url: "https://github.com/openai/codex/commits/main" },
@@ -111,31 +55,22 @@ test("parses chunked hosted search calls, actions, sources, and terminal respons
 	assert.equal(hostedSearchActivityForMessage({ provider: "custom", model: "gpt-5.6-luna", responseId: "resp_1" }), activity);
 });
 
-test("ignores malformed SSE and remains invisible without a real web_search_call", () => {
+test("ignores unrelated and malformed parsed events without a real web_search_call", () => {
 	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
-	const observer = new HostedSearchSseObserver(activity);
-	observer.push("event: response.output_item.done\r\ndata: not-json\r\n\r\n");
-	observer.push("data: [DONE]\n\n");
-	observer.end();
+	for (const event of [null, "not an event", [], {}, { type: "response.output_item.done", item: null }, { type: "response.completed" }]) {
+		observeHostedSearchEvent(activity, event);
+	}
 	assert.equal(activity.observed, false);
 	assert.equal(activity.phase, "pending");
 });
 
 test("sanitizes C1 controls and keeps generic provider error messages", () => {
 	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
-	const observer = new HostedSearchSseObserver(activity);
-	observer.push(sse("response.output_item.done", {
+	observeHostedSearchEvent(activity, {
 		type: "response.output_item.done",
-		item: {
-			id: "ws_error",
-			type: "web_search_call",
-			status: "completed",
-			action: { type: "search", query: "safe\u009dhidden" },
-		},
-	}));
-	observer.push(sse("error", { type: "error", message: "provider\u009cexploded" }));
-	observer.end();
-
+		item: { id: "ws_error", type: "web_search_call", status: "completed", action: { type: "search", query: "safe\u009dhidden" } },
+	});
+	observeHostedSearchEvent(activity, { type: "error", message: "provider\u009cexploded" });
 	const snapshot = activity.snapshot();
 	assert.equal(snapshot.calls[0]?.query, "safehidden");
 	assert.equal(snapshot.phase, "failed");
@@ -144,26 +79,15 @@ test("sanitizes C1 controls and keeps generic provider error messages", () => {
 
 test("keeps a failed search call failed when the response completes", () => {
 	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
-	const observer = new HostedSearchSseObserver(activity);
-	observer.push(sse("response.output_item.done", {
+	observeHostedSearchEvent(activity, {
 		type: "response.output_item.done",
-		item: {
-			id: "ws_failed",
-			type: "web_search_call",
-			status: "failed",
-			action: { type: "search", queries: ["alpha", "beta"] },
-		},
-	}));
-	observer.push(sse("response.output_text.annotation.added", {
+		item: { id: "ws_failed", type: "web_search_call", status: "failed", action: { type: "search", queries: ["alpha", "beta"] } },
+	});
+	observeHostedSearchEvent(activity, {
 		type: "response.output_text.annotation.added",
 		annotation: { type: "url_citation", title: "Observed", url: "https://example.com/observed" },
-	}));
-	observer.push(sse("response.completed", {
-		type: "response.completed",
-		response: { id: "resp_failed_search", completed_at: 2, output: [] },
-	}));
-	observer.end();
-
+	});
+	observeHostedSearchEvent(activity, { type: "response.completed", response: { id: "resp_failed_search", completed_at: 2, output: [] } });
 	const snapshot = activity.snapshot();
 	assert.equal(snapshot.phase, "failed");
 	assert.equal(snapshot.error, "Search call failed");
@@ -177,26 +101,25 @@ test("preserves a persisted cancelled phase when a call failed before abort", ()
 	activity.upsertCall("ws_failed", "failed", { type: "search", query: "before abort" });
 	activity.cancel(3000);
 	const snapshot = activity.snapshot();
-
 	assert.equal(snapshot.phase, "cancelled");
 	assert.deepEqual(HostedSearchActivity.restore(snapshot).snapshot(), snapshot);
 });
 
-test("drops oversized malformed SSE frames and resumes at the next event", () => {
-	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna" });
-	const observer = new HostedSearchSseObserver(activity);
-	observer.push(`data: ${"x".repeat(2_000_100)}`);
-	observer.push(`\n\ndata: ${JSON.stringify({
-		type: "response.output_item.done",
-		item: {
-			id: "ws_after_oversize",
-			type: "web_search_call",
-			status: "completed",
-			action: { type: "search", query: "still parsed" },
-		},
-	})}\n\n`);
-	observer.end();
-	assert.equal(activity.snapshot().calls[0]?.query, "still parsed");
+test("collects final search output from raw WebSocket done and incomplete events", () => {
+	for (const type of ["response.done", "response.incomplete"]) {
+		const activity = new HostedSearchActivity({ provider: "custom", model: "gpt", startedAt: 1000 });
+		observeHostedSearchEvent(activity, {
+			type,
+			response: { id: "resp_ws", completed_at: 2, output: [{
+				type: "web_search_call", id: "ws_terminal", status: "completed",
+				action: { type: "find_in_page", pattern: "result", url: "https://example.com/" },
+			}] },
+		});
+		assert.equal(activity.snapshot().callCount, 1);
+		assert.equal(activity.snapshot().calls[0]?.query, "result");
+		assert.equal(activity.snapshot().sources[0]?.url, "https://example.com/");
+		assert.equal(activity.phase, "completed");
+	}
 });
 
 test("restores persisted activities by response id without treating entries as messages", () => {
@@ -343,18 +266,17 @@ test("keeps a failed call past the display cap from being overwritten by respons
 	resetHostedSearchActivities();
 	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt-5.6-luna", startedAt: 1000 });
 	setActiveHostedSearchActivity(activity);
-	const observer = new HostedSearchSseObserver(activity);
 	for (let index = 0; index < 24; index++) {
-		observer.push(sse("response.web_search_call.completed", {
+		observeHostedSearchEvent(activity, {
 			type: "response.web_search_call.completed",
 			item_id: `ws_${index}`,
-		}));
+		});
 	}
-	observer.push(sse("response.web_search_call.in_progress", {
+	observeHostedSearchEvent(activity, {
 		type: "response.web_search_call.in_progress",
 		item_id: "ws_beyond",
-	}));
-	observer.push(sse("response.output_item.done", {
+	});
+	observeHostedSearchEvent(activity, {
 		type: "response.output_item.done",
 		item: {
 			id: "ws_beyond",
@@ -362,12 +284,11 @@ test("keeps a failed call past the display cap from being overwritten by respons
 			status: "failed",
 			action: { type: "search", query: "beyond cap" },
 		},
-	}));
-	observer.push(sse("response.completed", {
+	});
+	observeHostedSearchEvent(activity, {
 		type: "response.completed",
 		response: { id: "resp_beyond", completed_at: 2, output: [] },
-	}));
-	observer.end();
+	});
 
 	const snapshot = activity.snapshot();
 	assert.equal(snapshot.callCount, 25);

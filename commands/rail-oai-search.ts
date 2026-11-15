@@ -204,7 +204,6 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 			mode = action === "probe" ? "live" : action;
 			probeNextRequest = action === "probe";
 			searchRunning = false;
-			capture.sync(ctx, mode !== "off" && supportsNativeGptSearch(ctx.model));
 			updateStatus(ctx);
 			if (action === "probe") {
 				if (ctx.hasUI) ctx.ui.notify("Rail native search probe armed for the next eligible request.", "info");
@@ -220,7 +219,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 		searchRunning = false;
 		probeNextRequest = false;
 		restoreHostedSearchActivities(ctx.sessionManager.getBranch());
-		capture.sync(ctx, false);
+		capture.shutdown();
 		updateStatus(ctx);
 	});
 
@@ -230,14 +229,16 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 
 	pi.on("model_select", async (_event, ctx) => {
 		searchRunning = false;
-		capture.sync(ctx, mode !== "off" && supportsNativeGptSearch(ctx.model));
 		updateStatus(ctx);
 	});
 
 	pi.on("turn_start", async (_event, ctx) => {
 		turnActive = true;
-		capture.sync(ctx, mode !== "off" && supportsNativeGptSearch(ctx.model));
-		capture.startTurn();
+		capture.startTurn(ctx);
+	});
+
+	pi.on("provider_stream_event", (event) => {
+		capture.observe(event);
 	});
 
 	pi.on("message_start", async (event) => {
@@ -253,6 +254,7 @@ export function installRailOaiSearch(pi: ExtensionAPI): void {
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
+		capture.shutdown();
 		turnActive = false;
 		searchRunning = false;
 		updateStatus(ctx);

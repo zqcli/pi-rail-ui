@@ -6,7 +6,6 @@ export const HOSTED_SEARCH_ENTRY_VERSION = 1;
 const MAX_CALLS = 24;
 const MAX_SOURCES = 32;
 const MAX_TEXT_LENGTH = 1000;
-const MAX_SSE_FRAME_LENGTH = 2_000_000;
 
 export type HostedSearchPhase = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type HostedSearchActionType = "search" | "open_page" | "find_in_page" | "other";
@@ -76,7 +75,6 @@ export class HostedSearchActivity {
 	private readonly countedCallIds = new Set<string>();
 	private readonly sourcesByUrl = new Map<string, HostedSearchSource>();
 	private readonly listeners = new Set<ActivityListener>();
-	private readonly observerTasks = new Set<Promise<void>>();
 	private responseIdValue: string | undefined;
 	private assistantTimestampValue: number | undefined;
 	private phaseValue: HostedSearchPhase;
@@ -237,15 +235,6 @@ export class HostedSearchActivity {
 		else if (!this.terminal) this.complete();
 	}
 
-	observe(task: Promise<void>): void {
-		const tracked = task.catch(() => undefined).finally(() => this.observerTasks.delete(tracked));
-		this.observerTasks.add(tracked);
-	}
-
-	async waitForObservers(): Promise<void> {
-		await Promise.all([...this.observerTasks]);
-	}
-
 	snapshot(): HostedSearchSnapshot {
 		return {
 			version: HOSTED_SEARCH_ENTRY_VERSION,
@@ -316,81 +305,6 @@ function annotationsFrom(value: unknown): Array<{ url: unknown; title?: unknown 
 	return annotations;
 }
 
-export class HostedSearchSseObserver {
-	private readonly decoder = new TextDecoder();
-	private buffer = "";
-	private discardingOversizedFrame = false;
-	private doneValue = false;
-
-	constructor(private readonly activity: HostedSearchActivity) {}
-
-	get done(): boolean { return this.doneValue; }
-
-	push(chunk: Uint8Array | string): void {
-		if (this.doneValue) return;
-		this.buffer += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
-		this.drain(false);
-	}
-
-	end(): void {
-		if (this.doneValue) return;
-		this.buffer += this.decoder.decode();
-		this.drain(true);
-	}
-
-	private drain(flush: boolean): void {
-		for (;;) {
-			if (this.discardingOversizedFrame) {
-				const discarded = /\r?\n\r?\n/u.exec(this.buffer);
-				if (!discarded) {
-					this.buffer = this.buffer.slice(-3);
-					break;
-				}
-				this.buffer = this.buffer.slice(discarded.index + discarded[0].length);
-				this.discardingOversizedFrame = false;
-				continue;
-			}
-			const match = /\r?\n\r?\n/u.exec(this.buffer);
-			if (!match) {
-				if (this.buffer.length > MAX_SSE_FRAME_LENGTH) {
-					this.buffer = this.buffer.slice(-3);
-					this.discardingOversizedFrame = true;
-				}
-				break;
-			}
-			const frame = this.buffer.slice(0, match.index);
-			this.buffer = this.buffer.slice(match.index + match[0].length);
-			if (frame.length <= MAX_SSE_FRAME_LENGTH) this.handleFrame(frame);
-			if (this.doneValue) {
-				this.buffer = "";
-				break;
-			}
-		}
-		if (flush && !this.discardingOversizedFrame && this.buffer.trim()) {
-			if (this.buffer.length <= MAX_SSE_FRAME_LENGTH) this.handleFrame(this.buffer);
-			this.buffer = "";
-		}
-	}
-
-	private handleFrame(frame: string): void {
-		const data = frame
-			.split(/\r?\n/u)
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).replace(/^ /u, ""))
-			.join("\n");
-		if (!data) return;
-		if (data === "[DONE]") {
-			this.doneValue = true;
-			return;
-		}
-		try {
-			observeHostedSearchEvent(this.activity, JSON.parse(data));
-		} catch {
-			// Capture is observational; malformed provider events must not affect the model stream.
-		}
-	}
-}
-
 function observeHostedSearchOutputItem(activity: HostedSearchActivity, item: unknown): void {
 	if (!isRecord(item)) return;
 	if (item["type"] === "web_search_call") {
@@ -428,7 +342,7 @@ export function observeHostedSearchEvent(activity: HostedSearchActivity, value: 
 		if (citation) activity.addSource(citation.url, citation.title);
 		return;
 	}
-	if (type === "response.completed" && isRecord(value["response"])) {
+	if ((type === "response.completed" || type === "response.done" || type === "response.incomplete") && isRecord(value["response"])) {
 		const response = value["response"];
 		activity.setResponseId(response["id"]);
 		for (const item of Array.isArray(response["output"]) ? response["output"] : []) observeHostedSearchOutputItem(activity, item);
@@ -459,15 +373,6 @@ export function resetHostedSearchActivities(): void {
 
 export function setActiveHostedSearchActivity(activity: HostedSearchActivity | undefined): void {
 	activeActivity = activity;
-}
-
-export function observeActiveHostedSearchEvent(provider: string, model: string, value: unknown): void {
-	if (!activeActivity || activeActivity.provider !== provider || activeActivity.model !== model) return;
-	try {
-		observeHostedSearchEvent(activeActivity, value);
-	} catch {
-		// Observation must never affect the provider stream.
-	}
 }
 
 export function indexHostedSearchActivity(activity: HostedSearchActivity): void {

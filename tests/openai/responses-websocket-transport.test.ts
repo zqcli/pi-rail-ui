@@ -67,6 +67,10 @@ test("Responses WebSocket proxy resolution follows scheme-specific proxy precede
 		https_proxy: undefined,
 		NO_PROXY: undefined,
 		no_proxy: undefined,
+		NPM_CONFIG_WSS_PROXY: undefined,
+		NPM_CONFIG_HTTPS_PROXY: undefined,
+		NPM_CONFIG_PROXY: undefined,
+		NPM_CONFIG_NO_PROXY: undefined,
 		npm_config_wss_proxy: undefined,
 		npm_config_https_proxy: undefined,
 		npm_config_proxy: undefined,
@@ -119,7 +123,7 @@ test("Responses WebSocket transport reuses a session connection and sends an inp
 		sessionId,
 		useCachedContext: true,
 		onStart: () => undefined,
-		onEvent: (event) => observedEvents.push(String(event.type)),
+		onEvent: (event) => { observedEvents.push(String(event.type)); },
 		responseItems: () => [{ type: "message", role: "assistant", content: "answer" }],
 	});
 	await new Promise((resolve) => setTimeout(resolve, 20));

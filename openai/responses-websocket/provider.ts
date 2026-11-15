@@ -27,7 +27,7 @@ import {
 	responsesShared,
 	simpleOptions,
 } from "../../core/pi-ai-internal";
-import { observeActiveHostedSearchEvent } from "../hosted-search-activity";
+import { PROVIDER_STREAM_EVENTS } from "../provider-stream-events";
 import {
 	readRailResponsesWebSocketSettings,
 	routeMatchesModel,
@@ -42,7 +42,7 @@ import {
 
 const { createGrammarToolInputProperties } = constrainedSampling;
 const { clampOpenAIPromptCacheKey } = promptCache;
-const { convertResponsesMessages, convertResponsesTools, processResponsesStream } = responsesShared;
+const { convertResponsesMessages, convertResponsesTools, getResponsesToolSupport, processResponsesStream } = responsesShared;
 const { buildBaseOptions } = simpleOptions;
 const { formatProviderError, normalizeProviderError } = providerErrors;
 const { getProviderEnvValue } = providerEnv;
@@ -54,9 +54,10 @@ const BASE_TOOL_CALL_PROVIDERS = ["openai", "openai-codex", "opencode"];
 
 type InstallClaim = { claimed: boolean };
 type RequestBody = Record<string, unknown> & { input?: unknown[]; previous_response_id?: string };
+type RegisteredProviderConfig = NonNullable<ReturnType<ExtensionContext["modelRegistry"]["getRegisteredProviderConfig"]>>;
 type ProviderLease = {
 	providerId: string;
-	previousConfig: ProviderConfig | undefined;
+	previousConfig: RegisteredProviderConfig | undefined;
 	wrapper: NonNullable<ProviderConfig["streamSimple"]>;
 };
 
@@ -64,7 +65,8 @@ export function resolveResponsesWebSocketCache(options: OpenAIResponsesOptions |
 	useCachedContext: boolean;
 	sessionId?: string;
 } {
-	const useCachedContext = options?.cacheRetention !== "none"
+	const useCachedContext = !options?.disableContinuation
+		&& options?.cacheRetention !== "none"
 		&& (options?.transport === "websocket-cached" || options?.transport === "auto" || options?.transport === undefined);
 	return {
 		useCachedContext,
@@ -129,7 +131,7 @@ function buildRequestBody(
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 ): RequestBody {
 	const compat = getCompat(model);
-	const transcriptTools = resolveTranscriptTools(context.messages, compat.supportsAdditionalTools || compat.supportsToolSearch);
+	const transcriptTools = resolveTranscriptTools(context.messages, getResponsesToolSupport(compat));
 	const messages = convertResponsesMessages(model, context, toolCallProviders(model), {
 		grammarToolInputProperties,
 		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
@@ -271,7 +273,7 @@ export function streamResponsesWebSocketRoute(
 						includeSystemPrompt: false,
 						grammarToolInputProperties,
 					}).filter((item) => item.type !== "function_call_output" && item.type !== "custom_tool_call_output"),
-					onEvent: (event) => observeActiveHostedSearchEvent(model.provider, model.id, event),
+					onEvent: (event) => options?.onProviderStreamEvent?.(event, model),
 				});
 				request = attempt;
 				try {
@@ -373,12 +375,15 @@ export function installRailResponsesWebSocket(pi: ExtensionAPI): void {
 			const current = ctx.modelRegistry.getRegisteredProviderConfig(lease.providerId);
 			if (!current || current.streamSimple !== lease.wrapper) continue;
 			const { streamSimple: _streamSimple, api: currentApi, ...rest } = current;
-			const restored: ProviderConfig = { ...lease.previousConfig, ...rest };
+			const restored: RegisteredProviderConfig = { ...lease.previousConfig, ...rest };
 			if (currentApi !== RESPONSES_API && currentApi !== undefined) restored.api = currentApi;
 			else if (lease.previousConfig?.api !== undefined) restored.api = lease.previousConfig.api;
 			if (lease.previousConfig?.streamSimple) restored.streamSimple = lease.previousConfig.streamSimple;
 			pi.unregisterProvider(lease.providerId);
-			if (Object.keys(restored).length > 0) pi.registerProvider(lease.providerId, restored);
+			// Pi 1.5.2's registry permits an explicit undefined samplingParams on a
+			// chat model; its extension declaration omits that optional union. Keep
+			// the registry config intact, including image/classifier models and hooks.
+			if (Object.keys(restored).length > 0) pi.registerProvider(lease.providerId, restored as ProviderConfig);
 		}
 		leases.clear();
 	};
@@ -391,7 +396,7 @@ export function installRailResponsesWebSocket(pi: ExtensionAPI): void {
 			if (ctx.modelRegistry.getRegisteredNativeProvider(providerId)) continue;
 			const previousConfig = ctx.modelRegistry.getRegisteredProviderConfig(providerId);
 			const changesExistingModelApis = previousConfig?.api !== RESPONSES_API
-				&& previousConfig?.models?.some((model) => model.api === undefined) === true;
+				&& previousConfig?.models?.some((model) => (model.type === undefined || model.type === "chat") && model.api === undefined) === true;
 			const shadowsAnotherStream = previousConfig?.streamSimple !== undefined
 				&& previousConfig.api !== RESPONSES_API;
 			if (changesExistingModelApis || shadowsAnotherStream) continue;
@@ -401,6 +406,7 @@ export function installRailResponsesWebSocket(pi: ExtensionAPI): void {
 					? streamSimpleRoute(route, original.stream, original.streamSimple, model, context, options)
 					: original.streamSimple(model, context, options);
 			};
+			Object.defineProperty(wrapper, PROVIDER_STREAM_EVENTS, { value: true });
 			pi.registerProvider(providerId, {
 				api: RESPONSES_API,
 				streamSimple: wrapper,

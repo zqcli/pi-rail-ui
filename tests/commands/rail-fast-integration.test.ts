@@ -10,7 +10,7 @@ import { RpcSessionWorker, buildRpcWorkerArgs } from "../../tools/subagents/rpc-
 import { createStatelessAgentRunner } from "../../tools/subagents/stateless-runner";
 import { railFastExtensionPath } from "../../commands/rail-fast";
 import { railOaiSearchExtensionPath } from "../../commands/rail-oai-search";
-import { HostedSearchActivity, HostedSearchSseObserver } from "../../openai/hosted-search-activity";
+import { HostedSearchActivity, observeHostedSearchEvent } from "../../openai/hosted-search-activity";
 import type { RailModelRef } from "../../tools/subagents/models";
 import type { WorkerStartSpec } from "../../tools/subagents/session-broker";
 
@@ -38,7 +38,7 @@ function hostedSearchRequested(body: Record<string, unknown>): boolean {
 // Each search-enabled response carries exactly one complete hosted web_search_call
 // item with a stable id plus the assistant's final text. The same bytes are read by
 // Pi's Responses parser (which ignores web_search_call items but must still surface
-// the final text) and by the rail-oai-search HostedSearchSseObserver (which must
+// the final text) and by the public provider_stream_event search observer (which must
 // count the stable id once, not once per lifecycle event and not once per output copy).
 function responseEvents(text: string, responseId: string, options: { search: boolean }): string {
 	const searchId = `${responseId}-web-search`;
@@ -90,9 +90,9 @@ function responseEvents(text: string, responseId: string, options: { search: boo
 
 test("real stateless and persistent children apply fast mode and hosted search only to eligible GPT requests", { timeout: 30_000 }, async (t) => {
 	const observed = new HostedSearchActivity({ provider: model.provider, model: model.modelId });
-	const observer = new HostedSearchSseObserver(observed);
-	observer.push(responseEvents("observed probe", "resp_observe", { search: true }));
-	observer.end();
+	for (const line of responseEvents("observed probe", "resp_observe", { search: true }).split("\n")) {
+		if (line.startsWith("data: ")) observeHostedSearchEvent(observed, JSON.parse(line.slice(6)));
+	}
 	const snapshot = observed.snapshot();
 	assert.equal(snapshot.callCount, 1);
 	assert.deepEqual(snapshot.calls, [{

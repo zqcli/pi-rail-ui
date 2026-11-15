@@ -70,7 +70,7 @@ export interface ResponsesWebSocketRequestOptions {
 	useCachedContext: boolean;
 	responseItems(outputResponseId: string): unknown[];
 	onStart(): void;
-	onEvent?(event: ResponseStreamEvent): void;
+	onEvent?(event: ResponseStreamEvent): void | Promise<void>;
 }
 
 const connectionCache = new Map<string, Map<string, ConnectionEntry>>();
@@ -498,7 +498,7 @@ function createEventStream(
 	socket: WebSocket,
 	signal: AbortSignal | undefined,
 	idleTimeoutMs: number | undefined,
-	onEvent?: (event: ResponseStreamEvent) => void,
+	onEvent?: (event: ResponseStreamEvent) => void | Promise<void>,
 ): { events: AsyncGenerator<ResponseStreamEvent>; dispose(): void } {
 	const queue: ResponseStreamEvent[] = [];
 	let wake: (() => void) | undefined;
@@ -513,11 +513,6 @@ function createEventStream(
 	const onMessage = (data: RawData) => {
 		try {
 			const parsed = JSON.parse(decodeRawData(data)) as ResponseStreamEvent;
-			try {
-				onEvent?.(parsed);
-			} catch {
-				// Event observation must not affect the provider stream.
-			}
 			const type = typeof parsed.type === "string" ? String(parsed.type) : "";
 			if (type === "response.completed" || type === "response.done" || type === "response.incomplete") {
 				sawTerminal = true;
@@ -564,7 +559,9 @@ function createEventStream(
 			for (;;) {
 				if (signal?.aborted) throw new Error("Request was aborted");
 				if (queue.length > 0) {
-					yield queue.shift()!;
+					const event = queue.shift()!;
+					await onEvent?.(event);
+					yield event;
 					continue;
 				}
 				if (done) break;

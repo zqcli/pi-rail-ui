@@ -1,316 +1,145 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { setImmediate } from "node:timers/promises";
 import { test } from "node:test";
-import { normalizeContext, type Provider, type SimpleStreamOptions, type TranscriptContext } from "@earendil-works/pi-ai";
-import type { ProviderConfig } from "@earendil-works/pi-coding-agent";
-import {
-	HostedSearchProviderCapture,
-	createHostedSearchObservedFetch,
-} from "../../openai/hosted-search-capture";
-import { HostedSearchActivity } from "../../openai/hosted-search-activity";
+import { normalizeContext, type Api, type Model } from "@earendil-works/pi-ai";
+import { stream as streamOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
+import type { ExtensionContext, ProviderStreamEvent } from "@earendil-works/pi-coding-agent";
+import { HostedSearchProviderCapture } from "../../openai/hosted-search-capture";
+import { hostedSearchActivityForMessage } from "../../openai/hosted-search-activity";
 
-const model: any = {
-	provider: "custom",
-	api: "openai-responses",
-	id: "gpt-5.6-luna",
-	name: "GPT 5.6 Luna",
+const model: Model<"openai-responses"> = {
+	provider: "custom", api: "openai-responses", id: "gpt-test", name: "GPT Test",
+	baseUrl: "https://example.test/v1", reasoning: false, input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 1024,
+};
+const searchItem = {
+	id: "ws_search", type: "web_search_call", status: "completed",
+	action: { type: "search", query: "网络搜索", sources: [{ title: "Result", url: "https://example.com/result" }] },
 };
 
-function eventStream(...events: unknown[]): Response {
-	const body = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
-	return new Response(body, { headers: { "content-type": "text/event-stream" } });
+function rawEvent(data: unknown, requestModel: Model<Api> = model): ProviderStreamEvent {
+	return { type: "provider_stream_event", provider: requestModel.provider, api: requestModel.api, model: requestModel.id, data };
 }
 
-function fakeRuntime(options: { previousConfig?: any; native?: Provider } = {}) {
-	const configs = new Map<string, any>();
-	if (options.previousConfig) configs.set("custom", options.previousConfig);
-	let lastOptions: SimpleStreamOptions | undefined;
-	let lastContext: TranscriptContext | undefined;
-	const provider: Provider = {
-		id: "custom",
-		name: "Custom",
-		auth: {} as any,
-		getModels: () => [model],
-		stream: () => ({}) as any,
-		streamSimple: (_model, _context, streamOptions) => {
-			lastOptions = streamOptions;
-			lastContext = _context;
-			return { original: true } as any;
-		},
-	};
-	const registry = {
-		getProvider: () => provider,
-		getRegisteredProviderConfig: () => configs.get("custom"),
-		getRegisteredNativeProvider: () => options.native,
-	};
-	const calls: string[] = [];
-	const pi = {
-		registerProvider: (providerId: string, config: any) => {
-			calls.push(`register:${providerId}`);
-			configs.set(providerId, { ...(configs.get(providerId) ?? {}), ...config });
-		},
-		unregisterProvider: (providerId: string) => {
-			calls.push(`unregister:${providerId}`);
-			configs.delete(providerId);
-		},
-	};
-	const ctx: any = { model, modelRegistry: registry, ui: { setStatus() {} } };
-	return { configs, provider, registry, pi, ctx, calls, getLastOptions: () => lastOptions, getLastContext: () => lastContext };
-}
-
-test("observed fetch returns the original response and captures hosted search SSE", async () => {
-	const activityEvents: string[] = [];
-	const runtime = fakeRuntime();
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged: (activity) => activityEvents.push(activity.phase),
-	});
-	capture.startTurn();
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	const wrapper = runtime.configs.get("custom").streamSimple;
-	const response = eventStream(
-		{ type: "response.created", response: { id: "resp_capture" } },
-		{
-			type: "response.output_item.done",
-			item: {
-				id: "ws_capture",
-				type: "web_search_call",
-				status: "completed",
-				action: { type: "open_page", url: "https://example.com/current" },
-			},
-		},
-		{ type: "response.completed", response: { id: "resp_capture", completed_at: 2, output: [] } },
-	);
-	assert.deepEqual(wrapper(model, normalizeContext({ messages: [] }), { fetch: async () => response }), { original: true });
-	const fetch = runtime.getLastOptions()!.fetch!;
-	const observedFetch = createHostedSearchObservedFetch(
-		async () => response,
-		new HostedSearchActivity({ provider: "custom", model: "gpt" }),
-	);
-	assert.equal(await observedFetch("https://example.com/v1/responses"), response);
-
-	const providerResponse = await fetch("https://example.com/v1/responses");
-	assert.equal(providerResponse instanceof Response, true);
-	const snapshot = await capture.finishTurn({
-		provider: "custom",
-		model: "gpt-5.6-luna",
-		responseId: "resp_capture",
-		stopReason: "stop",
-	});
-	assert.equal(snapshot?.phase, "completed");
-	assert.equal(snapshot?.calls[0]?.type, "open_page");
-	assert.equal(snapshot?.sources[0]?.url, "https://example.com/current");
-	assert.equal(activityEvents.includes("running"), true);
-});
-
-test("provider wrapper forwards the normalized transcript and preserves callbacks and options", () => {
-	const runtime = fakeRuntime();
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged() {},
-	});
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	const wrapper: NonNullable<ProviderConfig["streamSimple"]> = runtime.configs.get("custom").streamSimple;
-	const context = normalizeContext({
-		systemPrompt: "keep the prompt",
-		messages: [
-			{ role: "user", content: "question", timestamp: 1 },
-			{ role: "system", content: "later system update", timestamp: 2 },
-		],
-	});
-	const options: SimpleStreamOptions = {
-		fetch: async () => new Response("local fixture"),
-		apiKey: "fixture-key",
-		sessionId: "fixture-session",
-		cacheRetention: "long",
-		reasoning: "high",
-		signal: new AbortController().signal,
-		headers: { "x-test": "preserved" },
-		maxTokens: 123,
-		onPayload: (payload) => payload,
-		onResponse: () => {},
-	};
-	Object.freeze(options);
-	wrapper(model, context);
-	assert.equal(runtime.getLastOptions(), undefined);
-	wrapper(model, context, options);
-	assert.equal(runtime.getLastContext(), context);
-	assert.equal(runtime.getLastOptions(), options);
-	capture.startTurn();
-	wrapper(model, context, options);
-	const forwarded = runtime.getLastOptions()!;
-	assert.equal(runtime.getLastContext(), context);
-	assert.notEqual(forwarded.fetch, options.fetch);
-	assert.deepEqual({ ...forwarded, fetch: options.fetch }, options);
-	assert.equal(forwarded.onPayload, options.onPayload);
-	assert.equal(forwarded.onResponse, options.onResponse);
-	capture.shutdown();
-});
-
-test("active capture uses global fetch when options are absent and bypasses disabled models", async (t) => {
-	const response = new Response("fixture");
-	const baseFetch = t.mock.fn(async () => response);
-	t.mock.method(globalThis, "fetch", baseFetch);
-	const runtime = fakeRuntime();
-	let enabled = true;
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
+function setupCapture(requestModel: Model<Api> = model, enabled = true) {
+	const phases: string[] = [];
+	const capture = new HostedSearchProviderCapture({ registerProvider() { throw new Error("unexpected provider registration"); } } as any, {
 		isEnabled: () => enabled,
-		onActivityChanged() {},
+		onActivityChanged: (activity) => phases.push(activity.phase),
 	});
-	t.after(() => capture.shutdown());
-	capture.sync(runtime.ctx, true);
-	capture.startTurn();
-	const wrapper: NonNullable<ProviderConfig["streamSimple"]> = runtime.configs.get("custom").streamSimple;
-	const context = normalizeContext({ messages: [] });
-	wrapper(model, context);
-	const forwardedFetch = runtime.getLastOptions()!.fetch!;
-	const init = { headers: { "x-test": "unchanged" } };
-	assert.equal(await forwardedFetch("https://example.com/other", init), response);
-	assert.deepEqual(baseFetch.mock.calls[0]?.arguments, ["https://example.com/other", init]);
-	assert.equal(runtime.getLastContext(), context);
-	enabled = false;
-	const options: SimpleStreamOptions = { maxTokens: 10 };
-	wrapper(model, context, options);
-	assert.equal(runtime.getLastOptions(), options);
-	wrapper(model, context);
-	assert.equal(runtime.getLastOptions(), undefined);
+	const ctx = { model: requestModel, modelRegistry: { getRegisteredProviderConfig: () => undefined } } as unknown as ExtensionContext;
+	capture.startTurn(ctx);
+	return { capture, phases, ctx };
+}
+
+test("public capture scopes events to the active model and associates the assistant before any raw event", async () => {
+	const { capture, phases } = setupCapture();
+	const assistant = { provider: model.provider, model: model.id, timestamp: 123, stopReason: "stop" };
+	capture.associateMessage(assistant);
+	capture.observe(rawEvent({ type: "response.output_item.done", item: searchItem }, { ...model, provider: "other" }));
+	capture.observe(rawEvent({ type: "response.output_item.done", item: searchItem }, { ...model, id: "other" }));
+	capture.observe(rawEvent({ type: "response.output_item.done", item: searchItem }, { ...model, api: "openai-completions" }));
+	assert.equal(phases.includes("running"), false);
+	capture.observe(rawEvent({ type: "response.web_search_call.searching", item_id: searchItem.id }));
+	capture.observe(rawEvent({ type: "response.output_item.done", item: searchItem }));
+	const snapshot = await capture.finishTurn(assistant);
+	assert.equal(snapshot?.phase, "completed");
+	assert.equal(snapshot?.callCount, 1);
+	assert.equal(snapshot?.assistantTimestamp, 123);
+	assert.equal(snapshot?.calls[0]?.query, "网络搜索");
+	assert.equal(hostedSearchActivityForMessage(assistant)?.observed, true);
+	assert.equal(phases.includes("running"), true);
+	capture.observe(rawEvent({ type: "response.output_item.done", item: { ...searchItem, id: "idle" } }));
+	assert.equal(await capture.finishTurn(assistant), undefined);
 });
 
-test("settles observation on DONE even when the SSE connection stays open", async () => {
-	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt" });
-	const encoder = new TextEncoder();
-	const response = new Response(new ReadableStream({
-		start(controller) {
-			controller.enqueue(encoder.encode(
-				`data: ${JSON.stringify({
-					type: "response.output_item.done",
-					item: { id: "ws_done", type: "web_search_call", status: "completed", action: { type: "search", query: "done" } },
-				})}\n\ndata: [DONE]\n\n`,
-			));
+test("public capture supports Azure, Codex, and custom Responses providers without overriding them", async () => {
+	for (const api of ["openai-responses", "azure-openai-responses", "openai-codex-responses", "custom-responses"] as Api[]) {
+		const requestModel = { ...model, api };
+		const { capture } = setupCapture(requestModel);
+		capture.observe(rawEvent({ type: "response.output_item.done", item: searchItem }, requestModel));
+		assert.equal((await capture.finishTurn({ provider: model.provider, model: model.id, stopReason: "stop" }))?.callCount, 1);
+	}
+	const { capture } = setupCapture(model, false);
+	capture.observe(rawEvent({ type: "response.output_item.done", item: searchItem }));
+	assert.equal(await capture.finishTurn({ provider: model.provider, model: model.id, stopReason: "stop" }), undefined);
+});
+
+test("message finalization preserves failures and cancellation when the stream has no terminal event", async () => {
+	for (const [stopReason, phase] of [["error", "failed"], ["aborted", "cancelled"], ["length", "completed"]] as const) {
+		const { capture } = setupCapture();
+		capture.observe(rawEvent({ type: "response.web_search_call.searching", item_id: searchItem.id }));
+		const snapshot = await capture.finishTurn({ provider: model.provider, model: model.id, stopReason, errorMessage: "provider failed" });
+		assert.equal(snapshot?.phase, phase);
+		assert.equal(snapshot?.callCount, 1);
+		if (phase === "failed") assert.equal(snapshot?.error, "provider failed");
+	}
+});
+
+test("new turns discard abandoned activity and do not persist search-free responses", async () => {
+	const { capture, ctx } = setupCapture();
+	capture.observe(rawEvent({ type: "response.output_item.done", item: searchItem }));
+	capture.startTurn(ctx);
+	capture.observe(rawEvent({ type: "response.created", response: { id: "resp_no_search" } }));
+	assert.equal(await capture.finishTurn({ provider: model.provider, model: model.id, stopReason: "stop" }), undefined);
+});
+
+test("Pi parses chunked HTTP SSE once and awaits hosted search observation before message completion", { timeout: 5_000 }, async (t) => {
+	const textItem = {
+		id: "msg_test", type: "message", role: "assistant", status: "completed",
+		content: [{ type: "output_text", text: "Search answer", annotations: [] }],
+	};
+	const events = [
+		{ type: "response.created", response: { id: "resp_sse" } },
+		{ type: "response.web_search_call.in_progress", item_id: searchItem.id },
+		{ type: "response.web_search_call.searching", item_id: searchItem.id },
+		{ type: "response.output_item.done", item: searchItem },
+		{ type: "response.output_item.done", output_index: 1, item: textItem },
+		{ type: "response.completed", response: {
+			id: "resp_sse", status: "completed", completed_at: 2, output: [searchItem, textItem],
+			usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+		} },
+	];
+	const wire = Buffer.from(events.map((event) => `event: ${event.type}\r\ndata: ${JSON.stringify(event)}\r\n\r\n`).join("") + "data: [DONE]\r\n\r\n");
+	const server = createServer(async (_request, response) => {
+		response.writeHead(200, { "content-type": "text/event-stream" });
+		for (let index = 0; index < wire.length; index += 7) {
+			response.write(wire.subarray(index, index + 7));
+			await setImmediate();
+		}
+		response.end();
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("SSE fixture did not bind");
+	const requestModel = { ...model, baseUrl: `http://127.0.0.1:${address.port}/v1` };
+	const { capture, phases } = setupCapture(requestModel);
+	const observed: unknown[] = [];
+	const stream = streamOpenAIResponses(requestModel, normalizeContext({ messages: [{ role: "user", content: "search", timestamp: 1 }] }), {
+		apiKey: "fixture-key",
+		onProviderStreamEvent: async (data, providerModel) => {
+			await setImmediate();
+			observed.push(data);
+			capture.observe(rawEvent(data, providerModel));
 		},
-	}), { headers: { "content-type": "text/event-stream" } });
-	const fetch = createHostedSearchObservedFetch(async () => response, activity);
-	await fetch("https://example.com/v1/responses");
-	await Promise.race([
-		activity.waitForObservers(),
-		new Promise((_, reject) => setTimeout(() => reject(new Error("observer did not settle on DONE")), 100)),
-	]);
-	assert.equal(activity.snapshot().calls[0]?.query, "done");
-});
-
-test("settles observation when the provider request is aborted", async () => {
-	const activity = new HostedSearchActivity({ provider: "custom", model: "gpt" });
-	const controller = new AbortController();
-	const response = new Response(new ReadableStream({
-		start(streamController) {
-			streamController.enqueue(new TextEncoder().encode(
-				`data: ${JSON.stringify({
-					type: "response.output_item.added",
-					item: { id: "ws_abort", type: "web_search_call", status: "in_progress" },
-				})}\n\n`,
-			));
-		},
-	}), { headers: { "content-type": "text/event-stream" } });
-	const fetch = createHostedSearchObservedFetch(async () => response, activity);
-	await fetch("https://example.com/v1/responses", { signal: controller.signal });
-	controller.abort();
-	await Promise.race([
-		activity.waitForObservers(),
-		new Promise((_, reject) => setTimeout(() => reject(new Error("observer did not settle on abort")), 100)),
-	]);
-	assert.equal(activity.phase, activity.observed ? "running" : "pending");
-});
-
-test("restores the previous legacy provider stream while Rail still owns that field", () => {
-	const previousStream = () => ({ previous: true }) as any;
-	const runtime = fakeRuntime({ previousConfig: { api: "openai-responses", streamSimple: previousStream, baseUrl: "old" } });
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged() {},
 	});
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	assert.notEqual(runtime.configs.get("custom").streamSimple, previousStream);
-	capture.restore();
-	assert.equal(runtime.configs.get("custom").streamSimple, previousStream);
-	assert.equal(runtime.configs.get("custom").baseUrl, "old");
-	assert.deepEqual(runtime.calls, ["register:custom", "unregister:custom", "register:custom"]);
-});
-
-test("does not override native extension providers or clobber a newer stream owner", () => {
-	const nativeRuntime = fakeRuntime({ native: fakeRuntime().provider });
-	const nativeCapture = new HostedSearchProviderCapture(nativeRuntime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged() {},
-	});
-	assert.equal(nativeCapture.sync(nativeRuntime.ctx, true), false);
-	assert.deepEqual(nativeRuntime.calls, []);
-
-	const runtime = fakeRuntime();
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged() {},
-	});
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	const newerStream = () => ({ newer: true }) as any;
-	const newer = { ...runtime.configs.get("custom"), streamSimple: newerStream, baseUrl: "new-owner" };
-	runtime.configs.set("custom", newer);
-	capture.restore();
-	assert.equal(runtime.configs.get("custom"), newer);
-	assert.deepEqual(runtime.calls, ["register:custom"]);
-});
-
-test("keeps a merged non-stream overlay without stacking another wrapper", () => {
-	const runtime = fakeRuntime();
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged() {},
-	});
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	const wrapper = runtime.configs.get("custom").streamSimple;
-	const mergedOverlay = { ...runtime.configs.get("custom"), baseUrl: "https://new-overlay.example/v1" };
-	runtime.configs.set("custom", mergedOverlay);
-
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	assert.equal(runtime.configs.get("custom"), mergedOverlay);
-	assert.equal(runtime.configs.get("custom").streamSimple, wrapper);
-	assert.deepEqual(runtime.calls, ["register:custom"]);
-	capture.restore();
-	assert.equal(runtime.configs.get("custom").baseUrl, "https://new-overlay.example/v1");
-	assert.equal(runtime.configs.get("custom").streamSimple, undefined);
-});
-
-test("reacquires capture after a newer stream owner replaces the wrapper", () => {
-	const runtime = fakeRuntime();
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged() {},
-	});
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	const newerStream = () => ({ newer: true }) as any;
-	runtime.configs.set("custom", {
-		...runtime.configs.get("custom"),
-		baseUrl: "https://new-owner.example/v1",
-		streamSimple: newerStream,
-	});
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	assert.notEqual(runtime.configs.get("custom").streamSimple, newerStream);
-	capture.restore();
-	assert.equal(runtime.configs.get("custom").baseUrl, "https://new-owner.example/v1");
-	assert.equal(runtime.configs.get("custom").streamSimple, newerStream);
-});
-
-test("reinstalls for a different Responses API and declines Codex WebSocket capture", () => {
-	const runtime = fakeRuntime();
-	const capture = new HostedSearchProviderCapture(runtime.pi as any, {
-		isEnabled: () => true,
-		onActivityChanged() {},
-	});
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	const openAiWrapper = runtime.configs.get("custom").streamSimple;
-	runtime.ctx.model = { ...model, api: "azure-openai-responses" };
-	assert.equal(capture.sync(runtime.ctx, true), true);
-	assert.notEqual(runtime.configs.get("custom").streamSimple, openAiWrapper);
-
-	runtime.ctx.model = { ...model, api: "openai-codex-responses" };
-	assert.equal(capture.sync(runtime.ctx, true), false);
-	assert.equal(runtime.configs.has("custom"), false);
+	let finished = false;
+	for await (const event of stream) {
+		if (event.type === "start") capture.associateMessage(event.partial);
+		if (event.type === "done") {
+			finished = true;
+			assert.deepEqual(observed, events);
+			assert.deepEqual(event.message.content.map((block) => block.type === "text" ? block.text : block.type), ["Search answer"]);
+			const snapshot = await capture.finishTurn(event.message);
+			assert.equal(snapshot?.phase, "completed");
+			assert.equal(snapshot?.callCount, 1);
+			assert.equal(snapshot?.calls[0]?.query, "网络搜索");
+			assert.deepEqual(snapshot?.sources, [{ title: "Result", url: "https://example.com/result" }]);
+		}
+		if (event.type === "error") assert.fail(event.error.errorMessage);
+	}
+	assert.equal(finished, true);
+	assert.equal(phases.includes("running"), true);
 });

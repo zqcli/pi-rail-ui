@@ -278,32 +278,28 @@ test("/rail-oai-search keeps the selected mode across model switches", async () 
 function setupSearch() {
 	let command: any;
 	const handlers = new Map<string, any>();
-	const providerConfigs = new Map<string, any>();
-	const provider = { streamSimple: () => ({}) };
+	const entries: any[] = [];
+	const statuses: Array<string | undefined> = [];
 	const pi: any = {
 		events: eventBus(),
 		registerCommand: (_name: string, definition: any) => { command = definition; },
 		registerFlag: () => undefined,
 		getFlag: () => undefined,
 		on: (event: string, handler: any) => handlers.set(event, handler),
-		registerProvider: (providerId: string, config: any) => providerConfigs.set(providerId, config),
-		unregisterProvider: (providerId: string) => providerConfigs.delete(providerId),
-		appendEntry: () => undefined,
+		registerProvider: () => { throw new Error("search observation must not replace a provider"); },
+		unregisterProvider: () => { throw new Error("search observation must not unregister a provider"); },
+		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 	};
 	const ctx: any = {
 		hasUI: false,
 		model: { provider: "custom", api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6" },
 		waitForIdle: async () => undefined,
-		sessionManager: { getBranch: () => [] },
-		modelRegistry: {
-			getProvider: () => provider,
-			getRegisteredProviderConfig: (providerId: string) => providerConfigs.get(providerId),
-			getRegisteredNativeProvider: () => undefined,
-		},
-		ui: { setStatus: () => undefined },
+		sessionManager: { getBranch: () => entries },
+		modelRegistry: { getRegisteredProviderConfig: () => undefined },
+		ui: { setStatus: (_key: string, status: string | undefined) => statuses.push(status), notify() {} },
 	};
 	installRailOaiSearch(pi);
-	return { command, handlers, ctx };
+	return { command, handlers, ctx, entries, statuses };
 }
 
 test("idle keep-alive refreshes keep hosted search and leave an armed probe for the next turn", async () => {
@@ -350,89 +346,30 @@ test("/reload keeps the session's search mode while other session starts use the
 	await handlers.get("session_shutdown")({ reason: "quit" }, ctx);
 });
 
-test("persists observed search state before the assistant entry without requiring a response id", async () => {
-	let command: any;
-	let lastStreamOptions: any;
-	const handlers = new Map<string, any>();
-	const providerConfigs = new Map<string, any>();
-	const entries: any[] = [];
-	const model: any = {
-		provider: "custom",
-		api: "openai-responses",
-		id: "gpt-5.6-luna",
-		name: "GPT 5.6 Luna",
-	};
-	const provider: any = {
-		streamSimple: (_model: unknown, _context: unknown, options: unknown) => {
-			lastStreamOptions = options;
-			return {};
-		},
-	};
-	const pi: any = {
-		events: eventBus(),
-		registerCommand: (_name: string, definition: any) => { command = definition; },
-		registerFlag: () => undefined,
-		getFlag: () => undefined,
-		on: (event: string, handler: any) => handlers.set(event, handler),
-		registerProvider: (providerId: string, config: any) => {
-			providerConfigs.set(providerId, { ...(providerConfigs.get(providerId) ?? {}), ...config });
-		},
-		unregisterProvider: (providerId: string) => providerConfigs.delete(providerId),
-		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
-	};
-	const ctx: any = {
-		hasUI: false,
-		model,
-		waitForIdle: async () => {},
-		sessionManager: { getBranch: () => entries },
-		modelRegistry: {
-			getProvider: () => provider,
-			getRegisteredProviderConfig: (providerId: string) => providerConfigs.get(providerId),
-			getRegisteredNativeProvider: () => undefined,
-		},
-		ui: { setStatus() {}, notify() {} },
-	};
-
-	installRailOaiSearch(pi);
+test("persists observed search before the assistant entry and updates the footer without a response id", async () => {
+	const { handlers, ctx, entries, statuses } = setupSearch();
+	ctx.hasUI = true;
 	await handlers.get("session_start")({}, ctx);
-	await command.handler("live", ctx);
 	await handlers.get("turn_start")({}, ctx);
-	const wrapper = providerConfigs.get("custom").streamSimple;
-	const body = [
-		`data: ${JSON.stringify({
-			type: "response.output_item.done",
-			item: {
-				id: "ws_no_response_id",
-				type: "web_search_call",
-				status: "completed",
-				action: { type: "search", query: "session persistence" },
-			},
-		})}\n\n`,
-		"data: [DONE]\n\n",
-	].join("");
-	wrapper(model, {}, {
-		fetch: async () => new Response(body, { headers: { "content-type": "text/event-stream" } }),
-	});
-	await lastStreamOptions.fetch("https://example.com/v1/responses");
-	const assistant = { role: "assistant", provider: "custom", model: "gpt-5.6-luna", timestamp: 4242, content: [], stopReason: "stop" };
+	const assistant = { role: "assistant", provider: "custom", model: "gpt-5.6-sol", timestamp: 4242, content: [], stopReason: "stop" };
 	await handlers.get("message_start")({ message: assistant }, ctx);
+	await handlers.get("provider_stream_event")({
+		type: "provider_stream_event", provider: "custom", api: "openai-responses", model: "gpt-5.6-sol",
+		data: { type: "response.output_item.done", item: {
+			id: "ws_no_response_id", type: "web_search_call", status: "completed",
+			action: { type: "search", query: "session persistence" },
+		} },
+	}, ctx);
+	assert.equal(statuses.at(-1), "SEARCHING");
 	await handlers.get("message_end")({ message: assistant }, ctx);
-
+	assert.equal(statuses.at(-1), "SEARCH LIVE");
 	assert.equal(entries.length, 1);
 	assert.equal(entries[0].data.responseId, undefined);
 	assert.equal(entries[0].data.assistantTimestamp, 4242);
 	assert.equal(entries[0].data.calls[0].query, "session persistence");
-	assert.equal(hostedSearchActivityForMessage({
-		provider: "custom",
-		model: "gpt-5.6-luna",
-		timestamp: 4242,
-	})?.observed, true);
+	assert.equal(hostedSearchActivityForMessage(assistant)?.observed, true);
 	await handlers.get("session_tree")({}, ctx);
-	assert.equal(hostedSearchActivityForMessage({
-		provider: "custom",
-		model: "gpt-5.6-luna",
-		timestamp: 4242,
-	})?.observed, true);
+	assert.equal(hostedSearchActivityForMessage(assistant)?.observed, true);
 	await handlers.get("turn_end")({}, ctx);
 	await handlers.get("session_shutdown")({}, ctx);
 });
@@ -487,56 +424,37 @@ test("startup flag selects hosted search before the first provider request, live
 	}
 });
 
-test("hosted search capture observes only eligible GPT Responses requests", async () => {
-	let command: any;
-	const handlers = new Map<string, any>();
-	const providerConfigs = new Map<string, any>();
-	let lastStreamOptions: any;
-	const provider: any = {
-		streamSimple: (_model: unknown, _context: unknown, options: unknown) => {
-			lastStreamOptions = options;
-			return {};
-		},
-	};
-	const pi: any = {
-		events: eventBus(),
-		registerCommand: (_name: string, definition: any) => { command = definition; },
-		registerFlag: () => undefined,
-		getFlag: () => undefined,
-		on: (event: string, handler: any) => handlers.set(event, handler),
-		registerProvider: (providerId: string, config: any) => {
-			providerConfigs.set(providerId, { ...(providerConfigs.get(providerId) ?? {}), ...config });
-		},
-		unregisterProvider: (providerId: string) => providerConfigs.delete(providerId),
-		appendEntry: () => undefined,
-	};
-	const ctx: any = {
-		hasUI: false,
-		model: { provider: "custom", api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" },
-		waitForIdle: async () => {},
-		sessionManager: { getBranch: () => [] },
-		modelRegistry: {
-			getProvider: () => provider,
-			getRegisteredProviderConfig: (providerId: string) => providerConfigs.get(providerId),
-			getRegisteredNativeProvider: () => undefined,
-		},
-		ui: { setStatus() {}, notify() {} },
-	};
-
-	installRailOaiSearch(pi);
+test("hosted search capture observes only eligible active GPT turns through public events", async () => {
+	const { command, handlers, ctx, entries } = setupSearch();
+	const models = [
+		{ provider: "custom", api: "openai-responses", id: "gpt-5.6-sol", name: "GPT 5.6 Sol" },
+		{ provider: "custom", api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" },
+		{ provider: "custom", api: "openai-completions", id: "gpt-4.1", name: "GPT 4.1" },
+		{ provider: "custom", api: "openai-codex-responses", id: "custom-latest", name: "GPT Custom" },
+	];
 	await handlers.get("session_start")({}, ctx);
-	await command.handler("live", ctx);
+	for (const [index, model] of models.entries()) {
+		ctx.model = model;
+		await handlers.get("model_select")({}, ctx);
+		const event = {
+			type: "provider_stream_event", provider: model.provider, api: model.api, model: model.id,
+			data: { type: "response.output_item.done", item: { id: `ws_${index}`, type: "web_search_call", status: "completed" } },
+		};
+		await handlers.get("provider_stream_event")(event, ctx);
+		await handlers.get("turn_start")({}, ctx);
+		await handlers.get("provider_stream_event")(event, ctx);
+		await handlers.get("message_end")({ message: { role: "assistant", provider: model.provider, model: model.id, stopReason: "stop" } }, ctx);
+		await handlers.get("turn_end")({}, ctx);
+	}
+	assert.deepEqual(entries.map((entry) => entry.data.model), ["gpt-5.6-sol", "custom-latest"]);
+	await command.handler("off", ctx);
 	await handlers.get("turn_start")({}, ctx);
-	const wrapper = providerConfigs.get("custom").streamSimple;
-	const baseOptions = {};
-	wrapper({ provider: "custom", api: "openai-responses", id: "gpt-5.6-sol" }, {}, baseOptions);
-	assert.equal(typeof (lastStreamOptions as any)?.fetch, "function", "eligible GPT request must be observed");
-	wrapper({ provider: "custom", api: "openai-responses", id: "deepseek-v4", name: "DeepSeek V4" }, {}, baseOptions);
-	assert.equal(lastStreamOptions, baseOptions, "non-GPT request must not be observed");
-	wrapper({ provider: "custom", api: "openai-completions", id: "gpt-4.1" }, {}, baseOptions);
-	assert.equal(lastStreamOptions, baseOptions, "blocklisted API must not be observed");
-	wrapper({ provider: "custom", api: "openai-responses", id: "custom-latest", name: "GPT Custom" }, {}, baseOptions);
-	assert.equal(typeof (lastStreamOptions as any)?.fetch, "function", "GPT Responses request must be observed");
+	await handlers.get("provider_stream_event")({
+		type: "provider_stream_event", provider: ctx.model.provider, api: ctx.model.api, model: ctx.model.id,
+		data: { type: "response.output_item.done", item: { id: "ws_disabled", type: "web_search_call", status: "completed" } },
+	}, ctx);
+	await handlers.get("message_end")({ message: { role: "assistant", provider: ctx.model.provider, model: ctx.model.id, stopReason: "stop" } }, ctx);
+	assert.equal(entries.length, 2);
 	await handlers.get("session_shutdown")({}, ctx);
 });
 

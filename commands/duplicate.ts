@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
@@ -9,8 +9,9 @@ export async function handleDuplicateCommand(ctx: ExtensionContext): Promise<voi
 		return;
 	}
 
-	// Pi writes the session file only once the first assistant message arrives.
-	if (!existsSync(currentSessionFile)) {
+	// Pi 1.5.2 persists the first user message. Keep Rail's existing admission
+	// rule explicit rather than inferring a reply from the file's existence.
+	if (!ctx.sessionManager.getEntries().some((entry) => entry.type === "message" && entry.message.role === "assistant")) {
 		ctx.ui.notify("Nothing to duplicate yet: the session has no assistant reply.", "warning");
 		return;
 	}

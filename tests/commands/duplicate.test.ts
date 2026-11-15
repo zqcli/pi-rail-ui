@@ -21,7 +21,7 @@ function populate(manager: SessionManager): SessionManager {
 		totalTokens: 15,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	// Persisting requires at least one assistant message (user-only buffers).
+	// A completed conversation is eligible for Rail duplication.
 	manager.appendMessage({ role: "user", content: "first prompt", timestamp: 1 });
 	manager.appendMessage({
 		role: "assistant",
@@ -54,13 +54,17 @@ test("duplicate before the first assistant reply explains why there is nothing t
 	const sessionDir = await makeSessionDir(t);
 	const source = SessionManager.create(join(sessionDir, "project"), sessionDir);
 	source.appendMessage({ role: "user", content: "first prompt", timestamp: 1 });
+	const beforeFiles = await readdir(sessionDir);
+	const sourceFile = source.getSessionFile()!;
+	const sourceBefore = await readFile(sourceFile, "utf8");
 	const notifications: Array<[string, string]> = [];
 	const ctx: any = { sessionManager: source, ui: { notify: (text: string, level: string) => notifications.push([text, level]) } };
 
 	await handleDuplicateCommand(ctx);
 
 	assert.deepEqual(notifications, [["Nothing to duplicate yet: the session has no assistant reply.", "warning"]]);
-	assert.deepEqual(await readdir(sessionDir), []);
+	assert.deepEqual(await readdir(sessionDir), beforeFiles, "no duplicate is created even though Pi persisted the user prompt");
+	assert.equal(await readFile(sourceFile, "utf8"), sourceBefore);
 });
 
 test("duplicate of a child session creates a sibling under the same original parent", async (t) => {

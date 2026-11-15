@@ -65,15 +65,19 @@ test("preserves native user Markdown transformers and outputPad", async () => {
 	};
 
 	await installUserMessageRail(extensionContextWithUserMessage(text, timestamp));
-	const component = new (UserMessageComponent as any)(text, undefined, 0, [transformer]);
-	const contentBox = component.children[0];
+	const messageId = "user-entry";
+	const entryTimestamp = new Date(timestamp).toISOString();
+	const component = new UserMessageComponent(text, undefined, 0, [transformer], messageId, entryTimestamp);
+	const markdown = component.children[0];
 	const rendered = stripAnsi(component.render(80).join("\n"));
 
-	assert.equal(contentBox.paddingX, 0);
+	assert.equal((markdown as any).paddingX, 0);
 	assert.match(rendered, /transformed user message/);
 	assert.deepEqual(transformContexts.at(-1), {
 		messageType: "user",
 		isStreaming: false,
 		availableWidth: 79,
+		messageId,
+		timestamp: entryTimestamp,
 	});
 });

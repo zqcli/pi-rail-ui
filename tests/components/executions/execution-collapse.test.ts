@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, before, describe, test } from "node:test";
-import { MouseRegion, Text, TuiAltScreen, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { getCapabilities, MouseRegion, setCapabilities, Text, TuiAltScreen, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { BashExecutionComponent, ToolExecutionComponent, initTheme } from "@earendil-works/pi-coding-agent";
 import {
 	AUTO_COLLAPSE_RENDERING_KEY,
@@ -96,6 +96,7 @@ class FakeTerminal {
 	clearScreen(): void {}
 	setTitle(): void {}
 	setProgress(): void {}
+	setProgramStatus(): void {}
 	get kittyProtocolActive(): boolean { return false; }
 }
 
@@ -449,6 +450,68 @@ describe("execution click handling", () => {
 			tui.stop();
 		}
 	});
+
+	test("keeps Pi's deferred argument rendering and final renderer metadata", async () => {
+		const calls: Array<{ label: string; context: any }> = [];
+		await installExecutionRails(darkToolTheme as any);
+		const tool = makeTool({
+			renderCall: (args: any, _theme: unknown, context: any) => {
+				calls.push({ label: args.label, context });
+				return new Text(args.label ?? "pending", 0, 0);
+			},
+		});
+		tool.setExpanded(true);
+		tool.render(50);
+		const before = calls.length;
+		tool.updateArgs({ label: "intermediate" });
+		tool.updateArgs({ label: "latest" });
+		assert.equal(calls.length, before, "argument deltas remain deferred until render");
+		assert.match(tool.render(50).join("\n"), /latest/);
+		assert.equal(calls.length, before + 1);
+		assert.equal(calls.at(-1)?.label, "latest");
+
+		tool.setArgsComplete();
+		tool.markExecutionStarted();
+		tool.updateResult({ content: [{ type: "text", text: "finished" }], isError: false, durationMs: 125 });
+		tool.render(50);
+		const context = calls.at(-1)!.context;
+		assert.equal(context.argsComplete, true);
+		assert.equal(context.executionStarted, true);
+		assert.equal(context.isPartial, false);
+		assert.equal(context.durationMs, 125);
+		assert.equal(context.toolCallId, "call-t");
+	});
+
+	for (const renderShell of ["default", "self"] as const) {
+		for (const protocol of ["kitty", "iterm2"] as const) {
+			test(`preserves native ${protocol} image rows through ${renderShell} shell collapse and expansion`, async () => {
+				const capabilities = getCapabilities();
+				setCapabilities({ ...capabilities, images: protocol });
+				try {
+					const tool = makeTool({ renderShell, renderCall: () => new Text("IMAGE TOOL", 0, 0) });
+					tool.updateResult({
+						content: [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aO2sAAAAASUVORK5CYII=" }],
+						isError: false,
+					});
+					tool.setExpanded(true);
+					const imageRows = (rows: string[]) => rows.filter((row) => row.includes("\x1b_G") || row.includes("\x1b]1337;File="));
+					const nativeImages = imageRows(tool.render(49));
+					assert.equal(nativeImages.length, 1);
+
+					await installExecutionRails(darkToolTheme as any);
+					assert.deepEqual(imageRows(tool.render(50)), nativeImages);
+					tool.setExpanded(false);
+					assert.deepEqual(imageRows(tool.render(50)), [], "collapsed Rail preview hides image content");
+					tool.setExpanded(true);
+					assert.deepEqual(imageRows(tool.render(50)), nativeImages);
+					tool.setShowImages(false);
+					assert.deepEqual(imageRows(tool.render(50)), []);
+				} finally {
+					setCapabilities(capabilities);
+				}
+			});
+		}
+	}
 
 	test("installed prototype handleMouse routes clicks through the seam and stays on native for press", async () => {
 		await installExecutionRails(darkToolTheme as any);

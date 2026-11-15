@@ -398,6 +398,8 @@ test("hands thinking clicks back to the native inner region when rail UI is off"
 });
 
 test("preserves native outputPad, transformers, streaming context, and length status", async () => {
+	const messageId = "assistant-entry";
+	const timestamp = "2026-01-03T09:30:00.000Z";
 	const transformContexts: any[] = [];
 	const transformer = (markdown: string, context: any) => {
 		transformContexts.push(context);
@@ -410,6 +412,8 @@ test("preserves native outputPad, transformers, streaming context, and length st
 		"Thinking...",
 		0,
 		[transformer],
+		messageId,
+		timestamp,
 	);
 	const message = {
 		role: "assistant",
@@ -426,17 +430,51 @@ test("preserves native outputPad, transformers, streaming context, and length st
 	assert.equal(nativeMarkdown.paddingX, 0);
 
 	const rendered = stripAnsi(component.render(80).join("\n"));
-	if ("markdownTransformers" in component) {
-		assert.match(rendered, /transformed reply/);
-		assert.deepEqual(transformContexts.at(-1), {
-			messageType: "assistant",
-			isStreaming: true,
-			availableWidth: 79,
-		});
-	} else {
-		assert.match(rendered, /native reply/);
-	}
+	assert.match(rendered, /transformed reply/);
+	assert.deepEqual(transformContexts.at(-1), {
+		messageType: "assistant",
+		isStreaming: true,
+		availableWidth: 79,
+		messageId,
+		timestamp,
+	});
 	assert.match(rendered, /truncated before completion|maximum output token limit/);
+});
+
+test("retains Pi Markdown instances and transformer context when a stream finishes", async () => {
+	const contexts: any[] = [];
+	const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", 0, [
+		(markdown, context) => {
+			contexts.push(context);
+			return `${markdown} (${context.isStreaming ? "streaming" : "complete"})`;
+		},
+	], "stream-entry", "2026-01-03T09:30:00.000Z");
+	const message: any = {
+		role: "assistant",
+		content: [{ type: "text", text: "first reply" }],
+		stopReason: "stop",
+	};
+
+	await installAssistantMessageRail(theme() as any);
+	component.updateContent(message, true);
+	const reply = () => (component as any).contentContainer.children.find((child: any) =>
+		resolveRailSection(child)?.kind === "assistantReply");
+	const markdown = reply().inner;
+	assert.match(stripAnsi(component.render(80).join("\n")), /first reply \(streaming\)/);
+
+	message.content[0].text = "final reply";
+	component.updateContent(message, false);
+	assert.equal(reply().inner, markdown, "Rail preserves Pi's reused Markdown component");
+	const completed = stripAnsi(component.render(80).join("\n"));
+	assert.match(completed, /final reply \(complete\)/);
+	assert.doesNotMatch(completed, /first reply|streaming/);
+	assert.deepEqual(contexts.at(-1), {
+		messageType: "assistant",
+		isStreaming: false,
+		availableWidth: 79,
+		messageId: "stream-entry",
+		timestamp: "2026-01-03T09:30:00.000Z",
+	});
 });
 
 test("decorates existing native assistant components after Rail is enabled again", async () => {

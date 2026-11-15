@@ -43,8 +43,7 @@ function getMarkdownSourceText(component: Component | undefined): string | undef
 }
 
 function getUserMessageMarkdown(component: UserMessageWithInternals): Component | undefined {
-	const container = component.children?.[0] as ({ children?: Component[] } | undefined);
-	const candidate = container?.children?.[0];
+	const candidate = component.children?.[0];
 	return typeof candidate?.render === "function" && getMarkdownSourceText(candidate) !== undefined
 		? candidate
 		: undefined;
@@ -96,8 +95,8 @@ function renderUserMessageWithSurface(
 			" ".repeat(textGapWidth) + padToWidth(timeLine, timestampWidth),
 		);
 		if (rows.length === 0) return [timestampRow];
-		// Native Box padding leaves a final row for the bottom padding. Put the
-		// timestamp immediately before it instead of rebuilding the whole box.
+		// Native Markdown leaves a final row for bottom padding. Keep the
+		// timestamp inside the message and before its final OSC 133 markers.
 		rows.splice(Math.max(0, rows.length - 1), 0, timestampRow);
 		return rows;
 	}, { markdown, nativeChildren: component.children });

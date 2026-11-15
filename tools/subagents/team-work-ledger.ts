@@ -147,7 +147,9 @@ export class WorkLedger {
 		const edges = (node: Node): Node[] => {
 			if ("signal" in node) {
 				const signal = this.signals.get(node.signal);
-				return signal?.state === "pending" ? waits(signal.work) : [];
+				// Replies are handled by serialized mailbox turns even while the recipient's Work is
+				// blocked. The sender's owning Work is not a producer dependency (nor a self-cycle).
+				return signal?.state === "pending" && !signal.reply ? waits(signal.work) : [];
 			}
 			const version = this.version(node.work);
 			return !version || isTerminalWorkState(version.state) ? [] : [...this.ownedChildren(node.work).map(workNode), ...waits(node.work)];

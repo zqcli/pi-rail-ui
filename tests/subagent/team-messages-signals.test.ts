@@ -379,3 +379,204 @@ test("signals: publication dependencies do not revive a runnable prerequisite's 
 	assert.equal(f.act(producer, { action: "signal", operation: "publish", signalId: signal.id, text: "phase complete" }).ok, true);
 	assert.deepEqual(ref(f.next()), ref(peer)); f.runtime.assertInvariants(f.teamId);
 });
+
+const messageId = (reply: TeamReply): string => {
+	assert.ok(reply.ok && reply.receipt?.status === "sent", JSON.stringify(reply));
+	return reply.receipt.messageId;
+};
+const openReply = (f: ReturnType<typeof fixture>, a: RuntimeActivation, id: string): SignalRecord => {
+	const reply = f.act(a, { action: "signal", operation: "open_reply", messageId: id });
+	assert.ok(reply.ok && reply.receipt?.status === "opened", JSON.stringify(reply));
+	return reply.data as SignalRecord;
+};
+/** Drain incidental Team/mailbox events, never substitute another Work for the expected one. */
+function nextFor(f: ReturnType<typeof fixture>, member: string, kind: "work" | "events"): RuntimeActivation {
+	for (let n = 0; n < 12; n++) {
+		const activation = f.next();
+		if (activation.binding.memberId === member && activation.scope.kind === kind) return activation;
+		assert.equal(activation.scope.kind, "events", "unexpected runnable Work");
+		assert.equal(f.act(activation, { action: "yield" }).ok, true); f.settle(activation);
+	}
+	throw new Error("expected activation did not arrive within the bounded event drain");
+}
+
+for (const when of ["before_open", "before_yield", "staged", "blocked"] as const) test(`reply handles: ${when} answer wakes the same Work without creating Work`, () => {
+	const f = fixture(["a"]); const a = f.next();
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "Which name?" }));
+	let signal = when === "before_open" ? undefined : openReply(f, a, question);
+	const b = f.next(); assert.equal(b.binding.memberId, "b");
+	if (when === "staged" || when === "blocked") {
+		assert.equal(f.yieldSignals(a, [signal!.id]).ok, true);
+		if (when === "blocked") {
+			f.settle(a); assert.equal(f.runtime.getWork(f.teamId, ref(a))!.current.state, "blocked");
+			assert.match(f.runtime.workWaits(f.teamId, ref(a))[0]!.reason!, /recipient b/);
+		}
+	}
+	const answerText = "x".repeat(4000);
+	const answer = messageId(f.act(b, { action: "message", to: "a", replyTo: question, text: answerText }));
+	if (!signal) signal = openReply(f, a, question);
+	assert.equal(f.runtime.getWork(f.teamId, ref(a))!.current.state, when === "blocked" ? "queued" : "running");
+	assert.equal(f.act(b, { action: "yield" }).ok, true); f.settle(b);
+	if (when === "before_open" || when === "before_yield") assert.equal(f.yieldSignals(a, [signal.id]).ok, true);
+	if (when !== "blocked") f.settle(a);
+	const resumed = nextFor(f, "a", "work");
+	assert.deepEqual(ref(resumed), ref(a));
+	assert.deepEqual(resumed.input.signalOutcomes?.[0]?.reply, { messageId: question, recipient: "b", replyId: answer });
+	assert.equal(resumed.input.signalOutcomes?.[0]?.text, answerText, "the complete reply is not truncated to the 1 KiB phase limit");
+	assert.deepEqual(f.runtime.getWork(f.teamId, ref(a))!.current.observedSignals, [signal.id]);
+	assert.deepEqual(f.runtime.getWork(f.teamId, ref(a))!.current.observedOutcomes, []);
+	assert.equal(f.runtime.getTeam(f.teamId).works.total, 1);
+	assert.equal(error(f.yieldSignals(resumed, [signal.id])), "NO_NEW_DEPENDENCY");
+	f.runtime.assertInvariants(f.teamId);
+});
+
+test("reply handles: reading, unrelated mail and normal mailbox completion do not rule out a delayed answer", () => {
+	const f = fixture(["a"]); const a = f.next();
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "Answer when available" }));
+	const first = f.next(); f.act(first, { action: "message", to: "a", text: "I am still checking" }); f.act(first, { action: "yield" }); f.settle(first);
+	const signal = openReply(f, a, question); assert.equal(signal.state, "pending", "opening after successful delivery still permits a future answer");
+	f.yieldSignals(a, [signal.id]); f.settle(a);
+	f.runtime.messageLead(f.teamId, "Ask b to finish the conversation"); const lead = nextFor(f, "lead", "events");
+	f.act(lead, { action: "message", to: "b", text: "You can answer now" }); f.act(lead, { action: "yield" }); f.settle(lead);
+	const second = nextFor(f, "b", "events");
+	assert.equal(f.runtime.getWork(f.teamId, ref(a))!.current.state, "blocked");
+	messageId(f.act(second, { action: "message", to: "a", replyTo: question, text: "Use Widget" }));
+	f.act(second, { action: "yield" }); f.settle(second);
+	assert.equal(nextFor(f, "a", "work").input.signalOutcomes?.[0]?.text, "Use Widget");
+});
+
+test("reply handles: a blocked recipient can answer from its mailbox without a false Work completion cycle", () => {
+	const f = fixture(); const a = f.next(), b = f.next();
+	f.act(b, { action: "yield", waitingFor: [ref(a)], checkpoint: "need a's result" }); f.settle(b);
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "Clarify the name before I finish" }));
+	const signal = openReply(f, a, question);
+	assert.equal(f.yieldSignals(a, [signal.id]).ok, true); f.settle(a);
+	const mailbox = nextFor(f, "b", "events");
+	messageId(f.act(mailbox, { action: "message", to: "a", replyTo: question, text: "Widget" }));
+	f.act(mailbox, { action: "yield" }); f.settle(mailbox);
+	const resumed = nextFor(f, "a", "work"); f.act(resumed, { action: "reply", result: { status: "succeeded", summary: "Used Widget" } }); f.settle(resumed);
+	assert.deepEqual(ref(nextFor(f, "b", "work")), ref(b));
+	assert.equal(f.runtime.getTeam(f.teamId).works.total, 2); f.runtime.assertInvariants(f.teamId);
+});
+
+test("reply handles: exact sender ownership, read/wait permissions and capacity-safe open retries", () => {
+	const f = fixture(["a", "b", "c"]); const a = f.next(), b = f.next(), c = f.next();
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "question" }));
+	const signal = openReply(f, a, question);
+	assert.equal(error(f.act(b, { action: "signal", operation: "open_reply", messageId: question })), "WRONG_WORK_OWNER");
+	assert.equal(error(f.act(c, { action: "message", to: "a", replyTo: question, text: "forged" })), "FORBIDDEN_ACTION");
+	assert.equal(error(f.act(a, { action: "signal", operation: "publish", signalId: signal.id, text: "self answer" })), "FORBIDDEN_ACTION");
+	assert.equal(error(f.yieldSignals(c, [signal.id])), "WRONG_WORK_OWNER");
+	assert.equal(error(f.act(c, { action: "status", view: "signal", id: signal.id })), "FORBIDDEN_ACTION");
+	const page = f.act(c, { action: "status", view: "signal" }); assert.ok(page.ok && page.data && "items" in page.data); assert.equal(page.data.items.length, 0);
+	for (let n = 1; n < TEAM_MAX_WORK_SIGNALS; n++) f.open(a, `phase ${n}`);
+	assert.equal(openReply(f, a, question).id, signal.id, "same-message retry succeeds even at the cap");
+	const args = { action: "signal", operation: "open_reply", messageId: question };
+	const first = f.runtime.handleAction(a.binding, a.scope, 100, "same-open", args, "same-native-call");
+	assert.deepEqual(f.runtime.handleAction(a.binding, a.scope, 100, "same-open", args, "same-native-call"), first);
+	assert.equal(error(f.act(b, { action: "signal", operation: "open_reply", messageId: "event:unknown" })), "UNKNOWN_MESSAGE");
+	f.runtime.assertInvariants(f.teamId);
+});
+
+for (const earlyHandle of [false, true]) for (const answerFirst of [false, true]) test(`reply handles: immutable first disposition (early handle ${earlyHandle}, answer first ${answerFirst})`, () => {
+	const f = fixture(["a"]); const a = f.next();
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "question" }));
+	const early = earlyHandle ? openReply(f, a, question) : undefined;
+	const b = f.next();
+	if (answerFirst) messageId(f.act(b, { action: "message", to: "a", replyTo: question, text: "first answer" }));
+	f.runtime.nativeSettled(b.binding, b.scope.activationId, { status: "error", error: { code: "NATIVE", message: "mailbox failed" } });
+	f.runtime.cleanupFinished(b.binding, b.scope.activationId, { ok: true });
+	f.runtime.reviveMember(f.teamId, "b");
+	f.act(a, { action: "message", to: "b", text: "continue conversation" }); const again = nextFor(f, "b", "events");
+	messageId(f.act(again, { action: "message", to: "a", replyTo: question, text: "later answer" }));
+	const signal = openReply(f, a, question); if (early) assert.equal(signal.id, early.id);
+	assert.equal(signal.state, answerFirst ? "published" : "unavailable");
+	assert.equal(answerFirst ? signal.text : signal.reply?.replyId, answerFirst ? "first answer" : undefined);
+	f.runtime.assertInvariants(f.teamId);
+});
+
+test("reply handles: member close after successful no-answer delivery wakes the waiter without an answer obligation", () => {
+	const f = fixture(["a"]); const a = f.next();
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "optional question" }));
+	const b = f.next(); f.act(b, { action: "yield" }); f.settle(b);
+	const signal = openReply(f, a, question); f.yieldSignals(a, [signal.id]); f.settle(a);
+	f.runtime.messageLead(f.teamId, "close b"); const lead = nextFor(f, "lead", "events");
+	assert.equal(f.act(lead, { action: "control", command: "close_member", memberId: "b" }).ok, true);
+	assert.equal(f.runtime.getWork(f.teamId, ref(a))!.current.state, "queued", "close wakes without a lazy status read");
+	const resumed = nextFor(f, "a", "work"); assert.equal(resumed.input.signalOutcomes?.[0]?.state, "unavailable");
+	f.runtime.assertInvariants(f.teamId);
+});
+
+test("reply handles: failed reply admission does not publish; a successful retry does", () => {
+	const f = fixture(); const a = f.next(), b = f.next();
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "question" })); const signal = openReply(f, a, question);
+	for (let n = 0; n < TEAM_MAX_MEMBER_MESSAGES; n++) messageId(f.act(b, { action: "message", to: "a", text: `notice ${n}` }));
+	assert.equal(error(f.act(b, { action: "message", to: "a", replyTo: question, text: "rejected answer" })), "REQUEST_QUEUE_FULL");
+	assert.equal(f.status(a, signal.id)?.state, "pending");
+	f.yieldSignals(a, [signal.id]); f.settle(a); const mailbox = nextFor(f, "a", "events"); f.act(mailbox, { action: "yield" }); f.settle(mailbox);
+	messageId(f.act(b, { action: "message", to: "a", replyTo: question, text: "accepted answer" }));
+	assert.equal(f.runtime.getWork(f.teamId, ref(b))!.current.state, "running", "answer does not end its producer's Work");
+	assert.equal(nextFor(f, "a", "work").input.signalOutcomes?.[0]?.text, "accepted answer");
+});
+
+for (const ending of ["finish", "cancel", "revise"] as const) test(`reply handles: sender ${ending} retires its exact unanswered message generation`, () => {
+	const f = fixture(["a"]); const a = f.next();
+	const question = messageId(f.act(a, { action: "message", to: "b", text: "old question" })); const signal = openReply(f, a, question);
+	f.runtime.messageLead(f.teamId, "control sender"); const lead = nextFor(f, "lead", "events");
+	if (ending === "finish") { f.act(a, { action: "reply", result: { status: "succeeded", summary: "no answer needed" } }); f.settle(a); }
+	else {
+		assert.equal(f.act(lead, { action: "control", command: ending === "cancel" ? "cancel_work" : "revise_work", workId: ref(a).workId,
+			expectedRevision: 1, ...(ending === "cancel" ? { reason: "no answer needed" } : { task: "new revision" }) }).ok, true);
+		assert.equal(error(f.act(a, { action: "signal", operation: "open_reply", messageId: question })), "ACTIVATION_ENDING"); f.settle(a, false);
+	}
+	assert.equal(f.status(lead, signal.id)?.state, "unavailable");
+	if (ending === "revise") {
+		const revised = nextFor(f, "a", "work");
+		assert.equal(error(f.act(revised, { action: "signal", operation: "open_reply", messageId: question })), "WRONG_WORK_OWNER");
+		assert.equal(error(f.yieldSignals(revised, [signal.id])), "WRONG_WORK_OWNER");
+	}
+	f.runtime.assertInvariants(f.teamId);
+});
+
+test("reply handles: strict codec distinguishes answer metadata from ordinary phase bounds", () => {
+	assert.deepEqual(normalizeTeamAction({ action: "signal", operation: "open_reply", messageId: "event:question" }), { action: "signal", operation: "open_reply", messageId: "event:question" });
+	for (const args of [{ operation: "open_reply" }, { operation: "open_reply", messageId: "event:q", name: "bad" }, { operation: "open", name: "phase", messageId: "event:q" }]) {
+		assert.throws(() => normalizeTeamAction({ action: "signal", ...args }));
+	}
+	const signal: SignalRecord = { id: "signal:reply", work: { workId: "work:a", revision: 1 }, author: "a", name: "Message answer", state: "published", createdAt: 1,
+		text: "a".repeat(4000), reply: { messageId: "event:q", recipient: "b", replyId: "event:answer" } };
+	const parse = (data: unknown) => parseTeamReply({ ok: true, from: "@hub", to: "a", data });
+	assert.ok(parse(signal).ok);
+	const { reply: _reply, ...phase } = signal; assert.throws(() => parse(phase), /invalid/);
+	const { text: _text, ...pending } = signal; assert.throws(() => parse({ ...pending, state: "pending" }), /state/);
+	assert.throws(() => parse({ ...signal, reply: { messageId: "event:q", recipient: "b" } }), /state/);
+	assert.throws(() => parse({ ...signal, reply: { ...signal.reply, forged: true } }), /unknown|unexpected/);
+});
+
+test("reply handles: projected answers ACK only delivered handles and private dispositions never leak into later mailboxes", () => {
+	const f = fixture(); let a = f.next(); const b = f.next();
+	const ids: string[] = [];
+	for (let n = 0; n < TEAM_MAX_WORK_SIGNALS; n++) {
+		const question = messageId(f.act(a, { action: "message", to: "b", text: `question ${n}` }));
+		ids.push(openReply(f, a, question).id);
+		messageId(f.act(b, { action: "message", to: "a", replyTo: question, text: `${n}:` + "x".repeat(3900) }));
+	}
+	f.yieldSignals(a, ids); f.settle(a);
+	a = nextFor(f, "a", "work");
+	assert.ok(a.input.omittedSignalOutcomes! > 0);
+	assert.equal(f.runtime.getWork(f.teamId, ref(a))!.current.observedSignals!.length, a.input.signalOutcomes!.length);
+	for (let turn = 0; turn < 4; turn++) {
+		const pending = ids.filter((id) => !f.runtime.getWork(f.teamId, ref(a))!.current.observedSignals?.includes(id));
+		if (!pending.length) break;
+		assert.equal(f.yieldSignals(a, pending).ok, true); f.settle(a); a = nextFor(f, "a", "work");
+	}
+	assert.equal(f.runtime.getWork(f.teamId, ref(a))!.current.observedSignals!.length, ids.length);
+	assert.deepEqual(f.runtime.getWork(f.teamId, ref(a))!.current.observedOutcomes, []);
+	// b answered from its Work before receiving the original questions in a mailbox. Those
+	// retained private dispositions must not leak into the subsequently validated public input.
+	f.act(b, { action: "reply", result: { status: "succeeded", summary: "answers sent" } }); f.settle(b);
+	const mailbox = nextFor(f, "b", "events");
+	assert.equal(mailbox.input.scope.kind, "events");
+	if (mailbox.input.scope.kind === "events") for (const event of mailbox.input.scope.events) assert.equal("replyOutcome" in event, false);
+	f.runtime.assertInvariants(f.teamId);
+});

@@ -89,6 +89,25 @@ function communicationAction(scenario, input, replies, turn) {
 		}
 		return [call(`communication-lead-yield-${turn}`, { action: "yield" })];
 	}
+	if (scenario === "reply-wait-live") {
+		if (input.scope.kind === "events") {
+			const question = input.scope.events.find((event) => event.kind === "MESSAGE");
+			if (input.member.id === "w2" && !replies.length) return [call("await-answer", {
+				action: "message", to: question.sender, replyTo: question.id, text: "Use Widget.",
+			})];
+			return [call(`await-mailbox-yield-${input.member.id}`, { action: "yield" })];
+		}
+		if (input.signalOutcomes?.length) {
+			const answer = input.signalOutcomes[0];
+			if (answer.state !== "published" || !answer.reply?.replyId || answer.text !== "Use Widget.") throw new Error("Missing correlated answer outcome");
+			return [call("await-sender-result", { action: "reply", result: { status: "succeeded", summary: "Resumed the same Work with the exact message answer." } })];
+		}
+		const sent = replies.find((reply) => reply.receipt?.status === "sent");
+		if (!sent) return [call("await-question", { action: "message", to: "w2", text: "Which public name?" })];
+		const opened = replies.find((reply) => reply.receipt?.status === "opened");
+		if (!opened) return [call("await-open", { action: "signal", operation: "open_reply", messageId: sent.receipt.messageId })];
+		return [call("await-yield", { action: "yield", waitingForSignals: [opened.receipt.signalId], checkpoint: "Need the answer to this exact question." })];
+	}
 	if (scenario === "messages-live") {
 		if (input.scope.kind === "work") return replies.some((reply) => reply.receipt?.status === "sent")
 			? [call("message-sender-result", { action: "reply", result: { status: "succeeded", summary: "Sender finished before the question was handled." } })]
@@ -121,7 +140,7 @@ function communicationAction(scenario, input, replies, turn) {
 const A09_CONTINUATION = "third-party boundary continuation";
 
 function actionFor(scenario, input, replies, turn, messages = [], activationIndex = 0) {
-	if (scenario === "messages-live" || scenario === "signals-live") return communicationAction(scenario, input, replies, turn);
+	if (scenario === "messages-live" || scenario === "signals-live" || scenario === "reply-wait-live") return communicationAction(scenario, input, replies, turn);
 	if (scenario.startsWith("rail-compaction-")) {
 		if (input.scope.kind === "events") {
 			const command = input.scope.events.find((event) => event.kind === "USER_COMMAND");

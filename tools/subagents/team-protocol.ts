@@ -101,7 +101,7 @@ export type HoldReason = "attention" | "budget" | "protocol" | "lead_unavailable
 export type TeamOutcome = "succeeded" | "partial" | "failed";
 
 export interface WorkRef { workId: string; revision: number }
-/** A one-shot phase fact, not a resource lock or a statement of current availability. */
+/** A one-shot phase fact or correlated message answer, never a resource lock. */
 export interface SignalRecord {
 	id: string;
 	work: WorkRef;
@@ -110,6 +110,8 @@ export interface SignalRecord {
 	state: "pending" | "published" | "unavailable";
 	text?: string;
 	createdAt: number;
+	/** For an answer handle, work/author identify the original sender, not a phase producer. */
+	reply?: { messageId: string; recipient: string; replyId?: string };
 }
 export interface TeamEvidence {
 	source: string;
@@ -347,6 +349,7 @@ export type TeamAction =
 	| { action: "request"; to: string; task: string; title?: string; inputRefs: string[] }
 	| { action: "message"; to: string; text: string; replyTo?: string }
 	| { action: "signal"; operation: "open"; name: string }
+	| { action: "signal"; operation: "open_reply"; messageId: string }
 	| { action: "signal"; operation: "publish"; signalId: string; text: string }
 	| { action: "reply"; result: WorkResult }
 	| { action: "yield"; waitingFor: WorkRef[]; waitingForSignals?: string[]; checkpoint?: string; attention?: string }

@@ -419,7 +419,7 @@ export function normalizeTeamPlan(value: unknown): TeamPlan {
 const ACTION_FIELDS = {
 	request: ["to", "task", "title", "inputRefs"],
 	message: ["to", "text", "replyTo"],
-	signal: ["operation", "name", "signalId", "text"],
+	signal: ["operation", "name", "signalId", "text", "messageId"],
 	reply: ["result"],
 	yield: ["waitingFor", "waitingForSignals", "checkpoint", "attention"],
 	status: ["view", "id", "cursor", "limit"],
@@ -471,6 +471,8 @@ export const TEAM_TOOL_SCHEMA = Type.Union([
 	}, "Queue a notice or question without creating work or waiting for an answer. Sent means accepted, not read. Delivery uses a subsequent serialized mailbox/events activation, never an interruption. Use replyTo for a conversational answer, not reply(result)."),
 	schemaObject({ action: Type.Literal("signal"), operation: Type.Literal("open"), name: Type.String({ minLength: 1, maxLength: 60 }) },
 		"Open a fresh one-shot phase signal owned by this exact WorkRef. Share its returned signalId. Each new phase needs a new ID; a signal is not a resource lock."),
+	schemaObject({ action: Type.Literal("signal"), operation: Type.Literal("open_reply"), messageId: idSchema },
+		"Get an idempotent answer handle for a message sent by this exact WorkRef. Only if an answer is needed, yield waitingForSignals with its signalId. The first authenticated message(replyTo) satisfies it, including an answer sent earlier. No Work or answer obligation is created."),
 	schemaObject({ action: Type.Literal("signal"), operation: Type.Literal("publish"), signalId: idSchema,
 		text: Type.String({ minLength: 1, maxLength: TEAM_MAX_SIGNAL_TEXT_BYTES }) },
 		"Publish an owned pending signal immediately while continuing this work. A published fact is historical, not proof a resource is currently free."),
@@ -566,12 +568,17 @@ export function normalizeTeamAction(value: unknown): TeamAction {
 			return { action, to: normalizeAlias(value["to"], "to"), text: text(value["text"], "text", TEAM_MAX_NOTE_BYTES),
 				...(present(value["replyTo"]) ? { replyTo: normalizeId(value["replyTo"], "replyTo") } : {}) };
 		case "signal":
+			if (value["operation"] === "open_reply") {
+				if (present(value["name"]) || present(value["signalId"]) || present(value["text"])) return invalid("signal open_reply accepts only messageId");
+				return { action, operation: "open_reply", messageId: normalizeId(value["messageId"], "messageId") };
+			}
+			if (present(value["messageId"])) return invalid("messageId is only used by signal open_reply");
 			if (value["operation"] === "open") {
 				if (typeof value["name"] !== "string") return invalid("signal open requires name");
 				if (present(value["signalId"]) || present(value["text"])) return invalid("signal open accepts only name");
 				return { action, operation: "open", name: normalizeTitle(value["name"], "", "name") };
 			}
-			if (value["operation"] !== "publish" || present(value["name"])) return invalid("signal requires open(name) or publish(signalId,text)");
+			if (value["operation"] !== "publish" || present(value["name"])) return invalid("signal requires open(name), open_reply(messageId) or publish(signalId,text)");
 			return { action, operation: "publish", signalId: normalizeId(value["signalId"], "signalId"), text: text(value["text"], "text", TEAM_MAX_SIGNAL_TEXT_BYTES) };
 		case "request":
 			return { action, to: normalizeAlias(value["to"], "to"), task: text(value["task"], "task", TEAM_MAX_TASK_BYTES),
@@ -1360,14 +1367,24 @@ function parseReceipt(value: unknown): TeamReceipt {
 
 function parseSignal(value: unknown): SignalRecord {
 	if (!isRecord(value)) return protocol("signal must be an object");
-	frameKeys(value, ["id", "work", "author", "name", "state", "text", "createdAt"], "signal");
+	frameKeys(value, ["id", "work", "author", "name", "state", "text", "createdAt", "reply"], "signal");
 	if (typeof value["name"] !== "string") return protocol("signal requires name");
 	if (value["state"] !== "pending" && value["state"] !== "published" && value["state"] !== "unavailable") return protocol("invalid signal state");
 	if (value["state"] === "pending" ? value["text"] !== undefined : value["text"] === undefined) return protocol("signal text does not match its state");
+	let reply: SignalRecord["reply"];
+	if (value["reply"] !== undefined) {
+		const raw = value["reply"];
+		if (!isRecord(raw)) return protocol("signal.reply must be an object");
+		frameKeys(raw, ["messageId", "recipient", "replyId"], "signal.reply");
+		if (value["state"] === "published" ? raw["replyId"] === undefined : raw["replyId"] !== undefined) return protocol("signal.replyId does not match its state");
+		reply = { messageId: frameId(raw["messageId"], "signal.reply.messageId"), recipient: normalizeAlias(raw["recipient"], "signal.reply.recipient"),
+			...(raw["replyId"] !== undefined ? { replyId: frameId(raw["replyId"], "signal.reply.replyId") } : {}) };
+	}
 	return { id: frameId(value["id"], "signal.id"), work: normalizeWorkRef(value["work"], "signal.work"),
 		author: normalizeAlias(value["author"], "signal.author"), name: normalizeTitle(value["name"], "", "signal.name"),
 		state: value["state"], createdAt: safeInteger(value["createdAt"], "signal.createdAt", 0),
-		...(value["text"] !== undefined ? { text: text(value["text"], "signal.text", TEAM_MAX_SIGNAL_TEXT_BYTES) } : {}) };
+		...(reply ? { reply } : {}),
+		...(value["text"] !== undefined ? { text: text(value["text"], "signal.text", reply ? TEAM_MAX_NOTE_BYTES : TEAM_MAX_SIGNAL_TEXT_BYTES) } : {}) };
 }
 
 function parseReplyData(value: unknown): TeamReplyData {

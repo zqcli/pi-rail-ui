@@ -51,7 +51,7 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "messages-live" | "signals-live" | "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer" | "n08-cache-warming" | "rail-compaction-threshold" | "rail-compaction-instructions" | "rail-compaction-host" | "rail-compaction-overflow" | "rail-compaction-length",
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "messages-live" | "signals-live" | "reply-wait-live" | "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer" | "n08-cache-warming" | "rail-compaction-threshold" | "rail-compaction-instructions" | "rail-compaction-host" | "rail-compaction-overflow" | "rail-compaction-length",
 	open?: readonly string[], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}, workerCount = 2, childTeamExtension?: string) {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
 	const oldAgentDir = process.env["PI_CODING_AGENT_DIR"];
@@ -1880,5 +1880,63 @@ test("real Pi 1.5.2 signal RPC wakes a yielded consumer before producer completi
 	assert.equal(inputs.length, 2); assert.deepEqual(inputs[0].scope.work, inputs[1].scope.work);
 	assert.equal(inputs[1].signalOutcomes[0].state, "published"); assert.deepEqual(inputs[1].signalOutcomes[0].work, producerRef);
 	assert.equal(producerEntries.map(promptInput).filter(Boolean).length, 1, "producer stays in the same native activation after publication");
+	assert.equal(runtime.liveEffects(teamId).activeActivations, 0); runtime.assertInvariants(teamId);
+});
+
+test("real Pi 1.5.2 reply-handle RPC explicitly suspends and resumes the sending Work, without new Work, then closes", { timeout: 60000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "reply-wait-live");
+	const answering = deferred(), answer = deferred(), yielding = deferred(), finish = deferred(), closing = deferred(), close = deferred();
+	const recipient = handles.get("w2")!; const recipientRun = recipient.runActivation.bind(recipient);
+	recipient.runActivation = (activation, onRequest, onSettled, signal) => recipientRun(activation, async (frame, intentId) => {
+		if (frame.request.action === "business" && frame.request.args["action"] === "message" && frame.request.args["replyTo"]) {
+			answering.resolve(); await answer.promise;
+		}
+		if (frame.request.action === "tool_gate" && frame.request.toolCallId === "await-mailbox-yield-w2") {
+			yielding.resolve(); await finish.promise;
+		}
+		return onRequest(frame, intentId);
+	}, onSettled, signal);
+	const lead = handles.get("lead")!; const leadRun = lead.runActivation.bind(lead);
+	lead.runActivation = (activation, onRequest, onSettled, signal) => leadRun(activation, async (frame, intentId) => {
+		if (frame.request.action === "business" && frame.request.args["command"] === "close_team") {
+			closing.resolve(); await close.promise;
+		}
+		return onRequest(frame, intentId);
+	}, onSettled, signal);
+	const lifetime = driver.launch(teamId);
+	const senderRef = runtime.listWorks(teamId)[0]!.work;
+	try {
+		await waitForGateOrCancel(answering.promise, lifetime, runtime, teamId, handles, "recipient's correlated answer business RPC");
+		await waitUntil(() => runtime.getWork(teamId, senderRef)!.current.state === "blocked", "sender's native explicit reply wait");
+		assert.equal(runtime.getTeam(teamId).works.total, 1);
+		assert.deepEqual(runtime.getWork(teamId, senderRef)!.current.observedSignals ?? [], []);
+		assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")!.activity, "idle");
+		answer.resolve();
+		await waitForGateOrCancel(yielding.promise, lifetime, runtime, teamId, handles, "answerer's post-message native yield gate");
+		await waitUntil(() => runtime.getWork(teamId, senderRef)!.current.state === "resolved", "sender to resume and finish before the answerer's activation ends");
+		assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w2")!.activity, "running");
+		assert.equal(runtime.getWork(teamId, senderRef)!.current.observedSignals?.length, 1);
+		finish.resolve();
+		await waitForGateOrCancel(closing.promise, lifetime, runtime, teamId, handles, "lead close after answer continuation");
+		await waitUntil(() => runtime.processStats(teamId).memberActivations.get("w1") === 3
+			&& runtime.getTeam(teamId).members.filter((member) => member.id !== "lead").every((member) => member.activity === "idle"), "both native mailboxes to settle before close");
+	} finally { answer.resolve(); finish.resolve(); close.resolve(); }
+	const result = await awaitLifetimeOrCancel(lifetime, runtime, teamId, handles, "explicit answer wait and native close");
+	assert.equal(result.lifecycle, "closed"); assert.equal(result.outcome, "succeeded");
+	assert.equal(runtime.getTeam(teamId).works.total, 1); assert.equal(result.finalResultRefs.length, 1);
+	assert.ok(result.members.every((member) => member.lifecycle === "closed" && member.resourceState === "released"));
+	const senderEntries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	const recipientEntries = parseSession(await readFile(handles.get("w2")!.instance.sessionFile, "utf8"));
+	assertNativeCommunication(senderEntries, ["await-question", "await-open", "await-yield", "await-sender-result", "await-mailbox-yield-w1"]);
+	assertNativeCommunication(recipientEntries, ["await-answer", "await-mailbox-yield-w2"]);
+	assertNativeCommunication(parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8")), ["communication-close"]);
+	const inputs = senderEntries.map(promptInput).filter(Boolean), workInputs = inputs.filter((input) => input.scope.kind === "work");
+	assert.equal(workInputs.length, 2); assert.deepEqual(workInputs.map((input) => input.scope.work), [senderRef, senderRef]);
+	const outcome = workInputs[1].signalOutcomes[0]; assert.equal(outcome.state, "published"); assert.equal(outcome.text, "Use Widget.");
+	const question = recipientEntries.map(promptInput).filter(Boolean)[0].scope.events.find((event: any) => event.kind === "MESSAGE");
+	const mail = inputs.find((input) => input.scope.kind === "events").scope.events.find((event: any) => event.kind === "MESSAGE");
+	assert.equal(outcome.reply.messageId, question.id); assert.equal(outcome.reply.replyId, mail.id); assert.equal(mail.replyTo, question.id);
+	assert.deepEqual(runtime.getWork(teamId, senderRef)!.current.observedSignals, [outcome.id]);
+	assert.deepEqual(runtime.getWork(teamId, senderRef)!.current.observedOutcomes, []);
 	assert.equal(runtime.liveEffects(teamId).activeActivations, 0); runtime.assertInvariants(teamId);
 });

@@ -159,6 +159,8 @@ interface InternalEvent extends TeamEventView {
 	processed: boolean;
 	/** An explicit failed disposition, not a read receipt. */
 	deliveryFailure?: string;
+	/** First correlated answer or definitive unavailability, retained even before open_reply. */
+	replyOutcome?: { replyId: string } | { unavailable: string };
 	batchId?: string;
 	/** Report-only: never starts an events activation by itself, it rides along with the lead's next batch. */
 	passive?: true;
@@ -174,8 +176,8 @@ type WorkScope = Extract<ActivationInput["scope"], { kind: "work" }>;
 export interface TeamWaitFact {
 	work: WorkRef;
 	assignee: string;
-	/** A phase handle is distinct from completion of its exact producer WorkRef. */
-	signal?: { id: string; name: string };
+	/** A handle is distinct from Work completion; reply handles name their original message. */
+	signal?: { id: string; name: string; messageId?: string };
 	/** Signal state, or Work state ("held" when a hold keeps the Work from finishing). */
 	state: string;
 	/** One of the waiting version's own children rather than a peer's work. */
@@ -324,6 +326,7 @@ interface TeamState {
 	interrupted: Set<string>;
 	deliveries: Map<string, DeliveryRecord>;
 	events: InternalEvent[];
+	messageCount: number;
 	eventBatches: Map<string, EventBatch>;
 	/** A mailbox admission yields the next available worker permit to runnable Work. */
 	mailboxLast?: boolean;
@@ -432,11 +435,14 @@ function waitingOnText(waits: readonly TeamWaitFact[]): string {
 }
 
 /** Brief identity shared by member, Team and task rows; phase names never substitute for handles. */
-export const waitTargetText = (wait: TeamWaitFact): string => wait.signal ? `phase ${wait.signal.id} from ${wait.assignee}` : wait.assignee;
+export const waitTargetText = (wait: TeamWaitFact): string => wait.signal
+	? `${wait.signal.messageId ? `reply to ${wait.signal.messageId}` : `phase ${wait.signal.id}`} from ${wait.assignee}` : wait.assignee;
 
 /** One exact target, including ready outcomes that no longer block scheduling. */
 export function waitFactText(wait: TeamWaitFact): string {
-	const target = wait.signal ? `${wait.signal.id} «${previewText(wait.signal.name, 64)}» (${shortWorkRef(wait.work)})` : shortWorkRef(wait.work);
+	const target = wait.signal ? wait.signal.messageId
+		? `${wait.signal.id} reply to ${wait.signal.messageId} (sender ${shortWorkRef(wait.work)})`
+		: `${wait.signal.id} «${previewText(wait.signal.name, 64)}» (${shortWorkRef(wait.work)})` : shortWorkRef(wait.work);
 	return `${target} → ${wait.assignee} · ${wait.state}${wait.reason ? ` · ${wait.reason}` : ""}`
 		+ (wait.latestRevision === undefined ? "" : ` · current @${wait.latestRevision}`);
 }
@@ -549,7 +555,7 @@ export class TeamRuntime {
 			id, lifecycle: "prepared", health: "ok", stateVersion: 1, eventSeq: 0, createdAt, workStats: new Map(), pausedMs: 0,
 			deadline: null,
 			plan: copy(plan), lead: plan.lead, bootProcessed: false, cancelRequested: false, members, ledger: new WorkLedger(), ready: [], interrupted: new Set(), deliveries: new Map(), unknownAcknowledged: new Set(),
-			events: [], eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
+			events: [], messageCount: 0, eventBatches: new Map(), incidents: [], limits: budget.limits, budget,
 			reservedResultBytes: reserved, usage: emptySubagentUsage(), timeline: [], timelineOmitted: 0,
 			review: { schedule: copy(plan.review), nextAt: null, startedAt: createdAt, signature: "", finished: new Set(), wall: 0,
 				sequence: 0, reviewedSequence: 0, pending: new Map(), focus: new Map(), records: [] },
@@ -2622,6 +2628,13 @@ export class TeamRuntime {
 			const observed = new Set(version.observedSignals ?? []);
 			const waits = version.waitingForSignals.filter((id) => !observed.has(id)).map((id): TeamWaitFact => {
 				const signal = team.ledger.signals.get(id)!;
+				if (signal.reply) {
+					const recipient = team.members.get(signal.reply.recipient)!;
+					return { work: copy(signal.work), assignee: recipient.id,
+						signal: { id, name: signal.name, messageId: signal.reply.messageId }, state: signal.state, child: false, blocking: signal.state === "pending",
+						reason: signal.state === "pending" ? `awaiting correlated answer; recipient ${recipient.id} ${recipient.lifecycle}/${recipient.activity}; mailbox turns need no Work completion`
+							: `${signal.state === "unavailable" ? "answer unavailable" : "answer ready"}; awaiting delivery` };
+				}
 				const producer = this.waitedWorkFact(team, ref, signal.work, false);
 				const pending = signal.state === "pending";
 				return { ...producer, signal: { id, name: signal.name }, state: signal.state, blocking: pending,
@@ -2919,52 +2932,72 @@ export class TeamRuntime {
 		if (!recipient) fail("UNKNOWN_MEMBER", `Unknown recipient ${action.to}`);
 		if (recipient.lifecycle === "closing") fail("RECIPIENT_CLOSING", `Recipient ${action.to} is closing`);
 		if (recipient.lifecycle !== "open") fail("RECIPIENT_CLOSED", `Recipient ${action.to} is not open`);
+		let original: InternalEvent | undefined;
 		if (action.replyTo) {
-			const original = team.events.find((event) => event.id === action.replyTo && event.kind === "MESSAGE");
+			original = team.events.find((event) => event.id === action.replyTo && event.kind === "MESSAGE");
 			if (!original) fail("UNKNOWN_MESSAGE", `Unknown message ${action.replyTo}`);
 			if (original.recipient !== sender.id || original.sender !== action.to) fail("FORBIDDEN_ACTION", "A conversational reply must return to that message's authenticated sender");
 		}
 		const messages = team.events.filter((event) => event.kind === "MESSAGE");
-		if (messages.length >= TEAM_MAX_MESSAGES) fail("TEAM_CAPACITY", "Team message history is full; use work for further obligations");
+		if (team.messageCount >= TEAM_MAX_MESSAGES) fail("TEAM_CAPACITY", "Team message history is full; use work for further obligations");
 		if (messages.filter((event) => event.recipient === recipient.id && !event.processed).length >= TEAM_MAX_MEMBER_MESSAGES) fail("REQUEST_QUEUE_FULL", `Recipient ${recipient.id} message queue is full`);
 		const event = this.addEvent(team, { key: this.id("message"), kind: "MESSAGE", message: action.text,
 			sender: sender.id, recipient: recipient.id, ...(active.scope.work ? { work: copy(active.scope.work) } : {}),
 			...(action.replyTo ? { replyTo: action.replyTo } : {}) });
+		// Admission is atomic with the answer fact: rejected sends never satisfy a waiter.
+		if (original) original.replyOutcome ??= { replyId: event.id };
 		this.note(team, `${sender.id} sent ${event.id} → ${recipient.id} (queued, not read)`);
+		this.wakeWaiters(team);
 		return okReply(sender.id, { receipt: { status: "sent", messageId: event.id, recipient: recipient.id } });
 	}
 
 	private failMessages(team: TeamState, member: RuntimeMember, reason: string, batchId?: string): void {
 		const messages = team.events.filter((event) => event.kind === "MESSAGE" && event.recipient === member.id
 			&& !event.processed && (batchId === undefined || event.batchId === batchId));
-		if (!messages.length) return;
 		for (const event of messages) {
 			event.processed = true;
 			event.deliveryFailure = reason;
+			event.replyOutcome ??= { unavailable: reason };
 			delete event.batchId;
 		}
-		const ids = messages.map((event) => event.id).join(", ");
-		const previews = messages.map((event) => `${event.id} from ${event.sender}: ${previewText(event.message, 96)}`).join("; ");
-		this.note(team, `${member.id} messages unavailable (${ids}): ${reason}`);
-		this.addEvent(team, { key: `message-failure:${messages[0]!.id}`, kind: "MESSAGE_UNAVAILABLE", memberId: member.id,
-			message: `Message handling by ${member.id} was not confirmed: ${previews}. ${previewText(reason, 256)}. This is not a read/answer receipt; check already-sent replies before resending.` });
+		if (messages.length) {
+			const ids = messages.map((event) => event.id).join(", ");
+			const previews = messages.map((event) => `${event.id} from ${event.sender}: ${previewText(event.message, 96)}`).join("; ");
+			this.note(team, `${member.id} messages unavailable (${ids}): ${reason}`);
+			this.addEvent(team, { key: `message-failure:${messages[0]!.id}`, kind: "MESSAGE_UNAVAILABLE", memberId: member.id,
+				message: `Message handling by ${member.id} was not confirmed: ${previews}. ${previewText(reason, 256)}. This is not a read/answer receipt; check already-sent replies before resending.` });
+		}
+		this.wakeWaiters(team);
 	}
 
 	private signalAction(team: TeamState, member: RuntimeMember, active: ActiveActivation, action: Extract<TeamAction, { action: "signal" }>): TeamReply {
 		const work = this.requireWorkScope(team, member, active);
-		if (action.operation === "open") {
+		if (action.operation === "open" || action.operation === "open_reply") {
+			let original: InternalEvent | undefined;
+			if (action.operation === "open_reply") {
+				original = team.events.find((event) => event.id === action.messageId && event.kind === "MESSAGE");
+				if (!original) fail("UNKNOWN_MESSAGE", `Unknown message ${action.messageId}`);
+				if (original.sender !== member.id || !original.work || !sameWorkRef(original.work, work)) {
+					fail("WRONG_WORK_OWNER", "Only the exact WorkRef that sent a message may open its answer handle");
+				}
+				const existing = [...team.ledger.signals.values()].find((signal) => signal.reply?.messageId === original!.id);
+				if (existing) return okReply(member.id, { receipt: { status: "opened", signalId: existing.id }, data: copy(existing) });
+			}
 			if (team.ledger.signals.size >= TEAM_MAX_SIGNALS || [...team.ledger.signals.values()].filter((signal) => sameWorkRef(signal.work, work)).length >= TEAM_MAX_WORK_SIGNALS) {
 				fail("TEAM_CAPACITY", "Signal capacity reached for this Team or WorkRef");
 			}
 			const signal: SignalRecord = { id: this.modelId(team, "signal"), work: copy(work), author: member.id,
-				name: action.name, state: "pending", createdAt: this.timestamp() };
+				name: action.operation === "open" ? action.name : "Message answer", state: "pending", createdAt: this.timestamp(),
+				...(original ? { reply: { messageId: original.id, recipient: original.recipient! } } : {}) };
 			team.ledger.signals.set(signal.id, signal);
+			this.settleSignals(team);
 			this.note(team, `${member.id} opened ${signal.id} «${signal.name}» for ${shortWorkRef(work)}`);
 			this.changed(team);
 			return okReply(member.id, { receipt: { status: "opened", signalId: signal.id }, data: copy(signal) });
 		}
 		const signal = team.ledger.signals.get(action.signalId);
 		if (!signal) fail("UNKNOWN_SIGNAL", `Unknown signal ${action.signalId}`);
+		if (signal.reply) fail("FORBIDDEN_ACTION", "Answer handles are satisfied only by the recipient's authenticated message(replyTo), never by signal publish");
 		if (signal.author !== member.id || !sameWorkRef(signal.work, work)) fail("WRONG_WORK_OWNER", "Only the signal's exact owning WorkRef may publish it");
 		if (signal.state === "published" && signal.text === action.text) return okReply(member.id, { receipt: { status: "published", signalId: signal.id }, data: copy(signal) });
 		if (signal.state !== "pending") fail("SIGNAL_CLOSED", "This single-use signal is already closed; open a new signal for another phase");
@@ -2978,9 +3011,36 @@ export class TeamRuntime {
 
 	/** Pending phases cannot survive their exact Work revision. Published facts are never rewritten. */
 	private settleSignals(team: TeamState): void {
+		// Preserve the first answer/unavailability on each retained message, independent of when
+		// its sender opts into waiting. Merely reading a mailbox never rules out a later answer.
+		const messages = team.messageCount ? new Map(team.events.filter((event) => event.kind === "MESSAGE").map((event) => [event.id, event])) : undefined;
+		for (const event of messages?.values() ?? []) {
+			if (event.replyOutcome) continue;
+			const state = event.work ? team.ledger.version(event.work)!.state : undefined;
+			const recipient = team.members.get(event.recipient!)!;
+			if (event.deliveryFailure || recipient.lifecycle !== "open" || (state && isTerminalWorkState(state)) || team.lifecycle !== "active") {
+				event.replyOutcome = { unavailable: event.deliveryFailure ?? (recipient.lifecycle !== "open" ? `Recipient ${recipient.id} is ${recipient.lifecycle}`
+					: state && isTerminalWorkState(state) ? `Sending Work ${workRefKey(event.work!)} is ${state}` : `Team is ${team.lifecycle}`) };
+			}
+		}
 		for (const signal of team.ledger.signals.values()) {
+			if (signal.state !== "pending") continue;
+			if (signal.reply) {
+				const outcome = messages!.get(signal.reply.messageId)!.replyOutcome;
+				if (!outcome) continue;
+				if ("replyId" in outcome) {
+					signal.state = "published";
+					signal.reply.replyId = outcome.replyId;
+					signal.text = messages!.get(outcome.replyId)!.message;
+				} else {
+					signal.state = "unavailable";
+					signal.text = `No answer outcome: ${previewText(outcome.unavailable, 512)}. This does not imply the question was not read or handled.`;
+				}
+				this.note(team, `${signal.id} reply to ${signal.reply.messageId} ${signal.state}${signal.reply.replyId ? ` by ${signal.reply.recipient}: ${signal.reply.replyId}` : ""}`);
+				continue;
+			}
 			const version = team.ledger.version(signal.work)!;
-			if (signal.state !== "pending" || (!isTerminalWorkState(version.state) && team.lifecycle === "active")) continue;
+			if (!isTerminalWorkState(version.state) && team.lifecycle === "active") continue;
 			signal.state = "unavailable";
 			signal.text = `Not published: producer ${workRefKey(signal.work)} is ${version.state}; Team is ${team.lifecycle}. No resource release is implied.`;
 		}
@@ -3091,7 +3151,11 @@ export class TeamRuntime {
 			const version = team.ledger.version(ref)!;
 			const ids = action.waitingForSignals.filter((id) => !version.observedSignals?.includes(id));
 			if (!ids.length) fail("NO_NEW_DEPENDENCY", "All requested signal outcomes were already delivered to this work version");
-			for (const id of ids) if (!team.ledger.signals.has(id)) fail("UNKNOWN_SIGNAL", `Unknown signal ${id}`);
+			for (const id of ids) {
+				const signal = team.ledger.signals.get(id);
+				if (!signal) fail("UNKNOWN_SIGNAL", `Unknown signal ${id}`);
+				if (signal.reply && !sameWorkRef(signal.work, ref)) fail("WRONG_WORK_OWNER", "Only the exact sending WorkRef may wait for a message answer");
+			}
 			const cycle = team.ledger.findCycle(ref, [], ids);
 			if (cycle) {
 				this.note(team, `${member.id} wait rejected: dependency cycle ${capped(cycle, 8, " → ")}`);
@@ -3459,6 +3523,7 @@ export class TeamRuntime {
 		target.lifecycle = "closing";
 		target.resourceState = "stopping";
 		target.closeId = closeId;
+		this.wakeWaiters(team);
 		this.changed(team);
 		this.check(team);
 		return okReply(lead.id, { receipt: { status: "closing", command: "close_member", memberId, closeId } });
@@ -3587,6 +3652,7 @@ export class TeamRuntime {
 				this.settleSignals(team);
 				const record = team.ledger.signals.get(action.id);
 				if (!record) fail("UNKNOWN_SIGNAL", `Unknown signal ${action.id}`);
+				if (record.reply && record.author !== member.id && member.id !== team.lead) fail("FORBIDDEN_ACTION", "Message answer handles are visible only to the sender and Team lead");
 				return okReply(member.id, { data: copy(record) });
 			}
 			if (action.view === "result") {
@@ -3600,7 +3666,7 @@ export class TeamRuntime {
 		}
 		const offset = action.cursor ? this.cursorOffset(action.cursor) : 0;
 		this.settleSignals(team);
-		const items = action.view === "signal" ? [...team.ledger.signals.values()].map(copy) : action.view === "work" ? this.workSummaries(team)
+		const items = action.view === "signal" ? [...team.ledger.signals.values()].filter((signal) => !signal.reply || signal.author === member.id || member.id === team.lead).map(copy) : action.view === "work" ? this.workSummaries(team)
 			: action.view === "result" ? this.resultSummaries(team)
 			: team.incidents.map(incidentView);
 		const pageItems = items.slice(offset, offset + action.limit);
@@ -3617,7 +3683,7 @@ export class TeamRuntime {
 		for (;;) {
 			try {
 				input = this.activationInput(team, member, deliveryId, { kind: "events", eventBatchId: batchId,
-					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, passive: _passive, deliveryFailure: _failure, ...view }) => view), emergency },
+					events: selected.map(({ key: _key, processed: _processed, batchId: _batchId, passive: _passive, deliveryFailure: _failure, replyOutcome: _reply, ...view }) => view), emergency },
 				team.budget.inputSummary(undefined, member.id === team.lead, emergency));
 				break;
 			} catch (error) {
@@ -4365,6 +4431,7 @@ export class TeamRuntime {
 		const duplicate = team.events.find((item) => item.key === event.key);
 		if (duplicate) return duplicate;
 		const created: InternalEvent = { ...event, id: this.modelId(team, "event"), processed: false };
+		if (event.kind === "MESSAGE") team.messageCount++;
 		team.events.push(created);
 		team.eventSeq++;
 		this.changed(team);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { restoreTeamHistory } from "../../tools/subagents/team-history";
 import { TEAM_JOURNAL_ENTRY_TYPE, TeamJournalGeneration, type TeamJournalRecord } from "../../tools/subagents/team-journal";
-import { TeamProtocolError } from "../../tools/subagents/team-codec";
+import { normalizeTeamReviewRecord, TeamProtocolError } from "../../tools/subagents/team-codec";
 import type { WorkRef } from "../../tools/subagents/team-protocol";
 import { TeamRuntime, type RuntimeActivation } from "../../tools/subagents/team-runtime";
 
@@ -138,6 +138,142 @@ test("the snapshot carries the Flow, Lead and Waits facts with one line saying t
 	assert.match(task, /^Lead: busy \S+ · only lead \S+ · accept active p50 \S+ · p90 \S+ · \d+ pending$/mu);
 	assert.match(task, /^Waits: deps p50 \S+ · p90 \S+ · last: \S+/mu);
 	assert.match(task, /^The Flow, Lead and Waits numbers describe elapsed flow, not worker effort or blame; they are not a risk by themselves\. Host pauses are excluded\./mu);
+});
+
+test("a queued review refreshes at activation, records both times, and skips progress already included in that snapshot", () => {
+	const { runtime, teamId, advance } = world({ initial: [{ to: "w1", task: "Build it." }, { to: "w2", task: "Review the implementation." }] });
+	bootIdle(runtime, teamId);
+	const build = takeFor(runtime, teamId, "w1");
+	const contentReview = takeFor(runtime, teamId, "w2");
+	const ref = runtime.runReviewTick(teamId)!;
+	assert.match(runtime.getWork(teamId, ref)!.current.task, /Works \(reviews excluded\): 2 total · resolved 0 · running 2/u);
+	advance(60_000);
+	end(runtime, build, { action: "reply", result: { status: "succeeded", summary: "Build done." } });
+	assert.equal(runtime.runReviewTick(teamId), undefined, "business progress cannot enqueue a duplicate while the reviewer is busy");
+	assert.throws(() => runtime.reviewNow(teamId), /a review is still open/u);
+	advance(60_000);
+	end(runtime, contentReview, { action: "reply", result: { status: "succeeded", summary: "Content reviewed." } });
+	const review = takeFor(runtime, teamId, "w2");
+	assert.deepEqual(review.scope.work, ref);
+	assert.equal(review.input.scope.kind, "work");
+	if (review.input.scope.kind !== "work") return;
+	assert.equal(review.input.scope.task, runtime.getWork(teamId, ref)!.current.task);
+	assert.match(review.input.scope.task, /Works \(reviews excluded\): 2 total · resolved 2 · running 0/u);
+	assert.match(review.input.scope.task, /Finished since the last review \(2\):/u);
+	assert.match(review.input.scope.task, /snapshotAt: 2023-11-14T22:15:20\.000Z/u);
+	advance(30_000);
+	end(runtime, review, { action: "reply", result: { status: "succeeded", summary: "AT RISK: a requirement is still missing." } });
+	const [record] = runtime.listReviews(teamId);
+	assert.equal(record!.snapshotAt, 1_700_000_120_000);
+	assert.equal(record!.reviewedAt, 1_700_000_150_000);
+	assert.equal(record!.at, record!.reviewedAt);
+	assert.equal(record!.snapshot.elapsedMs, 120_000);
+	assert.equal(record!.snapshot.finishedSinceLast, 2);
+	assert.equal(record!.snapshot.works.resolved, 2);
+	assert.equal(runtime.runReviewTick(teamId), undefined, "the refreshed snapshot, not the enqueue-time one, is the comparison baseline");
+	const lead = takeFor(runtime, teamId, "lead");
+	assert.match(eventsOf(lead).find((event) => event.kind === "REVIEW_READY")!.message,
+		/snapshotAt: 2023-11-14T22:15:20\.000Z · reviewedAt: 2023-11-14T22:15:50\.000Z/u);
+	runtime.assertInvariants(teamId);
+});
+
+test("a resumed review refreshes again without losing its original progress baseline or focus", () => {
+	const { runtime, teamId, advance } = world({ initial: [{ to: "w1", task: "Build it." }], review: { by: "w2", everyMinutes: 60, focus: "Watch the migration risk." } });
+	bootIdle(runtime, teamId);
+	const build = takeFor(runtime, teamId, "w1");
+	const ref = runtime.reviewNow(teamId).work;
+	const first = takeFor(runtime, teamId, "w2");
+	end(runtime, first, { action: "yield", waitingFor: [build.scope.work!], checkpoint: "Waiting for the actual build result." });
+	advance(120_000);
+	assert.equal(runtime.runReviewTick(teamId), undefined, "a blocked review is still open");
+	end(runtime, build, { action: "reply", result: { status: "succeeded", summary: "Build done." } });
+	runtime.setReview(teamId, null);
+	const resumed = takeFor(runtime, teamId, "w2");
+	assert.deepEqual(resumed.scope.work, ref);
+	assert.equal(resumed.input.scope.kind, "work");
+	if (resumed.input.scope.kind !== "work") return;
+	assert.match(resumed.input.scope.task, /Finished since the last review \(1\):/u);
+	assert.match(resumed.input.scope.task, /snapshotAt: 2023-11-14T22:15:20\.000Z/u);
+	assert.match(resumed.input.scope.task, /Watch the migration risk\.$/u, "stopping future reviews does not change this review's focus");
+	advance(30_000);
+	end(runtime, resumed, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: build confirmed." } });
+	assert.equal(runtime.listReviews(teamId)[0]!.snapshot.finishedSinceLast, 1);
+	assert.equal(runtime.listReviews(teamId)[0]!.snapshotAt, 1_700_000_120_000);
+	assert.equal(runtime.listReviews(teamId)[0]!.reviewedAt, 1_700_000_150_000);
+	runtime.assertInvariants(teamId);
+});
+
+test("content review and periodic status checks can use different existing members", () => {
+	const { runtime, teamId } = world({ initial: [{ to: "w1", task: "Review the implementation in depth." }] });
+	bootIdle(runtime, teamId);
+	const content = takeFor(runtime, teamId, "w1");
+	const ref = runtime.reviewNow(teamId).work;
+	const statusCheck = takeFor(runtime, teamId, "w2");
+	assert.deepEqual(statusCheck.scope.work, ref);
+	assert.equal(runtime.getWork(teamId, content.scope.work!)!.current.state, "running");
+	end(runtime, statusCheck, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: content review is running." } });
+	assert.equal(runtime.takeNextActivation(teamId), undefined, "an on-track status check does not interrupt the content review or wake the lead");
+});
+
+test("refreshing a revised review preserves the lead's full instruction and stays within the delivered-task bound", () => {
+	const { runtime, teamId, advance } = world();
+	const lead = take(runtime, teamId);
+	const ref = runtime.reviewNow(teamId).work;
+	const instruction = "Review only the revised acceptance criterion. ".padEnd(8 * 1024, "x");
+	assert.equal(Buffer.byteLength(instruction), 8 * 1024);
+	assert.equal(act(runtime, lead, { action: "control", command: "revise_work", workId: ref.workId, expectedRevision: 1, task: instruction, inputRefs: [] }).ok, true);
+	end(runtime, lead, { action: "yield" });
+	advance(60_000);
+	const review = takeFor(runtime, teamId, "w2");
+	assert.equal(review.scope.work!.revision, 2);
+	assert.equal(review.input.scope.kind, "work");
+	if (review.input.scope.kind !== "work") return;
+	assert.ok(review.input.scope.task.startsWith(`${instruction}\n\nCurrent Team progress snapshot, snapshotAt: 2023-11-14T22:14:20.000Z`));
+	assert.ok(Buffer.byteLength(review.input.scope.task) <= 16 * 1024);
+	assert.equal(runtime.getWork(teamId, review.scope.work!)!.current.task, instruction);
+	end(runtime, review, { action: "yield", attention: "Confirm the acceptance criterion.", checkpoint: "Awaiting confirmation." });
+	advance(60_000);
+	runtime.releaseHold(teamId, review.scope.work!, runtime.getWork(teamId, review.scope.work!)!.current.hold!.incidentId, "The criterion is confirmed.");
+	const resumed = takeFor(runtime, teamId, "w2");
+	assert.equal(resumed.input.scope.kind, "work");
+	if (resumed.input.scope.kind !== "work") return;
+	assert.ok(resumed.input.scope.task.startsWith(`${instruction}\n\nCurrent Team progress snapshot, snapshotAt: 2023-11-14T22:15:20.000Z`));
+	assert.equal(resumed.input.scope.task.match(/Current Team progress snapshot/gu)?.length, 1, "resuming does not append old snapshots");
+	assert.ok(Buffer.byteLength(resumed.input.scope.task) <= 16 * 1024);
+	assert.equal(runtime.getWork(teamId, resumed.scope.work!)!.current.task, instruction);
+	end(runtime, resumed, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: revised criterion reviewed." } });
+	assert.equal(runtime.listReviews(teamId)[0]!.snapshotAt, 1_700_000_120_000);
+});
+
+test("progress after a review's snapshot remains eligible for the next tick", () => {
+	const { runtime, teamId, advance } = world({ initial: [{ to: "w1", task: "Build it." }] });
+	bootIdle(runtime, teamId);
+	const build = takeFor(runtime, teamId, "w1");
+	runtime.reviewNow(teamId);
+	const review = takeFor(runtime, teamId, "w2");
+	advance(60_000);
+	end(runtime, build, { action: "reply", result: { status: "succeeded", summary: "Build done." } });
+	advance(30_000);
+	end(runtime, review, { action: "reply", result: { status: "succeeded", summary: "ON TRACK: build was running at snapshot time." } });
+	assert.equal(runtime.listReviews(teamId)[0]!.snapshot.finishedSinceLast, 0);
+	const next = runtime.runReviewTick(teamId);
+	assert.ok(next, "committing a review must not swallow changes it did not see");
+	assert.match(runtime.getWork(teamId, next)!.current.task, /Finished since the last review \(1\):/u);
+});
+
+test("review timestamp decoding preserves old history without inventing a snapshot time", () => {
+	const { runtime, teamId, advance } = world();
+	bootIdle(runtime, teamId);
+	runtime.reviewNow(teamId);
+	advance(60_000);
+	answerReview(runtime, teamId, "ON TRACK: fine.");
+	const record = runtime.listReviews(teamId)[0]!;
+	assert.deepEqual(normalizeTeamReviewRecord(record), record);
+	const { snapshotAt: _snapshotAt, reviewedAt: _reviewedAt, ...legacy } = record;
+	assert.deepEqual(normalizeTeamReviewRecord(legacy), legacy);
+	for (const field of ["snapshotAt", "reviewedAt"]) for (const value of [-1, 1.5, "now", NaN]) {
+		assert.throws(() => normalizeTeamReviewRecord({ ...record, [field]: value }), TeamProtocolError);
+	}
 });
 
 test("ticks skip when nothing changed, a review is open, or the lead or reviewer is not open; review now ignores the unchanged skip", () => {
@@ -394,7 +530,7 @@ test("the review snapshot carries hold age, lead state, queued events, progress 
 	quiet.advance(7 * 60_000);
 	const task = (runtime: TeamRuntime, teamId: string, ref: WorkRef) => runtime.getWork(teamId, ref)!.current.task;
 	const held = task(quiet.runtime, quiet.teamId, quiet.runtime.reviewNow(quiet.teamId).work);
-	assert.match(held, /Snapshot taken at \d{4}-\d\d-\d\dT[\d:.]+Z\. It may be older than your activation; status shows the current state\./u);
+	assert.match(held, /snapshotAt: 2023-11-14T22:20:20\.000Z\. This snapshot is refreshed when your activation starts; status shows any later changes\./u);
 	assert.match(held, /Lead: idle · Team events queued for the lead: 2\n/u);
 	assert.match(held, /Held works:\n- \S+ w1 held 7 min \(attention\): .*Which repo\?/u);
 	assert.match(held, /Last finished non-review work: none yet · consecutive reviews without finished work, including this one: 1\n/u);

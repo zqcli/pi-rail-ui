@@ -610,6 +610,7 @@ test("Overview opens reviews newest first with schedule and verdict colours", (t
 test("Overview review sub-page selection shows summary/snapshot and Enter opens the full review", (t) => {
 	const { host, teamId } = fixture();
 	withReviews(host, teamId, [reviewRecord("a1", 5, "on_track"), reviewRecord("b2", 10, "at_risk", {
+		snapshotAt: 1_700_000_570_000, reviewedAt: 1_700_000_600_000,
 		summary: "AT RISK: Two works wait.\nSecond summary line.", findings: ["held work blocks the lead", "no result for runner"], limitations: ["no tool output inspected"] })]);
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
@@ -626,6 +627,7 @@ test("Overview review sub-page selection shows summary/snapshot and Enter opens 
 	assert.match(detail, /By: waiter · at risk · work:rb2@1 succeeded · result:rb2/u);
 	assert.match(detail, /Second summary line\./u);
 	assert.match(detail, /- held work blocks the lead/u);
+	assert.match(detail, /snapshotAt: 2023-11-14T22:22:50\.000Z · reviewedAt: 2023-11-14T22:23:20\.000Z/u);
 	assert.match(detail, /Budget: teamActivations 5\/100 · teamToolCalls 9\/unlimited/u);
 	assert.doesNotMatch(detail, /Review: waiter every/u);
 	ui.key("escape");

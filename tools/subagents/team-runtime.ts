@@ -3,7 +3,7 @@ import {
 	TEAM_COMMAND_CACHE, TEAM_LOOP_REPEATS, TEAM_MAX_CHILD_ISSUE_MESSAGE_BYTES, TEAM_MAX_DEPENDENCY_PREVIEWS, TEAM_MAX_LIVE_TEAMS, TEAM_MAX_EVENT_BATCH,
 	TEAM_MAX_PENDING_OPERATIONS, TEAM_MAX_TERMINAL_INCIDENTS,
 	TEAM_MAX_DEPENDENCY_PREVIEW_BYTES, TEAM_MAX_ID_LENGTH, TEAM_MAX_NOTE_BYTES, TEAM_MAX_RESULT_BYTES, TEAM_MAX_TEXT_ITEM_BYTES, TEAM_PROTOCOL_VERSION,
-	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_BUDGET_UNLIMITED, TEAM_MAX_REVIEWS, isTerminalWorkState, reviewVerdict, sameWorkRef,
+	TEAM_STATUS_DEFAULT_LIMIT, TEAM_STATUS_MAX_LIMIT, TEAM_BUDGET_PRESETS, TEAM_BUDGET_UNLIMITED, TEAM_MAX_REVIEWS, isTerminalWorkState, reviewVerdict, reviewTiming, sameWorkRef,
 	workRefKey, shortWorkRef, ROOT_GRANTABLE_COUNTERS, TEAM_VIEW_MAX_BUDGET_ROOTS, TEAM_VIEW_MAX_GRANTS, TEAM_VIEW_MAX_INCIDENTS,
 	type ActivationInput, type ActivationScope, type ChildIssue, type HoldReason, type RootGrantCounter, type TeamRootBudgetView, type TeamBudgetGrantView, type BindingV2, type DeliveryRecord, type EndIntent,
 	type TeamEventView, type MemberRecord, type OutcomeView, type ResultRecord,
@@ -267,13 +267,13 @@ interface ReviewState {
 	schedule: TeamReviewPlan | null;
 	nextAt: number | null;
 	startedAt: number;
-	/** Non-review works as of the last review's start: change detection. */
+	/** Non-review works seen by the last completed review: change detection. */
 	signature: string;
 	/** Non-review works already terminal then, and the wall clock then (timeline cut). */
 	finished: Set<string>;
 	wall: number;
-	/** The open review's snapshot, kept for its record. */
-	pending?: { snapshot: TeamReviewRecord["snapshot"] };
+	/** The open review's latest snapshot; the comparison baseline above stays fixed across its retries/resumes. */
+	pending?: { snapshotAt: number; snapshot: TeamReviewRecord["snapshot"]; signature: string; finished: Set<string>; wall: number; focus?: string };
 	records: TeamReviewRecord[];
 }
 
@@ -1079,35 +1079,18 @@ export class TeamRuntime {
 		return this.plainRecords(team).map((record) => `${record.id}@${record.currentRevision}:${currentVersion(record).state}:${currentVersion(record).hold?.incidentId ?? ""}`).join("|");
 	}
 
-	/** Create the review work (reviewer's task = snapshot + instructions) and remember what this review saw. */
+	/** Queue one review; its provisional snapshot is refreshed when an activation can actually start. */
 	private startReview(team: TeamState): WorkRef {
 		const reviewer = team.members.get(team.review.schedule!.by)!;
-		const records = this.plainRecords(team);
-		const done = records.filter((record) => isTerminalWorkState(currentVersion(record).state));
-		const fresh = done.filter((record) => !team.review.finished.has(record.id));
-		const state = (pick: (version: WorkVersion) => boolean) => records.filter((record) => pick(currentVersion(record))).length;
-		const used: Record<string, number> = { teamWorks: team.ledger.order.length, ...team.budget.used };
-		const snapshot: TeamReviewRecord["snapshot"] = {
-			elapsedMs: this.timestamp() - team.review.startedAt,
-			works: { total: records.length, resolved: state((v) => v.state === "resolved"), running: state((v) => v.state === "running"),
-				blocked: state((v) => v.state === "blocked"), held: state((v) => !!v.hold), failed: state((v) => v.state === "failed"),
-				cancelled: state((v) => v.state === "cancelled" || v.state === "superseded") },
-			finishedSinceLast: fresh.length,
-			budget: (["teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "teamWorks"] as const)
-				.map((counter) => ({ counter, used: used[counter]!, limit: team.limits[counter] })),
-		};
-		const at = this.timestamp();
-		const work = this.makeWork(team, team.lead, reviewer.id, this.reviewTask(team, snapshot, fresh, records), [], undefined, at);
+		const { task, pending } = this.captureReview(team, team.review.schedule!.focus);
+		const work = this.makeWork(team, team.lead, reviewer.id, task, [], undefined, pending.snapshotAt);
 		work.kind = "review";
 		this.assertInputFits(team, reviewer, work);
 		team.ledger.add(work);
 		const ref = { workId: work.id, revision: 1 };
 		this.enqueueWork(team, ref);
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
-		team.review.signature = this.reviewSignature(team);
-		team.review.finished = new Set(done.map((record) => record.id));
-		team.review.wall = Date.now();
-		team.review.pending = { snapshot };
+		team.review.pending = pending;
 		this.note(team, `review ${shortWorkRef(ref)} → ${reviewer.id}`);
 		this.changed(team);
 		this.check(team);
@@ -1115,10 +1098,30 @@ export class TeamRuntime {
 		return copy(ref);
 	}
 
+	private captureReview(team: TeamState, focus?: string): { task: string; pending: NonNullable<ReviewState["pending"]> } {
+		const at = this.timestamp();
+		const records = this.plainRecords(team);
+		const done = records.filter((record) => isTerminalWorkState(currentVersion(record).state));
+		const fresh = done.filter((record) => !team.review.finished.has(record.id));
+		const state = (pick: (version: WorkVersion) => boolean) => records.filter((record) => pick(currentVersion(record))).length;
+		const used: Record<string, number> = { teamWorks: team.ledger.order.length, ...team.budget.used };
+		const snapshot: TeamReviewRecord["snapshot"] = {
+			elapsedMs: at - team.review.startedAt,
+			works: { total: records.length, resolved: state((v) => v.state === "resolved"), running: state((v) => v.state === "running"),
+				blocked: state((v) => v.state === "blocked"), held: state((v) => !!v.hold), failed: state((v) => v.state === "failed"),
+				cancelled: state((v) => v.state === "cancelled" || v.state === "superseded") },
+			finishedSinceLast: fresh.length,
+			budget: (["teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "teamWorks"] as const)
+				.map((counter) => ({ counter, used: used[counter]!, limit: team.limits[counter] })),
+		};
+		return { task: this.reviewTask(team, snapshot, fresh, records, at, focus),
+			pending: { snapshotAt: at, snapshot, signature: this.reviewSignature(team), finished: new Set(done.map((record) => record.id)),
+				wall: Date.now(), ...(focus ? { focus } : {}) } };
+	}
+
 	/** The host-built snapshot (bounded well under 16 KiB: every list is capped and previewed) plus the instructions. */
-	private reviewTask(team: TeamState, snapshot: TeamReviewRecord["snapshot"], fresh: readonly WorkRecord[], records: readonly WorkRecord[]): string {
+	private reviewTask(team: TeamState, snapshot: TeamReviewRecord["snapshot"], fresh: readonly WorkRecord[], records: readonly WorkRecord[], now: number, focus?: string): string {
 		const facts = this.panelFacts(team.id);
-		const now = this.timestamp();
 		const minutes = (ms: number) => `${Math.round(ms / 60_000)} min`;
 		const w = snapshot.works;
 		const outcome = (record: WorkRecord) => {
@@ -1144,7 +1147,7 @@ export class TeamRuntime {
 		const flow = flowRows(this.flowStats(team.id));
 		const flowFacts = [`Flow: ${flow.flow}`, `Lead: ${flow.lead}`, `Waits: ${flow.waits}`, prompt("team", "review_flow_note")];
 		const signals = prompt("team", "review_signals", {
-			taken: new Date().toISOString(), lead: team.members.get(team.lead)!.activity === "idle" ? "idle" : "active", queued: String(facts.pendingEvents),
+			taken: new Date(now).toISOString(), lead: team.members.get(team.lead)!.activity === "idle" ? "idle" : "active", queued: String(facts.pendingEvents),
 			last_finished: finishedAt ? `${minutes(now - finishedAt)} ago` : "none yet", stale: String(stale),
 			held: held.length ? `${held.slice(0, 8).join("\n")}${held.length > 8 ? `\n+${held.length - 8} more` : ""}` : "none",
 		});
@@ -1164,21 +1167,27 @@ export class TeamRuntime {
 			`Previous review: ${previous ? `${previous.verdict?.replace("_", " ").toUpperCase() ?? "no verdict"} — ${previewText(previous.summary, 400)}` : "none"}`,
 			"Timeline since the last review (m:ss from launch):", ...timeline.map((line) => previewText(line, 200)),
 			"", prompt("team", "review_instructions"),
-			...(team.review.schedule?.focus ? ["", prompt("team", "review_focus", { focus: team.review.schedule.focus })] : []),
+			...(focus ? ["", prompt("team", "review_focus", { focus })] : []),
 		].join("\n");
 	}
 
 	/** Store (and journal) a review's outcome; a missing result means the review work failed. */
 	private recordReview(team: TeamState, member: RuntimeMember, ref: WorkRef, resultRef: string | undefined,
-		result: Pick<WorkResult, "status" | "summary" | "findings" | "limitations">): void {
+		result: Pick<WorkResult, "status" | "summary" | "findings" | "limitations">): TeamReviewRecord {
 		const verdict = reviewVerdict(result.summary);
-		const record: TeamReviewRecord = { id: this.modelId(team, "review"), at: this.timestamp(), by: member.id, work: copy(ref),
+		const at = this.timestamp();
+		const pending = team.review.pending!;
+		const record: TeamReviewRecord = { id: this.modelId(team, "review"), at, snapshotAt: pending.snapshotAt, reviewedAt: at, by: member.id, work: copy(ref),
 			...(resultRef ? { resultRef } : {}), status: result.status, ...(verdict ? { verdict } : {}),
 			summary: previewText(result.summary, TEAM_MAX_TEXT_ITEM_BYTES), ...(result.findings ? { findings: copy(result.findings) } : {}),
-			...(result.limitations ? { limitations: copy(result.limitations) } : {}), snapshot: team.review.pending!.snapshot };
+			...(result.limitations ? { limitations: copy(result.limitations) } : {}), snapshot: pending.snapshot };
 		this.tryJournal(team, { version: 2, kind: "review", teamId: team.id, at: record.at, review: copy(record) });
 		team.review.records.push(record);
 		if (team.review.records.length > TEAM_MAX_REVIEWS) team.review.records.shift();
+		team.review.signature = pending.signature;
+		team.review.finished = pending.finished;
+		team.review.wall = pending.wall;
+		return record;
 	}
 
 	/**
@@ -3351,17 +3360,27 @@ export class TeamRuntime {
 
 	private reserveWork(team: TeamState, member: RuntimeMember, ref: WorkRef): RuntimeActivation {
 		const version = team.ledger.version(ref)!;
+		const review = this.isReview(team, ref) ? this.captureReview(team, team.review.pending!.focus) : undefined;
+		// A lead-authored revision replaces the original instructions. Keep all of it (up to 8 KiB),
+		// adding only the compact current snapshot so the delivered task stays below 16 KiB.
+		const task = !review ? version.task : ref.revision === 1 ? review.task : `${version.task}\n\n${prompt("team", "review_revised_snapshot", {
+			taken: new Date(review.pending.snapshotAt).toISOString(), snapshot: JSON.stringify(review.pending.snapshot),
+		})}`;
 		const at = this.timestamp();
 		const deliveryId = this.id("delivery");
 		const scope: ActivationScope = { activationId: this.id("activation"), kind: "work", work: copy(ref) };
 		const input = this.activationInput(team, member, deliveryId, {
-			kind: "work", work: copy(ref), task: version.task, requester: team.ledger.get(ref.workId)!.record.requester,
+			kind: "work", work: copy(ref), task, requester: team.ledger.get(ref.workId)!.record.requester,
 			rootId: team.ledger.get(ref.workId)!.record.rootId,
 			...(team.ledger.get(ref.workId)!.record.parent ? { parent: copy(team.ledger.get(ref.workId)!.record.parent!) } : {}),
 			depth: team.ledger.get(ref.workId)!.record.depth, inputRefs: copy(version.inputRefs), waitingFor: copy(version.waitingFor),
 			...(version.checkpoint ? { checkpoint: version.checkpoint } : {}), ...(version.resumeInstruction ? { resumeInstruction: version.resumeInstruction } : {}),
 			...(ref.revision > 1 ? { previous: this.previousVersion(team, ref) } : {}),
 		}, team.budget.inputSummary(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false));
+		if (review) {
+			if (ref.revision === 1) version.task = review.task;
+			team.review.pending = review.pending;
+		}
 		version.state = "running";
 		version.updatedAt = at;
 		this.tickFlow(team);
@@ -3750,10 +3769,10 @@ export class TeamRuntime {
 			team.flow.committedAt.set(workRefKey(ref), team.flow.activeMs);
 		}
 		if (record.kind === "review") {
-			this.recordReview(team, member, ref, resultRef, result);
+			const review = this.recordReview(team, member, ref, resultRef, result);
 			// An ON TRACK review is only recorded; anything else (a risk, no verdict, a failed review) reaches the lead.
 			if (reviewVerdict(result.summary) !== "on_track" || result.status === "failed") this.addEvent(team, { key: `review:${resultRef}`, kind: "REVIEW_READY", work: ref, resultRef,
-				message: prompt("team", "event_review_ready", { work: workRefKey(ref), member: member.id, result_ref: resultRef, result: formatWorkResult(result) }) });
+				message: prompt("team", "event_review_ready", { work: workRefKey(ref), member: member.id, result_ref: resultRef, times: reviewTiming(review), result: formatWorkResult(result) }) });
 		} else if (!record.parent) this.addEvent(team, { key: `root-result:${workRefKey(ref)}:${resultRef}`, kind: "ROOT_RESULT_READY",
 			message: prompt("team", "event_root_result_ready", { work: workRefKey(ref), status: result.status, result_ref: resultRef, member: member.id, result: formatWorkResult(result) }), work: ref, resultRef });
 		this.wakeWaiters(team);

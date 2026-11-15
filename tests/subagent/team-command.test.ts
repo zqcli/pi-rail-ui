@@ -616,7 +616,7 @@ test("review command on a Team from history shows its schedule and reviews, and 
 	assert.equal(host.history.skipped, 0);
 	const { ctx, notifications } = commandContext();
 	await runTeamCommand(host, "hist-1 review", ctx);
-	assert.equal(notifications.at(-1)!.text, "Review: worker every 20 min\nreview:abcd · 2:05 · worker · off track: OFF TRACK: nothing merged.");
+	assert.equal(notifications.at(-1)!.text, "Review: worker every 20 min\nreview:abcd · 2:05 · worker · off track: OFF TRACK: nothing merged.\n  snapshotAt: not recorded · reviewedAt: 2023-11-14T22:13:20.001Z");
 	await assert.rejects(runTeamCommand(host, "hist-1 review now", ctx), /read-only history/u);
 });
 

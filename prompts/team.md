@@ -97,7 +97,7 @@ Events activation: you are the Team's lead and there is no current WorkRef. Hand
 
 ## review_instructions
 
-You are reviewing the Team's progress against the goal and the brief. You only advise: do not request or control work. Use status and read tools if needed, and judge from the snapshot above.
+You are reviewing the Team's progress against the goal and the brief. You only advise: do not request or control work. Use status and read tools if needed, and judge from the activation-time snapshot above. Before reporting a risk that could have changed, verify its current status.
 
 Verdicts:
 - ON TRACK: the Team is progressing toward the goal; waits are planned or already being handled; no lead action is needed.
@@ -117,7 +117,7 @@ Guidance from the Team's plan for this review, in addition to the criteria above
 
 ## review_signals
 
-Snapshot taken at {{taken}}. It may be older than your activation; status shows the current state.
+snapshotAt: {{taken}}. This snapshot is refreshed when your activation starts; status shows any later changes.
 Lead: {{lead}} · Team events queued for the lead: {{queued}}
 Last finished non-review work: {{last_finished}} · consecutive reviews without finished work, including this one: {{stale}}
 Held works:
@@ -126,6 +126,11 @@ Held works:
 ## review_flow_note
 
 The Flow, Lead and Waits numbers describe elapsed flow, not worker effort or blame; they are not a risk by themselves. Host pauses are excluded. Ready waits exclude member pauses and work holds. Dependency waits end when outcomes are deliverable, before resume queueing; “last” names the final dependency, not the cause of the entire wait. Accept is active time from root commit to acceptance/waiver, not time spent reviewing.
+
+## review_revised_snapshot
+
+Current Team progress snapshot, snapshotAt: {{taken}}. The task above is the lead's revised instruction; use status for current work details and any later changes.
+{{snapshot}}
 
 ## review_retry_note
 
@@ -198,6 +203,8 @@ No work is runnable; review blocked work or decide whether to close
 ## event_review_ready
 
 Periodic review {{work}} from {{member}}, result {{result_ref}}, in full below. It is advice only:
+
+{{times}}
 
 {{result}}
 

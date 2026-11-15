@@ -233,6 +233,10 @@ export interface TeamReviewRecord {
 	id: string;
 	/** Commit time. */
 	at: number;
+	/** Last activation's host snapshot time; absent in older history. */
+	snapshotAt?: number;
+	/** Outcome commit time (also `at`); absent in older history. */
+	reviewedAt?: number;
 	/** Reviewer alias. */
 	by: string;
 	work: WorkRef;
@@ -248,6 +252,11 @@ export interface TeamReviewRecord {
 		finishedSinceLast: number;
 		budget: Array<{ counter: string; used: number; limit: number }>;
 	};
+}
+
+/** Keep snapshot age distinct from result time; old history never recorded the former. */
+export function reviewTiming(review: Pick<TeamReviewRecord, "at" | "snapshotAt" | "reviewedAt">): string {
+	return `snapshotAt: ${review.snapshotAt === undefined ? "not recorded" : new Date(review.snapshotAt).toISOString()} · reviewedAt: ${new Date(review.reviewedAt ?? review.at).toISOString()}`;
 }
 
 // ---------------------------------------------------------------------------------------------

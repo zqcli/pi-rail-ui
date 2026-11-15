@@ -4,7 +4,7 @@ import type { BudgetScope } from "./team-budget";
 import { normalizeTitle, previewText } from "./team-codec";
 import type { TeamMemberSession, TeamSessionHost } from "./team-host";
 import { showTeamOverlay } from "./team-overlay";
-import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, workRefKey, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView } from "./team-protocol";
+import { ROOT_GRANTABLE_COUNTERS, TEAM_GRANTABLE_COUNTERS, TEAM_BUDGET_PRESETS, reviewTiming, workRefKey, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView } from "./team-protocol";
 import { clock, type GrantPreview } from "./team-runtime";
 import { formatBudgetLimit, formatBytes, formatHistoryEntry, formatHistorySummary, formatTeamView, lifecycleText } from "./team-tool";
 
@@ -337,7 +337,8 @@ async function deleteTeams(host: TeamSessionHost, targets: string[], ctx: Extens
 
 function reviewLines(schedule: TeamReviewPlan | undefined, reviews: readonly TeamReviewRecord[]): string[] {
 	return [`Review: ${schedule ? `${schedule.by} every ${schedule.everyMinutes} min` : "off"}`,
-		...reviews.slice(-10).map((review) => `${review.id} · ${clock(review.snapshot.elapsedMs)} · ${review.by} · ${review.verdict?.replace("_", " ") ?? review.status}: ${previewText(review.summary, 200)}`)];
+		...reviews.slice(-10).flatMap((review) => [`${review.id} · ${clock(review.snapshot.elapsedMs)} · ${review.by} · ${review.verdict?.replace("_", " ") ?? review.status}: ${previewText(review.summary, 200)}`,
+			`  ${reviewTiming(review)}`])];
 }
 
 /** `review` alone shows the schedule and the latest reviews; now, every and off change the Team and need confirmation. */

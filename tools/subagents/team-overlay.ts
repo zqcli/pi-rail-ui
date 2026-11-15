@@ -7,7 +7,7 @@ import { railModelReference } from "./models";
 import { COMPACT_THRESHOLD_CHOICES, readCompactThreshold, writeCompactThreshold } from "./team-compaction-settings";
 import { flowRows } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
-import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
+import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, reviewTiming, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
 
@@ -740,7 +740,7 @@ export class TeamOverlayComponent implements Focusable {
 
 	private snapshotLines(review: TeamReviewRecord): string[] {
 		const { elapsedMs, works, finishedSinceLast, budget } = review.snapshot;
-		return [`Snapshot: ${clock(elapsedMs)} · ${finishedSinceLast} finished since last review`,
+		return [reviewTiming(review), `Snapshot: ${clock(elapsedMs)} · ${finishedSinceLast} finished since last review`,
 			`Works: ${works.resolved}/${works.total} resolved · ${works.running} running · ${works.blocked} blocked · ${works.held} held · ${works.failed} failed · ${works.cancelled} cancelled`,
 			`Budget: ${budget.map(({ counter, used, limit }) => `${counter} ${used}/${limit >= TEAM_BUDGET_UNLIMITED ? "unlimited" : limit}`).join(" · ")}`];
 	}

@@ -912,7 +912,7 @@ export function normalizeResultRecord(value: unknown, field = "result record"): 
 /** Strict decoder for a review record written to the v2 history journal. */
 export function normalizeTeamReviewRecord(value: unknown, field = "review record"): TeamReviewRecord {
 	if (!isRecord(value)) return protocol(`${field} must be an object`);
-	frameKeys(value, ["id", "at", "by", "work", "resultRef", "status", "verdict", "summary", "findings", "limitations", "snapshot"], field);
+	frameKeys(value, ["id", "at", "snapshotAt", "reviewedAt", "by", "work", "resultRef", "status", "verdict", "summary", "findings", "limitations", "snapshot"], field);
 	const status = value["status"];
 	if (status !== "succeeded" && status !== "partial" && status !== "failed") return protocol(`${field}.status is invalid`);
 	const verdict = value["verdict"];
@@ -928,6 +928,8 @@ export function normalizeTeamReviewRecord(value: unknown, field = "review record
 	const limitations = textList(value["limitations"], `${field}.limitations`);
 	return {
 		id: frameId(value["id"], `${field}.id`), at: safeInteger(value["at"], `${field}.at`, 0), by: normalizeAlias(value["by"], `${field}.by`),
+		...(value["snapshotAt"] !== undefined ? { snapshotAt: safeInteger(value["snapshotAt"], `${field}.snapshotAt`, 0) } : {}),
+		...(value["reviewedAt"] !== undefined ? { reviewedAt: safeInteger(value["reviewedAt"], `${field}.reviewedAt`, 0) } : {}),
 		work: normalizeWorkRef(value["work"], `${field}.work`), ...(value["resultRef"] !== undefined ? { resultRef: frameId(value["resultRef"], `${field}.resultRef`) } : {}),
 		status, ...(verdict !== undefined ? { verdict: verdict as NonNullable<TeamReviewRecord["verdict"]> } : {}),
 		summary: text(value["summary"], `${field}.summary`, TEAM_MAX_TEXT_ITEM_BYTES),

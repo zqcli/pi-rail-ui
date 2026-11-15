@@ -429,7 +429,7 @@ test("the final text's Process block carries one flow line", async () => {
 		return { lifetime: Promise.resolve(terminal(teamId)) };
 	};
 	const text: string = (await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context())).content[0].text;
-	assert.match(text, /^Process:\n(?:- .*\n)*?- flow: workers avg \S+ · only lead \S+ · start delay p90 \S+ · waits p90 \S+ · most waited: \S.*\n(?:- .*\n)*Members:/mu);
+	assert.match(text, /^Process:\n(?:- .*\n)*?- flow: workers avg \S+ · only lead \S+ · ready first p90 \S+ · ready resume p90 \S+ · deps p90 \S+ · last dependency: \S.*\n(?:- .*\n)*Members:/mu);
 });
 
 /** Reserve the next activation and acknowledge its input, as a native member would. */

@@ -116,6 +116,8 @@ Instance metadata 和 lease 保存在 `~/.pi/agent/stateful-subagents/`；instan
 
 `/rail-team` 打开实时弹窗，包含 Overview、Progress（定期评审）、Members、Tasks 和 Timeline 五个视图（Tab 切换，方向键导航），支持经确认的 pause/continue/cancel/resume/grant/message/revive/lead 操作（按键 `p`（运行中为暂停，已暂停为继续）`/c/r/g/m/v/l`，Overview 显示完整 Team ID）及只读历史。`/rail-team list`（或在非 TUI 模式如 RPC/headless 下不带参数）保留文本列表；`/rail-team <teamId> …` 提供 live status、分页 `results [page:N]`、单条完整 `result <resultRef>`、budget、message、lead（把 lead 交给其他成员）、revive（重新打开进程仍存活的 faulted 成员；Team ID 可写唯一前缀）、pause [reason] / continue（在当前 pi 进程内冻结并稍后继续 Team：运行中的 activation（含 lead）完成当前模型请求和已发出的工具调用后，在下一个 provider gate 停住；不再启动新的 activation，期间 Team 截止时间不走；`continue` 恢复被停住的运行并通知 lead；重启 pi 后不保留）、resume（解除 attention/protocol hold）、grant 和 cancel。模型工具 `subagent_team status` 以游标分页列出 result refs；只有指定 `resultRef` 才读取一条完整 `ResultRecord`。历史只读：跨 session branch 或重启不恢复旧 Promise 或继续运行，未结束的 Team 显示为 interrupted；旧 v1 Team 记录只读映射为 legacy。
 
+Flow 延迟排除宿主暂停，ready 等待还排除成员暂停与 work hold；依赖 outcome 可交付时即结束依赖计时，后续恢复排队另算。`last dependency` 不是个人责任归因，验收 elapsed 也不是实际审阅耗时。详见 [Team Flow 指标口径](docs/subagent-team-flow.md)。
+
 在 `/rail-agent` 面板选中成员后按 `s` 停止、按 `x` 删除。对 Team 成员，Stop 只停止该成员，并将其运行中 work 记录为 outcome unknown；同 Team 其他成员/root 与无关 Team 不会被一并取消。停止 lead 会标记 `LEAD_UNAVAILABLE` 并暂停其他成员，Team 保持可由宿主管理。Delete 只有在成员原生进程实际退出得到确认后才删除 session 与 descriptor；退出未知时保留资源所有权并拒绝删除。
 
 完整协议、状态、错误码与限制见 [Team Actor v2](docs/subagent-team-actor.md)，100 项验收映射与本地证据见 [验证报告](docs/subagent-team-actor-validation.md)。该报告记录原始的纯 Runtime、fake transport 与真实 Pi 0.87.1 + 本地合成 provider 测试，不代表真实在线模型的决策质量，也不包含 TUI 人工验收和长时间、真实负载运行。该报告的缓存预热检查只覆盖运行中阶段的预热决策；idle 阶段预热在当时的 rail 子进程中未能触发，原因未查明。本次重跑结果及范围见 [Pi 1.5.2 迁移记录](docs/pi-1.5.2-migration.md)。

@@ -1,6 +1,7 @@
 /**
  * Flow metrics of a running Team (host display only): where time goes between the lead, the workers and the work
- * permits. Everything is updated incrementally and in O(1) per event with the Runtime's own clock; the arrays and the
+ * permits. Counters use Team active time (host pauses excluded); ready waits also exclude member pauses and holds.
+ * Updates follow existing queue/dependency transitions with the Runtime's own clock; the arrays and the
  * minute ring are bounded, and only the Progress tab, the final text and the review snapshot read the statistics.
  */
 
@@ -37,12 +38,17 @@ export interface FlowState {
 	buckets: Array<{ minute: number; workerMs: number; activeMs: number }>;
 	/** Versions that already had their first activation. */
 	started: Set<string>;
+	/** Active, unpaused ready time before each version's first activation, or a later activation. */
 	startDelays: number[];
-	/** Versions that yielded on dependencies: when, and on what. */
+	resumeDelays: number[];
+	/** Pending ready spells; a hold preserves elapsed ready time without counting the held interval. */
+	ready: Map<string, { since?: number; ms: number }>;
+	/** Dependency waits, in Team active time. Refs contain only outcomes not yet deliverable. */
 	waiting: Map<string, { since: number; refs: Array<{ workId: string; revision: number }> }>;
 	waitDurations: number[];
+	completedWaits: number;
 	waitsByMember: Map<string, { count: number; ms: number }>;
-	/** Committed root results awaiting the lead's accept/waive. */
+	/** Team active time of committed root results awaiting the lead's accept/waive. */
 	committedAt: Map<string, number>;
 	acceptLatencies: number[];
 }
@@ -50,7 +56,7 @@ export interface FlowState {
 export const newFlow = (at: number): FlowState => ({
 	lastAt: at, workers: 0, leads: 0, slots: 0, activeMs: 0, leadBusyMs: 0, leadOnlyMs: 0, workerMs: 0, allSlotsMs: 0,
 	buckets: Array.from({ length: 60 }, () => ({ minute: -1, workerMs: 0, activeMs: 0 })),
-	started: new Set(), startDelays: [], waiting: new Map(), waitDurations: [], waitsByMember: new Map(), committedAt: new Map(), acceptLatencies: [],
+	started: new Set(), startDelays: [], resumeDelays: [], ready: new Map(), waiting: new Map(), waitDurations: [], completedWaits: 0, waitsByMember: new Map(), committedAt: new Map(), acceptLatencies: [],
 });
 
 /** Keep the newest BOUND values. */
@@ -87,6 +93,7 @@ export function tickFlow(flow: FlowState, now: number, counting: boolean, slotLi
 export interface TeamFlowStats {
 	slotLimit: number;
 	activeMs: number;
+	pausedMs: number;
 	workersAvg: number | undefined;
 	workersRecent: number | undefined;
 	allSlotsShare: number | undefined;
@@ -94,10 +101,12 @@ export interface TeamFlowStats {
 	onlyLeadShare: number | undefined;
 	startP50: number | undefined;
 	startP90: number | undefined;
+	resumeP50: number | undefined;
+	resumeP90: number | undefined;
 	queued: { count: number; oldestMs: number; reason: string } | undefined;
 	waitP50: number | undefined;
 	waitP90: number | undefined;
-	/** Top 3 by count. */
+	/** Last dependency to become deliverable in a completed wait, top 3 by count. Not worker execution time. */
 	waited: Array<{ member: string; count: number; ms: number }>;
 	acceptP50: number | undefined;
 	acceptP90: number | undefined;
@@ -115,12 +124,12 @@ function percentile(values: readonly number[], share: number): number | undefine
 }
 
 /** `extra` is what only the Runtime knows at read time: the queue, the pending events, the cost and the largest context. */
-export function flowStats(flow: FlowState, now: number, extra: Pick<TeamFlowStats, "slotLimit" | "queued" | "pendingEvents" | "tokensPerWork" | "context">): TeamFlowStats {
+export function flowStats(flow: FlowState, now: number, extra: Pick<TeamFlowStats, "slotLimit" | "pausedMs" | "queued" | "pendingEvents" | "tokensPerWork" | "context">): TeamFlowStats {
 	const share = (ms: number) => flow.activeMs ? ms / flow.activeMs : undefined;
 	const recent = flow.buckets.filter((bucket) => bucket.minute > Math.floor(now / MINUTE) - RECENT_MINUTES);
 	const recentActive = recent.reduce((sum, bucket) => sum + bucket.activeMs, 0);
 	const waited = [...flow.waitsByMember].map(([member, { count, ms }]) => ({ member, count, ms })).sort((a, b) => b.count - a.count || b.ms - a.ms);
-	const waits = waited.reduce((sum, item) => sum + item.count, 0);
+	const waits = flow.completedWaits;
 	const startP90 = percentile(flow.startDelays, 0.9);
 	const onlyLeadShare = share(flow.leadOnlyMs);
 	return {
@@ -129,13 +138,14 @@ export function flowStats(flow: FlowState, now: number, extra: Pick<TeamFlowStat
 		workersRecent: recentActive ? recent.reduce((sum, bucket) => sum + bucket.workerMs, 0) / recentActive : undefined,
 		allSlotsShare: share(flow.allSlotsMs), leadBusyShare: share(flow.leadBusyMs), onlyLeadShare,
 		startP50: percentile(flow.startDelays, 0.5), startP90,
+		resumeP50: percentile(flow.resumeDelays, 0.5), resumeP90: percentile(flow.resumeDelays, 0.9),
 		waitP50: percentile(flow.waitDurations, 0.5), waitP90: percentile(flow.waitDurations, 0.9),
 		waited: waited.slice(0, 3),
 		acceptP50: percentile(flow.acceptLatencies, 0.5), acceptP90: percentile(flow.acceptLatencies, 0.9),
 		warn: {
 			lead: (onlyLeadShare ?? 0) > TEAM_FLOW_WARN.onlyLeadShare && flow.activeMs >= TEAM_FLOW_WARN.onlyLeadAfterMs,
-			queue: (startP90 ?? 0) > TEAM_FLOW_WARN.startDelayP90Ms || (extra.queued?.oldestMs ?? 0) > TEAM_FLOW_WARN.queuedOldestMs,
-			waits: waits >= TEAM_FLOW_WARN.waitedMinCount && waited[0]!.count / waits > TEAM_FLOW_WARN.waitedMemberShare,
+			queue: Math.max(startP90 ?? 0, percentile(flow.resumeDelays, 0.9) ?? 0) > TEAM_FLOW_WARN.startDelayP90Ms || (extra.queued?.oldestMs ?? 0) > TEAM_FLOW_WARN.queuedOldestMs,
+			waits: waits >= TEAM_FLOW_WARN.waitedMinCount && (waited[0]?.count ?? 0) / waits > TEAM_FLOW_WARN.waitedMemberShare,
 			cost: (extra.context?.tokens ?? 0) > TEAM_FLOW_WARN.contextTokens,
 		},
 	};
@@ -151,14 +161,14 @@ const percent = (value: number | undefined) => value === undefined ? "—" : `${
 const decimal = (value: number | undefined) => value === undefined ? "—" : value.toFixed(1);
 export const tokens = (value: number) => value < 1000 ? String(value) : value < 1_000_000 ? `${Math.round(value / 1000)}k` : `${(value / 1_000_000).toFixed(1)}M`.replace(/\.0M$/u, "M");
 
-/** The Progress rows (without their labels), each within 69 columns; also the Flow, Lead and Waits facts of a review snapshot. */
+/** The Progress warning rows and review facts. The popup wraps longer rows. */
 export function flowRows(stats: TeamFlowStats): { flow: string; lead: string; queue: string; waits: string; cost: string } {
 	const waited = stats.waited.slice(0, 2).map(({ member, count, ms }) => `${member} ${count}× ${flowDuration(ms)}`).join(" · ") || "—";
 	return {
-		flow: `workers avg ${decimal(stats.workersAvg)} (last 10m ${decimal(stats.workersRecent)}) · all ${stats.slotLimit} slots busy ${percent(stats.allSlotsShare)}`,
-		lead: `busy ${percent(stats.leadBusyShare)} · only lead ${percent(stats.onlyLeadShare)} · accept p50 ${flowDuration(stats.acceptP50)} · p90 ${flowDuration(stats.acceptP90)} · ${stats.pendingEvents} pending`,
-		queue: `start p50 ${flowDuration(stats.startP50)} · p90 ${flowDuration(stats.startP90)} · ${stats.queued ? `${stats.queued.count} queued, oldest ${flowDuration(stats.queued.oldestMs)} (${stats.queued.reason})` : "none queued"}`,
-		waits: `p50 ${flowDuration(stats.waitP50)} · p90 ${flowDuration(stats.waitP90)} · most: ${waited}`,
+		flow: `workers avg ${decimal(stats.workersAvg)} (last 10m ${decimal(stats.workersRecent)}) · all ${stats.slotLimit} slots busy ${percent(stats.allSlotsShare)} · host paused ${flowDuration(stats.pausedMs)}`,
+		lead: `busy ${percent(stats.leadBusyShare)} · only lead ${percent(stats.onlyLeadShare)} · accept active p50 ${flowDuration(stats.acceptP50)} · p90 ${flowDuration(stats.acceptP90)} · ${stats.pendingEvents} pending`,
+		queue: `ready first p50 ${flowDuration(stats.startP50)} · p90 ${flowDuration(stats.startP90)} · resume p90 ${flowDuration(stats.resumeP90)} · ${stats.queued ? `${stats.queued.count} queued, oldest ${flowDuration(stats.queued.oldestMs)} (${stats.queued.reason})` : "none queued"}`,
+		waits: `deps p50 ${flowDuration(stats.waitP50)} · p90 ${flowDuration(stats.waitP90)} · last: ${waited}`,
 		cost: `${stats.tokensPerWork === undefined ? "—" : tokens(Math.round(stats.tokensPerWork))} tokens/finished work · largest context ${stats.context ? `${stats.context.member} ${tokens(stats.context.tokens)}` : "—"}`,
 	};
 }
@@ -166,5 +176,5 @@ export function flowRows(stats: TeamFlowStats): { flow: string; lead: string; qu
 /** The one-line summary kept in the final text and in history. */
 export function flowSummary(stats: TeamFlowStats): string {
 	const top = stats.waited[0];
-	return `workers avg ${decimal(stats.workersAvg)} · only lead ${percent(stats.onlyLeadShare)} · start delay p90 ${flowDuration(stats.startP90)} · waits p90 ${flowDuration(stats.waitP90)} · most waited: ${top ? `${top.member} ${top.count}×` : "—"}`;
+	return `workers avg ${decimal(stats.workersAvg)} · only lead ${percent(stats.onlyLeadShare)} · ready first p90 ${flowDuration(stats.startP90)} · ready resume p90 ${flowDuration(stats.resumeP90)} · deps p90 ${flowDuration(stats.waitP90)} · last dependency: ${top ? `${top.member} ${top.count}×` : "—"} · host paused ${flowDuration(stats.pausedMs)}`;
 }

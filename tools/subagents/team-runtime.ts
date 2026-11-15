@@ -238,6 +238,9 @@ interface RuntimeMember extends MemberRecord {
 	active?: ActiveActivation;
 	/** Team active time (flow.activeMs) when the member's last activation ended; the lead's roster shows idle minutes from it. */
 	idleSinceActiveMs?: number;
+	/** Member pause clock in Team active milliseconds, used only by ready-wait metrics. */
+	flowPausedMs?: number;
+	flowPauseAt?: number;
 	/** Kind of the last activation reserved for this member: an idle lead alternates its runnable work with event batches. */
 	lastActivationKind?: "events" | "work";
 	lastActivation?: CompletedActivationTombstone;
@@ -517,7 +520,7 @@ export class TeamRuntime {
 			const record = this.makeWork(team, team.lead, initial.to, initial.task, initial.inputRefs, undefined, createdAt, undefined, 0, initial.title);
 			this.assertInputFits(team, team.members.get(initial.to)!, record);
 			team.ledger.add(record);
-			team.ready.push({ workId: record.id, revision: 1 });
+			this.enqueueWork(team, { workId: record.id, revision: 1 });
 		}
 		this.check(team);
 		if (terminalTeams.length >= TEAM_MAX_LIVE_TEAMS) this.teams.delete(terminalTeams[0]!.id);
@@ -639,7 +642,7 @@ export class TeamRuntime {
 		member.lifecycle = "faulted";
 		member.resourceState = member.resourceState === "starting" ? "owned" : member.resourceState;
 		member.error = { code: "HOST_MEMBER_STOPPED", message: reason };
-		member.pause = "none";
+		this.setMemberPause(team, member, "none");
 		team.health = "needs_attention";
 		if (member.id === team.lead) {
 			this.holdLeadWork(team);
@@ -809,7 +812,7 @@ export class TeamRuntime {
 				version.updatedAt = this.timestamp();
 				delete entry.stagedWait;
 			}
-			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+			this.dequeueWork(team, ref);
 		}
 	}
 
@@ -869,7 +872,7 @@ export class TeamRuntime {
 		const members = new Set<string>();
 		for (const member of team.members.values()) {
 			if (member.lifecycle !== "open" || member.pause !== "none") continue;
-			member.pause = member.active ? "requested" : "confirmed";
+			this.setMemberPause(team, member, member.active ? "requested" : "confirmed");
 			members.add(member.id);
 		}
 		team.hostPause = { at: this.timestamp(), members };
@@ -964,7 +967,7 @@ export class TeamRuntime {
 				delete version.hold;
 				version.state = "queued";
 				version.updatedAt = this.timestamp();
-				team.ready.push(copy(ref));
+				this.enqueueWork(team, ref);
 			}
 			for (const incident of team.incidents) if (incident.code === "LEAD_UNAVAILABLE" && incident.state === "open") this.resolveIncident(team, incident.id);
 			for (const other of team.members.values()) if (other.lifecycle === "open") this.liftPause(team, other);
@@ -1099,7 +1102,7 @@ export class TeamRuntime {
 		this.assertInputFits(team, reviewer, work);
 		team.ledger.add(work);
 		const ref = { workId: work.id, revision: 1 };
-		team.ready.push(ref);
+		this.enqueueWork(team, ref);
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
 		team.review.signature = this.reviewSignature(team);
 		team.review.finished = new Set(done.map((record) => record.id));
@@ -1360,7 +1363,7 @@ export class TeamRuntime {
 			delete version.hold;
 			version.state = "queued";
 			version.updatedAt = this.timestamp();
-			if (!team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
+			if (!team.ready.some((item) => sameWorkRef(item, ref))) this.enqueueWork(team, ref);
 			released.push(copy(ref));
 		}
 		for (const incident of team.incidents) {
@@ -1557,7 +1560,7 @@ export class TeamRuntime {
 			if (this.thresholdCompaction(team, member)) continue;
 			member.compactedAtBoundary = false;
 			const activation = this.reserveWork(team, member, ref);
-			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+			this.dequeueWork(team, ref);
 			team.interrupted.delete(workRefKey(ref));
 			this.check(team);
 			return activation;
@@ -1871,13 +1874,9 @@ export class TeamRuntime {
 		}
 		active.providerGatePending = false;
 		active.parked = true;
-		this.tickFlow(team);
-		// The lead's activations hold no work permit.
-		if (active.workPermitHeld) {
-			active.workPermitHeld = false;
-			team.flow.slots--;
-		}
-		member.pause = "confirmed";
+		this.endFlow(team, active);
+		active.workPermitHeld = false;
+		this.setMemberPause(team, member, "confirmed");
 		this.changed(team);
 		this.requestDrain(team.id);
 	}
@@ -1909,24 +1908,95 @@ export class TeamRuntime {
 		delete active.flowRole;
 	}
 
-	/** First activation of a version: its start delay. Next activation after a dependency yield: the wait, charged to the waited member that finished last. Reviews are not measured. */
-	private flowWorkStarted(team: TeamState, ref: WorkRef, version: WorkVersion, at: number): void {
+	/** Team active clock excluding this member's explicit/safety pauses, not time spent on another work. */
+	private readyClock(team: TeamState, member: RuntimeMember): number {
+		return team.flow.activeMs - (member.flowPausedMs ?? 0)
+			- (member.flowPauseAt === undefined ? 0 : team.flow.activeMs - member.flowPauseAt);
+	}
+
+	private setMemberPause(team: TeamState, member: RuntimeMember, pause: MemberRecord["pause"]): void {
+		this.tickFlow(team);
+		if (member.pause === "none" && pause !== "none") member.flowPauseAt = team.flow.activeMs;
+		else if (member.pause !== "none" && pause === "none" && member.flowPauseAt !== undefined) {
+			member.flowPausedMs = (member.flowPausedMs ?? 0) + team.flow.activeMs - member.flowPauseAt;
+			delete member.flowPauseAt;
+		}
+		member.pause = pause;
+	}
+
+	/** Queue bookkeeping only: priorities, permits and admission remain the scheduler's decision. */
+	private enqueueWork(team: TeamState, ref: WorkRef): void {
+		team.ready.push(copy(ref));
+		if (team.ledger.get(ref.workId)!.record.kind === "review") return;
+		this.tickFlow(team);
+		const key = workRefKey(ref);
+		// An issue/explicit hold release may requeue the consumer before its dependencies finish.
+		if (team.flow.waiting.has(key) && !team.ledger.version(ref)!.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency))) team.flow.waiting.delete(key);
+		const ready = team.flow.ready.get(key) ?? { ms: 0 };
+		ready.since ??= this.readyClock(team, team.members.get(team.ledger.get(ref.workId)!.record.assignee)!);
+		team.flow.ready.set(key, ready);
+	}
+
+	private dequeueWork(team: TeamState, ref: WorkRef): void {
+		team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+		const key = workRefKey(ref);
+		const ready = team.flow.ready.get(key);
+		const version = team.ledger.version(ref)!;
+		if (isTerminalWorkState(version.state)) {
+			team.flow.ready.delete(key);
+			team.flow.waiting.delete(key);
+			team.flow.committedAt.delete(key);
+		} else if (ready?.since !== undefined) {
+			this.tickFlow(team);
+			ready.ms += Math.max(0, this.readyClock(team, team.members.get(team.ledger.get(ref.workId)!.record.assignee)!) - ready.since);
+			delete ready.since;
+		}
+		if (!version.waitingFor.length) team.flow.waiting.delete(key);
+	}
+
+	/** Record ready time separately for first starts and continuations; dependency time never leaks into it. */
+	private flowWorkStarted(team: TeamState, ref: WorkRef): number | undefined {
 		if (team.ledger.get(ref.workId)!.record.kind === "review") return;
 		const flow = team.flow;
 		const key = workRefKey(ref);
-		if (!flow.started.has(key)) {
-			flow.started.add(key);
-			pushFlow(flow.startDelays, at - version.createdAt);
+		const ready = flow.ready.get(key);
+		let ms: number | undefined;
+		if (ready) {
+			const now = this.readyClock(team, team.members.get(team.ledger.get(ref.workId)!.record.assignee)!);
+			ms = ready.ms + (ready.since === undefined ? 0 : Math.max(0, now - ready.since));
+			pushFlow(flow.started.has(key) ? flow.resumeDelays : flow.startDelays, ms);
 		}
-		const wait = flow.waiting.get(key);
-		if (!wait) return;
+		flow.started.add(key);
+		flow.ready.delete(key);
+		// A child issue can wake a consumer before all dependencies finish. That interrupted wait has no completed sample.
 		flow.waiting.delete(key);
-		const updatedAt = (work: WorkRef) => team.ledger.version(work)!.updatedAt;
-		const last = wait.refs.reduce((latest, work) => updatedAt(work) >= updatedAt(latest) ? work : latest);
-		const member = team.ledger.get(last.workId)!.record.assignee;
-		const total = flow.waitsByMember.get(member) ?? { count: 0, ms: 0 };
-		flow.waitsByMember.set(member, { count: total.count + 1, ms: total.ms + at - wait.since });
-		pushFlow(flow.waitDurations, at - wait.since);
+		return ms;
+	}
+
+	/** Close at outcome readiness, not consumer restart. Never infer completion order from mutable updatedAt. */
+	private flowDependenciesReady(team: TeamState): void {
+		if (!team.flow.waiting.size) return;
+		this.tickFlow(team);
+		for (const [key, wait] of team.flow.waiting) {
+			if (wait.refs.some((ref) => this.isUnknownOutcome(team, ref))) {
+				// A lost outcome requires a policy decision, not a completed dependency-wait sample.
+				team.flow.waiting.delete(key);
+				continue;
+			}
+			const ready = wait.refs.filter((ref) => team.ledger.outcomeReady(ref));
+			wait.refs = wait.refs.filter((ref) => !team.ledger.outcomeReady(ref));
+			if (wait.refs.length) continue;
+			team.flow.waiting.delete(key);
+			const ms = Math.max(0, team.flow.activeMs - wait.since);
+			pushFlow(team.flow.waitDurations, ms);
+			team.flow.completedWaits++;
+			const members = new Set(ready.map((ref) => team.ledger.get(ref.workId)!.record.assignee));
+			// A simultaneous batch has no unique last member; retain the wait sample without fabricating attribution.
+			if (members.size !== 1) continue;
+			const member = [...members][0]!;
+			const total = team.flow.waitsByMember.get(member) ?? { count: 0, ms: 0 };
+			team.flow.waitsByMember.set(member, { count: total.count + 1, ms: total.ms + ms });
+		}
 	}
 
 	/** Flow metrics for the Progress tab, the final text and the review snapshot. */
@@ -1938,21 +2008,27 @@ export class TeamRuntime {
 		const usage = this.teamUsage(team);
 		const tokens = usage.input + usage.output + usage.cacheRead;
 		let queuedCount = 0;
-		let oldest: { at: number; assignee: string } | undefined;
+		let oldest: { ms: number; assignee: string } | undefined;
 		if (team.lifecycle === "active") for (const ref of team.ready) {
 			const entry = team.ledger.get(ref.workId);
 			const version = team.ledger.version(ref);
 			if (!entry || !version || version.state !== "queued" || entry.record.kind === "review" || !sameWorkRef(team.ledger.currentRef(ref.workId)!, ref)) continue;
 			queuedCount++;
-			if (!oldest || version.updatedAt < oldest.at) oldest = { at: version.updatedAt, assignee: entry.record.assignee };
+			const ready = team.flow.ready.get(workRefKey(ref));
+			const member = team.members.get(entry.record.assignee)!;
+			const ms = ready ? ready.ms + (ready.since === undefined ? 0 : Math.max(0, this.readyClock(team, member) - ready.since)) : 0;
+			if (!oldest || ms > oldest.ms) oldest = { ms, assignee: entry.record.assignee };
 		}
 		const slotLimit = team.limits.workPermits;
 		const permitLimited = oldest?.assignee !== team.lead && this.usedWorkPermits(team) >= slotLimit;
-		const reason = permitLimited ? "slots full" : oldest && team.members.get(oldest.assignee)?.active ? "member busy" : "starting";
+		const oldestMember = oldest && team.members.get(oldest.assignee);
+		const reason = team.hostPause ? "host paused" : oldestMember?.pause !== undefined && oldestMember.pause !== "none" ? "member paused"
+			: oldestMember && this.retryWaitMs(oldestMember) ? "retry backoff" : oldestMember?.compaction ? "compacting"
+			: oldestMember?.active ? "member busy" : permitLimited ? "slots full" : "starting";
 		const members = [...team.members.values()].filter((member) => member.usage.contextTokens > 0);
 		const largest = members.reduce<RuntimeMember | undefined>((top, member) => !top || member.usage.contextTokens > top.usage.contextTokens ? member : top, undefined);
-		return flowStats(team.flow, this.timestamp(), { slotLimit, pendingEvents: this.pendingLeadEvents(team),
-			queued: oldest ? { count: queuedCount, oldestMs: this.timestamp() - oldest.at, reason } : undefined,
+		return flowStats(team.flow, this.timestamp(), { slotLimit, pausedMs: team.pausedMs + (team.hostPause ? Math.max(0, (team.endedAt ?? this.timestamp()) - team.hostPause.at) : 0), pendingEvents: this.pendingLeadEvents(team),
+			queued: oldest ? { count: queuedCount, oldestMs: oldest.ms, reason } : undefined,
 			tokensPerWork: finished ? tokens / finished : undefined,
 			context: largest ? { member: largest.id, tokens: largest.usage.contextTokens } : undefined });
 	}
@@ -1975,11 +2051,11 @@ export class TeamRuntime {
 				permits++;
 				this.tickFlow(team);
 				active.workPermitHeld = true;
-				team.flow.slots++;
 			}
+			this.startFlow(team, member, active);
 			active.parked = false;
 			active.resumeRequested = false;
-			member.pause = "none";
+			this.setMemberPause(team, member, "none");
 			const resolve = active.providerGateResolve;
 			delete active.providerGateResolve;
 			delete active.providerGatePromise;
@@ -2697,7 +2773,7 @@ export class TeamRuntime {
 		const work = this.makeWork(team, requester.id, recipient.id, action.task, action.inputRefs, parent, at, rootId, depth, action.title);
 		this.assertInputFits(team, recipient, work, parent);
 		team.ledger.add(work);
-		team.ready.push({ workId: work.id, revision: 1 });
+		this.enqueueWork(team, { workId: work.id, revision: 1 });
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
 		this.note(team, `${requester.id} requested ${shortWorkRef({ workId: work.id, revision: 1 })} «${work.title}» → ${recipient.id}`);
 		this.changed(team);
@@ -2821,11 +2897,11 @@ export class TeamRuntime {
 			const parked = target.active?.parked && target.active.resumeRequested ? target.active : undefined;
 			if (!parked) return okReply(lead.id, { receipt: { status: "unchanged", command: "pause_member", memberId } });
 			parked.resumeRequested = false;
-			target.pause = "confirmed";
+			this.setMemberPause(team, target, "confirmed");
 			this.changed(team);
 			return okReply(lead.id, { receipt: { status: "applied", command: "pause_member", memberId } });
 		}
-		target.pause = target.active ? "requested" : "confirmed";
+		this.setMemberPause(team, target, target.active ? "requested" : "confirmed");
 		this.changed(team);
 		this.requestDrain(team.id);
 		return okReply(lead.id, { receipt: { status: "applied", command: "pause_member", memberId } });
@@ -2849,10 +2925,10 @@ export class TeamRuntime {
 		if (target.pause === "none" || active?.resumeRequested || team.hostPause) return false;
 		if (active?.parked) {
 			active.resumeRequested = true;
-			target.pause = "requested";
+			this.setMemberPause(team, target, "requested");
 			this.resumeParkedActivations(team);
 		} else {
-			target.pause = "none";
+			this.setMemberPause(team, target, "none");
 			if (active?.providerGatePending) this.tryParkAtProviderGate(team, target, active);
 		}
 		return true;
@@ -2915,7 +2991,7 @@ export class TeamRuntime {
 			version.state = "blocked";
 		} else {
 			version.state = "queued";
-			if (!team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
+			if (!team.ready.some((item) => sameWorkRef(item, ref))) this.enqueueWork(team, ref);
 		}
 		this.resolveIncident(team, incidentId);
 		this.changed(team);
@@ -2959,9 +3035,9 @@ export class TeamRuntime {
 			team.ledger.cleanupPending.add(workRefKey(currentRef));
 			this.requestActivationStop(team, assignee, "policy_superseded");
 		}
-		team.ready = team.ready.filter((ref) => !sameWorkRef(ref, currentRef));
+		this.dequeueWork(team, currentRef);
 		team.ledger.addRevision(entry.record.id, candidate);
-		team.ready.push({ workId: entry.record.id, revision: nextRevision });
+		this.enqueueWork(team, { workId: entry.record.id, revision: nextRevision });
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
 		this.wakeWaiters(team);
 		this.changed(team);
@@ -2994,7 +3070,7 @@ export class TeamRuntime {
 		this.dropHold(team, version);
 		version.updatedAt = this.timestamp();
 		delete team.ledger.get(work.workId)!.stagedWait;
-		team.ready = team.ready.filter((queued) => !sameWorkRef(queued, work));
+		this.dequeueWork(team, work);
 		const assignee = team.members.get(team.ledger.get(work.workId)!.record.assignee)!;
 		if (assignee.active?.scope.kind === "work" && sameWorkRef(assignee.active.scope.work!, work)) {
 			assignee.active.stopReason = "cancelled";
@@ -3027,7 +3103,8 @@ export class TeamRuntime {
 		const committedAt = team.flow.committedAt.get(workRefKey(control.work));
 		if (committedAt !== undefined) {
 			team.flow.committedAt.delete(workRefKey(control.work));
-			pushFlow(team.flow.acceptLatencies, version.updatedAt - committedAt);
+			this.tickFlow(team);
+			pushFlow(team.flow.acceptLatencies, Math.max(0, team.flow.activeMs - committedAt));
 		}
 		this.changed(team);
 		return okReply(actor.id, { receipt: { status: "applied", command: "accept_result", work: control.work } });
@@ -3050,7 +3127,7 @@ export class TeamRuntime {
 		}
 		member.lifecycle = "open";
 		// A member that reopens while the host has paused the Team stays paused until the host continues.
-		member.pause = team.hostPause ? "confirmed" : "none";
+		this.setMemberPause(team, member, team.hostPause ? "confirmed" : "none");
 		team.hostPause?.members.add(member.id);
 		if (member.error?.code === "NATIVE_LENGTH") member.compaction = { trigger: by === "host" ? "host" : "lead", state: "pending" };
 		delete member.error;
@@ -3295,10 +3372,10 @@ export class TeamRuntime {
 			budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		this.startFlow(team, member, member.active);
 		const firstStart = !team.flow.started.has(workRefKey(ref));
-		this.flowWorkStarted(team, ref, version, at);
+		const readyMs = this.flowWorkStarted(team, ref);
 		member.currentWork = copy(ref);
 		member.activity = "running";
-		this.note(team, firstStart ? `${member.id} started ${shortWorkRef(ref)} (queued ${clock(at - Math.max(version.createdAt, team.startedAt ?? version.createdAt))})` : `${member.id} resumed ${shortWorkRef(ref)}`);
+		this.note(team, firstStart ? `${member.id} started ${shortWorkRef(ref)}${readyMs === undefined ? "" : ` (ready ${clock(readyMs)})`}` : `${member.id} resumed ${shortWorkRef(ref)}`);
 		this.addDelivery(team, member, scope, input);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
@@ -3413,7 +3490,7 @@ export class TeamRuntime {
 		this.tickFlow(team);
 		member.idleSinceActiveMs = team.flow.activeMs;
 		this.resumeParkedActivations(team);
-		if (member.lifecycle === "open" && member.pause === "requested") member.pause = "confirmed";
+		if (member.lifecycle === "open" && member.pause === "requested") this.setMemberPause(team, member, "confirmed");
 		if (member.lifecycle === "closing" && member.id === team.lead) member.resourceState = "stopping";
 		this.changed(team);
 		this.updateQuiescence(team);
@@ -3486,7 +3563,7 @@ export class TeamRuntime {
 			if (!active.stopReason && version.state === "running" && (this.scheduleOverflow(team, member, active) || this.scheduleRetry(team, member, active))) {
 				version.state = "queued";
 				version.updatedAt = this.timestamp();
-				if (!team.ready.some((queued) => sameWorkRef(queued, ref))) team.ready.push(copy(ref));
+				if (!team.ready.some((queued) => sameWorkRef(queued, ref))) this.enqueueWork(team, ref);
 				// It already held a permit: after the backoff it must not queue behind fresh work again.
 				team.interrupted.add(workRefKey(ref));
 				this.wakeWaiters(team);
@@ -3525,8 +3602,8 @@ export class TeamRuntime {
 				version.updatedAt = this.timestamp();
 				if (completionReason === "policy_pause") {
 					version.state = "queued";
-					member.pause = "confirmed";
-					if (!team.ready.some((queued) => sameWorkRef(queued, ref))) team.ready.push(copy(ref));
+					this.setMemberPause(team, member, "confirmed");
+					if (!team.ready.some((queued) => sameWorkRef(queued, ref))) this.enqueueWork(team, ref);
 				} else if (completionReason === "loop_hold") {
 					this.holdWork(team, member, ref, "TOOL_LOOP",
 						`${member.id} repeated the same failing ${active.loopStop!.tool} call ${TEAM_LOOP_REPEATS} times; the work is held`, "protocol");
@@ -3571,8 +3648,11 @@ export class TeamRuntime {
 			const allReady = version.waitingFor.every((dependency) => team.ledger.outcomeReady(dependency));
 			version.state = allReady ? "queued" : "blocked";
 			version.updatedAt = this.timestamp();
-			if (!allReady) team.flow.waiting.set(workRefKey(ref), { since: version.updatedAt, refs: copy(version.waitingFor) });
-			if (allReady && !team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
+			if (!allReady && team.ledger.get(ref.workId)!.record.kind !== "review") {
+				this.tickFlow(team);
+				team.flow.waiting.set(workRefKey(ref), { since: team.flow.activeMs, refs: copy(version.waitingFor.filter((dependency) => !team.ledger.outcomeReady(dependency))) });
+			}
+			if (allReady && !team.ready.some((item) => sameWorkRef(item, ref))) this.enqueueWork(team, ref);
 			this.updateQuiescence(team);
 		} else if (intent?.kind === "yield_attention") {
 			team.questions++;
@@ -3665,7 +3745,10 @@ export class TeamRuntime {
 		if (result.status === "failed") version.error = { code: "BUSINESS_FAILED", message: result.summary };
 		else delete version.error;
 		version.updatedAt = committed.committedAt;
-		if (!record.parent && record.kind !== "review") team.flow.committedAt.set(workRefKey(ref), committed.committedAt);
+		if (!record.parent && record.kind !== "review") {
+			this.tickFlow(team);
+			team.flow.committedAt.set(workRefKey(ref), team.flow.activeMs);
+		}
 		if (record.kind === "review") {
 			this.recordReview(team, member, ref, resultRef, result);
 			// An ON TRACK review is only recorded; anything else (a risk, no verdict, a failed review) reaches the lead.
@@ -3741,12 +3824,13 @@ export class TeamRuntime {
 			version.state = "blocked";
 			version.hold = { reason: "attention", incidentId: incident.id };
 			version.updatedAt = this.timestamp();
-			team.ready = team.ready.filter((item) => !sameWorkRef(item, ref));
+			this.dequeueWork(team, ref);
 			this.changed(team);
 		}
 	}
 
 	private wakeWaiters(team: TeamState): void {
+		this.flowDependenciesReady(team);
 		this.holdUnknownDependencies(team);
 		for (const id of team.ledger.order) {
 			const ref = team.ledger.currentRef(id)!;
@@ -3757,7 +3841,7 @@ export class TeamRuntime {
 			if (!dependenciesReady && !this.pendingChildIssues(team, version).length) continue;
 			version.state = "queued";
 			version.updatedAt = this.timestamp();
-			if (!team.ready.some((item) => sameWorkRef(item, ref))) team.ready.push(copy(ref));
+			if (!team.ready.some((item) => sameWorkRef(item, ref))) this.enqueueWork(team, ref);
 		}
 		this.updateQuiescence(team);
 	}
@@ -3791,7 +3875,7 @@ export class TeamRuntime {
 				team.ledger.cleanupPending.add(workRefKey(child));
 				this.requestActivationStop(team, member, state === "superseded" ? "policy_superseded" : "policy_cancelled");
 			}
-			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, child));
+			this.dequeueWork(team, child);
 		}
 	}
 
@@ -3813,7 +3897,7 @@ export class TeamRuntime {
 			delete version.hold;
 			version.updatedAt = this.timestamp();
 			delete entry.stagedWait;
-			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+			this.dequeueWork(team, ref);
 			if (active) {
 				activeMember.active!.stopReason = "cancelled";
 				team.ledger.cleanupPending.add(workRefKey(ref));
@@ -3837,7 +3921,7 @@ export class TeamRuntime {
 			version.error = { code: "MEMBER_UNAVAILABLE", message: `${member.id} faulted before this work could finish` };
 			version.updatedAt = this.timestamp();
 			delete entry.stagedWait;
-			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+			this.dequeueWork(team, ref);
 			this.cancelDescendants(team, ref, "cancelled");
 		}
 	}
@@ -3845,7 +3929,7 @@ export class TeamRuntime {
 	private pauseMembersForLeadFault(team: TeamState): void {
 		for (const member of team.members.values()) {
 			if (member.id === team.lead || member.lifecycle !== "open" || member.pause !== "none") continue;
-			member.pause = member.active ? "requested" : "confirmed";
+			this.setMemberPause(team, member, member.active ? "requested" : "confirmed");
 			this.changed(team);
 		}
 	}
@@ -3863,7 +3947,7 @@ export class TeamRuntime {
 			version.hold = { reason: "lead_unavailable", incidentId: incident.id };
 			version.updatedAt = this.timestamp();
 			delete entry.stagedWait;
-			team.ready = team.ready.filter((queued) => !sameWorkRef(queued, ref));
+			this.dequeueWork(team, ref);
 		}
 	}
 
@@ -3874,7 +3958,7 @@ export class TeamRuntime {
 		version.state = "blocked";
 		version.hold = { reason: "budget", incidentId: incident.id };
 		version.updatedAt = this.timestamp();
-		team.ready = team.ready.filter((item) => !sameWorkRef(item, ref));
+		this.dequeueWork(team, ref);
 	}
 
 	private requireResult(team: TeamState, ref: string): void {

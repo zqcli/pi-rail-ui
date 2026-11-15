@@ -581,12 +581,12 @@ export class TeamOverlayComponent implements Focusable {
 			const context = memberContextText(member);
 			const prefix = `${this.theme.fg(statusColor(status), ICONS[status])} ${column(label(member), aliasWidth)}  `;
 			const stats = this.host.runtime.memberStats(team.teamId, member.id);
-			const busy = activeMs ? Math.round(stats.activeMs / activeMs * 100) : 0;
+			const occupied = activeMs ? Math.round(stats.activeMs / activeMs * 100) : 0;
 			const state = member.currentWork && member.lifecycle === "open" ? `running ${shortWorkRef(member.currentWork)}` : oneLine(memberDetail(member, facts, works, team.lead)).replace(/waiting on \d+ sub-tasks?: /u, "waiting for ");
 			const now = member.currentWork ? ` · now ${clock(this.host.runtime.workStats(team.teamId, member.currentWork).activeMs)}` : "";
 			const contextText = member.context && !member.compacting && !member.lastCompaction ? `ctx ${Math.round(member.context.percent)}%` : context;
 			const ctx = contextText ? `  ${member.context && member.context.percent >= 80 ? this.theme.fg("warning", contextText) : contextText}` : "";
-			const detail = `active ${clock(stats.activeMs)} · ${busy >= 90 ? this.theme.fg("warning", `busy ${busy}%`) : `busy ${busy}%`} · ${usageText(stats.usage)}`;
+			const detail = `elapsed ${clock(stats.activeMs)} · ${occupied >= 90 ? this.theme.fg("warning", `occupied ${occupied}%`) : `occupied ${occupied}%`} · ${usageText(stats.usage)}`;
 			return { member: member.id, text: `${prefix}${column(state + now, width - visibleWidth(prefix + ctx))}${ctx}`,
 				lines: wrapTextWithAnsi(detail, width - 2) };
 		});
@@ -609,7 +609,7 @@ export class TeamOverlayComponent implements Focusable {
 			// Two lines: a long title is cut so the route and work ref stay visible.
 			const route = ` · ${work.requester} → ${work.assignee} · ${shortWorkRef(work.work)}${work.work.revision > 1 ? ` (rev ${work.work.revision - 1}×)` : ""}`;
 			return [title(`${compact(workTitle(work), width - visibleWidth(route))}${route}`),
-				dim(`active ${clock(stats.activeMs)} · ${usageText(stats.usage)}${result ? ` · "${firstSentence(result.summary)}"` : ""}`)];
+				dim(`elapsed ${clock(stats.activeMs)} · ${usageText(stats.usage)}${result ? ` · "${firstSentence(result.summary)}"` : ""}`)];
 		}
 		return [];
 	}
@@ -629,7 +629,7 @@ export class TeamOverlayComponent implements Focusable {
 	private progressHead(team: TeamTeamView, width: number): string[] {
 		const stats = this.host.runtime.flowStats(team.teamId);
 		const count = (state: keyof typeof ICONS) => team.members.filter((member) => memberStatus(member) === state).length;
-		const lines = wrapTextWithAnsi(`Σ Team ${clock(stats.activeMs)} · ${count("running")} running · ${count("waiting")} waiting · ${count("idle")} idle · workers avg ${stats.workersAvg?.toFixed(1) ?? "—"}`, width);
+		const lines = wrapTextWithAnsi(`Σ Team ${clock(stats.activeMs)} · ${count("running")} running · ${count("waiting")} waiting · ${count("idle")} idle · workers avg ${stats.workersAvg?.toFixed(1) ?? "—"}${stats.pausedMs ? ` · host paused ${clock(stats.pausedMs)}` : ""}`, width);
 		lines.push(...wrapTextWithAnsi(`     ${usageText(team.usage)} · lead busy ${stats.leadBusyShare === undefined ? "—" : `${Math.round(stats.leadBusyShare * 100)}%`} · only lead ${stats.onlyLeadShare === undefined ? "—" : `${Math.round(stats.onlyLeadShare * 100)}%`}`, width));
 		const rows = flowRows(stats);
 		for (const key of ["lead", "queue", "waits", "cost"] as const) if (stats.warn[key]) {
@@ -798,11 +798,11 @@ export class TeamOverlayComponent implements Focusable {
 			return entry.members.map((id) => {
 				const state = entry.memberStates?.find((member) => member.id === id)?.lifecycle ?? "activity not retained";
 				const stats = entry.memberStats?.find((member) => member.id === id);
-				const busy = entry.activeMs && stats ? Math.round(stats.activeMs / entry.activeMs * 100) : undefined;
+				const occupied = entry.activeMs && stats ? Math.round(stats.activeMs / entry.activeMs * 100) : undefined;
 				const status = state === "faulted" ? "failed" : state === "closed" ? "completed" : "idle";
 				// Members without retained stats are one line each; the Σ row says so once.
 				return { member: id, text: `${this.theme.fg(statusColor(status), ICONS[status])} ${id}${id === entry.lead ? " (lead)" : ""}  ${state}`,
-					...(stats ? { lines: wrapTextWithAnsi(`active ${clock(stats.activeMs)} · ${busy !== undefined && busy >= 90 ? this.theme.fg("warning", `busy ${busy}%`) : `busy ${busy ?? "—"}%`} · ${usageText(stats.usage)}`, width - 2) } : {}) };
+					...(stats ? { lines: wrapTextWithAnsi(`elapsed ${clock(stats.activeMs)} · ${occupied !== undefined && occupied >= 90 ? this.theme.fg("warning", `occupied ${occupied}%`) : `occupied ${occupied ?? "—"}%`} · ${usageText(stats.usage)}`, width - 2) } : {}) };
 			});
 		}
 		if (this.tab === 1) return this.historyOverview(entry, width);

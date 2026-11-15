@@ -125,7 +125,7 @@ Held works:
 
 ## review_flow_note
 
-The Flow, Lead and Waits numbers locate bottlenecks (the lead, a hot member, work permits); they are not a risk by themselves.
+The Flow, Lead and Waits numbers describe elapsed flow, not worker effort or blame; they are not a risk by themselves. Host pauses are excluded. Ready waits exclude member pauses and work holds. Dependency waits end when outcomes are deliverable, before resume queueing; “last” names the final dependency, not the cause of the entire wait. Accept is active time from root commit to acceptance/waiver, not time spent reviewing.
 
 ## review_retry_note
 

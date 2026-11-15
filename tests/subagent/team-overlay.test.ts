@@ -1206,7 +1206,7 @@ test("task detail wraps full instruction, usage, lifecycle, revisions, child cou
 	const works = host.runtime.listWorks(teamId);
 	const root = works[0]!;
 	const facts = host.runtime.panelFacts(teamId);
-	facts.timeline = [{ at: 0, text: `lead requested work ${root.work.workId.split(":")[1]}@1 → runner` }, { at: 1000, text: `runner started work ${root.work.workId.split(":")[1]}@1 (queued 0:01)` }, { at: 2000, text: `lead revised work ${root.work.workId.split(":")[1]}@1: "Use the public field"` }];
+	facts.timeline = [{ at: 0, text: `lead requested work ${root.work.workId.split(":")[1]}@1 → runner` }, { at: 1000, text: `runner started work ${root.work.workId.split(":")[1]}@1 (ready 0:01)` }, { at: 2000, text: `lead revised work ${root.work.workId.split(":")[1]}@1: "Use the public field"` }];
 	facts.timelineOmitted = 2;
 	host.runtime.panelFacts = () => facts;
 	const ui = overlay(host);
@@ -1218,7 +1218,7 @@ test("task detail wraps full instruction, usage, lifecycle, revisions, child cou
 	assert.match(text, /earlier steps omitted/u);
 	assert.match(text, /requested work.*«Implement the popup»/u);
 	const unwrapped = rowsOf(ui.component.render(POPUP_WIDTH)).join(" ");
-	assert.match(unwrapped, /started work.*queued\s+0:01/u);
+	assert.match(unwrapped, /started work.*ready\s+0:01/u);
 	assert.match(unwrapped, /revised work.*Use the\s+public field/u);
 	assert.match(text, /Sub-tasks: 0 · 0 done · 0 waiting/u);
 	assert.match(text, /Result: Release complete\./u);

@@ -82,7 +82,7 @@ test("flow shares: only-lead excludes the lead's overlap with workers, and all-s
 	assert.equal(stats.slotLimit, 1);
 });
 
-test("start delay is recorded once per version (not on resume) and never for review works", () => {
+test("first-ready delay is recorded once per version (not on resume) and never for review works", () => {
 	const w = world({ review: { by: "w3", everyMinutes: 60 } });
 	w.end(w.take(), { action: "yield" });
 	w.clock.at = 7 * SECOND;

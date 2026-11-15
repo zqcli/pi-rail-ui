@@ -230,12 +230,12 @@ test("terminal accounting retains the final active interval and logical end acro
 	}
 });
 
-test("started lifecycle milestone records the first start's queued duration", () => {
+test("started lifecycle milestone records the first start's ready duration", () => {
 	const { runtime, teamId, clock } = fixture([{ to: "worker", title: "Agent release", task: "Implement the Agent." }]);
 	boot(runtime, teamId);
 	clock.at += 121000;
 	const activation = next(runtime, teamId);
-	assert.ok(runtime.panelFacts(teamId).timeline.some((entry) => entry.text === `worker started work ${activation.scope.work!.workId.slice(5)}@1 (queued 2:01)`));
+	assert.ok(runtime.panelFacts(teamId).timeline.some((entry) => entry.text === `worker started work ${activation.scope.work!.workId.slice(5)}@1 (ready 2:01)`));
 });
 
 test("live and terminal Team rename writes strict title records and history takes the latest", async () => {

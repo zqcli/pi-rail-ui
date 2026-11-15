@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { transformNativeSearchPayload } from "../../commands/rail-oai-search";
 import { rememberLiveRequestContext, runRemoteCompaction } from "../../tools/gpt-compaction/core";
+import { collectSystemMessages } from "../../tools/gpt-compaction/history";
 import { compactionIdentity } from "../../tools/gpt-compaction/model-eligibility";
 import {
 	clearRequestContextCache, rememberRequestContext, resolveCompactionRequestExtras,
@@ -266,6 +267,89 @@ test("declaration provenance and resolved schemas are independent snapshots", ()
 	const resolved = resolve(system([plain])).tools as { parameters: Record<string, unknown> }[];
 	resolved[0]!.parameters["properties"] = {};
 	assert.deepEqual(resolve(system([plain])).tools, wire([plain]), "request mutation must not modify the transcript");
+});
+
+test("live capture borrows canonical system state without cloning conversation bodies", (t) => {
+	const read = { ...tool("read"), constrainedSampling: { type: "json_schema", strict: "prefer" } } satisfies Tool;
+	const { manager, ctx } = harness(system([read]));
+	const edited = appendUser(manager, "original history ".repeat(10_000));
+	manager.appendContextEdit(edited, { content: "replacement history" });
+	const omitted = appendUser(manager, "discarded history");
+	manager.appendContextEdit(omitted, null);
+	const branch = manager.getBranch();
+	const before = structuredClone(branch);
+	const oldWire = { ...wire([read])[0], provider_tag: "preserve" };
+	const payload = { model: model.id, tools: [oldWire], reasoning: { effort: "high" } };
+	const copied: unknown[] = [];
+	const clone = globalThis.structuredClone;
+	t.mock.method(globalThis, "structuredClone", (value: unknown) => {
+		copied.push(value);
+		return clone(value);
+	});
+	rememberLiveRequestContext(ctx, payload);
+	assert.equal(copied.some((value) => branch.includes(value as SessionEntry)), false,
+		"declaration capture must not deep-copy session entries or their conversation payloads");
+	assert.deepEqual(manager.getBranch(), before);
+	const resolveLive = () => resolveCompactionRequestExtras(model, compactionIdentity(model), manager.getSessionId(),
+		convertToLlm(manager.buildSessionContext().messages));
+	assert.deepEqual(resolveLive().tools, [oldWire]);
+	// Borrowing projection messages must not turn cached provenance/extras into
+	// aliases of either the transcript declarations or the live provider payload.
+	payload.reasoning.effort = "low";
+	oldWire.provider_tag = "mutated";
+	assert.deepEqual(resolveLive().reasoning, { effort: "high" });
+	assert.equal((resolveLive().tools?.[0] as Record<string, unknown>)["provider_tag"], "preserve");
+	const parameters = structuredClone(read.parameters);
+	(read.constrainedSampling as { strict: string }).strict = "require";
+	assert.deepEqual(resolveLive().tools, wire([read]));
+	assert.deepEqual(read.parameters, parameters, "strict conversion must not mutate borrowed declarations");
+});
+
+test("system-only projection matches Pi across nested snapshots, context edits and detached branches", () => {
+	const stale = tool("stale");
+	const current = tool("current");
+	const added = tool("added");
+	const { manager } = harness(system([stale]));
+	const retained = appendUser(manager, "retained history");
+	manager.appendCompaction("older native summary", retained, 100);
+	manager.appendMessage({ role: "system", content: "pre-checkpoint delta", toolsAdded: [current], timestamp: 2 });
+	const omitted = appendUser(manager, "omit this");
+	manager.appendContextEdit(omitted, null);
+	manager.appendCompaction("newest summary", retained, 200);
+	manager.appendMessage({ role: "system", content: "post-checkpoint delta", toolsRemoved: [{ name: current.name }], toolsAdded: [added], timestamp: 3 });
+	manager.appendContextEdit(retained, { content: "post-checkpoint replacement" });
+	const branch = manager.getBranch();
+	const latest = branch.findLast((entry) => entry.type === "compaction")!;
+	assert.equal(latest.type, "compaction");
+	if (latest.type !== "compaction") return;
+	// Authoritative checkpoint state need not match the raw retained deltas.
+	latest.systemMessage = getCurrentSystemMessage(system([current], "authoritative snapshot"))!;
+	const expected = convertToLlm(buildSessionContext(branch).messages).filter((message) => message.role === "system");
+	const detached = branch.map((entry) => ({ ...entry, parentId: "outside-this-slice" }));
+	const before = structuredClone(detached);
+	const actual = convertToLlm(collectSystemMessages(detached));
+	assert.deepEqual(actual, expected);
+	assert.deepEqual(getCurrentTools(actual), [added]);
+	assert.equal(getCurrentSystemPrompt(actual), "authoritative snapshot\n\npost-checkpoint delta");
+	assert.deepEqual(detached, before, "re-linking must not mutate original parent links or bodies");
+});
+
+test("live capture switches provider identities without leaking wire tools or settings", () => {
+	const read = tool("read");
+	const { manager, ctx } = harness(system([read]));
+	appendUser(manager, "history");
+	const firstWire = { ...wire([read])[0], provider_tag: "first-provider" };
+	rememberLiveRequestContext(ctx, { model: model.id, tools: [firstWire], service_tier: "priority" });
+	const nextModel = { ...model, provider: "another-provider", baseUrl: "https://another.invalid/v1" };
+	ctx.model = nextModel;
+	const messages = convertToLlm(manager.buildSessionContext().messages);
+	const next = () => resolveCompactionRequestExtras(nextModel, compactionIdentity(nextModel), manager.getSessionId(), messages);
+	assert.deepEqual(next(), { tools: wire([read]) });
+	const nextWire = { ...wire([read])[0], provider_tag: "next-provider" };
+	rememberLiveRequestContext(ctx, { model: nextModel.id, tools: [nextWire], reasoning: { effort: "low" } });
+	assert.deepEqual(next(), { tools: [nextWire], reasoning: { effort: "low" } });
+	assert.deepEqual(resolveCompactionRequestExtras(model, compactionIdentity(model), manager.getSessionId(), messages),
+		{ tools: [firstWire], service_tier: "priority" });
 });
 
 test("system checkpoints replace retained deltas; the effective current instructions appear once", async () => {

@@ -143,8 +143,15 @@ export function materializeRailFreeProjection(branchEntries: readonly SessionEnt
 	return relinkLinearEntries(materialized);
 }
 
-export function collectMessages(entries: readonly SessionEntry[]): AgentMessage[] {
-	return projectLinearEntries(entries).flatMap((entry) => entry.messages);
+/**
+ * Read declaration state through Pi's canonical projection without copying
+ * conversation bodies. Projection only reads entries; re-link shallow wrappers
+ * for detached branches and borrow the system messages. Callers must snapshot
+ * any state they retain (the live-request cache copies its tool declarations).
+ */
+export function collectSystemMessages(entries: readonly SessionEntry[]): AgentMessage[] {
+	const path = entries.map((entry, index) => ({ ...entry, parentId: entries[index - 1]?.id ?? null }));
+	return buildSessionProjection(path).messages.filter((message) => message.role === "system");
 }
 
 export interface HistoryRebuildResult {

@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { prompt } from "../../core/prompts";
 import { buildCompactionHeaders, buildResponsesUrl, resolveCompactionAuth, resolveSessionId } from "./auth";
-import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectMessages, findEntryIndex, projectHistoryRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
+import { rebuildNativeHistory, rebuildNativeHistoryPrefix, collectSystemMessages, findEntryIndex, projectHistoryRange, resolveCheckpointBoundary, type CheckpointBoundary } from "./history";
 import { compactionIdentity, identitiesMatch, type CompactionIdentity } from "./model-eligibility";
 import { resolveCompactionRequestExtras, rememberRequestContext } from "./request-context";
 import {
@@ -484,7 +484,7 @@ function currentBranchMessagesBeforeCut(
 
 /** Resolve declaration state from Pi's canonical projected transcript. */
 function requestTranscript(branchEntries: readonly SessionEntry[]) {
-	const latestCompaction = [...branchEntries].reverse().find((entry) => entry.type === "compaction");
+	const latestCompaction = branchEntries.findLast((entry) => entry.type === "compaction");
 	if (latestCompaction?.type === "compaction" && !latestCompaction.systemMessage) {
 		// Pre-0.87/hand-edited native entries may not carry the authoritative
 		// system snapshot. Preserve the legacy declaration delta stream in that
@@ -500,7 +500,7 @@ function requestTranscript(branchEntries: readonly SessionEntry[]) {
 		}
 		return convertToLlm(messages);
 	}
-	return convertToLlm(collectMessages(branchEntries).filter((message) => message.role === "system"));
+	return convertToLlm(collectSystemMessages(branchEntries));
 }
 
 export function rememberLiveRequestContext(ctx: ExtensionContext, payload: unknown): void {

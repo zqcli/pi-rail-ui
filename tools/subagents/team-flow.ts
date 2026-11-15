@@ -168,6 +168,3 @@ export function flowSummary(stats: TeamFlowStats): string {
 	const top = stats.waited[0];
 	return `workers avg ${decimal(stats.workersAvg)} · only lead ${percent(stats.onlyLeadShare)} · start delay p90 ${flowDuration(stats.startP90)} · waits p90 ${flowDuration(stats.waitP90)} · most waited: ${top ? `${top.member} ${top.count}×` : "—"}`;
 }
-
-/** The legend row, from the thresholds; the popup wraps it where it is wider than the popup. */
-export const flowLegend = (): string => `Warn: only lead >${percent(TEAM_FLOW_WARN.onlyLeadShare)} · start p90 >${TEAM_FLOW_WARN.startDelayP90Ms / MINUTE}m, oldest >${TEAM_FLOW_WARN.queuedOldestMs / MINUTE}m · top waited >${percent(TEAM_FLOW_WARN.waitedMemberShare)} · context >${TEAM_FLOW_WARN.contextTokens / 1000}k`;

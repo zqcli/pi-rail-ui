@@ -29,7 +29,6 @@ export interface TeamActivationRun {
 interface ManagedMember {
 	binding: RuntimeActivation["binding"];
 	handle: BrokeredTeamMemberHandle;
-	contextWindow?: number;
 }
 
 /** Display-only native activity of one member across all of its activations. */
@@ -185,7 +184,7 @@ export class TeamMemberDriver {
 		try {
 			const handle = await opened;
 			if (handle.nativeContextWindow) this.runtime.setMemberContextWindow(request.teamId, request.memberId, handle.nativeContextWindow);
-			this.members.set(id, { binding, handle, ...(contextWindow !== undefined ? { contextWindow } : {}) });
+			this.members.set(id, { binding, handle });
 			return handle;
 		} catch (error) {
 			if (error instanceof TeamMemberOpenError) this.failedOpenings.set(id, error);

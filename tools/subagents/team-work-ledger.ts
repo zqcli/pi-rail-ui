@@ -158,16 +158,4 @@ export class WorkLedger {
 		}
 		return undefined;
 	}
-
-	/** Current blocked versions that wait on `ref`. */
-	waiters(ref: WorkRef): WorkRef[] {
-		const key = workRefKey(ref);
-		const found: WorkRef[] = [];
-		for (const id of this.order) {
-			const current = this.currentRef(id)!;
-			const version = this.version(current)!;
-			if (version.state === "blocked" && version.waitingFor.some((item) => workRefKey(item) === key)) found.push(current);
-		}
-		return found;
-	}
 }

@@ -310,7 +310,6 @@ export const DEFAULT_TEAM_BUDGET: Readonly<TeamBudgetLimits> = TEAM_BUDGET_PRESE
 export const TEAM_GRANTABLE_COUNTERS = ["teamActivations", "leadActivations", "teamModelRequests", "teamToolCalls", "emergencyLeadActivations"] as const;
 /** Counters a host grant may raise for one root. */
 export const ROOT_GRANTABLE_COUNTERS = ["rootChildren", "rootActivations", "rootModelRequests", "rootToolCalls"] as const;
-export type TeamGrantCounter = typeof TEAM_GRANTABLE_COUNTERS[number];
 export type RootGrantCounter = typeof ROOT_GRANTABLE_COUNTERS[number];
 
 // ---------------------------------------------------------------------------------------------
@@ -522,7 +521,6 @@ export interface DeliveryRecord {
 	/** Internal only. */
 	activationId: string;
 	work?: WorkRef;
-	eventIds?: string[];
 	state: "in_flight" | "delivered" | "cancelled" | "unknown";
 	dependencyOutcomes: WorkRef[];
 	childIssueIds?: string[];

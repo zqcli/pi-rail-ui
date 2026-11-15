@@ -121,7 +121,7 @@ export interface TeamRuntimeOptions {
 }
 
 export type CompactionResult = { ok: true; tokensBefore?: number; tokensAfter?: number; usage?: SubagentUsage } | { ok: false; error: string };
-type CompactionRequest = { trigger: "threshold" | "host" | "lead" | "overflow"; instructions?: string; requestedBy?: string };
+type CompactionRequest = { trigger: "threshold" | "host" | "lead" | "overflow"; instructions?: string };
 
 export interface TeamRuntimeExecutor {
 	compactMember?(binding: BindingV2, instructions?: string): Promise<CompactionResult>;
@@ -163,7 +163,6 @@ interface InternalEvent extends TeamEventView {
 }
 
 interface EventBatch {
-	id: string;
 	eventIds: string[];
 }
 
@@ -271,7 +270,7 @@ interface ReviewState {
 	finished: Set<string>;
 	wall: number;
 	/** The open review's snapshot, kept for its record. */
-	pending?: { workId: string; snapshot: TeamReviewRecord["snapshot"] };
+	pending?: { snapshot: TeamReviewRecord["snapshot"] };
 	records: TeamReviewRecord[];
 }
 
@@ -1105,7 +1104,7 @@ export class TeamRuntime {
 		team.review.signature = this.reviewSignature(team);
 		team.review.finished = new Set(done.map((record) => record.id));
 		team.review.wall = Date.now();
-		team.review.pending = { workId: work.id, snapshot };
+		team.review.pending = { snapshot };
 		this.note(team, `review ${shortWorkRef(ref)} → ${reviewer.id}`);
 		this.changed(team);
 		this.check(team);
@@ -2794,7 +2793,7 @@ export class TeamRuntime {
 			case "close_member": return this.closeMember(team, member, control.memberId);
 			case "revive_member": return this.reviveMemberControl(team, member, control.memberId);
 			case "compact_member": return okReply(member.id, { receipt: { status: "applied", command: "compact_member", memberId: control.memberId,
-				compaction: this.requestCompaction(team, control.memberId, { trigger: "lead", requestedBy: member.id, ...(control.instructions !== undefined ? { instructions: control.instructions } : {}) }) } });
+				compaction: this.requestCompaction(team, control.memberId, { trigger: "lead", ...(control.instructions !== undefined ? { instructions: control.instructions } : {}) }) } });
 			case "pause_member": return this.pauseMember(team, member, control.memberId);
 			case "resume_member": return this.resumeMember(team, member, control.memberId);
 			case "resume_work": return this.resumeWork(team, member, control.workId, control.expectedRevision, control.incidentId, control.instruction);
@@ -3053,7 +3052,7 @@ export class TeamRuntime {
 		// A member that reopens while the host has paused the Team stays paused until the host continues.
 		member.pause = team.hostPause ? "confirmed" : "none";
 		team.hostPause?.members.add(member.id);
-		if (member.error?.code === "NATIVE_LENGTH") member.compaction = { trigger: by === "host" ? "host" : "lead", state: "pending", requestedBy: by };
+		if (member.error?.code === "NATIVE_LENGTH") member.compaction = { trigger: by === "host" ? "host" : "lead", state: "pending" };
 		delete member.error;
 		delete member.retry;
 		this.note(team, `${by} revived ${member.id}`);
@@ -3256,7 +3255,7 @@ export class TeamRuntime {
 				selected = selected.slice(0, -1);
 			}
 		}
-		const eventBatch: EventBatch = { id: batchId, eventIds: selected.map((event) => event.id) };
+		const eventBatch: EventBatch = { eventIds: selected.map((event) => event.id) };
 		for (const event of selected) event.batchId = batchId;
 		team.eventBatches.set(batchId, eventBatch);
 		this.tickFlow(team);
@@ -3268,7 +3267,7 @@ export class TeamRuntime {
 		this.startFlow(team, member, activation);
 		member.activity = "running";
 		this.note(team, `${member.id} events activation (${eventKinds(selected)})`);
-		this.addDelivery(team, member, scope, input, eventBatch.eventIds);
+		this.addDelivery(team, member, scope, input);
 		this.changed(team);
 		return { binding: this.binding(team, member), scope: copy(scope), deliveryId, input };
 	}
@@ -3348,11 +3347,11 @@ export class TeamRuntime {
 		return projected;
 	}
 
-	private addDelivery(team: TeamState, member: RuntimeMember, scope: ActivationScope, input: ActivationInput, eventIds?: string[]): void {
+	private addDelivery(team: TeamState, member: RuntimeMember, scope: ActivationScope, input: ActivationInput): void {
 		// Only these outcomes survived size projection and the per-consumer unknown-outcome gate.
 		const dependencyOutcomes = input.outcomes.map((outcome) => copy(outcome.work));
 		team.deliveries.set(input.deliveryId, { id: input.deliveryId, memberId: member.id, activationId: scope.activationId,
-			...(scope.kind === "work" ? { work: copy(scope.work!) } : {}), ...(eventIds ? { eventIds: copy(eventIds) } : {}),
+			...(scope.kind === "work" ? { work: copy(scope.work!) } : {}),
 			state: "in_flight", dependencyOutcomes, ...(input.childIssues ? { childIssueIds: input.childIssues.map((issue) => issue.incidentId) } : {}) });
 	}
 

@@ -12,7 +12,7 @@ import {
 	TEAM_BUDGET_UNLIMITED, TEAM_MAX_INITIAL_REQUESTS, TEAM_MAX_NOTE_BYTES, TEAM_MAX_REVIEW_FOCUS_BYTES, TEAM_MAX_REVIEW_MINUTES, TEAM_MAX_ROLE_BYTES, TEAM_MAX_TASK_BYTES, TEAM_MAX_TIMEOUT_SECONDS, TEAM_MAX_MEMBERS, TEAM_MAX_TOOL_NAMES, TEAM_MIN_MEMBERS, TEAM_RESERVED_TOOLS,
 	workRefKey, type TeamBudgetLimits, type TeamBudgetPreset, type ResultRecord, type TeamMemberPolicy, type TeamResult, type TeamTeamView, type TeamWorkSummary, type WorkRef, isTerminalWorkState, reviewAssessment, sameWorkRef, shortWorkRef,
 } from "./team-protocol";
-import { capped, clock, formatTimeline, type TeamRuntime } from "./team-runtime";
+import { capped, clock, formatTimeline, waitFactText, type TeamRuntime } from "./team-runtime";
 
 export { formatTimeline };
 import {
@@ -141,7 +141,8 @@ function memberStateText(member: TeamTeamView["members"][number], works: readonl
 	const events = facts && member.id === lead ? ` · pending events ${facts.pendingEvents}` : "";
 	const results = facts?.results.get(member.id)?.count;
 	const error = member.error ? ` · ${member.error.code}: ${previewText(member.error.message, 160)}` : "";
-	return `${upper(member.lifecycle)} · ${activity}${pause}${retrying ? ` · ${retrying}` : ""}${events}${results ? ` · results ${results}` : ""}${error}${memberContextText(member) ? ` · ${memberContextText(member)}` : ""}`;
+	const waiting = !member.currentWork && facts?.stalled.get(member.id);
+	return `${upper(member.lifecycle)} · ${activity}${waiting ? ` · ${waiting}` : ""}${pause}${retrying ? ` · ${retrying}` : ""}${events}${results ? ` · results ${results}` : ""}${error}${memberContextText(member) ? ` · ${memberContextText(member)}` : ""}`;
 }
 
 export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSummary[] = [], totalHolds = works.filter((work) => work.hold).length,
@@ -153,7 +154,9 @@ export function formatTeamView(view: TeamTeamView, works: readonly TeamWorkSumma
 		return `${label(member).padEnd(width)} · ${memberStateText(member, works, view.lead, facts)} · ${policy}`;
 	});
 	const usage = view.usage;
+	const dependencies = [...(facts?.dependencies ?? [])].flatMap(([consumer, waits]) => waits.map((wait) => `  ${consumer}: ${waitFactText(wait)}`));
 	return [...teamLines(view, works, totalHolds, members, facts?.waitingFor),
+		...(dependencies.length ? ["Dependencies (exact versions):", ...dependencies.slice(0, 8), ...(dependencies.length > 8 ? [`  +${dependencies.length - 8} more; see Tasks details`] : [])] : []),
 		`Usage: ${usage.turns} turns · input ${usage.input} · output ${usage.output} · cache ${usage.cacheRead}/${usage.cacheWrite} · cost ${usage.cost.toFixed(4)}`];
 }
 

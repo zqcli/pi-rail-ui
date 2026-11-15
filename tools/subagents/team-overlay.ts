@@ -10,6 +10,7 @@ import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, reviewTiming, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
+import { waitFactText } from "./team-runtime";
 
 const TABS = ["Teams", "Overview", "Progress", "Tasks", "Timeline"] as const;
 const ICONS = { running: "▶", waiting: "⧗", held: "⏸", idle: "○", completed: "✓", failed: "✗" } as const;
@@ -694,8 +695,8 @@ export class TeamOverlayComponent implements Focusable {
 		}
 		if (work.state === "failed") return `failed: ${version.error?.code ?? "unknown"}`;
 		if (work.state === "blocked") {
-			const waits = [...version.waitingFor, ...this.host.runtime.getWork(teamId, work.work)!.children];
-			const names = [...new Set(waits.map((ref) => works.find((item) => item.work.workId === ref.workId)).filter((item) => item && !isTerminalWorkState(item.state)).map((item) => item!.assignee))];
+			const waits = this.host.runtime.workWaits(teamId, work.work).filter((wait) => wait.blocking);
+			const names = [...new Set(waits.map((wait) => `${wait.assignee}${wait.reason ? ` (${wait.reason})` : ""}`))];
 			return `waiting for ${names.join(", ") || "sub-tasks"}`;
 		}
 		if (work.state === "queued") {
@@ -718,9 +719,11 @@ export class TeamOverlayComponent implements Focusable {
 		const children = works.filter((item) => item.parent?.workId === work.work.workId && !item.kind);
 		const result = work.resultRef ? this.host.runtime.getResult(team.teamId, work.resultRef)?.result : undefined;
 		const stats = this.host.runtime.workStats(team.teamId, work.work);
+		const waits = this.host.runtime.workWaits(team.teamId, work.work);
 		const lines = [`${workTitle(work)} · ${shortWorkRef(work.work)}${work.work.revision > 1 ? ` (revised ${work.work.revision - 1}×)` : ""}`,
 			`${work.requester} → ${work.assignee} · ${this.taskState(team.teamId, work, works)} · ${usageText(stats.usage)}`, `Task: ${view.current.task}`, "Lifecycle:",
 			...(facts.timelineOmitted ? ["  … earlier steps omitted"] : []), ...milestones.map((row) => `  ${row.text}`),
+			...(waits.length ? ["Dependencies (exact versions):", ...waits.map((wait) => `  ${waitFactText(wait)}`)] : []),
 			`Sub-tasks: ${children.length} · ${children.filter((item) => item.state === "resolved").length} done · ${children.filter((item) => item.state === "blocked").length} waiting`,
 			`Result: ${result?.summary ?? "—"}`, ...(result?.findings ?? []).map((line) => `Finding: ${line}`), ...(result?.evidence ?? []).map((item) => `Evidence: ${item.source}${item.locator ? ` · ${item.locator}` : ""} · ${item.basis}`)];
 		return lines.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((text) => ({ text })));

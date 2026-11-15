@@ -1142,6 +1142,9 @@ test("Tasks rows use waiting/held/delivered/accepted/reason/error words; result 
 	const originalResult = host.runtime.getResult.bind(host.runtime);
 	const root = originalWorks(teamId)[0]!;
 	const child = originalWorks(teamId).find((work) => work.parent)!;
+	const originalWaits = host.runtime.workWaits.bind(host.runtime);
+	host.runtime.workWaits = (id, ref) => originalWaits(id, ref).map((wait) => wait.work.workId === child.work.workId
+		? { ...wait, state: "resolved", blocking: false, reason: "outcome ready; awaiting delivery" } : wait);
 	host.runtime.listWorks = (id) => originalWorks(id).map((work) => work.work.workId === root.work.workId ? { ...work, review: "accepted" } : work.parent ? { ...work, state: "resolved", resultRef: "result:synthetic" } : work);
 	host.runtime.getResult = (id, ref) => ref === "result:synthetic" ? { id: ref, author: child.assignee, work: child.work, committedAt: 1, source: "explicit_reply", result: { status: "succeeded", summary: "3 fixed. Second sentence." } } : originalResult(id, ref);
 	text = ui.text(POPUP_WIDTH);
@@ -1200,6 +1203,42 @@ test("real dependency-yield lifecycle identifies the awaited member, WorkRef/tit
 	assert.match(text, /Lifecycle:/u);
 	assert.match(text, /started work.*\(ready \d+:\d\d\)/u);
 	assert.ok(text.includes(`waiting on runner · work ${child.work.workId.split(":")[1]}@1 «Check child 1»`));
+});
+
+test("Tasks use exact peer revisions and show ready older outcomes separately from the remaining AND wait", (t) => {
+	let id = 0;
+	const host = new TeamSessionHost({} as SessionBroker, () => undefined, [], { createId: () => `x${++id}` });
+	const runtime = host.runtime;
+	const { teamId } = runtime.prepare({ members: ["lead", "a", "b", "c"].map((alias) => ({ alias, roleDescription: alias })),
+		lead: "lead", brief: { goal: "Exact wait display." }, timeoutSeconds: null,
+		initialRequests: ["a", "b", "c"].map((to) => ({ to, task: `${to} root` })) });
+	runtime.launch(teamId);
+	const take = () => {
+		const activation = runtime.takeNextActivation(teamId)!;
+		assert.equal(runtime.inputReady(activation.binding, activation.scope.activationId, activation.deliveryId).ok, true);
+		return activation;
+	};
+	const [lead, a, b, c] = [take(), take(), take(), take()];
+	assert.equal(runtime.handleAction(a.binding, a.scope, 1, "wait", { action: "yield", waitingFor: [b.scope.work!, c.scope.work!], checkpoint: "Both exact peers." }).ok, true);
+	runtime.nativeSettled(a.binding, a.scope.activationId, { status: "success", appliedToolCallId: "wait" });
+	runtime.cleanupFinished(a.binding, a.scope.activationId, { ok: true });
+	assert.equal(runtime.handleAction(lead.binding, lead.scope, 1, "revise", { action: "control", command: "revise_work", workId: b.scope.work!.workId, expectedRevision: 1, task: "b revision two" }).ok, true);
+	const ui = overlay(host);
+	t.after(() => ui.component.dispose());
+	ui.key("right"); ui.key("right");
+	assert.match(ui.text(200), /a root.*waiting for b \(cleanup pending\), c/u);
+	runtime.nativeSettled(b.binding, b.scope.activationId, { status: "aborted" });
+	runtime.cleanupFinished(b.binding, b.scope.activationId, { ok: true });
+	assert.match(ui.text(200), /a root.*waiting for c/u);
+	assert.doesNotMatch(ui.text(200).split("\n").find((line) => line.includes("a root"))!, /waiting for b/u);
+	ui.key("enter");
+	const top = ui.text(120);
+	ui.key("end");
+	const detail = rowsOf((top + "\n" + ui.text(120)).split("\n")).join(" ");
+	assert.match(detail, /Dependencies \(exact versions\):/u);
+	assert.match(detail, /@1 → b · superseded · outcome ready; awaiting delivery · current @2/u);
+	for (const width of [60, 73, 120, 200]) for (const line of ui.component.render(width)) assert.equal(visibleWidth(line), width);
+	runtime.assertInvariants(teamId);
 });
 
 test("task detail wraps full instruction, usage, lifecycle, revisions, child counts and result evidence", (t) => {

@@ -1897,7 +1897,8 @@ test("W: cancelled dependency is not deliverable until the old activation cleanu
 	}).ok, true);
 	assert.equal(runtime.getWork(teamId, childRef)?.current.state, "cancelled");
 	assert.equal(runtime.takeNextActivation(teamId), undefined, "dependent parent remains blocked while native cleanup is unknown");
-	assert.equal(runtime.panelFacts(teamId).stalled.has("w1"), false, "the cancelled dependency is terminal, so the panel has no one to name for the blocked parent");
+	assert.equal(runtime.panelFacts(teamId).stalled.get("w1"), `waiting on 1 sub-task: w2 (cancelled ${shortWorkRef(childRef)} · cleanup pending)`,
+		"a terminal dependency still names the unconfirmed cleanup that blocks its parent");
 	runtime.nativeSettled(child.binding, child.scope.activationId, { status: "aborted" });
 	runtime.cleanupFinished(child.binding, child.scope.activationId, { ok: true });
 	const resumed = runtime.takeNextActivation(teamId)!;

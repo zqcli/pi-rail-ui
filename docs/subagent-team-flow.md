@@ -31,6 +31,17 @@ Flow 的 `workers avg`、lead busy / only lead 和 slots busy 沿用 activation/
 - first/resume/deps/accept 各保留最近 1000 个**完成样本**，无样本显示 `—`；这不是所有未完成任务的预测。依赖排名是 Team 累计正常完成等待，不受样本数组轮换影响。最近 worker average 仍读取最近十个墙钟分钟桶中的 active 时间。
 - terminal journal 仍只保存一条可选摘要字符串，旧记录原样读取，不倒推或重写历史指标。
 
+## 只读等待诊断
+
+宿主 `status`、成员面板和 Tasks 详情共用 Runtime 派生的 exact-WorkRef 事实，不从成员名或最新 work summary 猜依赖。Tasks 详情保留已完成/替代但尚未交付的版本，标明 `outcome ready; awaiting delivery` 和当前版本号；不会把等待 `@1` 自动解释成等待 `@2`。AND 等待中某一项已完成、或 consumer 已排队但尚未 `input_ready`，都是正常投递过程，不报陈旧等待。
+
+- terminal 不等于可交付：`cleanup pending` 仍阻止依赖交付；`outcome unknown` 在清理确认后仍需明确决定。诊断本身不会解除 hold。
+- child issue 的 incident 仍 open 时显示由谁决定，即使该 issue 已经交付、从 parent 的待交付列表移除。正常唤醒 parent 处理问题不叫循环等待。
+- 排队依赖会指出成员正在执行的精确 WorkRef、处理 Team events、暂停、重试退避或 compaction；这是当前原因，不是整个等待时长的归因。
+- 已有 `DEPENDENCY_CYCLE` 校验继续阻止真实 WorkRef 环（含 staged wait 和 owned-child completion edges），拒绝尝试只在现有有界 Timeline 留一条说明。成员 A→B→A 的不同 WorkRef 链合法，不按成员建图报死锁。
+
+这部分不新增持久状态、协议字段、定时器或调度动作，不自动取消、改派或恢复 work。`tests/subagent/team-wait-diagnostics.test.ts` 覆盖精确旧版本、清理与未知结果、未观察的已完成结果、已交付 child issue、忙碌成员原因和合法/非法循环；既有 Tasks 窄屏与大 Team 性能回归继续适用。
+
 ## 实现规模与验证
 
 只增加一份 pending-ready `{since, ms}` Map、每成员两个暂停时钟数值和一个有界 resume 样本数组。复用现有 enqueue/dequeue、pause、wakeWaiters 边界与 Team active clock，没有新增持久事件、协议字段、采样器或历史追踪系统。pending-ready 项在启动或终止时清除，hold 时仅保留累计值；依赖只在现有唤醒路径检查。

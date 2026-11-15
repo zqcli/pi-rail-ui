@@ -168,14 +168,19 @@ interface EventBatch {
 
 type WorkScope = Extract<ActivationInput["scope"], { kind: "work" }>;
 
-/** A work that a blocked version still waits on, as the host panel names it. */
-interface WaitedWork {
+/** Read-only dependency facts for an exact consumer version; never scheduling instructions. */
+export interface TeamWaitFact {
 	work: WorkRef;
 	assignee: string;
 	/** The work state, or "held" when a hold is what keeps it from finishing. */
 	state: string;
 	/** One of the waiting version's own children rather than a peer's work. */
 	child: boolean;
+	/** Outcome unavailable, not a claim that the consumer itself is blocked. Terminal cleanup/unknown outcomes still count. */
+	blocking: boolean;
+	reason?: string;
+	/** An exact older dependency is never silently retargeted to this revision. */
+	latestRevision?: number;
 }
 
 interface ActiveActivation {
@@ -396,11 +401,17 @@ export const handlingText = (events: readonly { kind: string }[]): string => `ha
 const HELD_REASON = { budget: "budget exhausted", protocol: "protocol", lead_unavailable: "lead unavailable" } as const;
 
 /** Panel phrase for what a member waits on; one dependency also shows its ref. */
-function waitingOnText(waits: readonly WaitedWork[]): string {
-	const named = waits.map((wait) => `${wait.assignee} (${wait.state}${waits.length === 1 ? ` ${shortWorkRef(wait.work)}` : ""})`);
+function waitingOnText(waits: readonly TeamWaitFact[]): string {
+	const named = waits.map((wait) => `${wait.assignee} (${wait.state}${waits.length === 1 ? ` ${shortWorkRef(wait.work)}` : ""}${wait.reason ? ` · ${wait.reason}` : ""})`);
 	return waits.every((wait) => wait.child)
 		? `waiting on ${waits.length} sub-task${plural(waits.length)}: ${capped(named, 3)}`
 		: `waiting on ${capped(named, 3)}`;
+}
+
+/** One exact target, including ready outcomes that no longer block scheduling. */
+export function waitFactText(wait: TeamWaitFact): string {
+	return `${shortWorkRef(wait.work)} → ${wait.assignee} · ${wait.state}${wait.reason ? ` · ${wait.reason}` : ""}`
+		+ (wait.latestRevision === undefined ? "" : ` · current @${wait.latestRevision}`);
 }
 
 function fail(code: TeamErrorCode, message: string, blockers?: TeamProtocolError["blockers"]): never {
@@ -2521,6 +2532,49 @@ export class TeamRuntime {
 		};
 	}
 
+	/** Host diagnostics only. Ready but unobserved outcomes are facts, not stale/deadlocked waits. */
+	workWaits(teamId: string, ref: WorkRef): TeamWaitFact[] {
+		return this.workWaitFacts(this.team(teamId), ref);
+	}
+
+	private workWaitFacts(team: TeamState, ref: WorkRef, creationOrder?: ReadonlyMap<string, number>): TeamWaitFact[] {
+		const version = team.ledger.version(ref);
+		if (!version || isTerminalWorkState(version.state)) return [];
+		const children = team.ledger.ownedChildren(ref);
+		const childKeys = new Set(children.map(workRefKey));
+		const observed = new Set(version.observedOutcomes.map(workRefKey));
+		const targets = new Map([...version.waitingFor, ...children].map((work) => [workRefKey(work), work]));
+		return this.byCreation(team, [...targets].flatMap(([key, work]): TeamWaitFact[] => {
+			if (observed.has(key)) return [];
+			const entry = team.ledger.get(work.workId)!;
+			const waited = team.ledger.version(work)!;
+			const member = team.members.get(entry.record.assignee)!;
+			const cleanup = team.ledger.cleanupPending.has(key);
+			const unknown = this.isUnknownOutcome(team, work) && !team.unknownAcknowledged.has(`${workRefKey(ref)}>${key}`);
+			const ready = team.ledger.outcomeReady(work) && !unknown;
+			let reason: string | undefined;
+			if (cleanup || unknown) reason = [cleanup ? "cleanup pending" : "", unknown ? "outcome unknown; explicit decision required" : ""].filter(Boolean).join(" · ");
+			else if (ready) reason = "outcome ready; awaiting delivery";
+			else if (waited.hold) {
+				const incident = team.incidents.find((item) => item.id === waited.hold!.incidentId && item.state === "open");
+				if (incident && (waited.hold.reason === "attention" || waited.hold.reason === "protocol")) {
+					const owner = team.events.some((event) => event.incidentId === incident.id) ? team.lead : entry.record.requester;
+					reason = `needs ${owner}'s decision`;
+				} else reason = waited.hold.reason === "attention" ? "attention" : HELD_REASON[waited.hold.reason];
+			} else if (waited.state === "queued") {
+				reason = team.hostPause ? "host paused" : member.pause !== "none" ? "member paused"
+					: this.retryWaitMs(member) ? "retry backoff"
+					: member.active ? member.active.scope.kind === "work" ? `member busy on ${shortWorkRef(member.active.scope.work!)}` : "member handling Team events"
+						: member.compaction ? member.compaction.state === "running" ? "compacting" : "compaction scheduled"
+							: this.needsWorkPermit(team, member) && this.usedWorkPermits(team) >= team.limits.workPermits ? "slots full" : undefined;
+			} else if (waited.state === "running" && member.activity === "settling"
+				&& member.currentWork && sameWorkRef(member.currentWork, work)) reason = "settling";
+			return [{ work: { ...work }, assignee: entry.record.assignee, state: waited.hold ? "held" : waited.state,
+				child: childKeys.has(key), blocking: !ready, ...(reason ? { reason } : {}),
+				...(entry.record.currentRevision !== work.revision ? { latestRevision: entry.record.currentRevision } : {}) }];
+		}), (wait) => wait.work, creationOrder);
+	}
+
 	getResult(teamId: string, resultRef: string): ResultRecord | undefined {
 		const result = this.team(teamId).ledger.results.get(resultRef);
 		return result ? copy(result) : undefined;
@@ -2551,6 +2605,8 @@ export class TeamRuntime {
 		results: Map<string, { count: number; latest: ResultRecord }>;
 		/** Per member with blocked or held work: what it waits on, or why it is held. */
 		stalled: Map<string, string>;
+		/** Current waits/holds, keyed by exact consumer WorkRef; not every running work's child obligations. */
+		dependencies: Map<string, TeamWaitFact[]>;
 		/** Per member waiting to retry a transient provider error: attempt, time left and error. */
 		retrying: Map<string, string>;
 		/** While the lead runs an events activation: the event kinds of its batch. */
@@ -2569,7 +2625,17 @@ export class TeamRuntime {
 		const results = new Map([...latest].map(([author, { count, id }]) => [author, { count, latest: copy(team.ledger.results.get(id)!) }]));
 		// After close, leftover notices (for example MEMBER_CLOSED) are no longer work for the lead.
 		const pendingEvents = this.pendingLeadEvents(team);
-		const waits = this.memberWaits(team);
+		let creationOrder: ReadonlyMap<string, number> | undefined;
+		const dependencies = new Map(team.ledger.order.flatMap((id) => {
+			const ref = team.ledger.currentRef(id)!;
+			const version = team.ledger.version(ref)!;
+			// A running parent may own thousands of children without having yielded. It is not waiting.
+			if (version.state !== "blocked" && !version.waitingFor.length) return [];
+			creationOrder ??= new Map(team.ledger.order.map((workId, index) => [workId, index]));
+			const facts = this.workWaitFacts(team, ref, creationOrder);
+			return facts.length ? [[workRefKey(ref), facts] as const] : [];
+		}));
+		const waits = this.memberWaits(team, dependencies, creationOrder);
 		const holds = this.listHolds(teamId);
 		// A member's oldest hold speaks for it.
 		const oldestHolds = new Map<string, HostHoldView>();
@@ -2585,34 +2651,33 @@ export class TeamRuntime {
 			const text = this.retryText(team, member);
 			return text ? [[member.id, text] as const] : [];
 		}));
-		return { pendingEvents, results, stalled, retrying, ...(handling.length ? { leadHandling: handlingText(handling) } : {}),
+		return { pendingEvents, results, stalled, dependencies, retrying, ...(handling.length ? { leadHandling: handlingText(handling) } : {}),
 			...(waitingFor ? { waitingFor } : {}), timeline: copy(team.timeline), timelineOmitted: team.timelineOmitted };
 	}
 
 	/** Per member, the unresolved works its blocked, un-held versions wait on: their waitingFor and owned children, once each. */
-	private memberWaits(team: TeamState): Map<string, WaitedWork[]> {
-		const waits = new Map<string, Map<string, WaitedWork>>();
+	private memberWaits(team: TeamState, dependencies: ReadonlyMap<string, TeamWaitFact[]>, creationOrder?: ReadonlyMap<string, number>): Map<string, TeamWaitFact[]> {
+		const waits = new Map<string, Map<string, TeamWaitFact>>();
 		for (const id of team.ledger.order) {
 			const assignee = team.ledger.get(id)!.record.assignee;
 			const ref = team.ledger.currentRef(id)!;
 			const version = team.ledger.version(ref)!;
 			if (version.state !== "blocked" || version.hold) continue;
-			const children = team.ledger.ownedChildren(ref);
-			for (const work of [...version.waitingFor, ...children]) {
-				const waited = team.ledger.version(work)!;
-				if (isTerminalWorkState(waited.state)) continue;
-				const found = waits.get(assignee) ?? new Map<string, WaitedWork>();
-				found.set(workRefKey(work), { work, assignee: team.ledger.get(work.workId)!.record.assignee,
-					state: waited.hold ? "held" : waited.state, child: children.some((child) => sameWorkRef(child, work)) });
+			for (const wait of dependencies.get(workRefKey(ref)) ?? []) {
+				if (!wait.blocking) continue;
+				const found = waits.get(assignee) ?? new Map<string, TeamWaitFact>();
+				found.set(workRefKey(wait.work), wait);
 				waits.set(assignee, found);
 			}
 		}
-		return new Map([...waits].map(([member, found]) => [member, this.byCreation(team, [...found.values()], (wait) => wait.work)]));
+		return new Map([...waits].map(([member, found]) => [member, this.byCreation(team, [...found.values()], (wait) => wait.work, creationOrder)]));
 	}
 
 	/** waitingFor is canonicalized by WorkRef; panels and the timeline name waited works in creation order instead. */
-	private byCreation<T>(team: TeamState, items: readonly T[], work: (item: T) => WorkRef): T[] {
-		const created = (item: T) => team.ledger.order.indexOf(work(item).workId);
+	private byCreation<T>(team: TeamState, items: readonly T[], work: (item: T) => WorkRef, creationOrder?: ReadonlyMap<string, number>): T[] {
+		if (items.length < 2) return [...items];
+		const order = creationOrder ?? new Map(team.ledger.order.map((id, index) => [id, index]));
+		const created = (item: T) => order.get(work(item).workId)!;
 		return items.toSorted((left, right) => created(left) - created(right));
 	}
 
@@ -2643,7 +2708,7 @@ export class TeamRuntime {
 
 	/** The single most relevant reason an active Team has not finished, by priority. */
 	private teamWaitingFor(team: TeamState, holds: readonly HostHoldView[], oldestHolds: ReadonlyMap<string, HostHoldView>,
-		waits: ReadonlyMap<string, WaitedWork[]>): string | undefined {
+		waits: ReadonlyMap<string, TeamWaitFact[]>): string | undefined {
 		if (team.hostPause) {
 			const finishing = this.finishingActivations(team);
 			return finishing ? `Paused by the host (${finishing} activation${plural(finishing)} finishing)` : `Paused by the host for ${clock(this.timestamp() - team.hostPause.at)}`;
@@ -2853,11 +2918,17 @@ export class TeamRuntime {
 		for (const target of action.waitingFor) {
 			const record = team.ledger.get(target.workId)?.record;
 			if (!record || target.revision > record.currentRevision || !team.ledger.version(target)) fail("UNKNOWN_WORK", `Unknown dependency ${workRefKey(target)}`);
-			if (sameWorkRef(target, ref)) fail("DEPENDENCY_CYCLE", "Work cannot wait for itself", [{ kind: "cycle", id: workRefKey(ref), reason: "self dependency" }]);
+			if (sameWorkRef(target, ref)) {
+				this.note(team, `${member.id} wait rejected: dependency cycle ${shortWorkRef(ref)} → itself`);
+				fail("DEPENDENCY_CYCLE", "Work cannot wait for itself", [{ kind: "cycle", id: workRefKey(ref), reason: "self dependency" }]);
+			}
 		}
 		const newWaits = action.waitingFor.filter((target) => !version.observedOutcomes.some((observed) => sameWorkRef(observed, target)));
 		const cycle = team.ledger.findCycle(ref, newWaits);
-		if (cycle) fail("DEPENDENCY_CYCLE", `Dependency cycle: ${cycle.map(workRefKey).join(" -> ")}`, [{ kind: "cycle", reason: cycle.map(workRefKey).join(" -> ") }]);
+		if (cycle) {
+			this.note(team, `${member.id} wait rejected: dependency cycle ${capped(cycle.map(shortWorkRef), 8, " → ")}`);
+			fail("DEPENDENCY_CYCLE", `Dependency cycle: ${cycle.map(workRefKey).join(" -> ")}`, [{ kind: "cycle", reason: cycle.map(workRefKey).join(" -> ") }]);
+		}
 		const entry = team.ledger.get(ref.workId)!;
 		entry.stagedWait = { revision: ref.revision, refs: copy(newWaits) };
 		active.intent = { kind: "yield_dependencies", work: ref, waitingFor: copy(action.waitingFor), checkpoint: action.checkpoint, toolCallId };

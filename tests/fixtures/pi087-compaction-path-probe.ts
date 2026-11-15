@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs";
-import { normalizeContext, Type, type Api, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
+import { normalizeContext, type Api, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { compactionIdentity } from "../../tools/gpt-compaction/model-eligibility";
 import { rememberRequestContext, resolveCompactionRequestExtras } from "../../tools/gpt-compaction/request-context";
 

@@ -328,7 +328,7 @@ export async function runNativeRepairCompaction(args: {
 				event.customInstructions,
 				summary,
 				ctx.thinkingLevel,
-				providerStreamFn(ctx),
+				providerStreamFn(ctx, nativeRepairOutputBudget(model, preparation.settings.reserveTokens)),
 				undefined,
 				undefined,
 				undefined,
@@ -361,9 +361,11 @@ export async function runNativeRepairCompaction(args: {
  * (registered `streamSimple`) keep working instead of falling back to the
  * built-in OpenAI APIs.
  */
-function providerStreamFn(ctx: ExtensionContext): StreamFn {
+function providerStreamFn(ctx: ExtensionContext, maxTokens: number): StreamFn {
 	return ((model, context, options) => {
-		const pending = ctx.modelRegistry.complete(model as Model<Api>, context, options as never).then((message) => {
+		// Pi 1.5.2 no longer uses generateSummaryWithUsage's reserve argument.
+		// Keep the output bound assumed by Rail's native-repair chunk planner.
+		const pending = ctx.modelRegistry.complete(model as Model<Api>, context, { ...options, maxTokens } as never).then((message) => {
 			const stream = createAssistantMessageEventStream();
 			const partial = { ...message, content: [] as never, stopReason: "pending" as const };
 			stream.push({ type: "start", partial } as never);
@@ -413,6 +415,10 @@ function splitOversizedSummaryMessage(message: AgentMessage, budget: number): Ag
 	} as AgentMessage));
 }
 
+function nativeRepairOutputBudget(model: Model<Api>, reserveTokens: number): number {
+	return Math.max(16, Math.min(Math.floor(reserveTokens * 0.8), model.maxTokens));
+}
+
 /**
  * Bound each native repair request. A single native summary call is allowed
  * when it fits; otherwise summaries are folded in order through the same
@@ -421,7 +427,7 @@ function splitOversizedSummaryMessage(message: AgentMessage, budget: number): Ag
  * tool calls and rich messages fail closed rather than being truncated.
  */
 function chunkNativeRepairMessages(messages: readonly AgentMessage[], model: Model<Api>, reserveTokens: number): AgentMessage[][] | undefined {
-	const outputBudget = Math.max(16, Math.min(Math.floor(reserveTokens * 0.8), model.maxTokens));
+	const outputBudget = nativeRepairOutputBudget(model, reserveTokens);
 	const available = model.contextWindow - outputBudget - 512;
 	if (available < 128) return undefined;
 	// Leave room for the previous folded summary on every call after the first.

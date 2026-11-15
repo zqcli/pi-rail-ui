@@ -1,6 +1,5 @@
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent } from "@earendil-works/pi-ai";
 import { estimateTokens, findCutPoint, getAgentDir, sessionEntryToContextMessages, SettingsManager, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent, type SessionEntry, type SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import {
@@ -21,6 +20,7 @@ import {
 import { resolveCompactionAuth } from "./auth";
 import { isRailCompactionEntry, materializeRailFreeProjection, rebuildNativeHistoryPrefix } from "./history";
 import { clearRequestContextCache } from "./request-context";
+import { requestNativeRepairCompaction } from "./resume-compaction";
 import { claimSharedInstall, rejectRailOaiCommandForModel } from "../../commands/rail-oai-command";
 import { getGptCompactionDetails, isGptCompactionSummaryText, resolveSessionCheckpoint } from "./types";
 import {
@@ -226,19 +226,22 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 			preparation,
 			cancelled: false,
 		};
+		let claimed = false;
 		try {
-			// Only borrow the source branch when native admission would reject the
-			// current leaf. No entries are appended until after our hook restores it.
-			if (!admitsOriginal) {
-				if (repair.expectedLeafId) manager.branch(repair.expectedLeafId);
-				else manager.resetLeaf();
-			}
-			pendingNativeRepair = repair;
 			const result = await new Promise<{ ok: true } | { ok: false; detail: string }>((resolve) => {
 				try {
-					ctx.compact({
+					requestNativeRepairCompaction(ctx, {
 						onComplete: () => resolve({ ok: true }),
 						onError: (error) => resolve({ ok: false, detail: error.message }),
+					}, () => {
+						// Claim the repair before borrowing a source branch, and only
+						// after the adapter rules out another operation using that leaf.
+						claimed = true;
+						pendingNativeRepair = repair;
+						if (!admitsOriginal) {
+							if (repair.expectedLeafId) manager.branch(repair.expectedLeafId);
+							else manager.resetLeaf();
+						}
 					});
 				} catch (error) {
 					resolve({ ok: false, detail: error instanceof Error ? error.message : String(error) });
@@ -251,23 +254,25 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		} catch (error) {
 			return { ok: false, detail: error instanceof Error ? error.message : String(error) };
 		} finally {
-			// Never clobber an externally selected leaf or a successful new checkpoint.
-			if (manager.getSessionId() === repair.sessionId && manager.getLeafId() === repair.expectedLeafId) {
-				if (repair.originalLeafId) manager.branch(repair.originalLeafId);
-				else manager.resetLeaf();
+			if (claimed) {
+				// Never clobber an externally selected leaf or a successful new checkpoint.
+				if (manager.getSessionId() === repair.sessionId && manager.getLeafId() === repair.expectedLeafId) {
+					if (repair.originalLeafId) manager.branch(repair.originalLeafId);
+					else manager.resetLeaf();
+				}
+				if (pendingNativeRepair === repair) pendingNativeRepair = undefined;
 			}
-			if (pendingNativeRepair === repair) pendingNativeRepair = undefined;
 		}
 	};
-	const estimateDispatchTokens = (ctx: ExtensionContext, messages: readonly AgentMessage[], prompt?: string, images?: readonly ImageContent[]): number => {
+	const estimateDispatchTokens = (ctx: ExtensionContext, messages: readonly AgentMessage[], trigger?: AgentMessage): number => {
 		const activeTools = new Set(pi.getActiveTools());
 		const toolTokens = pi.getAllTools()
 			.filter((tool) => activeTools.has(tool.name))
 			.reduce((total, tool) => total + Math.ceil(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters, promptGuidelines: tool.promptGuidelines }).length / 4), 0);
-		const promptTokens = prompt === undefined ? 0 : estimateTokens({ role: "user", content: [{ type: "text", text: prompt }, ...(images ?? [])], timestamp: 0 });
-		return Math.ceil(ctx.getSystemPrompt().length / 4) + toolTokens + messages.reduce((total, message) => total + estimateTokens(message), 0) + promptTokens;
+		const triggerTokens = trigger === undefined ? 0 : estimateTokens(trigger);
+		return Math.ceil(ctx.getSystemPrompt().length / 4) + toolTokens + messages.reduce((total, message) => total + estimateTokens(message), 0) + triggerTokens;
 	};
-	const repairIfUnsafeResume = async (ctx: ExtensionContext, prompt?: string, images?: readonly ImageContent[]): Promise<boolean> => {
+	const repairIfUnsafeResume = async (ctx: ExtensionContext, trigger?: AgentMessage): Promise<boolean> => {
 		const branch = ctx.sessionManager.getBranch();
 		const checkpoint = resolveSessionCheckpoint(branch);
 		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return true;
@@ -282,7 +287,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		const rebuilt = rebuiltBranchMessages(branch);
 		const outputBudget = Math.max(settings.reserveTokens, model.maxTokens ?? 0);
 		const available = model.contextWindow - outputBudget - 256;
-		if (estimateDispatchTokens(ctx, rebuilt, prompt, images) <= available) return true;
+		if (estimateDispatchTokens(ctx, rebuilt, trigger) <= available) return true;
 		const repaired = await repairBeforeDisabling(ctx);
 		if (!repaired.ok) {
 			ctx.ui.notify(`GPT compaction resume remains fail-closed; native repair failed: ${redactSensitiveText(repaired.detail)}`, "error");
@@ -369,7 +374,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 			pendingNativeRepair.cancelled = true;
 			ctx.abort();
 		}
-		await repairIfUnsafeResume(ctx);
+		if (!await repairIfUnsafeResume(ctx)) ctx.abort();
 		updateStatus(mode, ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => updateStatus(mode, ctx));
@@ -377,7 +382,10 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 	pi.on("session_compact_failed", async (_event, ctx) => updateStatus(mode, ctx));
 	pi.on("before_agent_start", async (event, ctx) => {
 		syncMode();
-		await repairIfUnsafeResume(ctx, event.prompt, event.images);
+		const trigger: AgentMessage = event.messageType === "custom" ? event.message : {
+			role: "user", content: [{ type: "text", text: event.prompt }, ...(event.images ?? [])], timestamp: 0,
+		};
+		if (!await repairIfUnsafeResume(ctx, trigger)) ctx.abort();
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
@@ -443,7 +451,7 @@ export function installGptCompaction(pi: ExtensionAPI): void {
 		if (checkpoint.status !== "remote" && checkpoint.status !== "invalid") return undefined;
 		const support = modelSupportsRemoteCompaction(ctx.model);
 		const identity = support.supported ? await resolveRuntimeIdentity(ctx) : safeIdentity(ctx);
-		// Pi 0.87 has already applied ContextEditEntry edits in this canonical
+		// Pi has already applied ContextEditEntry edits in this canonical
 		// projection. Keep it as the live prefix when merging transient messages.
 		const storedMessages = ctx.sessionManager.buildSessionProjection().messages;
 		const decision = planContextReplay({

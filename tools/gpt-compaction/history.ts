@@ -278,7 +278,7 @@ function projectRecoveryPrefix(
 }
 
 /**
- * Project a logical interval using Pi 0.87's canonical SessionManager rules.
+ * Project a logical interval using Pi's canonical SessionManager rules.
  * The interval is expressed in the original branch's indices; context-edit
  * entries in the interval therefore affect their target before serialization.
  */

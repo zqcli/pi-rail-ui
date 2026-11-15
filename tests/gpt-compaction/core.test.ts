@@ -816,7 +816,7 @@ test("native repair folds an oversized recovered history in bounded summary call
 			modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "repair-key", baseUrl: smallModel.baseUrl }) },
 		} as any,
 		deps: {
-			nativeSummary: async (messages: any[], _model: any, _reserve: number, _apiKey: string | undefined, _headers: any, _signal: AbortSignal | undefined, _instructions: string | undefined, previousSummary: string | undefined) => {
+			nativeSummary: async (messages, _model, _reserve, _apiKey, _headers, _signal, _instructions, previousSummary) => {
 			calls.push(messages);
 			return {
 				text: `${previousSummary ?? ""} folded`,
@@ -833,7 +833,7 @@ test("native repair folds an oversized recovered history in bounded summary call
 test("Responses replay preserves images and synthesizes only missing tool results", () => {
 	const assistant = {
 		role: "assistant",
-		content: [{ type: "toolCall", id: "call-1|fc_1", name: "read", arguments: { path: "a.ts" } }],
+		content: [{ type: "toolCall", id: "call-1|fc_1", name: "read", arguments: { path: "a.ts" }, namespace: "files" }],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
@@ -854,6 +854,7 @@ test("Responses replay preserves images and synthesizes only missing tool result
 	const transformed = transformMessagesForResponses([assistant, result] as any, model);
 	assert.equal(transformed.filter((item: any) => item.role === "toolResult").length, 1);
 	assert.equal(JSON.stringify(serializeMessagesToResponsesInput(model, [assistant, result] as any)).includes("input_image"), true);
+	assert.equal((serializeMessagesToResponsesInput(model, [assistant, result] as any)[0] as { namespace?: string }).namespace, "files");
 
 	const missing = transformMessagesForResponses([assistant] as any, model);
 	assert.equal(missing.filter((item: any) => item.role === "toolResult").length, 1);
@@ -868,7 +869,7 @@ test("foreign assistant reasoning and text signatures are downgraded before repl
 			{ type: "thinking", thinking: "foreign reasoning", thinkingSignature: JSON.stringify({ v: 1, id: "foreign-reasoning" }) },
 			{ type: "thinking", thinking: "redacted", redacted: true, thinkingSignature: JSON.stringify({ v: 1, id: "foreign-redacted" }) },
 			{ type: "text", text: "foreign answer", textSignature: JSON.stringify({ v: 1, id: "foreign-text", phase: "final_answer" }) },
-			{ type: "toolCall", id: "call-foreign|foreign-item", name: "read", arguments: {}, thoughtSignature: "foreign-tool" },
+			{ type: "toolCall", id: "call-foreign|foreign-item", name: "read", arguments: {}, thoughtSignature: "foreign-tool", namespace: "foreign-namespace" },
 		],
 		api: model.api,
 		provider: "foreign-provider",
@@ -880,7 +881,7 @@ test("foreign assistant reasoning and text signatures are downgraded before repl
 	const transformed = transformMessagesForResponses([foreign] as any, model);
 	assert.equal(transformed.length, 2, "a foreign tool call receives a synthetic result after signature downgrade");
 	assert.equal((transformed[0] as any).content.some((block: any) => block.thinkingSignature || block.textSignature || block.thoughtSignature), false);
-	assert.doesNotMatch(JSON.stringify(serializeMessagesToResponsesInput(model, [foreign] as any)), /foreign-reasoning|foreign-redacted|foreign-text|foreign-tool/);
+	assert.doesNotMatch(JSON.stringify(serializeMessagesToResponsesInput(model, [foreign] as any)), /foreign-reasoning|foreign-redacted|foreign-text|foreign-tool|foreign-namespace/);
 });
 
 test("model-only identity comparison is not enough for opaque checkpoint replay", () => {

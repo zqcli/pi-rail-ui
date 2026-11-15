@@ -160,16 +160,15 @@ async function harness(t: TestContext, withUsage: boolean, reserveTokens = 200, 
 				model, sessionManager: manager, settingsManager: settings,
 				agent: { state: { messages: manager.buildSessionContext().messages } },
 				abort: async () => {}, _emit() {}, _clearManualCompactionState() {}, _emitSessionCompactFailed: async () => {},
-				_getSummarizationRequestAuth: async () => {
-					beforeHook?.();
-					return { model, apiKey: "local-test" };
-				},
 				_refreshFinalizedContext: () => {
 					session.agent.state.messages = manager.buildSessionProjection().messages;
 				},
 				_extensionRunner: {
 					hasHandlers: (name: string) => handlers.has(name),
-					emit: (event: any) => handlers.get(event.type)?.(event, ctx),
+					emit: (event: any) => {
+						if (event.type === "session_before_compact") beforeHook?.();
+						return handlers.get(event.type)?.(event, ctx);
+					},
 				},
 			};
 			cancelCurrent = () => AgentSession.prototype.abortCompaction.call(session as unknown as AgentSession);
@@ -233,6 +232,14 @@ test("off appends on the original branch and actual clone preserves each ledger 
 	assert.deepEqual(totals(h.manager).tokens, after.tokens);
 	assert.deepEqual(h.manager.buildSessionContext(), context);
 	assert.deepEqual(h.manager.getEntries().filter((entry) => entry.type === "usage"), h.usageEntries);
+});
+
+test("native repair keeps summary output within the active model's reserve budget", async (t) => {
+	const h = await harness(t, false, 50);
+	await h.off();
+	assert.equal(readGptCompactionSettings().mode, "off", h.notices.join("\n"));
+	assert.equal(h.requests.length, 1);
+	assert.equal(h.requests[0].options.maxTokens, 40, "summary output must respect the same reserve used to bound recovered history chunks");
 });
 
 test("repeated failed repair leaves all source entries untouched; retry does not duplicate usage", async (t) => {
@@ -509,7 +516,7 @@ test("cancellation restores exact entries and leaf, with and without a usage tai
 
 test("pre-hook failure restores the temporary branch and permits retry", async (t) => {
 	const h = await harness(t, false, 200, true, "none");
-	h.beforeHook(() => { throw new Error("auth failed before hook"); });
+	h.beforeHook(() => { throw new Error("failed before compaction hook"); });
 	await h.off();
 	await h.off();
 	assert.equal(h.requests.length, 0);

@@ -23,7 +23,8 @@ function stream(model, context, options) {
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
-			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			usage: { input: Number(process.env.RAIL_GPT_COMPACTION_SWITCH_USAGE ?? 1), output: 1, cacheRead: 0, cacheWrite: 0,
+				totalTokens: Number(process.env.RAIL_GPT_COMPACTION_SWITCH_USAGE ?? 1) + 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
@@ -37,7 +38,7 @@ function stream(model, context, options) {
 export default function install(pi) {
 	pi.registerProvider("cus-resp", {
 		name: "Rail model switch probe",
-		baseUrl: "https://gateway.example/v1",
+		baseUrl: process.env.RAIL_GPT_COMPACTION_GATEWAY ?? "https://gateway.example/v1",
 		apiKey: "probe-key",
 		api: "openai-responses",
 		streamSimple: stream,
@@ -47,7 +48,7 @@ export default function install(pi) {
 			reasoning: false,
 			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128_000,
+			contextWindow: Number(id === "gpt-alt" ? process.env.RAIL_GPT_COMPACTION_ALT_CONTEXT_WINDOW ?? 128_000 : process.env.RAIL_GPT_COMPACTION_CONTEXT_WINDOW ?? 128_000),
 			maxTokens: 64,
 		})),
 	});

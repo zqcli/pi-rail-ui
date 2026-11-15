@@ -183,8 +183,9 @@ export function transformMessagesForResponses(messages: readonly Message[], mode
 	return transformed;
 }
 
-function serializeAssistantItems(message: AssistantMessage, messageIndex: number): unknown[] {
+function serializeAssistantItems(message: AssistantMessage, messageIndex: number, model: Model<Api>): unknown[] {
 	const items: unknown[] = [];
+	const isSameModel = message.provider === model.provider && message.api === model.api && message.model === model.id;
 	for (const block of message.content) {
 		if (block.type === "thinking") {
 			if (!block.thinkingSignature) continue;
@@ -215,6 +216,7 @@ function serializeAssistantItems(message: AssistantMessage, messageIndex: number
 			call_id: callId,
 			name: block.name,
 			arguments: JSON.stringify(block.arguments),
+			...(isSameModel && block.namespace !== undefined ? { namespace: block.namespace } : {}),
 		});
 	}
 	return items;
@@ -256,7 +258,7 @@ export function serializeMessagesToResponsesInput(model: Model<Api>, messages: r
 			continue;
 		}
 		if (message.role === "assistant") {
-			input.push(...serializeAssistantItems(message, messageIndex));
+			input.push(...serializeAssistantItems(message, messageIndex, model));
 			messageIndex += 1;
 			continue;
 		}

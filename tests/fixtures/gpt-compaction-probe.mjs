@@ -1,5 +1,5 @@
 import { appendFileSync } from "node:fs";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 
 const logPath = process.env.RAIL_GPT_COMPACTION_PROBE_LOG;
 let providerCalls = 0;
@@ -32,17 +32,20 @@ function streamProbe(model, context, options) {
 				stream: false,
 			};
 			if (options?.onPayload) payload = await options.onPayload(payload);
-			record({ kind: "provider", context: context.messages, payload });
+			const summarizing = getCurrentSystemPrompt(context.messages).includes("context summarization assistant");
+			record({ kind: "provider", context: context.messages, payload, summarizing });
 			const overflow = process.env.RAIL_GPT_COMPACTION_OVERFLOW_ONCE === "1" && providerCalls === 1;
+			const failSummary = process.env.RAIL_GPT_COMPACTION_FAIL_SUMMARY === "1" && summarizing;
 			const message = {
 				role: "assistant",
-				content: overflow ? [] : [{ type: "text", text: "gpt-compaction-probe" }],
+				content: overflow || failSummary ? [] : [{ type: "text", text: "gpt-compaction-probe" }],
 				api: model.api,
 				provider: model.provider,
 				model: model.id,
 				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-				stopReason: options?.signal?.aborted ? "aborted" : overflow ? "error" : "stop",
+				stopReason: options?.signal?.aborted ? "aborted" : overflow || failSummary ? "error" : "stop",
 				...(overflow ? { errorMessage: "input exceeds the context window of this model" } : {}),
+				...(failSummary ? { errorMessage: "native summary unavailable" } : {}),
 				timestamp: Date.now(),
 			};
 			stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });

@@ -71,18 +71,27 @@ async function writePlainSeedSession(path: string, repeatCount = 2_000): Promise
 	await writeFile(path, `${entries}\n`);
 }
 
-async function startMockCompactionServer(): Promise<{
+async function startMockCompactionServer(holdRequest?: number): Promise<{
 	server: ReturnType<typeof createServer>;
 	gateway: string;
 	requests: Array<{ url: string | undefined; body: Record<string, any> }>;
+	heldClosed: Promise<void>;
 }> {
 	const requests: Array<{ url: string | undefined; body: Record<string, any> }> = [];
+	let closeHeld: () => void;
+	const heldClosed = new Promise<void>((resolve) => { closeHeld = resolve; });
 	const server = createServer((request, response) => {
 		let raw = "";
 		request.setEncoding("utf8");
 		request.on("data", (chunk) => { raw += chunk; });
 		request.on("end", () => {
 			requests.push({ url: request.url, body: JSON.parse(raw) as Record<string, any> });
+			if (requests.length === holdRequest) {
+				response.on("close", () => closeHeld());
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.flushHeaders();
+				return;
+			}
 			const checkpoint = { type: "compaction", id: "mock-item", encrypted_content: "opaque-server-checkpoint" };
 			const events = [
 				`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "mock-response" } })}\n\n`,
@@ -95,7 +104,7 @@ async function startMockCompactionServer(): Promise<{
 	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("mock server did not bind");
-	return { server, gateway: `http://127.0.0.1:${address.port}/v1`, requests };
+	return { server, gateway: `http://127.0.0.1:${address.port}/v1`, requests, heldClosed };
 }
 
 async function runProbe(agentDir: string, sessionPath: string, logPath: string, mode: "on" | "off"): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -128,7 +137,6 @@ async function runStatelessProbe(agentDir: string, gateway: string, logPath: str
 		"-e", providerFixture,
 		"-e", railExtension,
 		"--model", "cus-resp/gpt-5.6-sol",
-		"stateless compaction ".repeat(30_000),
 	], {
 		cwd: process.cwd(),
 		env: {
@@ -140,8 +148,9 @@ async function runStatelessProbe(agentDir: string, gateway: string, logPath: str
 			RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000",
 			RAIL_GPT_COMPACTION_PROBE_LOG: logPath,
 		},
-		stdio: ["ignore", "pipe", "pipe"],
+		stdio: ["pipe", "pipe", "pipe"],
 	});
+	child.stdin.end("stateless compaction ".repeat(30_000));
 	let stdout = "";
 	let stderr = "";
 	child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
@@ -168,7 +177,7 @@ async function readProbe(logPath: string): Promise<Record<string, any>> {
 	return record;
 }
 
-test("real Pi 0.87.1 loads the root extension and preserves live input in off/on replay", { timeout: 30_000 }, async (t) => {
+test("real Pi loads the root extension and preserves live input in off/on replay", { timeout: 30_000 }, async (t) => {
 	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-"));
 	t.after(() => rm(sandbox, { recursive: true, force: true }));
 
@@ -487,6 +496,152 @@ test("a live worker preflights global off before a multi-turn tool run", { timeo
 		const promptCount = JSON.stringify(record).split("run tool loop after global off").length - 1;
 		if (promptCount > 0) assert.equal(promptCount, 1, "the live prompt must occur exactly once in every later payload");
 	}
+});
+
+test("an idle custom trigger repairs recovered history before provider I/O and is delivered once", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-custom-resume-"));
+	t.after(async () => {
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	const logPath = join(sandbox, "provider.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath, 1_000);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", gptCompactionExtension,
+			"-e", fileURLToPath(new URL("../fixtures/gpt-compaction-custom-trigger.mjs", import.meta.url)), "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir,
+			RAIL_GPT_COMPACTION_GATEWAY: gateway, RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000", RAIL_GPT_COMPACTION_PROBE_LOG: logPath },
+	});
+	const trigger = `custom resume instruction ${"c".repeat(44_000)}`;
+	const events: Array<Record<string, any>> = [];
+	const unsubscribe = transport.onEvent((event) => events.push(event as Record<string, any>));
+	t.after(() => transport.stop());
+	await transport.start();
+	try {
+		await transport.request({ type: "compact" });
+		await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "off" }));
+		for (const content of ["small custom resume", trigger]) {
+			const settled = new Promise<void>((resolve, reject) => {
+				const stop = transport.onEvent((event) => {
+					if (event.type === "agent_settled") { stop(); resolve(); }
+					if (event.type === "transport_error") { stop(); reject(new Error(String(event["error"]))); }
+				});
+			});
+			await transport.request({ type: "prompt", message: `/gpt-compaction-custom-trigger ${content}` });
+			await settled;
+			if (content !== trigger) assert.equal(events.filter((event) => event["type"] === "compaction_end").length, 1,
+				"recovered history fits by itself; only the larger custom trigger should require native repair");
+		}
+	} finally {
+		unsubscribe();
+		await transport.stop();
+	}
+	assert.equal(requests.length, 1, "global off must prevent another remote compaction");
+	assert.equal(events.filter((event) => event["type"] === "compaction_end" && event["result"]?.["details"]?.["strategy"] === undefined).length, 1);
+	assert.deepEqual(events.filter((event) => event["type"] === "agent_settled").map((event) => event["aborted"]), [false, false]);
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	assert.equal(saved.filter((entry) => entry["type"] === "custom_message" && entry["content"] === trigger).length, 1);
+	const native = saved.find((entry) => entry["type"] === "compaction" && entry["details"]?.["strategy"] === undefined);
+	assert.ok(native?.["usage"], "native repair must persist its usage");
+	const records = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	const final = records.at(-1)?.["context"] as Array<Record<string, unknown>>;
+	assert.equal(final.filter((message) => JSON.stringify(message).includes(trigger)).length, 1);
+	assert.doesNotMatch(JSON.stringify(final), /opaque-server-checkpoint|GPT remote compaction checkpoint/);
+});
+
+test("failed reserved-budget repair aborts the run before any conversation provider request", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests } = await startMockCompactionServer();
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-failed-resume-"));
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	const logPath = join(sandbox, "provider.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 16_000, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath, 1_000);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", providerFixture, "-e", gptCompactionExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir,
+			RAIL_GPT_COMPACTION_GATEWAY: gateway, RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000", RAIL_GPT_COMPACTION_PROBE_LOG: logPath, RAIL_GPT_COMPACTION_FAIL_SUMMARY: "1" },
+	});
+	t.after(async () => {
+		await transport.stop();
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const events: Array<Record<string, any>> = [];
+	transport.onEvent((event) => events.push(event as Record<string, any>));
+	await transport.start();
+	await transport.request({ type: "compact" });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "off" }));
+	const settled = new Promise<void>((resolve) => {
+		const stop = transport.onEvent((event) => { if (event.type === "agent_settled") { stop(); resolve(); } });
+	});
+	await transport.request({ type: "prompt", message: "must not dispatch after failed repair" });
+	await settled;
+	assert.equal(requests.length, 1);
+	const records = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	assert.equal(records.length, 1, "one native summary attempt is sufficient to reject this run");
+	assert.equal(records[0]?.["summarizing"], true, "the conversation request must never follow failed native repair");
+	assert.deepEqual(events.filter((event) => event["type"] === "agent_settled").map((event) => event["aborted"]), [true]);
+	assert.equal(events.filter((event) => event["type"] === "agent_start").length, 1, "repair failure must not resubmit the trigger");
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	assert.equal(saved.filter((entry) => entry["type"] === "compaction").length, 1, "failed repair must preserve the original checkpoint");
+});
+
+test("model switching during ordinary auto compaction cancels its original request without overlapping repair", { timeout: 30_000 }, async (t) => {
+	const { server, gateway, requests, heldClosed } = await startMockCompactionServer(2);
+	const sandbox = await mkdtemp(join(process.cwd(), ".tmp-gpt-compaction-switch-active-"));
+	const agentDir = join(sandbox, "agent");
+	const sessionPath = join(sandbox, "session.jsonl");
+	const logPath = join(sandbox, "provider.jsonl");
+	await mkdir(join(agentDir, "rail-gpt-compaction"), { recursive: true });
+	await writeFile(join(agentDir, "rail-gpt-compaction", "settings.json"), JSON.stringify({ version: 1, remoteCompaction: "on" }));
+	await writeFile(join(agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1 }, retry: { enabled: false } }));
+	await writePlainSeedSession(sessionPath, 2_000);
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundleCli, "--mode", "rpc", "--session", sessionPath, "--no-extensions", "--offline", "-e", fileURLToPath(new URL("../fixtures/gpt-compaction-model-switch.mjs", import.meta.url)), "-e", gptCompactionExtension, "--model", "cus-resp/gpt-5.6-sol"],
+		cwd: process.cwd(),
+		env: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_CODING_AGENT_DIR: agentDir,
+			RAIL_GPT_COMPACTION_GATEWAY: gateway, RAIL_GPT_COMPACTION_CONTEXT_WINDOW: "20000", RAIL_GPT_COMPACTION_ALT_CONTEXT_WINDOW: "12000",
+			RAIL_GPT_COMPACTION_SWITCH_USAGE: "19500", RAIL_GPT_COMPACTION_SWITCH_LOG: logPath },
+	});
+	t.after(async () => {
+		await transport.stop();
+		await rm(sandbox, { recursive: true, force: true });
+		await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	});
+	const events: Array<Record<string, any>> = [];
+	transport.onEvent((event) => events.push(event as Record<string, any>));
+	await transport.start();
+	await transport.request({ type: "compact" });
+	const autoRequest = new Promise<void>((resolve) => server.once("request", () => resolve()));
+	const settled = new Promise<void>((resolve) => {
+		const stop = transport.onEvent((event) => { if (event.type === "agent_settled") { stop(); resolve(); } });
+	});
+	await transport.request({ type: "prompt", message: "produce ordinary automatic compaction" });
+	await autoRequest;
+	await transport.request({ type: "set_model", provider: "cus-resp", modelId: "gpt-alt" });
+	await Promise.all([settled, heldClosed]);
+	assert.equal(requests.length, 2, "only the original manual and automatic remote requests may start");
+	assert.equal(events.filter((event) => event["type"] === "compaction_start").length, 2, "model switching must not start a second compaction while the first is pending");
+	assert.equal(events.filter((event) => event["type"] === "compaction_end" && event["aborted"] === true).length, 1);
+	assert.deepEqual(events.filter((event) => event["type"] === "agent_settled").map((event) => event["aborted"]), [true]);
+	const records = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	assert.equal(records.length, 1, "no native summary or replacement conversation may overlap the remote request");
+	const saved = (await readFile(sessionPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+	assert.equal(saved.filter((entry) => entry["type"] === "compaction").length, 1, "the cancelled request and rejected overlap must not append checkpoints");
 });
 
 test("cancelling native repair restores the original opaque leaf", { timeout: 60_000 }, async (t) => {

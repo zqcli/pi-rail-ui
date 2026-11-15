@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import {
 	getCurrentSystemMessage, getCurrentSystemPrompt, getCurrentTools, getToolStateChanges,
-	normalizeContext, Type, type Api, type Message, type Model, type Tool,
+	normalizeContext, type Api, type Message, type Model, type Tool,
 } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import {
 	AgentSession, buildSessionContext, convertToLlm, createExtensionRuntime, ExtensionRunner, SessionManager,
@@ -148,7 +149,7 @@ for (const override of ["systemPrompt", "forceSystemPrompt"] as const) {
 			}]]]),
 		} as unknown as Extension;
 		const runner = new ExtensionRunner([extension], createExtensionRuntime(), process.cwd(), manager, ctx.modelRegistry as ModelRegistry);
-		const hook = await runner.emitBeforeAgentStart("test", undefined, { cwd: process.cwd(), customPrompt: "structured base" });
+		const hook = await runner.emitBeforeAgentStart({ messageType: "user", prompt: "test" }, { cwd: process.cwd(), customPrompt: "structured base" });
 		// Exercise Pi's real projection and systemPrompt getter, without starting a provider.
 		const session = Object.assign(Object.create(AgentSession.prototype), {
 			agent: {}, _runSystemPromptOptions: hook.systemPromptOptions,
@@ -174,13 +175,14 @@ test("Pi's normal prompt rendering and section patches stay aligned with current
 	const added = tool("added");
 	const { manager, ctx } = harness([]);
 	const runner = new ExtensionRunner([], createExtensionRuntime(), process.cwd(), manager, ctx.modelRegistry as ModelRegistry);
-	const { systemPromptOptions: options } = await runner.emitBeforeAgentStart("test", undefined, {
+	const { systemPromptOptions: options } = await runner.emitBeforeAgentStart({ messageType: "user", prompt: "test" }, {
 		cwd: process.cwd(), customPrompt: "structured base", selectedTools: [read.name],
 		sections: { policy: "old policy", obsolete: "obsolete section" },
 	});
 	const session = Object.assign(Object.create(AgentSession.prototype), {
 		agent: { state: { tools: [], messages: [] } }, _runSystemPromptOptions: options,
 		_toolRegistry: new Map([[read.name, read], [added.name, added]]),
+		_toolDefinitions: new Map(),
 	});
 	manager.appendMessage(session._preparePromptAndToolLoadout(options, []));
 	manager.appendMessage({ role: "system", content: "", toolsAdded: [read], timestamp: 1 });

@@ -141,7 +141,7 @@ test("bounded root budgets keep exhausted, granted and used creation order, omit
 	assert.equal(after.budget.rootsOmitted, roots.length + 1 - TEAM_VIEW_MAX_BUDGET_ROOTS);
 });
 
-test("Team view samples live usage once per active member for consistent member and Team totals", () => {
+test("Team view samples live usage once per active member and freezes native usage before cleanup", () => {
 	const w = world();
 	w.request(w.lead, "parent");
 	const parent = w.take("parent");
@@ -157,12 +157,21 @@ test("Team view samples live usage once per active member for consistent member 
 	assert.deepEqual(view.members.slice(0, 2).map((member) => member.usage.input), [10, 20]);
 	assert.deepEqual(view.members[1]!.context, { used: 0, window: 1000, percent: 0 }, "context remains the settled member observation");
 	w.call(parent, { action: "reply", result: { status: "succeeded", summary: "Done." } });
-	w.settle(parent, { status: "success", appliedToolCallId: "call-1", usage: { ...emptySubagentUsage(), input: 20, contextTokens: 100, turns: 1 } });
+	assert.equal(w.runtime.nativeSettled(parent.binding, parent.scope.activationId, {
+		status: "success", appliedToolCallId: "call-1", usage: { ...emptySubagentUsage(), input: 20, contextTokens: 100, turns: 1 },
+	}).ok, true);
 	calls.length = 0;
 	const settled = w.runtime.getTeam(w.teamId);
-	assert.deepEqual(calls, ["lead"], "settled native usage must not be sampled or added twice");
+	assert.deepEqual(calls, ["lead"], "settled native usage must not be sampled or added twice while cleanup is pending");
+	assert.equal(settled.members[1]!.activity, "settling");
 	assert.equal(settled.usage.input, 30);
 	assert.equal(settled.members[1]!.usage.input, 20);
+	assert.equal(w.runtime.cleanupFinished(parent.binding, parent.scope.activationId, { ok: true }).ok, true);
+	calls.length = 0;
+	const cleaned = w.runtime.getTeam(w.teamId);
+	assert.deepEqual(calls, ["lead"]);
+	assert.deepEqual(cleaned.usage, settled.usage);
+	assert.deepEqual(cleaned.members[1]!.usage, settled.members[1]!.usage);
 });
 
 test("perf: Team view and full budget inspection read the ledger linearly across 128 roots and 1152 works", (t) => {

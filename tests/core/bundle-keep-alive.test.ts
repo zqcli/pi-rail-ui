@@ -86,6 +86,7 @@ test("bundled CLI: capture the actual warmer through public AgentSession without
 	await transport.request({ type: "prompt", message: "/rail-keep-alive 1" });
 	await transport.request({ type: "prompt", message: "/ka-probe" });
 	const result = JSON.parse(await readFile(output, "utf8"));
+	assert.equal(result.version, "1.5.2");
 	assert.equal(result.captured, true);
 	assert.equal(result.bound, true);
 	assert.match(result.status, /KA 1m WAIT.*fresh real request/);
@@ -126,7 +127,16 @@ test("bundled CLI local mock provider: refresh retains request hooks and writes 
 	assert.equal(result.assistant, 1);
 	assert.equal(requests.length, 2);
 	assert.equal(requests[1].maxTokens, 1);
-	assert.deepEqual(requests.map(request => [request.hasPayloadHook, request.hasResponseHook, request.hasHeadersHook]), [[true, true, true], [true, true, true]]);
+	assert.deepEqual(requests.map(request => [request.hasPayloadHook, request.hasResponseHook, request.hasHeadersHook, request.hasStreamHook]),
+		[[true, true, true, true], [true, true, true, true]]);
+	assert.deepEqual(requests.map(request => request.hooks),
+		[{ payload: 1, response: 1, headers: 1, stream: 1 }, { payload: 2, response: 2, headers: 2, stream: 2 }]);
+	assert.deepEqual(requests.map(request => request.headers["x-ka-request"]), ["1", "2"], "headers are transformed again for the warm");
+	assert.ok(requests.every(request => request.localAuth), "both requests resolve the same local provider credentials");
+	assert.equal(requests[1].sessionId, requests[0].sessionId);
+	assert.equal(requests[1].disableContinuation, true, "a warm cannot replace the real provider conversation thread");
+	assert.equal(requests[1].maxRetries, 0);
+	assert.deepEqual(requests[1].payload, requests[0].payload);
 });
 
 test("real /reload hands the scheduled refresh to the reloaded extension without a new request", { timeout: 30_000 }, async (t) => {
@@ -241,4 +251,65 @@ test("real AgentSession.compact: a refresh while the compaction hook is blocked 
 	assert.equal(result.cancelledOldRun, true, JSON.stringify(result));
 	assert.equal(result.requests, 2, "no warm request during compaction");
 	assert.match(result.status, /PAUSED.*busy/, "the compacting session is busy, so the refresh pauses before any request");
+});
+
+
+test("real wall-clock expiry warms during long tools and again while idle", {
+	timeout: 150_000, skip: process.env["RAIL_KEEP_ALIVE_WALL_CLOCK"] !== "1",
+}, async (t) => {
+	const root = join(process.cwd(), ".tmp");
+	await mkdir(root, { recursive: true });
+	const dir = await mkdtemp(join(root, "ka-clock-"));
+	const output = join(dir, "result.json");
+	const log = join(dir, "provider.jsonl");
+	const transport = new PiRpcProcessTransport({
+		command: process.execPath,
+		args: [bundle, "--mode", "rpc", "--no-session", "--model", "rail-ka-local/local", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--offline", "-e", fixture],
+		cwd: process.cwd(),
+		env: { ...process.env, HOME: join(dir, "home"), PI_CODING_AGENT_DIR: join(dir, "agent"), PI_OFFLINE: "1", KA_WAIT_TEST: "1", KA_PROBE_OUTPUT: output, KA_PROBE_LOG: log },
+	});
+	t.after(async () => { await transport.stop().catch(() => {}); await rm(dir, { recursive: true, force: true }); });
+	await transport.start();
+	const command = (message: string) => transport.request({ type: "prompt", message });
+	const status = async () => {
+		await command("/ka-wait-status");
+		return JSON.parse(await readFile(output, "utf8"));
+	};
+	const until = async (predicate: (state: any) => boolean, timeout: number) => {
+		const deadline = Date.now() + timeout;
+		while (Date.now() < deadline) {
+			const state = await status();
+			if (predicate(state)) return state;
+			await new Promise(resolve => setTimeout(resolve, 250));
+		}
+		throw new Error("wall-clock keep-alive condition was not reached");
+	};
+	await command("/rail-keep-alive 1");
+	await command("hold two tools for the real minute timer");
+	const waiting = await until(state => state.pending.length === 2, 5_000);
+	assert.equal(waiting.label, "KA 1|1");
+	const warmedWhileWorking = await until(state => state.usage === 1, 70_000);
+	assert.equal(warmedWhileWorking.idle, false);
+	assert.equal(warmedWhileWorking.pending.length, 2);
+	assert.equal(warmedWhileWorking.label, "KA 1|1");
+	assert.ok(Date.now() >= waiting.nextWarmAt, "the real timer expired without forced dispatch or acceleration");
+	const settled = new Promise<void>(resolve => {
+		const off = transport.onEvent(event => { if (event.type === "agent_settled") { off(); resolve(); } });
+	});
+	await command("/ka-release a"); await command("/ka-release b");
+	await settled;
+	const idle = await status();
+	assert.equal(idle.idle, true);
+	assert.equal(idle.label, "KA 1|1");
+	const warmedWhileIdle = await until(state => state.usage === 2, 70_000);
+	assert.equal(warmedWhileIdle.idle, true);
+	assert.equal(warmedWhileIdle.label, "KA 1|1");
+	assert.ok(Date.now() >= idle.nextWarmAt);
+	const requests = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+	assert.equal(requests.length, 4, "one real request and one warm in each phase");
+	assert.deepEqual(requests[1].payload, requests[0].payload);
+	assert.deepEqual(requests[3].payload, requests[2].payload);
+	assert.deepEqual(requests.filter(request => request.maxTokens === 1).map(request => request.disableContinuation), [true, true]);
+	await command("/rail-keep-alive off");
+	assert.equal((await status()).label, undefined);
 });

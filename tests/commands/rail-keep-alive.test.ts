@@ -8,7 +8,7 @@ const { CacheWarmer, formatCacheWarmingStatus } = await import(pathToFileURL(joi
 import { installRailKeepAlive, keepAliveLabel, keepAliveStatus, onKeepAliveChange } from "../../commands/rail-keep-alive";
 
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
-function harness() {
+function harness(nativeMode: "off" | "streaming" | "idle" = "streaming") {
 	const handlers = new Map<string, Function[]>();
 	const commands = new Map<string, Function>();
 	let argumentCompletions: ((prefix: string) => Array<{ value: string }>) | undefined;
@@ -41,7 +41,7 @@ function harness() {
 		for (const handler of actions) action = (await handler(event, ctx))?.action ?? action;
 		return action;
 	};
-	const warmer = new CacheWarmer(models as any, manager as any, () => "streaming", decision) as any;
+	const warmer = new CacheWarmer(models as any, manager as any, () => nativeMode, decision) as any;
 	const session = Object.create(AgentSession.prototype) as AgentSession;
 	Object.defineProperties(session, { sessionManager: { value: manager }, _cacheWarmer: { value: warmer } });
 	let idle = true;
@@ -49,7 +49,7 @@ function harness() {
 	const emitAt = async (name: string, target: any, event: any = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, target); };
 	const emit = (name: string, event: any = {}) => emitAt(name, ctx, event);
 	const command = async (args: string) => commands.get("rail-keep-alive")!(args, ctx);
-	const request = { model: { provider: "test", id: "model", api: "openai-responses", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, context: { messages: [{ role: "system", content: "secret" }] }, options: { onPayload: () => {}, onResponse: () => {}, headers: { token: "local" } } };
+	const request = { model: { provider: "test", id: "model", api: "openai-responses", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, context: { messages: [{ role: "system", content: "secret" }] }, options: { onPayload: () => {}, onResponse: () => {}, onProviderStreamEvent: () => {}, transformHeaders: async (headers: any) => headers, headers: { token: "local" } } };
 	// AgentSession.model reads agent.state.model.
 	const parentController = new AbortController();
 	const agent = { state: { model: request.model, streamingMessage: undefined as any }, signal: parentController.signal };
@@ -65,11 +65,11 @@ function harness() {
 	}, cleanup: async () => { await emit("session_shutdown"); AgentSession.prototype.prompt = originalPrompt; AgentSession.prototype.dispose = originalDispose; } };
 }
 
-test("manual idle interval reuses native refresh and usage, beyond 30/180 minutes without metadata", async (t) => {
+test("manual idle interval reuses native refresh and usage beyond three hours without metadata", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
-		assert.equal(VERSION, "0.87.1");
+		assert.equal(VERSION, "1.5.2");
 		await h.begin();
 		await h.command("1");
 		assert.match(keepAliveStatus(h.manager)!, /WAIT.*fresh real request/);
@@ -81,10 +81,14 @@ test("manual idle interval reuses native refresh and usage, beyond 30/180 minute
 		assert.equal(h.calls[0].options.maxTokens, 1);
 		assert.equal(h.calls[0].options.onPayload, h.request.options.onPayload);
 		assert.equal(h.calls[0].options.onResponse, h.request.options.onResponse);
+		assert.equal(h.calls[0].options.onProviderStreamEvent, h.request.options.onProviderStreamEvent);
+		assert.equal(h.calls[0].options.transformHeaders, h.request.options.transformHeaders);
+		assert.equal(h.calls[0].options.disableContinuation, true, "warming must not replace the real conversation provider thread");
+		assert.equal(h.calls[0].options.maxRetries, 0);
 		assert.deepEqual(h.calls[0].options.headers, h.request.options.headers);
 		assert.equal(h.manager.entries.filter(e => e.type === "usage").length, 1);
 		for (let i = 0; i < 181; i++) { t.mock.timers.tick(60_000); await flush(); }
-		assert.equal(h.calls.length, 182, "continues beyond the native 30/180-minute windows");
+		assert.equal(h.calls.length, 182, "continues beyond the native 30/60-minute windows");
 		t.mock.timers.setTime(Date.now() + 120_000);
 		t.mock.timers.tick(60_000); await flush();
 		assert.match(keepAliveStatus(h.manager)!, /PAUSED.*late after sleep/);
@@ -463,7 +467,7 @@ test("native cancel (what AgentSession.dispose calls) aborts a pending manual ti
 	} finally { await h.cleanup(); }
 });
 
-test("unsafe replay and missing live warmer pause visibly without a request", async (t) => {
+test("public replay policy rejects disabled caching and unsafe thinking, while allowing adaptive thinking", async (t) => {
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
@@ -474,6 +478,13 @@ test("unsafe replay and missing live warmer pause visibly without a request", as
 		assert.match(keepAliveStatus(h.manager)!, /PAUSED.*cannot be replayed/);
 		t.mock.timers.tick(120_000); await flush();
 		assert.equal(h.calls.length, 0);
+		h.warmer.start({ ...h.request, model: { ...h.request.model, api: "anthropic-messages", compat: { forceAdaptiveThinking: true } },
+			options: { reasoning: "high" } }, () => true);
+		h.warmer.onAgentSettled();
+		t.mock.timers.tick(60_000); await flush();
+		assert.equal(h.calls.length, 1);
+		assert.equal(h.calls[0].options.reasoning, "high");
+		assert.equal(h.calls[0].options.maxTokens, 1);
 	} finally { await h.cleanup(); }
 });
 
@@ -653,4 +664,51 @@ test("a timer and an async decision both refuse dispatch while the session is bu
 		assert.equal(h.calls.length, 0);
 		assert.match(keepAliveStatus(h.manager)!, /PAUSED.*busy/);
 	} finally { await h.cleanup(); }
+});
+
+
+test("without the command, native off/streaming/idle schedules, failures and limits remain unchanged", async (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+	for (const mode of ["off", "streaming", "idle"] as const) {
+		const h = harness(mode);
+		const referenceCalls: any[] = [];
+		let result: any = { stopReason: "error", errorMessage: "local failure" };
+		const manager = { ...h.manager, entries: [] as any[] };
+		const reference = new CacheWarmer({ streamSimple(...args: any[]) {
+			referenceCalls.push(args); return { result: async () => result };
+		} } as any, manager as any, () => mode) as any;
+		try {
+			await h.begin();
+			h.setIdle(false);
+			const entry = { type: "message", message: { role: "assistant", usage: { input: 200_000, cacheRead: 0, cacheWrite: 0 } } };
+			h.manager.entries.push(entry); manager.entries.push(entry);
+			const request = { ...h.request, model: { ...h.request.model, promptCache: { short: 300 },
+				cost: { input: 10, output: 2, cacheRead: 1, cacheWrite: 10 } } };
+			h.setResult(result);
+			h.warmer.start(request, () => true); reference.start(request, () => true);
+			assert.deepEqual(h.warmer.status, reference.status, mode);
+			assert.equal(keepAliveLabel(h.manager), undefined);
+			assert.equal(h.warmer.getMode(), mode);
+			if (mode === "off") continue;
+			assert.equal(h.warmer.run.nextWarmAt, Date.now() + 270_000, "native TTL schedule starts during generation");
+			await responseEnded(h);
+			t.mock.timers.tick(270_000); await flush();
+			assert.equal(h.calls.length, referenceCalls.length);
+			assert.equal(h.calls.length, 1, "native streaming can warm while the agent is busy");
+			assert.deepEqual(h.warmer.status, reference.status, "native failures reschedule without a Rail pause");
+			assert.equal(h.notices.length, 0);
+			result = { stopReason: "stop", provider: "test", model: "model", usage: { input: 1, cost: { total: 0 } } };
+			h.setResult(result);
+			t.mock.timers.tick(270_000); await flush();
+			assert.deepEqual(h.manager.entries, manager.entries, "native usage accounting is unchanged");
+			h.warmer.onAgentSettled(); reference.onAgentSettled();
+			assert.deepEqual(h.warmer.status, reference.status, "settlement follows the native mode");
+			if (mode === "idle") {
+				t.mock.timers.setTime(Date.now() + 31 * 60_000);
+				h.warmer.onAgentSettled(); reference.onAgentSettled();
+				assert.deepEqual(h.warmer.status, reference.status);
+				assert.match(h.warmer.status.reason, /30-minute idle safety limit/);
+			}
+		} finally { reference.cancel(); await h.cleanup(); }
+	}
 });

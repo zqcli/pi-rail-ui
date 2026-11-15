@@ -1,8 +1,35 @@
-# Keep-alive during long-running tools
+# Keep-alive compatibility and validation
+
+## Pi 1.5.2 migration — 2026-11-15
+
+Compared Pi `v0.87.1` with release `v1.5.2` (`b4afdddf44e059c67ccf5097e5317d913521b470`), including the live CacheWarmer, SDK request construction, and ModelRuntime dispatch. The installed bundle's `VERSION` is asserted as `1.5.2` by the real-process probe.
+
+The public [`isCacheWarmingReplayable`](https://github.com/earendil-works/pi/blob/b4afdddf44e059c67ccf5097e5317d913521b470/packages/ai/src/cache-warming.ts) now replaces Rail's duplicated Anthropic replay rule. The disabled-cache pause remains explicit; adaptive-thinking requests retain the same supported behavior. Pi's public `cache_warming_decision` hook can change the decision, but cannot set the paid N-minute schedule, remove the native 30/60-minute windows, create the post-response tool-wait phase, or expose provider failures as a pause. Those controls therefore still use the guarded **1.5.2 live instance**, not a detached imported CacheWarmer class.
+
+The native [`refresh()`](https://github.com/earendil-works/pi/blob/b4afdddf44e059c67ccf5097e5317d913521b470/packages/coding-agent/src/core/cache-warmer.ts) retains request dispatch and usage accounting. Its new public `getCacheWarmingRequestOptions()` adds `disableContinuation: true`, alongside `maxTokens: 1`, `maxRetries: 0`, and the run's abort signal. Rail does not duplicate this logic. The refreshed request preserves payload/response/provider-stream callbacks, session identity, and provider auth resolution. The SDK's `transformHeaders` is retained and executed again for each refresh, so header hooks remain effective after the first request.
+
+Validation uses the repository's actual Pi **1.5.2 bundle** and a local synthetic `rail-ka-local/local` provider. No paid model requests or external provider traffic are used.
+
+```sh
+RAIL_KEEP_ALIVE_WALL_CLOCK=1 node --import tsx --test \
+  tests/commands/rail-keep-alive.test.ts tests/core/bundle-keep-alive.test.ts
+```
+
+Result: **36/36 passed**. A targeted TypeScript check using the repository compiler options reports **0 diagnostics** for the command, both test files, the probe, and their imports. This is focused validation; repository-wide checks are reported separately by the migration integrator.
+
+- The real bundle verifies busy-parent tool waits, sibling results and queued steering, idle refresh, usage without extra chat messages, idle `/reload` handoff, compacted transcripts, session renaming, and blocked compaction.
+- The optional wall-clock case runs for about **120 seconds**: a genuine one-minute timer refreshes while two tools are pending, and a second genuine one-minute timer refreshes after the parent continuation settles. It does not call `refresh()` directly, change the delay, or mock the clock. The default suite skips this slower case; the other bundle cases dispatch a scheduled refresh explicitly.
+- Request assertions confirm identical replayed parent payloads, re-execution of all four provider hooks, updated per-request headers, the same session ID and local credentials, disabled retries, and continuation isolation. These are local adapter-boundary observations, not a live HTTP/WSS or provider cache-hit claim.
+- A side-by-side unit check compares a bound session that never invokes the command with an untouched native CacheWarmer in `off`, `streaming`, and `idle` modes. Native TTL scheduling, refresh-on-busy behavior, failure rescheduling, usage recording, settlement, and idle safety limits remain unchanged.
+- Existing regression coverage remains for manual intervals beyond three hours, repeated long tool waits, aborts, fresh-request replacement, extension vetoes, sleep/provider pauses, late asynchronous decisions, footer labels, and authorization scoped to the same session ID. Forked/child session entries do not grant paid warming authorization.
+
+The historical real-provider results below were **not rerun on Pi 1.5.2**. This migration makes no new claim about provider TTLs, cache hits, actual billed cost, remote cancellation, or live model behavior. The maximum-output value is an intent; a provider adapter may enforce a larger minimum.
+
+## Historical Pi 0.87.1 validation
 
 Validated on 2026-10-01 with Pi **0.87.1**, starting from local `dev` commit `ec47313` in the `feat/rail-keep-alive` worktree. No upstream Pi files, global settings, or credentials were changed.
 
-## Contract
+### Contract
 
 - Each successful **parent model response** starts the configured N-minute countdown, including responses containing tool calls.
 - While tools run, the parent may still be `working`. That is not model generation: the completed request's prefix can be refreshed while waiting for subagents, Team launch, bash, or other tools.
@@ -16,9 +43,9 @@ Validated on 2026-10-01 with Pi **0.87.1**, starting from local `dev` commit `ec
 
 The implementation uses the native warmer's replay, usage accounting and run-identity validation. It adds a post-response waiting phase rather than tool-name-specific exceptions. The parent run's abort signal is observed only while that waiting phase is active and is detached on settlement/replacement/cleanup.
 
-## Automated checks (no paid requests)
+### Automated checks (no paid requests)
 
-### Native warmer + fake session + mock timers
+#### Native warmer + fake session + mock timers
 
 `tests/commands/rail-keep-alive.test.ts` exercises:
 
@@ -32,7 +59,7 @@ The implementation uses the native warmer's replay, usage accounting and run-ide
 8. Failed or aborted parent responses and rewritten prefixes cannot become replayable at settlement.
 9. A decision delayed across a new request, `turn_start`, or compaction cannot send the old refresh.
 
-### Real bundled Pi + local synthetic provider
+#### Real bundled Pi + local synthetic provider
 
 `tests/core/bundle-keep-alive.test.ts` adds a real parent agent turn with two parallel, externally released tools:
 
@@ -43,11 +70,11 @@ The implementation uses the native warmer's replay, usage accounting and run-ide
 
 This bundle test explicitly dispatches the scheduled native refresh to avoid a one-minute delay in the regular suite. It does **not** claim to test wall-clock timer expiry; mock-timer unit tests and the live runs below cover that separately.
 
-### Before/after verification
+#### Before/after verification
 
 All **8 new test cases** (7 unit cases and 1 bundle case) fail against the previous production implementation, and pass with the changes. The complete focused suite passes **33/33**. The full `npm run check` passes **992/992**; `PI_SUBAGENT_DEPTH=1 npm test` also passes **992/992**.
 
-## Live provider tests
+### Live provider tests
 
 Parent model: **`cus-resp/gpt-6-luna:max`**, **Fast enabled**. Subagent and Team members also explicitly selected `cus-resp/gpt-6-luna:max` with `fastMode: true`. Actual outgoing parent and warm payloads were checked for `reasoning.effort = max` and `service_tier = priority`.
 
@@ -67,7 +94,7 @@ All **7 live scenarios passed**, recording **8 parent warms** in total. These we
 
 `cus-resp/gpt-6-luna:max` with Fast also performed read-only code/test verification. Its first pass identified the async request-preparation gap; adding `turn_start` invalidation and its regression check addressed it. Its final pass found no blocker and independently ran the focused **33/33** tests.
 
-## Limits
+### Limits
 
 - Cancelling an already-dispatched request aborts it locally; whether upstream billing stops depends on the provider honoring cancellation.
 - Paid replay remains subject to existing cache-retention and unsafe Anthropic-thinking restrictions, extension vetoes, and late-timer/provider-error pauses.

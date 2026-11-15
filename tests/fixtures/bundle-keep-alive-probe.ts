@@ -1,9 +1,11 @@
 import { appendFile, readFile, writeFile } from "node:fs/promises";
-import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
-import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import { AgentSession, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installRailKeepAlive, keepAliveLabel, keepAliveStatus } from "../../commands/rail-keep-alive";
 
 export default function probe(pi: ExtensionAPI) {
+	const hooks = { payload: 0, response: 0, headers: 0, stream: 0 };
 	pi.registerProvider("rail-ka-local", {
 		baseUrl: "http://127.0.0.1:1/no-network",
 		apiKey: "local-only",
@@ -14,8 +16,11 @@ export default function probe(pi: ExtensionAPI) {
 				const headers = options?.headers;
 				const payload = await options?.onPayload?.({ model: model.id, input: context.messages }, model);
 				await options?.onResponse?.({ status: 200, headers: {} }, model);
-				await appendFile(process.env["KA_PROBE_LOG"]!, JSON.stringify({ maxTokens: options?.maxTokens, payload, headers,
-					hasPayloadHook: !!options?.onPayload, hasResponseHook: !!options?.onResponse, hasHeadersHook: headers?.["x-ka-probe"] === "yes" }) + "\n");
+				await options?.onProviderStreamEvent?.({ type: "local.probe" }, model);
+				await appendFile(process.env["KA_PROBE_LOG"]!, JSON.stringify({ maxTokens: options?.maxTokens, maxRetries: options?.maxRetries, disableContinuation: options?.disableContinuation,
+					payload, headers, hooks: { ...hooks }, sessionId: options?.sessionId, localAuth: options?.apiKey === "local-only",
+					hasPayloadHook: !!options?.onPayload, hasResponseHook: !!options?.onResponse, hasStreamHook: !!options?.onProviderStreamEvent,
+					hasHeadersHook: headers?.["x-ka-probe"] === "yes" }) + "\n");
 				const waiting = process.env["KA_WAIT_TEST"] === "1" && options?.maxTokens !== 1
 					&& !context.messages.some(message => message.role === "toolResult");
 				const message = { role: "assistant" as const, content: waiting
@@ -34,7 +39,14 @@ export default function probe(pi: ExtensionAPI) {
 		models: [{ id: "local", name: "local", reasoning: false, input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 64 }],
 	});
-	pi.on("before_provider_headers", ({ headers }) => { headers["x-ka-probe"] = "yes"; });
+	pi.on("before_provider_request", ({ payload }) => { hooks.payload++; return payload; });
+	pi.on("before_provider_headers", ({ headers }) => {
+		hooks.headers++;
+		headers["x-ka-probe"] = "yes";
+		headers["x-ka-request"] = String(hooks.headers);
+	});
+	pi.on("after_provider_response", () => { hooks.response++; });
+	pi.on("provider_stream_event", () => { hooks.stream++; });
 	// Like Rail's search status: any turn_end handler makes Pi re-project agent messages after the turn.
 	pi.on("turn_end", () => {});
 	const original = AgentSession.prototype.prompt;
@@ -132,7 +144,7 @@ export default function probe(pi: ExtensionAPI) {
 	pi.registerCommand("ka-probe", {
 		handler: async (_args, ctx) => {
 			const warmer = live?._cacheWarmer;
-			const before = { captured: Boolean(live && live.sessionManager === ctx.sessionManager),
+			const before = { version: VERSION, captured: Boolean(live && live.sessionManager === ctx.sessionManager),
 				bound: warmer?.getMode() === "idle", status: keepAliveStatus(ctx.sessionManager),
 				nativeStatus: live?.cacheWarmingStatus };
 			if (warmer?.run) {

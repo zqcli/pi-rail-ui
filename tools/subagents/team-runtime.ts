@@ -1213,6 +1213,13 @@ export class TeamRuntime {
 		return record;
 	}
 
+	/** A member fault can end an already-started review while it waits outside its own activation. */
+	private recordFailedReview(team: TeamState, member: RuntimeMember, ref: WorkRef, message: string): void {
+		if (!this.isReview(team, ref) || ![...team.deliveries.values()].some((delivery) => delivery.work && sameWorkRef(delivery.work, ref))
+			|| team.review.records.some((record) => sameWorkRef(record.work, ref))) return;
+		this.recordReview(team, member, ref, undefined, { status: "failed", summary: message });
+	}
+
 	/**
 	 * Host-only budget grant. Limits grow cumulatively and usage never resets; only budget holds
 	 * whose scope is now within limits are released. Attention, pause and lead-fault holds stay.
@@ -3855,7 +3862,7 @@ export class TeamRuntime {
 				version.state = "failed";
 				version.error = copy(error);
 				version.updatedAt = this.timestamp();
-				if (entry.record.kind === "review") this.recordReview(team, member, ref, undefined, { status: "failed", summary: error.message });
+				this.recordFailedReview(team, member, ref, error.message);
 			} else {
 				this.createIncident(team, error.code, error.message, ref, member.id);
 			}
@@ -4196,6 +4203,7 @@ export class TeamRuntime {
 			delete version.waitingForSignals;
 			delete version.hold;
 			version.updatedAt = this.timestamp();
+			if (version.state === "failed") this.recordFailedReview(team, member, ref, version.error.message);
 			delete entry.stagedWait;
 			this.dequeueWork(team, ref);
 			if (active) {
@@ -4222,6 +4230,7 @@ export class TeamRuntime {
 			delete version.hold;
 			version.error = { code: "MEMBER_UNAVAILABLE", message: `${member.id} faulted before this work could finish` };
 			version.updatedAt = this.timestamp();
+			this.recordFailedReview(team, member, ref, version.error.message);
 			delete entry.stagedWait;
 			this.dequeueWork(team, ref);
 			this.cancelDescendants(team, ref, "cancelled");

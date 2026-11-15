@@ -579,3 +579,46 @@ test("an unprocessed REVIEW_READY never blocks close_team", () => {
 	assert.equal(closed.ok, true, JSON.stringify(closed));
 	assert.equal(runtime.getTeam(teamId).lifecycle, "closing");
 });
+
+for (const failure of ["native", "transport", "cleanup", "host_stop"] as const) test(`a suspended review is recorded once when its reviewer's mailbox ends with ${failure}`, () => {
+	const records: TeamJournalRecord[] = [];
+	const { runtime, teamId, advance } = world({ initial: [{ to: "w1", task: "Build it." }], claim: ["w2"],
+		journal: new TeamJournalGeneration((record) => records.push(record)) });
+	bootIdle(runtime, teamId); const build = takeFor(runtime, teamId, "w1");
+	const opened = act(runtime, build, { action: "signal", operation: "open", name: "build phase" });
+	assert.ok(opened.ok && opened.receipt?.status === "opened"); if (!opened.ok || opened.receipt?.status !== "opened") return;
+	const reviewRef = runtime.reviewNow(teamId).work; const review = takeFor(runtime, teamId, "w2");
+	assert.deepEqual(review.scope.work, reviewRef);
+	end(runtime, review, { action: "yield", waitingForSignals: [opened.receipt.signalId], checkpoint: "wait for build phase" });
+	advance(60_000);
+	assert.equal(act(runtime, build, { action: "message", to: "w2", text: "quick question" }).ok, true);
+	const mailbox = takeFor(runtime, teamId, "w2"); assert.equal(mailbox.scope.kind, "events");
+	assert.equal(runtime.getWork(teamId, reviewRef)!.current.state, "blocked");
+	advance(120_000);
+	if (failure === "transport") runtime.activationLost(mailbox.binding, mailbox.scope.activationId, { code: "LOST", message: "mailbox disconnected" }, true);
+	else {
+		if (failure === "host_stop") runtime.hostStopMember(teamId, "w2", "stop reviewer");
+		assert.equal(runtime.nativeSettled(mailbox.binding, mailbox.scope.activationId,
+			failure === "host_stop" ? { status: "aborted" } : { status: "error", error: { code: "NATIVE_FAILURE", message: "mailbox failed" } }).ok, true);
+		assert.equal(runtime.cleanupFinished(mailbox.binding, mailbox.scope.activationId,
+			failure === "cleanup" ? { ok: false, error: { code: "CLEANUP_FAILED", message: "cleanup unconfirmed" } } : { ok: true }).ok, true);
+		if (failure === "cleanup") runtime.memberExitConfirmed(mailbox.binding);
+	}
+	assert.equal(runtime.getWork(teamId, reviewRef)!.current.state, "failed");
+	const completed = runtime.listReviews(teamId); assert.equal(completed.length, 1);
+	assert.deepEqual(completed[0]!.work, reviewRef); assert.equal(completed[0]!.status, "failed");
+	assert.equal(completed[0]!.snapshotAt, 1_700_000_000_000); assert.equal(completed[0]!.reviewedAt, 1_700_000_180_000);
+	assert.equal(completed[0]!.snapshot.elapsedMs, 0); assert.equal(completed[0]!.snapshot.works.running, 1); assert.equal(completed[0]!.snapshot.works.resolved, 0, "failure keeps the review's last actual snapshot, not mailbox-time progress");
+	assert.equal(records.filter((record) => record.kind === "review").length, 1, "review failure is journaled once");
+	runtime.assertInvariants(teamId);
+});
+
+test("a mailbox fault does not invent a snapshot for a review that never activated", () => {
+	const { runtime, teamId } = world({ initial: [{ to: "w1", task: "Build it." }] });
+	bootIdle(runtime, teamId); const build = takeFor(runtime, teamId, "w1"); const ref = runtime.reviewNow(teamId).work;
+	assert.equal(act(runtime, build, { action: "message", to: "w2", text: "question before review" }).ok, true);
+	const mailbox = takeFor(runtime, teamId, "w2"); assert.equal(mailbox.scope.kind, "events");
+	assert.equal(runtime.nativeSettled(mailbox.binding, mailbox.scope.activationId, { status: "error", error: { code: "NATIVE_FAILURE", message: "mailbox failed" } }).ok, true);
+	assert.equal(runtime.cleanupFinished(mailbox.binding, mailbox.scope.activationId, { ok: true }).ok, true);
+	assert.equal(runtime.getWork(teamId, ref)!.current.state, "failed"); assert.deepEqual(runtime.listReviews(teamId), []);
+});

@@ -264,13 +264,13 @@ Rail Subagent 通过 `fastMode: true` 使用同一套原生机制。Subagent Fas
 /rail-oai-search live|cached|off|probe
 ```
 
-每个 session 默认以 `live` 启动，eligible GPT 模型无需执行命令即可使用原生搜索；`/rail-oai-search off` 可在当前 session 中关闭。`live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。开启（`live`、`cached` 或 `probe`）时若当前模型非 GPT 或缺失，会以 `Cannot enable Rail OpenAI features for the current model: GPT models only.` 统一拒绝；资格会在 idle wait 前后校验，拒绝时不改变 mode、probe 标志或 capture lease；`off` 始终允许。非 GPT 模型下 footer 直接隐藏该 mode，而不是显示 inactive policy。生效条件是非空 API 加上 GPT 名称，并且 API 检查是 blocklist 而非 allowlist：缺失或空白的 API id 保持 inactive，内置的非 Responses API（`openai-completions`、`anthropic-messages`、`mistral-conversations` 等）保持 inactive，但其他任何 API id——包括自定义的 `cus-resp` 与 Codex 的 `openai-codex-responses`——仍然 eligible。GPT 模型落在这些非 eligible API 上时保持原 inactive 行为。GPT 匹配要求 model ID 或显示名称中存在独立的 `gpt` token，而不是任意 substring。由于 Rail 只重写 Responses 形态的 payload，eligible 的自定义 API 仍需收到 Responses 形态的请求；Codex 可以注入 hosted tool，但其默认 WebSocket transport 不会被观测，因此不计入搜索次数。Rail 在该请求中替换冲突的本地或 hosted `web_search`，并保留已有 `include` 并请求 source metadata。切换到非 GPT 或 inactive 模型后，当前模式会保持为 inactive；切回 eligible 模型时自动恢复。
+每个 session 默认以 `live` 启动，eligible GPT 模型无需执行命令即可使用原生搜索；`/rail-oai-search off` 可在当前 session 中关闭。`live` 允许访问外部网页，`cached` 将 hosted tool 限制为缓存内容。开启（`live`、`cached` 或 `probe`）时若当前模型非 GPT 或缺失，会以 `Cannot enable Rail OpenAI features for the current model: GPT models only.` 统一拒绝；资格会在 idle wait 前后校验，拒绝时不改变 mode、probe 标志或 capture lease；`off` 始终允许。非 GPT 模型下 footer 直接隐藏该 mode，而不是显示 inactive policy。生效条件是非空 API 加上 GPT 名称，并且 API 检查是 blocklist 而非 allowlist：缺失或空白的 API id 保持 inactive，内置的非 Responses API（`openai-completions`、`anthropic-messages`、`mistral-conversations` 等）保持 inactive，但其他任何 API id——包括自定义的 `cus-resp` 与 Codex 的 `openai-codex-responses`——仍然 eligible。GPT 模型落在这些非 eligible API 上时保持原 inactive 行为。GPT 匹配要求 model ID 或显示名称中存在独立的 `gpt` token，而不是任意 substring。由于 Rail 只重写 Responses 形态的 payload，eligible 的自定义 API 仍需收到 Responses 形态的请求。注入本身不计数：Rail 只统计实际观测到的 hosted `web_search_call`，包括经 Pi 1.5.2 公开 provider 事件观测到的 Codex 原生 WebSocket 调用。Rail 在该请求中替换冲突的本地或 hosted `web_search`，并保留已有 `include` 并请求 source metadata。切换到非 GPT 或 inactive 模型后，当前模式会保持为 inactive；切回 eligible 模型时自动恢复。
 
 `probe` 是一次性诊断模式：它会切换到 `live`，强制下一次 eligible Responses 请求调用 hosted `web_search`，随后立即恢复普通 `live`/`auto` 行为。它只用于验证 provider 注入和搜索活动面板，不改变正常搜索语义。
 
-该模式是 session-local 的，并在 `/reload` 后保留；print/json 运行通过 `--rail-oai-search-mode live|cached|off` 选择（默认 `live`）。Rail child 进程不会继承 parent 的 slash 状态：GPT stateless dispatch 与 persistent RPC worker 都会通过 `--rail-oai-search-mode live` 启动 standalone 搜索扩展，因此 eligible child 即使 parent 处于 `cached`、`off` 或 probe 状态也始终从 `live` 开始。非 GPT 的 stateless child 完全不加载该 helper；persistent worker 在原地切换 model 后由扩展逐请求门控。child 的 dispatch 头部和 grouped child 面板会在 `ContextWindow`/`FAST` 之后显示有效 policy 为 `SEARCH on` 或 `SEARCH off`；非 GPT child 显示 `FAST off · SEARCH off`，single result 面板与 control 调用不会显示。上面的 GPT/API 资格判断仍决定是否真正注入 hosted tool。Search 是 Rail 内部选择的 live policy，而非 Tool 参数：没有 `search`/`searchMode` 字段，也不会给 Tool parameters 或 details 增加任何内容。
+该模式是 session-local 的，并在 `/reload` 后保留；print/json 运行通过 `--rail-oai-search-mode live|cached|off` 选择（默认 `live`）。Rail child 进程不会继承 parent 的 slash 状态：GPT stateless dispatch 与 persistent RPC worker 都会通过 `--rail-oai-search-mode live` 启动 standalone 搜索扩展，因此 eligible child 即使 parent 处于 `cached`、`off` 或 probe 状态也始终从 `live` 开始。非 GPT 的 stateless child 完全不加载该 helper；persistent worker 在原地切换 model 后由扩展逐请求门控。child 的 dispatch 头部和 grouped child 面板会在 `ContextWindow`/`FAST` 之后显示有效 policy 为 `SEARCH on` 或 `SEARCH off`；非 GPT child 显示 `FAST off · SEARCH off`，single result 面板与 control 调用不会显示。上面的 GPT/API 资格判断仍决定是否真正注入 hosted tool。Search 是 Rail 内部选择的 live policy，而非 Tool 参数：没有 `search`/`searchMode` 输入字段。普通 run details 不变；Team assignment 会记录有效的只读 Search policy，便于审计。
 
-对于可安全包装的 `openai-responses` 和 `azure-openai-responses` SSE provider，Rail 还会旁路观察真实 hosted `web_search_call` 流，并在对应 Assistant turn 内插入一个搜索活动区。只有观察到真实 hosted call 后才显示；搜索中自动展开，成功后自动折叠，并以有界列表展示动作和来源链接；可单击或按 `Ctrl+O` 展开/折叠。已 finalize 的 snapshot（completed、failed 或 cancelled）作为 session custom entry 保存，不会进入 LLM context。每份已 finalize 的 snapshot 同时会以 Pi `entry_appended` 事件转发，因此 parent subagent 的 usage 行可以统计 Rail 观测到的 `web_search_call` 次数；仅用于显示的 SEARCH policy 与回答中的 citation 都不会计入该次数。Rail 不覆盖 native extension provider，也不改变 Codex 默认 WebSocket transport；这些路径仍可使用 hosted search，但只显示最终回答。
+Rail 通过 Pi 1.5.2 公开的 `provider_stream_event` hook 观察真实 hosted `web_search_call`，并在对应 Assistant turn 内插入一个搜索活动区。观测覆盖原生 Responses SSE、Codex WebSocket 和 Rail 自定义 Responses WebSocket，不需要替换 native provider 或其 transport。旧 custom `openai-responses` / `azure-openai-responses` stream 使用传入的 SSE fetch 却没有转发公开事件时，保留专用兼容观察；每个 turn 只选一个事件来源，避免重复计数。两种来源都不提供的 custom transport 不显示活动，也不增加计数。只有观察到真实 hosted call 后才显示；搜索中自动展开，成功后自动折叠，并以有界列表展示动作和来源链接；可单击或按 `Ctrl+O` 展开/折叠。已 finalize 的 snapshot（completed、failed 或 cancelled）作为 session custom entry 保存，不会进入 LLM context。每份已 finalize 的 snapshot 同时会以 Pi `entry_appended` 事件转发，因此 parent subagent 的 usage 行可以准确统计观测到的 `web_search_call`；仅用于显示的 SEARCH policy 与回答中的 citation 都不会计入该次数。
 
 ## 主要功能
 
@@ -492,9 +492,11 @@ pi-rail-ui/
 ├── config/
 │   ├── index.ts                     # 配置解析和解析后的样式/布局导出
 │   ├── colors.ts                    # 主题/颜色解析辅助
+│   ├── resolved-style.ts            # 样式默认值和 section/state 配置解析
 │   └── types.ts                     # 配置和布局类型
 ├── core/
-│   ├── clipboard.ts                 # 剪贴板辅助
+│   ├── prompts.ts                   # 内置模型指令与按 key 覆盖
+│   ├── pi-ai-internal.ts            # 匹配宿主 Pi 的无状态 AI 模块解析
 │   ├── patching.ts                  # 原型 patch 和原生 Pi 导出解析
 │   └── utils.ts                     # ANSI、宽度和终端格式化工具
 ├── rail/
@@ -502,17 +504,20 @@ pi-rail-ui/
 │   ├── rail-surface.ts              # 共享 rail/surface 渲染器
 │   ├── rail-section.ts              # Rail metadata、折叠状态和 wrapper 辅助
 │   ├── render-cache.ts              # 基于宽度/signature 的渲染缓存
-│   ├── gutter.ts                    # Fullscreen 左侧 gutter 容器包裹
+│   └── gutter.ts                    # Fullscreen 左侧 gutter 容器包裹
 └── components/
     ├── editor/
     │   ├── index.ts                 # Editor 功能导出
-    │   └── rail-editor.ts           # 原生 CustomEditor surface wrapper 和 autocomplete 样式
+    │   ├── rail-editor.ts           # 原生 CustomEditor surface wrapper
+    │   └── rail-editor-autocomplete.ts  # 原生 autocomplete 样式和 Rail 命令补全
     ├── footer/
     │   ├── index.ts                 # Footer 功能导出
     │   └── footer.ts                # Footer 统计、布局、缓存和渲染
     ├── messages/
     │   ├── index.ts                 # Message 功能导出
-    │   ├── assistant-message.ts     # Assistant thinking/reply rail wrapper
+    │   ├── assistant-message.ts     # 原生 Assistant patch 生命周期与 render cache
+    │   ├── assistant-message-rail.ts # Assistant thinking/reply rail wrapper 和区块间距
+    │   ├── hosted-search-rail.ts     # 观测到的 hosted-search 活动面板
     │   ├── user-message.ts          # User message rail card wrapper
     │   ├── command-output.ts        # Slash command output rail 包装
     │   └── resource-status.ts       # /reload resources 和 status/message rail 包装
@@ -537,7 +542,7 @@ pi-rail-ui/
    输入框、thinking、用户消息和命令/工具输出复用同一个 rail 几何模型。Pi 原生 selector 和 fullscreen viewport 不再由 Rail 重复实现。
 
 4. **原生 Pi 行为优先**
-   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择引擎、同步输出和 selector ownership。鼠标交互走 Pi 公开的 component `handleMouse` seam；`dispatchMouseEvent`/`retargetMouseEvent` 是 `pi-tui` 内部实现，不在其 package root 导出，Rail 从不直接 import。在没有公开 seam 的地方，Rail 仍选择性依赖 Pi 内部结构：bundled constructor identity 解析（`core/patching`）和消息/execution 的视觉 render decorator。Hosted search 另行使用 Pi 的公开 payload 与 provider-registration seam，对 Responses SSE 做有界旁路观察。
+   Rail 不再 patch Pi 的 renderer 生命周期、alternate screen、transcript viewport、鼠标选择引擎、同步输出和 selector ownership。鼠标交互走 Pi 公开的 component `handleMouse` seam；`dispatchMouseEvent`/`retargetMouseEvent` 是 `pi-tui` 内部实现，不在其 package root 导出，Rail 从不直接 import。在没有公开 seam 的地方，Rail 仍选择性依赖 Pi 内部结构：bundled constructor identity 解析（`core/patching`）和消息/execution 的视觉 render decorator。Hosted search 使用 Pi 公开的 payload 与已解析 provider-event hook；只有旧 custom SSE stream 需要限定范围的 provider-registration 兼容适配。
 
 5. **优化热路径性能**
    Rail 缓存 component 和 surface 渲染，但不再持有 Pi 原生 transcript scroll state。

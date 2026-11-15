@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { test } from "node:test";
 import { PiRpcProcessTransport } from "../../tools/subagents/rpc-transport";
 import { RpcSessionWorker, buildRpcWorkerArgs } from "../../tools/subagents/rpc-worker";
@@ -50,7 +51,7 @@ function promptInput(entry: any): any | undefined {
 	return JSON.parse(content);
 }
 
-async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer" | "n08-cache-warming" | "rail-compaction-threshold" | "rail-compaction-instructions" | "rail-compaction-host" | "rail-compaction-overflow" | "rail-compaction-length",
+async function createHarness(t: { after(fn: () => Promise<void>): void }, scenario: "messages-live" | "signals-live" | "n02" | "mixed-end" | "retry" | "compaction" | "close-loop" | "close-mixed" | "pause-mixed" | "revise-live" | "cancel-live" | "hang-live" | "budget-live" | "manager-budget" | "a09-live" | "tool-budget" | "manager-midstop" | "broker-stop" | "broker-delete" | "n01-role-only" | "n03-eight" | "n06-context-edit" | "n10-writer" | "n08-cache-warming" | "rail-compaction-threshold" | "rail-compaction-instructions" | "rail-compaction-host" | "rail-compaction-overflow" | "rail-compaction-length",
 	open?: readonly string[], runtimeOptions: ConstructorParameters<typeof TeamRuntime>[0] = {}, workerCount = 2, childTeamExtension?: string) {
 	const root = await mkdtemp(join(tmpdir(), "rail-team-v2-driver-"));
 	const oldAgentDir = process.env["PI_CODING_AGENT_DIR"];
@@ -105,7 +106,8 @@ async function createHarness(t: { after(fn: () => Promise<void>): void }, scenar
 		members: [{ alias: "lead", roleDescription: "Review Team outcomes.", model: "rail-team-local/probe", cwd: root, fastMode: false }, ...workerIds.map((alias) => ({ alias, roleDescription: `Handle ${alias}'s assigned work and answer peer questions.`, model: "rail-team-local/probe", cwd: root, fastMode: false,
 			...((scenario === "compaction" || scenario === "n06-context-edit" || scenario.startsWith("rail-compaction-")) && alias === "w1" ? { contextWindow: 64000 } : {}) }))], lead: "lead",
 		brief: { goal: "Verify same-session Team v2 activation and result settlement." },
-		initialRequests: scenario === "rail-compaction-threshold"
+		initialRequests: scenario === "signals-live" ? [{ to: "w1", task: "phase producer" }, { to: "w2", task: "phase consumer" }]
+			: scenario === "rail-compaction-threshold"
 			? [{ to: "w1", task: "first threshold work", inputRefs: [] }, { to: "w1", task: "second threshold work", inputRefs: [] }]
 			: scenario === "close-loop" || scenario === "close-mixed" ? []
 			: scenario === "n01-role-only" ? [{ to: "w1", task: "N01 initial review", inputRefs: [] }]
@@ -1753,4 +1755,130 @@ test("N08 real Pi: with cache warming configured and worthwhile, a Team binding 
 	const warmed = await waitForSessionEntry(worker, (entry) => entry.type === "usage" && entry.kind === "cache_warm", "an ordinary idle cache refresh");
 	assert.equal(warmed.provider, "rail-team-local");
 	assert.equal(await readFile(join(root, "settings.json"), "utf8"), settingsBefore);
+});
+
+/** Native session evidence, not synthetic Runtime calls: one real call/result and both RPC tool latches. */
+function assertNativeCommunication(entries: any[], expectedCallIds: readonly string[]): void {
+	const calls = entries.flatMap((entry) => entry.type === "message" && entry.message?.role === "assistant"
+		? (entry.message.content ?? []).filter((part: any) => part.type === "toolCall" && part.name === "team") : []);
+	const results = entries.filter((entry) => entry.type === "message" && entry.message?.role === "toolResult").map((entry) => entry.message);
+	const frames = entries.filter((entry) => entry.type === "custom" && entry.customType === TEAM_PRIVATE_ENTRY_TYPE).map((entry) => entry.data);
+	assert.ok(providerCalls(entries).length > 0, "the real child Pi called the local mock provider");
+	for (const id of expectedCallIds) {
+		assert.equal(calls.filter((item) => item.id === id).length, 1, `native assistant emitted ${id} once`);
+		assert.equal(results.filter((item) => item.toolCallId === id).length, 1, `native result settled ${id} once`);
+		const call = calls.find((item) => item.id === id)!;
+		const result = results.find((item) => item.toolCallId === id)!; assert.notEqual(result.isError, true, `native tool result confirmed ${id}`);
+		assert.equal(JSON.parse(messageText(result)).ok, true);
+		for (const action of ["tool_gate", "tool_result"]) assert.ok(frames.some((frame) => frame.kind === "request" && frame.request?.action === action && frame.request.toolCallId === id), `${id} crossed the private ${action} RPC`);
+		assert.ok(frames.some((frame) => frame.kind === "request" && frame.request?.action === "business" && isDeepStrictEqual(frame.request.args, call.arguments)), `${id} crossed the business RPC`);
+	}
+	assert.equal(calls.some((call) => call.arguments.action === "request"), false, "communication did not secretly create Work");
+	assert.deepEqual(frames.filter((frame) => frame.kind === "request" && frame.request?.action === "input_ready").map((frame) => frame.request.deliveryId).sort(),
+		entries.map(promptInput).filter(Boolean).map((input) => input.deliveryId).sort(), "each persisted native input receives its exact delivery ACK once");
+}
+
+function deferred() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => { resolve = done; });
+	return { promise, resolve };
+}
+
+test("real Pi 1.5.2 message RPC delivers and replies after the sender Work ends, without new Work, then closes", { timeout: 60000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "messages-live");
+	const waiting = deferred(), release = deferred(), closing = deferred(), close = deferred();
+	const recipient = handles.get("w2")!; const original = recipient.runActivation.bind(recipient);
+	// Delay only an actual incoming provider-gate reply. The child still performs every protocol step.
+	recipient.runActivation = (activation, onRequest, onSettled, signal) => original(activation, async (frame, intentId) => {
+		const reply = await onRequest(frame, intentId);
+		if (frame.request.action === "provider_gate") { waiting.resolve(); await release.promise; }
+		return reply;
+	}, onSettled, signal);
+	const lead = handles.get("lead")!; const leadRun = lead.runActivation.bind(lead);
+	lead.runActivation = (activation, onRequest, onSettled, signal) => leadRun(activation, async (frame, intentId) => {
+		if (frame.request.action === "business" && frame.request.args["command"] === "close_team") {
+			closing.resolve(); await close.promise;
+		}
+		return onRequest(frame, intentId);
+	}, onSettled, signal);
+	const lifetime = driver.launch(teamId);
+	try {
+		await waitForGateOrCancel(waiting.promise, lifetime, runtime, teamId, handles, "recipient mailbox provider gate");
+		await waitUntil(() => runtime.getTeam(teamId).works.resolved === 1, "sender Work to finish before mailbox handling");
+		assert.equal(runtime.getTeam(teamId).works.total, 1);
+		assert.equal(runtime.getTeam(teamId).members.find((member) => member.id === "w1")!.activity, "idle");
+		release.resolve();
+		await waitForGateOrCancel(closing.promise, lifetime, runtime, teamId, handles, "lead's native close RPC");
+		// The notification is only admission: do not race close against the sender's following yield/cleanup.
+		await waitUntil(() => runtime.getTeam(teamId).members.filter((member) => member.id !== "lead").every((member) => member.activity === "idle"), "both native mailboxes to settle");
+	} finally { release.resolve(); close.resolve(); }
+	const result = await awaitLifetimeOrCancel(lifetime, runtime, teamId, handles, "message conversation and native close");
+	assert.equal(result.lifecycle, "closed"); assert.equal(result.outcome, "succeeded");
+	assert.equal(runtime.getTeam(teamId).works.total, 1); assert.equal(result.finalResultRefs.length, 1);
+	assert.ok(result.members.every((member) => member.lifecycle === "closed" && member.resourceState === "released"));
+	const senderEntries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	const recipientEntries = parseSession(await readFile(handles.get("w2")!.instance.sessionFile, "utf8"));
+	const leadEntries = parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8"));
+	assertNativeCommunication(senderEntries, ["message-question", "message-sender-result", "message-conversation-done"]);
+	assertNativeCommunication(recipientEntries, ["message-answer", "message-mailbox-yield-w2"]);
+	assertNativeCommunication(leadEntries, ["communication-close"]);
+	const senderInputs = senderEntries.map(promptInput).filter(Boolean), recipientInputs = recipientEntries.map(promptInput).filter(Boolean);
+	assert.deepEqual(senderInputs.map((input) => input.scope.kind), ["work", "events"]);
+	assert.deepEqual(recipientInputs.map((input) => input.scope.kind), ["events"], "idle recipient never receives a manufactured Work");
+	const question = recipientInputs[0].scope.events.find((event: any) => event.kind === "MESSAGE");
+	const answer = senderInputs[1].scope.events.find((event: any) => event.kind === "MESSAGE");
+	assert.equal(question.sender, "w1"); assert.equal(question.recipient, "w2"); assert.deepEqual(question.work, senderInputs[0].scope.work);
+	assert.equal(answer.sender, "w2"); assert.equal(answer.replyTo, question.id); assert.equal(answer.message, "Use Widget.");
+	assert.equal(runtime.liveEffects(teamId).activeActivations, 0); runtime.assertInvariants(teamId);
+});
+
+test("real Pi 1.5.2 signal RPC wakes a yielded consumer before producer completion and closes both roots", { timeout: 60000 }, async (t) => {
+	const { runtime, teamId, driver, handles } = await createHarness(t, "signals-live");
+	const opened = deferred(), publishing = deferred(), publish = deferred(), finishing = deferred(), finish = deferred();
+	const producer = handles.get("w1")!; const producerRun = producer.runActivation.bind(producer);
+	producer.runActivation = (activation, onRequest, onSettled, signal) => producerRun(activation, async (frame, intentId) => {
+		if (frame.request.action === "business" && frame.request.args["action"] === "signal" && frame.request.args["operation"] === "publish") {
+			publishing.resolve(); await publish.promise;
+		}
+		const reply = await onRequest(frame, intentId);
+		if (reply.kind === "business" && reply.reply.ok && reply.reply.receipt?.status === "opened") opened.resolve();
+		if (frame.request.action === "tool_gate" && frame.request.toolCallId === "phase-producer-result") {
+			finishing.resolve(); await finish.promise;
+		}
+		return reply;
+	}, onSettled, signal);
+	const consumer = handles.get("w2")!; const consumerRun = consumer.runActivation.bind(consumer);
+	consumer.runActivation = (activation, onRequest, onSettled, signal) => consumerRun(activation, async (frame, intentId) => {
+		if (frame.request.action === "provider_gate") await opened.promise;
+		return onRequest(frame, intentId);
+	}, onSettled, signal);
+	const lifetime = driver.launch(teamId);
+	const producerRef = runtime.listWorks(teamId).find((work) => work.assignee === "w1")!.work;
+	const consumerRef = runtime.listWorks(teamId).find((work) => work.assignee === "w2")!.work;
+	try {
+		await waitForGateOrCancel(publishing.promise, lifetime, runtime, teamId, handles, "native signal publication RPC");
+		await waitUntil(() => runtime.getWork(teamId, consumerRef)!.current.state === "blocked", "consumer's real yield settlement");
+		assert.equal(runtime.getWork(teamId, producerRef)!.current.state, "running");
+		assert.deepEqual(runtime.getWork(teamId, consumerRef)!.current.observedSignals ?? [], []);
+		publish.resolve();
+		await waitForGateOrCancel(finishing.promise, lifetime, runtime, teamId, handles, "producer's post-publication reply gate");
+		await waitUntil(() => runtime.getWork(teamId, consumerRef)!.current.state === "resolved", "consumer to finish independently of producer");
+		assert.equal(runtime.getWork(teamId, producerRef)!.current.state, "running", "publication did not terminate the real producer activation");
+		assert.deepEqual(runtime.getWork(teamId, consumerRef)!.current.observedOutcomes, [], "phase ACK is not Work-result observation");
+		assert.equal(runtime.getWork(teamId, consumerRef)!.current.observedSignals?.length, 1);
+	} finally { opened.resolve(); publish.resolve(); finish.resolve(); }
+	const result = await awaitLifetimeOrCancel(lifetime, runtime, teamId, handles, "phase coordination and native close");
+	assert.equal(result.lifecycle, "closed"); assert.equal(result.outcome, "succeeded");
+	assert.equal(runtime.getTeam(teamId).works.total, 2); assert.equal(result.finalResultRefs.length, 2);
+	assert.ok(result.members.every((member) => member.lifecycle === "closed" && member.resourceState === "released"));
+	const producerEntries = parseSession(await readFile(handles.get("w1")!.instance.sessionFile, "utf8"));
+	const consumerEntries = parseSession(await readFile(handles.get("w2")!.instance.sessionFile, "utf8"));
+	assertNativeCommunication(producerEntries, ["phase-open", "phase-publish", "phase-producer-result"]);
+	assertNativeCommunication(consumerEntries, ["phase-read-handle", "phase-consumer-yield", "phase-consumer-result"]);
+	assertNativeCommunication(parseSession(await readFile(handles.get("lead")!.instance.sessionFile, "utf8")), ["communication-close"]);
+	const inputs = consumerEntries.map(promptInput).filter(Boolean);
+	assert.equal(inputs.length, 2); assert.deepEqual(inputs[0].scope.work, inputs[1].scope.work);
+	assert.equal(inputs[1].signalOutcomes[0].state, "published"); assert.deepEqual(inputs[1].signalOutcomes[0].work, producerRef);
+	assert.equal(producerEntries.map(promptInput).filter(Boolean).length, 1, "producer stays in the same native activation after publication");
+	assert.equal(runtime.liveEffects(teamId).activeActivations, 0); runtime.assertInvariants(teamId);
 });

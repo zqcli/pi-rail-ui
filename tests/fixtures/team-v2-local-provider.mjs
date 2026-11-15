@@ -70,9 +70,58 @@ function call(id, args) {
 	return { type: "toolCall", id, name: "team", arguments: args };
 }
 
+/** Communication scenarios still use the real native tool/RPC path; only model choices are scripted. */
+function communicationAction(scenario, input, replies, turn) {
+	if (replies.some((reply) => reply.ok === false || reply.toolError)) throw new Error(`Communication tool failed: ${JSON.stringify(replies)}`);
+	if (input.member.lead) {
+		const roots = input.scope.events.filter((event) => event.kind === "ROOT_RESULT_READY");
+		const unaccepted = roots.find((event) => !replies.some((reply) => reply.receipt?.command === "accept_result" && reply.receipt.work?.workId === event.work.workId));
+		if (unaccepted) return [call(`communication-accept-${unaccepted.work.workId}`, { action: "control", command: "accept_result", work: unaccepted.work, disposition: "accepted" })];
+		const canClose = scenario === "messages-live"
+			? input.scope.events.some((event) => event.kind === "MESSAGE" && event.message === "conversation complete")
+			: roots.length > 0;
+		if (canClose) {
+			const page = replies.find((reply) => reply.data?.view === "work");
+			if (!page) return [call(`communication-status-${turn}`, { action: "status", view: "work" })];
+			if (page.data.items.every((work) => work.state === "resolved" && work.review === "accepted")) return [call("communication-close", {
+				action: "control", command: "close_team", outcome: "succeeded", resultRefs: page.data.items.map((work) => work.resultRef),
+			})];
+		}
+		return [call(`communication-lead-yield-${turn}`, { action: "yield" })];
+	}
+	if (scenario === "messages-live") {
+		if (input.scope.kind === "work") return replies.some((reply) => reply.receipt?.status === "sent")
+			? [call("message-sender-result", { action: "reply", result: { status: "succeeded", summary: "Sender finished before the question was handled." } })]
+			: [call("message-question", { action: "message", to: "w2", text: "Which public name?" })];
+		const message = input.scope.events.find((event) => event.kind === "MESSAGE");
+		if (!message) throw new Error("Mailbox omitted its message");
+		if (replies.some((reply) => reply.receipt?.status === "sent")) return [call(`message-mailbox-yield-${input.member.id}`, { action: "yield" })];
+		return input.member.id === "w2"
+			? [call("message-answer", { action: "message", to: message.sender, replyTo: message.id, text: "Use Widget." })]
+			: [call("message-conversation-done", { action: "message", to: "lead", text: "conversation complete" })];
+	}
+	if (input.member.id === "w1") {
+		const opened = replies.find((reply) => reply.receipt?.status === "opened");
+		if (!opened) return [call("phase-open", { action: "signal", operation: "open", name: "SDK phase complete" })];
+		if (!replies.some((reply) => reply.receipt?.status === "published")) return [call("phase-publish", {
+			action: "signal", operation: "publish", signalId: opened.receipt.signalId, text: "SDK phase complete; unrelated work continues.",
+		})];
+		return [call("phase-producer-result", { action: "reply", result: { status: "succeeded", summary: "Producer finished after the consumer resumed." } })];
+	}
+	if (input.signalOutcomes?.length) {
+		if (input.signalOutcomes[0].state !== "published") throw new Error("Consumer did not receive a published phase");
+		return [call("phase-consumer-result", { action: "reply", result: { status: "succeeded", summary: "Consumer resumed from the phase, not the producer result." } })];
+	}
+	const signals = replies.find((reply) => reply.data?.view === "signal");
+	if (!signals) return [call("phase-read-handle", { action: "status", view: "signal" })];
+	if (signals.data.items.length !== 1) throw new Error("Expected one fresh phase handle");
+	return [call("phase-consumer-yield", { action: "yield", waitingForSignals: [signals.data.items[0].id], checkpoint: "Waiting for this exact SDK phase." })];
+}
+
 const A09_CONTINUATION = "third-party boundary continuation";
 
 function actionFor(scenario, input, replies, turn, messages = [], activationIndex = 0) {
+	if (scenario === "messages-live" || scenario === "signals-live") return communicationAction(scenario, input, replies, turn);
 	if (scenario.startsWith("rail-compaction-")) {
 		if (input.scope.kind === "events") {
 			const command = input.scope.events.find((event) => event.kind === "USER_COMMAND");

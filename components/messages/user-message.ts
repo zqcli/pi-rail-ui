@@ -1,5 +1,5 @@
 import { UserMessageComponent, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import type { Component } from "@earendil-works/pi-tui";
+import type { Component, DefaultTextStyle } from "@earendil-works/pi-tui";
 import { USER_MESSAGE_LAYOUT, applyTextColor } from "../../config";
 import { createPatchLifecycle } from "../../core/patching";
 import { cachedRender } from "../../rail/render-cache";
@@ -9,6 +9,10 @@ import { UserMessageTimestampRegistry, formatUserMessageTimestamp } from "./user
 
 type UserMessageWithInternals = {
 	children?: Component[];
+};
+
+type UserMessageMarkdown = Component & {
+	defaultTextStyle?: DefaultTextStyle;
 };
 
 type UserMessageConstructor = {
@@ -42,7 +46,7 @@ function getMarkdownSourceText(component: Component | undefined): string | undef
 	return typeof text === "string" ? text : undefined;
 }
 
-function getUserMessageMarkdown(component: UserMessageWithInternals): Component | undefined {
+function getUserMessageMarkdown(component: UserMessageWithInternals): UserMessageMarkdown | undefined {
 	const candidate = component.children?.[0];
 	return typeof candidate?.render === "function" && getMarkdownSourceText(candidate) !== undefined
 		? candidate
@@ -90,9 +94,13 @@ function renderUserMessageWithSurface(
 		const timeText = formatUserMessageTimestamp(timestamp);
 		const timeLine = applyTextColor(theme, USER_MESSAGE_LAYOUT.timestampColor, timeText);
 		const timestampWidth = Math.max(0, contentWidth - textGapWidth);
+		const timeContent = " ".repeat(textGapWidth) + padToWidth(timeLine, timestampWidth);
+		// Pi's Markdown owns the user-message background. Reuse its live theme
+		// callback for the entire timestamp row, including the gap and padding.
+		const nativeBackground = markdown.defaultTextStyle?.bgColor;
 		const timestampRow = surface.renderSurfaceRow(
 			width,
-			" ".repeat(textGapWidth) + padToWidth(timeLine, timestampWidth),
+			nativeBackground ? nativeBackground(timeContent) : timeContent,
 		);
 		if (rows.length === 0) return [timestampRow];
 		// Native Markdown leaves a final row for bottom padding. Keep the
@@ -118,6 +126,11 @@ export async function installUserMessageRail(ctx: ExtensionContext): Promise<voi
 		} catch {
 			return original.call(this, width);
 		}
+	});
+	userMessageLifecycle.patchMethod(ctor, "invalidate", (original) => function patchedUserMessageInvalidate(this: UserMessageWithInternals) {
+		// Theme changes invalidate native Markdown without replacing children.
+		Reflect.deleteProperty(this, USER_MESSAGE_RENDER_CACHE_KEY);
+		original.call(this);
 	});
 
 }

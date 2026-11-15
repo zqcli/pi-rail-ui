@@ -1267,9 +1267,9 @@ export class TeamRuntime {
 	/** Host inspection of every root budget (the Team view is a bounded summary). */
 	inspectBudget(teamId: string): { limits: TeamBudgetLimits; used: TeamBudgetView["used"]; roots: TeamRootBudgetView[]; grants: TeamBudgetGrantView[] } {
 		const team = this.team(teamId);
-		const roots = this.rootRecords(team);
+		const { rootBudgets } = this.workCounts(team);
 		return { limits: copy(team.limits), used: { teamWorks: team.ledger.order.length, ...copy(team.budget.used), reservedResultBytes: team.reservedResultBytes },
-			roots: roots.map((record) => team.budget.rootView(record.id, this.rootChildCount(team, record.id))), grants: copy(team.budget.grants) };
+			roots: rootBudgets, grants: copy(team.budget.grants) };
 	}
 
 	/** Host view of every current hold with its reason and incident, for explicit release or grant decisions. */
@@ -4336,28 +4336,57 @@ export class TeamRuntime {
 		fail("INTENT_CONFLICT", "The same tool call attempted a conflicting end intent");
 	}
 
+	/** Per-read counts: include review work in activity, but not in deliverable roots. */
+	private workCounts(team: TeamState) {
+		const works: TeamTeamView["works"] = { total: team.ledger.order.length, queued: 0, running: 0, blocked: 0, held: 0,
+			resolved: 0, failed: 0, cancelled: 0, roots: 0, rootsReviewed: 0 };
+		const memberCounts = new Map([...team.members.keys()].map((id) => [id, { queued: 0, blocked: 0, held: 0 }]));
+		const roots: string[] = [];
+		const rootChildren = new Map<string, number>();
+		for (const id of team.ledger.order) {
+			const record = team.ledger.get(id)!.record;
+			const version = currentVersion(record);
+			works[version.state === "superseded" ? "cancelled" : version.state]++;
+			const counts = memberCounts.get(record.assignee)!;
+			if (version.state === "queued" || version.state === "blocked") counts[version.state]++;
+			if (version.hold) { works.held++; counts.held++; }
+			if (record.parent) rootChildren.set(record.rootId, (rootChildren.get(record.rootId) ?? 0) + 1);
+			else if (record.kind !== "review") {
+				roots.push(id);
+				works.roots++;
+				if (version.review) works.rootsReviewed++;
+			}
+		}
+		return { works, memberCounts, rootBudgets: roots.map((id) => team.budget.rootView(id, rootChildren.get(id) ?? 0)) };
+	}
+
 	private view(team: TeamState): TeamTeamView {
-		const current = team.ledger.order.map((id) => currentVersion(team.ledger.get(id)!.record));
-		const members: TeamMemberView[] = [...team.members.values()].map((member) => ({
-			id: member.id, roleDescription: member.roleDescription, lifecycle: member.lifecycle,
-			activity: member.activity, pause: member.pause, ...(member.currentWork ? { currentWork: copy(member.currentWork) } : {}),
-			resourceState: member.resourceState,
-			...(member.error ? { error: projectWorkError(member.error) } : {}),
-			queued: current.filter((version, index) => version.state === "queued" && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
-			blocked: current.filter((version, index) => version.state === "blocked" && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
-			held: current.filter((version, index) => !!version.hold && team.ledger.get(team.ledger.order[index]!)!.record.assignee === member.id).length,
-			policy: copy(member.policy),
-			...(this.memberContext(member) ? { context: this.memberContext(member)! } : {}),
-			...(member.compaction?.state === "running" ? { compacting: true } : {}),
-			...(member.lastCompaction ? { lastCompaction: copy(member.lastCompaction) } : {}),
-			usage: this.memberStats(team.id, member.id).usage,
-		}));
-		const roots = this.rootRecords(team);
+		const { works, memberCounts, rootBudgets } = this.workCounts(team);
+		this.tickFlow(team);
+		const usage = copy(team.usage);
+		const members: TeamMemberView[] = [...team.members.values()].map((member) => {
+			const context = this.memberContext(member);
+			const memberUsage = copy(member.usage);
+			const active = member.active;
+			const live = active && !active.native && !active.activeTimeFolded ? this.liveUsage?.(team.id, member.id) : undefined;
+			if (live) { addActivationUsage(memberUsage, live); addActivationUsage(usage, live); }
+			return {
+				id: member.id, roleDescription: member.roleDescription, lifecycle: member.lifecycle,
+				activity: member.activity, pause: member.pause, ...(member.currentWork ? { currentWork: copy(member.currentWork) } : {}),
+				resourceState: member.resourceState,
+				...(member.error ? { error: projectWorkError(member.error) } : {}),
+				...memberCounts.get(member.id)!,
+				policy: copy(member.policy),
+				...(context ? { context } : {}),
+				...(member.compaction?.state === "running" ? { compacting: true } : {}),
+				...(member.lastCompaction ? { lastCompaction: copy(member.lastCompaction) } : {}),
+				usage: memberUsage,
+			};
+		});
 		const used: TeamBudgetView["used"] = { teamWorks: team.ledger.order.length, ...team.budget.used, reservedResultBytes: team.reservedResultBytes };
-		const rootChildren = (rootId: string) => this.rootChildCount(team, rootId);
 		// Bounded summaries (one private reply frame): exhausted, then granted, then used roots; untouched
 		// roots show the Team-wide default limits. Open incidents first, then the newest resolved ones.
-		const budgetRoots = roots.map((record) => team.budget.rootView(record.id, rootChildren(record.id)))
+		const budgetRoots = rootBudgets
 			.map((root) => ({ root, exhausted: team.budget.rootExhausted(root.rootId) !== undefined,
 				granted: ROOT_GRANTABLE_COUNTERS.some((counter) => root.limits[counter] !== team.limits[counter]) }))
 			.filter(({ root, exhausted, granted }) => exhausted || granted || Object.values(root.used).some((value) => value > 0));
@@ -4372,21 +4401,14 @@ export class TeamRuntime {
 		return {
 			version: TEAM_PROTOCOL_VERSION, teamId: team.id, title: team.plan.title!, shortId: team.id.slice(0, 8), lifecycle: team.lifecycle, health: team.health, stateVersion: team.stateVersion,
 			eventSeq: team.eventSeq, lead: team.lead, timeoutSeconds: team.plan.timeoutSeconds, deadline: team.deadline, brief: copy(team.plan.brief), members,
-			works: { total: current.length, queued: current.filter((version) => version.state === "queued").length,
-				running: current.filter((version) => version.state === "running").length,
-				blocked: current.filter((version) => version.state === "blocked").length,
-				held: current.filter((version) => !!version.hold).length,
-				resolved: current.filter((version) => version.state === "resolved").length,
-				failed: current.filter((version) => version.state === "failed").length,
-				cancelled: current.filter((version) => version.state === "cancelled" || version.state === "superseded").length,
-				roots: roots.length, rootsReviewed: roots.filter((record) => !!currentVersion(record).review).length },
+			works,
 			incidents: incidents.map(incidentView), incidentsOmitted: team.incidents.length - incidents.length,
 			budget: { limits: copy(team.limits), used,
 				exhausted: team.budget.teamExhausted(false) !== undefined || team.ledger.order.length >= team.limits.teamWorks
 					|| team.reservedResultBytes >= team.limits.reservedResultBytes,
 				roots: shownRoots, rootsOmitted: budgetRoots.length - shownRoots.length,
 				grants: copy(team.budget.grants.slice(-TEAM_VIEW_MAX_GRANTS)), grantsOmitted: Math.max(0, team.budget.grants.length - TEAM_VIEW_MAX_GRANTS) },
-			usage: this.teamUsage(team),
+			usage,
 			...(team.hostPause && team.lifecycle === "active" ? { paused: { since: team.hostPause.at, finishing: this.finishingActivations(team) } } : {}),
 			...(team.outcome ? { outcome: team.outcome } : {}), ...(team.reason ? { reason: projectErrorText(team.reason) } : {}),
 		};

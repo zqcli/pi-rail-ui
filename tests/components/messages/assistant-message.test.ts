@@ -4,8 +4,9 @@ import { AssistantMessageComponent, initTheme } from "@earendil-works/pi-coding-
 import { installAssistantMessageRail, uninstallAssistantMessageRail } from "../../../components/messages/assistant-message";
 import { renderAssistantMessageRail, updateNativeAssistantContent } from "../../../components/messages/assistant-message-rail";
 import { stripAnsi } from "../../../core/utils";
-import { resolveRailSection, setRailUiActive } from "../../../rail/rail-section";
-import { railThinkingSurface } from "../../../rail/rail-surface";
+import { collapseHint, resolveRailSection, setRailUiActive, wasRailSectionManuallyToggled } from "../../../rail/rail-section";
+import { EditorSurfaceRenderer, ThinkingRailBlock, railThinkingSurface } from "../../../rail/rail-surface";
+import { railSectionConfig } from "../../../config";
 import {
 	HostedSearchActivity,
 	resetHostedSearchActivities,
@@ -260,7 +261,70 @@ test("separates hosted search, assistant reply, and later thinking with blank ro
 	assert.equal(rows.slice(replyRow + 1, thinkingRow).some((row: string) => row.trim() === ""), true);
 });
 
-test("keeps a manually expanded thinking block expanded across streaming updates", () => {
+test("automatic thinking expansion follows updates without recording a manual choice", () => {
+	const component: any = {
+		contentContainer: {
+			children: [] as any[],
+			clear() { this.children = []; },
+			addChild(child: unknown) { this.children.push(child); },
+		},
+		hideThinkingBlock: false,
+		hiddenThinkingLabel: "Thinking...",
+		hasToolCalls: false,
+	};
+	let previous: unknown;
+	for (const [text, expanded] of [["short", true], ["one\ntwo\nthree\nfour", false], ["short again", true]] as const) {
+		component.contentContainer.children = [new MultiLineMarkdown(text)];
+		renderAssistantMessageRail(component, { content: [{ type: "thinking", thinking: text }] }, theme() as any, railThinkingSurface);
+		const block = component.contentContainer.children[0];
+		if (previous) assert.equal(block, previous);
+		previous = block;
+		block.render(80);
+		assert.equal(block.expanded, expanded);
+		assert.equal(wasRailSectionManuallyToggled(block), false);
+	}
+});
+
+test("collapsed thinking decorates only the preview while preserving native rows and narrow-width fallback", () => {
+	const limit = railSectionConfig("assistantThinking").autoCollapseAfterRows!;
+	const nativeRows = ["", "\x1b[1mtransformed native row\x1b[0m", "中文", ...Array.from({ length: 5000 }, (_, index) => `row ${index}`)];
+	for (const width of [4, 80]) {
+		const widths: number[] = [];
+		const inner = { render(innerWidth: number) { widths.push(innerWidth); return nativeRows; }, invalidate() {} };
+		const surface = new EditorSurfaceRenderer(railThinkingSurface.style);
+		const expandedRows = new ThinkingRailBlock(inner, surface).render(width);
+		const expected = expandedRows.slice(0, limit);
+		expected.push(surface.renderSurfaceRow(width, collapseHint(theme(), nativeRows.length - limit)));
+		widths.length = 0;
+		let decoratedRows = 0;
+		const decorate = surface.renderSurfaceRow.bind(surface);
+		surface.renderSurfaceRow = (rowWidth, line) => { decoratedRows++; return decorate(rowWidth, line); };
+		const component: any = {
+			contentContainer: {
+				children: [inner] as any[],
+				clear() { this.children = []; },
+				addChild(child: unknown) { this.children.push(child); },
+			},
+			hideThinkingBlock: false,
+			hiddenThinkingLabel: "Thinking...",
+			hasToolCalls: false,
+		};
+		// Raw text decides the collapse count; the visible rows remain native.
+		const rawText = "thinking\n".repeat(nativeRows.length).trim();
+		renderAssistantMessageRail(component, { content: [{ type: "thinking", thinking: rawText }] }, theme() as any, surface);
+		const block = component.contentContainer.children[0];
+		assert.deepEqual(block.render(width), expected);
+		assert.deepEqual(widths, [width < surface.minRenderableWidth() ? width : surface.contentWidth(width)]);
+		assert.equal(decoratedRows, width < surface.minRenderableWidth() ? 1 : limit + 1);
+		assert.deepEqual(block.render(width), expected);
+		assert.equal(widths.length, 1, "repeated collapsed rendering stays cached");
+		block.setExpanded(true);
+		assert.deepEqual(block.render(width), expandedRows);
+		assert.equal(widths.length, 2, "expanding renders the same native child once");
+	}
+});
+
+for (const expanded of [true, false]) test(`keeps manually ${expanded ? "expanded" : "collapsed"} thinking across streaming updates`, () => {
 	const thinking = new MultiLineMarkdown("line1\nline2\nline3\nline4\nline5");
 	const children: any[] = [new Spacer(), thinking];
 	const component: any = {
@@ -284,7 +348,7 @@ test("keeps a manually expanded thinking block expanded across streaming updates
 	block.render(80); // auto-collapse state is applied lazily during render
 	assert.equal(block.expanded, false);
 
-	block.setExpanded(true);
+	block.setExpanded(expanded);
 	// Simulate Pi's native updateContent replacing children with fresh native components.
 	component.contentContainer.children = [new Spacer(), new MultiLineMarkdown("line1\nline2\nline3\nline4\nline5\nline6")];
 	renderAssistantMessageRail(
@@ -296,7 +360,9 @@ test("keeps a manually expanded thinking block expanded across streaming updates
 
 	assert.equal(component.contentContainer.children[1], block);
 	const rows = block.render(80).map((row: string) => stripAnsi(row));
-	assert.equal(rows.some((row: string) => row.includes("line6")), true);
+	assert.equal(block.expanded, expanded);
+	assert.equal(wasRailSectionManuallyToggled(block), true);
+	assert.equal(rows.some((row: string) => row.includes("line6")), expanded);
 	assert.equal(rows.some((row: string) => /more lines/.test(row)), false);
 });
 

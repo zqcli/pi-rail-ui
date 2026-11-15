@@ -108,7 +108,6 @@ const ASSISTANT_THINKING_BLOCKS_KEY = Symbol.for("pi-rail-ui.assistant-thinking-
 
 class AssistantThinkingRailBlock implements Component {
 	expanded = true;
-	private autoSetting = false;
 	private fullCache?: { width: number; rows: string[] } | undefined;
 	private collapsedCache?: { width: number; limit: number; rows: string[] } | undefined;
 	private inner: Component;
@@ -146,11 +145,9 @@ class AssistantThinkingRailBlock implements Component {
 
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
-		if (!this.autoSetting) {
-			markRailSectionManuallyToggled(this);
-			this.owner[ASSISTANT_THINKING_MANUAL_KEY] = true;
-			this.owner[ASSISTANT_THINKING_EXPANDED_KEY] = expanded;
-		}
+		markRailSectionManuallyToggled(this);
+		this.owner[ASSISTANT_THINKING_MANUAL_KEY] = true;
+		this.owner[ASSISTANT_THINKING_EXPANDED_KEY] = expanded;
 		this.invalidate();
 	}
 
@@ -174,21 +171,17 @@ class AssistantThinkingRailBlock implements Component {
 
 		// Keep Pi's already-rendered child so Mermaid, LaTeX, outputPad, and
 		// extension Markdown transformers remain native. Only truncate rows for
-		// the optional Rail collapse presentation; never rebuild Markdown here.
-		const previewRows = this.fullRows(width).slice(0, Math.max(1, limit));
+		// the optional Rail collapse presentation; never rebuild Markdown or
+		// decorate hidden rows that will immediately be discarded.
+		const preview: Component = {
+			render: (innerWidth) => this.inner.render(innerWidth).slice(0, Math.max(1, limit)),
+			invalidate() {},
+		};
+		const previewRows = new ThinkingRailBlock(preview, this.surface).render(width);
 		const hidden = Math.max(0, this.rawLines.length - limit);
 		const rows = [...previewRows, this.surface.renderSurfaceRow(width, collapseHint(this.appTheme, hidden))];
 		this.collapsedCache = { width, limit, rows };
 		return rows;
-	}
-
-	private setExpandedAutomatically(expanded: boolean): void {
-		this.autoSetting = true;
-		try {
-			this.expanded = expanded;
-		} finally {
-			this.autoSetting = false;
-		}
 	}
 
 	render(width: number): string[] {
@@ -197,10 +190,10 @@ class AssistantThinkingRailBlock implements Component {
 		const limit = config.collapsible ? config.autoCollapseAfterRows : undefined;
 		let rows: string[];
 		if (!limit || this.hidden || this.rawLines.length <= limit) {
-			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.setExpandedAutomatically(true);
+			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.expanded = true;
 			rows = this.fullRows(width);
 		} else {
-			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.setExpandedAutomatically(false);
+			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.expanded = false;
 			rows = this.expanded ? this.fullRows(width) : this.collapsedRows(width, limit);
 		}
 		return rows;

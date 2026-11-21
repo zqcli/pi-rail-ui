@@ -1,13 +1,13 @@
 export type RailRowsCache = {
 	width: number;
-	innerLines: string[];
+	innerLines: readonly string[];
 	rows: string[];
 };
 
 export function cachedRailRows(
 	cache: RailRowsCache | undefined,
 	width: number,
-	innerLines: string[],
+	innerLines: readonly string[],
 	renderRows: () => string[],
 ): { cache: RailRowsCache; rows: string[] } {
 	if (cache?.width === width && cache.innerLines === innerLines) {

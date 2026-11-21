@@ -8,7 +8,7 @@ import {
 } from "./execution-presentation-policy";
 
 export type ExecutionKind = "bashExecution" | "toolExecution";
-export type RenderableCtor = { prototype: { render(width: number): string[]; setExpanded?(expanded: boolean): void } };
+export type RenderableCtor = { prototype: { render(width: number): readonly string[]; setExpanded?(expanded: boolean): void } };
 export type ExecutionRailPatchStore = {
 	active: boolean;
 	theme?: ThemeLike | undefined;
@@ -56,7 +56,7 @@ export function applyToolHintBackground(component: any, hint: string, width: num
 	return typeof bg === "function" ? bg(padded) : hint;
 }
 
-export function renderedChildLines(child: any, width: number): string[] {
+export function renderedChildLines(child: any, width: number): readonly string[] {
 	const lines = child?.render?.(width);
 	return Array.isArray(lines) ? lines : [];
 }
@@ -122,10 +122,10 @@ export function collapsedSimpleRows(
 export function collapsedExecutionRows(
 	component: any,
 	kind: ExecutionKind,
-	rows: string[],
+	rows: readonly string[],
 	width: number,
 	theme: ThemeLike | undefined,
-): string[] {
+): readonly string[] {
 	const config = railSectionConfig(kind);
 	const limit = config.collapsible ? config.autoCollapseAfterRows : undefined;
 	if (!limit || component.expanded || rows.length <= limit) return rows;

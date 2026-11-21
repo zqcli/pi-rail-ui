@@ -69,7 +69,7 @@ test("manual idle interval reuses native refresh and usage beyond three hours wi
 	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
 	const h = harness();
 	try {
-		assert.equal(VERSION, "1.5.2");
+		assert.equal(VERSION, "1.6.0");
 		await h.begin();
 		await h.command("1");
 		assert.match(keepAliveStatus(h.manager)!, /WAIT.*fresh real request/);

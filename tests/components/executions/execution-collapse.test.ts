@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, before, describe, test } from "node:test";
 import { getCapabilities, MouseRegion, setCapabilities, Text, TuiAltScreen, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { BashExecutionComponent, ToolExecutionComponent, initTheme } from "@earendil-works/pi-coding-agent";
+import { BashExecutionComponent, ToolExecutionComponent, createReadToolDefinition, initTheme } from "@earendil-works/pi-coding-agent";
+import { stripAnsi } from "../../../core/utils";
 import {
 	AUTO_COLLAPSE_RENDERING_KEY,
 	applyDefaultAutoCollapse,
@@ -57,6 +58,9 @@ const darkToolTheme = {
 		return `${colors[name] ?? ""}${value}`;
 	},
 };
+
+const testImage = { type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aO2sAAAAASUVORK5CYII=" };
+const imageRows = (rows: readonly string[]) => rows.filter((row) => row.includes("\x1b_G") || row.includes("\x1b]1337;File="));
 
 const mouseEvent = (type: string, button = "left") => ({
 	type,
@@ -311,26 +315,22 @@ describe("execution click handling", () => {
 		assert.equal(seen[0]!.y, 0, "self shell strips its leading blank row");
 	});
 
-	test("simple-collapsed renderer rows cannot hit a hidden child button and toggle the block instead", async () => {
+	test("an overridden read renderer keeps its button hidden until the whole card is expanded", async () => {
 		let buttonClicks = 0;
-		const def: any = {
-			renderCall: () => new MouseRegion(new Text("HIDDEN BUTTON", 0, 0), (event) => {
-				if (event.type !== "click") return undefined;
-				buttonClicks++;
-				return { handled: true };
-			}),
-		};
+		const cwd = process.cwd();
+		const def = createReadToolDefinition(cwd);
+		def.renderResult = () => new MouseRegion(new Text("HIDDEN BUTTON", 0, 0), (event) => {
+			if (event.type !== "click") return undefined;
+			buttonClicks++;
+			return { handled: true };
+		});
 		await installExecutionRails(darkToolTheme as any);
-		const tool = makeTool(undefined);
+		const tool = new ToolExecutionComponent("read", "r", { path: "file.txt" }, {}, def, ui, cwd);
 		tool.updateResult({
 			content: [{ type: "text", text: Array.from({ length: 30 }, (_, index) => `row ${index}`).join("\n") }],
 			details: {},
 			isError: false,
 		}, false);
-		Object.defineProperty(tool, "toolDefinition", {
-			value: def,
-			configurable: true,
-		});
 		tool.setExpanded(false);
 		const rows = tool.render(50);
 		assert.equal(rows.some((line: string) => line.includes("HIDDEN BUTTON")), false);
@@ -339,6 +339,11 @@ describe("execution click handling", () => {
 
 		assert.equal((tool as any).expanded, true);
 		assert.equal(buttonClicks, 0);
+		const expanded = tool.render(50);
+		const row = expanded.findIndex((line) => line.includes("HIDDEN BUTTON"));
+		assert.notEqual(row, -1);
+		tool.handleMouse(buttonClick(5, row, 50, expanded.length));
+		assert.equal(buttonClicks, 1);
 	});
 
 	test("a component built before install keeps native clicks, then Rail, then native again", async () => {
@@ -482,6 +487,48 @@ describe("execution click handling", () => {
 		assert.equal(context.toolCallId, "call-t");
 	});
 
+	test("collapsed read uses Pi's compact call, deferred arguments and error preview", async () => {
+		await installExecutionRails(darkToolTheme as any);
+		const cwd = process.cwd();
+		const tool = new ToolExecutionComponent("read", "r", { path: "old.txt" }, {}, createReadToolDefinition(cwd), ui, cwd);
+		tool.render(90);
+		tool.updateArgs({ path: "skills/example/SKILL.md", offset: 3, limit: 2 });
+		const text = () => stripAnsi(tool.render(90).join("\n"));
+		assert.match(text(), /\[skill\] example:3-4/);
+		tool.updateResult({ content: [{ type: "text", text: "ordinary body" }], isError: false });
+		assert.doesNotMatch(text(), /ordinary body/);
+		tool.updateResult({ content: [{ type: "text", text: "read failed" }], isError: true });
+		assert.match(text(), /read failed/);
+	});
+
+	test("collapsed read keeps Pi's model warning inside the Rail card, not the inline image", async () => {
+		const capabilities = getCapabilities();
+		setCapabilities({ ...capabilities, images: "kitty" });
+		try {
+			await installExecutionRails(darkToolTheme as any);
+			const cwd = process.cwd();
+			const tool = new ToolExecutionComponent("read", "r", { path: "photo.png" }, {}, createReadToolDefinition(cwd), ui, cwd);
+			const content = [{ type: "text", text: "Read image file [image/png]" }, testImage];
+			tool.updateResult({ content, details: { imageUnsupportedByModel: "text-only" }, isError: false });
+			const width = 100;
+			const rows = tool.render(width);
+			const warningRow = rows.findIndex((row) => stripAnsi(row).includes("[text-only does not support images; it saw a placeholder instead]"));
+			assert.notEqual(warningRow, -1);
+			assert.match(rows[warningRow]!, /▎/);
+			assert.deepEqual(imageRows(rows), []);
+			let pins = 0;
+			withRailSectionScrollAnchor(() => { pins++; }, () => tool.handleMouse(buttonClick(5, warningRow, width, rows.length)));
+			assert.equal(pins, 1);
+			assert.equal(imageRows(tool.render(width)).length, 1);
+			tool.setExpanded(false);
+			assert.deepEqual(imageRows(tool.render(width)), []);
+			tool.updateResult({ content, isError: false });
+			assert.doesNotMatch(stripAnsi(tool.render(width).join("\n")), /placeholder/);
+		} finally {
+			setCapabilities(capabilities);
+		}
+	});
+
 	for (const renderShell of ["default", "self"] as const) {
 		for (const protocol of ["kitty", "iterm2"] as const) {
 			test(`preserves native ${protocol} image rows through ${renderShell} shell collapse and expansion`, async () => {
@@ -490,11 +537,10 @@ describe("execution click handling", () => {
 				try {
 					const tool = makeTool({ renderShell, renderCall: () => new Text("IMAGE TOOL", 0, 0) });
 					tool.updateResult({
-						content: [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aO2sAAAAASUVORK5CYII=" }],
+						content: [testImage],
 						isError: false,
 					});
 					tool.setExpanded(true);
-					const imageRows = (rows: string[]) => rows.filter((row) => row.includes("\x1b_G") || row.includes("\x1b]1337;File="));
 					const nativeImages = imageRows(tool.render(49));
 					assert.equal(nativeImages.length, 1);
 

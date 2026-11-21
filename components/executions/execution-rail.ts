@@ -1,4 +1,4 @@
-import { truncateToVisualLines } from "@earendil-works/pi-coding-agent";
+import { createReadToolDefinition, truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import {
 	applyTextColor,
 	railAnsiForTheme,
@@ -31,8 +31,11 @@ import {
 const BASH_SURFACE_CACHE_KEY = Symbol.for("pi-rail-ui.bash-surface-cache");
 const TOOL_COLLAPSED_CONTENT_PADDING = 1;
 const TOOL_BACKGROUND_SGR_RE = /\x1b\[(?:4[0-9]|10[0-7]|48(?:(?:;|:)[0-9]*)+)m/g;
+const { renderCall: nativeReadCall, renderResult: nativeReadResult } = createReadToolDefinition(".");
 
-function renderBashWithoutSurface(component: any, width: number, originalRender: (width: number) => string[]): string[] {
+type NativeRender = (width: number) => readonly string[];
+
+function renderBashWithoutSurface(component: any, width: number, originalRender: NativeRender): readonly string[] {
 	applyDefaultAutoCollapse(component, "bashExecution", () => originalRender.call(component, width));
 	return originalRender.call(component, width);
 }
@@ -64,10 +67,10 @@ function collapsedBashPreviewRows(component: any, contentWidth: number, theme: T
 
 function normalizeCollapsedBashPreview(
 	component: any,
-	lines: string[],
+	lines: readonly string[],
 	contentWidth: number,
 	theme: ThemeLike | undefined,
-): string[] {
+): readonly string[] {
 	return collapsedBashPreviewRows(component, contentWidth, theme) ?? lines;
 }
 
@@ -102,9 +105,9 @@ function bashRenderSignature(component: any, width: number, contentWidth: number
 function renderBashExecutionRail(
 	component: any,
 	width: number,
-	originalRender: (width: number) => string[],
+	originalRender: NativeRender,
 	store: ExecutionRailPatchStore,
-): string[] {
+): readonly string[] {
 	const surface = bashExecutionSurfaceForTheme(store.theme);
 	if (width < surface.minRenderableWidth()) {
 		component[RAIL_RENDER_PRESENTATION_KEY] = "native";
@@ -164,7 +167,7 @@ function restyleNativeToolForegrounds(line: string, theme?: ThemeLike): string {
 	return line;
 }
 
-function renderToolSurfaceRows(component: any, rows: string[], width: number, theme?: ThemeLike): string[] {
+function renderToolSurfaceRows(component: any, rows: readonly string[], width: number, theme?: ThemeLike): string[] {
 	const surface = toolExecutionSurfaceForState(toolExecutionState(component));
 	return rows.map((line) => {
 		if (!line || isImageLineLike(line)) return line;
@@ -227,9 +230,9 @@ function collapsedToolSimpleRows(component: any, contentWidth: number, theme: Th
 function renderToolExecutionRail(
 	component: any,
 	width: number,
-	originalRender: (width: number) => string[],
+	originalRender: NativeRender,
 	store: ExecutionRailPatchStore,
-): string[] {
+): readonly string[] {
 	const kind = "toolExecution";
 	const config = railSectionConfig(kind);
 	const surface = toolExecutionSurfaceForState(toolExecutionState(component));
@@ -241,23 +244,34 @@ function renderToolExecutionRail(
 	const contentWidth = surface.contentWidth(width);
 	const simpleMode = config.collapsedRenderMode === "simple";
 	applyDefaultAutoCollapse(component, kind, () => originalRender.call(component, contentWidth), { avoidExpandedRender: simpleMode });
-	component[RAIL_RENDER_PRESENTATION_KEY] = simpleMode && !component.expanded ? "simple" : "native";
+	const simpleCollapsed = simpleMode && !component.expanded;
+	component[RAIL_RENDER_PRESENTATION_KEY] = simpleCollapsed ? "simple" : "native";
 	component[RAIL_RENDER_CONTENT_OFFSET_KEY] = surface.contentStartCol();
+	const def = component.toolDefinition;
+	if (simpleCollapsed && component.toolName === "read" && def
+		&& def.renderCall === nativeReadCall && def.renderResult === nativeReadResult && def.renderShell !== "self") {
+		// Pi's default shell composes the read call and result in this box; inline
+		// images stay hidden. Extension controls keep their normal simple preview.
+		if (component.argsPending) component.updateDisplay();
+		const rows: readonly string[] = component.contentBox.render(contentWidth);
+		return cachedRender(component, TOOL_RAIL_CACHE_KEY, `read:${width}:${toolExecutionState(component)}`,
+			() => renderToolSurfaceRows(component, ["", ...rows], width, store.theme), { rows });
+	}
 	const cacheable = Boolean(component.result && component.isPartial === false && (!Array.isArray(component.imageComponents) || component.imageComponents.length === 0));
 	if (cacheable) {
 		const signature = [width, toolExecutionState(component), component.expanded ? 1 : 0, simpleMode ? 1 : 0].join("\u001f");
 		return cachedRender(component, TOOL_RAIL_CACHE_KEY, signature, () => {
-			const renderedRows = simpleMode && !component.expanded
+			const renderedRows = simpleCollapsed
 				? collapsedToolSimpleRows(component, contentWidth, store.theme)
 				: originalRender.call(component, contentWidth);
-			const collapsedRows = simpleMode && !component.expanded || !shouldApplyGenericToolCollapse(component)
+			const collapsedRows = simpleCollapsed || !shouldApplyGenericToolCollapse(component)
 				? renderedRows
 				: collapsedExecutionRows(component, kind, renderedRows, contentWidth, store.theme);
 			return renderToolSurfaceRows(component, collapsedRows, width, store.theme);
 		}, { result: component.result, args: component.args });
 	}
 
-	if (simpleMode && !component.expanded) {
+	if (simpleCollapsed) {
 		return renderToolSurfaceRows(component, collapsedToolSimpleRows(component, contentWidth, store.theme), width, store.theme);
 	}
 
@@ -271,9 +285,9 @@ function renderToolExecutionRail(
 export function renderExecutionRail(
 	component: any,
 	width: number,
-	originalRender: (width: number) => string[],
+	originalRender: NativeRender,
 	store: ExecutionRailPatchStore,
-): string[] {
+): readonly string[] {
 	return isBashExecution(component)
 		? renderBashExecutionRail(component, width, originalRender, store)
 		: renderToolExecutionRail(component, width, originalRender, store);

@@ -108,7 +108,7 @@ const ASSISTANT_THINKING_BLOCKS_KEY = Symbol.for("pi-rail-ui.assistant-thinking-
 
 class AssistantThinkingRailBlock implements Component {
 	expanded = true;
-	private fullCache?: { width: number; rows: string[] } | undefined;
+	private fullCache?: { width: number; rows: readonly string[] } | undefined;
 	private collapsedCache?: { width: number; limit: number; rows: string[] } | undefined;
 	private inner: Component;
 	private surface: EditorSurfaceRenderer;
@@ -158,14 +158,14 @@ class AssistantThinkingRailBlock implements Component {
 		this.inner.invalidate?.();
 	}
 
-	private fullRows(width: number): string[] {
+	private fullRows(width: number): readonly string[] {
 		if (this.fullCache?.width === width) return this.fullCache.rows;
 		const rows = new ThinkingRailBlock(this.inner, this.surface).render(width);
 		this.fullCache = { width, rows };
 		return rows;
 	}
 
-	private collapsedRows(width: number, limit: number): string[] {
+	private collapsedRows(width: number, limit: number): readonly string[] {
 		if (this.collapsedCache?.width === width && this.collapsedCache.limit === limit) return this.collapsedCache.rows;
 		if (this.hidden || this.rawLines.length <= limit) return this.fullRows(width);
 
@@ -184,11 +184,11 @@ class AssistantThinkingRailBlock implements Component {
 		return rows;
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (!isRailUiActive()) return this.inner.render(width);
 		const config = railSectionConfig("assistantThinking");
 		const limit = config.collapsible ? config.autoCollapseAfterRows : undefined;
-		let rows: string[];
+		let rows: readonly string[];
 		if (!limit || this.hidden || this.rawLines.length <= limit) {
 			if (!wasRailSectionManuallyToggled(this) && this.owner?.[ASSISTANT_THINKING_MANUAL_KEY] !== true) this.expanded = true;
 			rows = this.fullRows(width);

@@ -97,7 +97,7 @@ function withAutoCollapseGuard(component: any, apply: () => void): void {
 export function applyDefaultAutoCollapse(
 	component: any,
 	kind: ExecutionKind,
-	renderExpandedRows: () => string[],
+	renderExpandedRows: () => readonly string[],
 	options: { avoidExpandedRender?: boolean } = {},
 ): void {
 	if (component?.[AUTO_COLLAPSE_RENDERING_KEY] || wasRailSectionManuallyToggled(component)) return;

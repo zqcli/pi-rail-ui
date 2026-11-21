@@ -151,7 +151,7 @@ export class SurfaceRailBlock implements Component {
 		this.inner.invalidate?.();
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (!isRailUiActive() || width < this.surface.minRenderableWidth()) return this.inner.render(width);
 		const innerLines = this.inner.render(this.surface.contentWidth(width));
 		const result = cachedRailRows(this.cached, width, innerLines, () => innerLines.map((line) => this.surface.renderSurfaceRow(width, line)));
@@ -175,7 +175,7 @@ export class SurfaceContentInsetBlock implements Component {
 		this.inner.invalidate?.();
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (!isRailUiActive()) return this.inner.render(width);
 		const inset = this.surface.contentStartCol();
 		if (inset <= 0 || width <= inset + 1) return this.inner.render(width);

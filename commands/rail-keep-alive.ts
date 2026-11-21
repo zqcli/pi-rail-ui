@@ -2,10 +2,11 @@ import { isCacheWarmingReplayable } from "@earendil-works/pi-ai";
 import { AgentSession, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createStore } from "../core/patching";
 
-// Pi 1.5.2's CacheWarmer is private and the bundled CLI has a different class
+// Pi 1.6.0's CacheWarmer is private and the bundled CLI has a different class
 // from dist/core/cache-warmer.js. The public decision hook cannot set intervals,
 // extend safety windows or pause failures. Keep this versioned scheduling seam on
 // the live AgentSession; native refresh retains auth, hooks and continuation isolation.
+const SUPPORTED_PI_VERSION = "1.6.0";
 const ENTRY = "rail-keep-alive";
 const INTERVAL = 60_000;
 /** A refresh later than this after its planned time (sleep, blocked event loop) pauses instead of catching up. */
@@ -94,7 +95,7 @@ function awaitSession(state: State): void {
 
 function valid(w: any, session: AgentSession, state: State): w is Warmer {
 	const status = w && Object.getOwnPropertyDescriptor(Object.getPrototypeOf(w), "status");
-	return VERSION === "1.5.2" && session instanceof AgentSession && w?.sessionManager === state.manager
+	return VERSION === SUPPORTED_PI_VERSION && session instanceof AgentSession && w?.sessionManager === state.manager
 		&& typeof status?.get === "function" && WARMER_METHODS.every((name) => typeof w[name] === "function")
 		&& typeof w.models?.streamSimple === "function";
 }
@@ -114,7 +115,7 @@ function pause(state: State, reason: string): void {
 function bind(state: State, session: AgentSession, resumed?: Run): void {
 	const w = (session as any)._cacheWarmer;
 	if (!valid(w, session, state)) {
-		state.unsupported = "unsupported Pi CacheWarmer (requires 1.5.2 live session)";
+		state.unsupported = `unsupported Pi CacheWarmer (requires ${SUPPORTED_PI_VERSION} live session)`;
 		state.mode.paused = state.unsupported;
 		changed(state);
 		state.notify(`Rail keep-alive unavailable: ${state.unsupported}; cannot control native warming`);

@@ -42,7 +42,7 @@ export class RailSectionBlock implements Component {
 		this.inner.invalidate?.();
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (!isRailUiActive()) return this.inner.render(width);
 		const layout = this.config.layout;
 		const railAnsi = this.config.style.rail.ansi ?? "";

@@ -75,7 +75,7 @@ class HostedSearchContent implements Component {
 	private activity: HostedSearchActivity;
 	private theme: Theme;
 	private unsubscribe: (() => void) | undefined;
-	private cached: { width: number; rows: string[] } | undefined;
+	private cached: { width: number; rows: readonly string[] } | undefined;
 
 	constructor(
 		activity: HostedSearchActivity,
@@ -111,7 +111,7 @@ class HostedSearchContent implements Component {
 		return this.activity.observed;
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (!this.activity.observed) return [];
 		const snapshot = this.activity.snapshot();
 		if (!wasRailSectionManuallyToggled(this)) this.expanded = snapshot.phase !== "completed";
@@ -128,11 +128,9 @@ class HostedSearchContent implements Component {
 					? "warning"
 					: "accent";
 		const title = new Text(this.theme.fg(color, this.theme.bold(summary)), 0, 0);
-		const rows = title.render(width);
-		if (this.expanded) {
-			const details = detailsMarkdown(snapshot);
-			if (details) rows.push(...new Markdown(details, 0, 0, getMarkdownTheme()).render(width));
-		}
+		const header = title.render(width);
+		const details = this.expanded ? detailsMarkdown(snapshot) : "";
+		const rows = details ? [...header, ...new Markdown(details, 0, 0, getMarkdownTheme()).render(width)] : header;
 		this.cached = { width, rows };
 		return rows;
 	}
@@ -184,7 +182,7 @@ export class HostedSearchRailBlock implements Component {
 		return handleRailSectionClickToggle(this, event, true);
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (!this.visible) return [];
 		return this.surface.render(width);
 	}

@@ -270,7 +270,6 @@ export function streamResponsesWebSocketRoute(
 						stream.push({ type: "start", partial: output });
 					},
 					responseItems: () => convertResponsesMessages(model, normalizeContext({ messages: [output] }), toolCallProviders(model), {
-						includeSystemPrompt: false,
 						grammarToolInputProperties,
 					}).filter((item) => item.type !== "function_call_output" && item.type !== "custom_tool_call_output"),
 					onEvent: (event) => options?.onProviderStreamEvent?.(event, model),

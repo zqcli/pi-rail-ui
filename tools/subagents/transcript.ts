@@ -710,7 +710,7 @@ class BoundedTranscriptView implements Component {
 		});
 	}
 
-	private renderEntry(entry: SubagentTranscriptEntry, width: number, unbounded = false): string[] {
+	private renderEntry(entry: SubagentTranscriptEntry, width: number, unbounded = false): readonly string[] {
 		if (entry.kind === "note") return new Text(this.theme.fg("dim", entry.text), 0, 0).render(width);
 		const failed = entry.status === "failed";
 		const icon = entry.kind === "user" ? "›"

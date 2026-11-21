@@ -76,7 +76,7 @@ function handleExecutionMouseEvent(
 }
 
 function patchRender(ctor: RenderableCtor): void {
-	executionRailLifecycle.patchMethod(ctor, "render", (original) => function patchedExecutionRender(this: any, width: number): string[] {
+	executionRailLifecycle.patchMethod(ctor, "render", (original) => function patchedExecutionRender(this: any, width: number): readonly string[] {
 		const currentStore = getExecutionRailPatchStore();
 		if (!currentStore.active) return original.call(this, width);
 		try {
@@ -148,10 +148,7 @@ export async function installExecutionRails(theme: ThemeLike): Promise<void> {
 	});
 
 	patchCreateResultRegion();
-	for (const ctor of [
-		ToolExecutionComponent as unknown as RenderableCtor,
-		BashExecutionComponent as unknown as RenderableCtor,
-	]) {
+	for (const ctor of [ToolExecutionComponent, BashExecutionComponent]) {
 		patchExecutionSetExpanded(executionRailLifecycle, ctor);
 		patchRender(ctor);
 		patchHandleMouse(ctor);

@@ -6,6 +6,7 @@ import { PROVIDER_STREAM_EVENTS } from "./provider-stream-events";
 const CAPTURE_APIS = new Set(["openai-responses", "azure-openai-responses"]);
 const MAX_SSE_FRAME_LENGTH = 2_000_000;
 type RegisteredProviderConfig = NonNullable<ReturnType<ExtensionContext["modelRegistry"]["getRegisteredProviderConfig"]>>;
+type LegacyReaders = { stop: AbortController; tasks: Set<Promise<void>>; completedAt?: number };
 type ProviderLease = {
 	providerId: string;
 	api: Api;
@@ -17,19 +18,21 @@ type ProviderLease = {
 export class LegacyHostedSearchCapture {
 	private lease: ProviderLease | undefined;
 	private context: ExtensionContext | undefined;
-	private readonly sources = new WeakMap<HostedSearchActivity, "public" | "legacy">();
-	private readonly pending = new Map<HostedSearchActivity, Set<Promise<void>>>();
+	private readonly readers = new WeakMap<HostedSearchActivity, LegacyReaders>();
 
 	constructor(private readonly pi: ExtensionAPI, private readonly activityFor: (model: Model<Api>) => HostedSearchActivity | undefined) {}
 
-	acceptPublicEvent(activity: HostedSearchActivity): boolean {
-		if (this.sources.get(activity) === "legacy") return false;
-		this.sources.set(activity, "public");
-		return true;
+	cancel(activity: HostedSearchActivity): void {
+		this.readers.get(activity)?.stop.abort();
 	}
 
 	async finish(activity: HostedSearchActivity): Promise<void> {
-		await Promise.all(this.pending.get(activity) ?? []);
+		const readers = this.readers.get(activity);
+		if (!readers) return;
+		await Promise.all(readers.tasks);
+		// Wire completion may race ahead of the public stream. Close the legacy
+		// card only after Pi finishes, using the original completion timestamp.
+		if (!readers.stop.signal.aborted && readers.completedAt !== undefined) activity.complete(readers.completedAt);
 	}
 
 	sync(ctx: ExtensionContext): void {
@@ -40,35 +43,30 @@ export class LegacyHostedSearchCapture {
 		if (model && this.lease?.providerId === model.provider && this.lease.api === model.api && current?.streamSimple === this.lease.wrapper) return;
 		this.restore();
 		current = model ? registry.getRegisteredProviderConfig(model.provider) : undefined;
-		if (!model || !CAPTURE_APIS.has(model.api) || !current?.streamSimple || registry.getRegisteredNativeProvider(model.provider)) return;
+		if (!model || !CAPTURE_APIS.has(model.api) || !current?.streamSimple || current.api !== model.api || registry.getRegisteredNativeProvider(model.provider)) return;
 		if (Reflect.get(current.streamSimple, PROVIDER_STREAM_EVENTS) === true) return;
 		const original = registry.getProvider(model.provider);
 		if (!original) return;
 		const wrapper: NonNullable<ProviderConfig["streamSimple"]> = (requestModel, context, options) => {
 			const activity = this.activityFor(requestModel);
 			if (!activity) return original.streamSimple(requestModel, context, options);
+			const readers: LegacyReaders = this.readers.get(activity) ?? { stop: new AbortController(), tasks: new Set<Promise<void>>() };
+			this.readers.set(activity, readers);
 			const baseFetch = options?.fetch ?? globalThis.fetch;
 			const fetch: FetchFunction = async (input, init) => {
 				const response = await baseFetch(input, init);
 				const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 				const contentType = response.headers.get("content-type");
 				if (!/\/responses(?:[?#]|$)/u.test(url) || !response.body || (contentType && !contentType.toLowerCase().includes("text/event-stream"))) return response;
-				if (this.sources.get(activity) === "public") return response;
+				if (readers.stop.signal.aborted) return response;
 				let clone: Response;
 				try { clone = response.clone(); } catch { return response; }
 				if (!clone.body) return response;
-				// Pick one source before the provider reads the response. An unknown
-				// custom stream may also emit public events; those remain available
-				// to other extensions without racing this legacy observer's state.
-				this.sources.set(activity, "legacy");
-				const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-				const tasks = this.pending.get(activity) ?? new Set<Promise<void>>();
-				this.pending.set(activity, tasks);
-				const task = observeResponseBody(clone, activity, signal).catch(() => undefined).finally(() => {
-					tasks.delete(task);
-					if (tasks.size === 0) this.pending.delete(activity);
-				});
-				tasks.add(task);
+				const signals = [readers.stop.signal, options?.signal, init?.signal ?? (input instanceof Request ? input.signal : undefined)];
+				const signal = AbortSignal.any(signals.filter((value): value is AbortSignal => value != null));
+				const observer = new HostedSearchSseObserver(activity, (at) => { readers.completedAt = at; });
+				const task = observeResponseBody(clone, observer, signal).catch(() => undefined).finally(() => readers.tasks.delete(task));
+				readers.tasks.add(task);
 				return response;
 			};
 			return original.streamSimple(requestModel, context, { ...options, fetch });
@@ -99,22 +97,22 @@ export class LegacyHostedSearchCapture {
 	}
 }
 
-async function observeResponseBody(response: Response, activity: HostedSearchActivity, signal?: AbortSignal): Promise<void> {
+async function observeResponseBody(response: Response, observer: HostedSearchSseObserver, signal: AbortSignal): Promise<void> {
 	const reader = response.body!.getReader();
-	const observer = new HostedSearchSseObserver(activity);
 	const cancel = () => { void reader.cancel().catch(() => undefined); };
-	if (signal?.aborted) { cancel(); reader.releaseLock(); return; }
-	signal?.addEventListener("abort", cancel, { once: true });
+	if (signal.aborted) { cancel(); reader.releaseLock(); return; }
+	signal.addEventListener("abort", cancel, { once: true });
 	try {
 		for (;;) {
 			const { done, value } = await reader.read();
+			if (signal.aborted) return;
 			if (done) break;
 			observer.push(value);
 			if (observer.done) { cancel(); break; }
 		}
-		observer.end();
+		if (!signal.aborted) observer.end();
 	} finally {
-		signal?.removeEventListener("abort", cancel);
+		signal.removeEventListener("abort", cancel);
 		reader.releaseLock();
 	}
 }
@@ -125,7 +123,7 @@ class HostedSearchSseObserver {
 	private discardingOversizedFrame = false;
 	private doneValue = false;
 
-	constructor(private readonly activity: HostedSearchActivity) {}
+	constructor(private readonly activity: HostedSearchActivity, private readonly onCompleted: (endedAt: number) => void) {}
 
 	get done(): boolean { return this.doneValue; }
 
@@ -187,7 +185,7 @@ class HostedSearchSseObserver {
 			return;
 		}
 		try {
-			observeHostedSearchEvent(this.activity, JSON.parse(data));
+			observeHostedSearchEvent(this.activity, JSON.parse(data), this.onCompleted);
 		} catch {
 			// Capture is observational; malformed provider events must not affect the model stream.
 		}

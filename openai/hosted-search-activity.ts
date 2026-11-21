@@ -71,9 +71,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export class HostedSearchActivity {
-	private readonly callsById = new Map<string, HostedSearchCall>();
-	private readonly countedCallIds = new Set<string>();
-	private readonly sourcesByUrl = new Map<string, HostedSearchSource>();
+	private callsById = new Map<string, HostedSearchCall>();
+	private countedCallIds = new Set<string>();
+	private sourcesByUrl = new Map<string, HostedSearchSource>();
 	private readonly listeners = new Set<ActivityListener>();
 	private responseIdValue: string | undefined;
 	private assistantTimestampValue: number | undefined;
@@ -129,6 +129,19 @@ export class HostedSearchActivity {
 	subscribe(listener: ActivityListener): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	/** Switch from provisional wire data to public observations without replacing a mounted card's activity. */
+	adoptObservations(source: HostedSearchActivity): void {
+		this.callsById = source.callsById;
+		this.countedCallIds = source.countedCallIds;
+		this.sourcesByUrl = source.sourcesByUrl;
+		this.responseIdValue = source.responseIdValue;
+		this.phaseValue = source.phaseValue;
+		this.endedAtValue = source.endedAtValue;
+		this.errorValue = source.errorValue;
+		this.callCountValue = source.callCountValue;
+		this.notify();
 	}
 
 	setResponseId(responseId: unknown): void {
@@ -314,7 +327,7 @@ function observeHostedSearchOutputItem(activity: HostedSearchActivity, item: unk
 	for (const annotation of annotationsFrom(item)) activity.addSource(annotation.url, annotation.title);
 }
 
-export function observeHostedSearchEvent(activity: HostedSearchActivity, value: unknown): void {
+export function observeHostedSearchEvent(activity: HostedSearchActivity, value: unknown, onCompleted?: (endedAt: number) => void): void {
 	if (!isRecord(value)) return;
 	const type = value["type"];
 	if (type === "response.created" && isRecord(value["response"])) {
@@ -346,7 +359,9 @@ export function observeHostedSearchEvent(activity: HostedSearchActivity, value: 
 		const response = value["response"];
 		activity.setResponseId(response["id"]);
 		for (const item of Array.isArray(response["output"]) ? response["output"] : []) observeHostedSearchOutputItem(activity, item);
-		activity.complete(typeof response["completed_at"] === "number" ? response["completed_at"] * 1000 : Date.now());
+		const endedAt = typeof response["completed_at"] === "number" ? response["completed_at"] * 1000 : Date.now();
+		if (onCompleted) onCompleted(endedAt);
+		else activity.complete(endedAt);
 		return;
 	}
 	if (type === "response.failed" || type === "error") {

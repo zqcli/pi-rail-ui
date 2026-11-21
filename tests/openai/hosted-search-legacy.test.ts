@@ -3,6 +3,8 @@ import { setImmediate } from "node:timers/promises";
 import { test } from "node:test";
 import { normalizeContext, type SimpleStreamOptions, type TranscriptContext } from "@earendil-works/pi-ai";
 import { stream as streamOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+import { hostedSearchBlockForAssistant } from "../../components/messages/hosted-search-rail";
 import { HostedSearchProviderCapture } from "../../openai/hosted-search-capture";
 import { PROVIDER_STREAM_EVENTS } from "../../openai/provider-stream-events";
 
@@ -88,9 +90,10 @@ test("custom legacy SSE streams retain capture and callbacks without duplicating
 	}
 });
 
-test("native and declared raw-event custom streams are not wrapped", async () => {
-	for (const options of [{ native: true }, { publicContract: true }]) {
+test("native, declared raw-event, and unrelated-API custom streams are not wrapped", async () => {
+	for (const options of [{ native: true }, { publicContract: true }, {}]) {
 		const fixture = runtime(options);
+		if (!options.native && !options.publicContract) fixture.setConfig({ ...fixture.previous, api: "openai-completions" });
 		fixture.capture.startTurn(fixture.ctx);
 		assert.deepEqual(fixture.mutations, []);
 		assert.equal(fixture.getConfig().streamSimple, fixture.original);
@@ -130,7 +133,8 @@ test("legacy observers drain on DONE and abort even when an SSE body stays open"
 			stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\n${abort ? "" : "data: [DONE]\n\n"}`));
 		} }), { headers: { "content-type": "text/event-stream" } });
 		fixture.getConfig().streamSimple(model, normalizeContext({ messages: [] }), { fetch: async () => response, signal: controller.signal });
-		assert.equal(await fixture.getLastOptions()!.fetch!(model.baseUrl + "/responses", { signal: controller.signal }), response);
+		// Legacy adapters may not forward the original options.signal to their fetch.
+		assert.equal(await fixture.getLastOptions()!.fetch!(model.baseUrl + "/responses"), response);
 		while (!fixture.phases.includes("running")) await setImmediate();
 		if (abort) controller.abort();
 		const snapshot = await fixture.capture.finishTurn({ provider: model.provider, model: model.id, stopReason: abort ? "aborted" : "stop" });
@@ -153,4 +157,63 @@ test("legacy malformed and oversized SSE frames do not hide later valid search e
 	assert.equal(snapshot?.callCount, 1);
 	assert.equal(snapshot?.calls[0]?.query, "legacy provider");
 	fixture.capture.shutdown();
+});
+
+test("unmarked custom streams keep live SSE unless a public hosted call takes over the same mounted card", { timeout: 3_000 }, async () => {
+	initTheme("dark");
+	const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text } as any;
+	const message = { provider: model.provider, model: model.id, timestamp: 123, stopReason: "stop" };
+	const publicCall = { ...item, id: "public-call", action: { type: "search", query: "native query" } };
+	const publicCitation = { type: "url_citation", url: "https://example.org/canonical", title: "Canonical citation" };
+	for (const hasPublicCall of [false, true]) {
+		const f = runtime({ passive: true });
+		f.capture.startTurn(f.ctx);
+		f.capture.associateMessage(message);
+		const mounted = hostedSearchBlockForAssistant({}, message, theme)!;
+		mounted.setExpanded(true);
+		const emit = (data: unknown) => f.capture.observe({ type: "provider_stream_event", provider: model.provider, model: model.id, api: model.api, data });
+		const source = { title: "Wire citation", url: "https://example.org/wire" };
+		const wireItem = { ...item, action: { ...item.action, sources: [source] } };
+		const response = new Response(wire([{ type: "response.output_item.done", item: wireItem }]), { headers: { "content-type": "text/event-stream" } });
+		f.getConfig().streamSimple(model, normalizeContext({ messages: [] }), { fetch: async () => response });
+		await f.getLastOptions()!.fetch!(model.baseUrl + "/responses");
+		while (!f.phases.includes("running")) await setImmediate();
+		emit({ type: "response.output_text.delta", delta: "answer" });
+		emit({ type: "response.created", response: { id: "public-response" } });
+		assert.match(mounted.render(100).join("\n"), /legacy provider/);
+		if (hasPublicCall) {
+			emit({ type: "response.output_text.annotation.added", annotation: publicCitation });
+			emit({ type: "response.output_item.done", item: publicCall });
+			const live = mounted.render(100).join("\n");
+			assert.match(live, /native query/);
+			assert.doesNotMatch(live, /legacy provider/);
+			emit({ type: "response.completed", response: { id: "public-response", output: [publicCall] } });
+		}
+		const snapshot = await f.capture.finishTurn(message);
+		assert.equal(snapshot?.callCount, 1);
+		assert.deepEqual(snapshot?.calls.map((call) => call.id), [hasPublicCall ? publicCall.id : wireItem.id]);
+		assert.deepEqual(snapshot?.sources.map((s) => s.url), [hasPublicCall ? publicCitation.url : source.url]);
+		assert.equal(await f.capture.finishTurn(message), undefined);
+		mounted.dispose();
+		f.capture.shutdown();
+	}
+});
+
+test("a finishing fallback cannot overwrite the next turn", { timeout: 2_000 }, async () => {
+	const f = runtime({ passive: true });
+	const message = { provider: model.provider, model: model.id, stopReason: "stop" };
+	f.capture.startTurn(f.ctx);
+	const response = new Response(new ReadableStream({ start(stream) {
+		stream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\n`));
+	} }), { headers: { "content-type": "text/event-stream" } });
+	f.getConfig().streamSimple(model, normalizeContext({ messages: [] }), { fetch: async () => response });
+	await f.getLastOptions()!.fetch!(model.baseUrl + "/responses");
+	while (!f.phases.includes("running")) await setImmediate();
+	const abandoned = f.capture.finishTurn(message);
+	f.capture.startTurn(f.ctx);
+	f.capture.observe({ type: "provider_stream_event", provider: model.provider, model: model.id, api: model.api, data: { type: "response.web_search_call.searching", item_id: "new-turn" } });
+	assert.equal(await abandoned, undefined);
+	assert.equal((await f.capture.finishTurn(message))?.calls[0]?.id, "new-turn");
+	f.capture.shutdown();
+	void response.body?.cancel();
 });

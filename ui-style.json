@@ -129,14 +129,6 @@
           "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "section" }
         }
       },
-      "commandOutput": {
-        "style": { "background": "transparent", "rail": { "rgb": [148, 226, 213] } },
-        "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
-      },
-      "resourceStatus": {
-        "style": { "background": "transparent", "rail": { "rgb": [250, 179, 135] } },
-        "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
-      },
       "selectorOutput": { "selectable": false, "style": { "background": { "rgb": [49, 50, 68] }, "rail": { "rgb": [148, 226, 213] } } },
       "custom": { "style": { "background": "transparent", "rail": false } }
     }

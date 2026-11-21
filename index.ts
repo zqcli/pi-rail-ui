@@ -13,7 +13,7 @@ import { installRailFast } from "./commands/rail-fast";
 import { installRailOaiSearch } from "./commands/rail-oai-search";
 import { installRailResponsesWebSocket } from "./openai/responses-websocket";
 import { installExecutionRails, uninstallExecutionRails } from "./components/executions";
-import { installAssistantMessageRail, uninstallAssistantMessageRail, installCommandOutputRail, uninstallCommandOutputRail, installResourceStatusRail, uninstallResourceStatusRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
+import { installAssistantMessageRail, uninstallAssistantMessageRail, installUserMessageRail, refreshUserMessageTimestamps, rememberUserMessageTimestamp, uninstallUserMessageRail } from "./components/messages";
 import { setRailUiActive } from "./rail";
 import { installGutter, uninstallGutter } from "./rail/gutter";
 import { installGptCompaction } from "./tools/gpt-compaction/extension";
@@ -60,8 +60,6 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		await installAssistantMessageRail(ctx.ui.theme);
 		await installUserMessageRail(ctx);
 		await installExecutionRails(ctx.ui.theme);
-		await installResourceStatusRail();
-		await installCommandOutputRail();
 	}
 
 	// Pi owns session replacement, terminal input, and renderer cleanup. Rail
@@ -72,8 +70,6 @@ export default async function piRailUi(pi: ExtensionAPI) {
 		uninstallAssistantMessageRail();
 		uninstallUserMessageRail();
 		uninstallExecutionRails();
-		uninstallResourceStatusRail();
-		uninstallCommandOutputRail();
 	}
 
 	function uninstall(ctx: ExtensionContext) {

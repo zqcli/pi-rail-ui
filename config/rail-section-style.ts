@@ -21,8 +21,6 @@ const RAIL_SECTION_KINDS: RailSectionKind[] = [
 	"userMessage",
 	"toolExecution",
 	"bashExecution",
-	"commandOutput",
-	"resourceStatus",
 	"selectorOutput",
 	"custom",
 ];
@@ -157,8 +155,6 @@ export function resolveRailSectionConfigs(input: RailSectionStyleResolutionInput
 		userMessage: { selectable: true, layout: { contentStartCol: surfaceContentStart + Math.max(0, style.userMessage.textGapWidth), spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
 		toolExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 0, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
 		bashExecution: { selectable: true, collapsible: true, clickToToggle: true, layout: { contentStartCol: bashContentStart, spacing: { beforeRows: bashExecutionVerticalSpacingRows, afterRows: 0, collapseAdjacent: true, scope: "section" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
-		commandOutput: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
-		resourceStatus: { selectable: true, layout: { contentStartCol: outerContentStart, spacing: { beforeRows: 1, afterRows: 0, collapseAdjacent: true, scope: "group" } }, selection: DEFAULT_RAIL_SECTION_SELECTION },
 		selectorOutput: { selectable: false, layout: { contentStartCol: surfaceContentStart }, selection: DEFAULT_RAIL_SECTION_SELECTION },
 		custom: { selectable: true, layout: { contentStartCol: outerContentStart }, selection: DEFAULT_RAIL_SECTION_SELECTION },
 	};

@@ -9,8 +9,6 @@ export type RailSectionKind =
 	| "userMessage"
 	| "toolExecution"
 	| "bashExecution"
-	| "commandOutput"
-	| "resourceStatus"
 	| "selectorOutput"
 	| "custom";
 export type RailSectionSelectionMode = "fullRow" | "contentOnly" | "visible";

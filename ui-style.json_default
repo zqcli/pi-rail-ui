@@ -113,14 +113,6 @@
           "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "section" }
         }
       },
-      "commandOutput": {
-        "style": { "background": "transparent", "rail": false },
-        "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
-      },
-      "resourceStatus": {
-        "style": { "background": "transparent", "rail": false },
-        "layout": { "spacing": { "beforeRows": 1, "afterRows": 0, "collapseAdjacent": true, "scope": "group" } }
-      },
       "selectorOutput": { "selectable": false, "style": { "background": "editor.background", "rail": "theme:thinkingText" } },
       "custom": { "style": { "background": "transparent", "rail": false } }
     }

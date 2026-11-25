@@ -254,6 +254,7 @@ interface RuntimeMember extends MemberRecord {
 	flowPauseAt?: number;
 	/** Kind of the last activation reserved for this member: an idle lead alternates its runnable work with event batches. */
 	lastActivationKind?: "events" | "work";
+	lastStartedWork?: WorkRef;
 	lastActivation?: CompletedActivationTombstone;
 	lastLostActivation?: { activationId: string; error: WorkError; resourceReleased: boolean; reason: ActivationCompletionReason };
 	/** Transient provider errors since the last successful completion; nothing is scheduled for this member before `nextAt`. */
@@ -1356,6 +1357,17 @@ export class TeamRuntime {
 	/** Host view of every work item's current revision (the model-facing status is paginated). */
 	listWorks(teamId: string): TeamWorkSummary[] {
 		return this.workSummaries(this.team(teamId));
+	}
+
+	/** Current or last activated work for the UI, never a request that only entered the queue. */
+	memberDisplayWork(teamId: string, memberId: string): TeamWorkSummary | undefined {
+		const team = this.team(teamId);
+		const member = team.members.get(memberId);
+		const ref = member?.currentWork ?? member?.lastStartedWork;
+		if (!ref) return undefined;
+		const entry = team.ledger.get(ref.workId);
+		const version = team.ledger.version(ref);
+		return entry && version ? this.workSummary(entry.record, version) : undefined;
 	}
 
 	/** Every Team this runtime generation still retains (live and recent terminal). */
@@ -3745,6 +3757,7 @@ export class TeamRuntime {
 		const firstStart = !team.flow.started.has(workRefKey(ref));
 		const readyMs = this.flowWorkStarted(team, ref);
 		member.currentWork = copy(ref);
+		member.lastStartedWork = member.currentWork;
 		member.activity = "running";
 		this.note(team, firstStart ? `${member.id} started ${shortWorkRef(ref)}${readyMs === undefined ? "" : ` (ready ${clock(readyMs)})`}` : `${member.id} resumed ${shortWorkRef(ref)}`);
 		this.addDelivery(team, member, scope, input);
@@ -4773,13 +4786,16 @@ export class TeamRuntime {
 	private workSummaries(team: TeamState): TeamWorkSummary[] {
 		return team.ledger.order.map((id) => {
 			const record = team.ledger.get(id)!.record;
-			const version = currentVersion(record);
-			return { work: { workId: id, revision: record.currentRevision }, title: record.title!, requester: record.requester, assignee: record.assignee,
-				...(record.parent ? { parent: copy(record.parent) } : {}),
-				state: version.state, taskPreview: previewText(version.task, 512), ...(version.hold ? { hold: version.hold.reason } : {}),
-				...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: version.review.disposition } : {}),
-				...(record.kind ? { kind: record.kind } : {}) };
+			return this.workSummary(record, currentVersion(record));
 		});
+	}
+
+	private workSummary(record: WorkRecord, version: WorkVersion): TeamWorkSummary {
+		return { work: { workId: record.id, revision: version.revision }, title: record.title!, requester: record.requester, assignee: record.assignee,
+			...(record.parent ? { parent: copy(record.parent) } : {}),
+			state: version.state, taskPreview: previewText(version.task, 512), ...(version.hold ? { hold: version.hold.reason } : {}),
+			...(version.resultRef ? { resultRef: version.resultRef } : {}), ...(version.review ? { review: version.review.disposition } : {}),
+			...(record.kind ? { kind: record.kind } : {}) };
 	}
 
 	private resultSummaries(team: TeamState): Array<{ id: string; work: WorkRef; author: string; status: WorkResult["status"]; summaryPreview: string }> {

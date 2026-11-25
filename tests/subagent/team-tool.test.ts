@@ -595,10 +595,12 @@ test("launch panel titles each task with who asked and which work, says where a 
 	const revise = { action: "control", command: "revise_work", workId: writerRef.workId, expectedRevision: 1, task: "Write the change, with tests.", inputRefs: [] };
 	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 2, "revise", revise, "revise").ok, true);
 	now = await panel();
-	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef({ workId: writerRef.workId, revision: 2 })} · revised`);
-	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the task text is the current revision's");
-	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress · @1 result superseded", "the current revision is in progress and the shown result is from @1");
+	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change.", "a queued revision must not replace the last executed task");
 	const revised = activate(host, teamId);
+	now = await panel();
+	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef(revised.scope.work!)} · revised`);
+	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the task text changes as soon as the revision runs");
+	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress · @1 result superseded", "the current revision is in progress and the shown result is from @1");
 	endActivation(host, revised, { action: "reply", result: { status: "succeeded", summary: "Tests added." } });
 	const waive = { ...accept, work: revised.scope.work, disposition: "waived", reason: "Accepted with limitations." };
 	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 3, "waive", waive, "waive").ok, true);
@@ -608,7 +610,17 @@ test("launch panel titles each task with who asked and which work, says where a 
 		action: "request", to: "writer", task: "Review another change.",
 	}).ok, true);
 	now = await panel();
+	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the queued next task doesn't replace the last executed one");
+	const next = activate(host, teamId);
+	now = await panel();
+	assert.equal(now.run("writer").transcript.entries[0].text, "Review another change.");
 	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress", "a different work never borrows the last result's reference or review");
+	for (const expanded of [false, true]) {
+		const rendered = tool.renderResult(updates.at(-1), { expanded, isPartial: true }, theme).render(200).join("\n");
+		assert.match(rendered, /task from lead[^\n]*Review another change\./u);
+		assert.doesNotMatch(rendered, /Write the change, with tests\./u);
+	}
+	endActivation(host, next, { action: "reply", result: { status: "succeeded", summary: "Review ready." } });
 
 	resolveLifetime(terminal(teamId));
 	await pending;
@@ -636,9 +648,12 @@ for (const state of ["cancelled", "failed"] as const) {
 			return { lifetime: Promise.resolve(terminal(teamId)) };
 		};
 		const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
-		assert.equal(result.details.members[1].transcript.entries[1].text, `↳ result → lead · ${state}`);
+		const destination = result.details.members[1].transcript.entries.find((entry: any) => entry.id === "result-destination");
+		assert.equal(destination?.text, state === "failed" ? "↳ result → lead · failed" : undefined, "a task cancelled before its first activation never becomes the displayed task");
 		for (const expanded of [false, true]) {
-			assert.match(tool.renderResult(result, { expanded, isPartial: false }, theme).render(200).join("\n"), new RegExp(`↳ result → lead · ${state}`, "u"));
+			const rendered = tool.renderResult(result, { expanded, isPartial: false }, theme).render(200).join("\n");
+			if (destination) assert.ok(rendered.includes(destination.text));
+			else assert.doesNotMatch(rendered, /Inspect the changed files\./u);
 		}
 	});
 }
@@ -773,7 +788,7 @@ test("launch panel reuses grouped subagent panels per member, live and after the
 	const [lead, worker] = update.details.members;
 	assert.deepEqual([lead.alias, lead.member?.lead, worker.alias, worker.member?.lead], ["lead", true, "worker", false]);
 	assert.equal(worker.usage.input, 7, "in-flight native usage is shown before Runtime folds it");
-	assert.equal(worker.transcript.entries[0].text, "Inspect the changed files.", "the member's current work is its initial task");
+	assert.equal(worker.transcript.entries.some((entry: any) => entry.initial), false, "the initial queued task is not yet running");
 	assert.equal(lead.transcript.entries.some((entry: any) => entry.initial), false, "the Manager's goal is in the Team header, not repeated as its task");
 	assert.match(lead.detail, /^dispatched: worker \(queued\) · \d+ pending events$/u, "the Manager's own dispatch is still open");
 	assert.equal(worker.status, "waiting", "queued work that has not started yet is waiting, not idle");

@@ -245,10 +245,8 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 		const activity = host.driver.memberActivity(teamId, member.id);
 		const usage = member.usage;
 		const latest = facts.results.get(member.id)?.latest;
-		const currentKey = member.currentWork ? workRefKey(member.currentWork) : undefined;
-		// The lead's Team-level job is the goal in the Team header; a task line is only for assigned work.
-		const assigned = works.filter((work) => work.assignee === member.id);
-		const task = assigned.find((work) => workRefKey(work.work) === currentKey) ?? assigned.find((work) => !isTerminalWorkState(work.state)) ?? assigned.at(-1);
+		// The lead's Team-level job is the goal in the Team header; a task line is only for activated work.
+		const task = host.runtime.memberDisplayWork(teamId, member.id);
 		const entries = activity?.transcript.entries ?? [];
 		return {
 			slot, alias: member.id, member: { lead: member.id === view.lead }, model: member.policy.model ?? "model unavailable", persistent: true,

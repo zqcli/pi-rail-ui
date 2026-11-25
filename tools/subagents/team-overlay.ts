@@ -7,7 +7,7 @@ import { railModelReference } from "./models";
 import { COMPACT_THRESHOLD_CHOICES, readCompactThreshold, writeCompactThreshold } from "./team-compaction-settings";
 import { flowRows } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
-import { TEAM_BUDGET_UNLIMITED, isTerminalWorkState, reviewAssessment, reviewTiming, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
+import { TEAM_BUDGET_UNLIMITED, reviewAssessment, reviewTiming, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
 import { formatBytes, memberContextText, memberDetail } from "./team-tool";
 import { statusColor } from "./transcript";
 import { waitFactText, waitTargetText, type TeamWaitFact } from "./team-runtime";
@@ -124,12 +124,6 @@ export function buildTeamTaskRows(works: readonly TeamWorkSummary[], expanded: R
 	};
 	for (const work of latest.values()) if (!work.parent && (!only || work.work.workId === only)) visit(work, 0);
 	return rows;
-}
-
-function assignedWork(member: TeamMemberView, works: readonly TeamWorkSummary[]): TeamWorkSummary | undefined {
-	const assigned = works.filter((work) => work.assignee === member.id);
-	return assigned.find((work) => member.currentWork && workRefKey(work.work) === workRefKey(member.currentWork))
-		?? assigned.find((work) => !isTerminalWorkState(work.state)) ?? assigned.at(-1);
 }
 
 function latestResult(memberId: string, works: TeamWorkSummary[], facts: Facts): string {
@@ -599,8 +593,8 @@ export class TeamOverlayComponent implements Focusable {
 		const dim = (text: string) => this.theme.fg("dim", compact(text, width));
 		if (this.tab === 2 && row?.member) {
 			const member = team.members.find((member) => member.id === row.member)!;
-			const work = assignedWork(member, works);
-			return [...wrapTextWithAnsi(`${member.id}${work ? ` · ${workTitle(work)} · from ${work.requester} · ${shortWorkRef(work.work)}` : ` · ${member.id === team.lead ? team.brief.goal : "No assigned work"}`}`, width).map(title),
+			const work = this.host.runtime.memberDisplayWork(team.teamId, member.id);
+			return [...wrapTextWithAnsi(`${member.id}${work ? ` · ${workTitle(work)} · from ${work.requester} · ${shortWorkRef(work.work)}` : ` · ${member.id === team.lead ? team.brief.goal : "No task started"}`}`, width).map(title),
 				dim(latestResult(member.id, works, facts))];
 		}
 		if (this.tab === 3 && row?.work) {
@@ -617,9 +611,9 @@ export class TeamOverlayComponent implements Focusable {
 
 	private memberDetail(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
 		const member = team.members.find((member) => member.id === this.detail)!;
-		const work = assignedWork(member, works);
+		const work = this.host.runtime.memberDisplayWork(team.teamId, member.id);
 		const task = work ? this.host.runtime.getWork(team.teamId, work.work)?.current.task : undefined;
-		const lines = [`Member ${member.id} · Esc back`, ...(memberContextText(member) ? [memberContextText(member)] : []), `Task: ${task ?? (member.id === team.lead ? team.brief.goal : "No assigned work")}`, "Outbound works:",
+		const lines = [`Member ${member.id} · Esc back`, ...(memberContextText(member) ? [memberContextText(member)] : []), `Task: ${task ?? (member.id === team.lead ? team.brief.goal : "No task started")}`, "Outbound works:",
 			...works.filter((work) => work.requester === member.id).map((work) => `  ${shortWorkRef(work.work)} → ${work.assignee} · ${work.hold ? "held" : work.state}`)];
 		const latest = facts.results.get(member.id)?.latest;
 		if (latest) lines.push(`Latest result: ${latest.result.status} · ${latest.id}`, latestResult(member.id, works, facts), latest.result.summary);

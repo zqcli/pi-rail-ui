@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, before, describe, test } from "node:test";
 import { getCapabilities, MouseRegion, setCapabilities, Text, TuiAltScreen, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { BashExecutionComponent, ToolExecutionComponent, createReadToolDefinition, initTheme } from "@earendil-works/pi-coding-agent";
+import { BashExecutionComponent, ToolExecutionComponent, createReadToolDefinition, initTheme, truncateTail } from "@earendil-works/pi-coding-agent";
 import { stripAnsi } from "../../../core/utils";
 import {
 	AUTO_COLLAPSE_RENDERING_KEY,
@@ -132,6 +132,20 @@ describe("execution click handling", () => {
 	function buttonClick(x: number, y: number, width: number, height: number): TuiMouseEvent {
 		return { type: "click", button: "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
 	}
+
+	test("expanded user bash shows Pi's full-output error and keeps the cached warning current", async () => {
+		await installExecutionRails(darkToolTheme as any);
+		const component = new BashExecutionComponent("demo", ui);
+		const truncated = truncateTail("first\nlast", { maxLines: 1 });
+		component.appendOutput(truncated.content);
+		component.setComplete(0, false, truncated, undefined, "fixture: ENOSPC");
+		component.render(90); // Let Rail apply its initial collapse before expanding.
+		component.setExpanded(true);
+		const render = () => stripAnsi(component.render(90).join("\n"));
+		assert.match(render(), /Could not save the full output: fixture: ENOSPC/);
+		component.setComplete(0, false, truncated, undefined, "fixture: EROFS");
+		assert.match(render(), /Could not save the full output: fixture: EROFS/);
+	});
 
 	test("generic tool toggles once on click and pins through the active anchor", async () => {
 		await installExecutionRails(darkToolTheme as any);

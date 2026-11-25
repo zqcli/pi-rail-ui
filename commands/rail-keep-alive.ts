@@ -2,11 +2,11 @@ import { isCacheWarmingReplayable } from "@earendil-works/pi-ai";
 import { AgentSession, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createStore } from "../core/patching";
 
-// Pi 1.6.0's CacheWarmer is private and the bundled CLI has a different class
+// Pi 1.6.1's CacheWarmer is private and the bundled CLI has a different class
 // from dist/core/cache-warmer.js. The public decision hook cannot set intervals,
 // extend safety windows or pause failures. Keep this versioned scheduling seam on
 // the live AgentSession; native refresh retains auth, hooks and continuation isolation.
-const SUPPORTED_PI_VERSION = "1.6.0";
+const SUPPORTED_PI_VERSION = "1.6.1";
 const ENTRY = "rail-keep-alive";
 const INTERVAL = 60_000;
 /** A refresh later than this after its planned time (sleep, blocked event loop) pauses instead of catching up. */

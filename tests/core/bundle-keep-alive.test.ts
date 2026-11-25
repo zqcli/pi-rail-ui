@@ -86,7 +86,7 @@ test("bundled CLI: capture the actual warmer through public AgentSession without
 	await transport.request({ type: "prompt", message: "/rail-keep-alive 1" });
 	await transport.request({ type: "prompt", message: "/ka-probe" });
 	const result = JSON.parse(await readFile(output, "utf8"));
-	assert.equal(result.version, "1.6.0");
+	assert.equal(result.version, "1.6.1");
 	assert.equal(result.captured, true);
 	assert.equal(result.bound, true);
 	assert.match(result.status, /KA 1m WAIT.*fresh real request/);

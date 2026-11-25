@@ -98,6 +98,7 @@ function bashRenderSignature(component: any, width: number, contentWidth: number
 		outputLines[outputLines.length - 1] ?? "",
 		component.truncationResult?.truncated ? 1 : 0,
 		component.fullOutputPath ?? "",
+		component.fullOutputError ?? "",
 		collapsedPreviewLimit("bashExecution"),
 	].join("\u001f");
 }

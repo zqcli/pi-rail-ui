@@ -277,7 +277,7 @@ test("real Pi member activity feeds the launch panel across activations and free
 	assert.ok(driver.memberActivity(teamId, "w1")!.transcript.entries.length > 0, "activity outlives the closed member");
 });
 
-test("real Pi 1.6.0 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member", { timeout: 60000 }, async (t) => {
+test("real Pi 1.6.1 Team v2 lifetime supports W1/W2 return-trip work with settled cleanup on one session per member", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles, broker } = await createHarness(t, "n02");
 	runtime.launch(teamId);
 	await assert.rejects(broker.dispatch({ target: "w1", task: "ordinary writer intrusion" }), /active team operation/u);
@@ -1784,7 +1784,7 @@ function deferred() {
 	return { promise, resolve };
 }
 
-test("real Pi 1.6.0 message RPC delivers and replies after the sender Work ends, without new Work, then closes", { timeout: 60000 }, async (t) => {
+test("real Pi 1.6.1 message RPC delivers and replies after the sender Work ends, without new Work, then closes", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles } = await createHarness(t, "messages-live");
 	const waiting = deferred(), release = deferred(), closing = deferred(), close = deferred();
 	const recipient = handles.get("w2")!; const original = recipient.runActivation.bind(recipient);
@@ -1832,7 +1832,7 @@ test("real Pi 1.6.0 message RPC delivers and replies after the sender Work ends,
 	assert.equal(runtime.liveEffects(teamId).activeActivations, 0); runtime.assertInvariants(teamId);
 });
 
-test("real Pi 1.6.0 signal RPC wakes a yielded consumer before producer completion and closes both roots", { timeout: 60000 }, async (t) => {
+test("real Pi 1.6.1 signal RPC wakes a yielded consumer before producer completion and closes both roots", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles } = await createHarness(t, "signals-live");
 	const opened = deferred(), publishing = deferred(), publish = deferred(), finishing = deferred(), finish = deferred();
 	const producer = handles.get("w1")!; const producerRun = producer.runActivation.bind(producer);
@@ -1883,7 +1883,7 @@ test("real Pi 1.6.0 signal RPC wakes a yielded consumer before producer completi
 	assert.equal(runtime.liveEffects(teamId).activeActivations, 0); runtime.assertInvariants(teamId);
 });
 
-test("real Pi 1.6.0 reply-handle RPC explicitly suspends and resumes the sending Work, without new Work, then closes", { timeout: 60000 }, async (t) => {
+test("real Pi 1.6.1 reply-handle RPC explicitly suspends and resumes the sending Work, without new Work, then closes", { timeout: 60000 }, async (t) => {
 	const { runtime, teamId, driver, handles } = await createHarness(t, "reply-wait-live");
 	const answering = deferred(), answer = deferred(), yielding = deferred(), finish = deferred(), closing = deferred(), close = deferred();
 	const recipient = handles.get("w2")!; const recipientRun = recipient.runActivation.bind(recipient);

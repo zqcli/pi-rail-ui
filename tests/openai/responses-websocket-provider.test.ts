@@ -13,6 +13,8 @@ import { WebSocketServer } from "ws";
 import { setImmediate } from "node:timers/promises";
 import { InMemoryCredentialStore, normalizeContext, type Model, type OpenAIResponsesOptions, type Provider } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
+import { streamSimple as streamSimpleCodex } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { stream as streamOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { HostedSearchProviderCapture } from "../../openai/hosted-search-capture";
 import { PROVIDER_STREAM_EVENTS } from "../../openai/provider-stream-events";
@@ -340,6 +342,47 @@ const fixtureModel: Model<"openai-responses"> = {
 };
 
 const noFallback = () => { throw new Error("unexpected SSE fallback"); };
+
+test("pinned Pi Codex sends the initial Astra max effort directly", async () => {
+	const model = getBuiltinModel("openai-codex", "gpt-6.2-astra");
+	const token = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url");
+	let payload: { reasoning?: { effort?: string }; input?: Array<{ type: string }> } | undefined;
+	const result = await streamSimpleCodex(model, normalizeContext({ messages: [
+		{ role: "user", content: "fixture", timestamp: 1 },
+	] }), {
+		apiKey: `fixture.${token}.fixture`,
+		reasoning: "max",
+		onPayload: (body) => { payload = body as typeof payload; throw new Error("inspect before send"); },
+	}).result();
+	assert.match(result.errorMessage ?? "", /inspect before send/);
+	assert.equal(payload?.reasoning?.effort, "max");
+	assert.equal(payload?.input?.some((item) => item.type === "configuration_update"), false);
+});
+
+test("Rail Responses replay uses Pi's completed tool-call encoding", async () => {
+	const model = { ...fixtureModel, id: "gpt-6.2-astra", reasoning: true, thinkingLevelMap: { max: "max" } };
+	const context = normalizeContext({ messages: [
+		{ role: "user", content: "fixture", timestamp: 1 },
+		{
+			role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: 2,
+			content: [{ type: "toolCall", id: "call_first|fc_first", name: "read", arguments: { path: "fixture" } }],
+			stopReason: "toolUse", usage: {
+				input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		},
+		{ role: "toolResult", toolCallId: "call_first|fc_first", toolName: "read", content: [{ type: "text", text: "fixture" }], isError: false, timestamp: 3 },
+	] });
+	let payload: { reasoning?: { effort?: string }; input?: Array<{ type: string; status?: string }> } | undefined;
+	const result = await streamResponsesWebSocketRoute(
+		{ provider: model.provider, endpoint: "wss://example.test/v1/responses", models: [model.id] },
+		noFallback, model, context,
+		{ apiKey: "fixture", reasoningEffort: "max", onPayload: (body) => { payload = body as typeof payload; throw new Error("inspect before send"); } },
+	).result();
+	assert.match(result.errorMessage ?? "", /inspect before send/);
+	assert.equal(payload?.input?.find((item) => item.type === "function_call")?.status, "completed");
+	assert.equal(payload?.reasoning?.effort, "max");
+});
 
 function completedResponse(id: string, output: unknown[] = []) {
 	return { id, status: "completed", output, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } };

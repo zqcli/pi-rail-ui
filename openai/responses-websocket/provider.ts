@@ -7,7 +7,6 @@ import {
 	normalizeContext,
 	registerSessionResourceCleanup,
 	resolveTranscript,
-	resolveTranscriptTools,
 	type Api,
 	type AssistantMessage,
 	type Model,
@@ -42,7 +41,7 @@ import {
 
 const { createGrammarToolInputProperties } = constrainedSampling;
 const { clampOpenAIPromptCacheKey } = promptCache;
-const { convertResponsesMessages, convertResponsesTools, getResponsesToolSupport, processResponsesStream } = responsesShared;
+const { convertResponsesMessages, prepareResponsesPrompt, processResponsesStream } = responsesShared;
 const { buildBaseOptions } = simpleOptions;
 const { formatProviderError, normalizeProviderError } = providerErrors;
 const { getProviderEnvValue } = providerEnv;
@@ -131,8 +130,7 @@ function buildRequestBody(
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 ): RequestBody {
 	const compat = getCompat(model);
-	const transcriptTools = resolveTranscriptTools(context.messages, getResponsesToolSupport(compat));
-	const messages = convertResponsesMessages(model, context, toolCallProviders(model), {
+	const { input, requestTools } = prepareResponsesPrompt(model, context, toolCallProviders(model), {
 		grammarToolInputProperties,
 		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
 		supportsAdditionalTools: compat.supportsAdditionalTools,
@@ -145,7 +143,7 @@ function buildRequestBody(
 	const cacheRetention = resolveCacheRetention(options);
 	const body: RequestBody = {
 		model: model.id,
-		input: messages,
+		input,
 		stream: true,
 		prompt_cache_key: cacheRetention === "none" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
 		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
@@ -157,12 +155,7 @@ function buildRequestBody(
 	}
 	if (options?.temperature !== undefined) body["temperature"] = options.temperature;
 	if (options?.serviceTier !== undefined) body["service_tier"] = options.serviceTier;
-	if (transcriptTools.requestTools.length > 0) {
-		body["tools"] = convertResponsesTools(transcriptTools.requestTools, {
-			supportsStrictMode: compat.supportsStrictMode,
-			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
-		});
-	}
+	if (requestTools.length > 0) body["tools"] = requestTools;
 	if (options?.toolChoice !== undefined) body["tool_choice"] = options.toolChoice;
 	if (model.reasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {

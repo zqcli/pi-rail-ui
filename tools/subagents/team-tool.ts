@@ -218,19 +218,12 @@ export function memberDetail(member: TeamTeamView["members"][number], facts: Pan
 	].filter(Boolean).join(" · ");
 }
 
-/** Title of a member's task line: who asked, which work and revision, and whether it is still open. */
-function taskLabel(work: TeamWorkSummary): string {
-	return `${isTerminalWorkState(work.state) ? "last task" : "task"} from ${work.requester}${work.parent ? " (sub-task)" : ""}`
-		+ ` · ${shortWorkRef(work.work)}${work.work.revision > 1 ? " · revised" : ""}`;
+export function teamTaskLabel(work: TeamWorkSummary, current: boolean): string {
+	return `${current ? "Current task" : "Last completed"} ← ${work.requester} · ${shortWorkRef(work.work)}`;
 }
 
-/** Destination of the shown task, never the result of a different work. */
-function resultTarget(work: TeamWorkSummary, latest?: ResultRecord): string {
-	const superseded = latest?.work.workId === work.work.workId && latest.work.revision < work.work.revision;
-	const fate = work.review ?? (work.resultRef ? work.parent ? "" : "awaiting review"
-		: work.state === "cancelled" || work.state === "failed" ? work.state : "in progress");
-	return `↳ result → ${work.requester}${fate ? ` · ${fate}` : ""}${work.resultRef ? ` · ${work.resultRef}` : ""}`
-		+ (superseded ? ` · @${latest.work.revision} result superseded` : "");
+export function teamHandoffLine(work: TeamWorkSummary): string {
+	return `Last handoff → ${work.assignee} · ${previewText(work.taskPreview, 80)}`;
 }
 
 /**
@@ -245,8 +238,8 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 		const activity = host.driver.memberActivity(teamId, member.id);
 		const usage = member.usage;
 		const latest = facts.results.get(member.id)?.latest;
-		// The lead's Team-level job is the goal in the Team header; a task line is only for activated work.
-		const task = host.runtime.memberDisplayWork(teamId, member.id);
+		const { current, completed, handoff } = host.runtime.memberTaskRoutes(teamId, member.id, latest?.work);
+		const task = current ?? completed;
 		const entries = activity?.transcript.entries ?? [];
 		return {
 			slot, alias: member.id, member: { lead: member.id === view.lead }, model: member.policy.model ?? "model unavailable", persistent: true,
@@ -262,11 +255,11 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 			fastModeText: member.policy.fastMode ? "on" : "off", searchModeText: member.policy.searchMode === "on" ? "on" : "off",
 			detail: memberDetail(member, facts, works, view.lead),
 			transcript: {
-				entries: task ? [
-					{ id: "initial-task", kind: "user", initial: true, label: taskLabel(task), text: task.taskPreview, order: 0 },
-					{ id: "result-destination", kind: "note", initial: true, text: resultTarget(task, latest), order: 0 },
+				entries: [
+					...(task ? [{ id: "team-task", kind: "user" as const, initial: true, label: teamTaskLabel(task, !!current), text: task.taskPreview, order: 0 }] : []),
+					...(handoff ? [{ id: "team-handoff", kind: "note" as const, initial: true, text: teamHandoffLine(handoff), order: 0 }] : []),
 					...entries,
-				] : entries,
+				],
 				omittedEntries: activity?.transcript.omittedEntries ?? 0,
 			},
 			...(activity?.isCompacting ? { isCompacting: true } : {}),

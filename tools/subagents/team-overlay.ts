@@ -8,7 +8,7 @@ import { COMPACT_THRESHOLD_CHOICES, readCompactThreshold, writeCompactThreshold 
 import { flowRows } from "./team-flow";
 import type { TeamHistoryEntry } from "./team-history";
 import { TEAM_BUDGET_UNLIMITED, reviewAssessment, reviewTiming, shortWorkRef, workRefKey, type TeamMemberView, type TeamOutcome, type TeamReviewPlan, type TeamReviewRecord, type TeamTeamView, type TeamWorkSummary } from "./team-protocol";
-import { formatBytes, memberContextText, memberDetail } from "./team-tool";
+import { formatBytes, memberContextText, memberDetail, teamHandoffLine, teamTaskLabel } from "./team-tool";
 import { statusColor } from "./transcript";
 import { waitFactText, waitTargetText, type TeamWaitFact } from "./team-runtime";
 
@@ -593,9 +593,10 @@ export class TeamOverlayComponent implements Focusable {
 		const dim = (text: string) => this.theme.fg("dim", compact(text, width));
 		if (this.tab === 2 && row?.member) {
 			const member = team.members.find((member) => member.id === row.member)!;
-			const work = this.host.runtime.memberDisplayWork(team.teamId, member.id);
-			return [...wrapTextWithAnsi(`${member.id}${work ? ` · ${workTitle(work)} · from ${work.requester} · ${shortWorkRef(work.work)}` : ` · ${member.id === team.lead ? team.brief.goal : "No task started"}`}`, width).map(title),
-				dim(latestResult(member.id, works, facts))];
+			const { current, completed, handoff } = this.host.runtime.memberTaskRoutes(team.teamId, member.id, facts.results.get(member.id)?.latest.work);
+			const work = current ?? completed;
+			return [...wrapTextWithAnsi(`${member.id} · ${work ? `${teamTaskLabel(work, !!current)} · ${workTitle(work)}` : member.id === team.lead ? team.brief.goal : "No task started"}`, width).map(title),
+				...(handoff ? [dim(teamHandoffLine(handoff))] : []), dim(latestResult(member.id, works, facts))];
 		}
 		if (this.tab === 3 && row?.work) {
 			const work = row.work;
@@ -611,11 +612,13 @@ export class TeamOverlayComponent implements Focusable {
 
 	private memberDetail(team: TeamTeamView, works: TeamWorkSummary[], facts: Facts, width: number): Row[] {
 		const member = team.members.find((member) => member.id === this.detail)!;
-		const work = this.host.runtime.memberDisplayWork(team.teamId, member.id);
-		const task = work ? this.host.runtime.getWork(team.teamId, work.work)?.current.task : undefined;
-		const lines = [`Member ${member.id} · Esc back`, ...(memberContextText(member) ? [memberContextText(member)] : []), `Task: ${task ?? (member.id === team.lead ? team.brief.goal : "No task started")}`, "Outbound works:",
-			...works.filter((work) => work.requester === member.id).map((work) => `  ${shortWorkRef(work.work)} → ${work.assignee} · ${work.hold ? "held" : work.state}`)];
 		const latest = facts.results.get(member.id)?.latest;
+		const { current, completed, handoff } = this.host.runtime.memberTaskRoutes(team.teamId, member.id, latest?.work);
+		const work = current ?? completed;
+		const lines = [`Member ${member.id} · Esc back`, ...(memberContextText(member) ? [memberContextText(member)] : []),
+			...(work ? [`${teamTaskLabel(work, !!current)}: ${this.host.runtime.getWork(team.teamId, work.work)?.current.task ?? work.taskPreview}`]
+				: member.id === team.lead ? [`Goal: ${team.brief.goal}`] : []),
+			...(handoff ? [teamHandoffLine(handoff)] : [])];
 		if (latest) lines.push(`Latest result: ${latest.result.status} · ${latest.id}`, latestResult(member.id, works, facts), latest.result.summary);
 		else lines.push("Latest result: none");
 		return lines.flatMap((text) => wrapTextWithAnsi(stripTerminalSequences(text), width).map((text) => ({ text })));

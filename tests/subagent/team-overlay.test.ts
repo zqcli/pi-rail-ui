@@ -146,18 +146,19 @@ test("five views show real running, waiting and held work, routes and attention"
 	assert.match(ui.text(), /\[Tasks\]/u);
 });
 
-test("Members Enter shows full task, outbound works, and latest result with destination", (t) => {
+test("Members Enter keeps the latest outbound handoff and the full completed task and result", (t) => {
 	const { host, runner, action, settle } = fixture();
 	const ui = overlay(host);
 	t.after(() => ui.component.dispose());
 	ui.key("tab"); ui.text(); ui.key("down"); ui.key("down"); ui.text(); ui.key("enter");
 	assert.match(ui.text(), /Member waiter · Esc back/u);
-	assert.match(ui.text(), /Keep every detail of this task\./u);
-	assert.match(ui.text(), /→ runner · queued/u);
+	assert.doesNotMatch(ui.text(), /Keep every detail of this task\./u, "a blocked task has not completed");
+	assert.match(ui.text(), /Last handoff → runner · Check child 1/u);
 	ui.key("escape");
 	settle(runner, action(runner, 1, { action: "reply", result: { status: "succeeded", summary: "Popup implemented." } }));
 	ui.text(); ui.key("down"); ui.text(); ui.key("enter");
 	assert.match(ui.text(), /Latest result: succeeded · /u);
+	assert.match(ui.text(), /Last completed ← lead · work \S+@1: Implement the popup/u);
 	assert.match(ui.text(), /Latest result: succeeded · "Popup implemented\." · awaiting acceptance/u);
 	assert.match(ui.text(), /Popup implemented\./u);
 });
@@ -385,7 +386,7 @@ test("Progress aligns alias/state, shows two-line active/usage rows and selected
 	const workerLines = members.slice(1);
 	assert.equal(new Set(workerLines.map((line) => line.indexOf("running work") >= 0 ? line.indexOf("running work") : line.indexOf("waiting for") >= 0 ? line.indexOf("waiting for") : line.indexOf("held ·"))).size, 1);
 	ui.key("down");
-	assert.match(ui.text(POPUP_WIDTH), /runner · Implement the popup · from lead · work/u);
+	assert.match(ui.text(POPUP_WIDTH), /runner · Current task ← lead · work \S+@1 · Implement the popup/u);
 	settle(runner, action(runner, 1, { action: "reply", result: { status: "succeeded", summary: "Done" } }));
 	assert.match(ui.text(POPUP_WIDTH), /Latest result: succeeded · "Done" · awaiting acceptance/u);
 });

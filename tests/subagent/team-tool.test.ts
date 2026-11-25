@@ -527,7 +527,7 @@ test("a paused Team says PAUSED in the launch panel, the status text and the Tea
 	await pending;
 });
 
-test("launch panel titles each task with who asked and which work, says where a result went, and shows what the Manager handles or has dispatched", async () => {
+test("launch panel shows the current or last completed task source and the latest actual handoff", async () => {
 	const { host, tool } = setup();
 	const prepared = await tool.execute("prepare", { ...sourceWriterArgs, initialRequests: [{ to: "writer", task: "Write the change.", inputRefs: null }] },
 		undefined, undefined, context());
@@ -538,96 +538,93 @@ test("launch panel titles each task with who asked and which work, says where a 
 	const updates: any[] = [];
 	const pending = tool.execute("launch", { action: "launch", teamId }, undefined, (update: any) => updates.push(update), context());
 	await new Promise<void>((resolve) => setImmediate(resolve));
-	/** The members of the newest panel update, once the throttled publish has run. */
 	const panel = async () => {
 		await new Promise((resolve) => setTimeout(resolve, 300));
-		const members: any[] = updates.at(-1).details.members;
-		const run = (alias: string) => members.find((member) => member.alias === alias);
-		for (const expanded of [false, true]) {
-			const rendered = tool.renderResult(updates.at(-1), { expanded, isPartial: true }, theme).render(200).join("\n");
-			for (const member of members) {
-				const destination = member.transcript.entries.find((entry: any) => entry.id === "result-destination");
-				if (destination) assert.ok(rendered.includes(destination.text), `destination stays visible, expanded=${expanded}`);
-				if (member.alias === "lead") assert.equal(destination, undefined);
-			}
-		}
-		return { run, title: (alias: string): string | undefined => run(alias).transcript.entries.find((entry: any) => entry.initial)?.label };
+		const update = updates.at(-1);
+		const run = (alias: string) => update.details.members.find((member: any) => member.alias === alias);
+		const entry = (alias: string, id: string) => run(alias).transcript.entries.find((item: any) => item.id === id);
+		const render = (expanded: boolean) => tool.renderResult(update, { expanded, isPartial: true }, theme).render(200).join("\n");
+		return { run, task: (alias: string) => entry(alias, "team-task"), handoff: (alias: string) => entry(alias, "team-handoff")?.text, render };
 	};
 
 	endActivation(host, activate(host, teamId), { action: "yield" });
 	const writer = activate(host, teamId);
 	const writerRef = writer.scope.work!;
 	const requested = host.runtime.handleAction(writer.binding, writer.scope, 1, "ask-source", { action: "request", to: "source", task: "Find the fixture." }, "ask-source");
+	assert.ok(requested.ok);
 	const fixtureRef = (requested as any).receipt.work;
+	let now = await panel();
+	assert.equal(now.task("writer").label, `Current task ← lead · ${shortWorkRef(writerRef)}`);
+	assert.equal(now.handoff("writer"), "Last handoff → source · Find the fixture.");
+	assert.equal(now.task("source"), undefined, "a queued receiver does not display unstarted work");
+	assert.equal(now.handoff("lead"), undefined, "prepared initial assignments are not handoffs made by the lead");
+
 	endActivation(host, writer, { action: "yield", waitingFor: [fixtureRef], checkpoint: "needs the fixture" }, 2);
 	const source = activate(host, teamId);
-
-	let now = await panel();
-	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef(writerRef)}`);
-	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress");
-	assert.equal(now.title("source"), `task from writer (sub-task) · ${shortWorkRef(fixtureRef)}`, "work a peer asked for is a sub-task of that peer");
-	assert.equal(now.run("lead").transcript.entries.some((entry: any) => entry.initial), false, "the Manager's task is the Team goal, in the header");
+	now = await panel();
+	assert.equal(now.task("writer"), undefined, "waiting with no completed work shows no task prompt");
+	assert.equal(now.handoff("writer"), "Last handoff → source · Find the fixture.");
+	assert.equal(now.task("source").label, `Current task ← writer · ${shortWorkRef(fixtureRef)}`);
 	assert.equal(now.run("writer").detail, `waiting on 1 sub-task: source (running ${shortWorkRef(fixtureRef)})`);
-	assert.equal(now.run("lead").detail, "dispatched: writer (waiting)", "the Manager's open dispatch replaces 'no assigned work'");
+	assert.equal(now.run("lead").detail, "dispatched: writer (waiting)");
 
 	endActivation(host, source, { action: "reply", result: { status: "succeeded", summary: "Fixture found." } });
 	endActivation(host, activate(host, teamId), { action: "reply", result: { status: "succeeded", summary: "Change written." } });
 	now = await panel();
-	assert.equal(now.title("source"), `last task from writer (sub-task) · ${shortWorkRef(fixtureRef)}`, "an ended task is the last one");
-	assert.equal(now.title("writer"), `last task from lead · ${shortWorkRef(writerRef)}`);
+	assert.equal(now.task("source").label, `Last completed ← writer · ${shortWorkRef(fixtureRef)}`);
+	assert.equal(now.task("writer").label, `Last completed ← lead · ${shortWorkRef(writerRef)}`);
 	assert.equal(now.run("source").output, "Fixture found.");
-	assert.equal(now.run("source").transcript.entries[1].text, `↳ result → writer · ${host.runtime.getWork(teamId, fixtureRef)!.current.resultRef}`);
 	assert.equal(now.run("writer").output, "Change written.");
-	assert.equal(now.run("writer").transcript.entries[1].text, `↳ result → lead · awaiting review · ${host.runtime.getWork(teamId, writerRef)!.current.resultRef}`);
+	assert.equal(now.handoff("writer"), "Last handoff → source · Find the fixture.", "returning a result is not a handoff");
 	assert.match(now.run("lead").detail, /^dispatched: writer \(awaiting review\) · \d+ pending events$/u);
-	const rendered = tool.renderResult({ ...updates.at(-1) }, { expanded: false, isPartial: true }, theme).render(100).join("\n");
-	assert.match(rendered, /result → lead · awaiting review/u);
-	assert.match(rendered, /last task from lead · work \S+@1\s+Write the change\./u);
-	assert.doesNotMatch(rendered, /initial task/u);
+	for (const expanded of [false, true]) {
+		const rendered = now.render(expanded);
+		assert.match(rendered, /Last completed ← lead · work \S+@1\s+Write the change\./u);
+		assert.match(rendered, /Last handoff → source · Find the fixture\./u);
+		assert.doesNotMatch(rendered, /initial task|result →/u);
+	}
 
 	const manager = activate(host, teamId);
-	const accept = { action: "control", command: "accept_result", work: writerRef, disposition: "accepted", reason: "looks right" };
-	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "accept", accept, "accept").ok, true);
-	now = await panel();
-	assert.equal(now.run("lead").detail, "handling ROOT_RESULT_READY, TEAM_QUIESCENT", "a running Manager says which events it is handling");
-	assert.match(now.run("writer").transcript.entries[1].text, /^↳ result → lead · accepted · result:/u);
-
 	const revise = { action: "control", command: "revise_work", workId: writerRef.workId, expectedRevision: 1, task: "Write the change, with tests.", inputRefs: [] };
-	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 2, "revise", revise, "revise").ok, true);
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 1, "revise", revise, "revise").ok, true);
 	now = await panel();
-	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change.", "a queued revision must not replace the last executed task");
+	assert.equal(now.task("writer").text, "Write the change.", "a queued revision must not replace the committed version");
+	assert.equal(now.run("lead").detail, "handling ROOT_RESULT_READY, TEAM_QUIESCENT");
 	const revised = activate(host, teamId);
 	now = await panel();
-	assert.equal(now.title("writer"), `task from lead · ${shortWorkRef(revised.scope.work!)} · revised`);
-	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the task text changes as soon as the revision runs");
-	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress · @1 result superseded", "the current revision is in progress and the shown result is from @1");
+	assert.equal(now.task("writer").label, `Current task ← lead · ${shortWorkRef(revised.scope.work!)}`);
+	assert.equal(now.task("writer").text, "Write the change, with tests.");
 	endActivation(host, revised, { action: "reply", result: { status: "succeeded", summary: "Tests added." } });
-	const waive = { ...accept, work: revised.scope.work, disposition: "waived", reason: "Accepted with limitations." };
-	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 3, "waive", waive, "waive").ok, true);
-	now = await panel();
-	assert.match(now.run("writer").transcript.entries[1].text, /^↳ result → lead · waived · result:/u);
-	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 4, "new-task", {
+
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 2, "new-task", {
 		action: "request", to: "writer", task: "Review another change.",
 	}).ok, true);
 	now = await panel();
-	assert.equal(now.run("writer").transcript.entries[0].text, "Write the change, with tests.", "the queued next task doesn't replace the last executed one");
+	assert.equal(now.task("writer").text, "Write the change, with tests.", "the queued next task doesn't replace the last completed one");
+	assert.equal(now.handoff("lead"), "Last handoff → writer · Review another change.");
 	const next = activate(host, teamId);
+	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 3, "plain-message", {
+		action: "message", to: "source", text: "Just a note.",
+	}).ok, true);
 	now = await panel();
-	assert.equal(now.run("writer").transcript.entries[0].text, "Review another change.");
-	assert.equal(now.run("writer").transcript.entries[1].text, "↳ result → lead · in progress", "a different work never borrows the last result's reference or review");
+	assert.equal(now.handoff("lead"), "Last handoff → writer · Review another change.", "a message to someone else is not a task handoff");
 	for (const expanded of [false, true]) {
-		const rendered = tool.renderResult(updates.at(-1), { expanded, isPartial: true }, theme).render(200).join("\n");
-		assert.match(rendered, /task from lead[^\n]*Review another change\./u);
+		const rendered = now.render(expanded);
+		assert.match(rendered, /Current task ← lead[^\n]*Review another change\./u);
 		assert.doesNotMatch(rendered, /Write the change, with tests\./u);
 	}
-	endActivation(host, next, { action: "reply", result: { status: "succeeded", summary: "Review ready." } });
+	endActivation(host, next, { action: "yield", attention: "Which file?", checkpoint: "Waiting on scope." });
+	now = await panel();
+	assert.equal(now.task("writer").text, "Write the change, with tests.", "a held, unfinished task does not replace the last completed task");
+	assert.match(now.task("writer").label, /^Last completed ← lead/u);
+	assert.equal(now.run("writer").output, "Tests added.");
 
 	resolveLifetime(terminal(teamId));
 	await pending;
 });
 
 for (const state of ["cancelled", "failed"] as const) {
-	test(`launch result destination shows ${state} without a result`, async () => {
+	test(`launch card omits uncompleted task prompt after work is ${state}`, async () => {
 		const { host, tool } = setup();
 		const prepared = await tool.execute("prepare", prepareArgs, undefined, undefined, context());
 		const teamId = prepared.details.view.teamId;
@@ -648,12 +645,10 @@ for (const state of ["cancelled", "failed"] as const) {
 			return { lifetime: Promise.resolve(terminal(teamId)) };
 		};
 		const result = await tool.execute("launch", { action: "launch", teamId }, undefined, undefined, context());
-		const destination = result.details.members[1].transcript.entries.find((entry: any) => entry.id === "result-destination");
-		assert.equal(destination?.text, state === "failed" ? "↳ result → lead · failed" : undefined, "a task cancelled before its first activation never becomes the displayed task");
+		assert.equal(result.details.members[1].transcript.entries.some((entry: any) => entry.id === "team-task"), false);
 		for (const expanded of [false, true]) {
 			const rendered = tool.renderResult(result, { expanded, isPartial: false }, theme).render(200).join("\n");
-			if (destination) assert.ok(rendered.includes(destination.text));
-			else assert.doesNotMatch(rendered, /Inspect the changed files\./u);
+			assert.doesNotMatch(rendered, /Inspect the changed files\.|result →/u);
 		}
 	});
 }

@@ -254,7 +254,7 @@ interface RuntimeMember extends MemberRecord {
 	flowPauseAt?: number;
 	/** Kind of the last activation reserved for this member: an idle lead alternates its runnable work with event batches. */
 	lastActivationKind?: "events" | "work";
-	lastStartedWork?: WorkRef;
+	lastHandoff?: WorkRef;
 	lastActivation?: CompletedActivationTombstone;
 	lastLostActivation?: { activationId: string; error: WorkError; resourceReleased: boolean; reason: ActivationCompletionReason };
 	/** Transient provider errors since the last successful completion; nothing is scheduled for this member before `nextAt`. */
@@ -1359,15 +1359,19 @@ export class TeamRuntime {
 		return this.workSummaries(this.team(teamId));
 	}
 
-	/** Current or last activated work for the UI, never a request that only entered the queue. */
-	memberDisplayWork(teamId: string, memberId: string): TeamWorkSummary | undefined {
+	/** Exact task versions for the member UI. Mailbox turns are not work. */
+	memberTaskRoutes(teamId: string, memberId: string, lastCompleted?: WorkRef) {
 		const team = this.team(teamId);
-		const member = team.members.get(memberId);
-		const ref = member?.currentWork ?? member?.lastStartedWork;
-		if (!ref) return undefined;
-		const entry = team.ledger.get(ref.workId);
-		const version = team.ledger.version(ref);
-		return entry && version ? this.workSummary(entry.record, version) : undefined;
+		const member = team.members.get(memberId)!;
+		const summarize = (ref?: WorkRef): TeamWorkSummary | undefined => {
+			if (!ref) return undefined;
+			const entry = team.ledger.get(ref.workId);
+			const version = team.ledger.version(ref);
+			return entry && version ? this.workSummary(entry.record, version) : undefined;
+		};
+		const active = member.active?.parked ? undefined : summarize(member.currentWork);
+		const current = active?.state === "running" ? active : undefined;
+		return { current, completed: current ? undefined : summarize(lastCompleted), handoff: summarize(member.lastHandoff) };
 	}
 
 	/** Every Team this runtime generation still retains (live and recent terminal). */
@@ -3100,12 +3104,14 @@ export class TeamRuntime {
 		const at = this.timestamp();
 		const work = this.makeWork(team, requester.id, recipient.id, action.task, action.inputRefs, parent, at, rootId, depth, action.title);
 		this.assertInputFits(team, recipient, work, parent);
+		const ref = { workId: work.id, revision: 1 };
 		team.ledger.add(work);
-		this.enqueueWork(team, { workId: work.id, revision: 1 });
+		this.enqueueWork(team, ref);
+		requester.lastHandoff = ref;
 		team.reservedResultBytes += TEAM_MAX_RESULT_BYTES;
-		this.note(team, `${requester.id} requested ${shortWorkRef({ workId: work.id, revision: 1 })} «${work.title}» → ${recipient.id}`);
+		this.note(team, `${requester.id} requested ${shortWorkRef(ref)} «${work.title}» → ${recipient.id}`);
 		this.changed(team);
-		return okReply(requester.id, { receipt: { status: "accepted", work: { workId: work.id, revision: 1 }, recipient: recipient.id, ...(recipient.pause !== "none" ? { paused: true } : {}) } });
+		return okReply(requester.id, { receipt: { status: "accepted", work: ref, recipient: recipient.id, ...(recipient.pause !== "none" ? { paused: true } : {}) } });
 	}
 
 	/**
@@ -3757,7 +3763,6 @@ export class TeamRuntime {
 		const firstStart = !team.flow.started.has(workRefKey(ref));
 		const readyMs = this.flowWorkStarted(team, ref);
 		member.currentWork = copy(ref);
-		member.lastStartedWork = member.currentWork;
 		member.activity = "running";
 		this.note(team, firstStart ? `${member.id} started ${shortWorkRef(ref)}${readyMs === undefined ? "" : ` (ready ${clock(readyMs)})`}` : `${member.id} resumed ${shortWorkRef(ref)}`);
 		this.addDelivery(team, member, scope, input);

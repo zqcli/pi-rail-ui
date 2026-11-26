@@ -68,6 +68,28 @@ test("messages: accepted without Work, idle recipient wakes serially and replies
 	f.runtime.assertInvariants(f.teamId);
 });
 
+test("member trigger follows the acknowledged input, not the latest queued message", () => {
+	const f = fixture(["a", "c"]);
+	const a = f.next(), c = f.next();
+	const trigger = () => f.runtime.memberTurnTrigger(f.teamId, "b");
+	assert.equal(f.act(a, { action: "message", to: "b", text: "first" }).ok, true);
+	assert.equal(f.act(c, { action: "message", to: "b", text: "second" }).ok, true);
+	const batch = f.runtime.takeNextActivation(f.teamId)!;
+	assert.equal(batch.binding.memberId, "b");
+	assert.equal(trigger(), undefined);
+	assert.equal(f.act(a, { action: "message", to: "b", text: "next turn" }).ok, true);
+	f.ready(batch);
+	assert.equal(trigger(), "Triggered by ← a, c · 2 messages");
+	assert.equal(f.act(batch, { action: "yield" }).ok, true);
+	f.settle(batch);
+	assert.equal(trigger(), "Last trigger ← a, c · 2 messages");
+	const next = f.runtime.takeNextActivation(f.teamId)!;
+	assert.equal(next.binding.memberId, "b");
+	assert.equal(trigger(), "Last trigger ← a, c · 2 messages");
+	f.ready(next);
+	assert.equal(trigger(), "Triggered by ← a · message: next turn");
+});
+
 test("messages: unknown/mismatched identity, bounds, and pending close are explicit", () => {
 	const f = fixture(["a"]); const a = f.next();
 	assert.equal(error(f.act(a, { action: "message", to: "missing", text: "x" })), "UNKNOWN_MEMBER");
@@ -422,6 +444,7 @@ for (const when of ["before_open", "before_yield", "staged", "blocked"] as const
 	const resumed = nextFor(f, "a", "work");
 	assert.deepEqual(ref(resumed), ref(a));
 	assert.deepEqual(resumed.input.signalOutcomes?.[0]?.reply, { messageId: question, recipient: "b", replyId: answer });
+	assert.match(f.runtime.memberTurnTrigger(f.teamId, "a") ?? "", /^Triggered by ← b · reply: x/u);
 	assert.equal(resumed.input.signalOutcomes?.[0]?.text, answerText, "the complete reply is not truncated to the 1 KiB phase limit");
 	assert.deepEqual(f.runtime.getWork(f.teamId, ref(a))!.current.observedSignals, [signal.id]);
 	assert.deepEqual(f.runtime.getWork(f.teamId, ref(a))!.current.observedOutcomes, []);

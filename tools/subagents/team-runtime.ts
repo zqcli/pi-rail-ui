@@ -196,6 +196,7 @@ interface ActiveActivation {
 	scope: ActivationScope;
 	deliveryId: string;
 	inputReady: boolean;
+	trigger: string;
 	intent?: EndIntent;
 	native?: NativeCompletion;
 	completion?: ActivationCompletion;
@@ -255,6 +256,7 @@ interface RuntimeMember extends MemberRecord {
 	/** Kind of the last activation reserved for this member: an idle lead alternates its runnable work with event batches. */
 	lastActivationKind?: "events" | "work";
 	lastHandoff?: WorkRef;
+	lastDeliveredTrigger?: string;
 	lastActivation?: CompletedActivationTombstone;
 	lastLostActivation?: { activationId: string; error: WorkError; resourceReleased: boolean; reason: ActivationCompletionReason };
 	/** Transient provider errors since the last successful completion; nothing is scheduled for this member before `nextAt`. */
@@ -1374,6 +1376,14 @@ export class TeamRuntime {
 		return { current, completed: current ? undefined : summarize(lastCompleted), handoff: summarize(member.lastHandoff) };
 	}
 
+	/** Host tool cards only. A queued or unacknowledged input is not the current turn. */
+	memberTurnTrigger(teamId: string, memberId: string): string | undefined {
+		const member = this.team(teamId).members.get(memberId)!;
+		const active = member.active;
+		if (active?.inputReady && !active.parked && !active.native) return `Triggered by ← ${active.trigger}`;
+		return member.lastDeliveredTrigger ? `Last trigger ← ${member.lastDeliveredTrigger}` : undefined;
+	}
+
 	/** Every Team this runtime generation still retains (live and recent terminal). */
 	listTeams(): TeamTeamView[] {
 		return [...this.teams.values()].map((team) => this.view(team));
@@ -1770,6 +1780,7 @@ export class TeamRuntime {
 			version!.updatedAt = this.timestamp();
 		}
 		active.inputReady = true;
+		member.lastDeliveredTrigger = active.trigger;
 		this.changed(team);
 		this.check(team);
 		return okReply(member.id);
@@ -3692,6 +3703,29 @@ export class TeamRuntime {
 		return okReply(member.id, { data: { view: action.view, items: pageItems, ...(next < items.length ? { cursor: `page:${next}` } : {}), hasMore: next < items.length } });
 	}
 
+	private turnTrigger(input: ActivationInput, firstStart = false): string {
+		const scope = input.scope;
+		if (scope.kind === "events") {
+			const mail = scope.events.filter((event) => event.kind === "MESSAGE" && event.sender);
+			if (mail.length === 1) {
+				const event = mail[0]!;
+				return `${event.sender} · ${event.replyTo ? "reply" : "message"}: ${previewText(event.message.replace(/\s+/gu, " "), 80)}`;
+			}
+			if (mail.length > 1) return `${capped([...new Set(mail.map((event) => event.sender!))], 3)} · ${mail.length} messages`;
+			if (scope.events.some((event) => event.kind === "USER_COMMAND")) return "@host · command";
+			if (scope.events.some((event) => event.kind === "BOOT")) return "Team started";
+			return eventKinds(scope.events);
+		}
+		const replies = input.signalOutcomes?.filter((signal) => signal.state === "published" && signal.reply?.replyId) ?? [];
+		if (replies.length === 1) return `${replies[0]!.reply!.recipient} · reply: ${previewText((replies[0]!.text ?? "").replace(/\s+/gu, " "), 80)}`;
+		if (replies.length > 1) return `${capped([...new Set(replies.map((signal) => signal.reply!.recipient))], 3)} · ${replies.length} replies`;
+		if (input.signalOutcomes?.length) return "Signal outcome";
+		if (input.childIssues?.length) return "Child task issue";
+		if (input.outcomes.length) return "Dependency outcome";
+		if (firstStart) return scope.work.revision === 1 ? `${scope.requester} · assignment` : "Task revision started";
+		return "Task resumed";
+	}
+
 	private reserveEvents(team: TeamState, member: RuntimeMember, events: InternalEvent[], emergency: boolean): RuntimeActivation {
 		const batchId = this.id("batch");
 		const scope: ActivationScope = { activationId: this.id("activation"), kind: "events", eventBatchId: batchId };
@@ -3714,7 +3748,7 @@ export class TeamRuntime {
 		for (const event of selected) event.batchId = batchId;
 		team.eventBatches.set(batchId, eventBatch);
 		this.tickFlow(team);
-		const activation: ActiveActivation = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: this.needsWorkPermit(team, member), parked: false, resumeRequested: false,
+		const activation: ActiveActivation = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, trigger: this.turnTrigger(input), workPermitHeld: this.needsWorkPermit(team, member), parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(undefined, member.id === team.lead, emergency), budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		member.active = activation;
@@ -3754,13 +3788,13 @@ export class TeamRuntime {
 		version.state = "running";
 		version.updatedAt = at;
 		this.tickFlow(team);
+		const firstStart = !team.flow.started.has(workRefKey(ref));
 		member.lastActivationKind = "work";
-		member.active = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, workPermitHeld: this.needsWorkPermit(team, member), parked: false, resumeRequested: false,
+		member.active = { startedActiveMs: team.flow.activeMs, scope, deliveryId, inputReady: false, trigger: this.turnTrigger(input, firstStart), workPermitHeld: this.needsWorkPermit(team, member), parked: false, resumeRequested: false,
 			providerGatePending: false, toolCalls: new Map(), completedToolCalls: new Map(), pauseBlockedToolCalls: 0, cache: new Map(), lastSequence: 0,
 			budget: team.budget.recordActivation(team.ledger.get(ref.workId)!.record.rootId, member.id === team.lead, false),
 			budgetBlockedToolCalls: 0, postIntentContinuations: 0 };
 		this.startFlow(team, member, member.active);
-		const firstStart = !team.flow.started.has(workRefKey(ref));
 		const readyMs = this.flowWorkStarted(team, ref);
 		member.currentWork = copy(ref);
 		member.activity = "running";

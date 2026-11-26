@@ -544,7 +544,7 @@ test("launch panel shows the current or last completed task source and the lates
 		const run = (alias: string) => update.details.members.find((member: any) => member.alias === alias);
 		const entry = (alias: string, id: string) => run(alias).transcript.entries.find((item: any) => item.id === id);
 		const render = (expanded: boolean) => tool.renderResult(update, { expanded, isPartial: true }, theme).render(200).join("\n");
-		return { run, task: (alias: string) => entry(alias, "team-task"), handoff: (alias: string) => entry(alias, "team-handoff")?.text, render };
+		return { run, trigger: (alias: string) => entry(alias, "team-trigger")?.text, task: (alias: string) => entry(alias, "team-task"), handoff: (alias: string) => entry(alias, "team-handoff")?.text, render };
 	};
 
 	endActivation(host, activate(host, teamId), { action: "yield" });
@@ -555,6 +555,9 @@ test("launch panel shows the current or last completed task source and the lates
 	const fixtureRef = (requested as any).receipt.work;
 	let now = await panel();
 	assert.equal(now.task("writer").label, `Current task ← lead · ${shortWorkRef(writerRef)}`);
+	assert.equal(now.trigger("writer"), "Triggered by ← lead · assignment");
+	assert.doesNotMatch(now.run("writer").detail, /^running/u);
+	assert.equal(now.trigger("source"), undefined);
 	assert.equal(now.handoff("writer"), "Last handoff → source · Find the fixture.");
 	assert.equal(now.task("source"), undefined, "a queued receiver does not display unstarted work");
 	assert.equal(now.handoff("lead"), undefined, "prepared initial assignments are not handoffs made by the lead");
@@ -565,6 +568,7 @@ test("launch panel shows the current or last completed task source and the lates
 	assert.equal(now.task("writer"), undefined, "waiting with no completed work shows no task prompt");
 	assert.equal(now.handoff("writer"), "Last handoff → source · Find the fixture.");
 	assert.equal(now.task("source").label, `Current task ← writer · ${shortWorkRef(fixtureRef)}`);
+	assert.equal(now.trigger("source"), "Triggered by ← writer · assignment");
 	assert.equal(now.run("writer").detail, `waiting on 1 sub-task: source (running ${shortWorkRef(fixtureRef)})`);
 	assert.equal(now.run("lead").detail, "dispatched: writer (waiting)");
 
@@ -581,6 +585,7 @@ test("launch panel shows the current or last completed task source and the lates
 		const rendered = now.render(expanded);
 		assert.match(rendered, /Last completed ← lead · work \S+@1\s+Write the change\./u);
 		assert.match(rendered, /Last handoff → source · Find the fixture\./u);
+		assert.match(rendered, /Last trigger ← Dependency outcome/u);
 		assert.doesNotMatch(rendered, /initial task|result →/u);
 	}
 
@@ -594,6 +599,7 @@ test("launch panel shows the current or last completed task source and the lates
 	now = await panel();
 	assert.equal(now.task("writer").label, `Current task ← lead · ${shortWorkRef(revised.scope.work!)}`);
 	assert.equal(now.task("writer").text, "Write the change, with tests.");
+	assert.equal(now.trigger("writer"), "Triggered by ← Task revision started");
 	endActivation(host, revised, { action: "reply", result: { status: "succeeded", summary: "Tests added." } });
 
 	assert.equal(host.runtime.handleAction(manager.binding, manager.scope, 2, "new-task", {

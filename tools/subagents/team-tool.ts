@@ -196,11 +196,11 @@ function dispatchedText(lead: string, works: readonly TeamWorkSummary[]): string
 }
 
 /** A member's panel state line: plain words, only the facts that matter now. */
-export function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts, works: readonly TeamWorkSummary[], lead: string): string {
+export function memberDetail(member: TeamTeamView["members"][number], facts: PanelFacts, works: readonly TeamWorkSummary[], lead: string, showRunningWork = true): string {
 	const results = facts.results.get(member.id)?.count ?? 0;
 	const resultText = results ? `${results} ${results === 1 ? "result" : "results"}` : "";
 	if (member.lifecycle === "closed") return ["closed", resultText].filter(Boolean).join(" · ");
-	const now = member.currentWork ? `running ${shortWorkRef(member.currentWork)}`
+	const now = member.currentWork ? (showRunningWork ? `running ${shortWorkRef(member.currentWork)}` : "")
 		: facts.retrying.has(member.id) ? facts.retrying.get(member.id)!
 		: member.id === lead && facts.leadHandling ? facts.leadHandling
 			: member.held || member.blocked ? facts.stalled.get(member.id) ?? "waiting on other work"
@@ -240,6 +240,7 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 		const latest = facts.results.get(member.id)?.latest;
 		const { current, completed, handoff } = host.runtime.memberTaskRoutes(teamId, member.id, latest?.work);
 		const task = current ?? completed;
+		const trigger = host.runtime.memberTurnTrigger(teamId, member.id);
 		const entries = activity?.transcript.entries ?? [];
 		return {
 			slot, alias: member.id, member: { lead: member.id === view.lead }, model: member.policy.model ?? "model unavailable", persistent: true,
@@ -253,10 +254,11 @@ function memberRuns(host: TeamSessionHost, teamId: string, facts: PanelFacts): S
 			usage, ...(activity ? { durationMs: activity.durationMs } : {}),
 			contextWindowText: formatContextWindowForDisplay(member.policy.contextWindow),
 			fastModeText: member.policy.fastMode ? "on" : "off", searchModeText: member.policy.searchMode === "on" ? "on" : "off",
-			detail: memberDetail(member, facts, works, view.lead),
+			detail: memberDetail(member, facts, works, view.lead, !current),
 			transcript: {
 				entries: [
-					...(task ? [{ id: "team-task", kind: "user" as const, initial: true, label: teamTaskLabel(task, !!current), text: task.taskPreview, order: 0 }] : []),
+					...(trigger ? [{ id: "team-trigger", kind: "note" as const, initial: true, text: trigger, order: -1 }] : []),
+					...(task ? [{ id: "team-task", kind: "user" as const, initial: true, label: teamTaskLabel(task, !!current), text: previewText(task.taskPreview.split(/(?<=[.!?])\s+|(?<=[。！？])|\r?\n/u, 1)[0]!, 60), order: 0 }] : []),
 					...(handoff ? [{ id: "team-handoff", kind: "note" as const, initial: true, text: teamHandoffLine(handoff), order: 0 }] : []),
 					...entries,
 				],
